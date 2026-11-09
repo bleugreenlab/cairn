@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use super::export::backing_branch_heads;
 use super::packed_refs::PackedRefs;
-use super::{export_git_verified, rollback_incomplete, JjEnv};
+use super::{export_git_preserving_checkout, export_git_verified, rollback_incomplete, JjEnv};
 use crate::{BookmarkState, LocalBookmarkView, RecordedBookmarkRestore};
 
 type Heads = BTreeMap<String, String>;
@@ -521,8 +521,9 @@ pub(crate) fn restore_recorded(jj: &JjEnv, store: &Path, op_id: &str) -> Result<
     }
 
     let Some(pre) = attempt.pre_view().cloned() else {
-        // Restore anyway is right; proving it is not possible.
-        let _ = export_git_verified(jj, store, true, "jj git export (after op restore)", &[]);
+        // Restore anyway is right; proving it is not possible, so there is
+        // nothing exact to name and only the global export applies.
+        let _ = export_git_preserving_checkout(jj, store, true, "jj git export (after op restore)");
         return Err(attempt.record(
             RollbackFailurePhase::SnapshotMissing,
             None,
@@ -586,8 +587,15 @@ pub(crate) fn restore_recorded(jj: &JjEnv, store: &Path, op_id: &str) -> Result<
         .iter()
         .filter_map(|name| Some((name.as_str(), pre.bookmarks.get(name)?.commit()?)))
         .collect();
-    let exported =
-        export_git_verified(jj, store, true, "jj git export (after op restore)", &expect);
+    // A named export requires exact expectations and cannot delete a ref. When
+    // no touched bookmark has a restored target to name (nothing moved, or the
+    // restore re-established an absence), the global export publishes the
+    // restored view; `must_match` below verifies the outcome either way.
+    let exported = if expect.is_empty() {
+        export_git_preserving_checkout(jj, store, true, "jj git export (after op restore)")
+    } else {
+        export_git_verified(jj, store, true, "jj git export (after op restore)", &expect)
+    };
     let mut unverified: Vec<String> = Vec::new();
     if let Err(error) = &exported {
         attempt
@@ -1037,9 +1045,9 @@ mod tests {
         add_workspace(&jj, &store, &ws, FEATURE, "main", None).unwrap();
         std::fs::write(ws.join("feature.rs"), "feature\n").unwrap();
         seal(&jj, &ws, "feature work", None).unwrap();
-        export_git_verified(&jj, &store, true, "fixture export", &[]).unwrap();
         let main = bookmark_commit(&jj, &store, "main").unwrap();
         let feature = bookmark_commit(&jj, &store, FEATURE).unwrap();
+        export_git_verified(&jj, &store, true, "fixture export", &[(FEATURE, &feature)]).unwrap();
         assert_ne!(main, feature);
         Some(Fixture {
             _home: home,
@@ -1077,7 +1085,14 @@ mod tests {
                 "test forward mutation",
             )
             .unwrap();
-            export_git_verified(jj, &self.store, true, "test forward export", &[]).unwrap();
+            export_git_verified(
+                jj,
+                &self.store,
+                true,
+                "test forward export",
+                &[(branch, target)],
+            )
+            .unwrap();
         }
 
         fn budgeted(&self) -> JjEnv {
@@ -1198,8 +1213,16 @@ mod tests {
         add_workspace(&fx.jj, &fx.store, &ws, OTHER, "main", None).unwrap();
         std::fs::write(ws.join("other.rs"), "other\n").unwrap();
         seal(&fx.jj, &ws, "unrelated work", None).unwrap();
-        export_git_verified(&fx.jj, &fx.store, true, "unrelated export", &[]).ok();
         let other = bookmark_commit(&fx.jj, &fx.store, OTHER).unwrap();
+        // Named, so the still-locked FEATURE ref is not part of this export.
+        export_git_verified(
+            &fx.jj,
+            &fx.store,
+            true,
+            "unrelated export",
+            &[(OTHER, &other)],
+        )
+        .unwrap();
         assert_eq!(fx.git_head(OTHER).as_deref(), Some(other.as_str()));
 
         // The repair is refused while Git still refuses the ref, and retried.

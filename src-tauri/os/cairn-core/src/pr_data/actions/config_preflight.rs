@@ -22,7 +22,6 @@ use crate::config::project_settings::{
     judge_landing_config, LandingConfigJudgement, UnreadableConfigCost, UnreadableProjectConfig,
     UnsupportedCheck,
 };
-use crate::orchestrator::Orchestrator;
 
 use super::context::MergeMrContext;
 
@@ -34,21 +33,27 @@ const CONFIG_PATH: &str = ".cairn/config.yaml";
 ///
 /// Advisory on its own failures, like the parse gate: a side that cannot be
 /// read decides nothing, and the landing proceeds as it would have.
+///
+/// It judges exactly what would land: `landing`, the merge result built on
+/// the prepared target commit `target_tip`. Never the moving branch names,
+/// which may have moved since. Preparation carried the source onto
+/// `target_tip`, so that commit is also the source's fork point from the
+/// target: nothing is resolved through jj (whose loader may settle
+/// operations), and only the two exact commits are read, through Git.
 pub(super) async fn preflight_landing_config(
-    orch: &Orchestrator,
     merge_context: &MergeMrContext,
+    target_tip: &str,
+    landing: &str,
 ) -> Result<Option<String>, String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let repository = PathBuf::from(&merge_context.mr.repo_path);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &repository);
     let (source, target) = (
         merge_context.source_branch.clone(),
         merge_context.target_branch.clone(),
     );
     let judgement = {
-        let (source, target) = (source.clone(), target.clone());
+        let (target_tip, landing) = (target_tip.to_string(), landing.to_string());
         tokio::task::spawn_blocking(move || {
-            let sides = ConfigSides::read(&jj, &store, &repository, &target, &source)?;
+            let sides = ConfigSides::read(&repository, &target_tip, &landing)?;
             Some(judge_landing_config(
                 sides.fork.as_deref(),
                 sides.target.as_deref(),
@@ -72,8 +77,9 @@ pub(super) async fn preflight_landing_config(
     }
 }
 
-/// The file's content at the branch's fork point, on the target, and at the
-/// branch head; `None` where the file is absent.
+/// The file's content at the source's fork point from the target (the
+/// prepared target itself), on the target, and in the landing; `None` where
+/// the file is absent.
 struct ConfigSides {
     fork: Option<Vec<u8>>,
     target: Option<Vec<u8>>,
@@ -81,20 +87,7 @@ struct ConfigSides {
 }
 
 impl ConfigSides {
-    fn read(
-        jj: &crate::jj::JjEnv,
-        store: &Path,
-        repository: &Path,
-        target: &str,
-        source: &str,
-    ) -> Option<Self> {
-        let head = crate::jj::bookmark_commit(jj, store, source)?;
-        let target_tip = crate::jj::bookmark_commit(jj, store, target)?;
-        let fork = crate::jj::revset_commit(
-            jj,
-            store,
-            &format!("heads(::bookmarks(exact:{target:?}) & ::bookmarks(exact:{source:?}))"),
-        )?;
+    fn read(repository: &Path, target_tip: &str, head: &str) -> Option<Self> {
         // The managed store shares the project repository's objects, so its
         // commits are read there.
         let read = |commit: &str| {
@@ -111,10 +104,11 @@ impl ConfigSides {
             })
             .ok()
         };
+        let target = read(target_tip)?;
         Some(Self {
-            fork: read(&fork)?,
-            target: read(&target_tip)?,
-            head: read(&head)?,
+            fork: target.clone(),
+            target,
+            head: read(head)?,
         })
     }
 }

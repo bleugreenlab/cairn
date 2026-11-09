@@ -50,56 +50,66 @@ pub fn introduced_parse_failures(
     sides: &[&str],
     paths: &[String],
 ) -> Vec<ParseFailure> {
-    let gated: Vec<String> = paths
-        .iter()
-        .filter(|path| is_gated(path))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if gated.is_empty() {
-        return Vec::new();
-    }
-    // Each candidate failure, with whether some side has held it parseable.
-    let mut failures: Vec<(ParseFailure, bool)> = texts_at(jj, store, merged, &gated)
-        .into_iter()
-        .filter_map(|(path, text)| parse_failure(&path, &text))
-        .map(|failure| (failure, false))
-        .collect();
-    for side in sides {
-        if failures.is_empty() {
-            break;
+    let mut presence_cache = std::collections::HashMap::new();
+    introduced_parse_failures_with(merged, sides, paths, |revision, path| {
+        let present = presence_cache
+            .entry(revision.to_string())
+            .or_insert_with(|| paths_present_at(jj, store, revision, paths));
+        match present {
+            Ok(present) => file_at_revision(jj, store, revision, path, present),
+            Err(error) => Err(error.clone()),
         }
-        let candidates: Vec<String> = failures
-            .iter()
-            .map(|(failure, _)| failure.path.clone())
-            .collect();
-        let Some(present) = presence(jj, store, side, &candidates) else {
-            failures.clear();
-            break;
+    })
+}
+
+/// The parser's merge-blame policy, independent of how immutable trees are read.
+/// The CLI and unpublished-transaction readers both pass through this function.
+pub(super) fn introduced_parse_failures_with(
+    merged: &str,
+    sides: &[&str],
+    paths: &[String],
+    mut read: impl FnMut(&str, &str) -> Result<FileContent, String>,
+) -> Vec<ParseFailure> {
+    let gated: BTreeSet<&String> = paths.iter().filter(|path| is_gated(path)).collect();
+    let mut failures = Vec::new();
+    for path in gated {
+        let text = match read(merged, path) {
+            Ok(FileContent::Text(text)) => text,
+            Ok(FileContent::Absent | FileContent::Binary) => continue,
+            Err(error) => {
+                log::warn!("parse gate: could not read `{path}` at `{merged}`: {error}");
+                continue;
+            }
         };
-        failures.retain_mut(|(failure, held)| {
-            match file_at_revision(jj, store, side, &failure.path, &present) {
+        let Some(failure) = parse_failure(path, &text) else {
+            continue;
+        };
+        let mut held = false;
+        let mut introduced = true;
+        for side in sides {
+            match read(side, path) {
                 Ok(FileContent::Text(text)) => {
-                    *held = true;
-                    parse_failure(&failure.path, &text).is_none()
+                    held = true;
+                    if parse_failure(path, &text).is_some() {
+                        introduced = false;
+                        break;
+                    }
                 }
-                Ok(FileContent::Absent | FileContent::Binary) => true,
+                Ok(FileContent::Absent | FileContent::Binary) => {}
                 Err(error) => {
                     log::warn!(
-                        "parse gate: could not read `{}` at `{side}`, so the merge is not blamed \
-                         for it: {error}",
-                        failure.path
+                        "parse gate: could not read `{path}` at `{side}`, nothing blamed: {error}"
                     );
-                    false
+                    introduced = false;
+                    break;
                 }
             }
-        });
+        }
+        if introduced && held {
+            failures.push(failure);
+        }
     }
     failures
-        .into_iter()
-        .filter_map(|(failure, held)| held.then_some(failure))
-        .collect()
 }
 
 /// The refusal for a fold of bookmark `source` into bookmark `target` whose
@@ -183,33 +193,6 @@ pub fn render_failures(failures: &[ParseFailure]) -> String {
         .map(|failure| format!("- {failure}"))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn presence(jj: &JjEnv, store: &Path, rev: &str, paths: &[String]) -> Option<BTreeSet<String>> {
-    paths_present_at(jj, store, rev, paths)
-        .map_err(|error| {
-            log::warn!("parse gate: could not list paths at `{rev}`, nothing decided: {error}");
-        })
-        .ok()
-}
-
-fn texts_at(jj: &JjEnv, store: &Path, rev: &str, paths: &[String]) -> Vec<(String, String)> {
-    let Some(present) = presence(jj, store, rev, paths) else {
-        return Vec::new();
-    };
-    paths
-        .iter()
-        .filter_map(
-            |path| match file_at_revision(jj, store, rev, path, &present) {
-                Ok(FileContent::Text(text)) => Some((path.clone(), text)),
-                Ok(FileContent::Absent | FileContent::Binary) => None,
-                Err(error) => {
-                    log::warn!("parse gate: could not read `{path}` at `{rev}`: {error}");
-                    None
-                }
-            },
-        )
-        .collect()
 }
 
 /// Every path whose content differs between two revisions, by its name at

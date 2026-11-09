@@ -495,6 +495,22 @@ pub fn resolve_default_branch(
         .unwrap_or_else(|| "main".to_string())
 }
 
+/// The effective default branch of a project whose checkout is at
+/// `project_path` (absent for a project with no local checkout) and whose row
+/// stores `stored_default_branch`: [`resolve_default_branch`] over the
+/// checkout's read-only settings. Every reader that needs the effective default
+/// resolves it here, so the config's precedence over the stored column is
+/// decided in one place.
+pub fn effective_default_branch(
+    project_path: Option<&Path>,
+    stored_default_branch: Option<&str>,
+) -> String {
+    let config = project_path
+        .map(load_project_settings_read_only)
+        .unwrap_or_default();
+    resolve_default_branch(&config, stored_default_branch)
+}
+
 /// Load the raw project settings file.
 /// Returns (settings, needs_migration) where needs_migration is true if legacy fields were found.
 fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFile, bool), String> {

@@ -9,9 +9,9 @@
 //! commit of the stack keeps its id, and the bookmark fast-forwards onto a new
 //! child of its old tip.
 //!
-//! The merge is jj's own (`jj new --no-edit <tip> <dest>`), so the tree that
-//! is judged is the tree that is committed, and for fixed parents it is
-//! deterministic: a landing can redo it and prove it got the same tree.
+//! The canonical kernel uses jj's own tree merge and writes only hidden objects.
+//! The tree judged is the tree committed. Detached preparation and the locked
+//! adapter share this kernel; only installation publishes the accepted candidate.
 //!
 //! Which branches catch up this way is the orchestrator's decision (an
 //! operator-set per-branch mode); this module only performs one merge, and
@@ -48,7 +48,7 @@ pub enum MergeCatchUp {
         new_base: String,
     },
     /// The merge recorded a conflict, or produced a tree that does not parse
-    /// or carries conflict scaffolding. It was undone: the branch is exactly
+    /// or carries conflict scaffolding. It was not installed: the branch is exactly
     /// where it was. The diagnostic's coordinates are (merge base, tip, dest).
     Conflicted { diagnostic: ConflictDiagnostic },
     /// The merge was not attempted, and nothing moved. `reason` begins with
@@ -138,17 +138,9 @@ pub fn base_side_paths(jj: &JjEnv, store: &Path, old_base: &str, new_base: &str)
 /// merge. Only [`CarriedContent::FromTip`] is meaningful here, because the
 /// owner resolved against this very destination.
 ///
-/// Steps, all fail-closed:
-/// 1. `dest_commit` already in `::tip`: [`MergeCatchUp::AlreadyCurrent`].
-/// 2. The merge base `heads(::tip & ::dest)` must be exactly one commit, or
-///    the merge is refused untouched.
-/// 3. `jj new --no-edit <tip> <dest>` creates the merge without moving `@`.
-/// 4. A carry restores its paths into the merge from the tip.
-/// 5. A recorded conflict, a path both sides changed that parsed on each side
-///    and fails in the merge, or conflict scaffolding at the tree root undoes
-///    the operation and reports a conflict.
-/// 6. The bookmark is moved forward onto the merge and exported through the
-///    guarded export.
+/// Uses the same hidden-object kernel as detached preparation, then installs
+/// through the two-coordinate CAS and guarded export. Conflicts and refusals
+/// publish no operation and require no live mutation or undo.
 pub fn merge_base_into_branch(
     jj: &JjEnv,
     store: &Path,
@@ -157,246 +149,62 @@ pub fn merge_base_into_branch(
     message: &str,
     carry: Option<&ResolutionCarry>,
 ) -> Result<MergeCatchUp, String> {
-    let tip = bookmark_commit_checked(jj, store, branch)?
-        .ok_or_else(|| format!("catch-up merge: bookmark `{branch}` does not resolve"))?;
-    if let Some(carry) = carry {
-        if carry.expected_pre_tip != tip {
-            return Err(format!(
-                "resolved catch-up merge of `{branch}` refused before moving anything: it was \
-                 requested with the branch at `{}`, and it is now at `{tip}`. Re-read \
-                 cairn:~/rebase and request it again.",
-                carry.expected_pre_tip
-            ));
+    let snapshot = super::advance::capture_replay(store, branch, dest_commit, false)?;
+    let coordinate = snapshot.coordinate().clone();
+    let budget = jj
+        .operation_deadline
+        .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or(super::env::JJ_DEFAULT_TIMEOUT);
+    let candidate = match super::advance::compute_branch_merge_with_message(
+        jj, snapshot, carry, message, budget,
+    ) {
+        Ok(candidate) => candidate,
+        Err(AdvanceComputeError::Conflict(diagnostic)) => {
+            return Ok(MergeCatchUp::Conflicted {
+                diagnostic: *diagnostic,
+            });
         }
-        if carry
-            .paths
-            .iter()
-            .any(|(_, content)| *content != CarriedContent::FromTip)
+        Err(AdvanceComputeError::Repository(reason))
+            if reason.starts_with(MERGE_CATCH_UP_REFUSAL) =>
         {
-            return Err(format!(
-                "resolved catch-up merge of `{branch}`: a merge takes each resolved path whole \
-                 from the committed tip; a carried text was offered, and nothing moved"
-            ));
+            return Ok(MergeCatchUp::Refused { reason });
         }
-    }
-    if revset_descends_from(jj, store, &tip, dest_commit) {
+        Err(error) => return Err(error.to_string()),
+    };
+    let head = candidate.head();
+    if head == coordinate.head {
         return Ok(MergeCatchUp::AlreadyCurrent);
     }
-    if branch_is_ancestor_of(jj, store, branch, dest_commit) {
-        fast_forward_bookmark(jj, store, branch, dest_commit)?;
-        return Ok(MergeCatchUp::FastForwarded {
-            to: dest_commit.to_string(),
-        });
-    }
-
-    let bases = merge_bases(jj, store, &tip, dest_commit)?;
-    if bases.len() != 1 {
-        let reason = ambiguous_merge_base_refusal(branch, dest_commit, &bases);
-        log::warn!("catch-up[{branch}] {reason}");
-        return Ok(MergeCatchUp::Refused { reason });
-    }
-    let old_base = bases[0].clone();
-
-    // Exact under the store lock: every operation after this one is ours.
-    let pre_op = operation_id(jj, store)?;
-    let pair = format!("children({tip}) & children({dest_commit})");
-    let before: BTreeSet<String> = revset_commit_ids(jj, store, &pair)?.into_iter().collect();
-    let new_merge = |before: &BTreeSet<String>| -> Result<String, String> {
-        let after: BTreeSet<String> = revset_commit_ids(jj, store, &pair)?.into_iter().collect();
-        let mut added: Vec<String> = after.difference(before).cloned().collect();
-        match added.len() {
-            1 => Ok(added.remove(0)),
-            n => Err(format!(
-                "catch-up merge: expected exactly one new merge of {tip} and {dest_commit}, found {n}"
-            )),
-        }
+    let old_base = if head == coordinate.base {
+        None
+    } else {
+        // The kernel already proved uniqueness at the captured operation.
+        Some(
+            merge_bases(jj, store, &coordinate.head, &coordinate.base)?
+                .into_iter()
+                .next()
+                .ok_or("catch-up merge lost its merge base")?,
+        )
     };
-    // One transaction: a lost lock repeats it safely and adds no second child.
-    run_store_rewrite(
-        jj,
-        store,
-        &[
-            "new",
-            "--no-edit",
-            "--ignore-working-copy",
-            "-m",
-            message,
-            &tip,
-            dest_commit,
-        ],
-        "jj new (catch-up merge)",
-    )
-    .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-    let mut merge =
-        new_merge(&before).map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-
-    if let Some(carry) = carry.filter(|carry| !carry.paths.is_empty()) {
-        let mut args = vec![
-            "restore",
-            "--from",
-            tip.as_str(),
-            "--into",
-            merge.as_str(),
-            "--ignore-working-copy",
-            "--",
-        ];
-        let quoted: Vec<String> = carry
-            .paths
-            .iter()
-            .map(|(path, _)| quote_fileset(path))
-            .collect();
-        args.extend(quoted.iter().map(String::as_str));
-        run_store_rewrite(jj, store, &args, "jj restore (catch-up merge resolution)")
-            .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-        // The restore rewrote the merge, so it has a new id; the old one is
-        // hidden and no longer a child of either parent.
-        merge = new_merge(&before)
-            .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-        log::info!(
-            "catch-up[{branch}] carried the committed resolution of {} path(s) into the merge",
-            carry.paths.len()
-        );
-    }
-
-    let conflicted = revset_has_conflict(jj, store, &merge)
-        .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-    if conflicted {
-        let paths: Vec<String> = conflicted_commits(jj, store, &merge)
-            .into_iter()
-            .flat_map(|commit| commit.files)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut diagnostic =
-            capture_conflict_diagnostic(jj, store, branch, dest_commit, Some(&tip), paths.clone());
-        diagnostic.conflicted_tip = Some(merge.clone());
-        roll_back_conflicting_rebase(jj, store, branch, dest_commit, &pre_op)?;
-        log::info!(
-            "catch-up[{branch}] merge of {tip} with {dest_commit} (base {old_base}) conflicted on \
-             {} path(s) and was undone; the branch is unchanged: {}",
-            paths.len(),
-            if paths.is_empty() {
-                "<none enumerated>".to_string()
-            } else {
-                paths.join(", ")
-            }
-        );
-        return Ok(MergeCatchUp::Conflicted { diagnostic });
-    }
-
-    // Clean in jj's terms is a statement about lines. A path both sides
-    // changed must still parse, or the merge is refused like a conflict.
-    let own = changed_paths(jj, store, &old_base, &tip);
-    let overlapping: Vec<String> = changed_paths(jj, store, &old_base, dest_commit)
-        .into_iter()
-        .filter(|path| own.contains(path))
-        .collect();
-    let failures = introduced_parse_failures(jj, store, &merge, &[&tip, dest_commit], &overlapping);
-    if !failures.is_empty() {
-        let paths: Vec<String> = failures
-            .iter()
-            .map(|failure| failure.path.clone())
-            .collect();
-        let mut diagnostic =
-            capture_conflict_diagnostic(jj, store, branch, dest_commit, Some(&tip), paths);
-        diagnostic.condition = ConflictCondition::Unparseable;
-        diagnostic.conflicted_tip = Some(merge.clone());
-        diagnostic.validation = Some(ValidationRefusal {
-            commit: merge.clone(),
-            failures: failures.clone(),
-        });
-        roll_back_conflicting_rebase(jj, store, branch, dest_commit, &pre_op)?;
-        log::warn!(
-            "catch-up[{branch}] merge {merge} recorded no conflict but does not parse; undone.\n{}",
-            render_failures(&failures)
-        );
-        return Ok(MergeCatchUp::Conflicted { diagnostic });
-    }
-
-    // Judge the tree before the bookmark moves, not only at export: a moved
-    // bookmark whose export is then refused is partial state.
-    let scaffolding = git_backend_root(jj, store)
-        .and_then(|git_dir| root_conflict_scaffolding(Some(jj), Path::new(&git_dir), &merge))
-        .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-    if !scaffolding.is_empty() {
-        let mut diagnostic = capture_conflict_diagnostic(
+    let installed =
+        super::advance::install_legacy_replay(jj, candidate).map_err(|error| error.to_string())?;
+    if let Err(error) = installed.export {
+        return Err(roll_back_rebase(
             jj,
             store,
             branch,
-            dest_commit,
-            Some(&tip),
-            overlapping.clone(),
-        );
-        diagnostic.condition = ConflictCondition::ContentConflict;
-        diagnostic.conflicted_tip = Some(merge.clone());
-        diagnostic.scaffolding = Some(ScaffoldingRefusal {
-            commit: merge.clone(),
-            entries: scaffolding.clone(),
-        });
-        roll_back_conflicting_rebase(jj, store, branch, dest_commit, &pre_op)?;
-        log::error!(
-            "catch-up[{branch}] merge {merge} recorded no conflict but its tree root carries jj \
-             conflict scaffolding ({}); undone before the bookmark moved",
-            scaffolding.join(", ")
-        );
-        return Ok(MergeCatchUp::Conflicted { diagnostic });
+            &coordinate.operation,
+            error,
+        ));
     }
-
-    // A forward move: the merge is a child of the tip.
-    jj.run(
-        store,
-        &[
-            "bookmark",
-            "set",
-            branch,
-            "-r",
-            &merge,
-            "--ignore-working-copy",
-        ],
-        "jj bookmark set (catch-up merge)",
-    )
-    .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-    match export_bookmark_advance_guarded(jj, store, true, branch, "jj git export (catch-up merge)")
-    {
-        Ok(()) => {}
-        Err(ExportError::ConflictScaffolding {
-            commit, entries, ..
-        }) => {
-            let mut diagnostic = capture_conflict_diagnostic(
-                jj,
-                store,
-                branch,
-                dest_commit,
-                Some(&tip),
-                overlapping,
-            );
-            diagnostic.condition = ConflictCondition::ContentConflict;
-            diagnostic.conflicted_tip = Some(merge.clone());
-            diagnostic.scaffolding = Some(ScaffoldingRefusal { commit, entries });
-            roll_back_conflicting_rebase(jj, store, branch, dest_commit, &pre_op)?;
-            return Ok(MergeCatchUp::Conflicted { diagnostic });
-        }
-        Err(ExportError::Failed(error)) => {
-            return Err(roll_back_rebase(
-                jj,
-                store,
-                branch,
-                &pre_op,
-                format!("catch-up merge of `{branch}` moved the bookmark, and exporting it failed: {error}"),
-            ));
-        }
+    match old_base {
+        Some(old_base) => Ok(MergeCatchUp::Merged {
+            merge: head,
+            old_base,
+            new_base: coordinate.base,
+        }),
+        None => Ok(MergeCatchUp::FastForwarded { to: head }),
     }
-    jj.check_operation_budget("catch-up merge follow-through")
-        .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
-    log::info!(
-        "catch-up[{branch}] merged {dest_commit} into {tip} as {merge} (base {old_base}); no \
-         commit of the branch was rewritten"
-    );
-    Ok(MergeCatchUp::Merged {
-        merge,
-        old_base,
-        new_base: dest_commit.to_string(),
-    })
 }
 
 #[cfg(test)]
@@ -513,6 +321,167 @@ mod tests {
             let after = self.operations();
             after[..after.len() - before.len()].to_vec()
         }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_merge_is_hidden_until_cas_install_and_keeps_exact_source_graph() {
+        use jj_lib::object_id::ObjectId as _;
+        use jj_lib::repo::Repo as _;
+        let Some(bin) = jj_bin() else { return };
+        let fx = fixture(&bin);
+        let source = fx.commit(&["main"], BRANCH, "own.txt", "own\n");
+        let dest = fx.commit(&["main"], "main", "base.txt", "base\n");
+        export_bookmark_advance_guarded(&fx.jj, &fx.store, true, BRANCH, "fixture export").unwrap();
+        let git_dir = git_backend_root(&fx.jj, &fx.store).unwrap();
+        let git_tip = || {
+            git_stdout(
+                &fx.store,
+                &[
+                    "--git-dir",
+                    &git_dir,
+                    "rev-parse",
+                    &format!("refs/heads/{BRANCH}"),
+                ],
+            )
+        };
+        let before = operation_id(&fx.jj, &fx.store).unwrap();
+        let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+        let candidate = compute_branch_merge_advance(
+            &fx.jj,
+            snapshot,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let head = candidate.head();
+        let tree = candidate.tree().unwrap();
+        assert!(candidate.dropped_commit_ids().is_empty());
+        assert_eq!(fx.tip(BRANCH), source);
+        assert_eq!(git_tip(), source);
+        assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), before);
+        let repo = futures::executor::block_on(crate::load_repo_at_head(&fx.store)).unwrap();
+        let object = repo
+            .store()
+            .get_commit(&jj_lib::backend::CommitId::try_from_hex(&head).unwrap())
+            .unwrap();
+        assert_eq!(
+            object
+                .parent_ids()
+                .iter()
+                .map(|id| id.hex())
+                .collect::<Vec<_>>(),
+            vec![source.clone(), dest.clone()]
+        );
+        assert!(
+            !repo.index().has_id(object.id()).unwrap(),
+            "hidden objects are not published in the live index"
+        );
+        let local = install_branch_advance_local(&fx.jj, candidate).unwrap();
+        assert_eq!(local.tree, tree);
+        assert_eq!(fx.tip(BRANCH), head);
+        assert_eq!(git_tip(), source, "local acceptance does not export");
+        let installed = export_installed_branch_advance(&fx.jj, local);
+        assert!(installed.export.is_ok(), "{:?}", installed.export);
+        assert_eq!(git_tip(), head);
+        assert_eq!(fx.parents(&head), vec![source, dest]);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_merge_refuses_either_moved_coordinate_and_expired_budget() {
+        let Some(bin) = jj_bin() else { return };
+        for moved in [BRANCH, "main"] {
+            let fx = fixture(&bin);
+            fx.commit(&["main"], BRANCH, "own.txt", "own\n");
+            fx.commit(&["main"], "main", "base.txt", "base\n");
+            let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+            assert!(matches!(
+                compute_branch_merge_advance(&fx.jj, snapshot, None, std::time::Duration::ZERO),
+                Err(AdvanceComputeError::TimedOut)
+            ));
+            let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+            let candidate = compute_branch_merge_advance(
+                &fx.jj,
+                snapshot,
+                None,
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+            fx.commit(&[moved], moved, "later.txt", "later\n");
+            let before = operation_id(&fx.jj, &fx.store).unwrap();
+            assert!(matches!(
+                install_branch_advance_local(&fx.jj, candidate),
+                Err(AdvanceInstallError::CoordinatesChanged)
+            ));
+            assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), before);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_merge_conflict_does_not_publish_or_replay() {
+        let Some(bin) = jj_bin() else { return };
+        let fx = fixture(&bin);
+        let source = fx.commit(&["main"], BRANCH, "same.txt", "own\n");
+        fx.commit(&["main"], "main", "same.txt", "base\n");
+        let before = operation_id(&fx.jj, &fx.store).unwrap();
+        let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+        let result = compute_branch_merge_advance(
+            &fx.jj,
+            snapshot,
+            None,
+            std::time::Duration::from_secs(30),
+        );
+        assert!(matches!(result, Err(AdvanceComputeError::Conflict(_))));
+        assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), before);
+        assert_eq!(fx.tip(BRANCH), source);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_merge_resolution_keeps_session_destination_when_main_moves() {
+        let Some(bin) = jj_bin() else { return };
+        let fx = fixture(&bin);
+        let source = fx.commit(&["main"], BRANCH, "same.txt", "own\n");
+        let dest = fx.commit(&["main"], "main", "same.txt", "base\n");
+        let resolved = fx.commit(&[BRANCH], BRANCH, "same.txt", "resolved\n");
+        let carry = ResolutionCarry::from_tip(&resolved, &["same.txt".to_string()]);
+        assert!(capture_branch_merge_resolution(&fx.store, BRANCH, "main").is_err());
+        assert!(capture_branch_merge_resolution(&fx.store, BRANCH, &dest[..12]).is_err());
+        let snapshot = capture_branch_merge_resolution(&fx.store, BRANCH, &dest).unwrap();
+        let candidate = compute_branch_merge_advance(
+            &fx.jj,
+            snapshot,
+            Some(&carry),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let later = fx.commit(&["main"], "main", "later.txt", "later\n");
+        let local = install_branch_advance_local(&fx.jj, candidate).unwrap();
+        let merge = local.head.clone();
+        assert!(export_installed_branch_advance(&fx.jj, local)
+            .export
+            .is_ok());
+        assert_eq!(fx.parents(&merge), vec![resolved.clone(), dest]);
+        assert_eq!(fx.parents(&resolved), vec![source]);
+        assert_eq!(fx.file(BRANCH, "same.txt"), "resolved\n");
+        assert_eq!(fx.tip("main"), later);
+        let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+        let candidate = compute_branch_merge_advance(
+            &fx.jj,
+            snapshot,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let local = install_branch_advance_local(&fx.jj, candidate).unwrap();
+        let next = local.head.clone();
+        assert!(export_installed_branch_advance(&fx.jj, local)
+            .export
+            .is_ok());
+        assert_eq!(fx.parents(&next), vec![merge, later]);
+        assert_eq!(fx.file(BRANCH, "same.txt"), "resolved\n");
     }
 
     fn message(dest: &str) -> String {
@@ -807,10 +776,11 @@ mod tests {
         assert_ne!(fx.tip(plain), plain_tip, "the plain sibling was rebased");
         assert_eq!(fx.parents(&fx.tip(plain)), vec![dest]);
         let since = fx.operations_since(&ops);
-        assert_eq!(
-            since.iter().filter(|op| op.contains("rebase")).count(),
-            1,
-            "exactly one rebase ran, the plain sibling's: {since:?}"
+        assert!(
+            since
+                .iter()
+                .all(|op| !op.contains("rebase") && !op.contains("abandon")),
+            "both paths install detached candidates without CLI rewrites: {since:?}"
         );
     }
 

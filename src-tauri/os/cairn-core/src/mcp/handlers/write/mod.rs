@@ -19,16 +19,21 @@ use self::types::{
 };
 use super::target::{target_family, TargetFamily};
 use crate::mcp::types::{ChangeMode, ChangePayload, McpCallbackRequest};
+use crate::orchestrator::base_advance::preparation::{
+    prepare_branch, PreparationPurpose, PreparationRequest, PreparedBranch, PREPARATION_ATTEMPTS,
+};
 use crate::orchestrator::Orchestrator;
 use crate::resources::mutations::{
-    blocking_append_kind, dispatch_resource_change, project_write_crossing_path,
+    blocking_append_kind, dispatch_resource_change_under_store, project_write_crossing_path,
     run_blocking_group, validate_blocking_group, PromotedMemoryRef,
 };
+use crate::storage::RowExt;
 use cairn_common::authorization::AuthorityRequest;
 use cairn_platform::stack::off_frame;
 
-/// The first item that addresses a node's `rebase` resource. Both of its
-/// actions (`replay`, `fast-forward-from-origin`) take the project store lock
+/// The first item that addresses a node's `rebase` resource. Every one of its
+/// actions (`replay`, `fast-forward-from-origin`, `dismiss-acceptance`) takes
+/// the project store lock
 /// inline, which a batch carrying file edits already holds for its whole
 /// logical transaction, and that lock is not reentrant.
 fn rebase_item_index(changes: &[crate::mcp::types::ChangeItem]) -> Option<usize> {
@@ -41,6 +46,26 @@ fn target_is_rebase(target: &str) -> bool {
     cairn_uri::parse_uri(target)
         .and_then(|parsed| cairn_uri::delegate_thread_descendant(parsed).ok())
         .is_some_and(|resource| matches!(resource, cairn_uri::CairnResource::NodeRebase { .. }))
+}
+
+/// The first item that patches a node artifact with a pull-request `action`
+/// (merge, close, refresh, publish). Each pushes, merges, or queries the
+/// remote, and takes the store lock or a branch reservation to do it, so it
+/// cannot run inside a file batch's store-lock hold. An artifact content edit
+/// is not one: its pull-request sync is deferred past the hold instead.
+fn pr_action_item_index(changes: &[crate::mcp::types::ChangeItem]) -> Option<usize> {
+    changes.iter().position(|item| {
+        item.mode == ChangeMode::Patch
+            && item
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.get("action").is_some())
+            && cairn_uri::parse_uri(&item.target)
+                .and_then(|parsed| cairn_uri::delegate_thread_descendant(parsed).ok())
+                .is_some_and(|resource| {
+                    matches!(resource, cairn_uri::CairnResource::NodeArtifact { .. })
+                })
+    })
 }
 
 /// [`target_is_rebase`] for a target as a transcript recorded it, which may still
@@ -287,6 +312,78 @@ pub mod test_pause {
 
     type Pause = (Arc<Notify>, Arc<Notify>);
     static PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> = LazyLock::new(Default::default);
+    static SEAL_PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> = LazyLock::new(Default::default);
+    static LOCK_PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> = LazyLock::new(Default::default);
+    static LOCKED_PREPARATIONS: LazyLock<Mutex<HashMap<String, usize>>> =
+        LazyLock::new(Default::default);
+
+    type Coordinates = Vec<(String, String, String)>;
+    static INTERPRETATIONS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Coordinates>>>>> =
+        LazyLock::new(Default::default);
+
+    /// Observe the immutable head/base pair at each file interpretation, not
+    /// merely the eventual success of a seal.
+    pub struct Interpretations {
+        tool_use_id: String,
+        entries: Arc<Mutex<Coordinates>>,
+    }
+
+    impl Interpretations {
+        pub fn coordinates(&self) -> Coordinates {
+            self.entries.lock().unwrap().clone()
+        }
+
+        pub fn locked_preparations(&self) -> usize {
+            LOCKED_PREPARATIONS
+                .lock()
+                .unwrap()
+                .get(&self.tool_use_id)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl Drop for Interpretations {
+        fn drop(&mut self) {
+            INTERPRETATIONS.lock().unwrap().remove(&self.tool_use_id);
+            LOCKED_PREPARATIONS
+                .lock()
+                .unwrap()
+                .remove(&self.tool_use_id);
+            LOCK_PAUSES.lock().unwrap().remove(&self.tool_use_id);
+        }
+    }
+
+    pub fn observe_interpretations(tool_use_id: &str) -> Interpretations {
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        LOCKED_PREPARATIONS
+            .lock()
+            .unwrap()
+            .insert(tool_use_id.to_string(), 0);
+        INTERPRETATIONS
+            .lock()
+            .unwrap()
+            .insert(tool_use_id.to_string(), entries.clone());
+        Interpretations {
+            tool_use_id: tool_use_id.to_string(),
+            entries,
+        }
+    }
+
+    pub(super) fn interpreting(
+        tool_use_id: Option<&str>,
+        head: &str,
+        base: &super::super::branch::PublicationBase,
+    ) {
+        let observer = tool_use_id.and_then(|id| INTERPRETATIONS.lock().unwrap().get(id).cloned());
+        if let Some(entries) = observer {
+            entries.lock().unwrap().push((
+                head.to_string(),
+                base.branch.clone(),
+                base.commit.clone(),
+            ));
+        }
+    }
 
     /// Park the next optimistic delivery of `tool_use_id` after its replay
     /// lookup. Returns `(reached, resume)`: `reached` is notified when it
@@ -300,15 +397,50 @@ pub mod test_pause {
         pause
     }
 
-    pub(super) async fn reached(tool_use_id: Option<&str>) {
-        let Some(tool_use_id) = tool_use_id else {
-            return;
-        };
-        let pause = PAUSES.lock().unwrap().remove(tool_use_id);
+    /// Park after file interpretation, immediately before acquiring the seal
+    /// lock. Preparation may itself need the store lock before this boundary.
+    pub fn before_seal(tool_use_id: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        SEAL_PAUSES
+            .lock()
+            .unwrap()
+            .insert(tool_use_id.to_string(), pause.clone());
+        pause
+    }
+
+    /// Park the locked attempt after preparation and before its writer guard.
+    pub fn before_locked_write(tool_use_id: &str) -> Pause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        LOCK_PAUSES
+            .lock()
+            .unwrap()
+            .insert(tool_use_id.to_string(), pause.clone());
+        pause
+    }
+
+    pub(super) async fn locking(tool_use_id: Option<&str>) {
+        if let Some(id) = tool_use_id {
+            if let Some(count) = LOCKED_PREPARATIONS.lock().unwrap().get_mut(id) {
+                *count += 1;
+            }
+        }
+        pause_at(&LOCK_PAUSES, tool_use_id).await;
+    }
+
+    async fn pause_at(pauses: &Mutex<HashMap<String, Pause>>, tool_use_id: Option<&str>) {
+        let pause = tool_use_id.and_then(|id| pauses.lock().unwrap().remove(id));
         if let Some((reached, resume)) = pause {
             reached.notify_one();
             resume.notified().await;
         }
+    }
+
+    pub(super) async fn reached(tool_use_id: Option<&str>) {
+        pause_at(&PAUSES, tool_use_id).await;
+    }
+
+    pub(super) async fn sealing(tool_use_id: Option<&str>) {
+        pause_at(&SEAL_PAUSES, tool_use_id).await;
     }
 }
 
@@ -353,7 +485,7 @@ async fn handle_write_under_barrier(
     let report = {
         let (drained, epoch) = (&mut *drained, &mut epoch);
         off_frame(move || {
-            handle_write_attempt(orch, request, drained, WriteLocking::Optimistic, epoch)
+            handle_write_attempt(orch, request, drained, WriteLocking::Optimistic, epoch, 0)
         })
     }
     .await;
@@ -391,8 +523,155 @@ async fn handle_write_under_barrier(
         return report;
     }
     let epoch = &mut epoch;
-    off_frame(move || handle_write_attempt(orch, request, drained, WriteLocking::Locked, epoch))
+    off_frame(move || handle_write_attempt(orch, request, drained, WriteLocking::Locked, epoch, 0))
         .await
+}
+
+struct PreparedWrite {
+    coordinate: PreparedBranch,
+    db: std::sync::Arc<crate::storage::LocalDb>,
+}
+
+impl PreparedWrite {
+    /// Owner publications may have extended the prepared head before this
+    /// writer acquired its guard. That extension still carries the prepared
+    /// base, but a replacement history is not permission to skip preparation.
+    async fn revalidate_locked(
+        &self,
+        guard: &crate::orchestrator::JjStoreGuard,
+    ) -> Result<(), crate::orchestrator::base_advance::preparation::PreparationRefusal> {
+        use crate::orchestrator::base_advance::preparation::PreparationRefusal;
+        let current =
+            cairn_vcs::resolve_coordinate(&self.coordinate.store, &self.coordinate.branch)
+                .await
+                .map_err(|error| PreparationRefusal::Unresolved {
+                    coordinate: self.coordinate.branch.clone(),
+                    reason: error.to_string(),
+                })?;
+        self.coordinate
+            .revalidate_for_publication(&self.db, guard, &current)
+            .await?;
+        if current == self.coordinate.head_after {
+            return Ok(());
+        }
+        let limit = std::time::Duration::from_secs(2);
+        let contained = tokio::time::timeout(limit, cairn_vcs::history::contains(
+            &self.coordinate.store, &self.coordinate.head_after, &current,
+        )).await
+            .map_err(|_| PreparationRefusal::Repository(
+                format!("The locked write's indexed ancestry proof timed out after {limit:?}; no file edits were interpreted.")
+            ))?
+            .map_err(|error| PreparationRefusal::Repository(error.to_string()))?;
+        if !contained {
+            return Err(PreparationRefusal::Moved {
+                what: format!(
+                    "the prepared head {} was replaced by non-descendant {current}",
+                    self.coordinate.head_after
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Resolve the declaration before reading a moving branch name. A branchless
+/// job writes directly to its integration target, not onto a second base.
+/// `None` means this exact delivery already published: its ledger row, not a
+/// fresh patch interpretation, owns the answer.
+async fn prepare_current_write(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    write_call: Option<&replay::WriteCall>,
+) -> Result<Option<PreparedWrite>, String> {
+    let (run, db) = super::run_context::lookup_run_routed(&orch.db, request).await?;
+    let (branch, declared) = db
+        .query_opt(
+            "SELECT branch, base_branch FROM jobs WHERE id = ?1 AND project_id = ?2",
+            (run.job_id.clone(), run.project_id.clone()),
+            |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the publication job is missing".to_string())?;
+    let own_branch = branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let branch = match branch
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| declared.filter(|name| !name.trim().is_empty()))
+    {
+        Some(branch) => branch.trim().to_string(),
+        None => {
+            crate::orchestrator::base_advance::load_project_default_branch(&db, &run.project_id)
+                .await?
+                .ok_or_else(|| "the publication project has no integration target".to_string())?
+        }
+    };
+    let mut preparation = PreparationRequest::new(
+        run.project_id,
+        branch,
+        Some(run.job_id),
+        PreparationPurpose::OwnerCommit,
+    );
+    preparation.write_replay = write_call
+        .cloned()
+        .map(|call| replay::WriteReplayProbe::new(orch.db.local.clone(), call));
+    let coordinate = match prepare_branch(orch, preparation).await {
+        Ok(coordinate) => coordinate,
+        Err(
+            crate::orchestrator::base_advance::preparation::PreparationRefusal::AlreadyPublished,
+        ) => {
+            // The same delivery sealed while this one waited to prepare.
+            // Its existing replay row owns the answer, not another advance.
+            return Ok(None);
+        }
+        // The job's own minted branch is gone: the same terminal refusal its
+        // reads give (`branch::map_own_coordinate_error`).
+        Err(crate::orchestrator::base_advance::preparation::PreparationRefusal::Absent {
+            coordinate,
+        }) if own_branch.as_deref() == Some(coordinate.as_str()) => {
+            return Err(super::branch::BranchRefResolutionError::OwnBranchLost {
+                branch: coordinate,
+            }
+            .to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(Some(PreparedWrite { coordinate, db }))
+}
+
+async fn reserve_write_branch(
+    orch: &Orchestrator,
+    prepared: Option<&PreparedWrite>,
+) -> Result<Option<crate::orchestrator::BranchReservation>, String> {
+    let Some(prepared) = prepared else {
+        return Ok(None);
+    };
+    orch.reserve_branches(
+        &prepared.coordinate.store,
+        &[prepared.coordinate.branch.as_str()],
+        "logical write publication",
+        crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+    )
+    .await
+    .map(Some)
+}
+
+fn preparation_failure(payload: &ChangePayload, error: String) -> String {
+    let (index, item) = payload
+        .changes
+        .iter()
+        .enumerate()
+        .find(|(_, item)| matches!(target_family(&item.target), Ok(TargetFamily::File)))
+        .expect("preparation belongs to a file write");
+    change_report_json(
+        Vec::new(),
+        vec![build_failure(index, item, error).failure],
+        None,
+        payload.atomic.unwrap_or(false),
+    )
 }
 
 /// One attempt at the write. An optimistic attempt that meets a moved head,
@@ -405,6 +684,7 @@ async fn handle_write_attempt(
     drained: &mut Vec<super::run::held::Drained>,
     locking: WriteLocking,
     epoch: &mut ReplayEpoch,
+    preparation_attempt: u32,
 ) -> String {
     // Authoritative validation gate, shared with cairn-cmd's pre-flight check so
     // the contract and error text are identical everywhere. Collects every
@@ -457,7 +737,14 @@ async fn handle_write_attempt(
             return deny_change(
                 &payload.changes,
                 index,
-                "Refusing cairn:~/rebase in a batch with file edits: its replay and fast-forward-from-origin actions take the project's version-control store lock, which this batch's file commit holds until it seals. Nothing in this batch was applied. Send the file edits with their commit_msg as one write, then the cairn:~/rebase patch as its own write.".to_string(),
+                "Refusing cairn:~/rebase in a batch with file edits: its replay, fast-forward-from-origin and dismiss-acceptance actions take the project's version-control store lock, which this batch's file commit holds until it seals. Nothing in this batch was applied. Send the file edits with their commit_msg as one write, then the cairn:~/rebase patch as its own write.".to_string(),
+            );
+        }
+        if let Some(index) = pr_action_item_index(&payload.changes) {
+            return deny_change(
+                &payload.changes,
+                index,
+                "Refusing a pull-request action (merge, close, refresh, publish) in a batch with file edits: it pushes or merges through the project's version-control store, whose lock this batch's file commit holds until it seals. Nothing in this batch was applied. Send the file edits with their commit_msg as one write, then the artifact patch carrying `action` as its own write.".to_string(),
             );
         }
     }
@@ -833,12 +1120,58 @@ async fn handle_write_attempt(
     if optimistic {
         *epoch = ReplayEpoch::Unchecked;
     }
+    // A recorded delivery owns its sealed answer, even if the branch or its
+    // declaration can no longer be prepared. It never interprets the patch again.
+    if has_file_targets {
+        if let Some(call) = write_call.as_ref() {
+            match replay::recorded_report_checked(&orch.db.local, call).await {
+                Ok(Some(_)) => {
+                    *epoch = ReplayEpoch::Checked;
+                    return replay::answer_file_replay(&orch.db.local, call).await;
+                }
+                Ok(None) => {}
+                Err(error) => return preparation_failure(&payload, error),
+            }
+        }
+    }
+    if has_file_targets && preparation_attempt >= PREPARATION_ATTEMPTS {
+        return preparation_failure(&payload, format!(
+            "Branch preparation exhausted {PREPARATION_ATTEMPTS} write attempts because its head or base kept changing; no file changes were published."
+        ));
+    }
+    let prepared_write = if has_file_targets {
+        match prepare_current_write(orch, request, write_call.as_ref()).await {
+            Ok(prepared) => prepared,
+            Err(error) => return preparation_failure(&payload, error),
+        }
+    } else {
+        None
+    };
+    if has_file_targets && prepared_write.is_none() {
+        *epoch = ReplayEpoch::Checked;
+        let Some(call) = write_call.as_ref() else {
+            return preparation_failure(
+                &payload,
+                "A published write has no replay identity.".to_string(),
+            );
+        };
+        return replay::answer_file_replay(&orch.db.local, call).await;
+    }
     let write_store = if has_file_targets {
         crate::mcp::vcs::resolve_store_lock(orch, request).await
     } else {
         None
     };
+    // Immutable preparation does not reserve the branch for the whole patch
+    // interpretation. Reserve only before taking the mutation guard.
+    let mut write_reservation = None;
     let mut write_store_guard = if has_file_targets && !optimistic {
+        #[cfg(feature = "test-utils")]
+        test_pause::locking(request.tool_use_id.as_deref()).await;
+        write_reservation = match reserve_write_branch(orch, prepared_write.as_ref()).await {
+            Ok(reservation) => reservation,
+            Err(error) => return preparation_failure(&payload, error),
+        };
         let store = write_store.clone();
         match crate::mcp::vcs::acquire_store_lock(
             orch,
@@ -887,37 +1220,43 @@ async fn handle_write_attempt(
     // while the first is still publishing.
     if has_file_targets {
         if let Some(call) = write_call.as_ref() {
-            if replay::recorded_report(&orch.db.local, call)
-                .await
-                .is_some()
-            {
+            let recorded = match replay::recorded_report_checked(&orch.db.local, call).await {
+                Ok(recorded) => recorded,
+                Err(error) => return preparation_failure(&payload, error),
+            };
+            if recorded.is_some() {
                 // The row itself now owns completion. Release the repository-wide
                 // lock before waiting on or resuming remote work for this call.
                 drop(write_store_guard);
+                drop(write_reservation);
                 *epoch = ReplayEpoch::Checked;
-                match replay::await_file_replay_or_takeover(&orch.db.local, call).await {
-                    replay::FileReplayClaim::Replayed(report) => {
-                        return replay::mark_as_replay(&report);
-                    }
-                    replay::FileReplayClaim::TakenOver { owner, report } => {
-                        // An ordinary write finalizes its row as soon as the commit is
-                        // sealed, so a pending row is what an interrupted delivery left
-                        // behind. Its sealed report is the answer.
-                        if replay::finalize_owned_report(&orch.db.local, call, &owner, &report)
-                            .await
-                        {
-                            return replay::mark_as_replay(&report);
-                        }
-                        return "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string();
-                    }
-                    replay::FileReplayClaim::Stalled => {
-                        return "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string();
-                    }
-                }
+                return replay::answer_file_replay(&orch.db.local, call).await;
             }
         }
     }
 
+    if let (Some(prepared), Some(guard)) = (prepared_write.as_ref(), write_store_guard.as_ref()) {
+        if let Err(error) = prepared.revalidate_locked(guard).await {
+            drop(write_store_guard);
+            drop(write_reservation);
+            *epoch = ReplayEpoch::Checked;
+            if matches!(
+                error,
+                crate::orchestrator::base_advance::preparation::PreparationRefusal::Moved { .. }
+            ) {
+                return Box::pin(handle_write_attempt(
+                    orch,
+                    request,
+                    drained,
+                    WriteLocking::Locked,
+                    epoch,
+                    preparation_attempt + 1,
+                ))
+                .await;
+            }
+            return preparation_failure(&payload, error.to_string());
+        }
+    }
     #[cfg(feature = "test-utils")]
     if optimistic {
         test_pause::reached(request.tool_use_id.as_deref()).await;
@@ -988,6 +1327,7 @@ async fn handle_write_attempt(
                     drained,
                     WriteLocking::Locked,
                     epoch,
+                    preparation_attempt,
                 ))
                 .await;
             }
@@ -995,50 +1335,129 @@ async fn handle_write_attempt(
     }
     if !optimistic {
         if let Some(resolution) = logical_resolution.as_mut() {
-            *drained = super::run::held::drain_held_publications(
+            let (Some(prepared), Some(reservation), Some(guard)) = (
+                prepared_write.as_ref(),
+                write_reservation.as_ref(),
+                write_store_guard.as_ref(),
+            ) else {
+                return preparation_failure(
+                    &payload,
+                    "Publishing held work requires the prepared coordinate and its store guard."
+                        .to_string(),
+                );
+            };
+            match super::run::held::drain_held_publications(
                 orch,
-                &resolution.project_id,
-                &resolution.rev,
-                store_trace.as_ref(),
+                &prepared.coordinate,
+                &prepared.db,
+                reservation,
+                guard,
+                &resolution.commit_id,
+                crate::orchestrator::BatchAdmission::None,
             )
-            .await;
-            // The write's expected-head check must see the head the drain
-            // left, or it would refuse its own branch as moved.
-            if super::run::held::any_landed(drained) {
-                match cairn_vcs::resolve_coordinate(&resolution.repository_path, &resolution.rev)
-                    .await
-                {
-                    Ok(head) => resolution.commit_id = head,
-                    Err(error) => {
-                        return serde_json::to_string(&empty_change_report(
-                            Vec::new(),
-                            vec![ChangeFailure {
-                                index: 0,
-                                target: payload
-                                    .changes
-                                    .first()
-                                    .map(|change| change.target.clone())
-                                    .unwrap_or_default(),
-                                mode: payload
-                                    .changes
-                                    .first()
-                                    .map(|change| mode_name(change.mode))
-                                    .unwrap_or("patch")
-                                    .to_string(),
-                                kind: "file".to_string(),
-                                error: format!(
-                                    "Re-resolve the logical head after publishing held commits: {error}"
-                                ),
-                            }],
-                            None,
-                            payload.atomic.unwrap_or(false),
-                            false,
+            .await
+            {
+                Ok(drain) => {
+                    drained.extend(drain.drained);
+                    resolution.commit_id = drain.head;
+                }
+                Err(error) => {
+                    drop(write_store_guard);
+                    drop(write_reservation);
+                    *epoch = ReplayEpoch::Checked;
+                    if matches!(
+                        error,
+                        crate::orchestrator::base_advance::preparation::PreparationRefusal::Moved { .. }
+                    ) {
+                        return Box::pin(handle_write_attempt(
+                            orch,
+                            request,
+                            drained,
+                            WriteLocking::Locked,
+                            epoch,
+                            preparation_attempt + 1,
                         ))
-                        .unwrap_or_else(|serialize_error| serialize_error.to_string());
+                        .await;
                     }
+                    return preparation_failure(&payload, error.to_string());
                 }
             }
         }
+    }
+    let publication_base = match logical_resolution.as_ref() {
+        Some(_) if prepared_write.is_some() => Some(super::branch::PublicationBase::from_prepared(
+            &prepared_write.as_ref().expect("prepared write").coordinate,
+        )),
+        Some(resolution) => {
+            match super::branch::capture_publication_base(orch, request, resolution).await {
+                Ok(base) => Some(base),
+                Err(error) => {
+                    let (index, item) = payload
+                        .changes
+                        .iter()
+                        .enumerate()
+                        .find(|(_, item)| {
+                            matches!(target_family(&item.target), Ok(TargetFamily::File))
+                        })
+                        .expect("a logical resolution belongs to a file write");
+                    let failure = build_failure(index, item, error).failure;
+                    return change_report_json(
+                        Vec::new(),
+                        vec![failure],
+                        None,
+                        payload.atomic.unwrap_or(false),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    if let (Some(prepared), Some(resolution), Some(base)) = (
+        prepared_write.as_ref(),
+        logical_resolution.as_ref(),
+        publication_base.as_ref(),
+    ) {
+        let coordinate_matches = prepared.coordinate.branch == resolution.rev
+            && prepared.coordinate.relationship.base_branch == base.branch
+            && prepared.coordinate.base_commit == base.commit;
+        let coherent = if !coordinate_matches {
+            false
+        } else if let Some(guard) = write_store_guard.as_ref() {
+            match prepared
+                .coordinate
+                .revalidate_for_publication(&prepared.db, guard, &resolution.commit_id)
+                .await
+            {
+                Ok(()) => true,
+                Err(
+                    crate::orchestrator::base_advance::preparation::PreparationRefusal::Moved {
+                        ..
+                    },
+                ) => false,
+                Err(error) => return preparation_failure(&payload, error.to_string()),
+            }
+        } else {
+            prepared.coordinate.head_after == resolution.commit_id
+        };
+        if !coherent {
+            drop(write_store_guard);
+            drop(write_reservation);
+            *epoch = ReplayEpoch::Checked;
+            return Box::pin(handle_write_attempt(
+                orch,
+                request,
+                drained,
+                WriteLocking::Locked,
+                epoch,
+                preparation_attempt + 1,
+            ))
+            .await;
+        }
+    }
+    #[cfg(feature = "test-utils")]
+    if let (Some(resolution), Some(base)) = (logical_resolution.as_ref(), publication_base.as_ref())
+    {
+        test_pause::interpreting(request.tool_use_id.as_deref(), &resolution.commit_id, base);
     }
     let mut logical_snapshot = std::collections::HashMap::new();
     if revert_commit.is_none() {
@@ -1234,6 +1653,14 @@ async fn handle_write_attempt(
     let mut logical_mutations = Vec::new();
     let mut first_file_change: Option<IndexedChange<'_>> = None;
     let mut promoted_memories: Vec<(usize, String, String, PromotedMemoryRef)> = Vec::new();
+    // create-pr artifacts stored under this batch's store guard; their pull
+    // requests are synced in completion, after the guard is released.
+    let mut deferred_pr_syncs: Vec<(
+        usize,
+        String,
+        String,
+        crate::pr_data::actions::DeferredPrSync,
+    )> = Vec::new();
     let mut index = 0;
 
     while index < payload.changes.len() {
@@ -1437,8 +1864,19 @@ async fn handle_write_attempt(
                 }
                 progress.begin(index, &applied, &failures);
             }
-            let dispatched =
-                off_frame(|| dispatch_resource_change(orch, request, index, item, false)).await;
+            // A batch with file targets holds its store guard through here; a
+            // resource item on that store runs under it.
+            let dispatched = off_frame(|| {
+                dispatch_resource_change_under_store(
+                    orch,
+                    request,
+                    index,
+                    item,
+                    false,
+                    write_store_guard.as_ref(),
+                )
+            })
+            .await;
             #[cfg(feature = "test-utils")]
             if let Some(call) = write_call.as_ref().filter(|_| resource_progress.is_some()) {
                 replay::hold_resource_item(call, index, replay::ItemPhase::AfterDispatch).await;
@@ -1451,6 +1889,14 @@ async fn handle_write_attempt(
                             change.target.clone(),
                             change.mode.clone(),
                             promoted,
+                        ));
+                    }
+                    if let Some(deferral) = change.deferred_pr_sync.clone() {
+                        deferred_pr_syncs.push((
+                            change.index,
+                            change.target.clone(),
+                            change.mode.clone(),
+                            deferral,
                         ));
                     }
                     applied.push(change.into());
@@ -1576,6 +2022,12 @@ async fn handle_write_attempt(
     let mut export = Ok(());
     let mut ordinary_ledger_claim = replay::LedgerClaim::NotClaimed;
     if optimistic && first_file_change.is_some() {
+        #[cfg(feature = "test-utils")]
+        test_pause::sealing(request.tool_use_id.as_deref()).await;
+        write_reservation = match reserve_write_branch(orch, prepared_write.as_ref()).await {
+            Ok(reservation) => reservation,
+            Err(error) => return preparation_failure(&payload, error),
+        };
         let guard = match crate::mcp::vcs::acquire_store_lock(
             orch,
             write_store.as_deref(),
@@ -1627,17 +2079,41 @@ async fn handle_write_attempt(
         let held =
             super::run::held::held_rows(&orch.db.local, &resolution.project_id, &resolution.rev)
                 .await;
+        let base = match prepared_write.as_ref() {
+            Some(prepared) => Ok(super::branch::PublicationBase::from_prepared(
+                &prepared.coordinate,
+            )),
+            None => super::branch::capture_publication_base(orch, request, resolution).await,
+        };
+        let prepared_unchanged = match (prepared_write.as_ref(), guard.as_ref()) {
+            (Some(prepared), Some(guard)) => {
+                match prepared.coordinate.revalidate(&prepared.db, guard).await {
+                    Ok(()) => true,
+                    Err(
+                        crate::orchestrator::base_advance::preparation::PreparationRefusal::Moved {
+                            ..
+                        },
+                    ) => false,
+                    Err(error) => return preparation_failure(&payload, error.to_string()),
+                }
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
         let unchanged = !replayed
+            && prepared_unchanged
             && head.as_deref() == Some(resolution.commit_id.as_str())
+            && base.as_ref().ok() == publication_base.as_ref()
             && held.is_ok_and(|rows| rows.is_empty());
         if !unchanged {
             log::info!(
-                "logical write on `{}`: the head, held work, or replay ledger changed after \
+                "logical write on `{}`: the head, base, held work, or replay ledger changed after \
                  preparation (prepared on {}, now {head:?}); writing again under the store lock",
                 resolution.rev,
                 resolution.commit_id
             );
             drop(guard);
+            drop(write_reservation);
             *epoch = ReplayEpoch::Checked;
             return Box::pin(handle_write_attempt(
                 orch,
@@ -1645,6 +2121,7 @@ async fn handle_write_attempt(
                 drained,
                 WriteLocking::Locked,
                 epoch,
+                preparation_attempt + 1,
             ))
             .await;
         }
@@ -1667,6 +2144,12 @@ async fn handle_write_attempt(
             logical_resolution
                 .as_ref()
                 .expect("file writes require a resolved logical head"),
+            publication_base
+                .as_ref()
+                .expect("file writes require a resolved base"),
+            prepared_write.as_ref(),
+            write_reservation.as_ref(),
+            write_store_guard.as_ref(),
             match revert_commit.as_ref() {
                 Some(commit) => crate::jj::ProposedPublication::Revert(commit.clone()),
                 None => crate::jj::ProposedPublication::Mutations(logical_mutations.clone()),
@@ -1755,6 +2238,7 @@ async fn handle_write_attempt(
     // origin, cloud, GitHub, artifact, and check work must not serialize every
     // repository writer behind this call.
     drop(write_store_guard);
+    drop(write_reservation);
     // Boxed so a resource-only write does not carry the whole completion future
     // on its poll stack.
     let completion = Box::pin(async {
@@ -1788,6 +2272,18 @@ async fn handle_write_attempt(
                 });
             }
         };
+        // The branch the origin push below publishes, when it runs: a deferred
+        // create-pr sync on that branch does not push it a second time.
+        let pushed_branch = matches!(
+            publication_requirement,
+            crate::merge_requests::queries::PublicationRequirement::RequiredForOpenPr
+        )
+        .then(|| {
+            logical_resolution
+                .as_ref()
+                .map(|resolution| resolution.rev.clone())
+        })
+        .flatten();
         // The publication ladder past the store transaction: the export already ran
         // under the store lock inside it, and the origin push runs here because it is
         // network I/O that must not hold the lock. Both legs report the same way,
@@ -1845,6 +2341,24 @@ async fn handle_write_attempt(
                 kind: "publication".to_string(),
                 error: error.clone(),
             });
+            // The branch these pull requests present did not reach origin, so
+            // none of them is synced, and none is pushed again here.
+            for (index, target, mode, deferral) in &deferred_pr_syncs {
+                settle_deferred_pr_sync(&mut applied, *index, "pull request not synced");
+                failures.push(ChangeFailure {
+                    index: *index,
+                    target: target.clone(),
+                    mode: mode.clone(),
+                    kind: "resource".to_string(),
+                    error: format!(
+                        "The create-pr artifact (version {}) was stored, but its pull request \
+                         was not synced: this write's branch push failed first (see the \
+                         publication failure). Patch the artifact with action:\"publish\" once \
+                         the push can succeed.",
+                        deferral.version
+                    ),
+                });
+            }
             commit = Some(CommitReport {
                 status: "sealed locally; unpublished".to_string(),
                 sha: sealed_sha,
@@ -1861,6 +2375,45 @@ async fn handle_write_attempt(
                 replay::finalize_report(&orch.db.local, call, &report).await;
             }
             return report;
+        }
+        // No store guard or branch reservation is held from here on.
+        for (index, target, mode, deferral) in &deferred_pr_syncs {
+            use crate::pr_data::actions::DeferredPrSyncOutcome;
+            match crate::pr_data::actions::complete_deferred_pr_sync(
+                orch,
+                deferral,
+                pushed_branch.as_deref(),
+            )
+            .await
+            {
+                Ok(DeferredPrSyncOutcome::Synced) => settle_deferred_pr_sync(
+                    &mut applied,
+                    *index,
+                    "pull request synced after this write released its store lock",
+                ),
+                Ok(DeferredPrSyncOutcome::NoPullRequest) => {
+                    settle_deferred_pr_sync(&mut applied, *index, "no pull request to sync yet")
+                }
+                Ok(DeferredPrSyncOutcome::Superseded { by_version }) => settle_deferred_pr_sync(
+                    &mut applied,
+                    *index,
+                    &format!("pull request sync left to the newer version {by_version}"),
+                ),
+                Err(error) => {
+                    settle_deferred_pr_sync(&mut applied, *index, "pull request not synced");
+                    failures.push(ChangeFailure {
+                        index: *index,
+                        target: target.clone(),
+                        mode: mode.clone(),
+                        kind: "resource".to_string(),
+                        error: format!(
+                            "The create-pr artifact (version {}) was stored, but its pull \
+                             request was not synced: {error}",
+                            deferral.version
+                        ),
+                    });
+                }
+            }
         }
         if let Some(ref publication) = post_seal_publication {
             let _phase = store_trace
@@ -2129,6 +2682,15 @@ async fn handle_write_attempt(
     completion.await
 }
 
+/// Replace a deferred create-pr item's pending marker with what its sync did.
+fn settle_deferred_pr_sync(applied: &mut [AppliedChange], index: usize, outcome: &str) {
+    if let Some(change) = applied.iter_mut().find(|change| change.index == index) {
+        change.summary = change
+            .summary
+            .replace(crate::pr_data::actions::DEFERRED_PR_SYNC_PENDING, outcome);
+    }
+}
+
 /// What a fenced `write` may target by absolute path without a prompt: what a
 /// shell write under `run` from the same directory may write. That is the
 /// static carve-outs, plus `residence` when it is a job's own directory under
@@ -2144,6 +2706,47 @@ fn in_sandbox_write_roots(residence: &std::path::Path) -> Vec<std::path::PathBuf
         roots.push(residence.to_path_buf());
     }
     roots
+}
+
+#[cfg(test)]
+mod pr_action_item_tests {
+    use super::pr_action_item_index;
+    use crate::mcp::types::{ChangeItem, ChangeMode};
+    use serde_json::json;
+
+    fn item(target: &str, mode: ChangeMode, payload: serde_json::Value) -> ChangeItem {
+        ChangeItem {
+            target: target.to_string(),
+            mode,
+            payload: Some(payload),
+        }
+    }
+
+    #[test]
+    fn only_an_artifact_patch_carrying_action_is_a_pull_request_action() {
+        let artifact = "cairn://p/chg/1/1/builder/create-pr";
+        let changes = [
+            item(
+                "file:a.txt",
+                ChangeMode::Patch,
+                json!({"old_string": "a", "new_string": "b"}),
+            ),
+            item(
+                artifact,
+                ChangeMode::Create,
+                json!({"title": "T", "body": "B"}),
+            ),
+            item(artifact, ChangeMode::Patch, json!({"title": "T2"})),
+            item(
+                "cairn://p/chg/1/1/builder/rebase",
+                ChangeMode::Patch,
+                json!({"action": "replay"}),
+            ),
+            item(artifact, ChangeMode::Patch, json!({"action": "publish"})),
+        ];
+        assert_eq!(pr_action_item_index(&changes), Some(4));
+        assert_eq!(pr_action_item_index(&changes[..4]), None);
+    }
 }
 
 #[cfg(test)]
@@ -3137,14 +3740,22 @@ mod change_preview_tests {
     /// preparing outside the lock safe (I3, I5).
     #[test]
     fn logical_write_lock_precedes_head_resolution_and_publication() {
-        let source = include_str!("mod.rs");
+        let source = include_str!("mod.rs")
+            .split_once("async fn handle_write_attempt(")
+            .unwrap()
+            .1
+            .split_once("\nfn settle_deferred_pr_sync(")
+            .unwrap()
+            .0;
+        let reserve = source.find("reserve_write_branch(").unwrap();
         let lock = source.find("\"logical write transaction\"").unwrap();
+        assert!(source.find("prepare_current_write(").unwrap() < reserve && reserve < lock);
         let resolve = source[lock..]
             .find("resolve_current_for_read")
             .map(|offset| lock + offset)
             .unwrap();
         let prepare = source[resolve..]
-            .find("apply_logical_file_batch")
+            .find("apply_file_changes(")
             .map(|offset| resolve + offset)
             .unwrap();
         let publish = source[prepare..]
@@ -3157,6 +3768,10 @@ mod change_preview_tests {
             .find("\"logical write transaction\"")
             .map(|offset| lock + 1 + offset)
             .expect("an optimistic write takes the lock to seal");
+        let late_reserve = source[prepare..late_lock]
+            .find("reserve_write_branch(")
+            .expect("the optimistic seal reserves before taking its store guard");
+        assert!(late_reserve > 0);
         let seal = source[late_lock..]
             .find("finalize_file_commit(")
             .map(|offset| late_lock + offset)
@@ -3167,7 +3782,22 @@ mod change_preview_tests {
         let head_recheck = source[late_lock..seal]
             .find("cairn_vcs::resolve_coordinate")
             .expect("the head is re-read under the sealing lock");
-        assert!(replay_recheck > 0 && head_recheck > 0);
+        let base_recheck = source[late_lock..seal]
+            .find("capture_publication_base")
+            .expect("the base and its declaration are re-read under the sealing lock");
+        let base_capture = source[resolve..prepare]
+            .find("capture_publication_base")
+            .expect("the publication base is captured before interpreting patches");
+        assert!(replay_recheck > 0 && head_recheck > 0 && base_recheck > 0 && base_capture > 0);
+        let finalizer = include_str!("file_mutations.rs");
+        let finalizer = finalizer
+            .split_once("pub(super) async fn finalize_file_commit(")
+            .unwrap()
+            .1;
+        let publication = finalizer.find("publish_logical_head_exported").unwrap();
+        assert!(finalizer.find("reservation.covers(").unwrap() < publication);
+        assert!(finalizer.find("revalidate_for_publication").unwrap() < publication);
+        assert!(finalizer.find("branch_write_permit").unwrap() < publication);
         assert!(!source.contains(&["recover_stale", "file_commit"].concat()));
         assert!(!source.contains(&["update", "_stale"].concat()));
     }

@@ -1,10 +1,14 @@
 //! Accept native rebuild publication without erasing newer replay obligations.
-use crate::orchestrator::base_advance::{consume_held_replay_source_conn, HeldReplaySource};
+//!
+//! A descendant held behind this branch's conflict session has nothing
+//! recorded here to retire: the hold is read from the session itself
+//! (`preparation::held_by_parent_conflict`), so superseding the session is
+//! what releases every descendant.
 use crate::storage::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 use cairn_db::turso::params;
 use std::path::Path;
 
-// Include the session, request and held-source coordinates, not merely a
+// Include the session and request coordinates, not merely a
 // second-resolution timestamp: a fresh conflict may replace a row in one second.
 const GENERATION: &str = "json_array(i.updated_at, i.diagnostic_version,
     i.conflict_condition, i.base_commit, i.ours_commit, i.theirs_commit,
@@ -12,8 +16,7 @@ const GENERATION: &str = "json_array(i.updated_at, i.diagnostic_version,
     i.resolution_state, i.resolution_basis_json, i.marker_state, i.marker_diagnostic,
     i.replay_request_id, i.replay_resolution, i.replay_drop_incoming_reason,
     i.replay_requested_at, i.replay_requested_tip, i.replay_requested_destination,
-    i.replay_served_at, i.replay_result_json,
-    i.held_replay_source_cut, i.held_replay_source_tip)";
+    i.replay_served_at, i.replay_result_json)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Item {
@@ -22,8 +25,6 @@ struct Item {
     base_branch: String,
     generation: String,
     request_destination: Option<String>,
-    held_cut: Option<String>,
-    held_tip: Option<String>,
     session_tip: Option<String>,
     resolution_state: Option<String>,
     request_tip: Option<String>,
@@ -33,7 +34,6 @@ struct Item {
 #[derive(Clone)]
 struct Retirement {
     item: Item,
-    held: bool,
     session: bool,
     request: bool,
     state: &'static str,
@@ -45,12 +45,11 @@ async fn items(conn: &TrackedConnection, store: &str, branch: &str) -> DbResult<
         .query(
             &format!(
                 "SELECT i.intent_id, n.destination_commit, n.target_branch, {GENERATION},
-            i.replay_requested_destination, i.held_replay_source_cut, i.held_replay_source_tip,
-            i.ours_commit, i.resolution_state, i.replay_requested_tip,
+            i.replay_requested_destination, i.ours_commit, i.resolution_state, i.replay_requested_tip,
             (i.replay_request_id IS NOT NULL AND i.replay_served_at IS NULL)
          FROM jj_reconcile_items i JOIN jj_reconcile_intents n ON n.id=i.intent_id
          WHERE n.store_path=?1 AND i.bookmark=?2
-           AND (i.resolution_state='open' OR i.held_replay_source_tip IS NOT NULL
+           AND (i.resolution_state='open'
                 OR (i.replay_request_id IS NOT NULL AND i.replay_served_at IS NULL))
          ORDER BY i.intent_id"
             ),
@@ -65,12 +64,10 @@ async fn items(conn: &TrackedConnection, store: &str, branch: &str) -> DbResult<
             base_branch: row.text(2)?,
             generation: row.text(3)?,
             request_destination: row.opt_text(4)?,
-            held_cut: row.opt_text(5)?,
-            held_tip: row.opt_text(6)?,
-            session_tip: row.opt_text(7)?,
-            resolution_state: row.opt_text(8)?,
-            request_tip: row.opt_text(9)?,
-            request_pending: row.i64(10)? != 0,
+            session_tip: row.opt_text(5)?,
+            resolution_state: row.opt_text(6)?,
+            request_tip: row.opt_text(7)?,
+            request_pending: row.i64(8)? != 0,
         });
     }
     Ok(result)
@@ -198,8 +195,6 @@ impl Snapshot {
         for item in self.items {
             let same_base = item.base_branch == base_branch;
             let destination_covered = same_base && carries(&item.destination);
-            let held = item.held_tip.is_some()
-                && (destination_covered || original(item.held_tip.as_deref()));
             let open = item.resolution_state.as_deref() == Some("open");
             let session = open && (destination_covered || original(item.session_tip.as_deref()));
             let request = item.request_pending
@@ -210,16 +205,13 @@ impl Snapshot {
                             .unwrap_or(&item.destination),
                     ))
                     || original(item.request_tip.as_deref()));
-            let complete = (item.held_tip.is_none() || held)
-                && (!open || session)
-                && (!item.request_pending || request);
+            let complete = (!open || session) && (!item.request_pending || request);
             if !complete {
                 retained += 1;
             }
-            if held || session || request {
+            if session || request {
                 covered.push(Retirement {
                     item,
-                    held,
                     session,
                     request,
                     complete,
@@ -246,15 +238,6 @@ impl Snapshot {
                 }
                 for retirement in &covered {
                     let item = &retirement.item;
-                    if let Some(tip) = item.held_tip.as_ref().filter(|_| retirement.held) {
-                        let expected = HeldReplaySource {
-                            intent_id: item.intent.clone(), destination: item.destination.clone(),
-                            base_branch: item.base_branch.clone(), cut: item.held_cut.clone(), tip: tip.clone(),
-                        };
-                        if consume_held_replay_source_conn(conn, Path::new(&path), &branch, &expected).await? != 1 {
-                            return Err(DbError::Row("rebuild held-source generation changed".into()));
-                        }
-                    }
                     // Supersession withdraws only captured old authority, never a
                     // descendant's receipt or a request installed after capture.
                     conn.execute(

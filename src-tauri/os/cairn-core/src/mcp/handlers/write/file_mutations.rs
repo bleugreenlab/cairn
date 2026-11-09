@@ -1731,6 +1731,10 @@ pub(super) async fn finalize_file_commit(
     first_change: &IndexedChange<'_>,
     promoted_memory_uris: &[String],
     logical_resolution: &super::super::branch::BranchResolution,
+    publication_base: &super::super::branch::PublicationBase,
+    prepared: Option<&super::PreparedWrite>,
+    reservation: Option<&crate::orchestrator::BranchReservation>,
+    guard: Option<&crate::orchestrator::JjStoreGuard>,
     proposed: crate::jj::ProposedPublication,
     marker_escape: Option<&str>,
 ) -> IndexedResult<CommitOutcome> {
@@ -1864,6 +1868,62 @@ pub(super) async fn finalize_file_commit(
             description: final_commit_msg,
         }
     };
+    let reservation = reservation
+        .filter(|reservation| {
+            reservation.covers(&logical_resolution.repository_path, &logical_resolution.rev)
+        })
+        .ok_or_else(|| {
+            build_failure(
+                first_change.index,
+                first_change.item,
+                "The write does not hold its branch publication reservation; no commit was published."
+                    .to_string(),
+            )
+        })?;
+    if let Some(prepared) = prepared {
+        let guard = guard.ok_or_else(|| {
+            build_failure(
+                first_change.index,
+                first_change.item,
+                "A prepared write requires its store writer guard; no commit was published."
+                    .to_string(),
+            )
+        })?;
+        let _admission = guard
+            .branch_write_permit(
+                &prepared.db,
+                reservation,
+                &prepared.coordinate.project_id,
+                &prepared.coordinate.branch,
+                crate::orchestrator::BatchAdmission::None,
+            )
+            .await
+            .map_err(|error| {
+                build_failure(first_change.index, first_change.item, error.to_string())
+            })?;
+        prepared
+            .coordinate
+            .revalidate_for_publication(&prepared.db, guard, &logical_resolution.commit_id)
+            .await
+            .map_err(|error| {
+                build_failure(first_change.index, first_change.item, error.to_string())
+            })?;
+    } else {
+        let current_base =
+            super::super::branch::capture_publication_base(orch, request, logical_resolution)
+                .await
+                .map_err(|error| build_failure(first_change.index, first_change.item, error))?;
+        if &current_base != publication_base {
+            return Err(build_failure(
+                first_change.index,
+                first_change.item,
+                format!(
+                    "The publication base changed from {}@{} to {}@{} after the file edits were interpreted; no commit was published. Retry the write against the current base.",
+                    publication_base.branch, publication_base.commit, current_base.branch, current_base.commit,
+                ),
+            ));
+        }
+    }
     // Asked here, under the store lock this finalizer runs inside, and not when
     // the write was prepared: the issue can resolve while a prepared write waits
     // for the lock, and the seal below is the step that cannot be taken back.

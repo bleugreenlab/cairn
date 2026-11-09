@@ -1350,7 +1350,13 @@ where
     P: FnOnce(&str) -> Result<ParentCoordinate, String>,
     M: FnOnce() -> Result<String, String>,
 {
-    let _store_guard = run_db_borrowed(async {
+    // Routed before the store lock: the journal the import is bracketed against.
+    let db = run_db_borrowed(async {
+        crate::execution::routing::owning_db_for_project(&orch.db, &job.project_id)
+            .await
+            .map_err(|error| error.to_string())
+    })?;
+    let store_guard = run_db_borrowed(async {
         Ok(orch
             .acquire_jj_store_lock(
                 store,
@@ -1365,7 +1371,40 @@ where
     }
     let scoped = jj.preserving_import_bookmarks(preserved);
     let jj = &scoped;
-    crate::jj::ensure_project_store(jj, store, repo_path)?;
+    let journal = db.clone();
+    let (import_jj, import_store, import_repo) =
+        (jj.clone(), store.to_path_buf(), repo_path.to_path_buf());
+    let (store_guard, ()) = run_db_borrowed(orch.bracket_store_mutation(
+        store_guard,
+        None,
+        db,
+        &job.project_id,
+        move || crate::jj::ensure_project_store(&import_jj, &import_store, &import_repo),
+    ))?;
+
+    // Every bookmark this preparation may create is admitted first, under the
+    // same guard: a name the acceptance journal still owes (a deleted branch
+    // re-created) is refused rather than inheriting its rows.
+    let admit_new = |name: &str| -> Result<(), String> {
+        if behavior.mints_branch && crate::jj::bookmark_commit(jj, store, name).is_none() {
+            run_db_borrowed(async {
+                store_guard
+                    .branch_create_permit(&journal, &job.project_id, name)
+                    .await
+                    .map(|_| ())
+                    .map_err(String::from)
+            })?;
+        }
+        Ok(())
+    };
+    if let Some(existing) = job.branch.as_deref() {
+        admit_new(existing)?;
+    }
+    let mint_name = move || -> Result<String, String> {
+        let name = mint_name()?;
+        admit_new(&name)?;
+        Ok(name)
+    };
 
     let base_ref = job.base_branch.as_deref().unwrap_or("HEAD");
     refuse_fenced_coordinate(orch, store, base_ref)?;
@@ -1385,15 +1424,6 @@ where
         refuse_fenced_coordinate(orch, store, &adopted.branch)?;
     }
 
-    if let Some(adopt_head) = continuation.adopt_head() {
-        run_db_borrowed(async {
-            let db = crate::execution::routing::owning_db_for_job(&orch.db, &job.id)
-                .await
-                .map_err(|error| error.to_string())?;
-            crate::orchestrator::base_advance::refuse_held_continuity(&db, jj, store, adopt_head)
-                .await
-        })?;
-    }
     let (branch, base_commit) = select_job_coordinate(
         behavior,
         CoordinateRequest {
@@ -1437,14 +1467,19 @@ where
 /// moved. Unlocked, an import made inside another writer's rollback window is
 /// rewound by that rollback, and the export that follows the restore then
 /// deletes or rewinds the very git refs the import had just brought in.
+///
+/// `db` is project `project_id`'s owning database, whose acceptance journal the
+/// import is bracketed against (see [`Orchestrator::bracket_store_mutation`]).
 pub(crate) fn import_project_store_locked(
     orch: &Orchestrator,
+    db: &std::sync::Arc<crate::storage::LocalDb>,
+    project_id: &str,
     jj: &crate::jj::JjEnv,
     store: &Path,
     repo_path: &Path,
     operation: &str,
 ) -> Result<(), String> {
-    let _store_guard = run_db_borrowed(async {
+    let store_guard = run_db_borrowed(async {
         Ok(orch
             .acquire_jj_store_lock(
                 store,
@@ -1458,7 +1493,19 @@ pub(crate) fn import_project_store_locked(
         store,
         &format!("Importing the project store ({operation})"),
     )?;
-    crate::jj::ensure_project_store(&jj.preserving_import_bookmarks(preserved), store, repo_path)
+    let (import_jj, import_store, import_repo) = (
+        jj.preserving_import_bookmarks(preserved),
+        store.to_path_buf(),
+        repo_path.to_path_buf(),
+    );
+    run_db_borrowed(orch.bracket_store_mutation(
+        store_guard,
+        None,
+        db.clone(),
+        project_id,
+        move || crate::jj::ensure_project_store(&import_jj, &import_store, &import_repo),
+    ))
+    .map(|(_guard, ())| ())
 }
 
 fn refuse_fenced_coordinate(orch: &Orchestrator, store: &Path, branch: &str) -> Result<(), String> {
@@ -11150,6 +11197,143 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(jj)]
+    async fn a_bulk_import_and_mint_refuse_before_mutating_a_reserved_landing_source() {
+        let Some(fx) = successor_fixture() else {
+            return;
+        };
+        let orch = test_orchestrator(migrated_test_db("reserved-import.db").await);
+        let repo = fx.project.path().to_string_lossy().to_string();
+        let job = seed_successor(&orch, &repo, Continuity::Clean, false).await;
+        let reservation = orch
+            .reserve_branches(
+                &fx.store,
+                &[DEAD_BRANCH],
+                "landing paused before remote publication",
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        git(fx.project.path(), &["checkout", "-q", DEAD_BRANCH]);
+        std::fs::write(
+            fx.project.path().join("remote-change.txt"),
+            "new owner content\n",
+        )
+        .unwrap();
+        git(fx.project.path(), &["add", "-A"]);
+        git(
+            fx.project.path(),
+            &["commit", "-q", "-m", "external commit awaiting import"],
+        );
+        let incoming = git_stdout(fx.project.path(), &["rev-parse", "HEAD"]);
+        git(fx.project.path(), &["checkout", "-q", "main"]);
+        const ARRIVED: &str = "feature/arrived-during-reservation";
+        const MINTED: &str = "agent/reserved-mint";
+        git(fx.project.path(), &["branch", ARRIVED, &incoming]);
+        let before = crate::jj::operation_id(&fx.jj, &fx.store).unwrap();
+
+        let refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    import_project_store_locked(
+                        &orch,
+                        &orch.db.local,
+                        "fixture-project",
+                        &fx.jj,
+                        &fx.store,
+                        fx.project.path(),
+                        "reservation fixture",
+                    )
+                })
+                .join()
+                .unwrap()
+        })
+        .unwrap_err();
+        assert!(
+            refused.contains(DEAD_BRANCH) && refused.contains("landing paused"),
+            "{refused}"
+        );
+        let base = fx.base.clone();
+        let refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    prepare_store_coordinate(
+                        &orch,
+                        &fx.jj,
+                        &fx.store,
+                        fx.project.path(),
+                        &job,
+                        &mints(),
+                        |revision| (revision == "main").then(|| base.clone()),
+                        |_| unreachable!("a minting job reads no parent"),
+                        || Ok(MINTED.to_string()),
+                    )
+                })
+                .join()
+                .unwrap()
+        })
+        .err()
+        .expect("the mint's bulk import is refused");
+        assert!(refused.contains(DEAD_BRANCH), "{refused}");
+        assert_eq!(crate::jj::operation_id(&fx.jj, &fx.store).unwrap(), before);
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&fx.store, DEAD_BRANCH)
+                .await
+                .unwrap(),
+            fx.dead_head,
+            "the reservation protects the literal source, not only its export",
+        );
+        for name in [ARRIVED, MINTED] {
+            assert!(
+                cairn_vcs::resolve_coordinate(&fx.store, name)
+                    .await
+                    .is_err(),
+                "a refused bulk operation must not partially import or mint {name}"
+            );
+        }
+        assert_eq!(
+            git_stdout(
+                fx.project.path(),
+                &["rev-parse", &format!("refs/heads/{DEAD_BRANCH}")]
+            ),
+            incoming,
+            "refusal must not erase the external commit waiting in Git",
+        );
+
+        drop(reservation);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    import_project_store_locked(
+                        &orch,
+                        &orch.db.local,
+                        "fixture-project",
+                        &fx.jj,
+                        &fx.store,
+                        fx.project.path(),
+                        "retry after reservation",
+                    )
+                })
+                .join()
+                .unwrap()
+        })
+        .unwrap();
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&fx.store, DEAD_BRANCH)
+                .await
+                .unwrap(),
+            incoming
+        );
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&fx.store, ARRIVED)
+                .await
+                .unwrap(),
+            incoming
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
     async fn unrelated_preparation_preserves_a_fenced_branch_after_git_changes() {
         use crate::orchestrator::branch_recovery;
         let fx = successor_fixture().expect("real jj required");
@@ -11455,6 +11639,8 @@ mod tests {
             let importing = scope.spawn(|| {
                 import_project_store_locked(
                     &orch,
+                    &orch.db.local,
+                    "fixture-project",
                     &fx.jj,
                     &fx.store,
                     fx.project.path(),

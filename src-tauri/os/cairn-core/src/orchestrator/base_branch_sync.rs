@@ -68,7 +68,6 @@ const ERROR_EXCERPT_CHARS: usize = 120;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
     Startup,
-    Merge,
     Push,
     Poll,
     Fetch,
@@ -632,6 +631,19 @@ async fn store_lacks_origin(
     if contains == Some(true) {
         return false;
     }
+    let accepted =
+        match crate::orchestrator::base_advance::managed_publication_claims(orch, store, branch)
+            .await
+        {
+            Ok(Some(accepted)) => accepted,
+            Ok(None) => return true,
+            Err(error) => {
+                log::warn!(
+                    "could not establish managed publication authority for `{branch}`: {error}"
+                );
+                return true;
+            }
+        };
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let (store, branch, local, remote) = (
         store.to_path_buf(),
@@ -640,7 +652,16 @@ async fn store_lacks_origin(
         remote.to_string(),
     );
     let superseded = tokio::task::spawn_blocking(move || {
-        crate::jj::origin_copy_is_superseded(&jj, &store, &branch, &local, &remote)
+        crate::jj::origin_copy_is_superseded_with_accepted(
+            &jj,
+            &store,
+            &branch,
+            &local,
+            &remote,
+            &accepted,
+            crate::jj::BACKGROUND_RECONCILE_BUDGET,
+        )
+        .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())

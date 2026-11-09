@@ -148,9 +148,10 @@ spans resources rather than belonging to any single one:
 - Your branch is the only durable record. `write` requires a `commit_msg` for
   file-target edits, and a mutating `run` commits to the same branch; without a
   `commit_msg`, a run's changes are undone.
-- When the base branch advances, Cairn rebases your branch onto it. Resolve any
-  reported conflict with ordinary file writes; do not rebase or force-push by
-  hand.
+- When the base branch advances, nothing happens to your branch until your next
+  commit, a check or run that names it, or a merge needs the current base; then
+  Cairn carries it onto the base once. Resolve any reported conflict with
+  ordinary file writes; do not rebase or force-push by hand.
 - Relative `file:` targets address the project root, and repository commands
   execute through `run`. Your `run` batches, terminals, and REPLs share one
   working directory, so a command validated with `run` behaves identically in a

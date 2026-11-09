@@ -305,9 +305,6 @@ async fn a_write_whose_branch_moves_before_its_seal_is_written_again_under_the_l
         return;
     };
     repo.write("notes.txt", "alpha\n");
-    let store = jj::project_store_dir(repo.config.path(), repo.project.path());
-    let held = repo.orch.hold_jj_store_lock_for_test(&store).await;
-
     let orch = repo.orch.clone();
     let mut request = make_request(
         repo.cwd(),
@@ -321,33 +318,302 @@ async fn a_write_whose_branch_moves_before_its_seal_is_written_again_under_the_l
         }),
     );
     request.run_id = Some("run-change".to_string());
+    let id = "branch-moves-before-seal";
+    record_write_call(&repo.orch.db.local, id, &request.payload).await;
+    request.tool_use_id = Some(id.into());
+    let (reached, resume) = cairn_core::internal::mcp::handlers::write::test_pause::before_seal(id);
     let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+        .await
+        .expect("the write has prepared its patch without retaining the store lock");
 
-    // Prepared against `alpha`, and now queued to seal.
-    tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while !repo
-            .orch
-            .jj_store_lock_waiters_for_test(&store)
-            .iter()
-            .any(|operation| operation == "logical write transaction")
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("the write prepares without the lock and queues only to seal");
-
-    // Another writer lands on the branch while this one waits.
-    repo.write("notes.txt", "alpha\nbeta\n");
-    drop(held);
+    let report = repo
+        .change_report(json!({
+            "changes": [{"target":"file:notes.txt", "mode":"patch",
+                "payload":{"old_string":"alpha", "new_string":"alpha\nbeta"}}],
+            "commit_msg":"concurrent owner publication"
+        }))
+        .await;
+    assert_successful_change(&report, 1);
+    resume.notify_one();
 
     let report = parse_report(&write.await.unwrap());
     assert_successful_change(&report, 1);
+    assert_eq!(repo.read("notes.txt"), "alpha-mine\nbeta\n");
+}
+
+#[tokio::test]
+async fn a_file_seal_checks_acceptance_debt_that_appeared_after_patch_interpretation() {
+    for atomic in [false, true] {
+        for status in ["unknown", "pending"] {
+            let Some(repo) = ChangeTestRepo::try_new().await else {
+                eprintln!("skipping: jj not resolvable");
+                return;
+            };
+            repo.write("debt.txt", "before\n");
+            let before = repo.branch_head();
+            let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+            let store_key = std::fs::canonicalize(&store)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let env = jj::environment(&repo.jj_bin, repo.config.path());
+            let base = jj::bookmark_commit(&env, &store, "main").unwrap();
+            let id = format!("file-acceptance-debt-{atomic}-{status}");
+            let mut request = make_request(
+                repo.cwd(),
+                json!({
+                    "changes": [{"target":"file:debt.txt", "mode":"patch",
+                        "payload":{"old_string":"before", "new_string":"after"}}],
+                    "atomic": atomic,
+                    "commit_msg": "publish only with settled acceptance"
+                }),
+            );
+            request.run_id = Some("run-change".into());
+            request.tool_use_id = Some(id.clone());
+            record_write_call(&repo.orch.db.local, &id, &request.payload).await;
+            let (reached, resume) =
+                cairn_core::internal::mcp::handlers::write::test_pause::before_seal(&id);
+            let orch = repo.orch.clone();
+            let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+            tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+                .await
+                .expect("the patch has been interpreted without a writer guard");
+            let guard = repo.orch.hold_jj_store_lock_for_test(&store).await;
+            repo.orch
+                .db
+                .local
+                .execute(
+                    "INSERT INTO branch_advance_acceptances
+                   (id, project_id, store_path, branch, head_before, head_after, base_branch,
+                    base_commit, captured_operation, dropped_commits_json, inherited_drops_json,
+                    status, created_at)
+                 VALUES ('debt-at-seal', ?1, ?2, 'agent/CHG-1-builder-0', ?3, ?4,
+                         'main', ?3, 'captured-op', '[]', '[]', ?5, 1)",
+                    params![
+                        repo.project_id.as_str(),
+                        store_key.as_str(),
+                        base.as_str(),
+                        before.as_str(),
+                        status
+                    ],
+                )
+                .await
+                .unwrap();
+            drop(guard);
+            resume.notify_one();
+            let report = parse_report(&write.await.unwrap());
+
+            if status == "pending" {
+                assert_successful_change(&report, 1);
+                assert_eq!(repo.read("debt.txt"), "after\n");
+                let settled = repo
+                    .orch
+                    .db
+                    .local
+                    .query_one(
+                        "SELECT status FROM branch_advance_acceptances WHERE id = 'debt-at-seal'",
+                        (),
+                        |row| row.text(0),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(settled, "accepted");
+            } else {
+                assert!(failure_count(&report) > 0, "{report}");
+                assert!(report.to_string().contains("debt-at-seal"), "{report}");
+                assert_eq!(
+                    repo.branch_head(),
+                    before,
+                    "the refused seal moves no bookmark"
+                );
+                assert_eq!(
+                    repo.read("debt.txt"),
+                    "before\n",
+                    "the proposed patch never landed"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_locked_write_adopts_three_owner_publications_without_spending_race_retries() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        return;
+    };
+    repo.write("notes.txt", "alpha\n");
+    let id = "locked-write-owner-extensions";
+    let mut request = make_request(
+        repo.cwd(),
+        json!({
+            "changes":[{"target":"file:notes.txt", "mode":"patch",
+                "payload":{"old_string":"alpha", "new_string":"alpha-mine"}}],
+            "commit_msg":"write on latest owner head"
+        }),
+    );
+    request.run_id = Some("run-change".into());
+    record_write_call(&repo.orch.db.local, id, &request.payload).await;
+    request.tool_use_id = Some(id.into());
+    let observations =
+        cairn_core::internal::mcp::handlers::write::test_pause::observe_interpretations(id);
+    let (optimistic, resume_optimistic) =
+        cairn_core::internal::mcp::handlers::write::test_pause::before_seal(id);
+    let (locked, resume_locked) =
+        cairn_core::internal::mcp::handlers::write::test_pause::before_locked_write(id);
+    let orch = repo.orch.clone();
+    let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(60), optimistic.notified())
+        .await
+        .unwrap();
+    let publish = |text: &'static str, replacement: &'static str| {
+        repo.change_report(json!({
+            "changes":[{"target":"file:notes.txt", "mode":"patch",
+                "payload":{"old_string":text, "new_string":replacement}}],
+            "commit_msg":"extend owner history"
+        }))
+    };
+    assert_successful_change(&publish("alpha", "alpha\nfirst").await, 1);
+    resume_optimistic.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(60), locked.notified())
+        .await
+        .expect("the locked attempt prepared, but has not taken its writer guard");
+    for (old, new) in [
+        ("first", "first\nsecond"),
+        ("second", "second\nthird"),
+        ("third", "third\nfourth"),
+    ] {
+        assert_successful_change(&publish(old, new).await, 1);
+    }
+    let adopted = repo.branch_head();
+    resume_locked.notify_one();
+    let report = parse_report(&write.await.unwrap());
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        observations.locked_preparations(),
+        1,
+        "descendant owner commits do not consume the bounded replacement-history retries"
+    );
+    let interpreted = observations.coordinates();
+    assert_eq!(interpreted.len(), 2);
+    assert_eq!(interpreted[1].0, adopted);
     assert_eq!(
         repo.read("notes.txt"),
-        "alpha-mine\nbeta\n",
-        "the write is applied to the moved head, keeping the line the move added"
+        "alpha-mine\nfirst\nsecond\nthird\nfourth\n"
     );
+}
+
+#[tokio::test]
+async fn an_optimistic_write_restarts_when_only_its_base_coordinate_changes() {
+    for move_declaration in [false, true] {
+        let Some(repo) = ChangeTestRepo::try_new().await else {
+            return;
+        };
+        repo.write("notes.txt", "alpha\n");
+        let before = repo.branch_head();
+        let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+        let orch = repo.orch.clone();
+        let mut request = make_request(
+            repo.cwd(),
+            json!({
+                "changes": [{"target":"file:notes.txt", "mode":"patch",
+                    "payload":{"old_string":"alpha", "new_string":"alpha-mine"}}],
+                "commit_msg":"edit against current base"
+            }),
+        );
+        request.run_id = Some("run-change".into());
+        let tool_use_id = if move_declaration {
+            "base-declaration-race"
+        } else {
+            "base-tip-race"
+        };
+        record_write_call(&repo.orch.db.local, tool_use_id, &request.payload).await;
+        request.tool_use_id = Some(tool_use_id.to_string());
+        let interpretations =
+            cairn_core::internal::mcp::handlers::write::test_pause::observe_interpretations(
+                tool_use_id,
+            );
+        let (reached, resume) =
+            cairn_core::internal::mcp::handlers::write::test_pause::before_seal(tool_use_id);
+        let write = tokio::spawn(async move { handle_write(&orch, &request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+            .await
+            .expect("the optimistic write has captured its base and prepared its patch");
+        let held = repo.orch.hold_jj_store_lock_for_test(&store).await;
+        let env = jj::environment(&repo.jj_bin, repo.config.path());
+        if move_declaration {
+            let base = jj::bookmark_commit(&env, &store, "main").unwrap();
+            env.run(
+                &store,
+                &[
+                    "bookmark",
+                    "set",
+                    "alternate-base",
+                    "-r",
+                    &base,
+                    "--ignore-working-copy",
+                ],
+                "create equal-tip integration target",
+            )
+            .unwrap();
+            repo.orch
+                .db
+                .local
+                .execute(
+                    "UPDATE jobs SET base_branch = 'alternate-base' WHERE id = 'job-change'",
+                    (),
+                )
+                .await
+                .unwrap();
+        } else {
+            env.run(
+                &store,
+                &[
+                    "bookmark",
+                    "set",
+                    "main",
+                    "-r",
+                    &before,
+                    "--ignore-working-copy",
+                ],
+                "move only integration base",
+            )
+            .unwrap();
+        }
+        assert_eq!(repo.branch_head(), before, "the authored head did not move");
+        let first = interpretations.coordinates();
+        assert_eq!(
+            first.len(),
+            1,
+            "the first patch interpretation has completed"
+        );
+        let expected_base = if move_declaration {
+            "alternate-base"
+        } else {
+            "main"
+        };
+        let expected_commit = jj::bookmark_commit(&env, &store, expected_base).unwrap();
+        drop(held);
+        resume.notify_one();
+        let report = parse_report(&write.await.unwrap());
+        assert_successful_change(&report, 1);
+        assert_eq!(repo.read("notes.txt"), "alpha-mine\n");
+        let interpreted = interpretations.coordinates();
+        assert_eq!(
+            interpreted.len(),
+            2,
+            "a base-only race must reinterpret, not merely seal successfully"
+        );
+        assert_eq!(interpreted[0], first[0]);
+        assert_eq!(
+            interpreted[1],
+            (before, expected_base.to_string(), expected_commit)
+        );
+        assert_ne!(
+            interpreted[0], interpreted[1],
+            "the restarted interpretation uses the new base identity"
+        );
+    }
 }
 
 /// Two deliveries of one write call, where the first seals after the second
@@ -1166,6 +1432,85 @@ async fn a_file_batch_with_a_rebase_item_is_refused_before_taking_the_store_lock
     );
     drop(held);
     assert_eq!(repo.read("rebase-batch.txt"), "before\n");
+}
+
+/// A pull-request action pushes or merges through the store whose lock a file
+/// batch holds, so a batch that carries one is refused before anything applies,
+/// atomic or not: no file is edited, the branch does not move, and the pull
+/// request is not touched.
+#[tokio::test]
+async fn a_file_batch_with_a_pull_request_action_is_refused_before_anything_applies() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("action-batch.txt", "before\n");
+    repo.seal_base("seed pull-request action specimen");
+    bind_remote_pr_to_job(&repo).await;
+    let edits =
+        cairn_core::pr_data::actions::prose_edit_seam::install(repo.project.path(), |_| Ok(()));
+    let head = repo.branch_head();
+    let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+
+    for atomic in [true, false] {
+        for (target, action) in [
+            ("cairn:~/create-pr", "publish"),
+            ("cairn://p/chg/1/1/builder/create-pr", "merge"),
+        ] {
+            let report = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                repo.change_report(json!({
+                    "changes": [
+                        {
+                            "target": "file:action-batch.txt",
+                            "mode": "patch",
+                            "payload": { "old_string": "before", "new_string": "after" }
+                        },
+                        { "target": target, "mode": "patch", "payload": { "action": action } }
+                    ],
+                    "commit_msg": "edit and act on the pull request in one batch",
+                    "atomic": atomic
+                })),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{action} atomic={atomic}: the batch waited on a lock"));
+
+            assert_eq!(
+                report["applied"].as_array().map(Vec::len),
+                Some(0),
+                "{action} atomic={atomic}: {report:?}"
+            );
+            assert_eq!(
+                failure_count(&report),
+                1,
+                "{action} atomic={atomic}: {report:?}"
+            );
+            assert_eq!(
+                report["failures"][0]["index"], 1,
+                "{action} atomic={atomic}"
+            );
+            let error = report["failures"][0]["error"].as_str().unwrap();
+            assert!(
+                error.contains("Refusing a pull-request action")
+                    && error.contains("as its own write"),
+                "{action} atomic={atomic}: the refusal must name the rule and the remedy: {error}"
+            );
+            assert!(
+                report["commit"].is_null(),
+                "{action} atomic={atomic}: {report:?}"
+            );
+        }
+    }
+    assert_eq!(repo.read("action-batch.txt"), "before\n");
+    assert_eq!(repo.branch_head(), head, "the branch must not move");
+    assert!(
+        edits.probes().is_empty(),
+        "the pull request must not be touched"
+    );
+    assert!(
+        repo.orch.jj_store_lock_waiters_for_test(&store).is_empty(),
+        "a refused batch must leave nothing queued on the store lock"
+    );
 }
 
 /// The store lock is not reentrant. A task that asks for it while holding it
@@ -2419,6 +2764,54 @@ async fn a_replayed_write_applies_once_and_returns_the_first_report() {
     assert_eq!(repo.read("notes.txt"), "head\ntail\n");
 }
 
+#[tokio::test]
+async fn a_sealed_write_replays_without_preparing_its_now_missing_base_or_waiting_for_the_store() {
+    for atomic in [false, true] {
+        let Some(repo) = ChangeTestRepo::try_new().await else {
+            eprintln!("skipping: jj not resolvable");
+            return;
+        };
+        repo.write("replay-coordinate.txt", "tail\n");
+        let payload = json!({
+            "changes": [{
+                "target": "file:replay-coordinate.txt",
+                "mode": "patch",
+                "payload": { "old_string": "tail", "new_string": "head\ntail" }
+            }],
+            "atomic": atomic,
+            "commit_msg": "seal the original delivery"
+        });
+        let first = repo
+            .change_report_as_tool_use("toolu_missing_base_replay", payload.clone())
+            .await;
+        assert_successful_change(&first, 1);
+        let head = repo.branch_head();
+        repo.orch
+            .db
+            .local
+            .execute(
+                "UPDATE jobs SET base_branch = 'no-such-integration-target' WHERE id = 'job-chg'",
+                (),
+            )
+            .await
+            .unwrap();
+        let store = jj::project_store_dir(repo.config.path(), repo.project.path());
+        let held = repo.orch.hold_jj_store_lock_for_test(&store).await;
+        let replay = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            repo.change_report_as_tool_use("toolu_missing_base_replay", payload),
+        )
+        .await
+        .expect("a sealed replay neither prepares nor waits for a store writer");
+        drop(held);
+        assert_successful_change(&replay, 1);
+        assert!(replay["replayed"].is_string(), "{replay:?}");
+        assert_eq!(replay["commit"]["sha"], first["commit"]["sha"]);
+        assert_eq!(repo.branch_head(), head);
+        assert_eq!(repo.read("replay-coordinate.txt"), "head\ntail\n");
+    }
+}
+
 /// The replay ledger claims its row inside the store lock, BEFORE the
 /// publication ladder's remaining rungs have run. So the report it records says
 /// `committed` even when the export or the required origin push then fails and
@@ -2471,6 +2864,140 @@ async fn a_write_whose_publication_failed_is_not_replayed_as_committed() {
         repo.read("notes.txt"),
         "head\ntail\n",
         "the redelivery must still not re-apply the patch"
+    );
+}
+
+/// Bind an open remote pull request to this fixture's own job, so a create-pr
+/// artifact write on that job has a pull request to sync.
+async fn bind_remote_pr_to_job(repo: &ChangeTestRepo) {
+    repo.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO merge_requests
+             (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number)
+             VALUES ('mr-deferred', 'job-change', ?1, 'Old title', 'agent/CHG-1-builder-0', 'main', 'open', 0, 1, 1, 4242)",
+            cairn_db::turso::params![repo.project_id.clone()],
+        )
+        .await
+        .unwrap();
+}
+
+fn file_and_create_pr_payload() -> serde_json::Value {
+    json!({
+        "changes": [
+            {
+                "target": "file:notes.txt",
+                "mode": "patch",
+                "payload": { "old_string": "tail", "new_string": "head\ntail" }
+            },
+            {
+                "target": "cairn://p/chg/1/1/builder/create-pr",
+                "mode": "create",
+                "payload": { "title": "Deferred title", "body": "Deferred body" }
+            }
+        ],
+        "commit_msg": "prepend head"
+    })
+}
+
+/// A batch that edits files holds its store lock and branch reservation while
+/// it dispatches a create-pr artifact. The artifact's pull-request sync is
+/// network I/O, so it runs in completion: when it edits the pull request,
+/// neither lock is held. A sync that fails there is reported in the final
+/// report, the replay ledger carries that report, and a redelivery is answered
+/// with it without editing the pull request again.
+#[tokio::test]
+async fn a_mixed_batch_syncs_its_create_pr_artifact_after_releasing_its_locks() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "tail\n");
+    bind_remote_pr_to_job(&repo).await;
+    let edits = cairn_core::pr_data::actions::prose_edit_seam::install(repo.project.path(), |_| {
+        Err("scripted: GitHub refused the edit".to_string())
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_deferred_sync", file_and_create_pr_payload())
+        .await;
+
+    assert!(first["commit"]["sha"].is_string(), "{first:?}");
+    assert_eq!(repo.read("notes.txt"), "head\ntail\n");
+    let probes = edits.probes();
+    assert_eq!(probes.len(), 1, "one pull-request edit: {probes:?}");
+    assert_eq!(probes[0].pr_number, 4242);
+    assert_eq!(
+        probes[0].store_lock_holder, None,
+        "the pull request is edited with the store lock free"
+    );
+    assert_eq!(
+        probes[0].branch_reservation_holder, None,
+        "and with the branch reservation free"
+    );
+    let error = failure_error(&first, 1);
+    assert!(
+        error.contains("was not synced") && error.contains("scripted: GitHub refused the edit"),
+        "{first:?}"
+    );
+    let summary = first["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["index"] == 1)
+        .map(|change| change["summary"].as_str().unwrap().to_string())
+        .expect("the artifact was stored");
+    assert!(summary.contains("pull request not synced"), "{summary}");
+    assert!(!summary.contains("sync pending"), "{summary}");
+
+    let replay = repo
+        .change_report_as_tool_use("toolu_deferred_sync", file_and_create_pr_payload())
+        .await;
+    assert_eq!(replay["commit"]["sha"], first["commit"]["sha"]);
+    assert!(
+        failure_error(&replay, 1).contains("was not synced"),
+        "the redelivery is answered with the failed sync: {replay:?}"
+    );
+    assert_eq!(edits.probes().len(), 1, "a redelivery edits nothing again");
+}
+
+/// When the batch's own branch push fails, its deferred create-pr syncs are
+/// reported unsynced and nothing pushes or edits the pull request again.
+#[tokio::test]
+async fn a_failed_branch_push_leaves_the_deferred_create_pr_sync_unsynced() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "tail\n");
+    bind_remote_pr_to_job(&repo).await;
+    repo.break_origin();
+    let edits =
+        cairn_core::pr_data::actions::prose_edit_seam::install(repo.project.path(), |_| Ok(()));
+
+    let first = repo
+        .change_report_as_tool_use("toolu_deferred_unpublished", file_and_create_pr_payload())
+        .await;
+
+    assert_eq!(
+        first["commit"]["status"], "sealed locally; unpublished",
+        "{first:?}"
+    );
+    assert!(
+        failure_error(&first, 1).contains("branch push failed first"),
+        "{first:?}"
+    );
+    assert!(
+        edits.probes().is_empty(),
+        "no pull-request edit after a failed push"
+    );
+    let replay = repo
+        .change_report_as_tool_use("toolu_deferred_unpublished", file_and_create_pr_payload())
+        .await;
+    assert!(
+        failure_error(&replay, 1).contains("branch push failed first"),
+        "{replay:?}"
     );
 }
 

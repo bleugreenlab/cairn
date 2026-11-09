@@ -23,8 +23,9 @@ pub(crate) use blocking::{
     blocking_append_kind, run_blocking_group, validate_blocking_group, BlockingResult,
 };
 pub(crate) use dispatch::{
-    asking_thread_id, attachment_removal_authority, authorize_start_now, dispatch_resource_change,
-    inference_records_authority, queue_authority, rebase_authority,
+    acceptance_debt_section, asking_thread_id, attachment_removal_authority, authorize_start_now,
+    dispatch_resource_change, dispatch_resource_change_under_store, inference_records_authority,
+    queue_authority, rebase_authority,
 };
 pub(crate) use hash::hash_resource_target;
 pub(crate) use mcp::workspace_mcp_authority;
@@ -65,6 +66,9 @@ pub(crate) struct ResourceAppliedChange {
     pub(crate) summary: String,
     pub(crate) data: Option<serde_json::Value>,
     pub(crate) promoted_memory: Option<PromotedMemoryRef>,
+    /// A create-pr artifact stored under the caller's held store lock, whose
+    /// pull-request sync the caller runs once it releases the lock.
+    pub(crate) deferred_pr_sync: Option<crate::pr_data::actions::DeferredPrSync>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

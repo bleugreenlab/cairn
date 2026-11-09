@@ -793,7 +793,7 @@ async fn claim_merge_request_resolution(
     db: &LocalDb,
     mr_id: &str,
     resolution: PrNodeResolution,
-    merged_commit: Option<&str>,
+    landed: Landed<'_>,
     now: i64,
 ) -> Result<bool, String> {
     let moved = match resolution {
@@ -801,9 +801,10 @@ async fn claim_merge_request_resolution(
             db.execute(
                 "UPDATE merge_requests
                  SET status = 'merged', merged_at = ?1, updated_at = ?1,
-                     merged_commit = COALESCE(?2, merged_commit)
-                 WHERE id = ?3 AND status IN ('open', 'closed')",
-                params![now, merged_commit, mr_id],
+                     merged_commit = COALESCE(?2, merged_commit),
+                     merged_source_commit = COALESCE(?3, merged_source_commit)
+                 WHERE id = ?4 AND status IN ('open', 'closed')",
+                params![now, landed.commit, landed.source, mr_id],
             )
             .await
         }
@@ -887,6 +888,21 @@ enum Resolver {
     Observed,
 }
 
+/// What a merge put where: the commit it wrote to the target, and the commit
+/// the source branch is expected to hold once the landing is recorded.
+///
+/// `source` is an exact identity the landing route accepted, never derived by
+/// comparison: the folded or published commit when the landing moved the
+/// source bookmark onto it, otherwise the source head the route merged. Branch
+/// cleanup deletes a merged branch only while it still holds this commit, so a
+/// commit its owner made after the landing is never deleted. `None` when the
+/// route cannot name it; cleanup then falls back to a real ancestry proof.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Landed<'a> {
+    pub commit: Option<&'a str>,
+    pub source: Option<&'a str>,
+}
+
 /// Resolve a `pr` node by its owner id (`merge_requests.job_id`): the producing
 /// `pr` action_run (CAIRN-1220) or a legacy `create_pr` producing job.
 ///
@@ -903,7 +919,29 @@ pub async fn resolve_pr_node(
         orch,
         owner_id,
         resolution,
-        merged_commit,
+        Landed {
+            commit: merged_commit,
+            source: None,
+        },
+        Resolver::Performed(attribution),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`resolve_pr_node`] for a merge whose route knows exactly what it landed,
+/// including the source commit branch cleanup may later rely on.
+pub async fn resolve_pr_node_landed(
+    orch: &Orchestrator,
+    owner_id: &str,
+    attribution: Option<PrResolutionAttribution>,
+    landed: Landed<'_>,
+) -> Result<(), String> {
+    resolve_pr_node_as(
+        orch,
+        owner_id,
+        PrNodeResolution::Merge,
+        landed,
         Resolver::Performed(attribution),
     )
     .await
@@ -926,25 +964,19 @@ pub(super) async fn resolve_observed_pr_node(
     orch: &Orchestrator,
     owner_id: &str,
     resolution: PrNodeResolution,
-    merged_commit: Option<&str>,
+    landed: Landed<'_>,
 ) -> Result<bool, String> {
-    resolve_pr_node_as(
-        orch,
-        owner_id,
-        resolution,
-        merged_commit,
-        Resolver::Observed,
-    )
-    .await
+    resolve_pr_node_as(orch, owner_id, resolution, landed, Resolver::Observed).await
 }
 
 async fn resolve_pr_node_as(
     orch: &Orchestrator,
     owner_id: &str,
     resolution: PrNodeResolution,
-    merged_commit: Option<&str>,
+    landed: Landed<'_>,
     resolver: Resolver,
 ) -> Result<bool, String> {
+    let merged_commit = landed.commit;
     // Route to the database that owns this PR's producing job (team replica or
     // private DB). Every row this resolution reads or writes — the merge_requests
     // status transition, the issue resolution, the pr action_run completion, and
@@ -962,8 +994,7 @@ async fn resolve_pr_node_as(
         serde_json::to_string(&lane_snapshot_for_job(orch, &db, owner_id, &mr_id).await)
             .map_err(|e| format!("Failed to record the lane snapshot: {e}"))?;
     let performed = matches!(resolver, Resolver::Performed(_));
-    let claimed =
-        claim_merge_request_resolution(&db, &mr_id, resolution, merged_commit, now).await?;
+    let claimed = claim_merge_request_resolution(&db, &mr_id, resolution, landed, now).await?;
     let attribution = match resolver {
         Resolver::Performed(attribution) => Some(attribution.unwrap_or_else(|| {
             log::error!(
@@ -994,11 +1025,13 @@ async fn resolve_pr_node_as(
         // by a refresh that saw this same merge land on GitHub while this call
         // was in flight, or by an earlier resolution. The cascade ran then. What
         // this call adds is who acted and, for a merge, the commit it produced.
-        if let (PrNodeResolution::Merge, Some(commit)) = (resolution, merged_commit) {
+        if matches!(resolution, PrNodeResolution::Merge) {
             db.execute(
-                "UPDATE merge_requests SET merged_commit = ?1
-                 WHERE id = ?2 AND status = 'merged' AND merged_commit IS NULL",
-                params![commit, mr_id.as_str()],
+                "UPDATE merge_requests
+                 SET merged_commit = COALESCE(merged_commit, ?1),
+                     merged_source_commit = COALESCE(merged_source_commit, ?2)
+                 WHERE id = ?3 AND status = 'merged'",
+                params![merged_commit, landed.source, mr_id.as_str()],
             )
             .await
             .map_err(|e| db_error("Failed to record the merged commit", e))?;
@@ -1125,23 +1158,23 @@ async fn resolve_pr_node_as(
             });
         }
 
-        // Downstream sibling/coordinator reconciliation advances *other* in-flight
-        // branches (siblings auto-rebase onto the advanced tip; a Coordinator on
-        // the integration branch has its `@` re-parented). It has no bearing on
-        // whether THIS PR is merged, is best-effort end to end, and is re-fired
-        // idempotently by the GitHub `push` webhook (guarded by the before/after
-        // commit-id snapshot in `reconcile_base_advance`). So spawn it off the
+        // The base-advance follow-up (importing origin's default, base checks,
+        // service and code-map notices, re-pointing children of the merged
+        // branch) touches no sibling branch and has no bearing on whether THIS
+        // PR is merged. It is best-effort and idempotent, so spawn it off the
         // synchronous merge path: the resolution — and the "merging" button —
         // returns immediately, and the reconcile lands in the background.
+        // Recorded as the merge attempt's own `merge_downstream` record, so any
+        // branch work or wake it causes is attributed to this merge.
         let orch = orch.clone();
         let owner_id = owner_id.to_string();
-        tokio::spawn(async move {
+        tokio::spawn(super::merge_metrics::downstream(async move {
             let started = std::time::Instant::now();
-            if let Err(e) = crate::orchestrator::base_advance::notify_downstream_of_base_advance(
+            let notified = crate::orchestrator::base_advance::notify_downstream_of_base_advance(
                 &orch, &owner_id,
             )
-            .await
-            {
+            .await;
+            if let Err(e) = &notified {
                 log::warn!("Failed to notify downstream jobs of base advance: {}", e);
             }
             log::info!(
@@ -1149,7 +1182,8 @@ async fn resolve_pr_node_as(
                 owner_id,
                 started.elapsed()
             );
-        });
+            notified
+        }));
     }
 
     announce_pr_resolution(orch, &merge_context);
@@ -1777,7 +1811,10 @@ mod tests {
             &orch,
             "builder-job",
             PrNodeResolution::Merge,
-            Some("b77e7657"),
+            Landed {
+                commit: Some("b77e7657"),
+                source: None,
+            },
         )
         .await
         .expect("the observed merge resolves");
@@ -1824,7 +1861,10 @@ mod tests {
             &orch,
             "builder-job",
             PrNodeResolution::Merge,
-            Some("b77e7657"),
+            Landed {
+                commit: Some("b77e7657"),
+                source: None,
+            },
         )
         .await
         .expect("a repeat observation is harmless");
@@ -1851,11 +1891,14 @@ mod tests {
         .await
         .expect("the issue resolves merged");
 
-        assert!(
-            resolve_observed_pr_node(&orch, "builder-job", PrNodeResolution::Close, None)
-                .await
-                .unwrap()
-        );
+        assert!(resolve_observed_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Close,
+            Landed::default()
+        )
+        .await
+        .unwrap());
 
         assert_eq!(
             scalar(
@@ -1907,11 +1950,14 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
 
-        assert!(
-            resolve_observed_pr_node(&orch, "builder-job", PrNodeResolution::Close, None)
-                .await
-                .unwrap()
-        );
+        assert!(resolve_observed_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Close,
+            Landed::default()
+        )
+        .await
+        .unwrap());
 
         assert_eq!(
             scalar(
@@ -1947,11 +1993,14 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
 
-        assert!(
-            resolve_observed_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None)
-                .await
-                .unwrap()
-        );
+        assert!(resolve_observed_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Landed::default()
+        )
+        .await
+        .unwrap());
         let merged_at = scalar(
             db,
             "SELECT CAST(merged_at AS TEXT) FROM merge_requests WHERE id = ?1",

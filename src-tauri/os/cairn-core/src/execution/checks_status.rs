@@ -1,10 +1,7 @@
 use crate::config::project_settings::{
     CheckCommand, CheckPolicy, CheckWhen, ChecksContract, UnsupportedCheck,
 };
-use crate::execution::cache::{
-    list_check_results_for_job, observed_commit_for_job, resolve_job_logical_head,
-    CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys,
-};
+use crate::execution::cache::{CheckResultCacheEntry, HeadVerdictKeys, OwnedHeadVerdictKeys};
 use crate::execution::check_evidence::{
     reconcile_evidence, EvidenceInputs, EvidenceReconciliation,
 };
@@ -27,7 +24,7 @@ use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
 };
 use crate::execution::selection::plan_checks;
-use crate::jj::{logical_changed_files, logical_tree_hash, own_patch_against, OwnPatch};
+use crate::jj::{logical_changed_files, logical_tree_hash};
 use crate::mcp::handlers::run::CheckStatusEntry;
 use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
@@ -1085,7 +1082,7 @@ pub async fn node_check_statuses(
     let live = WaveCadence::of(orch, job_id).any();
     orch.node_check_status_cache.record_read_branch(live);
     let compute = || compute_node_check_statuses(orch, job_id);
-    if live {
+    let mut statuses = if live {
         orch.node_check_status_cache
             .get_or_compute_live(job_id, compute)
             .await
@@ -1093,7 +1090,101 @@ pub async fn node_check_statuses(
         orch.node_check_status_cache
             .get_or_compute(job_id, compute)
             .await
+    }?;
+    // A refused check/run capture records evidence without moving the head or
+    // advancing this cache's generation. Read it outside the cached projection.
+    if let Some(diagnostic) = current_base_conflict(orch, job_id).await {
+        for status in &mut statuses {
+            if status.state != NodeCheckState::Unsupported {
+                clear_conflicting_verdict(status, &diagnostic);
+            }
+        }
     }
+    Some(statuses)
+}
+
+async fn current_base_conflict(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .ok()?;
+    let coords = resolve_job_coords(&db, job_id).await.ok().flatten()?;
+    let base_branch = match coords.base_branch.filter(|base| !base.trim().is_empty()) {
+        Some(base) => base,
+        None => {
+            crate::orchestrator::base_advance::load_project_default_branch(&db, &coords.project_id)
+                .await
+                .ok()
+                .flatten()?
+        }
+    };
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&coords.repository_path));
+    // All DB reads above have released their connections before store work.
+    let head = cairn_vcs::resolve_coordinate(&store, &coords.branch)
+        .await
+        .ok()?;
+    let base = cairn_vcs::resolve_coordinate(&store, &base_branch)
+        .await
+        .ok()?;
+    let store = store.to_string_lossy().into_owned();
+    db.read(|conn| {
+        let (project, store, branch, head, base_branch, base) = (
+            coords.project_id.clone(),
+            store.clone(),
+            coords.branch.clone(),
+            head.clone(),
+            base_branch.clone(),
+            base.clone(),
+        );
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT item.last_diagnostic FROM jj_reconcile_items item
+                 JOIN jj_reconcile_intents intent ON intent.id=item.intent_id
+                 WHERE intent.project_id=?1 AND intent.store_path=?2
+                   AND item.bookmark=?3 AND item.observed_tip=?4
+                   AND intent.target_branch=?5 AND intent.destination_commit=?6
+                   AND item.outcome_kind='check_conflict'
+                 ORDER BY item.updated_at DESC LIMIT 1",
+                    cairn_db::turso::params![project, store, branch, head, base_branch, base],
+                )
+                .await?;
+            rows.next().await?.map(|row| row.text(0)).transpose()
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn clear_conflicting_verdict(status: &mut NodeCheckStatus, diagnostic: &str) {
+    // Pending is the lane's existing no-verdict state. The preparation outcome
+    // names why; neither an old verdict nor an infrastructure failure represents it.
+    status.state = NodeCheckState::Pending;
+    status.request_id = None;
+    status.observation_id = None;
+    status.cached = None;
+    status.duration_ms = None;
+    status.ran_at = None;
+    status.passed = None;
+    status.failed = None;
+    status.skipped = None;
+    status.deferred = None;
+    status.parser = None;
+    status.complete = None;
+    status.selection = None;
+    status.suite_failures = None;
+    status.failure_names.clear();
+    status.plan_audit_note = None;
+    status.output_tail = None;
+    status.failure_kind = None;
+    status.suppressed_after = None;
+    status.executor = None;
+    status.verified_on = None;
+    status.notice = Some(format!("Conflicts with base: {diagnostic}. No current verdict; earlier observations remain in history."));
+    status.declared_unverified = None;
+    status.progress = None;
+    status.base_attribution = None;
+    status.evidence = None;
 }
 
 async fn compute_node_check_statuses(
@@ -1124,6 +1215,13 @@ async fn compute_node_check_statuses(
         .ok()
         .flatten();
     clock.lap("retirement");
+    let capture_plan = retired
+        .as_ref()
+        .and_then(|retired| retired.plan.clone())
+        .or_else(|| {
+            orch.turn_end_check_runtime_status(job_id)
+                .map(|status| status.plan)
+        });
     let (branch, statuses) = if let Some(retired) = retired {
         (
             "retired",
@@ -1146,6 +1244,26 @@ async fn compute_node_check_statuses(
     append_durability_notices(&mut statuses, durability);
     append_durability_notices(&mut statuses, Ok(orch.review_durability_errors(job_id)));
     clock.lap("durability");
+    let capture_plan = match capture_plan {
+        Some(plan) => Ok(Some(plan)),
+        None => latest_recorded_wave_plan(&db, job_id).await,
+    };
+    match capture_plan {
+        Ok(Some(plan)) => append_wave_capture_notices(&mut statuses, &plan),
+        Ok(None) => {}
+        Err(error) => {
+            for status in statuses
+                .iter_mut()
+                .filter(|status| status.when == CheckWhen::Review.as_str())
+            {
+                append_notice(
+                    status,
+                    &format!("Recorded review-wave capture unreadable: {error}"),
+                );
+            }
+        }
+    }
+    clock.lap("capture");
     clock.report(job_id, branch);
     Some(statuses)
 }
@@ -1172,26 +1290,95 @@ fn append_durability_notices(
             Err(error) => vec![format!("Review durability status unreadable: {error}")],
         };
         for message in notices {
-            let notice = status.notice.get_or_insert_with(String::new);
-            if notice.contains(&message) {
-                continue;
-            }
-            if !notice.is_empty() {
-                notice.push(' ');
-            }
-            notice.push_str(&message);
+            append_notice(status, &message);
         }
+    }
+}
+
+fn append_notice(status: &mut NodeCheckStatus, message: &str) {
+    let notice = status.notice.get_or_insert_with(String::new);
+    if notice.contains(message) {
+        return;
+    }
+    if !notice.is_empty() {
+        notice.push(' ');
+    }
+    notice.push_str(message);
+}
+
+/// The recorded evaluation coordinate, never an assertion about the current
+/// lane. The logical result hash and the captured Git tree have different
+/// meanings and must never be substituted for one another.
+pub(crate) fn format_wave_capture(plan: &WavePlan) -> String {
+    fn coordinate(value: Option<&str>) -> String {
+        value
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("`{value}`"))
+            .unwrap_or_else(|| "unknown".into())
+    }
+    let mut out = format!(
+        "Recorded review-wave capture (historical metadata, not current-verdict authority): judged head {}, logical tree {}, fork {}.",
+        coordinate(Some(&plan.head)), coordinate(Some(&plan.tree_hash)), coordinate(Some(&plan.base)),
+    );
+    let Some(capture) = &plan.capture else {
+        out.push_str(" Preparation capture unknown: head before, Git tree, exact target base and accepted-install warnings were not recorded.");
+        return out;
+    };
+    out.push_str(&format!(
+        " Authority {}; revision {}; head before {}; head after {}; Git tree {}; exact target {} at {}; advanced {}; attempts {}.",
+        coordinate(Some(&capture.authority)), coordinate(Some(&capture.revision)),
+        coordinate(capture.head_before.as_deref()), coordinate(Some(&capture.head_after)),
+        coordinate(capture.git_tree.as_deref()), coordinate(capture.base_branch.as_deref()),
+        coordinate(capture.base_commit.as_deref()), capture.advanced,
+        capture.attempts.map(|attempts| attempts.to_string()).unwrap_or_else(|| "unknown".into()),
+    ));
+    if capture.head_after != plan.head {
+        out.push_str(
+            " Capture head differs from the wave's judged head; provenance is inconsistent.",
+        );
+    }
+    if !capture.provenance.is_empty() {
+        out.push(' ');
+        out.push_str(&capture.provenance);
+    }
+    for warning in &capture.warnings {
+        out.push_str(" Accepted-install warning: ");
+        out.push_str(warning);
+    }
+    out
+}
+
+fn append_wave_capture_notices(statuses: &mut [NodeCheckStatus], plan: &WavePlan) {
+    let message = format_wave_capture(plan);
+    for status in statuses
+        .iter_mut()
+        .filter(|status| status.when == CheckWhen::Review.as_str())
+    {
+        append_notice(status, &message);
+    }
+}
+
+/// Context for resource headers, including a retired or rowless wave. A
+/// completed wave's context remains explicitly historical when the head moves.
+pub(crate) async fn recorded_wave_capture(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    if let Some(status) = orch.turn_end_check_runtime_status(job_id) {
+        return Some(format_wave_capture(&status.plan));
+    }
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .ok()?;
+    match latest_recorded_wave_plan(&db, job_id).await {
+        Ok(Some(plan)) => Some(format_wave_capture(&plan)),
+        Ok(None) => None,
+        Err(error) => Some(format!("Recorded review-wave capture unreadable: {error}")),
     }
 }
 
 /// The projection while a wave is in flight.
 ///
-/// It reads only what the wave published when it planned: its sealed commit,
-/// the contract that commit declares, its tree, and every check's input hash at
-/// it. So it resolves no repository, loads no jj workspace, computes no fork
-/// point, and reads no config. Keying by the wave's sealed commit rather than
-/// the job's live head is also what keeps the key consistent with the wave's
-/// tree hash when the branch moves on mid-wave.
+/// While the head and live fork still match the wave, read its captured inputs.
+/// If either moved or is unknown, resolve inputs through the settled projection;
+/// keeping a wave alive never promotes its original verdict to a new coordinate.
 async fn live_statuses(
     orch: &Orchestrator,
     job_id: &str,
@@ -1205,7 +1392,11 @@ async fn live_statuses(
         // Every lane stays pending rather than showing stale rows from an
         // earlier run of this long-lived job, which needs only the check names:
         // the contract at the node's logical head.
-        let logical_head = resolve_job_logical_head(orch, job_id).await.ok()?;
+        let repository =
+            crate::jj::project_store_dir(&orch.config_dir, Path::new(&coords.repository_path));
+        let logical_head = cairn_vcs::resolve_coordinate(&repository, &coords.branch)
+            .await
+            .ok()?;
         clock.lap("logical_head");
         let contract = orch
             .node_check_status_cache
@@ -1229,6 +1420,22 @@ async fn live_statuses(
         ));
     };
     let plan = &status.plan;
+    let live_range =
+        crate::diff::live_job_branch_range(db, job_id, &orch.jj_binary_path, &orch.config_dir)
+            .await
+            .ok()
+            .flatten();
+    clock.lap("live_range");
+    if !live_range
+        .as_ref()
+        .is_some_and(|range| range.tip == plan.head && range.base == plan.base)
+    {
+        // Keeping a wave alive preserves its captured evidence, not permission
+        // to answer the current lanes with that evidence. The fork can change
+        // without the head moving when the integration target acquires part of
+        // this branch. Only the canonical current-input lookup can prove reuse.
+        return settled_statuses(orch, job_id, db, coords, cadence, clock).await;
+    }
     if plan.checks.is_empty() {
         return Some(unsupported_lanes(job_id, &plan.unsupported).collect());
     }
@@ -1245,34 +1452,13 @@ async fn live_statuses(
     )
     .await;
     clock.lap("base_attribution");
-    // Only a base replay that kept the branch's patch moves the head without
-    // withdrawing the wave, so a wave pinned to an earlier head is answering
-    // for the same change on the base that head was on, and its lanes say which
-    // head that was. Reading the node's head is the one VCS step this branch
-    // takes, and only when there is a verdict to label; the live window bounds
-    // it to once per poll tick per job.
-    let mut verified_on = HashMap::new();
-    if !rows.is_empty() {
-        let head = resolve_job_logical_head(orch, job_id).await.ok();
-        clock.lap("logical_head");
-        if head.is_some_and(|head| head != plan.head) {
-            let verified = VerifiedHead {
-                head: plan.head.clone(),
-                base: plan.base.clone(),
-            };
-            verified_on = rows
-                .iter()
-                .map(|lane| (lane.row.check_name.clone(), verified.clone()))
-                .collect();
-        }
-    }
     let statuses = assemble_statuses(
         orch,
         job_id,
         &plan.checks,
         LaneVerdicts {
             rows: rows_by_name(rows),
-            verified_on,
+            verified_on: HashMap::new(),
             attributions,
         },
         Some(&plan.applicable_names),
@@ -1436,20 +1622,12 @@ async fn settled_statuses(
     clock: &mut PhaseClock,
 ) -> Option<Vec<NodeCheckStatus>> {
     let project_root = std::path::PathBuf::from(&coords.repository_path);
-    let logical_repository = {
-        let jj_binary_path = orch.jj_binary_path.clone();
-        let config_dir = orch.config_dir.clone();
-        let project_repo = project_root.clone();
-        tokio::task::spawn_blocking(move || {
-            let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-        })
+    // Inspection never initializes or imports a store. Symbolic resolution
+    // refuses a split operation log instead of settling it through the CLI.
+    let logical_repository = crate::jj::project_store_dir(&orch.config_dir, &project_root);
+    let logical_head = cairn_vcs::resolve_coordinate(&logical_repository, &coords.branch)
         .await
-        .ok()?
-        .ok()?
-    };
-    clock.lap("coordinate_repository");
-    let logical_head = resolve_job_logical_head(orch, job_id).await.ok()?;
+        .ok()?;
     clock.lap("logical_head");
     // The same live fork point the review cadence gates on. Reading the
     // recorded `jobs.base_commit` here would show a node checks that its own
@@ -1486,8 +1664,18 @@ async fn settled_statuses(
     let status_project_id = coords.project_id.clone();
     let status_contract = contract.clone();
     let status_jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let (rows_by_name, applicable_names, verified_on, verdicts_elapsed) =
+    let (rows_by_name, applicable_names, verdicts_elapsed) =
         tokio::task::spawn_blocking(move || {
+            let mut commits = vec![logical_head.as_str()];
+            if let Some(range) = &live_range {
+                commits.push(range.base.as_str());
+            }
+            let status_jj = status_jj
+                .pin_immutable_read(&logical_repository, &commits)
+                .inspect_err(|error| {
+                    log::debug!("check status immutable read unavailable: {error}")
+                })
+                .ok()?;
             let checks = &status_contract.checks;
             // The projection must answer both "does this check apply" and "which
             // verdict answers it" exactly as the runners do, so it resolves each
@@ -1533,7 +1721,7 @@ async fn settled_statuses(
                 },
                 None => ChangeBasis::Unknown,
             };
-            let live_rows = head_tree.as_deref().and_then(|tree_hash| {
+            let live_rows = head_tree.as_deref().map(|tree_hash| {
                 let input_hashes =
                     check_input_hashes(checks, &inputs, entries.as_deref(), tree_hash, basis);
                 // What a wave planned at this checkout would expect, so the
@@ -1541,24 +1729,25 @@ async fn settled_statuses(
                 let expected_toolchain =
                     cairn_checkenv::expected_toolchain_identity_in(&project_root);
                 let verdicts_started = Instant::now();
-                let rows = head_verdicts(
+                let rows = current_verdict_rows(
                     status_db.clone(),
                     &status_project_id,
                     checks,
-                    HeadVerdictKeys {
+                    Some(HeadVerdictKeys {
                         tree_hash,
                         input_hashes: &input_hashes,
                         job_id: &status_job_id,
                         commit_sha: &logical_head,
                         expected_toolchain: &expected_toolchain,
-                    },
+                    }),
                 );
                 verdicts_elapsed = verdicts_started.elapsed();
-                rows.ok().map(|rows| attribute_reuse(rows, tree_hash))
+                rows
             });
-            let mut rows = live_rows
-                .or_else(|| list_check_results_for_job(status_db.clone(), &status_job_id).ok())
-                .unwrap_or_default();
+            // An unreadable coordinate or lookup is not permission to use the
+            // job's history: those rows may judge different inputs in either
+            // direction. Historical observations remain available in the ledger.
+            let rows = live_rows.unwrap_or_default();
             let applicable_names = changed.as_ref().map(|changed| {
                 plan_checks(checks, &inputs, changed, &project_root)
                     .into_iter()
@@ -1566,60 +1755,10 @@ async fn settled_statuses(
                     .map(|plan| plan.name)
                     .collect::<HashSet<_>>()
             });
-            // An applicable lane with no verdict at this head may still hold one
-            // this job recorded on an earlier head carrying the same change, when
-            // base advances replayed the branch while its wave ran.
-            let mut verified_on = HashMap::new();
-            if let (Some(head_tree), Some(range), Some(applicable)) = (
-                head_tree.as_deref(),
-                live_range.as_ref(),
-                applicable_names.as_ref(),
-            ) {
-                let missing: HashSet<String> = applicable
-                    .iter()
-                    .filter(|name| !rows.iter().any(|lane| &lane.row.check_name == *name))
-                    .cloned()
-                    .collect();
-                if !missing.is_empty() {
-                    let job_rows = list_check_results_for_job(status_db.clone(), &status_job_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|lane| lane.row)
-                        .collect();
-                    for (row, verified) in carry_forward_unchanged_patch(
-                        &missing,
-                        &logical_head,
-                        head_tree,
-                        job_rows,
-                        |row| {
-                            observed_commit_for_job(status_db.clone(), &status_job_id, row)
-                                .ok()
-                                .flatten()
-                        },
-                        |commit| {
-                            own_patch_against(
-                                &status_jj,
-                                &logical_repository,
-                                commit,
-                                &range.target_head,
-                            )
-                            .ok()
-                        },
-                    ) {
-                        verified_on.insert(row.check_name.clone(), verified);
-                        rows.push(row.into());
-                    }
-                }
-            }
-            (
-                rows_by_name(rows),
-                applicable_names,
-                verified_on,
-                verdicts_elapsed,
-            )
+            Some((rows_by_name(rows), applicable_names, verdicts_elapsed))
         })
         .await
-        .ok()?;
+        .ok()??;
     clock.lap("blocking");
     clock.record("blocking.head_verdicts", verdicts_elapsed);
     let attributions = match live_base.as_deref() {
@@ -1644,7 +1783,7 @@ async fn settled_statuses(
         &contract.checks,
         LaneVerdicts {
             rows: rows_by_name,
-            verified_on,
+            verified_on: HashMap::new(),
             attributions,
         },
         applicable_names.as_ref(),
@@ -1657,6 +1796,22 @@ async fn settled_statuses(
         job_id,
         &contract.unsupported,
     ))
+}
+
+/// Current evidence has one authority. Missing coordinates or a failed lookup
+/// yield no rows, never the job's historical last result or an equal-patch row.
+fn current_verdict_rows(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    checks: &HashMap<String, CheckCommand>,
+    head: Option<HeadVerdictKeys<'_>>,
+) -> Vec<LaneRow> {
+    let Some(head) = head else {
+        return Vec::new();
+    };
+    head_verdicts(db, project_id, checks, head)
+        .map(|rows| attribute_reuse(rows, head.tree_hash))
+        .unwrap_or_default()
 }
 
 fn rows_by_name(rows: Vec<LaneRow>) -> HashMap<String, LaneRow> {
@@ -1813,59 +1968,6 @@ fn unrecorded_output_tail(
     } else {
         None
     }
-}
-
-/// Verdicts this job recorded on an earlier head whose own patch is the current
-/// head's, for the `missing` lanes: those the current head applies but holds no
-/// verdict for.
-///
-/// A base advance that replays a branch without changing its patch does not
-/// withdraw the review wave running on it, so that wave records against the
-/// pre-replay head, whose tree (and usually its lanes' input hashes) the current
-/// head does not share. The verdict is still about the change the branch claims,
-/// so the lane carries it, naming the head and base it was recorded on. A head
-/// whose patch differs (a commit since, a conflict resolution, a replay that
-/// altered a hunk) carries nothing, and neither does anything unreadable.
-///
-/// `commit_of` names the commit a row was observed on; `patch_of` reads a head's
-/// own patch against the integration target. Each head's patch is read once.
-fn carry_forward_unchanged_patch(
-    missing: &HashSet<String>,
-    head: &str,
-    head_tree: &str,
-    job_rows: Vec<CheckResultCacheEntry>,
-    mut commit_of: impl FnMut(&CheckResultCacheEntry) -> Option<String>,
-    mut patch_of: impl FnMut(&str) -> Option<OwnPatch>,
-) -> Vec<(CheckResultCacheEntry, VerifiedHead)> {
-    let mut patches: HashMap<String, Option<OwnPatch>> = HashMap::new();
-    let mut carried = Vec::new();
-    for row in job_rows {
-        if !missing.contains(&row.check_name) || row.tree_hash == head_tree {
-            continue;
-        }
-        let Some(commit) = commit_of(&row).filter(|commit| commit != head) else {
-            continue;
-        };
-        if !patches.contains_key(head) {
-            patches.insert(head.to_string(), patch_of(head));
-        }
-        if !patches.contains_key(&commit) {
-            let patch = patch_of(&commit);
-            patches.insert(commit.clone(), patch);
-        }
-        let (Some(Some(current)), Some(Some(earlier))) = (patches.get(head), patches.get(&commit))
-        else {
-            continue;
-        };
-        if current.patch == earlier.patch {
-            let verified = VerifiedHead {
-                head: commit,
-                base: earlier.base.clone(),
-            };
-            carried.push((row, verified));
-        }
-    }
-    carried
 }
 
 /// Mark every row reached from another tree as `cached`.
@@ -2038,20 +2140,38 @@ fn status_fast_tier_label(status: &NodeCheckStatus) -> Option<String> {
         })
 }
 
+fn annotation_with_notice(mut annotation: String, status: &NodeCheckStatus) -> String {
+    if let Some(notice) = status.notice.as_deref().filter(|notice| !notice.is_empty()) {
+        if !annotation.contains(notice) {
+            if !annotation.is_empty() {
+                annotation.push_str(", ");
+            }
+            annotation.push_str(notice);
+        }
+    }
+    annotation
+}
+
 pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
     // Checked ahead of suppression: a head row that was bounded earlier and is
     // now not attempted at all says the newer, more useful thing.
     if status.failure_kind.as_deref() == Some(CheckFailureKind::NotPlaceable.as_str()) {
-        return Some(not_placeable_annotation(status.output_tail.as_deref()));
+        return Some(annotation_with_notice(
+            not_placeable_annotation(status.output_tail.as_deref()),
+            status,
+        ));
     }
     if status.failure_kind.as_deref() == Some(CheckFailureKind::ConfigUnreadable.as_str()) {
-        return Some(UNREADABLE_CONFIG_ANNOTATION.to_string());
+        return Some(annotation_with_notice(
+            UNREADABLE_CONFIG_ANNOTATION.to_string(),
+            status,
+        ));
     }
     // A suppressed check produced no verdict at this tree — Cairn declined to run
     // it. Every arm below describes a verdict, so saying any of them here would
     // dress the absence of a result up as one.
     if status.suppressed_after.is_some() {
-        return Some("suppressed".to_string());
+        return Some(annotation_with_notice("suppressed".to_string(), status));
     }
     if status.state == NodeCheckState::Unsupported {
         return status.notice.clone();
@@ -2282,6 +2402,16 @@ async fn latest_planned_unsupported(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<BTreeMap<String, UnsupportedCheck>, String> {
+    Ok(latest_recorded_wave_plan(db, job_id)
+        .await?
+        .map(|plan| plan.unsupported.clone())
+        .unwrap_or_default())
+}
+
+async fn latest_recorded_wave_plan(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<Arc<WavePlan>>, String> {
     let plan_json = db
         .query_opt(
             "SELECT plan_json FROM turn_end_check_attempts
@@ -2293,10 +2423,10 @@ async fn latest_planned_unsupported(
         .await
         .map_err(|error| error.to_string())?;
     let Some(plan_json) = plan_json else {
-        return Ok(BTreeMap::new());
+        return Ok(None);
     };
     serde_json::from_str::<WavePlan>(&plan_json)
-        .map(|plan| plan.unsupported)
+        .map(|plan| Some(Arc::new(plan)))
         .map_err(|error| error.to_string())
 }
 
@@ -2937,6 +3067,7 @@ mod tests {
             panic!("`when: landing` is unsupported without the variant");
         };
         let plan = WavePlan {
+            capture: None,
             head: "head".to_string(),
             base: "base".to_string(),
             tree_hash: "tree".to_string(),
@@ -3222,94 +3353,6 @@ mod tests {
             toolchain_fingerprint: None,
             defined_by_commit_sha: Some("commit-a".to_string()),
         }
-    }
-
-    fn own_patch(base: &str, patch: &str) -> crate::jj::OwnPatch {
-        crate::jj::OwnPatch {
-            base: base.to_string(),
-            patch: patch.to_string(),
-        }
-    }
-
-    /// A wave kept across base replays records on the pre-replay head. A lane
-    /// the current head has no verdict for carries that verdict exactly when the
-    /// earlier head's own patch is the current head's, naming that head and the
-    /// base it was on; a head whose patch differs carries nothing, and a lane
-    /// that already holds a verdict here, or a row from this very tree, is left
-    /// alone.
-    #[test]
-    fn a_verdict_carries_forward_only_from_a_head_with_the_same_patch() {
-        let row = |name: &str, tree: &str| CheckResultCacheEntry {
-            source_observation_id: None,
-            tree_hash: tree.to_string(),
-            ..verdict_row(name, name != "red")
-        };
-        let rows = vec![
-            row("red", "tree-replayed-off"),
-            row("green", "tree-replayed-off"),
-            row("edited", "tree-before-commit"),
-            row("answered", "tree-replayed-off"),
-            row("here", "tree-head"),
-        ];
-        let missing: HashSet<String> = ["red", "green", "edited", "here"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let mut patch_reads = Vec::new();
-        let carried = carry_forward_unchanged_patch(
-            &missing,
-            "head",
-            "tree-head",
-            rows,
-            |row| {
-                Some(match row.tree_hash.as_str() {
-                    "tree-replayed-off" => "replayed-off".to_string(),
-                    "tree-before-commit" => "before-commit".to_string(),
-                    _ => "head".to_string(),
-                })
-            },
-            |commit| {
-                patch_reads.push(commit.to_string());
-                Some(match commit {
-                    "head" => own_patch("main-now", "+change\n"),
-                    "replayed-off" => own_patch("main-then", "+change\n"),
-                    _ => own_patch("main-then", "+partial\n"),
-                })
-            },
-        );
-        let names: Vec<_> = carried
-            .iter()
-            .map(|(row, verified)| (row.check_name.as_str(), verified.clone()))
-            .collect();
-        let verified = VerifiedHead {
-            head: "replayed-off".to_string(),
-            base: "main-then".to_string(),
-        };
-        assert_eq!(
-            names,
-            vec![("red", verified.clone()), ("green", verified)],
-            "a red carries as faithfully as a green"
-        );
-        patch_reads.sort();
-        assert_eq!(
-            patch_reads,
-            vec!["before-commit", "head", "replayed-off"],
-            "each head's patch is read once"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_patch_carries_nothing() {
-        let missing: HashSet<String> = ["rust".to_string()].into_iter().collect();
-        let carried = carry_forward_unchanged_patch(
-            &missing,
-            "head",
-            "tree-head",
-            vec![verdict_row("rust", true)],
-            |_| Some("earlier".to_string()),
-            |commit| (commit == "earlier").then(|| own_patch("main", "+x\n")),
-        );
-        assert!(carried.is_empty());
     }
 
     fn parsed_json(passed: usize, failures: &[&str]) -> String {
@@ -5059,5 +5102,1197 @@ mod tests {
             ),
             Some(LaneExistence::Absent)
         );
+    }
+}
+
+#[cfg(test)]
+mod complete_input_projection_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::execution::cache::{
+        record_fresh_check_observation, FreshCheckObservationWrite, SealedCheckCoordinate,
+    };
+    use crate::execution::checks_settlement::{classify, owes_a_review_wave, ChecksSnapshot};
+    use crate::execution::gates::vocabulary::{
+        check_verdict_evidence, CheckVerdictCoordinate, GateOutcome,
+    };
+    use crate::execution::inputs::fixtures::TreeFixture;
+    use crate::messages::delivery::HeadTurn;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
+
+    const TOOLS: &str = "rustc=fixture;bun=fixture";
+    const ADDED: &str = "src-tauri/turso_migrations/0292_branch.sql";
+
+    pub(super) struct Fixture {
+        pub(super) root: tempfile::TempDir,
+        pub(super) orch: Orchestrator,
+        pub(super) db: Arc<LocalDb>,
+        pub(super) checks: HashMap<String, CheckCommand>,
+        pub(super) tools: String,
+        name: String,
+    }
+
+    impl Fixture {
+        pub(super) async fn new(name: &str) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let db = Arc::new(
+                LocalDb::open_migrated_for_test(root.path().join("checks.db"))
+                    .await
+                    .unwrap(),
+            );
+            db.execute_script(
+                "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+                 VALUES('project-a','default','P','P','/tmp/project-a',1,1);",
+            )
+            .await
+            .unwrap();
+            let state = Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.path().join("search")).unwrap()),
+            ));
+            let orch = Orchestrator::builder(
+                state,
+                Arc::new(TestServicesBuilder::new().build()),
+                root.path().to_path_buf(),
+            )
+            .build();
+            let check = serde_yaml::from_str(
+                "command: bun run check:migrations\nwhen: review\npolicy: gate\nbaseRelative: true\nimpact: [src-tauri/**]\n"
+            ).unwrap();
+            Self {
+                root,
+                orch,
+                db,
+                checks: HashMap::from([(name.into(), check)]),
+                tools: TOOLS.into(),
+                name: name.into(),
+            }
+        }
+
+        fn keys(
+            &self,
+            tree: &TreeFixture,
+            head: &str,
+            basis: ChangeBasis<'_>,
+        ) -> OwnedHeadVerdictKeys {
+            let entries = tree.entries();
+            let snapshot = TreeSnapshot::new(Some(&entries), tree);
+            let inputs = ResolvedInputs::resolve(&self.checks, &HashMap::new(), &snapshot);
+            OwnedHeadVerdictKeys {
+                tree_hash: format!("tree-{head}"),
+                input_hashes: check_input_hashes(
+                    &self.checks,
+                    &inputs,
+                    Some(&entries),
+                    &format!("tree-{head}"),
+                    basis,
+                ),
+                job_id: "job-a".into(),
+                commit_sha: head.into(),
+                expected_toolchain: self.tools.clone(),
+            }
+        }
+
+        fn environment(&self) -> String {
+            let check = &self.checks[&self.name];
+            cairn_checkenv::verdict_environment_with_runtime(
+                &cairn_checkenv::verdict_environment_hash(
+                    crate::execution::check_identity::verdict_environment_names(check),
+                    |name| std::env::var(name).ok(),
+                ),
+                &crate::execution::check_identity::expected_verdict_runtime(check, &self.tools),
+            )
+        }
+
+        pub(super) fn observe(&self, head: &OwnedHeadVerdictKeys, passed: bool, id: &str) {
+            let input = &head.input_hashes[&self.name];
+            record_fresh_check_observation(self.db.clone(), FreshCheckObservationWrite {
+                manual_handle: None,
+                publication_id: None,
+                sealed_coordinate: SealedCheckCoordinate::new(&head.commit_sha, &head.commit_sha, &head.tree_hash, input),
+                id: id.into(),
+                public_handle: format!("{id:0<24}"),
+                project_id: "project-a".into(),
+                commit_sha: head.commit_sha.clone(),
+                defined_by_commit_sha: head.commit_sha.clone(),
+                tree_hash: head.tree_hash.clone(),
+                check_name: self.name.clone(),
+                input_hash: input.clone(),
+                environment_fingerprint: "fixture-environment".into(),
+                verdict_platform: Some(crate::execution::check_identity::gating_platform().into()),
+                verdict_arch: Some(std::env::consts::ARCH.into()),
+                verdict_environment_hash: Some(self.environment()),
+                exit_code: if passed { 0 } else { 1 },
+                verdict: if passed { "passed" } else { "failed" }.into(),
+                failure_kind: None,
+                complete: true,
+                reusable: true,
+                non_reusable_reason: None,
+                parser_version: crate::execution::check_identity::CHECK_PARSER_VERSION as i64,
+                result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+                ran_at: 100,
+                duration_ms: 10,
+                job_id: Some("job-a".into()),
+                run_id: None,
+                cadence: "review".into(),
+                executor_id: None,
+                executor_device_id: None,
+                executor_connection_generation: None,
+                executor_cell_id: None,
+                executor_lease_epoch: None,
+                executor_started_at_unix_ms: None,
+                executor_finished_at_unix_ms: None,
+                runner_build_id: Some(cairn_checkenv::implementation_identity().into()),
+                toolchain_fingerprint: Some(self.tools.clone()),
+                output_tail: format!("original evidence on {}", head.commit_sha),
+                target_results_json: Some(r#"{"parser":"tsc","complete":true,"passed":0,"failed":0,"skipped":0,"failures":[]}"#.into()),
+                selection: None,
+                deferred_count: 0,
+                plan_audit_state: None,
+                plan_audit_note: None,
+                audit_findings: vec![],
+                phases: None,
+                execution_warmth: None,
+                cell_origin: None,
+                build_jobs: None,
+                tests: vec![],
+                infra_reset_scopes: vec![],
+                failure_signature: None,
+                placement_facts: None,
+                substrate_shape: None,
+            }).unwrap();
+        }
+
+        fn snapshot(&self, head: Option<&OwnedHeadVerdictKeys>, running: bool) -> ChecksSnapshot {
+            let rows = current_verdict_rows(
+                self.db.clone(),
+                "project-a",
+                &self.checks,
+                head.map(OwnedHeadVerdictKeys::keys),
+            );
+            let statuses = assemble_statuses(
+                &self.orch,
+                "job-a",
+                &self.checks,
+                LaneVerdicts {
+                    rows: rows_by_name(rows),
+                    ..LaneVerdicts::default()
+                },
+                Some(&HashSet::from([self.name.clone()])),
+                &HashMap::new(),
+                if running {
+                    WaveCadence::reviewing_for_test()
+                } else {
+                    WaveCadence::default()
+                },
+                None,
+            );
+            ChecksSnapshot {
+                settlement: classify(&statuses, HeadTurn::Idle, running),
+                statuses,
+                terminal_reason: None,
+                retired: None,
+            }
+        }
+
+        pub(super) fn gate(&self, head: &OwnedHeadVerdictKeys) -> GateOutcome {
+            check_verdict_evidence(
+                self.db.clone(),
+                &CheckVerdictCoordinate {
+                    project_id: "project-a".into(),
+                    check_name: self.name.clone(),
+                    input_hash: head.input_hashes[&self.name].clone(),
+                    verdict_platforms: crate::execution::check_identity::verdict_platforms(
+                        &self.checks[&self.name],
+                    ),
+                    verdict_environment_hash: self.environment(),
+                },
+                Some(&serde_json::json!("passed")),
+            )
+            .unwrap()
+        }
+
+        fn assert_absent(&self, head: &OwnedHeadVerdictKeys) {
+            assert_eq!(
+                self.gate(head),
+                GateOutcome::NoEvidence,
+                "a gate must not infer either colour"
+            );
+            let running = self.snapshot(Some(head), true);
+            assert_eq!(
+                running.verdict(),
+                "moving",
+                "an old completed lane must not release a suite wait"
+            );
+            let stopped = self.snapshot(Some(head), false);
+            assert_eq!(stopped.verdict(), "incomplete");
+            assert!(
+                owes_a_review_wave(&stopped),
+                "the waiter must still demand current evidence"
+            );
+        }
+    }
+
+    fn changed(path: &str) -> crate::jj::GraphFileChange {
+        crate::jj::GraphFileChange {
+            path: path.into(),
+            previous_path: None,
+            status: "added".into(),
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    fn against(changed: &[crate::jj::GraphFileChange]) -> ChangeBasis<'_> {
+        ChangeBasis::Against {
+            changed,
+            base_entries: None,
+        }
+    }
+
+    // Both trees contain the identical branch-authored 0292 file. Only the
+    // base's migration directory changes: filling a gap repairs a red; adding
+    // another 0292 invalidates a green.
+    #[tokio::test]
+    async fn base_directory_moves_invalidate_both_old_red_and_old_green_for_gates_and_waits() {
+        for passed in [false, true] {
+            let f = Fixture::new("migrations").await;
+            let authored = [changed(ADDED)];
+            let old_tree = TreeFixture::new()
+                .file("src-tauri/turso_migrations/0290_base.sql", "base")
+                .file(ADDED, "branch");
+            let old_tree = if passed {
+                old_tree.file("src-tauri/turso_migrations/0291_base.sql", "base")
+            } else {
+                old_tree
+            };
+            let new_tree = if passed {
+                TreeFixture::new()
+                    .file("src-tauri/turso_migrations/0290_base.sql", "base")
+                    .file("src-tauri/turso_migrations/0291_base.sql", "base")
+                    .file("src-tauri/turso_migrations/0292_base.sql", "collision")
+                    .file(ADDED, "branch")
+            } else {
+                TreeFixture::new()
+                    .file("src-tauri/turso_migrations/0290_base.sql", "base")
+                    .file("src-tauri/turso_migrations/0291_base.sql", "gap repaired")
+                    .file(ADDED, "branch")
+            };
+            let original = f.keys(&old_tree, "original", against(&authored));
+            let current = f.keys(&new_tree, "replayed", against(&authored));
+            assert_ne!(original.input_hashes, current.input_hashes);
+            f.observe(&original, passed, "old-verdict");
+            f.assert_absent(&current);
+            let history = f.snapshot(Some(&original), false);
+            assert_eq!(history.verdict(), if passed { "passed" } else { "failed" });
+            assert_eq!(
+                history.statuses[0].output_tail.as_deref(),
+                (!passed).then_some("original evidence on original")
+            );
+            let original_rows =
+                crate::execution::cache::latest_check_results_for_job(&f.db, "job-a")
+                    .await
+                    .unwrap();
+            assert_eq!(
+                original_rows[0].row.output_tail,
+                "original evidence on original"
+            );
+            assert_eq!(original_rows[0].row.tree_hash, original.tree_hash);
+            assert_eq!(
+                original_rows[0].row.defined_by_commit_sha.as_deref(),
+                Some("original")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_complete_inputs_reuse_across_source_commits_for_gates_and_waits() {
+        for passed in [false, true] {
+            let f = Fixture::new("migrations").await;
+            let authored = [changed(ADDED)];
+            let tree = TreeFixture::new().file(ADDED, "branch");
+            let original = f.keys(&tree, "original", against(&authored));
+            let replayed = TreeFixture::new()
+                .file(ADDED, "branch")
+                .file("README.md", "an unrelated base change");
+            let current = f.keys(&replayed, "replayed", against(&authored));
+            assert_eq!(original.input_hashes, current.input_hashes);
+            f.observe(&original, passed, "same-inputs");
+            assert_eq!(
+                f.gate(&current),
+                if passed {
+                    GateOutcome::Satisfied
+                } else {
+                    GateOutcome::Refuted
+                }
+            );
+            let snapshot = f.snapshot(Some(&current), true);
+            assert_eq!(snapshot.verdict(), if passed { "passed" } else { "failed" });
+            assert_eq!(snapshot.statuses[0].cached, Some(true));
+            assert_eq!(
+                snapshot.statuses[0].verified_on, None,
+                "compatible reuse answers current inputs without relabelling its source"
+            );
+            assert_eq!(
+                snapshot.statuses[0].output_tail.as_deref(),
+                (!passed).then_some("original evidence on original")
+            );
+            let original_rows =
+                crate::execution::cache::latest_check_results_for_job(&f.db, "job-a")
+                    .await
+                    .unwrap();
+            assert_eq!(
+                original_rows[0].row.output_tail,
+                "original evidence on original"
+            );
+            assert_eq!(original_rows[0].row.tree_hash, original.tree_hash);
+            assert_eq!(
+                original_rows[0].row.defined_by_commit_sha.as_deref(),
+                Some("original")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_legacy_history_without_source_provenance_cannot_answer_current_lanes() {
+        for passed in [false, true] {
+            let f = Fixture::new("migrations").await;
+            let authored = [changed(ADDED)];
+            let original_tree = TreeFixture::new().file(ADDED, "branch");
+            let current_tree = TreeFixture::new()
+                .file(ADDED, "branch")
+                .file("README.md", "unrelated base change");
+            let original = f.keys(&original_tree, "original", against(&authored));
+            let current = f.keys(&current_tree, "current", against(&authored));
+            assert_eq!(original.input_hashes, current.input_hashes);
+            // This is old hot-index history, not an immutable observation: no
+            // definition, environment, or source-observation provenance exists.
+            f.db.execute(
+                "INSERT INTO check_result_cache
+                   (project_id,tree_hash,input_hash,check_name,exit_code,passed,
+                    output_tail,duration_ms,ran_at,job_id,cached)
+                 VALUES('project-a','tree-original',?1,'migrations',?2,?3,
+                    'legacy historical result',1,100,'job-a',0)",
+                (
+                    original.input_hashes["migrations"].clone(),
+                    if passed { 0_i64 } else { 1_i64 },
+                    if passed { 1_i64 } else { 0_i64 },
+                ),
+            )
+            .await
+            .unwrap();
+            f.assert_absent(&current);
+            let history = crate::execution::cache::latest_check_results_for_job(&f.db, "job-a")
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].row.passed, passed);
+            assert_eq!(history[0].row.tree_hash, "tree-original");
+            assert_eq!(history[0].row.defined_by_commit_sha, None);
+            assert_eq!(history[0].row.output_tail, "legacy historical result");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_coordinate_and_unknown_change_do_not_fall_back_to_job_history() {
+        for passed in [false, true] {
+            let f = Fixture::new("migrations").await;
+            let tree = TreeFixture::new().file(ADDED, "branch");
+            let original = f.keys(&tree, "original", against(&[changed(ADDED)]));
+            f.observe(&original, passed, "known-inputs");
+            let unknown = f.keys(&tree, "current", ChangeBasis::Unknown);
+            f.assert_absent(&unknown);
+            assert_eq!(f.snapshot(None, false).verdict(), "incomplete");
+            assert_eq!(f.snapshot(None, true).verdict(), "moving");
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_or_missing_base_blobs_do_not_answer_gates_or_waits_even_at_the_same_tree() {
+        let f = Fixture::new("executor-protocol").await;
+        let path = "src-tauri/os/cairn-common/src/executor_protocol.rs";
+        let authored = [changed(path)];
+        let tree = TreeFixture::new().file(path, "branch protocol");
+        let old_base = vec![(path.into(), "base-v1".into())];
+        let new_base = vec![(path.into(), "base-v2".into())];
+        let original = f.keys(
+            &tree,
+            "same-head",
+            ChangeBasis::Against {
+                changed: &authored,
+                base_entries: Some(&old_base),
+            },
+        );
+        f.observe(&original, true, "protocol-v1");
+        for base_entries in [Some(new_base.as_slice()), None] {
+            let current = f.keys(
+                &tree,
+                "same-head",
+                ChangeBasis::Against {
+                    changed: &authored,
+                    base_entries,
+                },
+            );
+            f.assert_absent(&current);
+        }
+    }
+}
+
+#[cfg(test)]
+mod moved_wave_projection_tests {
+    use super::complete_input_projection_tests::Fixture;
+    use super::*;
+    use crate::execution::checks_settlement::node_checks_settlement;
+    use crate::jj::tests::{git, git_stdout, init_project, jj_bin};
+
+    // Use real store bookmarks and the live/settled selector. A completed
+    // captured result answers current consumers only through complete-input
+    // identity, never merely through an equal patch or its source head.
+    #[tokio::test]
+    async fn a_preserved_wave_answers_current_consumers_only_when_complete_inputs_match() {
+        let Some(bin) = jj_bin() else { return };
+        for (old_passed, movement) in [
+            (false, "seal"),
+            (true, "seal"),
+            (false, "fork"),
+            (true, "fork"),
+            (false, "replay"),
+            (true, "replay"),
+            (false, "reuse"),
+            (true, "reuse"),
+        ] {
+            let mut f = Fixture::new("migrations").await;
+            f.orch.jj_binary_path = bin.clone();
+            let repo = f.root.path().join("repo");
+            std::fs::create_dir_all(repo.join(".cairn")).unwrap();
+            std::fs::create_dir_all(repo.join("src-tauri/turso_migrations")).unwrap();
+            init_project(&repo);
+            std::fs::write(repo.join(".cairn/config.yaml"),
+                "checks:\n  migrations:\n    command: bun run check:migrations\n    when: review\n    policy: gate\n    baseRelative: true\n    impact: [src-tauri/**]\n"
+            ).unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-qm", "contract"]);
+            let base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+            git(&repo, &["checkout", "-qb", "review-branch"]);
+            std::fs::write(
+                repo.join("src-tauri/turso_migrations/0291_prefix.sql"),
+                "prefix",
+            )
+            .unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-qm", "branch prefix"]);
+            let prefix_head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+            std::fs::write(
+                repo.join("src-tauri/turso_migrations/0292_branch.sql"),
+                "old inputs",
+            )
+            .unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-qm", "old seal"]);
+            let old_head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+            f.db.execute(
+                "UPDATE projects SET repo_path=?1 WHERE id='project-a'",
+                (repo.to_string_lossy().into_owned(),),
+            )
+            .await
+            .unwrap();
+            f.db.execute_script(
+                "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+                   VALUES('issue-a','project-a',1,'I','active',1,1);
+                 INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+                   VALUES('exec-a','r','issue-a','project-a','running',1,1);
+                 INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+                   VALUES('job-a','project-a','issue-a','exec-a','complete','builder','builder','review-branch','main',1,1);"
+            ).await.unwrap();
+            f.tools = cairn_checkenv::expected_toolchain_identity_in(&repo);
+            let jj = crate::jj::environment(&bin, &f.orch.config_dir);
+            let store = crate::jj::coordinate_repository(&jj, &f.orch.config_dir, &repo).unwrap();
+            let original = captured_keys(&f, &jj, &store, &old_head, &base);
+            let plan = Arc::new(WavePlan {
+                capture: Some(crate::execution::checks::CheckCapture {
+                    authority: "managed".into(),
+                    revision: "review-branch".into(),
+                    head_before: Some(old_head.clone()),
+                    head_after: old_head.clone(),
+                    git_tree: Some(git_stdout(
+                        &repo,
+                        &["rev-parse", &format!("{old_head}^{{tree}}")],
+                    )),
+                    base_branch: Some("main".into()),
+                    base_commit: Some(base.clone()),
+                    advanced: false,
+                    attempts: Some(1),
+                    warnings: vec!["fixture accepted export follow-up pending".into()],
+                    provenance: "original immutable wave capture".into(),
+                }),
+                head: old_head.clone(),
+                base: base.clone(),
+                tree_hash: original.tree_hash.clone(),
+                checks: f.checks.clone(),
+                applicable_names: HashSet::from(["migrations".into()]),
+                input_hashes: original.input_hashes.clone(),
+                expected_toolchain: original.expected_toolchain.clone(),
+                unsupported: BTreeMap::new(),
+            });
+            let slot = f
+                .orch
+                .try_begin_turn_end_checks("job-a", "old-wave")
+                .unwrap();
+            f.db.execute(
+                "INSERT INTO turn_end_check_attempts(id,job_id,state,plan_json,created_at,updated_at) VALUES('old-wave','job-a','submitted',?1,1,1)",
+                (serde_json::to_string(plan.as_ref()).unwrap(),),
+            ).await.unwrap();
+            slot.cancel().set_runtime_status("old-wave", plan.clone());
+
+            let mut current_base = match movement {
+                "fork" => {
+                    // The target acquired a prefix without moving this head.
+                    git(&repo, &["update-ref", "refs/heads/main", &prefix_head]);
+                    prefix_head
+                }
+                "replay" | "reuse" => {
+                    // Replaying keeps both authored files. Only a selected
+                    // base input, not an unrelated README, changes the key.
+                    git(&repo, &["checkout", "main"]);
+                    let path = if movement == "reuse" {
+                        "README.md"
+                    } else {
+                        "src-tauri/turso_migrations/0290_base.sql"
+                    };
+                    let path = repo.join(path);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, "new base input").unwrap();
+                    git(&repo, &["add", "-A"]);
+                    git(&repo, &["commit", "-qm", "base advanced"]);
+                    git_stdout(&repo, &["rev-parse", "HEAD"])
+                }
+                _ => {
+                    std::fs::write(
+                        repo.join("src-tauri/turso_migrations/0292_branch.sql"),
+                        "new inputs",
+                    )
+                    .unwrap();
+                    git(&repo, &["add", "-A"]);
+                    git(&repo, &["commit", "-qm", "new seal"]);
+                    base.clone()
+                }
+            };
+            crate::jj::import_git(&jj, &store).unwrap();
+            if matches!(movement, "replay" | "reuse") {
+                jj.run(
+                    &store,
+                    &[
+                        "rebase",
+                        "-b",
+                        "review-branch",
+                        "-o",
+                        "main",
+                        "--ignore-working-copy",
+                    ],
+                    "test fixture unchanged-patch replay",
+                )
+                .unwrap();
+                let intermediate_head = cairn_vcs::resolve_coordinate(&store, "review-branch")
+                    .await
+                    .unwrap();
+                let patch_unchanged =
+                    crate::jj::own_patch_against(&jj, &repo, &old_head, &current_base)
+                        .unwrap()
+                        .patch
+                        == crate::jj::own_patch_against(
+                            &jj,
+                            &repo,
+                            &intermediate_head,
+                            &current_base,
+                        )
+                        .unwrap()
+                        .patch;
+                assert!(patch_unchanged);
+                crate::execution::checks::cancel_stale_review_on_branch_advance(
+                    &f.orch,
+                    "job-a",
+                    crate::execution::checks::BranchAdvance::BaseReplay { patch_unchanged },
+                )
+                .await;
+                assert!(!slot.is_cancelled());
+                assert_eq!(plan.head, old_head);
+                assert_eq!(plan.base, base);
+                assert_eq!(plan.tree_hash, original.tree_hash);
+                f.orch
+                    .invalidate_node_check_status("job-a", "test-first-base-advance");
+                assert_eq!(
+                    node_checks_settlement(&f.orch, "job-a", Some("migrations"))
+                        .await
+                        .unwrap()
+                        .verdict(),
+                    "moving"
+                );
+
+                let path = if movement == "reuse" {
+                    "README.md"
+                } else {
+                    "src-tauri/turso_migrations/0290_base.sql"
+                };
+                std::fs::write(repo.join(path), "second base input").unwrap();
+                git(&repo, &["add", "-A"]);
+                git(
+                    &repo,
+                    &[
+                        "commit",
+                        "-qm",
+                        "base advances again before the wave finishes",
+                    ],
+                );
+                let second_base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+                assert_ne!(second_base, current_base);
+                current_base = second_base;
+                crate::jj::import_git(&jj, &store).unwrap();
+                jj.run(
+                    &store,
+                    &[
+                        "rebase",
+                        "-b",
+                        "review-branch",
+                        "-o",
+                        "main",
+                        "--ignore-working-copy",
+                    ],
+                    "second unchanged-patch replay while original wave runs",
+                )
+                .unwrap();
+            }
+            let new_head = cairn_vcs::resolve_coordinate(&store, "review-branch")
+                .await
+                .unwrap();
+            assert_eq!(new_head == old_head, movement == "fork");
+            if matches!(movement, "replay" | "reuse") {
+                let old_patch =
+                    crate::jj::own_patch_against(&jj, &repo, &old_head, &current_base).unwrap();
+                let new_patch =
+                    crate::jj::own_patch_against(&jj, &repo, &new_head, &current_base).unwrap();
+                assert_eq!(
+                    old_patch.patch, new_patch.patch,
+                    "patch equality is not verdict identity"
+                );
+                crate::execution::checks::cancel_stale_review_on_branch_advance(
+                    &f.orch,
+                    "job-a",
+                    crate::execution::checks::BranchAdvance::BaseReplay {
+                        patch_unchanged: old_patch.patch == new_patch.patch,
+                    },
+                )
+                .await;
+                assert!(
+                    !slot.is_cancelled(),
+                    "both base advances preserve the original wave"
+                );
+            }
+            let current = captured_keys(&f, &jj, &store, &new_head, &current_base);
+            assert_eq!(
+                original.input_hashes == current.input_hashes,
+                movement == "reuse"
+            );
+            assert_eq!(
+                crate::execution::cache::resolve_job_logical_head(&f.orch, "job-a")
+                    .await
+                    .unwrap(),
+                new_head
+            );
+
+            // Completion stays attributed to the original plan. Only the
+            // complete-input-compatible case can answer either current consumer.
+            f.observe(&original, old_passed, "late-old-wave");
+            let completed_original = plan_verdict_rows(&f.db, "project-a", "job-a", &plan).await;
+            assert_eq!(completed_original.len(), 1);
+            assert_eq!(completed_original[0].row.tree_hash, original.tree_hash);
+            assert_eq!(
+                completed_original[0].row.defined_by_commit_sha.as_deref(),
+                Some(old_head.as_str())
+            );
+            assert_eq!(
+                completed_original[0].row.input_hash,
+                original.input_hashes["migrations"]
+            );
+            assert_eq!(completed_original[0].row.passed, old_passed);
+            assert!(
+                !slot.is_cancelled(),
+                "projection must not cancel preserved work"
+            );
+            f.orch
+                .invalidate_node_check_status("job-a", "test-new-seal");
+            let waiting = node_checks_settlement(&f.orch, "job-a", Some("migrations"))
+                .await
+                .unwrap();
+            let recorded_capture = format_wave_capture(&plan);
+            assert!(waiting.statuses[0]
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains(&recorded_capture));
+            assert!(recorded_capture.contains("fixture accepted export follow-up pending"));
+            assert!(recorded_capture.contains(&format!("head before `{old_head}`")));
+            assert!(recorded_capture.contains(&format!("exact target `main` at `{base}`")));
+            use crate::execution::gates::vocabulary::GateOutcome;
+            let expected_gate = if movement == "reuse" {
+                if old_passed {
+                    GateOutcome::Satisfied
+                } else {
+                    GateOutcome::Refuted
+                }
+            } else {
+                GateOutcome::NoEvidence
+            };
+            assert_eq!(f.gate(&current), expected_gate);
+            assert_eq!(resolved_gate(&f.orch).await, expected_gate);
+            if movement == "reuse" {
+                assert_eq!(
+                    waiting.verdict(),
+                    if old_passed { "passed" } else { "failed" }
+                );
+                assert_eq!(waiting.statuses[0].cached, Some(true));
+                assert_eq!(waiting.statuses[0].verified_on, None);
+            } else {
+                assert_eq!(waiting.verdict(), "moving");
+                assert_eq!(waiting.statuses[0].state, NodeCheckState::Pending);
+                f.observe(&current, !old_passed, "new-wave-verdict");
+                f.orch
+                    .invalidate_node_check_status("job-a", "test-current-result");
+                let answered = node_checks_settlement(&f.orch, "job-a", Some("migrations"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    answered.verdict(),
+                    if old_passed { "failed" } else { "passed" }
+                );
+                assert_eq!(
+                    f.gate(&current),
+                    if old_passed {
+                        GateOutcome::Refuted
+                    } else {
+                        GateOutcome::Satisfied
+                    }
+                );
+                assert_eq!(resolved_gate(&f.orch).await, f.gate(&current));
+            }
+            assert_eq!(plan.head, old_head);
+            assert_eq!(plan.base, base);
+            assert_eq!(plan.tree_hash, original.tree_hash);
+            assert!(
+                !slot.is_cancelled(),
+                "reading current verdicts must not cancel the old wave"
+            );
+            f.orch.release_turn_end_slot_for_test("job-a");
+            drop(slot);
+            assert_eq!(
+                recorded_wave_capture(&f.orch, "job-a").await.as_deref(),
+                Some(recorded_capture.as_str())
+            );
+            let cairn_vcs::SettledOperation::Single(operation) =
+                cairn_vcs::settled_operation(&store).unwrap()
+            else {
+                panic!("fixture starts with one operation");
+            };
+            for name in ["split-a", "split-b"] {
+                jj.run(
+                    &store,
+                    &[
+                        "--at-op",
+                        &operation,
+                        "bookmark",
+                        "create",
+                        "-r",
+                        &old_head,
+                        name,
+                        "--ignore-working-copy",
+                    ],
+                    "fork status fixture operation log",
+                )
+                .unwrap();
+            }
+            let heads = || match cairn_vcs::settled_operation(&store).unwrap() {
+                cairn_vcs::SettledOperation::Split(heads) => heads.len(),
+                cairn_vcs::SettledOperation::Single(_) => 1,
+            };
+            assert_eq!(heads(), 2);
+            f.orch
+                .invalidate_node_check_status("job-a", "test-split-log");
+            assert!(node_check_statuses(&f.orch, "job-a").await.is_none());
+            assert!(node_checks_settlement(&f.orch, "job-a", Some("migrations"))
+                .await
+                .is_err());
+            // Immutable history remains readable, without making the current
+            // symbolic branch authoritative on either side of the split.
+            assert!(
+                !crate::execution::checks_main::first_parent_ancestry(&jj, &store, &old_head)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                recorded_wave_capture(&f.orch, "job-a").await.as_deref(),
+                Some(recorded_capture.as_str())
+            );
+            assert_eq!(
+                heads(),
+                2,
+                "status and historical reads must not settle the log"
+            );
+            f.db.execute("UPDATE issues SET status='closed' WHERE id='issue-a'", ())
+                .await
+                .unwrap();
+            f.orch
+                .invalidate_node_check_status("job-a", "test-retired-capture");
+            let retired = node_check_statuses(&f.orch, "job-a").await.unwrap();
+            assert!(retired[0]
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains(&recorded_capture));
+            let resource =
+                crate::execution::checks_turn_end::render_turn_end_checks_section(&f.orch, "job-a")
+                    .await
+                    .unwrap();
+            assert!(resource.contains(&recorded_capture));
+            assert!(resource.contains("This node was closed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_base_conflict_hides_a_cached_green_but_coordinate_mismatches_do_not() {
+        use crate::orchestrator::base_advance::preparation::{
+            prepare_branch, PreparationPurpose, PreparationRefusal, PreparationRequest,
+        };
+        let Some(bin) = jj_bin() else { return };
+        let mut f = Fixture::new("migrations").await;
+        f.orch.jj_binary_path = bin.clone();
+        let repo = f.root.path().join("repo");
+        std::fs::create_dir_all(repo.join(".cairn")).unwrap();
+        std::fs::create_dir_all(repo.join("src-tauri/turso_migrations")).unwrap();
+        init_project(&repo);
+        std::fs::write(repo.join(".cairn/config.yaml"),
+            "checks:\n  migrations:\n    command: bun run check:migrations\n    when: review\n    policy: gate\n    baseRelative: true\n    impact: [src-tauri/**]\n").unwrap();
+        let path = repo.join("src-tauri/turso_migrations/0291_shared.sql");
+        std::fs::write(&path, "original\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "contract and shared input"]);
+        let original_base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-qb", "review-branch"]);
+        std::fs::write(&path, "branch\n").unwrap();
+        git(&repo, &["commit", "-qam", "branch work"]);
+        let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "main"]);
+        std::fs::write(&path, "base\n").unwrap();
+        git(&repo, &["commit", "-qam", "new conflicting base"]);
+        let base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        f.db.execute(
+            "UPDATE projects SET repo_path=?1,default_branch='main' WHERE id='project-a'",
+            (repo.to_string_lossy().into_owned(),),
+        )
+        .await
+        .unwrap();
+        f.db.execute_script(
+            "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('issue-a','project-a',1,'I','active',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+               VALUES('exec-a','r','issue-a','project-a','running',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+               VALUES('job-a','project-a','issue-a','exec-a','running','builder','builder','review-branch','main',1,1);"
+        ).await.unwrap();
+        f.tools = cairn_checkenv::expected_toolchain_identity_in(&repo);
+        let jj = crate::jj::environment(&bin, &f.orch.config_dir);
+        let store = crate::jj::coordinate_repository(&jj, &f.orch.config_dir, &repo).unwrap();
+        let keys = captured_keys(&f, &jj, &store, &head, &original_base);
+        f.observe(&keys, true, "green-before-conflict");
+        let green = node_check_statuses(&f.orch, "job-a").await.unwrap();
+        assert_eq!(green[0].state, NodeCheckState::Passed);
+        for purpose in [PreparationPurpose::Check, PreparationPurpose::Run] {
+            let refusal = prepare_branch(
+                &f.orch,
+                PreparationRequest::new(
+                    "project-a",
+                    "review-branch",
+                    Some("job-a".into()),
+                    purpose,
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(refusal, PreparationRefusal::Conflict(_)),
+                "{refusal}"
+            );
+            assert_eq!(
+                cairn_vcs::resolve_coordinate(&store, "review-branch")
+                    .await
+                    .unwrap(),
+                head
+            );
+            // No generation invalidation: the green projection is already cached.
+            let blocked = node_check_statuses(&f.orch, "job-a").await.unwrap();
+            let status = &blocked[0];
+            assert_eq!(status.state, NodeCheckState::Pending);
+            let annotation = format_status_annotation(status).unwrap();
+            for expected in ["conflicts with base", base.as_str(), "0291_shared.sql"] {
+                assert!(
+                    annotation.to_lowercase().contains(&expected.to_lowercase()),
+                    "{annotation}"
+                );
+            }
+            assert!(status.observation_id.is_none());
+            assert!(status.ran_at.is_none());
+            assert!(status.cached.is_none());
+            assert!(status.parser.is_none());
+            assert!(status.passed.is_none());
+            assert!(status.failed.is_none());
+            assert!(status.evidence.is_none());
+            assert!(status.failure_kind.is_none());
+        }
+        for (column, wrong) in [
+            ("observed_tip", original_base.as_str()),
+            ("destination_commit", original_base.as_str()),
+            ("target_branch", "different-base"),
+            ("store_path", "/different/store"),
+            ("outcome_kind", "conflict"),
+        ] {
+            let table = if matches!(column, "observed_tip" | "outcome_kind") {
+                "jj_reconcile_items"
+            } else {
+                "jj_reconcile_intents"
+            };
+            let original = if column == "observed_tip" {
+                head.as_str()
+            } else if column == "destination_commit" {
+                base.as_str()
+            } else if column == "target_branch" {
+                "main"
+            } else if column == "outcome_kind" {
+                "check_conflict"
+            } else {
+                store.to_str().unwrap()
+            };
+            f.db.execute(format!("UPDATE {table} SET {column}=?1"), (wrong,))
+                .await
+                .unwrap();
+            assert_eq!(
+                node_check_statuses(&f.orch, "job-a").await.unwrap(),
+                green,
+                "a different {column} must leave the green alone"
+            );
+            f.db.execute(format!("UPDATE {table} SET {column}=?1"), (original,))
+                .await
+                .unwrap();
+        }
+        let rows = current_verdict_rows(f.db.clone(), "project-a", &f.checks, Some(keys.keys()));
+        assert_eq!(rows.len(), 1, "the original green remains in history");
+        assert!(rows[0].row.passed);
+    }
+
+    async fn resolved_gate(
+        orch: &Orchestrator,
+    ) -> crate::execution::gates::vocabulary::GateOutcome {
+        use crate::execution::gates::vocabulary::{CheckVerdictFact, GateContext, GateFact};
+        let clause = serde_json::from_value(serde_json::json!({
+            "fact": "check_verdict", "check": "migrations", "issue": "cairn://p/P/1", "verdict": "passed"
+        })).unwrap();
+        CheckVerdictFact
+            .resolve(&GateContext::new(orch, 0), &clause)
+            .await
+            .unwrap()
+    }
+
+    fn captured_keys(
+        f: &Fixture,
+        jj: &crate::jj::JjEnv,
+        store: &Path,
+        head: &str,
+        base: &str,
+    ) -> OwnedHeadVerdictKeys {
+        let entries = crate::jj::tree_entries(jj, store, head).unwrap();
+        let blobs = TreeBlobs {
+            jj,
+            repository: store,
+        };
+        let snapshot = TreeSnapshot::new(Some(&entries), &blobs);
+        let inputs = ResolvedInputs::resolve(&f.checks, &HashMap::new(), &snapshot);
+        let changed = logical_changed_files(jj, store, base, head).unwrap();
+        let tree_hash = logical_tree_hash(jj, store, head).unwrap();
+        let input_hashes = check_input_hashes(
+            &f.checks,
+            &inputs,
+            Some(&entries),
+            &tree_hash,
+            ChangeBasis::Against {
+                changed: &changed,
+                base_entries: None,
+            },
+        );
+        OwnedHeadVerdictKeys {
+            tree_hash,
+            input_hashes,
+            job_id: "job-a".into(),
+            commit_sha: head.into(),
+            expected_toolchain: f.tools.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod capture_provenance_tests {
+    use super::*;
+    use crate::execution::checks::CheckCapture;
+    use crate::execution::checks_settlement::{classify, owes_a_review_wave, ChecksSnapshot};
+    use crate::messages::delivery::HeadTurn;
+
+    fn plan() -> WavePlan {
+        WavePlan {
+            head: "judged-original-head".into(),
+            tree_hash: "original-logical-hash".into(),
+            base: "original-fork".into(),
+            checks: HashMap::new(),
+            applicable_names: HashSet::new(),
+            input_hashes: HashMap::new(),
+            expected_toolchain: String::new(),
+            unsupported: BTreeMap::new(),
+            capture: Some(CheckCapture {
+                authority: "managed".into(),
+                revision: "managed-branch".into(),
+                head_before: Some("before-preparation".into()),
+                head_after: "judged-original-head".into(),
+                git_tree: Some("actual-git-tree-object".into()),
+                base_branch: Some("integration-target".into()),
+                base_commit: Some("exact-target-commit".into()),
+                advanced: true,
+                attempts: Some(2),
+                warnings: vec!["export recovery is pending".into()],
+                provenance: "accepted capture provenance".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn recorded_capture_names_original_coordinates_and_accepted_install_warnings() {
+        let plan = plan();
+        let before = serde_json::to_value(&plan).unwrap();
+        let text = format_wave_capture(&plan);
+        for fact in [
+            "judged head `judged-original-head`",
+            "logical tree `original-logical-hash`",
+            "fork `original-fork`",
+            "head before `before-preparation`",
+            "head after `judged-original-head`",
+            "Git tree `actual-git-tree-object`",
+            "exact target `integration-target` at `exact-target-commit`",
+            "advanced true",
+            "attempts 2",
+            "accepted capture provenance",
+            "Accepted-install warning: export recovery is pending",
+            "not current-verdict authority",
+        ] {
+            assert!(text.contains(fact), "missing {fact}: {text}");
+        }
+        assert_eq!(serde_json::to_value(&plan).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_capture_never_invents_head_before_or_git_tree_from_logical_hash() {
+        let mut plan = plan();
+        plan.capture = None;
+        let text = format_wave_capture(&plan);
+        assert!(text.contains("judged head `judged-original-head`"));
+        assert!(text.contains("logical tree `original-logical-hash`"));
+        assert!(text.contains("fork `original-fork`"));
+        assert!(text.contains("Preparation capture unknown"));
+        assert!(!text.contains("head before `judged-original-head`"));
+        assert!(!text.contains("Git tree `original-logical-hash`"));
+    }
+
+    #[test]
+    fn capture_notices_preserve_current_wait_state_and_existing_notice_facts() {
+        let mut pending = test_status("review", "gate", "review", NodeCheckState::Pending);
+        pending.notice = Some("newer attempt retained; log persistence failed".into());
+        let mut statuses = vec![
+            pending,
+            test_status("write", "gate", "write", NodeCheckState::Passed),
+        ];
+        append_wave_capture_notices(&mut statuses, &plan());
+        append_wave_capture_notices(&mut statuses, &plan());
+        let notice = statuses[0].notice.as_deref().unwrap();
+        assert!(notice.starts_with("newer attempt retained; log persistence failed"));
+        assert_eq!(notice.matches("Recorded review-wave capture").count(), 1);
+        assert!(notice.contains("export recovery is pending"));
+        assert_eq!(statuses[0].state, NodeCheckState::Pending);
+        assert_eq!(statuses[0].verified_on, None);
+        assert_eq!(statuses[0].cached, None);
+        assert_eq!(
+            statuses[1].notice, None,
+            "review history must not claim write-lane provenance"
+        );
+        let json = serde_json::to_value(&statuses[0]).unwrap();
+        assert!(json["notice"]
+            .as_str()
+            .unwrap()
+            .contains("actual-git-tree-object"));
+        assert_eq!(json["state"], "pending");
+        let snapshot = |in_flight| ChecksSnapshot {
+            settlement: classify(&statuses, HeadTurn::Idle, in_flight),
+            statuses: statuses.clone(),
+            terminal_reason: None,
+            retired: None,
+        };
+        assert_eq!(snapshot(true).verdict(), "moving");
+        let stopped = snapshot(false);
+        assert_eq!(stopped.verdict(), "incomplete");
+        assert!(owes_a_review_wave(&stopped));
+    }
+
+    #[test]
+    fn recorded_capture_round_trips_and_mismatch_is_visible_without_relabelling() {
+        let mut plan = plan();
+        plan.capture.as_mut().unwrap().head_after = "inconsistent-recorded-head".into();
+        let decoded: WavePlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let text = format_wave_capture(&decoded);
+        assert!(text.contains("judged head `judged-original-head`"));
+        assert!(text.contains("head after `inconsistent-recorded-head`"));
+        assert!(text.contains("provenance is inconsistent"));
+        assert_eq!(decoded, plan);
+    }
+
+    #[test]
+    fn capture_warnings_survive_terminal_annotation_shortcuts() {
+        for kind in [
+            Some(CheckFailureKind::NotPlaceable),
+            Some(CheckFailureKind::ConfigUnreadable),
+            None,
+        ] {
+            let mut status = test_status("review", "gate", "review", NodeCheckState::Failed);
+            status.failure_kind = kind.map(|kind| kind.as_str().to_string());
+            if kind.is_none() {
+                status.suppressed_after = Some(3);
+            }
+            append_wave_capture_notices(std::slice::from_mut(&mut status), &plan());
+            let text = format_status_annotation(&status).unwrap();
+            assert!(text.contains("export recovery is pending"), "{text}");
+            assert!(text.contains("judged-original-head"), "{text}");
+            assert_eq!(status.state, NodeCheckState::Failed);
+        }
+    }
+
+    #[test]
+    fn missing_exact_capture_fields_remain_unknown() {
+        let mut plan = plan();
+        let capture = plan.capture.as_mut().unwrap();
+        capture.authority = "exact".into();
+        capture.head_before = None;
+        capture.git_tree = None;
+        capture.base_branch = None;
+        capture.base_commit = None;
+        capture.attempts = None;
+        let text = format_wave_capture(&plan);
+        assert!(text.contains("head before unknown"));
+        assert!(text.contains("Git tree unknown"));
+        assert!(text.contains("exact target unknown at unknown"));
+        assert!(text.contains("attempts unknown"));
+        assert!(!text.contains("Git tree `original-logical-hash`"));
     }
 }

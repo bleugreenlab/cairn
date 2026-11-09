@@ -13,7 +13,6 @@
 //! the owner has reviewed the incoming changes through, which only the owner
 //! (or the operator) moves forward with `mark-reviewed`.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::storage::{LocalDb, RowExt};
@@ -269,24 +268,6 @@ pub(crate) async fn mode_for(
     Ok(Some(mode))
 }
 
-/// Every bookmark of `store` in merge mode, for one reconcile pass. Expired
-/// modes are ended on the way, exactly as [`mode_for`] ends them.
-pub(crate) async fn merge_mode_bookmarks(
-    db: &LocalDb,
-    project_id: &str,
-    store: &Path,
-) -> Result<BTreeSet<String>, String> {
-    let mut live = BTreeSet::new();
-    for mode in load_rows(db, project_id, &store_key(store), None).await? {
-        if let Some(reason) = expiry_reason(db, &mode).await? {
-            remove(db, &mode, CatchUpEventKind::Expired, "system", &reason).await?;
-            continue;
-        }
-        live.insert(mode.bookmark);
-    }
-    Ok(live)
-}
-
 /// Record one event in the branch's audit trail, and log it.
 pub(crate) async fn record_event(
     db: &LocalDb,
@@ -522,15 +503,6 @@ pub(crate) async fn clear(
     remove(db, &mode, CatchUpEventKind::Cleared, actor, detail).await
 }
 
-/// End the mode of every branch the job owns: its landing or its issue's
-/// resolution. Recorded as `cleared` by `system`.
-pub(crate) async fn clear_for_job(db: &LocalDb, job_id: &str, detail: &str) -> Result<(), String> {
-    for mode in modes_for_job(db, job_id).await? {
-        remove(db, &mode, CatchUpEventKind::Cleared, "system", detail).await?;
-    }
-    Ok(())
-}
-
 /// End the mode of every branch an issue's jobs own, inside the transaction
 /// that resolves the issue: an `cleared` event by `system` for each, the mode
 /// rows removed, and any merge-era cooldown released.
@@ -596,35 +568,6 @@ pub(crate) async fn end_on_landing(
     {
         log::warn!("catch-up[{branch}] could not end its mode after landing: {error}");
     }
-}
-
-async fn modes_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<CatchUpMode>, String> {
-    let job_id = job_id.to_string();
-    let keys: Vec<(String, String, String)> = db
-        .read(move |conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT project_id, store_path, bookmark FROM branch_catch_up_modes
-                          WHERE job_id = ?1",
-                        params![job_id],
-                    )
-                    .await?;
-                let mut keys = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    keys.push((row.text(0)?, row.text(1)?, row.text(2)?));
-                }
-                Ok(keys)
-            })
-        })
-        .await
-        .map_err(|error| format!("load catch-up modes for job: {error}"))?;
-    let mut modes = Vec::new();
-    for (project_id, store, bookmark) in keys {
-        modes.extend(load_rows(db, &project_id, &store, Some(&bookmark)).await?);
-    }
-    Ok(modes)
 }
 
 /// Record that the owner reviewed the incoming base changes through `through`.
@@ -901,11 +844,18 @@ pub(crate) async fn announce_reconcile_outcome(
             let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
             let read_store = store.to_path_buf();
             let (old_base, new_base) = (merged.old_base.clone(), merged.new_base.clone());
-            let paths = tokio::task::spawn_blocking(move || {
-                crate::jj::base_side_paths(&jj, &read_store, &old_base, &new_base)
+            let paths = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
+                let jj =
+                    jj.pin_immutable_read(&read_store, &[old_base.as_str(), new_base.as_str()])?;
+                Ok(crate::jj::base_side_paths(
+                    &jj,
+                    &read_store,
+                    &old_base,
+                    &new_base,
+                ))
             })
             .await
-            .map_err(|error| format!("base-side path worker failed: {error}"))?;
+            .map_err(|error| format!("base-side path worker failed: {error}"))??;
             let hits = mode.review_hits(&paths);
             let others: Vec<String> = paths
                 .iter()
@@ -913,24 +863,28 @@ pub(crate) async fn announce_reconcile_outcome(
                 .cloned()
                 .collect();
             let note = merge_note(branch, target, merged, &hits, &others);
-            let urgency = if hits.is_empty() {
-                crate::messages::queued::DeliveryUrgency::Passive
-            } else {
-                crate::messages::queued::DeliveryUrgency::Steer
-            };
-            match crate::messages::delivery::latest_run_for_job(db, &mode.job_id) {
-                Some(run_id) => crate::messages::delivery::queue_system_direct_once(
-                    orch,
-                    &run_id,
-                    &note,
-                    urgency,
-                    &format!("catch-up-merge:{}", merged.merge),
-                )?,
-                None => log::info!(
-                    "catch-up[{branch}] no run of job {} to tell about merge {}",
-                    mode.job_id,
-                    merged.merge
-                ),
+            // A clean demand catch-up is learned at the owner's next turn;
+            // review-path hits gate landing, but never wake an idle builder.
+            let urgency = crate::messages::queued::DeliveryUrgency::Passive;
+            let jobs = super::base_advance::load_on_branch_jobs(db, project_id, branch).await?;
+            for job in jobs {
+                match crate::messages::delivery::latest_run_for_job(db, &job.id) {
+                    Some(run_id) => crate::messages::delivery::queue_system_direct_once(
+                        orch,
+                        &run_id,
+                        &note,
+                        urgency,
+                        &format!(
+                            "catch-up-merge:{project_id}:{branch}:{}:{}",
+                            merged.new_base, job.id
+                        ),
+                    )?,
+                    None => log::info!(
+                        "catch-up[{branch}] no run of job {} to tell about merge {}",
+                        job.id,
+                        merged.merge
+                    ),
+                }
             }
             record_event(
                 db,
@@ -1130,10 +1084,6 @@ mod tests {
             None,
             "the mode covers one bookmark"
         );
-        assert_eq!(
-            merge_mode_bookmarks(&db, "proj-1", store).await.unwrap(),
-            ["agent/one".to_string()].into_iter().collect()
-        );
         mark_reviewed(&db, &mode, "base1", "cairn://p/proj/1/1/builder")
             .await
             .unwrap();
@@ -1183,10 +1133,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(merge_mode_bookmarks(&db, "proj-1", store)
+        assert!(mode_for(&db, "proj-1", store, "agent/one")
             .await
             .unwrap()
-            .is_empty());
+            .is_none());
     }
 
     #[tokio::test]

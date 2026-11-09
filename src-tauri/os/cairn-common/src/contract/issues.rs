@@ -12,7 +12,7 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
         kind: ResourceKind::Issue,
         uri_template: "cairn://p/{project}/{number}",
         name: "Issue details",
-        description: "Issue overview with comments, PR data, and execution history",
+        description: "Issue overview with comments, PR data, execution history, and literal branch/base heads with bounded ahead/behind counts (≥ means capped; unresolved ancestry is unknown). Reading never prepares a branch or acquires a checkout",
         read_projections: NO_PROJECTIONS,
         related: ISSUE_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -258,7 +258,7 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
     // resolves to a node-family kind whose template spells an issue coordinate a
     // thread does not have. Reading any of these addresses returns that family's
     // own affordance block, so this line only has to say the addresses exist.
-    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /queue (its children's cap-held executions in start order; patch {order:[N,...]} to reorder), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no branch. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
+    description: "A first-class thread overview, including child branches' literal head/base and bounded ahead/behind counts (≥ means capped; unresolved ancestry is unknown). Reading never prepares branches or acquires a checkout. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /queue (its children's cap-held executions in start order; patch {order:[N,...]} to reorder), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no branch. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

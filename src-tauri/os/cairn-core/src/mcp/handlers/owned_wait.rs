@@ -1254,6 +1254,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"command": "true", "when": "review"}))
                 .unwrap();
         let plan = crate::execution::checks_turn_end::WavePlan {
+            capture: None,
             head: "feedfacecafe0123".to_string(),
             base: "base".to_string(),
             tree_hash: "tree-at-merge".to_string(),
@@ -1372,7 +1373,12 @@ mod tests {
             .iter()
             .map(|lane| lane.as_str().unwrap())
             .collect();
-        assert!(lanes.contains(&"- lint [no verdict]"), "{value}");
+        assert!(
+            lanes
+                .iter()
+                .any(|lane| lane.starts_with("- lint [no verdict]")),
+            "{value}"
+        );
         assert!(
             value["note"]
                 .as_str()
@@ -1399,7 +1405,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(
-            section.contains("closed before any review wave recorded a plan"),
+            section.contains("This node was closed. No readable review-wave plan is on record"),
             "{section}"
         );
     }

@@ -2026,23 +2026,38 @@ pub(super) async fn read_node(
             // stale; for an open PR, consult the jj store directly (its single
             // source of truth) so the coordinator sees the blocker BEFORE
             // attempting a merge.
-            let source_conflict = if pr_status == "open" {
-                crate::pr_data::actions::source_conflict_report(
-                    &orch.jj_binary_path,
-                    &orch.config_dir,
-                    &repo_path,
-                    &source_branch,
-                    Some(&target_branch),
-                )
-            } else {
-                None
-            };
+            // The store is read through one pinned view, so this read never
+            // settles a split operation log; an unreadable store says so rather
+            // than passing the cached GitHub bit off as a verdict.
+            let source_conflict: Option<crate::pr_data::actions::SourceConflicts> =
+                (pr_status == "open").then(|| {
+                    let view = crate::pr_data::actions::StoreView::capture(
+                        &orch.jj_binary_path,
+                        &orch.config_dir,
+                        &repo_path,
+                    );
+                    crate::pr_data::actions::source_conflict_report(
+                        &view,
+                        &source_branch,
+                        Some(&target_branch),
+                    )
+                });
+            let conflicted = source_conflict.as_ref().and_then(|c| c.report());
+            let unknown = source_conflict.as_ref().and_then(|c| c.unknown());
 
             if let Some(review) = review_decision {
                 output.push_str(&format!("Review: {}\n", review));
             }
-            if source_conflict.is_some() {
+            if conflicted.is_some() {
                 output.push_str("Mergeable: CONFLICTING\n");
+            } else if unknown.is_some() {
+                match &mergeable {
+                    Some(merge) => output.push_str(&format!(
+                        "Mergeable: UNKNOWN (GitHub last reported {merge}, which cannot see a \
+                         conflict recorded in the branch store)\n"
+                    )),
+                    None => output.push_str("Mergeable: UNKNOWN\n"),
+                }
             } else if let Some(merge) = mergeable {
                 output.push_str(&format!("Mergeable: {}\n", merge));
             }
@@ -2052,7 +2067,7 @@ pub(super) async fn read_node(
             if additions.is_some() || deletions.is_some() {
                 let adds = additions.unwrap_or(0);
                 let dels = deletions.unwrap_or(0);
-                if source_conflict.is_some() {
+                if conflicted.is_some() {
                     output.push_str(&format!(
                         "Changes: +{} -{} (stale — branch carries conflicts; resolve before trusting)\n",
                         adds, dels
@@ -2061,7 +2076,12 @@ pub(super) async fn read_node(
                     output.push_str(&format!("Changes: +{} -{}\n", adds, dels));
                 }
             }
-            if let Some(report) = &source_conflict {
+            if let Some(reason) = unknown {
+                output.push('\n');
+                output.push_str(&crate::pr_data::actions::unknown_conflict_note(reason));
+                output.push('\n');
+            }
+            if let Some(report) = conflicted {
                 output.push_str("\n⛔ Conflicted history — cannot merge:\n");
                 output.push_str(&crate::pr_data::actions::format_conflicted_commits(
                     &report.commits,

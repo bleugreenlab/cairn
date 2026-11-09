@@ -218,19 +218,23 @@ fn pr_cache_from_row(row: &cairn_db::turso::Row) -> DbResult<PrCache> {
         title: row.opt_text(4)?,
         body: row.opt_text(5)?,
         // This is the cached read: no probe runs here, so it may not assert more
-        // than the row can support. GitHub's own last-seen state is authoritative
-        // when present; otherwise an unresolved change is OPEN only when there is
+        // than the row can support. Cairn's recorded merge is authoritative: a
+        // squash Cairn published onto the target is merged though GitHub shows
+        // the pull request closed. Otherwise GitHub's last-seen state stands
+        // when present, and an unresolved change is OPEN only when there is
         // something open to point at — a bound pull request, or a local-only
         // change that is open by construction.
-        state: row
-            .opt_text(6)?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(match status.as_str() {
-                "merged" => PrState::Merged,
-                "closed" => PrState::Closed,
-                _ if pr_number.is_some() || is_local => PrState::Open,
-                _ => PrState::Unpublished,
-            }),
+        state: if status == "merged" {
+            PrState::Merged
+        } else {
+            row.opt_text(6)?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(match status.as_str() {
+                    "closed" => PrState::Closed,
+                    _ if pr_number.is_some() || is_local => PrState::Open,
+                    _ => PrState::Unpublished,
+                })
+        },
         is_draft: false,
         review_decision: row.opt_text(8)?.and_then(|s| s.parse().ok()),
         mergeable: row

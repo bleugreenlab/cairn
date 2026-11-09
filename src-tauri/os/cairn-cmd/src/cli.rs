@@ -50,7 +50,9 @@ fn parse_check_run_observation(raw: &str) -> Result<serde_json::Value, String> {
         .get("observation")
         .ok_or_else(|| "observation response did not contain an observation".to_string())?;
     match observation.get("state").and_then(serde_json::Value::as_str) {
-        Some("queued" | "running" | "parked" | "complete" | "failed") => Ok(observation.clone()),
+        Some("queued" | "running" | "parked" | "complete" | "failed" | "conflictsWithBase") => {
+            Ok(observation.clone())
+        }
         Some(state) => Err(format!(
             "observation response contained unknown state {state:?}"
         )),
@@ -519,6 +521,26 @@ fn render_check_run_response(raw: &str) -> Result<(String, bool), String> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("configured check failed")
             .to_string());
+    }
+    if let Some(conflict) = envelope.get("conflictsWithBase") {
+        let text = |key: &str| conflict[key].as_str().unwrap_or("unknown");
+        let paths = conflict["paths"]
+            .as_array()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Ok((format!(
+            "Conflicts with base: {}: branch `{}` at {} conflicts with base `{}` at {}{}; no test verdict (observation {})",
+            envelope["suite"].as_str().unwrap_or("check"),
+            text("branch"), text("head"), text("baseBranch"), text("baseCommit"),
+            if paths.is_empty() { String::new() } else { format!(": {paths}") },
+            envelope["handle"].as_str().unwrap_or("unknown"),
+        ), false));
     }
     let result = envelope
         .get("result")
@@ -1109,6 +1131,13 @@ async fn watch_check_run(
                 })
                 .to_string())
             }
+            Some("conflictsWithBase") => {
+                return Ok(serde_json::json!({
+                    "ok": true, "conflictsWithBase": observation,
+                    "suite": suite, "handle": handle,
+                })
+                .to_string());
+            }
             Some("failed") => {
                 return Err(observation
                     .get("error")
@@ -1677,6 +1706,54 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[tokio::test]
+    async fn check_run_conflicts_with_base_names_coordinates_and_exits_two() {
+        let response = serde_json::json!({
+            "ok": true,
+            "observation": {
+                "state": "conflictsWithBase",
+                "branch": "agent/branch", "head": "literal-head",
+                "baseBranch": "stacked-parent", "baseCommit": "current-base",
+                "paths": ["src/one.rs", "src/two.rs"]
+            }
+        })
+        .to_string();
+        assert_eq!(
+            parse_check_run_observation(&response).unwrap()["state"],
+            "conflictsWithBase"
+        );
+        let client = check_poll_client(vec![(true, response.clone())]);
+        let terminal = watch_check_run(
+            &client,
+            "rust-tests",
+            "request-1",
+            &std::sync::Mutex::new(None),
+        )
+        .await
+        .unwrap();
+        let (error, passed) = render_check_run_response(&terminal).unwrap();
+        assert!(!passed);
+        assert_eq!(check_response_exit_code(&terminal, passed), 2);
+        assert!(!error.contains("stopped waiting"));
+        for expected in [
+            "Conflicts with base",
+            "agent/branch",
+            "literal-head",
+            "stacked-parent",
+            "current-base",
+            "src/one.rs",
+            "src/two.rs",
+            "no test verdict",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        let client = check_poll_client(vec![(true, response)]);
+        assert_eq!(
+            follow_check_runs(&client, &[("rust-tests".into(), "request-1".into())], 0).await,
+            2
+        );
     }
 
     #[tokio::test]

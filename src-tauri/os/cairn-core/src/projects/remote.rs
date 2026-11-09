@@ -140,11 +140,10 @@ pub async fn pull_project_on_default_branch_push(
         .default_branch
         .as_deref()
         .unwrap_or(event_default_branch);
-    let config = crate::config::project_settings::load_project_settings_read_only(Path::new(
-        &project.repo_path,
-    ));
-    let default_branch =
-        crate::config::project_settings::resolve_default_branch(&config, Some(stored_default));
+    let default_branch = crate::config::project_settings::effective_default_branch(
+        Some(Path::new(&project.repo_path)),
+        Some(stored_default),
+    );
 
     // The main-checkout update is best-effort: webhook processing cannot refuse an
     // external push that already happened. Still run the same dirty-checkout gate
@@ -506,7 +505,7 @@ mod tests {
     async fn push_sync_uses_resolved_default_branch_for_checkout_reconcile() {
         let db = migrated_db().await;
         insert_project(&db, "local", "/repos/local").await;
-        crud::set_default_branch_db(&db, "local", "develop")
+        crud::seed_default_branch_db(&db, "local", "develop")
             .await
             .unwrap();
 

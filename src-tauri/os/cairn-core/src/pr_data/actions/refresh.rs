@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::conflict::{
-    conflict_recovery_hint, format_conflicted_commits, source_conflict_report, SourceConflictReport,
+    conflict_recovery_hint, format_conflicted_commits, source_conflict_report,
+    unknown_conflict_note, SourceConflicts, StoreView,
 };
 use super::context::{
     db_error, load_mr_branches, load_mr_issue_id, resolve_mr_context_for_job,
@@ -53,15 +54,22 @@ use super::resolution::{
 /// UNKNOWN is not a weaker block than CONFLICTING. The merge boundary
 /// (`merge_pr_for_job`) refuses a conflicted source from the store itself, and
 /// the desktop enables its merge button only on MERGEABLE.
+///
+/// A conflict state the store could not answer is UNKNOWN as well: GitHub's bit
+/// cannot see a jj-recorded conflict, so passing it through would publish the
+/// same unverified green.
 fn published_mergeable(
     github: MergeableState,
     diverged: bool,
-    tip_conflicted: bool,
+    conflicts: &SourceConflicts,
 ) -> MergeableState {
-    match (diverged, tip_conflicted) {
-        (true, _) => MergeableState::Unknown,
-        (false, true) => MergeableState::Conflicting,
-        (false, false) => github,
+    if diverged {
+        return MergeableState::Unknown;
+    }
+    match conflicts {
+        SourceConflicts::Unknown(_) => MergeableState::Unknown,
+        _ if conflicts.tip_conflicted() => MergeableState::Conflicting,
+        _ => github,
     }
 }
 
@@ -261,45 +269,46 @@ fn emit_merge_request_change(orch: &Orchestrator, mr_context: &MrContext, action
     );
 }
 
-/// The commit the branch store holds for `branch`, or `None` when the store
-/// cannot answer.
-///
-/// The store is the branch authority, so this is the commit every claim about
-/// "the current version of this change" is measured against. `None` is a real
-/// answer meaning the version is unknown — never a licence to measure something
-/// else instead.
-fn store_branch_commit(orch: &Orchestrator, repo_path: &str, branch: &str) -> Option<String> {
-    if branch.is_empty() {
-        return None;
-    }
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    crate::jj::bookmark_commit(&jj, &store, branch)
-}
-
 /// Compare the commit the pull request describes against the commit the branch
-/// actually holds.
+/// actually holds in `view`.
 ///
 /// A pull request whose head lags its branch reports mergeability, checks and a
 /// diffstat for the head it holds. Every one of those signals is then a verdict
 /// on a version nobody has reviewed — the shape in which a pull request read
 /// green while the entire merge-blocking fix sat in commits it did not contain.
-fn compare_heads(
-    orch: &Orchestrator,
-    repo_path: &str,
-    source_branch: &str,
-    pr_head_sha: &str,
-) -> HeadComparison {
+fn compare_heads(view: &StoreView, source_branch: &str, pr_head_sha: &str) -> HeadComparison {
     let branch_head = if pr_head_sha.is_empty() {
         None
     } else {
-        store_branch_commit(orch, repo_path, source_branch)
+        view.bookmark_commit(source_branch)
     };
     classify_heads(pr_head_sha, branch_head, |branch_head| {
-        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-        crate::jj::revset_descends_from(&jj, &store, branch_head, pr_head_sha)
+        view.descends_from(branch_head, pr_head_sha)
     })
+}
+
+/// Every branch-store answer one refresh pass publishes, read through one view:
+/// the head comparison (for an open pull request) and the source's conflicts.
+/// The store is the branch authority, so these are what every claim about "the
+/// current version of this change" is measured against; a view that cannot be
+/// pinned leaves both unknown rather than licensing a measurement of something
+/// else.
+pub(super) fn probe_store(
+    view: &StoreView,
+    source_branch: &str,
+    target_branch: &str,
+    pr_head_sha: &str,
+    open: bool,
+) -> (HeadComparison, SourceConflicts) {
+    let heads = if open {
+        compare_heads(view, source_branch, pr_head_sha)
+    } else {
+        HeadComparison::Unknown
+    };
+    (
+        heads,
+        source_conflict_report(view, source_branch, Some(target_branch)),
+    )
 }
 
 /// Record a pull request discovered by head branch onto the merge request that
@@ -399,7 +408,8 @@ pub(crate) struct PrSnapshot {
     /// The PR head against the branch head; `Unknown` for an unbound or
     /// no-longer-open pull request, or when the comparison could not run.
     pub(crate) heads: HeadComparison,
-    pub(crate) conflict: Option<SourceConflictReport>,
+    /// Read through the same store view as `heads`.
+    pub(crate) conflict: SourceConflicts,
     pub(crate) files: Vec<PrFile>,
     /// When this snapshot began reading the world it describes: GitHub for a
     /// bound pull request, origin and the branch store for an unbound change.
@@ -418,6 +428,46 @@ pub(crate) struct PrSnapshot {
     /// A merge or close GitHub reported that the row had not recorded when this
     /// snapshot was computed.
     observed: Option<ObservedResolution>,
+    /// Work Cairn's own landing record still owes this pull request.
+    landing_follow_up: Option<LandingFollowUp>,
+}
+
+/// What a refresh found Cairn's landing record still owes a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandingFollowUp {
+    /// A publication's outcome is unknown: settle it from the target's
+    /// history. Until then GitHub's closed state is no evidence either way.
+    Recover,
+    /// The row records a landing GitHub still shows open: comment and close.
+    SettleGitHub,
+}
+
+impl LandingFollowUp {
+    fn of(
+        recorded_status: Option<&str>,
+        github: &PrState,
+        unsettled_landing: bool,
+    ) -> Option<Self> {
+        if unsettled_landing {
+            Some(Self::Recover)
+        } else if recorded_status == Some("merged") && matches!(github, PrState::Open) {
+            Some(Self::SettleGitHub)
+        } else {
+            None
+        }
+    }
+}
+
+/// The state a bound pull request renders: Cairn's recorded merge, else what
+/// GitHub reports. A change Cairn landed by publishing a squash onto the
+/// target is merged though GitHub shows it closed (or, briefly, open); the
+/// converse never holds, because only a proven landing moves the row.
+fn effective_state(recorded_status: Option<&str>, github: PrState) -> PrState {
+    if recorded_status == Some("merged") {
+        PrState::Merged
+    } else {
+        github
+    }
 }
 
 /// GitHub says a pull request is merged or closed, and its `merge_requests` row
@@ -427,6 +477,8 @@ struct ObservedResolution {
     owner_id: String,
     resolution: PrNodeResolution,
     merged_commit: Option<String>,
+    /// The head GitHub merged: the exact source commit that route landed.
+    merged_source: Option<String>,
     project_id: String,
     target_branch: Option<String>,
 }
@@ -435,25 +487,18 @@ struct ObservedResolution {
 ///
 /// Asked only of a pull request GitHub reports merged or closed, so an open one
 /// pays nothing for it.
-async fn observe_resolution(
-    db: &LocalDb,
+fn observe_resolution(
     mr_context: &MrContext,
     pr_details: &ParsedPrDetails,
     branches: Option<&(String, String)>,
+    recorded: Option<&str>,
 ) -> Option<ObservedResolution> {
     let resolution = match pr_details.state {
         PrState::Merged => PrNodeResolution::Merge,
         PrState::Closed => PrNodeResolution::Close,
         PrState::Open | PrState::Unpublished => return None,
     };
-    let recorded = db
-        .query_opt_text(
-            "SELECT status FROM merge_requests WHERE id = ?1",
-            params![mr_context.mr_id.as_str()],
-        )
-        .await
-        .ok()
-        .flatten()?;
+    let recorded = recorded?;
     let unrecorded = match resolution {
         PrNodeResolution::Merge => recorded != "merged",
         PrNodeResolution::Close => recorded == "open",
@@ -462,6 +507,9 @@ async fn observe_resolution(
         owner_id: mr_context.job_id.clone(),
         resolution,
         merged_commit: pr_details.merge_commit.clone(),
+        merged_source: matches!(resolution, PrNodeResolution::Merge)
+            .then(|| pr_details.head_sha.clone())
+            .filter(|head| !head.is_empty()),
         project_id: mr_context.project_id.clone(),
         target_branch: branches.map(|(_, target)| target.clone()),
     })
@@ -482,7 +530,10 @@ async fn settle_observed_resolution(orch: &Orchestrator, snapshot: &PrSnapshot) 
         orch,
         &observed.owner_id,
         observed.resolution,
-        observed.merged_commit.as_deref(),
+        super::Landed {
+            commit: observed.merged_commit.as_deref(),
+            source: observed.merged_source.as_deref(),
+        },
     )
     .await
     {
@@ -510,6 +561,38 @@ async fn settle_observed_resolution(orch: &Orchestrator, snapshot: &PrSnapshot) 
             observed.owner_id,
             observed.resolution
         ),
+    }
+}
+
+/// Do what the snapshot found Cairn's landing record owes its pull request.
+///
+/// Like an observed resolution this runs after the single flight, because it
+/// invalidates the snapshot it acts on. Both halves are safe for every joined
+/// reader to attempt: recovery and GitHub settlement each let one caller in
+/// this process drive a given attempt or pull request.
+async fn settle_landing_follow_up(orch: &Orchestrator, job_id: &str, snapshot: &PrSnapshot) {
+    match snapshot.landing_follow_up {
+        None => {}
+        Some(LandingFollowUp::SettleGitHub) => {
+            super::landing_record::settle_github_best_effort(orch, job_id).await;
+        }
+        Some(LandingFollowUp::Recover) => {
+            let db = match crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
+                Ok(db) => db,
+                Err(error) => {
+                    log::warn!("landing recovery for {job_id}: {error}");
+                    return;
+                }
+            };
+            match super::landing_record::reconcile_landing_for(orch, &db, &snapshot.cache.id).await
+            {
+                Ok(outcomes) if !outcomes.is_empty() => {
+                    orch.invalidate_pr_refresh(job_id, "landing-recovered");
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("landing recovery for {job_id}: {error}"),
+            }
+        }
     }
 }
 
@@ -605,6 +688,7 @@ pub(crate) async fn pr_snapshot_for_job(
     match snapshot {
         Some(snapshot) => {
             settle_observed_resolution(orch, &snapshot).await;
+            settle_landing_follow_up(orch, job_id, &snapshot).await;
             Ok(snapshot)
         }
         None => Err(failure
@@ -667,10 +751,13 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
                             failure: unbound.failure,
                         }),
                         heads: HeadComparison::Unknown,
-                        conflict: None,
+                        conflict: SourceConflicts::Unknown(
+                            "no pull request is bound, so its source was not probed".to_string(),
+                        ),
                         files: Vec::new(),
                         read_at,
                         observed: None,
+                        landing_follow_up: None,
                     });
                 }
             }
@@ -686,13 +773,23 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
     // A green signal on a head the branch has moved past is a verdict on a tree
     // nobody validated; both surfaces render which commit each side holds. This
     // and the conflict probe feed one decision, so the two cannot overwrite each
-    // other — see `published_mergeable`.
-    let heads = branches
-        .as_ref()
-        .filter(|_| matches!(pr_details.state, PrState::Open))
-        .map_or(HeadComparison::Unknown, |(source_branch, _)| {
-            compare_heads(orch, &repo_path, source_branch, &pr_details.head_sha)
-        });
+    // other — see `published_mergeable`. Both read one pinned view of the store,
+    // so they describe the same moment and neither can settle the store.
+    let (heads, conflict) = match branches.as_ref() {
+        Some((source_branch, target_branch)) => probe_store(
+            &StoreView::capture(&orch.jj_binary_path, &orch.config_dir, &repo_path),
+            source_branch,
+            target_branch,
+            &pr_details.head_sha,
+            matches!(pr_details.state, PrState::Open),
+        ),
+        None => (
+            HeadComparison::Unknown,
+            SourceConflicts::Unknown(
+                "the merge request records no source and target branch".to_string(),
+            ),
+        ),
+    };
     let divergence = heads.divergence();
     if let (Some(divergence), Some((source_branch, _))) = (divergence, branches.as_ref()) {
         log::warn!(
@@ -702,24 +799,11 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
             divergence.branch_head
         );
     }
-    let conflict = branches
-        .as_ref()
-        .and_then(|(source_branch, target_branch)| {
-            source_conflict_report(
-                &orch.jj_binary_path,
-                &orch.config_dir,
-                &repo_path,
-                source_branch,
-                Some(target_branch),
-            )
-        });
     if branches.is_some() {
         pr_details.mergeable = published_mergeable(
             pr_details.mergeable.clone(),
             divergence.is_some(),
-            conflict
-                .as_ref()
-                .is_some_and(|report| report.tip_conflicted),
+            &conflict,
         );
     }
     let checks = fetch_checks_via_api(http, &auth, &owner, &repo, &pr_details.head_sha)
@@ -739,7 +823,31 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
     if write.changed {
         emit_merge_request_change(orch, &mr_context, "update");
     }
-    let observed = observe_resolution(&db, &mr_context, &pr_details, branches.as_ref()).await;
+    let recorded = db
+        .query_opt_text(
+            "SELECT status FROM merge_requests WHERE id = ?1",
+            params![mr_id.as_str()],
+        )
+        .await
+        .ok()
+        .flatten();
+    // A publication whose outcome is unknown may be on the target already, so
+    // GitHub reporting the pull request closed is not "closed without
+    // merging": recovery settles it from the target's history instead.
+    let unsettled_landing = recorded.as_deref() == Some("open")
+        && super::landing_record::has_unsettled_landing(&db, &mr_id).await;
+    let observed = if unsettled_landing {
+        None
+    } else {
+        observe_resolution(
+            &mr_context,
+            &pr_details,
+            branches.as_ref(),
+            recorded.as_deref(),
+        )
+    };
+    let landing_follow_up =
+        LandingFollowUp::of(recorded.as_deref(), &pr_details.state, unsettled_landing);
 
     let cache = PrCache {
         id: mr_id.clone(),
@@ -748,7 +856,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
         pr_url: pr_url.clone(),
         title: pr_details.title.clone(),
         body: pr_details.body.clone(),
-        state: pr_details.state.clone(),
+        state: effective_state(recorded.as_deref(), pr_details.state.clone()),
         is_draft: pr_details.is_draft,
         review_decision: pr_details.review_decision.clone(),
         mergeable: pr_details.mergeable.clone(),
@@ -763,8 +871,14 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
         target_branch: branches.as_ref().map(|(_, target)| target.clone()),
     };
 
+    // Owed landing work keeps the snapshot live, so a follow-up that failed is
+    // retried rather than settled behind a merged state that never expires.
+    let expires_at = match landing_follow_up {
+        Some(_) => Some(now + UNRESOLVED_FRESHNESS_SECS),
+        None => PrSnapshot::expiry(&cache, now),
+    };
     Ok(PrSnapshot {
-        expires_at: PrSnapshot::expiry(&cache, now),
+        expires_at,
         cache,
         unbound: None,
         branches,
@@ -773,6 +887,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
         files,
         read_at,
         observed,
+        landing_follow_up,
     })
 }
 
@@ -970,12 +1085,13 @@ async fn refresh_unbound_pr_for_job(
         )
     });
 
-    // Both sides of the measurement come from the branch store, the branch
-    // authority. An open change whose branch the store cannot resolve is one
-    // whose current version is unknown — which is an answer, not a licence to
-    // measure whatever the checkout happens to hold.
-    let source_commit = store_branch_commit(orch, &repo_path, &source_branch);
-    let target_commit = store_branch_commit(orch, &repo_path, &target_branch);
+    // Both sides of the measurement come from one pinned view of the branch
+    // store, the branch authority. An open change whose branch the view cannot
+    // resolve is one whose current version is unknown — which is an answer, not
+    // a licence to measure whatever the checkout happens to hold.
+    let view = StoreView::capture(&orch.jj_binary_path, &orch.config_dir, &repo_path);
+    let source_commit = view.bookmark_commit(&source_branch);
+    let target_commit = view.bookmark_commit(&target_branch);
     let licensed = probe.as_ref().is_some_and(|probe| {
         verdict_is_licensed(
             &probe.publication,
@@ -1289,7 +1405,7 @@ pub async fn render_live_pr_section(
 
     let source_branches = snapshot.branches.clone();
     let divergence = snapshot.heads.divergence();
-    let source_conflict = snapshot.conflict.as_ref();
+    let source_conflict = &snapshot.conflict;
     let checks = &cache.checks;
     let checks_status = &cache.checks_status;
     let files = &snapshot.files;
@@ -1341,7 +1457,7 @@ pub async fn render_live_pr_section(
             out.push('\n');
         }
     }
-    if source_conflict.as_ref().is_some_and(|r| r.tip_conflicted) {
+    if source_conflict.tip_conflicted() {
         // A conflicted TIP inflates the diff GitHub reports; flag it so the
         // number can't read as a clean, mergeable change.
         out.push_str(&format!(
@@ -1356,7 +1472,14 @@ pub async fn render_live_pr_section(
             cache.deletions.unwrap_or(0)
         ));
     }
-    if let (Some(report), Some((src, tgt))) = (source_conflict, &source_branches) {
+    if let (Some(reason), Some(_), PrState::Open | PrState::Unpublished) =
+        (source_conflict.unknown(), &source_branches, &cache.state)
+    {
+        out.push('\n');
+        out.push_str(&unknown_conflict_note(reason));
+        out.push('\n');
+    }
+    if let (Some(report), Some((src, tgt))) = (source_conflict.report(), &source_branches) {
         if report.tip_conflicted {
             out.push_str("\n⛔ Conflicted history — cannot merge:\n");
             out.push_str(&format_conflicted_commits(&report.commits));
@@ -1790,31 +1913,48 @@ mod tests {
     /// it — the same category of error as the green signal.
     #[test]
     fn a_divergent_head_outranks_the_local_conflict_probe() {
+        let conflicted = |tip_conflicted| {
+            SourceConflicts::Conflicted(super::super::conflict::SourceConflictReport {
+                commits: Vec::new(),
+                tip_conflicted,
+            })
+        };
         // Same commit on both sides: both answers describe the change under
         // review, and the local probe wins over GitHub's bit, which reports a
         // jj-conflicted commit as mergeable.
         assert_eq!(
-            published_mergeable(MergeableState::Mergeable, false, true),
+            published_mergeable(MergeableState::Mergeable, false, &conflicted(true)),
             MergeableState::Conflicting
         );
         // Divergent head, conflicted current tip: two subjects, no verdict.
         assert_eq!(
-            published_mergeable(MergeableState::Mergeable, true, true),
+            published_mergeable(MergeableState::Mergeable, true, &conflicted(true)),
             MergeableState::Unknown
         );
         // Divergent head alone.
         assert_eq!(
-            published_mergeable(MergeableState::Mergeable, true, false),
+            published_mergeable(MergeableState::Mergeable, true, &SourceConflicts::Clean),
             MergeableState::Unknown
         );
         // Agreed head, clean tip: GitHub is describing the change under review.
         assert_eq!(
-            published_mergeable(MergeableState::Mergeable, false, false),
+            published_mergeable(MergeableState::Mergeable, false, &SourceConflicts::Clean),
+            MergeableState::Mergeable
+        );
+        // Conflicted intermediates under a clean tip do not block.
+        assert_eq!(
+            published_mergeable(MergeableState::Mergeable, false, &conflicted(false)),
             MergeableState::Mergeable
         );
         assert_eq!(
-            published_mergeable(MergeableState::Conflicting, false, false),
+            published_mergeable(MergeableState::Conflicting, false, &SourceConflicts::Clean),
             MergeableState::Conflicting
+        );
+        // A store the pass could not read is no verdict, whatever GitHub says.
+        let unknown = SourceConflicts::Unknown("the store has 2 concurrent operation heads".into());
+        assert_eq!(
+            published_mergeable(MergeableState::Mergeable, false, &unknown),
+            MergeableState::Unknown
         );
     }
 

@@ -1013,17 +1013,9 @@ async fn run_pass(
             "main cadence for project {project_id}: {error}; attesting the store's current {default_branch}"
         );
     }
-    let repository = {
-        let jj_binary_path = orch.jj_binary_path.clone();
-        let config_dir = orch.config_dir.clone();
-        let project_repo = repo_root.clone();
-        tokio::task::spawn_blocking(move || {
-            let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-        })
-        .await
-        .map_err(|error| format!("coordinate repository task failed: {error}"))??
-    };
+    // Refresh above is the guarded writer. Capturing an existing coordinate
+    // below must neither create a missing store nor reconcile a split log.
+    let repository = crate::jj::project_store_dir(&orch.config_dir, &repo_root);
     let commit = cairn_vcs::resolve_coordinate(&repository, default_branch)
         .await
         .map_err(|error| format!("default head '{default_branch}' is unresolvable: {error}"))?;
@@ -1141,6 +1133,17 @@ async fn refresh_default_branch(
     .map_err(|error| format!("fetch failed: {error}"))?;
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_root);
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let reservation = orch
+        .reserve_branches(
+            &store,
+            &[default_branch],
+            "main cadence canonical refresh",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await?;
     let guard = orch
         .acquire_jj_store_lock(
             &store,
@@ -1149,6 +1152,7 @@ async fn refresh_default_branch(
         )
         .await;
     let _phase = guard.phase("main cadence canonical refresh");
+    orch.refuse_foreign_reservations(&guard, Some(&reservation))?;
     let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
         orch,
         &store,
@@ -1159,8 +1163,24 @@ async fn refresh_default_branch(
     let jj = jj.preserving_import_bookmarks(preserved);
     crate::jj::ensure_store_initialized(&jj, &store, repo_root)
         .map_err(|error| format!("store init failed: {error}"))?;
-    crate::jj::reconcile_tracked_bookmark(&jj, &store, default_branch)
-        .map_err(|error| format!("bookmark reconcile failed: {error}"))?;
+    // The reconcile imports (which may move any bookmark) and then moves the
+    // default: admit its writer, and bracket the import for every other.
+    guard
+        .branch_write_permit(
+            &db,
+            &reservation,
+            project_id,
+            default_branch,
+            crate::orchestrator::BatchAdmission::None,
+        )
+        .await?;
+    let (reconcile_store, reconcile_branch) = (store.clone(), default_branch.to_string());
+    orch.bracket_store_mutation(guard, Some(&reservation), db, project_id, move || {
+        crate::jj::reconcile_tracked_bookmark(&jj, &reconcile_store, &reconcile_branch)
+            .map(|_| ())
+            .map_err(|error| format!("bookmark reconcile failed: {error}"))
+    })
+    .await?;
     Ok(())
 }
 
@@ -1326,6 +1346,7 @@ async fn attempt_lane(
             // The fork point of the tip with its own branch is the tip, so a
             // whole-suite run carries no changed-file attribution.
             attribution_target: context.default_branch.to_string(),
+            attribution_commit: None,
         },
         context.commit.to_string(),
         &lane.check,
@@ -2664,6 +2685,7 @@ pub(crate) fn first_parent_ancestry(
     repository: &Path,
     tip: &str,
 ) -> Result<MainChain, String> {
+    let jj = jj.pin_immutable_read(repository, &[tip])?;
     let revset = format!("first_ancestors({tip}, {BRACKET_SCAN})");
     jj.run(
         repository,
@@ -3631,7 +3653,17 @@ async fn merge_bracket(
     base: &str,
     tip: &str,
 ) -> Bracket {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let jj = match crate::jj::environment(&orch.jj_binary_path, &orch.config_dir)
+        .pin_immutable_read(repository, &[base, tip])
+    {
+        Ok(jj) => jj,
+        Err(error) => {
+            return Bracket {
+                unavailable: Some(error),
+                ..Bracket::default()
+            }
+        }
+    };
     let revset = format!("{base}..{tip}");
     let limit = BRACKET_SCAN.to_string();
     let output = match jj.run(
@@ -9163,5 +9195,53 @@ mod tests {
             "typecheck is no longer declared"
         );
         assert_eq!(slots.outcomes("q").len(), 1, "projects are independent");
+    }
+}
+
+#[cfg(test)]
+mod pinned_check_read_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn immutable_main_ancestry_preserves_a_split_operation_log() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        crate::jj::tests::init_project(project.path());
+        let jj = crate::jj::environment(&bin, home.path());
+        let store = crate::jj::coordinate_repository(&jj, home.path(), project.path()).unwrap();
+        let head = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
+        let before = first_parent_ancestry(&jj, &store, &head).unwrap();
+        let cairn_vcs::SettledOperation::Single(operation) =
+            cairn_vcs::settled_operation(&store).unwrap()
+        else {
+            panic!("fixture is settled");
+        };
+        for name in ["left-read", "right-read"] {
+            jj.run(
+                &store,
+                &[
+                    "--at-op",
+                    &operation,
+                    "bookmark",
+                    "create",
+                    "-r",
+                    &head,
+                    name,
+                    "--ignore-working-copy",
+                ],
+                "fork main ancestry fixture",
+            )
+            .unwrap();
+        }
+        assert!(jj.pin_settled_read(&store).is_err());
+        let after = first_parent_ancestry(&jj, &store, &head).unwrap();
+        assert_eq!(after.depth, before.depth);
+        assert!(
+            matches!(cairn_vcs::settled_operation(&store).unwrap(), cairn_vcs::SettledOperation::Split(heads) if heads.len() == 2)
+        );
     }
 }

@@ -60,9 +60,22 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
 /// in which case `git rev-parse` would successfully discover the ancestor's
 /// object database while silently choosing the wrong store. Plain-Git
 /// coordinates remain independent of jj.
+///
+/// The jj case reads the backend from disk ([`backend_git_dir`]) rather than
+/// asking `jj git root`: that command loads the repository at its head, so it
+/// would snapshot a working copy and merge a split operation log on what every
+/// caller here treats as a read.
 pub(crate) fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     if is_jj_dir(ws) {
-        return jj.run(ws, &["git", "root"], "jj git root");
+        return backend_git_dir(ws)
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                format!(
+                    "{} is a jj workspace, but its Git backend could not be read from \
+                     .jj/repo/store",
+                    ws.display()
+                )
+            });
     }
     let out = jj.command_output(
         cairn_platform::env::git()
@@ -81,6 +94,42 @@ pub(crate) fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> 
         "git rev-parse --absolute-git-dir failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     ))
+}
+
+/// The jj repository directory `ws/.jj/repo` names: that directory itself in a
+/// store's own workspace, or the target of the pointer file a secondary
+/// workspace carries there (a relative target is relative to `.jj`).
+pub(crate) fn jj_repo_dir(ws: &Path) -> Option<std::path::PathBuf> {
+    let pointer = ws.join(".jj").join("repo");
+    if pointer.is_dir() {
+        return Some(pointer);
+    }
+    let target = std::path::PathBuf::from(std::fs::read_to_string(&pointer).ok()?.trim());
+    Some(if target.is_absolute() {
+        target
+    } else {
+        pointer.parent()?.join(target)
+    })
+}
+
+/// The Git directory backing the jj repository at `ws`, read from its on-disk
+/// layout: `store/git_target` for an external backend (a relative target is
+/// relative to `store`), else the `store/git` jj keeps internally. This is the
+/// directory `jj git root` reports, found without loading the repository.
+pub(crate) fn backend_git_dir(ws: &Path) -> Option<std::path::PathBuf> {
+    let store = jj_repo_dir(ws)?.join("store");
+    let git_dir = match std::fs::read_to_string(store.join("git_target")) {
+        Ok(raw) => {
+            let target = std::path::PathBuf::from(raw.trim());
+            if target.is_absolute() {
+                target
+            } else {
+                store.join(target)
+            }
+        }
+        Err(_) => store.join("git"),
+    };
+    git_dir.is_dir().then_some(git_dir)
 }
 
 /// Stable identity for the sealed tree content at `@-`.

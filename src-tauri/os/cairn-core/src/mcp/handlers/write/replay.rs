@@ -206,6 +206,19 @@ fn wall_clock_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+pub(super) async fn answer_file_replay(db: &LocalDb, call: &WriteCall) -> String {
+    match await_file_replay_or_takeover(db, call).await {
+        FileReplayClaim::Replayed(report) => mark_as_replay(&report),
+        FileReplayClaim::TakenOver { owner, report } => {
+            if finalize_owned_report(db, call, &owner, &report).await {
+                return mark_as_replay(&report);
+            }
+            "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string()
+        }
+        FileReplayClaim::Stalled => "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string(),
+    }
+}
+
 pub(super) async fn await_file_replay_or_takeover(
     db: &LocalDb,
     call: &WriteCall,
@@ -290,14 +303,54 @@ pub(super) enum FileReplayClaim {
 
 /// The provider call one delivery of a `write` belongs to.
 #[derive(Debug, Clone)]
-pub(super) struct WriteCall {
+pub(crate) struct WriteCall {
     run_id: String,
     id: String,
 }
 
 impl WriteCall {
+    #[cfg(test)]
+    pub(crate) fn for_test(run_id: &str, tool_use_id: &str) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            id: tool_use_id.to_string(),
+        }
+    }
+
     pub(super) fn tool_use_id(&self) -> &str {
         &self.id
+    }
+}
+
+/// The existing write ledger, pinned to the database that owns it. Branch
+/// preparation uses this probe while holding its store guard; it never mints
+/// a second replay identity or treats a failed read as an absent delivery.
+#[derive(Clone)]
+pub(crate) struct WriteReplayProbe {
+    db: std::sync::Arc<LocalDb>,
+    call: WriteCall,
+}
+
+impl std::fmt::Debug for WriteReplayProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteReplayProbe")
+            .field("call", &self.call)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WriteReplayProbe {
+    pub(crate) fn new(db: std::sync::Arc<LocalDb>, call: WriteCall) -> Self {
+        Self { db, call }
+    }
+
+    pub(crate) async fn published_under_guard(
+        &self,
+        _guard: &crate::orchestrator::JjStoreGuard,
+    ) -> Result<bool, String> {
+        recorded_report_checked(&self.db, &self.call)
+            .await
+            .map(|report| report.is_some())
     }
 }
 
@@ -542,6 +595,13 @@ async fn claim_resource_call_with_timeout(
 }
 
 pub(super) async fn recorded_report(db: &LocalDb, call: &WriteCall) -> Option<String> {
+    recorded_report_checked(db, call).await.unwrap_or_default()
+}
+
+pub(super) async fn recorded_report_checked(
+    db: &LocalDb,
+    call: &WriteCall,
+) -> Result<Option<String>, String> {
     let (run_id, tool_use_id) = (call.run_id.clone(), call.id.clone());
     db.read(|conn| {
         let (run_id, tool_use_id) = (run_id.clone(), tool_use_id.clone());
@@ -560,7 +620,7 @@ pub(super) async fn recorded_report(db: &LocalDb, call: &WriteCall) -> Option<St
         })
     })
     .await
-    .unwrap_or_default()
+    .map_err(|error| format!("inspect the write replay ledger before branch preparation: {error}"))
 }
 
 /// Whether this delivery claimed the ledger row, and may therefore correct the
@@ -1288,6 +1348,32 @@ mod tests {
                 id: "toolu-1".to_string(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn checked_write_replay_lookup_distinguishes_absent_published_and_unreadable() {
+        let (db, call) = ledger_db("write-replay-checked.db").await;
+        assert_eq!(recorded_report_checked(&db, &call).await.unwrap(), None);
+        let saved = report("committed");
+        assert_eq!(
+            record_report(&db, &call, &saved).await,
+            LedgerClaim::Claimed
+        );
+        assert_eq!(
+            recorded_report_checked(&db, &call).await.unwrap(),
+            Some(saved),
+        );
+
+        // Only this fixture's schema becomes unavailable. An unreadable ledger
+        // is not permission to advance a redelivered write's branch.
+        db.execute(
+            "ALTER TABLE write_replay_ledger RENAME TO unavailable_write_replay_ledger",
+            (),
+        )
+        .await
+        .unwrap();
+        let error = recorded_report_checked(&db, &call).await.unwrap_err();
+        assert!(error.contains("inspect the write replay ledger"), "{error}");
     }
 
     fn report(status: &str) -> String {

@@ -3735,6 +3735,7 @@ fn claimed_slot(orch: &Orchestrator, job_id: &str) -> (String, crate::orchestrat
 /// The immutable facts a wave that sealed `head` publishes.
 fn plan_at(head: &str) -> Arc<crate::execution::checks_turn_end::WavePlan> {
     Arc::new(crate::execution::checks_turn_end::WavePlan {
+        capture: None,
         head: head.to_string(),
         base: String::new(),
         tree_hash: String::new(),

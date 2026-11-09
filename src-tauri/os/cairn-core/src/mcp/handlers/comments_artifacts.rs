@@ -493,6 +493,11 @@ pub(crate) async fn preview_artifact_change(
 ///
 /// `is_patch` merges the payload over the latest artifact (validating the full
 /// merged object); `create` stores the payload as-is.
+///
+/// `defer_pr_sync` is set when the calling write holds its project's store
+/// lock. A create-pr version's pull-request sync is network I/O, so it is then
+/// not run here: the stored version comes back as a [`DeferredPrSync`] for the
+/// write to complete after it releases the lock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_artifact_change(
     orch: &Orchestrator,
@@ -505,7 +510,8 @@ pub(crate) async fn write_artifact_change(
     artifact_name: Option<&str>,
     payload: &serde_json::Value,
     is_patch: bool,
-) -> Result<String, String> {
+    defer_pr_sync: bool,
+) -> Result<(String, Option<crate::pr_data::actions::DeferredPrSync>), String> {
     let services = &orch.services;
     refuse_thread_session_artifact(number, exec_seq, node_name, task_name, artifact_name)?;
     // Resolve the project's owning database (a team project's jobs/artifacts live
@@ -625,19 +631,33 @@ pub(crate) async fn write_artifact_change(
     )
     .await?;
 
+    let mut deferred_pr_sync = None;
     let synced_pr_metadata = if let Some((title, body)) = create_pr_artifact_details(
         &effective_payload,
         artifact_name,
         stored.output_name.as_deref(),
         &stored.artifact_type,
     ) {
-        crate::pr_data::actions::sync_create_pr_artifact_for_job(
-            orch,
-            &job_id,
-            &title,
-            body.as_deref(),
-        )
-        .await?
+        if defer_pr_sync {
+            deferred_pr_sync = Some(crate::pr_data::actions::DeferredPrSync {
+                job_id: job_id.clone(),
+                output_name: stored
+                    .output_name
+                    .clone()
+                    .unwrap_or_else(|| output_name.clone()),
+                artifact_id: stored.artifact_id.clone(),
+                version: stored.version,
+            });
+            false
+        } else {
+            crate::pr_data::actions::sync_create_pr_artifact_for_job(
+                orch,
+                &job_id,
+                &title,
+                body.as_deref(),
+            )
+            .await?
+        }
     } else {
         false
     };
@@ -805,8 +825,8 @@ pub(crate) async fn write_artifact_change(
     }
 
     let verb = if is_patch { "patched" } else { "wrote" };
-    Ok(format!(
-        "Artifact {} ({}, type: {}, version {}){}{}{}",
+    let summary = format!(
+        "Artifact {} ({}, type: {}, version {}){}{}{}{}",
         verb,
         artifact_uri,
         stored.artifact_type,
@@ -821,8 +841,14 @@ pub(crate) async fn write_artifact_change(
         } else {
             ""
         },
+        if deferred_pr_sync.is_some() {
+            format!(" — {}", crate::pr_data::actions::DEFERRED_PR_SYNC_PENDING)
+        } else {
+            String::new()
+        },
         terminal_handoff_suffix(should_arm_terminal_interrupt)
-    ))
+    );
+    Ok((summary, deferred_pr_sync))
 }
 
 /// Server-side capture of a schema-constrained ephemeral call's NATIVE

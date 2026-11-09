@@ -2697,14 +2697,26 @@ async fn render_resource_body(
             name,
             path,
         } => {
-            super::threads::read_thread(
+            let mut overview = super::threads::read_thread(
                 db,
                 &project,
                 &name,
                 &path,
                 i64::from(orch.get_settings().max_open_children_per_thread),
             )
-            .await
+            .await;
+            if path.is_empty() {
+                overview.push_str(
+                    &super::vcs::branch_summaries(
+                        orch,
+                        db,
+                        &project,
+                        super::vcs::BranchSummaryScope::Thread(name),
+                    )
+                    .await,
+                );
+            }
+            overview
         }
         CairnResource::ThreadQueue { project, thread } => {
             if let Some(error) = reject_query_params("thread queue", &params) {
@@ -2770,7 +2782,17 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("issue", &params) {
                 error
             } else {
-                read_issue(db, &orch.db.local, &project, number).await
+                let mut overview = read_issue(db, &orch.db.local, &project, number).await;
+                overview.push_str(
+                    &super::vcs::branch_summaries(
+                        orch,
+                        db,
+                        &project,
+                        super::vcs::BranchSummaryScope::Issue(number),
+                    )
+                    .await,
+                );
+                overview
             }
         }
         CairnResource::IssueExecutions { project, number } => {

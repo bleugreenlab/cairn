@@ -1,0 +1,6665 @@
+//! Captured coordinates and object lifetime for detached branch advancement.
+//!
+//! Captures never reconcile operation heads or change bookmarks. The snapshot
+//! owns a reclamation lease until computation and installation have finished.
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures::{AsyncReadExt as _, StreamExt as _};
+use jj_lib::backend::{CommitId, CopyId, TreeValue};
+use jj_lib::commit::Commit;
+use jj_lib::matchers::EverythingMatcher;
+use jj_lib::merge::Merge;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
+use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_store::RefTarget;
+use jj_lib::ref_name::RefName;
+use jj_lib::repo::{MutableRepo, ReadonlyRepo, Repo as _};
+use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::revset::ResolvedRevsetExpression;
+use jj_lib::rewrite::CommitRewriter;
+
+#[cfg(test)]
+thread_local! {
+    static REMOTE_PROOF_ANCESTOR_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(4095) };
+}
+
+/// The result of explicit, writer-locked operation-head repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledOperations {
+    pub before: Vec<String>,
+    pub after: String,
+}
+
+/// Explicitly reconcile operation heads under the caller's canonical store
+/// writer lock. Unlike literal loading, this function may publish a merged view.
+/// A singleton is returned without loading, rewriting or publishing anything.
+pub fn settle_operation_heads(
+    jj: &super::JjEnv,
+    store: &Path,
+) -> Result<SettledOperations, String> {
+    jj.check_operation_budget("settle operation heads")?;
+    let workspace = crate::load_workspace(store)?;
+    let loader = workspace.repo_loader();
+    block_on(async {
+        let mut before: Vec<_> = loader
+            .op_heads_store()
+            .get_op_heads()
+            .await
+            .map_err(|error| format!("read operation heads: {error}"))?
+            .into_iter()
+            .map(|id| id.hex())
+            .collect();
+        before.sort();
+        if before.is_empty() {
+            return Err("cannot repair a store with no operation heads".to_string());
+        }
+        if before.len() == 1 {
+            return Ok(SettledOperations {
+                after: before[0].clone(),
+                before,
+            });
+        }
+        let repo = loader
+            .load_at_head()
+            .await
+            .map_err(|error| format!("settle operation heads: {error}"))?;
+        Ok(SettledOperations {
+            before,
+            after: repo.op_id().hex(),
+        })
+    })
+}
+
+/// Both bookmark coordinates captured from one exact operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvanceCoordinate {
+    pub branch: String,
+    pub head: String,
+    pub base_branch: String,
+    pub base: String,
+    pub operation: String,
+}
+
+/// An immutable repository snapshot, kept alive independently of bookmark
+/// movement. Core must separately validate its declared integration relationship
+/// under the canonical store lock before installing any computation from it.
+pub struct BranchAdvanceSnapshot {
+    store: PathBuf,
+    repo: Arc<ReadonlyRepo>,
+    coordinate: AdvanceCoordinate,
+    local_base: bool,
+    dependent_bookmarks: Option<HashSet<String>>,
+    _lease: super::object_lease::ObjectLease,
+}
+
+impl BranchAdvanceSnapshot {
+    /// Supply the complete transitive declared-dependent closure captured under
+    /// the same store guard. These names are not independent ownership anchors.
+    /// They still protect older versions during literal divergence inspection.
+    ///
+    /// This is source-operation evidence, not another install CAS: a dependent
+    /// created or retargeted later keeps its old content and its next preparation
+    /// uses predecessor proof to catch up. No dependent is advanced here.
+    pub fn with_dependent_bookmarks(mut self, names: Vec<String>) -> Self {
+        self.dependent_bookmarks = Some(names.into_iter().collect());
+        self
+    }
+
+    pub fn coordinate(&self) -> &AdvanceCoordinate {
+        &self.coordinate
+    }
+
+    /// Return H's exact tree when the captured base is already an ancestor and
+    /// neither H nor its branch-owned history needs conflict healing. This is a
+    /// pure index/object query: no CLI, name repair or view writes. `budget`
+    /// starts at entry and is checked around every index, object, tree and
+    /// range step; expiry is [`AdvanceComputeError::TimedOut`], never `None`.
+    pub fn already_prepared(
+        &self,
+        budget: Duration,
+    ) -> Result<Option<String>, AdvanceComputeError> {
+        let deadline = Deadline(Instant::now() + budget);
+        deadline.check()?;
+        futures::executor::block_on(self.already_prepared_within(&deadline))
+    }
+
+    async fn already_prepared_within(
+        &self,
+        deadline: &Deadline,
+    ) -> Result<Option<String>, AdvanceComputeError> {
+        // Every answer, `None` included, is given only inside the budget: a
+        // probe that overran is a timeout, never "needs a replay".
+        deadline.check()?;
+        let head = CommitId::try_from_hex(&self.coordinate.head)
+            .ok_or_else(|| compute_error("invalid captured head"))?;
+        let base = CommitId::try_from_hex(&self.coordinate.base)
+            .ok_or_else(|| compute_error("invalid captured base"))?;
+        let ancestor = self
+            .repo
+            .index()
+            .is_ancestor(&base, &head)
+            .map_err(compute_error)?;
+        deadline.check()?;
+        if !ancestor {
+            return Ok(None);
+        }
+        let tip = self.repo.store().get_commit(&head).map_err(compute_error)?;
+        let base_commit = self.repo.store().get_commit(&base).map_err(compute_error)?;
+        deadline.check()?;
+        if tip.has_conflict() || base_commit.has_conflict() {
+            return Ok(None);
+        }
+        let roots = tip.tree().trees().await.map_err(compute_error)?;
+        deadline.check()?;
+        let Some(root) = roots.as_resolved() else {
+            return Ok(None);
+        };
+        let mut names = Vec::new();
+        for entry in root.entries_non_recursive() {
+            deadline.check()?;
+            names.push(entry.name().as_internal_str());
+        }
+        let scaffolded = !cairn_common::conflict_scaffolding::conflict_scaffolding_in_root_listing(
+            &names.join("\n"),
+        )
+        .is_empty();
+        deadline.check()?;
+        if scaffolded {
+            return Ok(None);
+        }
+        let commits = branch_commits(self.repo.as_ref(), &head, &base, deadline, None).await?;
+        for commit in &commits {
+            deadline.check()?;
+            if commit.has_conflict() {
+                return Ok(None);
+            }
+        }
+        deadline.check()?;
+        Ok(tip.tree_ids().as_resolved().map(|id| id.hex()))
+    }
+
+    /// Return exact input commits reachable from the captured head, without
+    /// loading objects or mutating the view. The caller supplies the remaining
+    /// absolute-operation budget; expiry is never a partial subset. Well-formed
+    /// unindexed IDs are excluded: every ancestor of indexed H is indexed.
+    /// Malformed IDs refuse the whole query. Consumers must treat exclusion as
+    /// withholding evidence, never as permission to discard or overwrite work.
+    pub fn reachable_from_head(
+        &self,
+        commits: &[String],
+        budget: Duration,
+    ) -> Result<Vec<String>, AdvanceComputeError> {
+        let deadline = Deadline(Instant::now() + budget);
+        deadline.check()?;
+        let head = CommitId::try_from_hex(&self.coordinate.head)
+            .ok_or_else(|| compute_error("invalid captured head"))?;
+        let mut reachable = Vec::new();
+        for commit in commits {
+            deadline.check()?;
+            let id = parsed_evidence(self.repo.as_ref(), commit)?;
+            if !self.repo.index().has_id(&id).map_err(compute_error)? {
+                continue;
+            }
+            if self
+                .repo
+                .index()
+                .is_ancestor(&id, &head)
+                .map_err(compute_error)?
+            {
+                reachable.push(commit.clone());
+            }
+            deadline.check()?;
+        }
+        deadline.check()?;
+        Ok(reachable)
+    }
+
+    /// Compare BOTH bookmarks in a freshly loaded, settled repository.
+    ///
+    /// This is a preflight, not an installer or a replacement for the caller's
+    /// canonical writer lock. Installation must perform this comparison in its
+    /// own transaction immediately before publication.
+    pub fn coordinates_match(&self) -> Result<bool, String> {
+        block_on(async {
+            let current = crate::load_repo_at_head(&self.store)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(self.matches_repo(&current))
+        })
+    }
+
+    fn matches_repo(&self, current: &ReadonlyRepo) -> bool {
+        let expected = &self.coordinate;
+        normal_target(current, &expected.branch).is_ok_and(|id| id.hex() == expected.head)
+            && if self.local_base {
+                normal_target(current, &expected.base_branch)
+                    .is_ok_and(|id| id.hex() == expected.base)
+            } else {
+                crate::resolve_symbol_at(current, &expected.base_branch)
+                    .is_ok_and(|id| id.hex() == expected.base)
+            }
+    }
+
+    /// The captured operation, never re-resolved through its former head name.
+    pub fn operation(&self) -> String {
+        self.repo.op_id().hex()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvanceCaptureError {
+    Busy(String),
+    UnsettledOperations { heads: usize },
+    UnresolvedCoordinate { name: String },
+    Repository(String),
+}
+
+impl std::fmt::Display for AdvanceCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(reason) | Self::Repository(reason) => f.write_str(reason),
+            Self::UnsettledOperations { heads } => write!(f, "the store has {heads} operation heads; literal inspection requires one settled operation"),
+            Self::UnresolvedCoordinate { name } => write!(f, "advance coordinate `{name}` is missing or conflicted"),
+        }
+    }
+}
+
+impl std::error::Error for AdvanceCaptureError {}
+
+/// Capture a branch and its integration target from a single operation.
+///
+/// Runs synchronously on the caller's blocking worker. The caller captures its
+/// declared base relationship under the canonical store lock; VCS knows only
+/// bookmarks, not the host's relationship database. Garbage collection refuses
+/// while a snapshot is alive, including after either bookmark moves.
+pub fn capture_branch_advance(
+    store: &Path,
+    branch: &str,
+    base_branch: &str,
+) -> Result<BranchAdvanceSnapshot, AdvanceCaptureError> {
+    if branch.is_empty() || base_branch.is_empty() || branch == base_branch {
+        return Err(AdvanceCaptureError::UnresolvedCoordinate {
+            name: if branch.is_empty() {
+                branch.into()
+            } else {
+                base_branch.into()
+            },
+        });
+    }
+    capture_replay_typed(store, branch, base_branch, true)
+}
+
+/// Capture an explicit merge resolution against an immutable session destination.
+/// The host still validates the declared relationship under its store guard.
+/// Only the source bookmark is mutable here: later movement of the relationship's
+/// live base must not retarget an authorized resolution against an older base.
+pub fn capture_branch_merge_resolution(
+    store: &Path,
+    branch: &str,
+    destination: &str,
+) -> Result<BranchAdvanceSnapshot, AdvanceCaptureError> {
+    let unresolved = || AdvanceCaptureError::UnresolvedCoordinate {
+        name: destination.into(),
+    };
+    if branch.is_empty() || CommitId::try_from_hex(destination).is_none() {
+        return Err(unresolved());
+    }
+    let snapshot = capture_replay_typed(store, branch, destination, false)?;
+    // Reject symbols and abbreviations even when they happen to resolve.
+    if destination != snapshot.coordinate.base {
+        return Err(unresolved());
+    }
+    Ok(snapshot)
+}
+
+pub(super) fn capture_replay(
+    store: &Path,
+    branch: &str,
+    base_branch: &str,
+    local_base: bool,
+) -> Result<BranchAdvanceSnapshot, String> {
+    capture_replay_typed(store, branch, base_branch, local_base).map_err(|error| error.to_string())
+}
+
+fn capture_replay_typed(
+    store: &Path,
+    branch: &str,
+    base_branch: &str,
+    local_base: bool,
+) -> Result<BranchAdvanceSnapshot, AdvanceCaptureError> {
+    let git_dir = super::store_git_dir(store).ok_or_else(|| {
+        AdvanceCaptureError::Repository(format!(
+            "resolve backing Git directory for {}",
+            store.display()
+        ))
+    })?;
+    let lease =
+        super::object_lease::ObjectLease::acquire(&git_dir).map_err(|error| match error {
+            super::object_lease::LeaseError::Busy => {
+                AdvanceCaptureError::Busy("store maintenance is active".into())
+            }
+            super::object_lease::LeaseError::Repository(error) => {
+                AdvanceCaptureError::Repository(error)
+            }
+        })?;
+    let workspace = crate::load_workspace(store).map_err(AdvanceCaptureError::Repository)?;
+    let loader = workspace.repo_loader();
+    let repo = futures::executor::block_on(async {
+        let heads = loader
+            .op_heads_store()
+            .get_op_heads()
+            .await
+            .map_err(|error| AdvanceCaptureError::Repository(error.to_string()))?;
+        let [head] = heads.as_slice() else {
+            return Err(AdvanceCaptureError::UnsettledOperations { heads: heads.len() });
+        };
+        let operation = loader
+            .load_operation(head)
+            .await
+            .map_err(|error| AdvanceCaptureError::Repository(error.to_string()))?;
+        loader
+            .load_at(&operation)
+            .await
+            .map_err(|error| AdvanceCaptureError::Repository(error.to_string()))
+    })?;
+    let unresolved = |name: &str| AdvanceCaptureError::UnresolvedCoordinate { name: name.into() };
+    let coordinate = AdvanceCoordinate {
+        branch: branch.to_string(),
+        head: normal_target(&repo, branch)
+            .map_err(|_| unresolved(branch))?
+            .hex(),
+        base_branch: base_branch.to_string(),
+        base: if local_base {
+            normal_target(&repo, base_branch).map_err(|_| unresolved(base_branch))?
+        } else {
+            crate::resolve_symbol_at(&repo, base_branch).map_err(|_| unresolved(base_branch))?
+        }
+        .hex(),
+        operation: repo.op_id().hex(),
+    };
+    Ok(BranchAdvanceSnapshot {
+        store: store.to_path_buf(),
+        repo,
+        coordinate,
+        local_base,
+        dependent_bookmarks: None,
+        _lease: lease,
+    })
+}
+
+/// A validated detached advancement. Construction is private to the VCS engines:
+/// callers cannot turn an arbitrary commit into permission to advance a branch.
+pub struct BranchAdvanceCandidate {
+    snapshot: BranchAdvanceSnapshot,
+    head: Commit,
+    healing: super::AncestryHeal,
+    dropped_commit_ids: Vec<String>,
+    expires_at: Instant,
+}
+
+impl BranchAdvanceCandidate {
+    pub fn coordinate(&self) -> &AdvanceCoordinate {
+        self.snapshot.coordinate()
+    }
+
+    pub fn head(&self) -> String {
+        self.head.id().hex()
+    }
+
+    /// Exact accepted removed-from-this-branch claims: actual drops and source
+    /// identities superseded by proven base predecessors. The historical field
+    /// name does not imply all their content was discarded.
+    /// Available before install for a pending witness; publication authority only
+    /// begins when this complete candidate is durably accepted.
+    pub fn dropped_commit_ids(&self) -> &[String] {
+        &self.dropped_commit_ids
+    }
+
+    pub fn tree(&self) -> Result<String, String> {
+        self.head
+            .tree_ids()
+            .as_resolved()
+            .map(|tree| tree.hex())
+            .ok_or_else(|| "detached advance candidate has unresolved trees".to_string())
+    }
+}
+
+/// A refusal from detached computation. Conflict diagnostics refer only to the
+/// captured immutable coordinates; the caller must revalidate before retaining
+/// them or opening a conflict session.
+#[derive(Debug, Clone)]
+pub enum AdvanceComputeError {
+    Conflict(Box<super::ConflictDiagnostic>),
+    BaseConflicted { base: String },
+    TimedOut,
+    CoordinatesChanged,
+    AmbiguousOwnership { commit: String },
+    UnknownEvidence { commit: String },
+    Busy,
+    UnaccountedRemoteCommits { commits: Vec<String> },
+    EvidenceLimit { limit: usize },
+    Repository(String),
+}
+
+impl std::fmt::Display for AdvanceComputeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(diagnostic) => write!(
+                f,
+                "advance conflicts with base: {}",
+                diagnostic.conflicting_paths().join(", ")
+            ),
+            Self::BaseConflicted { base } => {
+                write!(f, "advance base `{base}` carries recorded conflicts")
+            }
+            Self::TimedOut => {
+                f.write_str("detached branch advance timed out: operation budget exhausted")
+            }
+            Self::CoordinatesChanged => f.write_str("detached replay inputs changed"),
+            Self::AmbiguousOwnership { commit } => write!(
+                f,
+                "merge `{commit}` requires complete declared-dependent ownership context"
+            ),
+            Self::EvidenceLimit { limit } => write!(
+                f,
+                "branch history/proof exceeds the {limit}-entry bound; rebuild the branch from its current base while preserving its own changes"
+            ),
+            Self::Busy => f.write_str("store maintenance is active"),
+            Self::UnaccountedRemoteCommits { commits } => {
+                write!(f, "origin has unaccounted commits: {}", commits.join(", "))
+            }
+            Self::UnknownEvidence { commit } => write!(
+                f,
+                "advance evidence `{commit}` is not a full indexed commit"
+            ),
+            Self::Repository(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for AdvanceComputeError {}
+
+fn compute_error(error: impl std::fmt::Display) -> AdvanceComputeError {
+    let error = error.to_string();
+    if super::is_jj_timeout_error(&error) {
+        AdvanceComputeError::TimedOut
+    } else {
+        AdvanceComputeError::Repository(error)
+    }
+}
+
+/// Removed-from-this-branch evidence from an accepted installation of this branch.
+/// The caller must exclude pending/unaccepted records and validate project/store
+/// provenance. Head ancestry is independently checked against the exact local T.
+#[derive(Debug, Clone)]
+pub struct AcceptedAdvanceDrops {
+    pub head_after: String,
+    pub dropped_commit_ids: Vec<String>,
+}
+
+/// Prove every origin-only commit using hidden status, exact predecessor
+/// ancestry, or accepted drop evidence. This is not permission to rewrite an
+/// unmanaged/default branch, nor a remote lease: those policies belong to the
+/// publisher. Unknown evidence and exhausted budgets refuse the whole proof.
+pub fn origin_copy_is_superseded_with_accepted(
+    jj: &super::JjEnv,
+    store: &Path,
+    branch: &str,
+    local: &str,
+    remote: &str,
+    accepted: &[AcceptedAdvanceDrops],
+    budget: Duration,
+) -> Result<bool, AdvanceComputeError> {
+    let limit = Instant::now() + budget;
+    let deadline = Deadline(
+        jj.operation_deadline
+            .map_or(limit, |outer| outer.min(limit)),
+    );
+    deadline.check()?;
+    let git_dir =
+        super::store_git_dir(store).ok_or_else(|| compute_error("resolve proof store"))?;
+    let _lease =
+        super::object_lease::ObjectLease::acquire(&git_dir).map_err(|error| match error {
+            super::object_lease::LeaseError::Busy => AdvanceComputeError::Busy,
+            super::object_lease::LeaseError::Repository(error) => compute_error(error),
+        })?;
+    futures::executor::block_on(async {
+        deadline.check()?;
+        let repo = crate::load_repo_at_head(store)
+            .await
+            .map_err(compute_error)?;
+        deadline.check()?;
+        let local = indexed_evidence(repo.as_ref(), local)?;
+        let tracked = repo.view().get_remote_bookmark(
+            RefName::new(branch).to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+        );
+        if !tracked.is_tracked()
+            || tracked
+                .target
+                .as_normal()
+                .is_none_or(|id| id.hex() != remote)
+        {
+            return Ok(false);
+        }
+        let remote = indexed_evidence(repo.as_ref(), remote)?;
+        if !normal_target(&repo, branch).is_ok_and(|target| target == local) {
+            return Err(AdvanceComputeError::CoordinatesChanged);
+        }
+        // View visibility is independent of a ref's target: an earlier
+        // branch-local operation may have removed an obsolete view head
+        // while another bookmark still names its hidden ancestor. Cairn is
+        // the sole view owner: hiding origin-only work is only a shortcut
+        // over its own rewrite/drop evidence, never authority to abandon
+        // arbitrary external commits.
+        let origin_only = ResolvedRevsetExpression::commit(remote)
+            .ancestors()
+            .minus(&ResolvedRevsetExpression::commit(local.clone()).ancestors())
+            .intersection(&ResolvedRevsetExpression::visible_heads().ancestors());
+        let visible = origin_only.evaluate(repo.as_ref()).map_err(compute_error)?;
+        let mut stream = visible.stream();
+        let mut missing = HashSet::new();
+        while let Some(id) = stream.next().await {
+            deadline.check()?;
+            missing.insert(id.map_err(compute_error)?);
+        }
+        for claim in accepted {
+            deadline.check()?;
+            let head_after = parsed_evidence(repo.as_ref(), &claim.head_after)?;
+            // A reclaimed historical head cannot be an ancestor of this
+            // indexed T. Ignore the old row; inherited evidence lives on a
+            // newer accepted row. Malformed IDs still refuse.
+            if !repo.index().has_id(&head_after).map_err(compute_error)? {
+                continue;
+            }
+            if !repo
+                .index()
+                .is_ancestor(&head_after, &local)
+                .map_err(compute_error)?
+            {
+                continue;
+            }
+            for dropped in &claim.dropped_commit_ids {
+                deadline.check()?;
+                if dropped.len() != repo.store().commit_id_length() * 2 {
+                    return Err(AdvanceComputeError::UnknownEvidence {
+                        commit: dropped.clone(),
+                    });
+                }
+                let id = CommitId::try_from_hex(dropped).ok_or_else(|| {
+                    AdvanceComputeError::UnknownEvidence {
+                        commit: dropped.clone(),
+                    }
+                })?;
+                missing.remove(&id);
+            }
+        }
+        // The direct flattened metadata is the common path. Ordinary jj
+        // amendments may retain only one predecessor, so follow exact
+        // predecessor edges too. Missing metadata never becomes evidence.
+        let ancestors = ResolvedRevsetExpression::commit(local.clone())
+            .ancestors()
+            .minus(&ResolvedRevsetExpression::commit(local.clone()))
+            .evaluate(repo.as_ref())
+            .map_err(compute_error)?;
+        let mut stream = ancestors.stream();
+        let mut direct_head = Some(repo.store().get_commit(&local).map_err(compute_error)?);
+        #[cfg(not(test))]
+        let ancestor_limit = 4095;
+        #[cfg(test)]
+        let ancestor_limit = REMOTE_PROOF_ANCESTOR_LIMIT.with(std::cell::Cell::get);
+        let mut visited = HashSet::new();
+        let mut edges = 0usize;
+        let mut inspected = 0usize;
+        while !missing.is_empty() {
+            deadline.check()?;
+            let commit = if let Some(head) = direct_head.take() {
+                head
+            } else {
+                if inspected >= ancestor_limit {
+                    break;
+                }
+                let Some(id) = stream.next().await else { break };
+                inspected += 1;
+                repo.store()
+                    .get_commit(&id.map_err(compute_error)?)
+                    .map_err(compute_error)?
+            };
+            let mut pending = Vec::new();
+            for id in &commit.store_commit().predecessors {
+                deadline.check()?;
+                missing.remove(id);
+                if pending.len() < 16_384 {
+                    pending.push((id.clone(), 1usize));
+                }
+            }
+            while let Some((id, depth)) = pending.pop() {
+                deadline.check()?;
+                missing.remove(&id);
+                if missing.is_empty() {
+                    break;
+                }
+                if depth >= 64
+                    || visited.len() >= 4096
+                    || edges >= 16_384
+                    || !visited.insert(id.clone())
+                {
+                    continue;
+                }
+                edges += 1;
+                let Ok(predecessor) = repo.store().get_commit(&id) else {
+                    continue;
+                };
+                for older in &predecessor.store_commit().predecessors {
+                    deadline.check()?;
+                    missing.remove(older);
+                    if pending.len() < 16_384 {
+                        pending.push((older.clone(), depth + 1));
+                    }
+                }
+            }
+        }
+        deadline.check()?;
+        if missing.is_empty() {
+            Ok(true)
+        } else {
+            let mut commits: Vec<_> = missing.into_iter().map(|id| id.hex()).collect();
+            commits.sort();
+            Err(AdvanceComputeError::UnaccountedRemoteCommits { commits })
+        }
+    })
+}
+
+fn indexed_evidence(
+    repo: &dyn jj_lib::repo::Repo,
+    hex: &str,
+) -> Result<CommitId, AdvanceComputeError> {
+    let id = parsed_evidence(repo, hex)?;
+    if !repo.index().has_id(&id).map_err(compute_error)? {
+        return Err(AdvanceComputeError::UnknownEvidence {
+            commit: hex.to_string(),
+        });
+    }
+    Ok(id)
+}
+
+fn parsed_evidence(
+    repo: &dyn jj_lib::repo::Repo,
+    hex: &str,
+) -> Result<CommitId, AdvanceComputeError> {
+    let unknown = || AdvanceComputeError::UnknownEvidence {
+        commit: hex.to_string(),
+    };
+    if hex.len() != repo.store().commit_id_length() * 2 {
+        return Err(unknown());
+    }
+    CommitId::try_from_hex(hex).ok_or_else(unknown)
+}
+
+struct Deadline(Instant);
+
+impl Deadline {
+    fn check(&self) -> Result<(), AdvanceComputeError> {
+        if Instant::now() >= self.0 {
+            Err(AdvanceComputeError::TimedOut)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Text already proven by a destination's declared structural merge rules.
+/// This is distinct from a human conflict-session resolution carry. The host
+/// validates rule authority; VCS validates coordinates, affected paths and trees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredMergeEdits {
+    pub expected_head: String,
+    pub expected_base: String,
+    pub edits: Vec<(String, String)>,
+}
+
+/// Compute a branch-local replay without publishing any operation or bookmark.
+///
+/// Run on a blocking worker and await that worker before releasing its lifetime.
+/// The absolute deadline is checked between graph, merge and file operations;
+/// no timed-out worker retains permission to install. `resolution` is an
+/// already-authorized carry, not a request to compute a resolution basis.
+pub fn compute_branch_advance(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    budget: Duration,
+) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
+    compute_branch_advance_with_declared(jj, snapshot, resolution, None, budget)
+}
+
+/// Replay with optional pre-proven declared structural merges. Repeating a
+/// refused computation with these edits still publishes no live view; a fresh
+/// capture is accepted only when the plan's exact H/B pair still matches.
+pub fn compute_branch_advance_with_declared(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    declared: Option<&DeclaredMergeEdits>,
+    budget: Duration,
+) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
+    compute_with_recovery(jj, snapshot, resolution, declared, budget, false)
+}
+
+/// Compute merge-mode catch-up without publishing an operation or bookmark.
+/// Existing source commits are never rewritten, replayed, healed or dropped.
+/// A divergent candidate has exact parents H then B; installation uses the same
+/// snapshot lease, absolute deadline and two-coordinate CAS as replay candidates.
+pub fn compute_branch_merge_advance(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    budget: Duration,
+) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
+    let message = super::catch_up_merge_message(
+        &snapshot.coordinate.base_branch,
+        &snapshot.coordinate.base,
+        &snapshot.coordinate.branch,
+    );
+    compute_branch_merge_with_message(jj, snapshot, resolution, &message, budget)
+}
+
+pub(super) fn compute_branch_merge_with_message(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    message: &str,
+    budget: Duration,
+) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
+    let limit = Instant::now() + budget;
+    let deadline = Deadline(
+        jj.operation_deadline
+            .map_or(limit, |outer| outer.min(limit)),
+    );
+    deadline.check()?;
+    let bounded = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let head = super::packed_refs::with_packed_refs_patience_for(
+        &bounded,
+        super::PackedRefs::JjStore(&snapshot.store),
+        "compute detached catch-up merge",
+        || {
+            let result = futures::executor::block_on(compute_merge_candidate(
+                &snapshot, resolution, message, &deadline,
+            ));
+            match result {
+                Err(AdvanceComputeError::Repository(error))
+                    if super::packed_refs_lock_error(&error) =>
+                {
+                    Err(error)
+                }
+                other => Ok(other),
+            }
+        },
+    )
+    .map_err(compute_error)??;
+    deadline.check()?;
+    Ok(BranchAdvanceCandidate {
+        snapshot,
+        healing: super::AncestryHeal {
+            tip: head.id().hex(),
+            ..Default::default()
+        },
+        head,
+        dropped_commit_ids: Vec::new(),
+        expires_at: deadline.0,
+    })
+}
+
+/// The canonical merge kernel for both detached preparation and the locked
+/// legacy adapter. Only fresh objects are written; its transaction is never committed.
+async fn compute_merge_candidate(
+    snapshot: &BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    message: &str,
+    deadline: &Deadline,
+) -> Result<Commit, AdvanceComputeError> {
+    deadline.check()?;
+    let repo = &snapshot.repo;
+    let ours = repo
+        .store()
+        .get_commit(&indexed_evidence(repo.as_ref(), &snapshot.coordinate.head)?)
+        .map_err(compute_error)?;
+    let base = repo
+        .store()
+        .get_commit(&indexed_evidence(repo.as_ref(), &snapshot.coordinate.base)?)
+        .map_err(compute_error)?;
+    if let Some(carry) = resolution {
+        if carry.expected_pre_tip != snapshot.coordinate.head {
+            return Err(AdvanceComputeError::CoordinatesChanged);
+        }
+        if carry
+            .paths
+            .iter()
+            .any(|(_, content)| *content != super::CarriedContent::FromTip)
+        {
+            return Err(compute_error(
+                "catch-up refused: merge resolution must take whole paths from the committed tip",
+            ));
+        }
+    }
+    if base.has_conflict() {
+        return Err(AdvanceComputeError::BaseConflicted {
+            base: base.id().hex(),
+        });
+    }
+    deadline.check()?;
+    let already_current = repo
+        .index()
+        .is_ancestor(base.id(), ours.id())
+        .map_err(compute_error)?;
+    let fast_forward = repo
+        .index()
+        .is_ancestor(ours.id(), base.id())
+        .map_err(compute_error)?;
+    deadline.check()?;
+    let mut overlapping = Vec::new();
+    let candidate = if already_current {
+        ours.clone()
+    } else if fast_forward {
+        base.clone()
+    } else {
+        let bases = repo
+            .index()
+            .common_ancestors(
+                std::slice::from_ref(ours.id()),
+                std::slice::from_ref(base.id()),
+            )
+            .map_err(compute_error)?;
+        deadline.check()?;
+        if bases.len() != 1 {
+            let ids: Vec<_> = bases.iter().map(|id| id.hex()).collect();
+            return Err(compute_error(super::ambiguous_merge_base_refusal(
+                &snapshot.coordinate.branch,
+                &snapshot.coordinate.base,
+                &ids,
+            )));
+        }
+        let fork = repo.store().get_commit(&bases[0]).map_err(compute_error)?;
+        let own = changed(&fork, &ours, deadline).await?;
+        overlapping = changed(&fork, &base, deadline)
+            .await?
+            .into_iter()
+            .map(|(_, path)| path)
+            .filter(|path| own.iter().any(|(_, own)| own == path))
+            .collect();
+        let mut tx = repo.start_transaction();
+        let tree = jj_lib::rewrite::merge_commit_trees(tx.repo(), &[ours.clone(), base.clone()])
+            .await
+            .map_err(compute_error)?;
+        deadline.check()?;
+        let mut tree = MergedTreeBuilder::new(tree);
+        if let Some(carry) = resolution {
+            for (path, _) in &carry.paths {
+                deadline.check()?;
+                let path =
+                    RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+                let value = ours.tree().path_value(&path).await.map_err(compute_error)?;
+                if !value.is_resolved() {
+                    return Err(compute_error(
+                        "catch-up refused: committed resolution path is unresolved",
+                    ));
+                }
+                tree.set_or_remove(path, value);
+            }
+        }
+        let tree = tree.write_tree().await.map_err(compute_error)?;
+        deadline.check()?;
+        let commit = tx
+            .repo_mut()
+            .new_commit(vec![ours.id().clone(), base.id().clone()], tree)
+            .set_description(message)
+            .detach()
+            .write_hidden()
+            .await
+            .map_err(compute_error)?;
+        deadline.check()?;
+        commit
+    };
+    if candidate.has_conflict() {
+        let paths = conflict_paths(&candidate)?;
+        return Err(AdvanceComputeError::Conflict(Box::new(
+            diagnostic(snapshot, &ours, &base, &candidate, &paths, deadline).await?,
+        )));
+    }
+    let failures =
+        candidate_parse_failures(&ours, &base, &candidate, &overlapping, deadline).await?;
+    if !failures.is_empty() {
+        let paths: Vec<_> = failures
+            .iter()
+            .map(|failure| failure.path.clone())
+            .collect();
+        let mut refusal = diagnostic(snapshot, &ours, &base, &candidate, &paths, deadline).await?;
+        refusal.condition = super::ConflictCondition::Unparseable;
+        refusal.validation = Some(super::ValidationRefusal {
+            commit: candidate.id().hex(),
+            failures,
+        });
+        return Err(AdvanceComputeError::Conflict(Box::new(refusal)));
+    }
+    let roots = candidate.tree().trees().await.map_err(compute_error)?;
+    deadline.check()?;
+    let root = roots
+        .as_resolved()
+        .ok_or_else(|| compute_error("merge candidate has unresolved trees"))?;
+    let mut names = Vec::new();
+    for entry in root.entries_non_recursive() {
+        deadline.check()?;
+        names.push(entry.name().as_internal_str());
+    }
+    let entries =
+        cairn_common::conflict_scaffolding::conflict_scaffolding_in_root_listing(&names.join("\n"));
+    if !entries.is_empty() {
+        let mut refusal =
+            diagnostic(snapshot, &ours, &base, &candidate, &overlapping, deadline).await?;
+        refusal.condition = super::ConflictCondition::ContentConflict;
+        refusal.scaffolding = Some(super::ScaffoldingRefusal {
+            commit: candidate.id().hex(),
+            entries,
+        });
+        return Err(AdvanceComputeError::Conflict(Box::new(refusal)));
+    }
+    deadline.check()?;
+    Ok(candidate)
+}
+
+const SQUASH_RECEIPT_LIMIT: usize = 4096;
+
+/// Construct a fresh squash object without rewriting any existing commit or view.
+/// A real merge would make every exact source-range commit an ancestor; these
+/// predecessor receipts preserve that history under the squash's fresh change ID.
+/// Ownership remains enforced by replay's pinning policy where receipts are used.
+pub(super) fn compute_branch_squash(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    message: &str,
+    budget: Duration,
+) -> Result<(BranchAdvanceCandidate, usize), AdvanceComputeError> {
+    let limit = Instant::now() + budget;
+    let deadline = Deadline(
+        jj.operation_deadline
+            .map_or(limit, |outer| outer.min(limit)),
+    );
+    deadline.check()?;
+    let bounded = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let (head, collapsed) = super::packed_refs::with_packed_refs_patience_for(
+        &bounded,
+        super::PackedRefs::JjStore(&snapshot.store),
+        "construct branch-only squash",
+        || {
+            let result = futures::executor::block_on(async {
+                deadline.check()?;
+                let source = snapshot.repo.store()
+                    .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head)
+                        .ok_or_else(|| compute_error("invalid squash source"))?)
+                    .map_err(compute_error)?;
+                let base = snapshot.repo.store()
+                    .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.base)
+                        .ok_or_else(|| compute_error("invalid squash base"))?)
+                    .map_err(compute_error)?;
+                if !snapshot.repo.index().is_ancestor(base.id(), source.id()).map_err(compute_error)? {
+                    return Err(compute_error(format!(
+                        "flatten guard: branch `{}` does not descend from dest `{}`; refusing to re-parent a stale tree",
+                        snapshot.coordinate.branch, snapshot.coordinate.base,
+                    )));
+                }
+                if base.has_conflict() || source.has_conflict() {
+                    return Err(compute_error("squash guard: source and base tips must be conflict-free"));
+                }
+                let roots = source.tree().trees().await.map_err(compute_error)?;
+                deadline.check()?;
+                let root = roots.as_resolved()
+                    .ok_or_else(|| compute_error("squash guard: source tree is unresolved"))?;
+                let mut listing = String::new();
+                for entry in root.entries_non_recursive() {
+                    deadline.check()?;
+                    listing.push_str(entry.name().as_internal_str());
+                    listing.push('\n');
+                }
+                if !cairn_common::conflict_scaffolding::conflict_scaffolding_in_root_listing(&listing).is_empty() {
+                    return Err(compute_error("squash guard: source tree contains conflict scaffolding"));
+                }
+                let commits = branch_commits(snapshot.repo.as_ref(), source.id(), base.id(), &deadline, Some(SQUASH_RECEIPT_LIMIT)).await?;
+                let collapsed = commits.iter().filter(|commit| commit.has_conflict()).count();
+                let mut predecessors = Vec::new();
+                let mut seen = HashSet::new();
+                for commit in commits.iter().rev() {
+                    deadline.check()?;
+                    if seen.insert(commit.id().clone()) {
+                        predecessors.push(commit.id().clone());
+                    }
+                }
+                for commit in commits.iter().rev() {
+                    for predecessor in &commit.store_commit().predecessors {
+                        deadline.check()?;
+                        if predecessor.hex().len() != snapshot.repo.store().commit_id_length() * 2 {
+                            return Err(AdvanceComputeError::UnknownEvidence { commit: predecessor.hex() });
+                        }
+                        if snapshot.repo.index().has_id(predecessor).map_err(compute_error)?
+                            && snapshot.repo.index().is_ancestor(predecessor, base.id()).map_err(compute_error)?
+                        {
+                            continue;
+                        }
+                        if seen.insert(predecessor.clone()) {
+                            predecessors.push(predecessor.clone());
+                        }
+                        if predecessors.len() > SQUASH_RECEIPT_LIMIT {
+                            return Err(AdvanceComputeError::EvidenceLimit { limit: SQUASH_RECEIPT_LIMIT });
+                        }
+                    }
+                }
+                if predecessors.len() > SQUASH_RECEIPT_LIMIT {
+                    return Err(AdvanceComputeError::EvidenceLimit { limit: SQUASH_RECEIPT_LIMIT });
+                }
+                let mut tx = snapshot.repo.start_transaction();
+                let head = tx.repo_mut()
+                    .new_commit(vec![base.id().clone()], source.tree())
+                    .set_predecessors(predecessors)
+                    .set_description(message)
+                    .detach().write_hidden().await.map_err(compute_error)?;
+                // With the same exact parent, tree identity proves the complete
+                // pre/post footprint, including every deletion, is identical.
+                if head.tree_ids() != source.tree_ids() || head.parent_ids() != [base.id().clone()] {
+                    return Err(compute_error("flatten footprint guard: squash tree or exact parent changed"));
+                }
+                deadline.check()?;
+                Ok((head, collapsed))
+            });
+            match result {
+                Err(AdvanceComputeError::Repository(error)) if super::packed_refs_lock_error(&error) => Err(error),
+                other => Ok(other),
+            }
+        },
+    ).map_err(compute_error)??;
+    deadline.check()?;
+    Ok((
+        BranchAdvanceCandidate {
+            snapshot,
+            healing: super::AncestryHeal {
+                tip: head.id().hex(),
+                ..Default::default()
+            },
+            head,
+            dropped_commit_ids: Vec::new(),
+            expires_at: deadline.0,
+        },
+        collapsed,
+    ))
+}
+
+pub(super) fn compute_legacy_replay(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    budget: Duration,
+) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
+    compute_with_recovery(jj, snapshot, resolution, None, budget, true)
+}
+
+fn compute_with_recovery(
+    jj: &super::JjEnv,
+    snapshot: BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    declared: Option<&DeclaredMergeEdits>,
+    budget: Duration,
+    legacy: bool,
+) -> Result<BranchAdvanceCandidate, AdvanceComputeError> {
+    if declared.is_some_and(|plan| {
+        plan.expected_head != snapshot.coordinate.head
+            || plan.expected_base != snapshot.coordinate.base
+    }) {
+        return Err(AdvanceComputeError::CoordinatesChanged);
+    }
+    let limit = Instant::now() + budget;
+    let deadline = Deadline(
+        jj.operation_deadline
+            .map_or(limit, |outer| outer.min(limit)),
+    );
+    // Legacy callers without an operation budget retain the canonical
+    // maintenance-owned stale-lock proof. Detached callers always have an
+    // absolute bound and never enter that unbounded external proof.
+    let patience = if legacy {
+        jj.clone()
+    } else {
+        jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()))
+    };
+    let (head, healing, dropped_commit_ids) = super::packed_refs::with_packed_refs_patience_for(
+        &patience,
+        super::PackedRefs::JjStore(&snapshot.store),
+        "compute detached replay",
+        || {
+            let result = futures::executor::block_on(compute_candidate(
+                jj, &snapshot, resolution, declared, &deadline,
+            ));
+            match result {
+                Err(AdvanceComputeError::Repository(error))
+                    if super::packed_refs_lock_error(&error) =>
+                {
+                    Err(error)
+                }
+                other => Ok(other),
+            }
+        },
+    )
+    .map_err(compute_error)??;
+    deadline.check()?;
+    Ok(BranchAdvanceCandidate {
+        snapshot,
+        head,
+        healing,
+        dropped_commit_ids,
+        expires_at: deadline.0,
+    })
+}
+
+async fn branch_commits(
+    repo: &dyn jj_lib::repo::Repo,
+    head: &CommitId,
+    base: &CommitId,
+    deadline: &Deadline,
+    limit: Option<usize>,
+) -> Result<Vec<Commit>, AdvanceComputeError> {
+    let expression = ResolvedRevsetExpression::commit(head.clone())
+        .ancestors()
+        .minus(&ResolvedRevsetExpression::commit(base.clone()).ancestors());
+    let revset = expression.evaluate(repo).map_err(compute_error)?;
+    let mut stream = revset.stream();
+    let mut commits = Vec::new();
+    while let Some(id) = stream.next().await {
+        deadline.check()?;
+        if let Some(limit) = limit {
+            if commits.len() >= limit {
+                return Err(AdvanceComputeError::EvidenceLimit { limit });
+            }
+        }
+        commits.push(
+            repo.store()
+                .get_commit(&id.map_err(compute_error)?)
+                .map_err(compute_error)?,
+        );
+    }
+    // Revsets stream reverse topologically. Every parent is processed before
+    // its child, including both arms of branch-owned merges.
+    commits.reverse();
+    Ok(commits)
+}
+
+// Structural squash receipts retain all exact source IDs; ordinary temporal
+// versions remain capped. Missing objects consume temporal room, never become
+// permanent structural receipts. Proof consumers still compare IDs directly.
+fn rewrite_predecessors(
+    old: &Commit,
+    deadline: &Deadline,
+) -> Result<Vec<CommitId>, AdvanceComputeError> {
+    let mut seen = HashSet::new();
+    let mut structural = Vec::new();
+    let mut temporal = vec![old.id().clone()];
+    seen.insert(old.id().clone());
+    for id in &old.store_commit().predecessors {
+        deadline.check()?;
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if id.hex().len() != old.store().commit_id_length() * 2 {
+            return Err(AdvanceComputeError::UnknownEvidence { commit: id.hex() });
+        }
+        let loaded = old.store().get_commit(id);
+        deadline.check()?;
+        let differs = match loaded {
+            Ok(commit) => commit.change_id() != old.change_id(),
+            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => false,
+            Err(error) => return Err(compute_error(error)),
+        };
+        if differs {
+            structural.push(id.clone());
+            if structural.len() > SQUASH_RECEIPT_LIMIT {
+                return Err(AdvanceComputeError::EvidenceLimit {
+                    limit: SQUASH_RECEIPT_LIMIT,
+                });
+            }
+        } else if temporal.len() < 64 {
+            temporal.push(id.clone());
+        }
+    }
+    structural.extend(temporal);
+    Ok(structural)
+}
+
+/// Source-operation ownership is deliberate: a later foreign bookmark move
+/// cannot invalidate candidate content and is not an extra installation CAS.
+fn foreign_heads(
+    repo: &ReadonlyRepo,
+    branch: &str,
+    dependents: Option<&HashSet<String>>,
+) -> Vec<CommitId> {
+    repo.view()
+        .local_bookmarks()
+        .filter(|(name, _)| {
+            *name != RefName::new(branch)
+                && !dependents.is_some_and(|names| names.contains(name.as_str()))
+        })
+        .flat_map(|(_, target)| target.added_ids().cloned())
+        .chain(
+            repo.view()
+                .local_tags()
+                .flat_map(|(_, target)| target.added_ids().cloned()),
+        )
+        // A working-copy commit has no branch-ownership identity in jj's view.
+        // It can be this branch's own or stale checkout, not a foreign owner.
+        // Installation still preserves workspace heads and their ancestry.
+        .collect()
+}
+
+/// A literal branch target remains authoritative when another branch retains
+/// an older version of the same change. Only unowned visible residue is repair.
+pub(crate) fn branch_tip_divergent(
+    repo: &ReadonlyRepo,
+    branch: &str,
+    tip: &CommitId,
+) -> Result<bool, String> {
+    let limit = Instant::now() + Duration::from_secs(10);
+    let commit = repo
+        .store()
+        .get_commit(tip)
+        .map_err(|error| error.to_string())?;
+    let targets = repo
+        .resolve_change_id(commit.change_id())
+        .map_err(|error| error.to_string())?
+        .ok_or("change ID has no visible targets")?;
+    let foreign = foreign_heads(repo, branch, None);
+    for (_, other) in targets.visible_with_offsets() {
+        if other == tip {
+            continue;
+        }
+        let mut owned = false;
+        for anchor in &foreign {
+            if Instant::now() >= limit {
+                return Err("branch ownership inspection timed out".into());
+            }
+            if repo
+                .index()
+                .is_ancestor(other, anchor)
+                .map_err(|error| error.to_string())?
+            {
+                owned = true;
+                break;
+            }
+        }
+        if !owned {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn replay_boundaries(
+    snapshot: &BranchAdvanceSnapshot,
+    commits: &[Commit],
+    head: &Commit,
+    base: &Commit,
+    deadline: &Deadline,
+) -> Result<(HashSet<CommitId>, HashMap<CommitId, CommitId>), AdvanceComputeError> {
+    let repo = snapshot.repo.as_ref();
+    let foreign = foreign_heads(
+        repo,
+        &snapshot.coordinate.branch,
+        snapshot.dependent_bookmarks.as_ref(),
+    );
+    // Filter descendants of the demanded head once. They retain this branch's
+    // old graph; they are not independent owners of its merge arms.
+    let mut independent = Vec::new();
+    for anchor in foreign {
+        deadline.check()?;
+        if !repo
+            .index()
+            .is_ancestor(head.id(), &anchor)
+            .map_err(compute_error)?
+        {
+            independent.push(anchor);
+        }
+    }
+    // One indexed reachability union supplies the SAME ownership predicate to
+    // primary-line selection and side pinning. No per-commit × anchor walks.
+    let considered: HashSet<_> = commits
+        .iter()
+        .flat_map(|commit| {
+            std::iter::once(commit.id().clone()).chain(commit.parent_ids().iter().cloned())
+        })
+        .collect();
+    let expression = ResolvedRevsetExpression::commits(independent)
+        .ancestors()
+        .intersection(&ResolvedRevsetExpression::commits(
+            considered.into_iter().collect(),
+        ));
+    let owners = expression.evaluate(repo).map_err(compute_error)?;
+    let mut stream = owners.stream();
+    let mut foreign_owned = HashSet::new();
+    while let Some(id) = stream.next().await {
+        deadline.check()?;
+        foreign_owned.insert(id.map_err(compute_error)?);
+    }
+    let range: HashSet<_> = commits.iter().map(|commit| commit.id().clone()).collect();
+    let mut primary = HashSet::new();
+    let mut next = head.clone();
+    while range.contains(next.id()) {
+        deadline.check()?;
+        primary.insert(next.id().clone());
+        let Some(first) = next.parent_ids().first() else {
+            break;
+        };
+        let owned = &foreign_owned;
+        let unowned: Vec<_> = next
+            .parent_ids()
+            .iter()
+            .filter(|id| !owned.contains(id))
+            .collect();
+        let base_arm = next
+            .parent_ids()
+            .iter()
+            .skip(1)
+            .map(|id| {
+                repo.index()
+                    .is_ancestor(id, base.id())
+                    .map_err(compute_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|is_base| is_base);
+        let parent = if next.parent_ids().len() > 1 && owned.contains(first) && !base_arm {
+            if snapshot.dependent_bookmarks.is_none() {
+                return Err(AdvanceComputeError::AmbiguousOwnership {
+                    commit: next.id().hex(),
+                });
+            }
+            if unowned.len() != 1 {
+                return Err(AdvanceComputeError::AmbiguousOwnership {
+                    commit: next.id().hex(),
+                });
+            }
+            // Parent order does not transfer ownership. In a reversed merge
+            // (foreign side, own line), follow the uniquely unanchored own line.
+            unowned[0]
+        } else {
+            first
+        };
+        next = repo.store().get_commit(parent).map_err(compute_error)?;
+    }
+    let mut pinned = HashSet::new();
+    for commit in commits {
+        deadline.check()?;
+        if primary.contains(commit.id()) {
+            continue;
+        }
+        if foreign_owned.contains(commit.id()) {
+            pinned.insert(commit.id().clone());
+        }
+    }
+    // Change-ID indexing is cheap, but only exact directional predecessors prove
+    // incorporation. Fresh-identity squashes need the same proof via a receipt
+    // index; build that only for identities not already proven by this pass.
+    let eligible: Vec<_> = commits.iter().collect();
+    let mut mapping = HashMap::new();
+    let mut by_change: HashMap<CommitId, HashSet<CommitId>> = HashMap::new();
+    for old in &eligible {
+        deadline.check()?;
+        let targets: HashSet<_> = repo
+            .resolve_change_id(old.change_id())
+            .map_err(compute_error)?
+            .map(|changes| changes.targets.into_iter().map(|(id, _)| id).collect())
+            .unwrap_or_default();
+        if let Some(id) = exact_base_successor(
+            repo,
+            old,
+            base,
+            &targets,
+            !pinned.contains(old.id()),
+            deadline,
+        )? {
+            mapping.insert(old.id().clone(), id);
+        } else {
+            by_change.insert(old.id().clone(), targets);
+        }
+    }
+    if by_change.is_empty() {
+        return retain_replay_boundaries(repo, commits, pinned, mapping, deadline).await;
+    }
+    // Unlanded own commits also need this walk: absent a reverse predecessor
+    // index, they cannot be distinguished from identities collapsed by a squash.
+    // Plain history growth consumes the deadline, not the evidence quota.
+    super::reached_step("advance: scan squash receipts");
+    let expression = ResolvedRevsetExpression::commit(base.id().clone())
+        .ancestors()
+        .minus(&ResolvedRevsetExpression::commit(head.id().clone()).ancestors());
+    let indexed = expression.evaluate(repo).map_err(compute_error)?;
+    let mut stream = indexed.stream();
+    let mut receipt_candidates: HashMap<CommitId, HashSet<CommitId>> = HashMap::new();
+    let mut receipt_count = 0usize;
+    let mut edge_count = 0usize;
+    while let Some(id) = stream.next().await {
+        deadline.check()?;
+        let id = id.map_err(compute_error)?;
+        let newer = match repo.store().get_commit(&id) {
+            Ok(commit) => commit,
+            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => continue,
+            Err(error) => return Err(compute_error(error)),
+        };
+        if !newer.store_commit().predecessors.is_empty() {
+            receipt_count += 1;
+            if receipt_count > 65_536 {
+                return Err(AdvanceComputeError::EvidenceLimit { limit: 65_536 });
+            }
+        }
+        for predecessor in &newer.store_commit().predecessors {
+            deadline.check()?;
+            edge_count += 1;
+            if edge_count > 1_048_576 {
+                return Err(AdvanceComputeError::EvidenceLimit { limit: 1_048_576 });
+            }
+            if predecessor.hex().len() != repo.store().commit_id_length() * 2 {
+                return Err(AdvanceComputeError::UnknownEvidence {
+                    commit: predecessor.hex(),
+                });
+            }
+            if by_change.contains_key(predecessor) {
+                receipt_candidates
+                    .entry(predecessor.clone())
+                    .or_default()
+                    .insert(id.clone());
+            }
+        }
+    }
+    for old in eligible {
+        let Some(mut targets) = by_change.remove(old.id()) else {
+            continue;
+        };
+        targets.extend(receipt_candidates.remove(old.id()).unwrap_or_default());
+        if let Some(id) = exact_base_successor(
+            repo,
+            old,
+            base,
+            &targets,
+            !pinned.contains(old.id()),
+            deadline,
+        )? {
+            mapping.insert(old.id().clone(), id);
+        }
+    }
+    retain_replay_boundaries(repo, commits, pinned, mapping, deadline).await
+}
+
+async fn retain_replay_boundaries(
+    repo: &dyn jj_lib::repo::Repo,
+    commits: &[Commit],
+    potential_pins: HashSet<CommitId>,
+    mut mapping: HashMap<CommitId, CommitId>,
+    deadline: &Deadline,
+) -> Result<(HashSet<CommitId>, HashMap<CommitId, CommitId>), AdvanceComputeError> {
+    let range: HashSet<_> = commits.iter().map(|commit| commit.id().clone()).collect();
+    let mut retained = HashSet::new();
+    // Mapping only shrinks. Newly replayed own merges can require additional
+    // literal foreign arms, whose entire in-range ancestry must remain intact.
+    // Retained arms satisfy prefix closure; an unproven own ancestor does not.
+    loop {
+        deadline.check()?;
+        let previous = mapping.len();
+        let mut roots = HashSet::new();
+        for commit in commits {
+            deadline.check()?;
+            if potential_pins.contains(commit.id()) || mapping.contains_key(commit.id()) {
+                continue;
+            }
+            for parent in commit.parent_ids() {
+                deadline.check()?;
+                if potential_pins.contains(parent) && !mapping.contains_key(parent) {
+                    roots.insert(parent.clone());
+                }
+            }
+        }
+        if !roots.is_empty() {
+            let expression = ResolvedRevsetExpression::commits(roots.into_iter().collect())
+                .ancestors()
+                .intersection(&ResolvedRevsetExpression::commits(
+                    range.iter().cloned().collect(),
+                ));
+            let ancestors = expression.evaluate(repo).map_err(compute_error)?;
+            let mut stream = ancestors.stream();
+            while let Some(id) = stream.next().await {
+                deadline.check()?;
+                retained.insert(id.map_err(compute_error)?);
+            }
+        }
+        mapping.retain(|id, _| !retained.contains(id));
+        // branch_commits is oldest-first: removing one unproven prefix member
+        // invalidates all dependent mappings in this pass, without guessing that
+        // a descendant receipt also proves its missing ancestors.
+        for commit in commits {
+            deadline.check()?;
+            if !mapping.contains_key(commit.id()) {
+                continue;
+            }
+            let mut complete = true;
+            for parent in commit.parent_ids() {
+                deadline.check()?;
+                if range.contains(parent)
+                    && !mapping.contains_key(parent)
+                    && !retained.contains(parent)
+                {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete {
+                mapping.remove(commit.id());
+            }
+        }
+        if mapping.len() == previous {
+            break;
+        }
+    }
+    // A foreign object keeps its literal ancestors reachable. An own-line
+    // ancestor may still replay onto the new base; treating that own version as
+    // a replay pin could prevent the candidate from including the new base.
+    let pinned = potential_pins
+        .into_iter()
+        .filter(|id| !mapping.contains_key(id))
+        .collect();
+    Ok((pinned, mapping))
+}
+
+fn exact_base_successor(
+    repo: &dyn jj_lib::repo::Repo,
+    old: &Commit,
+    base: &Commit,
+    targets: &HashSet<CommitId>,
+    allow_temporal: bool,
+    deadline: &Deadline,
+) -> Result<Option<CommitId>, AdvanceComputeError> {
+    let mut successor: Option<CommitId> = None;
+    let mut ambiguous = false;
+    for id in targets {
+        deadline.check()?;
+        if !repo
+            .index()
+            .is_ancestor(id, base.id())
+            .map_err(compute_error)?
+        {
+            continue;
+        }
+        let newer = match repo.store().get_commit(id) {
+            Ok(commit) => commit,
+            Err(jj_lib::backend::BackendError::ObjectNotFound { .. }) => continue,
+            Err(error) => return Err(compute_error(error)),
+        };
+        if !newer.store_commit().predecessors.contains(old.id()) {
+            continue;
+        }
+        if let Some(chosen) = &successor {
+            if repo
+                .index()
+                .is_ancestor(id, chosen)
+                .map_err(compute_error)?
+            {
+                successor = Some(id.clone());
+            } else if !repo
+                .index()
+                .is_ancestor(chosen, id)
+                .map_err(compute_error)?
+            {
+                ambiguous = true;
+            }
+        } else {
+            successor = Some(id.clone());
+        }
+    }
+    let successor = if ambiguous { None } else { successor };
+    // A pin only withholds the already-judged answer. Filtering temporal facts
+    // before ambiguity would let the pin turn an ambiguous proof into authority.
+    if !allow_temporal {
+        if let Some(id) = &successor {
+            let newer = repo.store().get_commit(id).map_err(compute_error)?;
+            if newer.change_id() == old.change_id() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(successor)
+}
+
+async fn rewrite_hidden(
+    repo: &mut MutableRepo,
+    old: &Commit,
+    parents: Vec<CommitId>,
+    deadline: &Deadline,
+) -> Result<Commit, AdvanceComputeError> {
+    if parents == old.parent_ids() {
+        return Ok(old.clone());
+    }
+    let commit = CommitRewriter::new(repo, old.clone(), parents)
+        .rebase()
+        .await
+        .map_err(compute_error)?
+        .set_predecessors(rewrite_predecessors(old, deadline)?)
+        .detach()
+        .write_hidden()
+        .await
+        .map_err(compute_error)?;
+    repo.add_head(&commit).await.map_err(compute_error)?;
+    Ok(commit)
+}
+
+fn conflict_paths(commit: &Commit) -> Result<Vec<String>, AdvanceComputeError> {
+    commit
+        .tree()
+        .conflicts()
+        .map(|(path, value)| {
+            value.map_err(compute_error)?;
+            Ok(path.as_internal_file_string().to_string())
+        })
+        .collect()
+}
+
+async fn restore_paths(
+    repo: &mut MutableRepo,
+    commit: &Commit,
+    source: &Commit,
+    paths: &[String],
+    deadline: &Deadline,
+) -> Result<Commit, AdvanceComputeError> {
+    let mut tree = MergedTreeBuilder::new(commit.tree());
+    for path in paths {
+        deadline.check()?;
+        let path = RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+        let value = source
+            .tree()
+            .path_value(&path)
+            .await
+            .map_err(compute_error)?;
+        if !value.is_resolved() {
+            return Err(compute_error("ancestry heal source has unresolved paths"));
+        }
+        tree.set_or_remove(path, value);
+    }
+    let tree = tree.write_tree().await.map_err(compute_error)?;
+    let restored = repo
+        .rewrite_commit(commit)
+        .set_predecessors(rewrite_predecessors(commit, deadline)?)
+        .set_tree(tree)
+        .detach()
+        .write_hidden()
+        .await
+        .map_err(compute_error)?;
+    repo.add_head(&restored).await.map_err(compute_error)?;
+    Ok(restored)
+}
+
+struct ProvenMergeCollapse {
+    source: CommitId,
+    parent: CommitId,
+}
+
+fn prove_merge_collapse(
+    repo: &dyn jj_lib::repo::Repo,
+    old: &Commit,
+    parents: &[CommitId],
+    base: &Commit,
+    proven: &HashSet<CommitId>,
+    dropped: &HashSet<CommitId>,
+    deadline: &Deadline,
+) -> Result<ProvenMergeCollapse, AdvanceComputeError> {
+    let refusal = || {
+        compute_error(
+            "replay would collapse distinct merge parents without individual integration proof",
+        )
+    };
+    if old.parent_ids().len() <= 1 || parents != [base.id().clone()] {
+        return Err(refusal());
+    }
+    for parent in old.parent_ids() {
+        deadline.check()?;
+        if !proven.contains(parent)
+            && !dropped.contains(parent)
+            && !repo
+                .index()
+                .is_ancestor(parent, base.id())
+                .map_err(compute_error)?
+        {
+            return Err(refusal());
+        }
+    }
+    Ok(ProvenMergeCollapse {
+        source: old.id().clone(),
+        parent: base.id().clone(),
+    })
+}
+
+async fn newly_empty(
+    repo: &MutableRepo,
+    before: &Commit,
+    after: &Commit,
+    collapse: Option<&ProvenMergeCollapse>,
+) -> Result<Option<CommitId>, AdvanceComputeError> {
+    if after.parent_ids().len() != 1 {
+        return Ok(None);
+    }
+    let collapsed_merge = before.parent_ids().len() > 1;
+    if collapsed_merge {
+        if !collapse.is_some_and(|proof| {
+            proof.source == *before.id() && after.parent_ids() == [proof.parent.clone()]
+        }) {
+            return Err(compute_error(
+                "[ADVANCE-MERGE-INVARIANT] unproven merge collapse cannot be emptied",
+            ));
+        }
+    } else if before.parent_ids().len() != 1 {
+        return Ok(None);
+    }
+    let parent = repo
+        .store()
+        .get_commit(&after.parent_ids()[0])
+        .map_err(compute_error)?;
+    if after.tree_ids() != parent.tree_ids() {
+        return Ok(None);
+    }
+    // The guarded rebase has already integrated every old parent. A collapsed
+    // merge with no remaining own change is now a newly empty linear commit.
+    if collapsed_merge {
+        return Ok(Some(parent.id().clone()));
+    }
+    let old_parent = repo
+        .store()
+        .get_commit(&before.parent_ids()[0])
+        .map_err(compute_error)?;
+    Ok((before.tree_ids() != old_parent.tree_ids()).then(|| parent.id().clone()))
+}
+
+async fn heal_branch(
+    repo: &mut MutableRepo,
+    head: &Commit,
+    base: &Commit,
+    pinned: &HashSet<CommitId>,
+    dropped_ids: &mut HashSet<CommitId>,
+    deadline: &Deadline,
+) -> Result<(Commit, super::AncestryHeal), AdvanceComputeError> {
+    let before = branch_commits(repo, head.id(), base.id(), deadline, None).await?;
+    if !before.iter().any(Commit::has_conflict) {
+        return Ok((
+            head.clone(),
+            super::AncestryHeal {
+                tip: head.id().hex(),
+                ..Default::default()
+            },
+        ));
+    }
+    let mut mapping: HashMap<CommitId, CommitId> = HashMap::new();
+    let mut healed = Vec::new();
+    let mut dropped = Vec::new();
+    for old in &before {
+        deadline.check()?;
+        if pinned.contains(old.id()) {
+            if old.has_conflict() {
+                return Err(compute_error(
+                    "cannot heal conflicted history owned by a foreign branch",
+                ));
+            }
+            mapping.insert(old.id().clone(), old.id().clone());
+            continue;
+        }
+        let parents = old
+            .parent_ids()
+            .iter()
+            .map(|id| mapping.get(id).unwrap_or(id).clone())
+            .collect();
+        let mut current = rewrite_hidden(repo, old, parents, deadline).await?;
+        let mut resolved_paths = None;
+        if current.has_conflict() {
+            let paths = conflict_paths(&current)?;
+            if paths.is_empty() {
+                return Err(compute_error(format!(
+                    "{} no conflicted paths named",
+                    super::ANCESTRY_HEAL_GUARD
+                )));
+            }
+            // An existing conflict takes the committed clean-tip resolution.
+            // A newly conflicted descendant takes its own pre-heal tree.
+            let source = if old.has_conflict() { head } else { old };
+            current = restore_paths(repo, &current, source, &paths, deadline).await?;
+            super::reached_step("ancestry heal: commit resolved");
+            if old.has_conflict() {
+                resolved_paths = Some(paths);
+            }
+        }
+        if current.has_conflict() {
+            return Err(compute_error(format!(
+                "{} restored commit remains conflicted",
+                super::ANCESTRY_HEAL_GUARD
+            )));
+        }
+        if let Some(parent) = newly_empty(repo, old, &current, None).await? {
+            dropped_ids.insert(old.id().clone());
+            dropped_ids.extend(old.store_commit().predecessors.iter().cloned());
+            dropped.push(super::emptied::dropped_label(
+                &old.id().hex(),
+                old.description().lines().next().unwrap_or(""),
+            ));
+            mapping.insert(old.id().clone(), parent);
+        } else {
+            if let Some(paths) = resolved_paths {
+                healed.push((old.id().clone(), paths));
+            }
+            mapping.insert(old.id().clone(), current.id().clone());
+        }
+    }
+    let final_id = mapping.get(head.id()).unwrap_or(head.id()).clone();
+    let final_head = repo.store().get_commit(&final_id).map_err(compute_error)?;
+    if final_head.tree_ids() != head.tree_ids() {
+        return Err(compute_error(format!(
+            "{} healed tip tree changed",
+            super::ANCESTRY_HEAL_GUARD
+        )));
+    }
+    // Add provenance only to surviving healed commits, then rebase their
+    // branch-owned descendants. Metadata-only rewrites cannot alter the tree.
+    let final_commits = branch_commits(repo, final_head.id(), base.id(), deadline, None).await?;
+    let healed_report = healed
+        .iter()
+        .map(|(id, paths)| {
+            let commit = repo.store().get_commit(id).map_err(compute_error)?;
+            Ok(super::HealedCommit {
+                change_id: commit.change_id().reverse_hex(),
+                paths: paths.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, AdvanceComputeError>>()?;
+    let notes: HashMap<CommitId, Vec<String>> = healed
+        .into_iter()
+        .filter_map(|(old, paths)| mapping.get(&old).cloned().map(|id| (id, paths)))
+        .filter(|(id, _)| final_commits.iter().any(|commit| commit.id() == id))
+        .collect();
+    let mut annotated = HashMap::new();
+    let mut first = true;
+    for old in final_commits {
+        deadline.check()?;
+        if pinned.contains(old.id()) {
+            annotated.insert(old.id().clone(), old.id().clone());
+            continue;
+        }
+        let parents = old
+            .parent_ids()
+            .iter()
+            .map(|id| annotated.get(id).unwrap_or(id).clone())
+            .collect();
+        let mut current = rewrite_hidden(repo, &old, parents, deadline).await?;
+        if let Some(paths) = notes.get(old.id()) {
+            let note = super::heal::heal_note(
+                &base.id().hex(),
+                &head.id().hex(),
+                head.description().lines().next().unwrap_or(""),
+                paths,
+                if first { &dropped } else { &[] },
+            );
+            first = false;
+            current = repo
+                .rewrite_commit(&current)
+                .set_predecessors(rewrite_predecessors(&current, deadline)?)
+                .set_description(format!("{}\n\n{note}", old.description().trim_end()))
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(compute_error)?;
+            repo.add_head(&current).await.map_err(compute_error)?;
+        }
+        annotated.insert(old.id().clone(), current.id().clone());
+    }
+    let id = annotated.get(final_head.id()).unwrap_or(final_head.id());
+    let result = repo.store().get_commit(id).map_err(compute_error)?;
+    if result.tree_ids() != head.tree_ids() {
+        return Err(compute_error(format!(
+            "{} annotated tip tree changed",
+            super::ANCESTRY_HEAL_GUARD
+        )));
+    }
+    let report = super::AncestryHeal {
+        tip: result.id().hex(),
+        healed: healed_report,
+        dropped,
+    };
+    Ok((result, report))
+}
+
+// Drop events during healing name hidden intermediate commits. Only original
+// source commits absent from both ancestry and exact predecessor evidence become
+// accepted-drop evidence; labels and tree equality are never publication proof.
+async fn exact_source_drops(
+    repo: &MutableRepo,
+    source: &[Commit],
+    head: &Commit,
+    base: &Commit,
+    proven_base_versions: &HashSet<CommitId>,
+    dropped_ids: &HashSet<CommitId>,
+    deadline: &Deadline,
+) -> Result<Vec<String>, AdvanceComputeError> {
+    let mut predecessors = HashSet::new();
+    for commit in branch_commits(repo, head.id(), base.id(), deadline, None).await? {
+        deadline.check()?;
+        predecessors.extend(commit.store_commit().predecessors.iter().cloned());
+    }
+    let mut dropped = Vec::new();
+    for old in source {
+        deadline.check()?;
+        if proven_base_versions.contains(old.id())
+            || predecessors.contains(old.id())
+            || repo
+                .index()
+                .is_ancestor(old.id(), head.id())
+                .map_err(compute_error)?
+        {
+            continue;
+        }
+        if !dropped_ids.contains(old.id()) {
+            return Err(compute_error(format!(
+                "source commit {} has neither a successor nor an actual drop",
+                old.id().hex()
+            )));
+        }
+        dropped.push(old.id().hex());
+    }
+    Ok(dropped)
+}
+
+const REMOVED_CLAIM_INVARIANT: &str = "[ADVANCE-CLAIM-INVARIANT]";
+
+fn validate_removed_claims(
+    repo: &dyn jj_lib::repo::Repo,
+    head: &Commit,
+    claims: &[String],
+    deadline: &Deadline,
+) -> Result<(), AdvanceComputeError> {
+    for claim in claims {
+        deadline.check()?;
+        let id = indexed_evidence(repo, claim)?;
+        if repo
+            .index()
+            .is_ancestor(&id, head.id())
+            .map_err(compute_error)?
+        {
+            return Err(AdvanceComputeError::Repository(format!(
+                "{REMOVED_CLAIM_INVARIANT} retained source {claim} cannot be claimed as removed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn accepted_source_claims(
+    mut actual: Vec<String>,
+    proven: &HashSet<CommitId>,
+    deadline: &Deadline,
+) -> Result<Vec<String>, AdvanceComputeError> {
+    for id in proven {
+        deadline.check()?;
+        actual.push(id.hex());
+    }
+    actual.sort();
+    actual.dedup();
+    if actual.len() > SQUASH_RECEIPT_LIMIT {
+        return Err(AdvanceComputeError::EvidenceLimit {
+            limit: SQUASH_RECEIPT_LIMIT,
+        });
+    }
+    Ok(actual)
+}
+
+async fn changed(
+    from: &Commit,
+    to: &Commit,
+    deadline: &Deadline,
+) -> Result<Vec<(String, String)>, AdvanceComputeError> {
+    let mut result = Vec::new();
+    let mut stream = from.tree().diff_stream(&to.tree(), &EverythingMatcher);
+    while let Some(entry) = stream.next().await {
+        deadline.check()?;
+        let values = entry.values.map_err(compute_error)?;
+        let status = if values.before.as_resolved().is_some_and(Option::is_none) {
+            "A"
+        } else if values.after.as_resolved().is_some_and(Option::is_none) {
+            "D"
+        } else {
+            "M"
+        };
+        result.push((
+            status.to_string(),
+            entry.path.as_internal_file_string().to_string(),
+        ));
+    }
+    Ok(result)
+}
+
+async fn file_content(
+    commit: &Commit,
+    path: &str,
+    deadline: &Deadline,
+) -> Result<super::FileContent, String> {
+    let path = RepoPathBuf::from_internal_string(path).map_err(|error| error.to_string())?;
+    let value = commit
+        .tree()
+        .path_value(&path)
+        .await
+        .map_err(|error| error.to_string())?;
+    match value.as_resolved() {
+        Some(None) => Ok(super::FileContent::Absent),
+        Some(Some(TreeValue::File { id, .. })) => {
+            let mut reader = commit
+                .store()
+                .read_file(&path, id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 65536];
+            loop {
+                deadline
+                    .check()
+                    .map_err(|_| "candidate read deadline exhausted".to_string())?;
+                let count = reader
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            Ok(match String::from_utf8(bytes) {
+                Ok(text) => super::FileContent::Text(text),
+                Err(_) => super::FileContent::Binary,
+            })
+        }
+        Some(Some(_)) => Ok(super::FileContent::Binary),
+        None => Err("path contains a recorded conflict".to_string()),
+    }
+}
+
+async fn diagnostic(
+    snapshot: &BranchAdvanceSnapshot,
+    ours: &Commit,
+    base: &Commit,
+    candidate: &Commit,
+    paths: &[String],
+    deadline: &Deadline,
+) -> Result<super::ConflictDiagnostic, AdvanceComputeError> {
+    let fork = crate::best_common_ancestor(snapshot.repo.as_ref(), ours.id(), base.id())
+        .map_err(compute_error)?;
+    let mut incoming = BTreeMap::new();
+    if let Some(fork) = &fork {
+        let fork = snapshot
+            .repo
+            .store()
+            .get_commit(fork)
+            .map_err(compute_error)?;
+        for (status, path) in changed(&fork, base, deadline).await? {
+            incoming.insert(path, status);
+        }
+    }
+    for path in paths {
+        incoming
+            .entry(path.clone())
+            .or_insert_with(|| "C".to_string());
+    }
+    let mut equal = !paths.is_empty();
+    for path in paths {
+        deadline.check()?;
+        let path = RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+        equal &= ours.tree().path_value(&path).await.map_err(compute_error)?
+            == base.tree().path_value(&path).await.map_err(compute_error)?;
+    }
+    Ok(super::ConflictDiagnostic {
+        base: fork.map(|id| id.hex()),
+        ours: Some(ours.id().hex()),
+        theirs: Some(base.id().hex()),
+        conflicted_tip: Some(candidate.id().hex()),
+        condition: if equal {
+            super::ConflictCondition::BaseDrift
+        } else {
+            super::ConflictCondition::ContentConflict
+        },
+        incoming: incoming
+            .into_iter()
+            .map(|(path, status)| {
+                let classification = if paths.contains(&path) {
+                    super::IncomingClassification::Conflicting
+                } else {
+                    super::IncomingClassification::CleanOnRetry
+                };
+                super::IncomingFile {
+                    path,
+                    status,
+                    classification,
+                }
+            })
+            .collect(),
+        scaffolding: None,
+        validation: None,
+    })
+}
+
+async fn apply_declared_edits(
+    repo: &mut MutableRepo,
+    candidate: &Commit,
+    plan: &DeclaredMergeEdits,
+    refused_paths: &[String],
+    deadline: &Deadline,
+) -> Result<Commit, AdvanceComputeError> {
+    let paths: std::collections::BTreeSet<_> =
+        plan.edits.iter().map(|(path, _)| path.as_str()).collect();
+    let refused: std::collections::BTreeSet<_> = refused_paths.iter().map(String::as_str).collect();
+    if paths.is_empty() || paths.len() != plan.edits.len() || paths != refused {
+        return Err(compute_error(
+            "declared structural merge does not exactly cover refused paths",
+        ));
+    }
+    let mut tree = MergedTreeBuilder::new(candidate.tree());
+    for (path, content) in &plan.edits {
+        deadline.check()?;
+        if let Some(failure) = crate::parse_gate::parse_failure(path, content) {
+            return Err(compute_error(format!(
+                "declared structural merge does not parse: {failure}"
+            )));
+        }
+        let path = RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+        let current = candidate
+            .tree()
+            .path_value(&path)
+            .await
+            .map_err(compute_error)?;
+        let (executable, copy_id) = match current.as_resolved() {
+            Some(Some(TreeValue::File {
+                executable,
+                copy_id,
+                ..
+            })) => (*executable, copy_id.clone()),
+            _ => (false, CopyId::placeholder()),
+        };
+        let mut reader = futures::io::Cursor::new(content.as_bytes());
+        let id = repo
+            .store()
+            .write_file(&path, &mut reader)
+            .await
+            .map_err(compute_error)?;
+        tree.set_or_remove(
+            path,
+            Merge::resolved(Some(TreeValue::File {
+                id,
+                executable,
+                copy_id,
+            })),
+        );
+    }
+    let tree = tree.write_tree().await.map_err(compute_error)?;
+    let resolved = repo
+        .new_commit(vec![candidate.id().clone()], tree)
+        .set_description("Merge declared registry lists element-wise after base advance")
+        .detach()
+        .write_hidden()
+        .await
+        .map_err(compute_error)?;
+    repo.add_head(&resolved).await.map_err(compute_error)?;
+    Ok(resolved)
+}
+
+async fn candidate_parse_failures(
+    ours: &Commit,
+    base: &Commit,
+    candidate: &Commit,
+    paths: &[String],
+    deadline: &Deadline,
+) -> Result<Vec<super::ParseFailure>, AdvanceComputeError> {
+    let mut contents = HashMap::new();
+    for commit in [ours, base, candidate] {
+        for path in paths {
+            deadline.check()?;
+            contents.insert(
+                (commit.id().hex(), path.clone()),
+                file_content(commit, path, deadline).await,
+            );
+        }
+    }
+    deadline.check()?;
+    Ok(super::landing_gate::introduced_parse_failures_with(
+        &candidate.id().hex(),
+        &[&ours.id().hex(), &base.id().hex()],
+        paths,
+        |revision, path| {
+            contents
+                .get(&(revision.to_string(), path.to_string()))
+                .cloned()
+                .unwrap_or_else(|| Err("unreadable candidate path".to_string()))
+        },
+    ))
+}
+
+async fn compute_candidate(
+    jj: &super::JjEnv,
+    snapshot: &BranchAdvanceSnapshot,
+    resolution: Option<&super::ResolutionCarry>,
+    declared: Option<&DeclaredMergeEdits>,
+    deadline: &Deadline,
+) -> Result<(Commit, super::AncestryHeal, Vec<String>), AdvanceComputeError> {
+    deadline.check()?;
+    let repo = &snapshot.repo;
+    let ours = repo
+        .store()
+        .get_commit(
+            &CommitId::try_from_hex(&snapshot.coordinate.head)
+                .ok_or_else(|| compute_error("invalid captured head"))?,
+        )
+        .map_err(compute_error)?;
+    let base = repo
+        .store()
+        .get_commit(
+            &CommitId::try_from_hex(&snapshot.coordinate.base)
+                .ok_or_else(|| compute_error("invalid captured base"))?,
+        )
+        .map_err(compute_error)?;
+    if base.has_conflict() {
+        return Err(AdvanceComputeError::BaseConflicted {
+            base: base.id().hex(),
+        });
+    }
+    if resolution.is_some_and(|carry| carry.expected_pre_tip != snapshot.coordinate.head) {
+        return Err(AdvanceComputeError::CoordinatesChanged);
+    }
+    // Ask jj's configured immutable policy at the captured operation, never at
+    // the live operation head. This read cannot auto-reconcile concurrent ops.
+    let needs_rebase = !repo
+        .index()
+        .is_ancestor(base.id(), ours.id())
+        .map_err(compute_error)?
+        && !repo
+            .index()
+            .is_ancestor(ours.id(), base.id())
+            .map_err(compute_error)?;
+    let commits = branch_commits(repo.as_ref(), ours.id(), base.id(), deadline, None).await?;
+    let (pinned, mut mapping) =
+        replay_boundaries(snapshot, &commits, &ours, &base, deadline).await?;
+    let proven_base_versions: HashSet<_> = mapping.keys().cloned().collect();
+    let mut dropped_ids = HashSet::new();
+    let range = format!("({}..{})", base.id().hex(), ours.id().hex());
+    let rewrite_scope = if needs_rebase {
+        range.clone()
+    } else {
+        format!("(({range} & conflicts()):: & {range})")
+    };
+    let excluded: Vec<_> = pinned
+        .iter()
+        .chain(mapping.keys())
+        .map(|id| id.hex())
+        .collect();
+    let rewrite_scope = if excluded.is_empty() {
+        rewrite_scope
+    } else {
+        format!("({rewrite_scope}) ~ ({})", excluded.join(" | "))
+    };
+    let bounded = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let query = |expression: &str| {
+        bounded.run(
+            &snapshot.store,
+            &[
+                "log",
+                "--at-op",
+                &snapshot.coordinate.operation,
+                "--ignore-working-copy",
+                "-r",
+                expression,
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ],
+            "inspect immutable detached replay scope",
+        )
+    };
+    let immutable = query(&format!("{rewrite_scope} & immutable()")).map_err(compute_error)?;
+    if !immutable.trim().is_empty() {
+        let on_trunk = !query(&format!("{rewrite_scope} & ::trunk()"))
+            .map_err(compute_error)?
+            .trim()
+            .is_empty();
+        let cause = if on_trunk {
+            "Some commits are already on the default branch; this branch has at least partly landed. Refusing to replay already-landed history."
+        } else if !query(&format!("{rewrite_scope} & ::untracked_remote_bookmarks()"))
+            .map_err(compute_error)?
+            .trim()
+            .is_empty()
+        {
+            "None of this branch's commits are on the default branch; nothing has landed. They are immutable because origin holds them under a remote bookmark this store does not track."
+        } else {
+            "Some of this branch's commits are immutable under the repository's configured policy."
+        };
+        return Err(compute_error(format!(
+            "immutable commit in detached replay scope. {cause}"
+        )));
+    }
+    let mut transaction = repo.start_transaction();
+    let mut candidate = ours.clone();
+    let mut replay_dropped = Vec::new();
+    if !repo
+        .index()
+        .is_ancestor(base.id(), ours.id())
+        .map_err(compute_error)?
+    {
+        if repo
+            .index()
+            .is_ancestor(ours.id(), base.id())
+            .map_err(compute_error)?
+        {
+            candidate = base.clone();
+        } else {
+            for old in &commits {
+                if let Some(id) = mapping.get(old.id()) {
+                    candidate = repo.store().get_commit(id).map_err(compute_error)?;
+                    continue;
+                }
+                if pinned.contains(old.id()) {
+                    candidate = old.clone();
+                    mapping.insert(old.id().clone(), old.id().clone());
+                    continue;
+                }
+                super::reached_step("advance: before hidden rewrite");
+                deadline.check()?;
+                let mut parents = Vec::new();
+                for parent in old.parent_ids() {
+                    let mut parent = mapping
+                        .get(parent)
+                        .cloned()
+                        .unwrap_or_else(|| base.id().clone());
+                    // A proven landed prefix is already supplied by the whole
+                    // base, including its later commits, not just its successor.
+                    if transaction
+                        .repo()
+                        .index()
+                        .is_ancestor(&parent, base.id())
+                        .map_err(compute_error)?
+                    {
+                        parent = base.id().clone();
+                    }
+                    if !parents.contains(&parent) {
+                        parents.push(parent);
+                    }
+                }
+                let collapse =
+                    if old.parent_ids().len() > 1 && parents.len() != old.parent_ids().len() {
+                        Some(prove_merge_collapse(
+                            transaction.repo(),
+                            old,
+                            &parents,
+                            &base,
+                            &proven_base_versions,
+                            &dropped_ids,
+                            deadline,
+                        )?)
+                    } else {
+                        None
+                    };
+                // Healing can absorb a resolution-only commit into its older
+                // conflicted parent (a different change ID). When the old clean
+                // tree is exactly the base and its sole parent was mapped, that
+                // resolution is newly empty. Do not replay conflict bookkeeping
+                // as a fresh patch. Originally empty commits are still retained.
+                if parents == [base.id().clone()]
+                    && old.parent_ids().len() == 1
+                    && mapping.contains_key(&old.parent_ids()[0])
+                    && old.tree_ids() == base.tree_ids()
+                    && repo
+                        .store()
+                        .get_commit(&old.parent_ids()[0])
+                        .map_err(compute_error)?
+                        .tree_ids()
+                        != old.tree_ids()
+                {
+                    dropped_ids.insert(old.id().clone());
+                    replay_dropped.push(super::emptied::dropped_label(
+                        &old.id().hex(),
+                        old.description().lines().next().unwrap_or(""),
+                    ));
+                    candidate = base.clone();
+                    mapping.insert(old.id().clone(), base.id().clone());
+                    continue;
+                }
+                let current =
+                    rewrite_hidden(transaction.repo_mut(), old, parents, deadline).await?;
+                super::reached_step("advance: hidden commit written");
+                deadline.check()?;
+                candidate = if let Some(parent) =
+                    newly_empty(transaction.repo(), old, &current, collapse.as_ref()).await?
+                {
+                    dropped_ids.insert(old.id().clone());
+                    replay_dropped.push(super::emptied::dropped_label(
+                        &old.id().hex(),
+                        old.description().lines().next().unwrap_or(""),
+                    ));
+                    repo.store().get_commit(&parent).map_err(compute_error)?
+                } else {
+                    current
+                };
+                mapping.insert(old.id().clone(), candidate.id().clone());
+            }
+        }
+    }
+    if transaction
+        .repo()
+        .index()
+        .is_ancestor(candidate.id(), base.id())
+        .map_err(compute_error)?
+    {
+        candidate = base.clone();
+    }
+    if candidate.has_conflict() {
+        if let Some(carry) = resolution.filter(|carry| !carry.paths.is_empty()) {
+            let mut tree = MergedTreeBuilder::new(candidate.tree());
+            for (path, content) in &carry.paths {
+                deadline.check()?;
+                let path =
+                    RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+                let value = match content {
+                    super::CarriedContent::FromTip => {
+                        ours.tree().path_value(&path).await.map_err(compute_error)?
+                    }
+                    super::CarriedContent::Text(text) => {
+                        let old_value =
+                            ours.tree().path_value(&path).await.map_err(compute_error)?;
+                        let (executable, copy_id) = match old_value.as_resolved() {
+                            Some(Some(TreeValue::File {
+                                executable,
+                                copy_id,
+                                ..
+                            })) => (*executable, copy_id.clone()),
+                            _ => (false, CopyId::placeholder()),
+                        };
+                        let mut reader = futures::io::Cursor::new(text.as_bytes());
+                        let id = repo
+                            .store()
+                            .write_file(&path, &mut reader)
+                            .await
+                            .map_err(compute_error)?;
+                        Merge::resolved(Some(TreeValue::File {
+                            id,
+                            executable,
+                            copy_id,
+                        }))
+                    }
+                };
+                tree.set_or_remove(path, value);
+            }
+            let tree = tree.write_tree().await.map_err(compute_error)?;
+            candidate = transaction
+                .repo_mut()
+                .rewrite_commit(&candidate)
+                .set_predecessors(rewrite_predecessors(&candidate, deadline)?)
+                .set_tree(tree)
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(compute_error)?;
+            transaction
+                .repo_mut()
+                .add_head(&candidate)
+                .await
+                .map_err(compute_error)?;
+        }
+    }
+    if candidate.has_conflict() {
+        if let Some(plan) = declared {
+            let paths = conflict_paths(&candidate)?;
+            candidate =
+                apply_declared_edits(transaction.repo_mut(), &candidate, plan, &paths, deadline)
+                    .await?;
+        }
+    }
+    if candidate.has_conflict() {
+        let paths = conflict_paths(&candidate)?;
+        return Err(AdvanceComputeError::Conflict(Box::new(
+            diagnostic(snapshot, &ours, &base, &candidate, &paths, deadline).await?,
+        )));
+    }
+    // Reuse the merge parse-blame policy with an unpublished object reader.
+    let fork =
+        crate::best_common_ancestor(repo.as_ref(), ours.id(), base.id()).map_err(compute_error)?;
+    let mut overlapping = Vec::new();
+    if let Some(fork) = fork {
+        let fork = repo.store().get_commit(&fork).map_err(compute_error)?;
+        let own = changed(&fork, &ours, deadline).await?;
+        overlapping = changed(&ours, &candidate, deadline)
+            .await?
+            .into_iter()
+            .map(|(_, path)| path)
+            .filter(|path| own.iter().any(|(_, own)| own == path))
+            .collect();
+    }
+    let mut failures =
+        candidate_parse_failures(&ours, &base, &candidate, &overlapping, deadline).await?;
+    if !failures.is_empty() {
+        if let Some(plan) = declared {
+            let paths: Vec<_> = failures
+                .iter()
+                .map(|failure| failure.path.clone())
+                .collect();
+            candidate =
+                apply_declared_edits(transaction.repo_mut(), &candidate, plan, &paths, deadline)
+                    .await?;
+            failures =
+                candidate_parse_failures(&ours, &base, &candidate, &overlapping, deadline).await?;
+        }
+    }
+    if !failures.is_empty() {
+        let paths: Vec<_> = failures
+            .iter()
+            .map(|failure| failure.path.clone())
+            .collect();
+        let mut refusal = diagnostic(snapshot, &ours, &base, &candidate, &paths, deadline).await?;
+        refusal.condition = super::ConflictCondition::Unparseable;
+        refusal.validation = Some(super::ValidationRefusal {
+            commit: candidate.id().hex(),
+            failures,
+        });
+        return Err(AdvanceComputeError::Conflict(Box::new(refusal)));
+    }
+    let backing = super::export::resolve_backing_checkout(&snapshot.store)
+        .ok_or_else(|| compute_error("detached advance has no backing Git repository"))?;
+    let bounded_jj = jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()));
+    let entries = super::export::root_conflict_scaffolding(
+        Some(&bounded_jj),
+        &backing,
+        &candidate.id().hex(),
+    )
+    .map_err(compute_error)?;
+    if !entries.is_empty() {
+        let mut refusal =
+            diagnostic(snapshot, &ours, &base, &candidate, &overlapping, deadline).await?;
+        refusal.condition = super::ConflictCondition::ContentConflict;
+        refusal.scaffolding = Some(super::ScaffoldingRefusal {
+            commit: candidate.id().hex(),
+            entries,
+        });
+        return Err(AdvanceComputeError::Conflict(Box::new(refusal)));
+    }
+    let (head, mut healing) = heal_branch(
+        transaction.repo_mut(),
+        &candidate,
+        &base,
+        &pinned,
+        &mut dropped_ids,
+        deadline,
+    )
+    .await?;
+    if !transaction
+        .repo()
+        .index()
+        .is_ancestor(base.id(), head.id())
+        .map_err(compute_error)?
+    {
+        return Err(compute_error(
+            "detached candidate does not include its captured base",
+        ));
+    }
+    replay_dropped.append(&mut healing.dropped);
+    healing.dropped = replay_dropped;
+    let actual_drops = exact_source_drops(
+        transaction.repo(),
+        &commits,
+        &head,
+        &base,
+        &proven_base_versions,
+        &dropped_ids,
+        deadline,
+    )
+    .await?;
+    // Replay/heal decisions retain their actual-drop set. Only the accepted
+    // candidate's emitted evidence also retains its exact proven base mappings.
+    let dropped_commit_ids = accepted_source_claims(actual_drops, &proven_base_versions, deadline)?;
+    validate_removed_claims(transaction.repo(), &head, &dropped_commit_ids, deadline)?;
+    deadline.check()?;
+    Ok((head, healing, dropped_commit_ids))
+}
+
+/// A successful local installation, with export failure kept distinct from
+/// durable acceptance. A failed export must be recovered, never retried as a
+/// second replay or reported as a fully published branch.
+#[derive(Debug)]
+pub struct InstalledBranchAdvance {
+    pub coordinate: AdvanceCoordinate,
+    pub head: String,
+    pub tree: String,
+    pub export: Result<(), String>,
+    pub healing: super::AncestryHeal,
+    pub dropped_commit_ids: Vec<String>,
+    pub accepted_operation: Option<String>,
+    /// What the export's budgeted transaction could not verify (a killed
+    /// writer not proven gone). Its environment ends with this call, so the
+    /// caller, still holding the store guard, persists these as a fence.
+    pub recoveries: Vec<super::RecoveryCoordinates>,
+}
+
+/// Durable jj acceptance before backing-Git export. The candidate's object
+/// lease remains held while the caller records acceptance under its store lock.
+pub struct LocallyInstalledBranchAdvance {
+    pub coordinate: AdvanceCoordinate,
+    pub head: String,
+    pub tree: String,
+    pub healing: super::AncestryHeal,
+    pub dropped_commit_ids: Vec<String>,
+    pub accepted_operation: Option<String>,
+    candidate: BranchAdvanceCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvanceInstallError {
+    CoordinatesChanged,
+    Expired,
+    Repository(String),
+}
+
+impl std::fmt::Display for AdvanceInstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CoordinatesChanged => {
+                f.write_str("branch or base changed before detached advance installation")
+            }
+            Self::Expired => f.write_str(
+                "detached branch advance installation timed out: operation budget exhausted",
+            ),
+            Self::Repository(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for AdvanceInstallError {}
+
+/// The legacy explicit heal adapter, sharing the detached engine. Its caller
+/// holds the canonical writer lock throughout capture, compute and installation.
+pub(super) fn heal_branch_locked(
+    jj: &super::JjEnv,
+    store: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<super::AncestryHeal, String> {
+    let snapshot = capture_replay(store, branch, base, false)?;
+    let head = CommitId::try_from_hex(&snapshot.coordinate.head).ok_or("invalid heal head")?;
+    let base = CommitId::try_from_hex(&snapshot.coordinate.base).ok_or("invalid heal base")?;
+    if !snapshot
+        .repo
+        .index()
+        .is_ancestor(&base, &head)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "{} branch does not descend from its heal base",
+            super::ANCESTRY_HEAL_GUARD
+        ));
+    }
+    if snapshot
+        .repo
+        .store()
+        .get_commit(&head)
+        .map_err(|error| error.to_string())?
+        .has_conflict()
+    {
+        return Err(format!(
+            "{} tip is itself conflict-flagged",
+            super::ANCESTRY_HEAL_GUARD
+        ));
+    }
+    let pre_op = snapshot.coordinate.operation.clone();
+    let remaining = jj
+        .operation_deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(super::env::JJ_DEFAULT_TIMEOUT);
+    let candidate =
+        compute_legacy_replay(jj, snapshot, None, remaining).map_err(|error| error.to_string())?;
+    let installed = install_legacy_replay(jj, candidate).map_err(|error| error.to_string())?;
+    if let Err(error) = installed.export {
+        return Err(super::merge::roll_back_rebase(
+            jj, store, branch, &pre_op, error,
+        ));
+    }
+    Ok(installed.healing)
+}
+
+/// Install only the candidate's branch into a freshly loaded transaction.
+///
+/// The caller MUST hold the canonical store writer lock through this function
+/// and independently revalidate the declared base relationship under that lock.
+/// There is no network I/O here. No operation or view from computation is
+/// published; unrelated branch, workspace and remote updates survive.
+pub fn install_branch_advance_exported(
+    jj: &super::JjEnv,
+    candidate: BranchAdvanceCandidate,
+) -> Result<InstalledBranchAdvance, AdvanceInstallError> {
+    install_branch_advance_local(jj, candidate)
+        .map(|local| export_installed_branch_advance(jj, local))
+}
+
+pub(super) fn install_legacy_replay(
+    jj: &super::JjEnv,
+    candidate: BranchAdvanceCandidate,
+) -> Result<InstalledBranchAdvance, AdvanceInstallError> {
+    install_branch_advance_local(jj, candidate).map(|local| export_installed(jj, local, true))
+}
+
+/// Accept a detached candidate locally, without exporting any Git ref.
+/// The caller holds the canonical writer lock and revalidates the relationship.
+/// Record a durable acceptance witness before calling the export half.
+pub fn install_branch_advance_local(
+    _jj: &super::JjEnv,
+    candidate: BranchAdvanceCandidate,
+) -> Result<LocallyInstalledBranchAdvance, AdvanceInstallError> {
+    let remaining = candidate
+        .expires_at
+        .saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(AdvanceInstallError::Expired);
+    }
+    let tree = candidate.tree().map_err(AdvanceInstallError::Repository)?;
+    let head = candidate.head();
+    let accepted_operation = block_on(async {
+        let snapshot = &candidate.snapshot;
+        let repo = crate::load_repo_at_head(&snapshot.store)
+            .await
+            .map_err(|error| format!("reload detached advance store: {error}"))?;
+        if !snapshot.matches_repo(&repo) {
+            return Ok(None);
+        }
+        // Indexing is ephemeral even for an unchanged head. It validates the
+        // base-inclusion invariant; only a changed branch commits this transaction.
+        let mut transaction = repo.start_transaction();
+        transaction
+            .repo_mut()
+            .add_head(&candidate.head)
+            .await
+            .map_err(|error| format!("index detached advance: {error}"))?;
+        let base =
+            CommitId::try_from_hex(&snapshot.coordinate.base).ok_or("invalid captured base")?;
+        if !transaction
+            .repo()
+            .index()
+            .is_ancestor(&base, candidate.head.id())
+            .map_err(|error| error.to_string())?
+        {
+            return Err("detached candidate does not include its captured base".to_string());
+        }
+        if head != snapshot.coordinate.head {
+            transaction.repo_mut().set_local_bookmark_target(
+                RefName::new(&snapshot.coordinate.branch),
+                RefTarget::normal(candidate.head.id().clone()),
+            );
+            let old =
+                CommitId::try_from_hex(&snapshot.coordinate.head).ok_or("invalid captured head")?;
+            let old_commit = snapshot
+                .repo
+                .store()
+                .get_commit(&old)
+                .map_err(|error| error.to_string())?;
+            if candidate.head.change_id() == old_commit.change_id() {
+                let anchored = repo
+                    .view()
+                    .local_bookmarks_for_commit(&old)
+                    .any(|(name, _)| name != RefName::new(&snapshot.coordinate.branch))
+                    || repo
+                        .view()
+                        .local_tags()
+                        .any(|(_, target)| target.added_ids().any(|id| id == &old))
+                    || repo.view().wc_commit_ids().values().any(|id| id == &old);
+                if !anchored {
+                    transaction.repo_mut().remove_head(&old);
+                }
+            }
+            // A fresh-identity squash retains the old graph without inspecting
+            // or changing riders. Maintenance can reclaim unowned residue later.
+            // The only publication point. All expensive candidate work happened
+            // before this fresh transaction, not in a previously captured view.
+            super::reached_step("advance: before install commit");
+            if Instant::now() >= candidate.expires_at {
+                return Ok(Some(None));
+            }
+            let accepted = transaction
+                .commit(format!(
+                    "advance `{}` onto `{}`",
+                    snapshot.coordinate.branch, snapshot.coordinate.base_branch
+                ))
+                .await
+                .map_err(|error| format!("install detached advance: {error}"))?;
+            return Ok(Some(Some(Some(accepted.op_id().hex()))));
+        }
+        if Instant::now() >= candidate.expires_at {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some(None)))
+    })
+    .map_err(AdvanceInstallError::Repository)?
+    .ok_or(AdvanceInstallError::CoordinatesChanged)
+    .and_then(|accepted| accepted.ok_or(AdvanceInstallError::Expired))?;
+    Ok(LocallyInstalledBranchAdvance {
+        coordinate: candidate.snapshot.coordinate.clone(),
+        head,
+        tree,
+        healing: candidate.healing.clone(),
+        dropped_commit_ids: candidate.dropped_commit_ids.clone(),
+        accepted_operation,
+        candidate,
+    })
+}
+
+/// Complete verified export after the caller has durably recorded acceptance.
+/// The caller must retain the same canonical writer guard across both halves.
+pub fn export_installed_branch_advance(
+    jj: &super::JjEnv,
+    local: LocallyInstalledBranchAdvance,
+) -> InstalledBranchAdvance {
+    export_installed(jj, local, false)
+}
+
+fn export_installed(
+    jj: &super::JjEnv,
+    local: LocallyInstalledBranchAdvance,
+    legacy: bool,
+) -> InstalledBranchAdvance {
+    let candidate = &local.candidate;
+    let snapshot = &candidate.snapshot;
+    // The lease remains alive through verified export and all its repair
+    // paths, even if the candidate expires after durable jj acceptance.
+    super::reached_step("rebase: before export");
+    let export_env = if legacy {
+        jj.clone()
+    } else {
+        jj.with_operation_budget(
+            candidate
+                .expires_at
+                .saturating_duration_since(Instant::now()),
+        )
+        .cleanup_env()
+    };
+    let export = export_accepted_branch(
+        &export_env,
+        &snapshot.store,
+        &snapshot.coordinate.branch,
+        &local.head,
+    );
+    if !candidate.healing.dropped.is_empty() {
+        log::info!(
+            "accepted advance of `{}` dropped newly empty commits: {}",
+            snapshot.coordinate.branch,
+            candidate.healing.dropped.join(", ")
+        );
+    }
+    // A legacy export ran in the caller's own environment, whose ledger the
+    // caller drains itself.
+    let recoveries = if legacy {
+        Vec::new()
+    } else {
+        export_env.take_recoveries()
+    };
+    InstalledBranchAdvance {
+        coordinate: local.coordinate,
+        head: local.head,
+        tree: local.tree,
+        export,
+        healing: local.healing,
+        dropped_commit_ids: local.dropped_commit_ids,
+        accepted_operation: local.accepted_operation,
+        recoveries,
+    }
+}
+
+/// Re-export one already accepted exact head, including after process restart.
+/// The caller MUST hold the canonical writer lock through the check and export.
+/// This neither replays nor grants authority to a pending acceptance record.
+pub fn export_accepted_branch(
+    jj: &super::JjEnv,
+    store: &Path,
+    branch: &str,
+    expected_head: &str,
+) -> Result<(), String> {
+    block_on(async {
+        let repo = crate::load_repo_at_head(store)
+            .await
+            .map_err(|error| error.to_string())?;
+        let expected =
+            indexed_evidence(repo.as_ref(), expected_head).map_err(|error| error.to_string())?;
+        if normal_target(&repo, branch)? != expected {
+            return Err("accepted advance head changed before export".to_string());
+        }
+        Ok(())
+    })?;
+    super::export::export_bookmark_advance(
+        jj,
+        store,
+        true,
+        branch,
+        "export accepted branch advance",
+    )
+}
+
+fn normal_target(repo: &ReadonlyRepo, branch: &str) -> Result<CommitId, String> {
+    repo.view()
+        .get_local_bookmark(RefName::new(branch))
+        .as_normal()
+        .cloned()
+        .ok_or_else(|| format!("advance bookmark `{branch}` is missing or conflicted"))
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    // Local jj futures need no Tokio reactor. A blocking worker may still carry
+    // an entered Tokio handle, where starting another Runtime would panic.
+    futures::executor::block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jj::testing::*;
+    use crate::jj::*;
+    use jj_lib::op_store::RefTarget;
+    use std::time::SystemTime;
+    use tempfile::TempDir;
+
+    async fn fixture_commit(
+        repo: &mut MutableRepo,
+        parent: &Commit,
+        path: &str,
+        content: &str,
+    ) -> Commit {
+        let path = RepoPathBuf::from_internal_string(path).unwrap();
+        let mut reader = futures::io::Cursor::new(content.as_bytes());
+        let id = repo.store().write_file(&path, &mut reader).await.unwrap();
+        let mut tree = MergedTreeBuilder::new(parent.tree());
+        tree.set_or_remove(
+            path,
+            Merge::resolved(Some(TreeValue::File {
+                id,
+                executable: false,
+                copy_id: CopyId::placeholder(),
+            })),
+        );
+        let tree = tree.write_tree().await.unwrap();
+        repo.new_commit(vec![parent.id().clone()], tree)
+            .set_description(content)
+            .detach()
+            .write_hidden()
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn accepted_source_claims_are_exact_sorted_complete_or_typed_refusal() {
+        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+        let proven = (1..=SQUASH_RECEIPT_LIMIT)
+            .map(|number| CommitId::try_from_hex(format!("{number:040x}")).unwrap())
+            .collect::<HashSet<_>>();
+        let first = format!("{:040x}", 1);
+        let claims = accepted_source_claims(vec![first.clone()], &proven, &deadline).unwrap();
+        assert_eq!(claims.len(), SQUASH_RECEIPT_LIMIT);
+        assert_eq!(claims.first(), Some(&first));
+        assert!(claims.windows(2).all(|pair| pair[0] < pair[1]));
+        let overflow = format!("{:040x}", SQUASH_RECEIPT_LIMIT + 1);
+        assert!(matches!(
+            accepted_source_claims(vec![overflow], &proven, &deadline),
+            Err(AdvanceComputeError::EvidenceLimit {
+                limit: SQUASH_RECEIPT_LIMIT
+            })
+        ));
+        assert!(matches!(
+            accepted_source_claims(Vec::new(), &proven, &Deadline(Instant::now())),
+            Err(AdvanceComputeError::TimedOut)
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn removed_claim_guard_checks_both_actual_drops_and_proven_mappings() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let snapshot = fixture.snapshot();
+        let head = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+            .unwrap();
+        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+        for claims in [
+            accepted_source_claims(vec![head.id().hex()], &HashSet::new(), &deadline).unwrap(),
+            accepted_source_claims(
+                Vec::new(),
+                &HashSet::from([head.parent_ids()[0].clone()]),
+                &deadline,
+            )
+            .unwrap(),
+        ] {
+            assert!(
+                matches!(validate_removed_claims(snapshot.repo.as_ref(), &head, &claims, &deadline),
+                Err(AdvanceComputeError::Repository(ref message)) if message.starts_with(REMOVED_CLAIM_INVARIANT))
+            );
+        }
+        assert!(matches!(
+            validate_removed_claims(
+                snapshot.repo.as_ref(),
+                &head,
+                &[head.id().hex()[..12].to_string()],
+                &deadline
+            ),
+            Err(AdvanceComputeError::UnknownEvidence { .. })
+        ));
+    }
+
+    #[test]
+    fn native_squash_publication_has_no_unnamed_branch_writer() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source
+                .lines()
+                .scan(0usize, |offset, line| {
+                    let at = *offset;
+                    *offset += line.len() + 1;
+                    Some((at, line))
+                })
+                .find(|(_, line)| line.starts_with(signature))
+                .unwrap()
+                .0;
+            let end = source[start..].find("\n}\n").unwrap() + start;
+            &source[start..end]
+        }
+        let advance = include_str!("advance.rs");
+        let merge = include_str!("merge.rs");
+        for text in [
+            body(advance, "pub(super) fn compute_branch_squash("),
+            body(merge, "pub fn squash_branch_onto("),
+            body(advance, "pub fn install_branch_advance_local("),
+        ] {
+            for forbidden in [
+                "rider",
+                "\"abandon\"",
+                "rebase_descendants",
+                "\"rebase\"",
+                "bookmarks()",
+                "visible_heads",
+                ".rewrite_commit(",
+                "op_restore",
+            ] {
+                // Descriptive comments are not executable writers.
+                let code = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!code.contains(forbidden), "{forbidden} in {text}");
+            }
+        }
+        let factory = body(advance, "pub(super) fn compute_branch_squash(");
+        assert!(factory.contains(".new_commit("));
+        assert!(factory.contains(".set_predecessors("));
+        assert!(factory.contains(".write_hidden()"));
+        assert!(!factory.contains(".commit("));
+        let install = body(advance, "pub fn install_branch_advance_local(");
+        assert!(install.contains("snapshot.matches_repo(&repo)"));
+        assert_eq!(install.matches(".set_local_bookmark_target(").count(), 1);
+        assert!(install.contains("candidate.head.change_id() == old_commit.change_id()"));
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn branch_only_squash_preserves_dormant_refs_and_complete_midstack_receipts() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let (base, source, child, nested, prefix) = futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let base = repo
+                .store()
+                .get_commit(&normal_target(&repo, "main").unwrap())
+                .unwrap();
+            let mut tx = repo.start_transaction();
+            let mut source = base.clone();
+            let mut child = None;
+            let mut prefix = None;
+            for number in 0..140 {
+                source = fixture_commit(
+                    tx.repo_mut(),
+                    &source,
+                    "parent.txt",
+                    &format!("parent {number}\n"),
+                )
+                .await;
+                if number == 31 {
+                    prefix = Some(source.clone());
+                    child = Some(
+                        fixture_commit(tx.repo_mut(), &source, "child.txt", "child delta\n").await,
+                    );
+                }
+            }
+            let child = child.unwrap();
+            let nested =
+                fixture_commit(tx.repo_mut(), &child, "nested.txt", "nested delta\n").await;
+            for (name, commit) in [
+                ("feature", &source),
+                ("child", &child),
+                ("nested", &nested),
+                ("rider", prefix.as_ref().unwrap()),
+                ("pending", &base),
+            ] {
+                tx.repo_mut().add_head(commit).await.unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new(name),
+                    RefTarget::normal(commit.id().clone()),
+                );
+            }
+            tx.commit("seed long source and dormant child hierarchy")
+                .await
+                .unwrap();
+            (base, source, child, nested, prefix.unwrap())
+        });
+        export_git_preserving_checkout(&fixture.jj, &fixture.store, true, "seed dormant refs")
+            .unwrap();
+        crate::repoint_bookmark_if_unchanged(
+            &fixture.store,
+            "pending",
+            &[base.id().hex()],
+            &source.id().hex(),
+            "pending unrelated publication",
+        )
+        .unwrap();
+        let fixed = [
+            ("child", child.id().hex()),
+            ("nested", nested.id().hex()),
+            ("rider", prefix.id().hex()),
+        ];
+        let assert_fixed = || {
+            for (name, id) in &fixed {
+                assert_eq!(
+                    bookmark_commit(&fixture.jj, &fixture.store, name).as_deref(),
+                    Some(id.as_str())
+                );
+                assert_eq!(
+                    git_stdout(fixture.project.path(), &["rev-parse", name]),
+                    *id
+                );
+            }
+            assert_eq!(
+                bookmark_commit(&fixture.jj, &fixture.store, "pending").unwrap(),
+                source.id().hex()
+            );
+            assert_eq!(
+                git_stdout(fixture.project.path(), &["rev-parse", "pending"]),
+                base.id().hex()
+            );
+        };
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        let (candidate, collapsed) = compute_branch_squash(
+            &fixture.jj,
+            capture_replay(&fixture.store, "feature", &base.id().hex(), false).unwrap(),
+            "first landing",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(collapsed, 0);
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        assert_fixed();
+        assert_eq!(candidate.head.parent_ids(), &[base.id().clone()]);
+        assert_eq!(candidate.head.tree_ids(), source.tree_ids());
+        assert_ne!(candidate.head.change_id(), source.change_id());
+        assert_eq!(candidate.head.store_commit().predecessors.len(), 140);
+        assert!(candidate.dropped_commit_ids().is_empty());
+        let first = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        first.export.unwrap();
+        assert_fixed();
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        assert_fixed();
+        let second_source = futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let parent = repo
+                .store()
+                .get_commit(&CommitId::try_from_hex(&first.head).unwrap())
+                .unwrap();
+            let mut tx = repo.start_transaction();
+            let tail =
+                fixture_commit(tx.repo_mut(), &parent, "tail.txt", "later parent work\n").await;
+            tx.repo_mut().add_head(&tail).await.unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("feature"),
+                RefTarget::normal(tail.id().clone()),
+            );
+            tx.commit("append before another unpublished squash")
+                .await
+                .unwrap();
+            tail
+        });
+        let second = squash_branch_onto(
+            &fixture.jj,
+            &fixture.store,
+            "feature",
+            &second_source.id().hex(),
+            &base.id().hex(),
+            "second landing",
+        )
+        .unwrap();
+        assert_fixed();
+        let snapshot = capture_branch_advance(&fixture.store, "child", "feature").unwrap();
+        let child_candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            child_candidate.head.parent_ids(),
+            &[CommitId::try_from_hex(&second.squashed_commit).unwrap()]
+        );
+        let mut prefix_claims = git_stdout(
+            fixture.project.path(),
+            &[
+                "rev-list",
+                &prefix.id().hex(),
+                &format!("^{}", base.id().hex()),
+            ],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        prefix_claims.sort();
+        assert_eq!(
+            child_candidate.dropped_commit_ids(),
+            prefix_claims,
+            "the accepted child retains exact represented-prefix evidence"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:parent.txt", child_candidate.head())]
+            ),
+            "parent 139"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:tail.txt", child_candidate.head())]
+            ),
+            "later parent work"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:child.txt", child_candidate.head())]
+            ),
+            "child delta"
+        );
+        assert_eq!(child_candidate.head.change_id(), child.change_id());
+        assert_fixed();
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn branch_only_squash_refuses_stale_source_and_expired_entry_without_writes() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let snapshot = fixture.snapshot();
+        let source = snapshot.coordinate.head.clone();
+        let base = snapshot.coordinate.base.clone();
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        assert!(matches!(
+            squash_branch_onto(
+                &fixture.jj,
+                &fixture.store,
+                "feature",
+                &base,
+                &base,
+                "stale"
+            ),
+            Err(SquashError::CoordinatesChanged)
+        ));
+        assert!(matches!(
+            squash_branch_onto(
+                &fixture.jj.with_operation_budget(Duration::ZERO),
+                &fixture.store,
+                "feature",
+                &source,
+                &base,
+                "expired"
+            ),
+            Err(SquashError::TimedOut)
+        ));
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn branch_only_squash_receipt_limit_is_streamed_and_structural_proofs_survive_rewrites() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let (base, source, too_long) = futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let base = repo
+                .store()
+                .get_commit(&normal_target(&repo, "main").unwrap())
+                .unwrap();
+            let mut tx = repo.start_transaction();
+            let mut tip = base.clone();
+            for _ in 0..SQUASH_RECEIPT_LIMIT {
+                tip = tx
+                    .repo_mut()
+                    .new_commit(vec![tip.id().clone()], tip.tree())
+                    .set_description("one source identity")
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .unwrap();
+            }
+            let source = tip.clone();
+            let too_long = tx
+                .repo_mut()
+                .new_commit(vec![tip.id().clone()], tip.tree())
+                .set_description("over source quota")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            for (name, commit) in [("at-limit", &source), ("over-limit", &too_long)] {
+                tx.repo_mut().add_head(commit).await.unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new(name),
+                    RefTarget::normal(commit.id().clone()),
+                );
+            }
+            tx.commit("seed exact receipt quota").await.unwrap();
+            (base, source, too_long)
+        });
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        assert!(matches!(
+            compute_branch_squash(
+                &fixture.jj,
+                capture_replay(&fixture.store, "over-limit", &base.id().hex(), false).unwrap(),
+                "refused",
+                Duration::from_secs(60)
+            ),
+            Err(AdvanceComputeError::EvidenceLimit {
+                limit: SQUASH_RECEIPT_LIMIT
+            })
+        ));
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "over-limit").unwrap(),
+            too_long.id().hex()
+        );
+        let (candidate, _) = compute_branch_squash(
+            &fixture.jj,
+            capture_replay(&fixture.store, "at-limit", &base.id().hex(), false).unwrap(),
+            "complete receipt",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.head.store_commit().predecessors.len(),
+            SQUASH_RECEIPT_LIMIT
+        );
+        assert!(candidate
+            .head
+            .store_commit()
+            .predecessors
+            .contains(source.id()));
+        futures::executor::block_on(async {
+            let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+            let mut tx = candidate.snapshot.repo.start_transaction();
+            let mut current = candidate.head.clone();
+            for number in 0..2 {
+                let predecessors = rewrite_predecessors(&current, &deadline).unwrap();
+                assert!(predecessors.contains(source.id()));
+                assert_eq!(predecessors.len(), SQUASH_RECEIPT_LIMIT + number + 1);
+                current = tx
+                    .repo_mut()
+                    .rewrite_commit(&current)
+                    .set_predecessors(predecessors)
+                    .set_description("rewritten squash receipt")
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .unwrap();
+            }
+            let missing = (1..=100)
+                .map(|number| CommitId::try_from_hex(format!("{number:040x}")).unwrap())
+                .collect::<Vec<_>>();
+            let temporal = tx
+                .repo_mut()
+                .rewrite_commit(&source)
+                .set_predecessors(missing)
+                .set_description("reclaimed temporal versions")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            assert_eq!(
+                rewrite_predecessors(&temporal, &deadline).unwrap().len(),
+                64
+            );
+        });
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_pin_can_only_withhold_an_exact_base_successor() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let old = repo
+                .store()
+                .get_commit(&normal_target(&repo, "feature").unwrap())
+                .unwrap();
+            let mut tx = repo.start_transaction();
+            let temporal = tx
+                .repo_mut()
+                .rewrite_commit(&old)
+                .set_predecessors(vec![old.id().clone()])
+                .set_description("temporal proof")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            let structural = tx
+                .repo_mut()
+                .new_commit(old.parent_ids().to_vec(), old.tree())
+                .set_predecessors(vec![old.id().clone()])
+                .set_description("structural proof")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            let base = tx
+                .repo_mut()
+                .new_commit(
+                    vec![temporal.id().clone(), structural.id().clone()],
+                    old.tree(),
+                )
+                .set_description("base containing incomparable proofs")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            tx.repo_mut().add_head(&base).await.unwrap();
+            let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+            for mask in 0..4 {
+                let mut targets = HashSet::new();
+                if mask & 1 != 0 {
+                    targets.insert(temporal.id().clone());
+                }
+                if mask & 2 != 0 {
+                    targets.insert(structural.id().clone());
+                }
+                let unpinned =
+                    exact_base_successor(tx.repo(), &old, &base, &targets, true, &deadline)
+                        .unwrap();
+                let pinned =
+                    exact_base_successor(tx.repo(), &old, &base, &targets, false, &deadline)
+                        .unwrap();
+                assert!(
+                    pinned.is_none() || pinned == unpinned,
+                    "a pin cannot resolve ambiguity or add authority"
+                );
+                match mask {
+                    0 | 3 => {
+                        assert!(unpinned.is_none());
+                        assert!(pinned.is_none());
+                    }
+                    1 => {
+                        assert_eq!(unpinned, Some(temporal.id().clone()));
+                        assert!(pinned.is_none());
+                    }
+                    2 => {
+                        assert_eq!(unpinned, Some(structural.id().clone()));
+                        assert_eq!(pinned, unpinned);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn integrated_foreign_merge_parents_preserve_only_the_authored_merge_delta() {
+        for (receipt, revert, own_edit) in [
+            ("complete", false, None),
+            ("complete", true, None),
+            (
+                "complete",
+                true,
+                Some(("own-resolution.txt", "own merge resolution\n")),
+            ),
+            (
+                "complete",
+                true,
+                Some(("foreign.txt", "only the deliberately revived fragment\n")),
+            ),
+            ("missing", true, None),
+            ("amendment", true, None),
+        ] {
+            let Some(fixture) = ReplayFixture::new(false) else {
+                return;
+            };
+            let original = "foreign first part\nforeign second part\n";
+            let amended = "foreign owner's later amendment\n";
+            let (base, parent, foreign, literal_foreign, child) =
+                futures::executor::block_on(async {
+                    let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+                    let base = repo
+                        .store()
+                        .get_commit(&normal_target(&repo, "main").unwrap())
+                        .unwrap();
+                    let mut tx = repo.start_transaction();
+                    let foreign =
+                        fixture_commit(tx.repo_mut(), &base, "foreign.txt", original).await;
+                    let own =
+                        fixture_commit(tx.repo_mut(), &base, "parent.txt", "parent work\n").await;
+                    let combined =
+                        fixture_commit(tx.repo_mut(), &own, "foreign.txt", original).await;
+                    let mut parent = tx
+                        .repo_mut()
+                        .new_commit(
+                            vec![own.id().clone(), foreign.id().clone()],
+                            combined.tree(),
+                        )
+                        .set_description("parent merges foreign")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                    if revert {
+                        let mut tree = MergedTreeBuilder::new(parent.tree());
+                        tree.set_or_remove(
+                            RepoPathBuf::from_internal_string("foreign.txt").unwrap(),
+                            Merge::resolved(None),
+                        );
+                        let tree = tree.write_tree().await.unwrap();
+                        parent = tx
+                            .repo_mut()
+                            .new_commit(vec![parent.id().clone()], tree)
+                            .set_description("parent reverts foreign")
+                            .detach()
+                            .write_hidden()
+                            .await
+                            .unwrap();
+                    }
+                    let literal_foreign = if receipt == "amendment" {
+                        let updated =
+                            fixture_commit(tx.repo_mut(), &base, "foreign.txt", amended).await;
+                        tx.repo_mut()
+                            .rewrite_commit(&foreign)
+                            .set_tree(updated.tree())
+                            .set_predecessors(vec![foreign.id().clone()])
+                            .set_description("foreign amendment")
+                            .detach()
+                            .write_hidden()
+                            .await
+                            .unwrap()
+                    } else {
+                        foreign.clone()
+                    };
+                    tx.repo_mut().add_head(&parent).await.unwrap();
+                    tx.repo_mut().add_head(&literal_foreign).await.unwrap();
+                    let old_merge = jj_lib::rewrite::merge_commit_trees(
+                        tx.repo(),
+                        &[parent.clone(), literal_foreign.clone()],
+                    )
+                    .await
+                    .unwrap();
+                    let child_tree = if let Some((path, content)) = own_edit {
+                        let path = RepoPathBuf::from_internal_string(path).unwrap();
+                        let mut reader = futures::io::Cursor::new(content.as_bytes());
+                        let id = tx
+                            .repo()
+                            .store()
+                            .write_file(&path, &mut reader)
+                            .await
+                            .unwrap();
+                        let mut tree = MergedTreeBuilder::new(old_merge.clone());
+                        tree.set_or_remove(
+                            path,
+                            Merge::resolved(Some(TreeValue::File {
+                                id,
+                                executable: false,
+                                copy_id: CopyId::placeholder(),
+                            })),
+                        );
+                        tree.write_tree().await.unwrap()
+                    } else {
+                        old_merge.clone()
+                    };
+                    let child = tx
+                        .repo_mut()
+                        .new_commit(
+                            vec![parent.id().clone(), literal_foreign.id().clone()],
+                            child_tree,
+                        )
+                        .set_description("authored child merge")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                    if own_edit.is_none() {
+                        assert_eq!(child.tree_ids(), old_merge.tree_ids());
+                    }
+                    for (name, commit) in [
+                        ("feature", &parent),
+                        ("foreign", &literal_foreign),
+                        ("child", &child),
+                    ] {
+                        tx.repo_mut().add_head(commit).await.unwrap();
+                        tx.repo_mut().set_local_bookmark_target(
+                            RefName::new(name),
+                            RefTarget::normal(commit.id().clone()),
+                        );
+                    }
+                    tx.commit("seed authored merge against an integrated foreign parent")
+                        .await
+                        .unwrap();
+                    (base, parent, foreign, literal_foreign, child)
+                });
+            export_git_preserving_checkout(
+                &fixture.jj,
+                &fixture.store,
+                true,
+                "seed authored merge refs",
+            )
+            .unwrap();
+            let landed = squash_branch_onto(
+                &fixture.jj,
+                &fixture.store,
+                "feature",
+                &parent.id().hex(),
+                &base.id().hex(),
+                "land parent net tree",
+            )
+            .unwrap();
+            let new_base = futures::executor::block_on(async {
+                let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+                let mut tx = repo.start_transaction();
+                let mut tip = repo
+                    .store()
+                    .get_commit(&CommitId::try_from_hex(&landed.squashed_commit).unwrap())
+                    .unwrap();
+                if receipt == "missing" {
+                    let predecessors = tip
+                        .store_commit()
+                        .predecessors
+                        .iter()
+                        .filter(|id| *id != foreign.id())
+                        .cloned()
+                        .collect();
+                    tip = tx
+                        .repo_mut()
+                        .rewrite_commit(&tip)
+                        .set_predecessors(predecessors)
+                        .set_description("missing foreign receipt")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                }
+                // Without a real tree change jj reuses the old merge tree when
+                // parent trees match, masking an incorrect literal foreign arm.
+                let tip = fixture_commit(
+                    tx.repo_mut(),
+                    &tip,
+                    "incoming.txt",
+                    "incoming base change\n",
+                )
+                .await;
+                tx.repo_mut().add_head(&tip).await.unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new("main"),
+                    RefTarget::normal(tip.id().clone()),
+                );
+                tx.commit("move the base tree beyond the squash")
+                    .await
+                    .unwrap();
+                tip
+            });
+            let snapshot = capture_branch_advance(&fixture.store, "child", "main")
+                .unwrap()
+                .with_dependent_bookmarks(Vec::new());
+            if receipt == "complete" {
+                futures::executor::block_on(async {
+                    let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+                    let mut tx = snapshot.repo.start_transaction();
+                    let local_child = tx.repo().store().get_commit(child.id()).unwrap();
+                    let local_base = tx.repo().store().get_commit(new_base.id()).unwrap();
+                    assert!(prove_merge_collapse(
+                        tx.repo(),
+                        &local_child,
+                        &[local_base.id().clone()],
+                        &local_base,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        &deadline
+                    )
+                    .is_err());
+                    let unproved = tx
+                        .repo_mut()
+                        .rewrite_commit(&local_child)
+                        .set_parents(vec![local_base.id().clone()])
+                        .set_tree(local_base.tree())
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(newly_empty(tx.repo(), &local_child, &unproved, None).await,
+                        Err(AdvanceComputeError::Repository(ref message)) if message.contains("[ADVANCE-MERGE-INVARIANT]"))
+                    );
+                });
+            }
+            let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+            let candidate =
+                compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60))
+                    .unwrap_or_else(|error| {
+                        panic!("receipt={receipt} revert={revert} edit={own_edit:?}: {error}")
+                    });
+            assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+            assert_eq!(
+                bookmark_commit(&fixture.jj, &fixture.store, "foreign").unwrap(),
+                literal_foreign.id().hex()
+            );
+            assert_eq!(
+                git_stdout(fixture.project.path(), &["rev-parse", "foreign"]),
+                literal_foreign.id().hex()
+            );
+            assert_eq!(
+                bookmark_commit(&fixture.jj, &fixture.store, "child").unwrap(),
+                child.id().hex()
+            );
+            assert_eq!(
+                git_stdout(
+                    fixture.project.path(),
+                    &["show", &format!("{}:incoming.txt", candidate.head())]
+                ),
+                "incoming base change"
+            );
+            if receipt == "complete" {
+                assert!(candidate.dropped_commit_ids().contains(&foreign.id().hex()));
+                if let Some((path, content)) = own_edit {
+                    assert_eq!(candidate.head.parent_ids(), &[new_base.id().clone()]);
+                    assert_eq!(candidate.head.change_id(), child.change_id());
+                    assert_eq!(candidate.head.description(), child.description());
+                    assert!(!candidate.dropped_commit_ids().contains(&child.id().hex()));
+                    assert_eq!(
+                        git_stdout(
+                            fixture.project.path(),
+                            &["show", &format!("{}:{path}", candidate.head())]
+                        ),
+                        content.trim_end()
+                    );
+                } else {
+                    assert_eq!(candidate.head.id(), new_base.id());
+                    assert_eq!(
+                        candidate
+                            .dropped_commit_ids()
+                            .iter()
+                            .filter(|id| *id == &child.id().hex())
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        candidate.healing.dropped,
+                        [super::super::emptied::dropped_label(
+                            &child.id().hex(),
+                            "authored child merge"
+                        )]
+                    );
+                }
+                let path = RepoPathBuf::from_internal_string("foreign.txt").unwrap();
+                let value =
+                    futures::executor::block_on(candidate.head.tree().path_value(&path)).unwrap();
+                if revert && own_edit.is_none_or(|(path, _)| path != "foreign.txt") {
+                    assert!(value.as_resolved().is_some_and(Option::is_none));
+                } else if !revert {
+                    assert_eq!(
+                        git_stdout(
+                            fixture.project.path(),
+                            &["show", &format!("{}:foreign.txt", candidate.head())]
+                        ),
+                        original.trim_end()
+                    );
+                }
+            } else {
+                assert!(candidate.head.parent_ids().contains(literal_foreign.id()));
+                assert!(!candidate
+                    .dropped_commit_ids()
+                    .contains(&literal_foreign.id().hex()));
+                assert_eq!(candidate.head.change_id(), child.change_id());
+                let expected = if receipt == "amendment" {
+                    amended
+                } else {
+                    original
+                };
+                assert_eq!(
+                    git_stdout(
+                        fixture.project.path(),
+                        &["show", &format!("{}:foreign.txt", candidate.head())]
+                    ),
+                    expected.trim_end()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_receipted_parent_prefix_can_absorb_its_foreign_arm_after_base_growth() {
+        for (receipt, own_merge, shared_ancestor) in [
+            ("complete", false, false),
+            ("missing_foreign", false, false),
+            ("missing_oldest", false, false),
+            ("temporal", false, false),
+            ("complete", true, false),
+            ("missing_own", true, true),
+        ] {
+            let Some(fixture) = ReplayFixture::new(false) else {
+                return;
+            };
+            let (base, parent, foreign, child, missing_own, merged_id, mut expected) =
+                futures::executor::block_on(async {
+                    let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+                    let base = repo
+                        .store()
+                        .get_commit(&normal_target(&repo, "main").unwrap())
+                        .unwrap();
+                    let mut tx = repo.start_transaction();
+                    let own =
+                        fixture_commit(tx.repo_mut(), &base, "parent.txt", "parent work\n").await;
+                    let foreign_parent = if shared_ancestor { &own } else { &base };
+                    let foreign = fixture_commit(
+                        tx.repo_mut(),
+                        foreign_parent,
+                        "foreign.txt",
+                        "foreign effect\n",
+                    )
+                    .await;
+                    let own_tip = if shared_ancestor {
+                        fixture_commit(
+                            tx.repo_mut(),
+                            &own,
+                            "later-parent.txt",
+                            "later parent work\n",
+                        )
+                        .await
+                    } else {
+                        own.clone()
+                    };
+                    let combined =
+                        fixture_commit(tx.repo_mut(), &own_tip, "foreign.txt", "foreign effect\n")
+                            .await;
+                    let merged = tx
+                        .repo_mut()
+                        .new_commit(
+                            vec![own_tip.id().clone(), foreign.id().clone()],
+                            combined.tree(),
+                        )
+                        .set_description("merge foreign into parent")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                    let mut tree = MergedTreeBuilder::new(merged.tree());
+                    tree.set_or_remove(
+                        RepoPathBuf::from_internal_string("foreign.txt").unwrap(),
+                        Merge::resolved(None),
+                    );
+                    let tree = tree.write_tree().await.unwrap();
+                    let parent = tx
+                        .repo_mut()
+                        .new_commit(vec![merged.id().clone()], tree)
+                        .set_description("parent reverts foreign effect")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                    let own_child =
+                        fixture_commit(tx.repo_mut(), &parent, "child.txt", "child work\n").await;
+                    let child = if own_merge {
+                        tx.repo_mut()
+                            .new_commit(
+                                vec![own_child.id().clone(), foreign.id().clone()],
+                                own_child.tree(),
+                            )
+                            .set_description("child explicitly retains foreign arm")
+                            .detach()
+                            .write_hidden()
+                            .await
+                            .unwrap()
+                    } else {
+                        own_child
+                    };
+                    for (name, commit) in [
+                        ("feature", &parent),
+                        ("foreign", &foreign),
+                        ("child", &child),
+                    ] {
+                        tx.repo_mut().add_head(commit).await.unwrap();
+                        tx.repo_mut().set_local_bookmark_target(
+                            RefName::new(name),
+                            RefTarget::normal(commit.id().clone()),
+                        );
+                    }
+                    tx.commit("seed child with a merged then reverted foreign prefix")
+                        .await
+                        .unwrap();
+                    let mut expected = [&own, &foreign, &merged, &parent]
+                        .map(|commit| commit.id().hex())
+                        .to_vec();
+                    if own_tip.id() != own.id() {
+                        expected.push(own_tip.id().hex());
+                    }
+                    (
+                        base,
+                        parent,
+                        foreign,
+                        child,
+                        own_tip.id().clone(),
+                        merged.id().clone(),
+                        expected,
+                    )
+                });
+            export_git_preserving_checkout(
+                &fixture.jj,
+                &fixture.store,
+                true,
+                "seed fixed foreign and child refs",
+            )
+            .unwrap();
+            let landed = squash_branch_onto(
+                &fixture.jj,
+                &fixture.store,
+                "feature",
+                &parent.id().hex(),
+                &base.id().hex(),
+                "land parent prefix",
+            )
+            .unwrap();
+            let advanced_base = futures::executor::block_on(async {
+                let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+                let mut tx = repo.start_transaction();
+                let mut tip = repo
+                    .store()
+                    .get_commit(&CommitId::try_from_hex(&landed.squashed_commit).unwrap())
+                    .unwrap();
+                if receipt == "temporal" {
+                    tip = tx
+                        .repo_mut()
+                        .rewrite_commit(&foreign)
+                        .set_predecessors(vec![foreign.id().clone()])
+                        .set_description("only a temporal foreign version is on the base")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                } else if receipt != "complete" {
+                    let missing = if receipt == "missing_foreign" {
+                        foreign.id()
+                    } else {
+                        &missing_own
+                    };
+                    let predecessors = tip
+                        .store_commit()
+                        .predecessors
+                        .iter()
+                        .filter(|id| *id != missing)
+                        .cloned()
+                        .collect();
+                    tip = tx
+                        .repo_mut()
+                        .rewrite_commit(&tip)
+                        .set_predecessors(predecessors)
+                        .set_description("external rewrite loses one exact receipt")
+                        .detach()
+                        .write_hidden()
+                        .await
+                        .unwrap();
+                } else if own_merge {
+                    // Tree-identical parent lists let jj reuse C's old tree and
+                    // mask the changed merge base. Force the actual merge-rebase.
+                    tip = fixture_commit(
+                        tx.repo_mut(),
+                        &tip,
+                        "incoming.txt",
+                        "incoming base change\n",
+                    )
+                    .await;
+                } else {
+                    for _ in 0..4100 {
+                        tip = tx
+                            .repo_mut()
+                            .new_commit(vec![tip.id().clone()], tip.tree())
+                            .set_description("later base history")
+                            .detach()
+                            .write_hidden()
+                            .await
+                            .unwrap();
+                    }
+                }
+                tx.repo_mut().add_head(&tip).await.unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new("main"),
+                    RefTarget::normal(tip.id().clone()),
+                );
+                tx.commit("supply the child's new base").await.unwrap();
+                tip
+            });
+            let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+            let snapshot = capture_branch_advance(&fixture.store, "child", "main")
+                .unwrap()
+                .with_dependent_bookmarks(Vec::new());
+            let foreign_mapped = futures::executor::block_on(async {
+                let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+                let commits = branch_commits(
+                    snapshot.repo.as_ref(),
+                    child.id(),
+                    advanced_base.id(),
+                    &deadline,
+                    None,
+                )
+                .await
+                .unwrap();
+                let (pinned, mapping) =
+                    replay_boundaries(&snapshot, &commits, &child, &advanced_base, &deadline)
+                        .await
+                        .unwrap();
+                if receipt == "missing_foreign" || receipt == "temporal" {
+                    assert!(pinned.contains(foreign.id()));
+                    assert!(!mapping.contains_key(foreign.id()));
+                } else {
+                    assert!(!pinned.contains(foreign.id()));
+                    assert!(mapping.contains_key(foreign.id()));
+                }
+                if receipt == "complete" {
+                    assert!(mapping.contains_key(&merged_id));
+                } else if receipt != "temporal" {
+                    assert!(
+                        !mapping.contains_key(&merged_id),
+                        "an incomplete prefix must replay"
+                    );
+                    assert!(!mapping.contains_key(parent.id()));
+                }
+                if shared_ancestor {
+                    let old_own = foreign.parent_ids()[0].clone();
+                    assert!(
+                        mapping.contains_key(&old_own),
+                        "the foreign reference does not override exact base receipts"
+                    );
+                }
+                mapping.contains_key(foreign.id())
+            });
+            let candidate = compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60))
+                .unwrap_or_else(|error| panic!("receipt={receipt} own_merge={own_merge} shared={shared_ancestor} foreign={}: {error}", foreign.id().hex()));
+            assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+            assert_eq!(
+                bookmark_commit(&fixture.jj, &fixture.store, "foreign").unwrap(),
+                foreign.id().hex()
+            );
+            assert_eq!(
+                git_stdout(fixture.project.path(), &["rev-parse", "foreign"]),
+                foreign.id().hex()
+            );
+            assert_eq!(
+                bookmark_commit(&fixture.jj, &fixture.store, "child").unwrap(),
+                child.id().hex()
+            );
+            assert_eq!(
+                git_stdout(
+                    fixture.project.path(),
+                    &["show", &format!("{}:child.txt", candidate.head())]
+                ),
+                "child work"
+            );
+            assert_eq!(
+                git_stdout(
+                    fixture.project.path(),
+                    &["show", &format!("{}:parent.txt", candidate.head())]
+                ),
+                "parent work"
+            );
+            if foreign_mapped || !own_merge {
+                let path = RepoPathBuf::from_internal_string("foreign.txt").unwrap();
+                assert!(
+                    futures::executor::block_on(candidate.head.tree().path_value(&path))
+                        .unwrap()
+                        .as_resolved()
+                        .is_some_and(Option::is_none)
+                );
+            }
+            if receipt == "complete" {
+                expected.sort();
+                assert_eq!(candidate.dropped_commit_ids(), expected);
+                if !own_merge {
+                    assert_eq!(candidate.head.parent_ids(), &[advanced_base.id().clone()]);
+                }
+            }
+            if !foreign_mapped {
+                assert!(!candidate.dropped_commit_ids().contains(&foreign.id().hex()));
+                assert!(
+                    cairn_platform::env::git()
+                        .args([
+                            "merge-base",
+                            "--is-ancestor",
+                            &foreign.id().hex(),
+                            &candidate.head()
+                        ])
+                        .current_dir(fixture.project.path())
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "literal foreign ancestry survives replay"
+                );
+            }
+            if own_merge {
+                assert_eq!(candidate.head.parent_ids().len(), 2);
+                if foreign_mapped {
+                    assert!(!candidate.head.parent_ids().contains(foreign.id()));
+                    assert!(candidate.head.parent_ids().contains(advanced_base.id()));
+                } else {
+                    assert!(candidate.head.parent_ids().contains(foreign.id()));
+                }
+            }
+            for claim in candidate.dropped_commit_ids() {
+                let output = cairn_platform::env::git()
+                    .args(["merge-base", "--is-ancestor", claim, &candidate.head()])
+                    .current_dir(fixture.project.path())
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(1),
+                    "retained source {claim} cannot be claimed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn branch_only_squash_receipts_keep_foreign_reverts_but_never_absorb_an_amendment() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let (base, source, foreign, foreign_owner) = futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let base = repo
+                .store()
+                .get_commit(&normal_target(&repo, "main").unwrap())
+                .unwrap();
+            let mut tx = repo.start_transaction();
+            let foreign =
+                fixture_commit(tx.repo_mut(), &base, "foreign.txt", "old foreign effect\n").await;
+            let owner = fixture_commit(
+                tx.repo_mut(),
+                &foreign,
+                "foreign-owner.txt",
+                "new owner delta\n",
+            )
+            .await;
+            let ours = fixture_commit(tx.repo_mut(), &base, "source.txt", "source delta\n").await;
+            let combined =
+                fixture_commit(tx.repo_mut(), &ours, "foreign.txt", "old foreign effect\n").await;
+            let merged = tx
+                .repo_mut()
+                .new_commit(
+                    vec![ours.id().clone(), foreign.id().clone()],
+                    combined.tree(),
+                )
+                .set_description("merge exact foreign identity")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            let mut tree = MergedTreeBuilder::new(merged.tree());
+            tree.set_or_remove(
+                RepoPathBuf::from_internal_string("foreign.txt").unwrap(),
+                Merge::resolved(None),
+            );
+            let tree = tree.write_tree().await.unwrap();
+            let source = tx
+                .repo_mut()
+                .new_commit(vec![merged.id().clone()], tree)
+                .set_description("revert foreign effect")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            for (name, commit) in [("feature", &source), ("foreign-owner", &owner)] {
+                tx.repo_mut().add_head(commit).await.unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new(name),
+                    RefTarget::normal(commit.id().clone()),
+                );
+            }
+            tx.repo_mut().set_remote_bookmark(
+                RefName::new("feature")
+                    .to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                jj_lib::op_store::RemoteRef {
+                    target: RefTarget::normal(source.id().clone()),
+                    state: jj_lib::op_store::RemoteRefState::Tracked,
+                },
+            );
+            tx.commit("seed source merge and later revert with an independent owner")
+                .await
+                .unwrap();
+            (base, source, foreign, owner)
+        });
+        let report = squash_branch_onto(
+            &fixture.jj,
+            &fixture.store,
+            "feature",
+            &source.id().hex(),
+            &base.id().hex(),
+            "land net source tree",
+        )
+        .unwrap();
+        origin_copy_is_superseded_with_accepted(
+            &fixture.jj,
+            &fixture.store,
+            "feature",
+            &report.squashed_commit,
+            &source.id().hex(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let snapshot = capture_branch_advance(&fixture.store, "foreign-owner", "feature").unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60)).unwrap();
+        assert_eq!(candidate.dropped_commit_ids(), &[foreign.id().hex()]);
+        assert_eq!(candidate.head.change_id(), foreign_owner.change_id());
+        let path = RepoPathBuf::from_internal_string("foreign.txt").unwrap();
+        assert!(
+            futures::executor::block_on(candidate.head.tree().path_value(&path))
+                .unwrap()
+                .as_resolved()
+                .is_some_and(Option::is_none)
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:foreign-owner.txt", candidate.head())]
+            ),
+            "new owner delta"
+        );
+        let foreign_candidate = candidate;
+        let amended = futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let mut tx = repo.start_transaction();
+            let tree =
+                fixture_commit(tx.repo_mut(), &base, "foreign.txt", "new owner amendment\n").await;
+            let amended = tx
+                .repo_mut()
+                .rewrite_commit(&foreign)
+                .set_predecessors(vec![foreign.id().clone()])
+                .set_tree(tree.tree())
+                .set_description("amend old foreign identity")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            tx.repo_mut().add_head(&amended).await.unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("amended-owner"),
+                RefTarget::normal(amended.id().clone()),
+            );
+            tx.commit("owner authors a new version absent from the squash receipt")
+                .await
+                .unwrap();
+            amended
+        });
+        let snapshot = capture_branch_advance(&fixture.store, "amended-owner", "feature").unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60)).unwrap();
+        assert_eq!(candidate.head.change_id(), amended.change_id());
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:foreign.txt", candidate.head())]
+            ),
+            "new owner amendment"
+        );
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "foreign-owner").unwrap(),
+            foreign_owner.id().hex()
+        );
+        futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let mut tx = repo.start_transaction();
+            let own = fixture_commit(
+                tx.repo_mut(),
+                &source,
+                "child.txt",
+                "child-owned merge work\n",
+            )
+            .await;
+            let child = tx
+                .repo_mut()
+                .new_commit(vec![own.id().clone(), foreign.id().clone()], own.tree())
+                .set_description("child retains foreign merge arm")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            tx.repo_mut().add_head(&child).await.unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("source-child"),
+                RefTarget::normal(child.id().clone()),
+            );
+            tx.repo_mut().set_remote_bookmark(
+                RefName::new("feature")
+                    .to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                jj_lib::op_store::RemoteRef {
+                    target: RefTarget::normal(amended.id().clone()),
+                    state: jj_lib::op_store::RemoteRefState::Tracked,
+                },
+            );
+            tx.commit("retain a foreign arm and observe outside origin amendment")
+                .await
+                .unwrap();
+        });
+        let snapshot = capture_branch_advance(&fixture.store, "source-child", "feature").unwrap();
+        futures::executor::block_on(async {
+            let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+            let head = snapshot
+                .repo
+                .store()
+                .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+                .unwrap();
+            let base = snapshot
+                .repo
+                .store()
+                .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.base).unwrap())
+                .unwrap();
+            let commits = branch_commits(
+                snapshot.repo.as_ref(),
+                head.id(),
+                base.id(),
+                &deadline,
+                None,
+            )
+            .await
+            .unwrap();
+            let (pinned, mapping) = replay_boundaries(&snapshot, &commits, &head, &base, &deadline)
+                .await
+                .unwrap();
+            assert!(!pinned.contains(foreign.id()));
+            assert!(
+                mapping.contains_key(foreign.id()),
+                "the exact receipt governs this merge parent"
+            );
+        });
+        let error = origin_copy_is_superseded_with_accepted(
+            &fixture.jj,
+            &fixture.store,
+            "feature",
+            &report.squashed_commit,
+            &amended.id().hex(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        let AdvanceComputeError::UnaccountedRemoteCommits { commits } = error else {
+            panic!("outside owner amendment must have a named refusal: {error}");
+        };
+        assert!(commits.contains(&amended.id().hex()));
+
+        // The child's publication is proven by L's structural receipts and
+        // the rewritten child's own predecessor. Accepted mappings retain proof
+        // when the bounded ancestry walk cannot reach L.
+        let origin = TempDir::new().unwrap();
+        git(origin.path(), &["init", "--bare", "-q", "-b", "main"]);
+        git(
+            fixture.project.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(
+            fixture.project.path(),
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{}:refs/heads/foreign-owner", foreign_owner.id().hex()),
+            ],
+        );
+        futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let mut tx = repo.start_transaction();
+            tx.repo_mut().set_remote_bookmark(
+                RefName::new("foreign-owner")
+                    .to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                jj_lib::op_store::RemoteRef {
+                    target: RefTarget::normal(foreign_owner.id().clone()),
+                    state: jj_lib::op_store::RemoteRefState::Tracked,
+                },
+            );
+            tx.commit("record the child's exact old origin coordinate")
+                .await
+                .unwrap();
+        });
+        let unchanged_child = bookmark_commit(&fixture.jj, &fixture.store, "source-child").unwrap();
+        let installed = install_branch_advance_exported(&fixture.jj, foreign_candidate).unwrap();
+        installed.export.unwrap();
+        assert_eq!(installed.dropped_commit_ids, [foreign.id().hex()]);
+        origin_copy_is_superseded_with_accepted(
+            &fixture.jj,
+            &fixture.store,
+            "foreign-owner",
+            &installed.head,
+            &foreign_owner.id().hex(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let claims = [AcceptedAdvanceDrops {
+            head_after: installed.head.clone(),
+            dropped_commit_ids: installed.dropped_commit_ids.clone(),
+        }];
+        struct RestoreAncestorLimit(usize);
+        impl Drop for RestoreAncestorLimit {
+            fn drop(&mut self) {
+                REMOTE_PROOF_ANCESTOR_LIMIT.with(|limit| limit.set(self.0));
+            }
+        }
+        let limit_scope =
+            RestoreAncestorLimit(REMOTE_PROOF_ANCESTOR_LIMIT.with(|limit| limit.replace(0)));
+        let missing = origin_copy_is_superseded_with_accepted(
+            &fixture.jj,
+            &fixture.store,
+            "foreign-owner",
+            &installed.head,
+            &foreign_owner.id().hex(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing, AdvanceComputeError::UnaccountedRemoteCommits { ref commits }
+            if commits == &[foreign.id().hex()])
+        );
+        origin_copy_is_superseded_with_accepted(
+            &fixture.jj,
+            &fixture.store,
+            "foreign-owner",
+            &installed.head,
+            &foreign_owner.id().hex(),
+            &claims,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let accepted = push_managed_branch_unrecorded(
+            &fixture.jj,
+            &fixture.store,
+            "foreign-owner",
+            Some(&foreign_owner.id().hex()),
+            &installed.head,
+            Some(&claims),
+        )
+        .unwrap();
+        drop(limit_scope);
+        readback_leased_push(&fixture.jj, &fixture.store, &accepted).unwrap();
+        record_leased_push(&fixture.jj, &fixture.store, &accepted).unwrap();
+        assert_eq!(
+            git_stdout(origin.path(), &["rev-parse", "refs/heads/foreign-owner"]),
+            installed.head
+        );
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "source-child").unwrap(),
+            unchanged_child
+        );
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "amended-owner").unwrap(),
+            amended.id().hex()
+        );
+        git(
+            fixture.project.path(),
+            &[
+                "push",
+                "--quiet",
+                "--force",
+                "origin",
+                &format!("{}:refs/heads/foreign-owner", amended.id().hex()),
+            ],
+        );
+        futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let mut tx = repo.start_transaction();
+            tx.repo_mut().set_remote_bookmark(
+                RefName::new("foreign-owner")
+                    .to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                jj_lib::op_store::RemoteRef {
+                    target: RefTarget::normal(amended.id().clone()),
+                    state: jj_lib::op_store::RemoteRefState::Tracked,
+                },
+            );
+            tx.commit("observe an outside owner's exact amendment on origin")
+                .await
+                .unwrap();
+        });
+        let outside = origin_copy_is_superseded_with_accepted(
+            &fixture.jj,
+            &fixture.store,
+            "foreign-owner",
+            &installed.head,
+            &amended.id().hex(),
+            &claims,
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(outside, AdvanceComputeError::UnaccountedRemoteCommits { ref commits }
+            if commits.contains(&amended.id().hex()))
+        );
+        let refused = push_managed_branch_unrecorded(
+            &fixture.jj,
+            &fixture.store,
+            "foreign-owner",
+            Some(&amended.id().hex()),
+            &installed.head,
+            Some(&claims),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refused,
+            LeasedPushError::RemoteRewriteUnproven { .. }
+        ));
+        assert_eq!(
+            git_stdout(origin.path(), &["rev-parse", "refs/heads/foreign-owner"]),
+            amended.id().hex()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn branch_only_squash_proof_walk_accepts_plain_base_growth_and_named_exports_refuse_empty_scope(
+    ) {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        futures::executor::block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store).await.unwrap();
+            let mut tip = repo
+                .store()
+                .get_commit(&normal_target(&repo, "main").unwrap())
+                .unwrap();
+            let mut tx = repo.start_transaction();
+            for _ in 0..5000 {
+                tip = tx
+                    .repo_mut()
+                    .new_commit(vec![tip.id().clone()], tip.tree())
+                    .set_description("ordinary base growth without predecessor metadata")
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .unwrap();
+            }
+            tx.repo_mut().add_head(&tip).await.unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("main"),
+                RefTarget::normal(tip.id().clone()),
+            );
+            tx.commit("advance plain base by five thousand commits")
+                .await
+                .unwrap();
+        });
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        assert!(
+            export_git_verified(&fixture.jj, &fixture.store, true, "empty named scope", &[])
+                .is_err()
+        );
+        assert!(super::super::export::export_git_guarded(
+            &fixture.jj,
+            &fixture.store,
+            true,
+            "empty named scope",
+            &[]
+        )
+        .is_err());
+        assert!(super::super::export::export_bookmark_advance(
+            &fixture.jj,
+            &fixture.store,
+            true,
+            "",
+            "empty named branch"
+        )
+        .is_err());
+        assert!(super::super::export::export_bookmark_advance_guarded(
+            &fixture.jj,
+            &fixture.store,
+            true,
+            "",
+            "empty named branch"
+        )
+        .is_err());
+        let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hook_scans = scans.clone();
+        at_step("advance: scan squash receipts", move || {
+            hook_scans.set(hook_scans.get() + 1)
+        });
+        let start = Instant::now();
+        let candidate = compute_branch_advance(
+            &fixture.jj,
+            fixture.snapshot(),
+            None,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        eprintln!(
+            "5k ordinary base receipt walk plus replay: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            scans.get(),
+            1,
+            "unlanded own commits still need the linear receipt walk"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:owner.txt", candidate.head())]
+            ),
+            "owner two"
+        );
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn branch_only_squash_export_failure_cannot_rollback_over_a_new_owner_commit() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        // First make the source descend from the exact current base.
+        let candidate = compute_branch_advance(
+            &fixture.jj,
+            fixture.snapshot(),
+            None,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let prepared = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        prepared.export.unwrap();
+        let source = prepared.head;
+        let base = bookmark_commit(&fixture.jj, &fixture.store, "main").unwrap();
+        let store = fixture.store.clone();
+        let owner_head = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorded = owner_head.clone();
+        at_step("rebase: before export", move || {
+            let head = futures::executor::block_on(async {
+                let repo = crate::load_repo_at_head(&store).await.unwrap();
+                let parent = repo
+                    .store()
+                    .get_commit(&normal_target(&repo, "feature").unwrap())
+                    .unwrap();
+                let mut tx = repo.start_transaction();
+                let own = fixture_commit(
+                    tx.repo_mut(),
+                    &parent,
+                    "owner-new.txt",
+                    "sealed during export\n",
+                )
+                .await;
+                tx.repo_mut().add_head(&own).await.unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new("feature"),
+                    RefTarget::normal(own.id().clone()),
+                );
+                tx.commit("owner seals after squash acceptance")
+                    .await
+                    .unwrap();
+                own.id().hex()
+            });
+            *recorded.borrow_mut() = Some(head);
+        });
+        let error = squash_branch_onto(
+            &fixture.jj,
+            &fixture.store,
+            "feature",
+            &source,
+            &base,
+            "landing",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("rollback incomplete"), "{error}");
+        let own = owner_head.borrow().clone().unwrap();
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),
+            own
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{own}:owner-new.txt")]
+            ),
+            "sealed during export"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn declared_registry_merge_is_detached_and_coordinate_bound() {
+        let Some(bin) = jj_bin() else { return };
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let original = "pub const ITEMS: &[&str] = &[\n    \"base\",\n];\n";
+        let ours = "pub const ITEMS: &[&str] = &[\n    \"base\",\n    \"owner\",\n];\n";
+        let theirs = "pub const ITEMS: &[&str] = &[\n    \"base\",\n    \"incoming\",\n];\n";
+        let combined =
+            "pub const ITEMS: &[&str] = &[\n    \"base\",\n    \"owner\",\n    \"incoming\",\n];\n";
+        std::fs::write(project.path().join("registry.rs"), original).unwrap();
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "registry ancestor"]);
+        git(project.path(), &["checkout", "-qb", "feature"]);
+        std::fs::write(project.path().join("registry.rs"), ours).unwrap();
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "owner registry"]);
+        git(project.path(), &["checkout", "-q", "main"]);
+        std::fs::write(project.path().join("registry.rs"), theirs).unwrap();
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "incoming registry"]);
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("store");
+        ensure_project_store(&jj, &store, project.path()).unwrap();
+        let capture = || capture_branch_advance(&store, "feature", "main").unwrap();
+        let snapshot = capture();
+        let coordinate = snapshot.coordinate().clone();
+        let before = operation_id(&jj, &store).unwrap();
+        let outcome = compute_branch_advance(&jj, snapshot, None, Duration::from_secs(30));
+        let Err(AdvanceComputeError::Conflict(diagnostic)) = outcome else {
+            panic!("expected list conflict")
+        };
+        assert_eq!(diagnostic.conflicting_paths(), ["registry.rs"]);
+        let plan = DeclaredMergeEdits {
+            expected_head: coordinate.head.clone(),
+            expected_base: coordinate.base.clone(),
+            edits: vec![("registry.rs".into(), combined.into())],
+        };
+        let candidate = compute_branch_advance_with_declared(
+            &jj,
+            capture(),
+            None,
+            Some(&plan),
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(operation_id(&jj, &store).unwrap(), before);
+        assert_eq!(
+            bookmark_commit(&jj, &store, "feature").unwrap(),
+            coordinate.head
+        );
+        assert_eq!(
+            git_stdout(
+                project.path(),
+                &["show", &format!("{}:registry.rs", candidate.head())]
+            ),
+            combined.trim_end()
+        );
+        let mut stale = plan.clone();
+        stale.expected_base = "0".repeat(coordinate.base.len());
+        assert!(matches!(
+            compute_branch_advance_with_declared(
+                &jj,
+                capture(),
+                None,
+                Some(&stale),
+                Duration::from_secs(30)
+            ),
+            Err(AdvanceComputeError::CoordinatesChanged)
+        ));
+        assert_eq!(operation_id(&jj, &store).unwrap(), before);
+        let mut malformed = plan;
+        malformed.edits[0].1 = "pub const ITEMS: &[&str] = &[".into();
+        assert!(compute_branch_advance_with_declared(
+            &jj,
+            capture(),
+            None,
+            Some(&malformed),
+            Duration::from_secs(30)
+        )
+        .is_err());
+        assert_eq!(operation_id(&jj, &store).unwrap(), before);
+        let installed = install_branch_advance_exported(&jj, candidate).unwrap();
+        installed.export.unwrap();
+        assert_eq!(
+            git_stdout(project.path(), &["show", "feature:registry.rs"]),
+            combined.trim_end()
+        );
+        assert_eq!(
+            bookmark_commit(&jj, &store, "main").unwrap(),
+            coordinate.base
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_visible_old_remote_retains_exact_rewrite_proof_after_child_preparation() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let origin = TempDir::new().unwrap();
+        git(origin.path(), &["init", "--bare", "-q", "-b", "main"]);
+        git(
+            fixture.project.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(fixture.project.path(), &["push", "-q", "origin", "feature"]);
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        track_bookmark(&fixture.jj, &fixture.store, "feature").unwrap();
+        let old = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+        fixture.run(&["new", &old, "--no-edit", "-m", "dormant sibling"]);
+        let dormant = fixture.run(&[
+            "log",
+            "-r",
+            "latest(children(feature))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        fixture.run(&["bookmark", "set", "dormant", "-r", &dormant]);
+        fixture.run(&["new", &old, "--no-edit", "-m", "intentional empty child"]);
+        let child = fixture.run(&[
+            "log",
+            "-r",
+            "latest(children(feature))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        fixture.run(&["bookmark", "set", "child", "-r", &child]);
+        let snapshot = fixture
+            .snapshot()
+            .with_dependent_bookmarks(vec!["dormant".into(), "child".into()]);
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60)).unwrap();
+        assert!(candidate
+            .head
+            .store_commit()
+            .predecessors
+            .contains(&CommitId::try_from_hex(&old).unwrap()));
+        let target = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        target.export.unwrap();
+        let snapshot = capture_branch_advance(&fixture.store, "child", "feature").unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            candidate.head.parent_ids(),
+            &[CommitId::try_from_hex(&target.head).unwrap()]
+        );
+        install_branch_advance_exported(&fixture.jj, candidate)
+            .unwrap()
+            .export
+            .unwrap();
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "dormant").unwrap(),
+            dormant
+        );
+        assert_eq!(
+            fixture.run(&["log", "-r", &old, "--no-graph", "-T", "hidden",]),
+            "false",
+            "the dormant owner keeps the old publication visible"
+        );
+        assert_eq!(
+            fixture.run(&[
+                "log",
+                "-r",
+                "tracked_remote_bookmarks(exact:\"feature\", remote=exact:\"origin\")",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ]),
+            old
+        );
+        assert!(
+            origin_copy_is_superseded(&fixture.jj, &fixture.store, "feature", &target.head, &old,)
+                .unwrap(),
+            "exact predecessors prove a visible anchored canonical rewrite"
+        );
+        fixture.run(&["bookmark", "set", "old-pointer", "-r", &old]);
+        let snapshot = capture_branch_advance(&fixture.store, "dormant", "feature").unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60)).unwrap();
+        install_branch_advance_exported(&fixture.jj, candidate)
+            .unwrap()
+            .export
+            .unwrap();
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "old-pointer").unwrap(),
+            old,
+        );
+        assert_eq!(
+            fixture.run(&["log", "-r", &old, "--no-graph", "-T", "hidden"]),
+            "true",
+            "advancing the final old descendant hides O even while a pointer retains it",
+        );
+        let snapshot = fixture.snapshot();
+        let replacement = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&target.head).unwrap())
+            .unwrap();
+        assert!(
+            replacement
+                .store_commit()
+                .predecessors
+                .contains(&CommitId::try_from_hex(&old).unwrap()),
+            "hidden O must also have exact independent predecessor accounting",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_external_remote_commit_has_a_named_refusal_over_a_large_base() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let (local, external) = block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store)
+                .await
+                .map_err(|error| error.to_string())?;
+            let base_id = normal_target(&repo, "main")?;
+            let mut base = repo
+                .store()
+                .get_commit(&base_id)
+                .map_err(|error| error.to_string())?;
+            let mut tx = repo.start_transaction();
+            for _ in 0..4200 {
+                base = tx
+                    .repo_mut()
+                    .new_commit(vec![base.id().clone()], base.tree())
+                    .set_description("base history")
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            let local = tx
+                .repo_mut()
+                .new_commit(vec![base.id().clone()], base.tree())
+                .set_description("own work")
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())?;
+            let external = tx
+                .repo_mut()
+                .new_commit(vec![base.id().clone()], base.tree())
+                .set_description("external work")
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())?;
+            for commit in [&local, &external] {
+                tx.repo_mut()
+                    .add_head(commit)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("feature"),
+                jj_lib::op_store::RefTarget::normal(local.id().clone()),
+            );
+            tx.repo_mut().set_remote_bookmark(
+                RefName::new("feature")
+                    .to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin")),
+                jj_lib::op_store::RemoteRef {
+                    target: jj_lib::op_store::RefTarget::normal(external.id().clone()),
+                    state: jj_lib::op_store::RemoteRefState::Tracked,
+                },
+            );
+            tx.commit("large base with external origin")
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((local.id().hex(), external.id().hex()))
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                origin_copy_is_superseded_with_accepted(
+                    &fixture.jj, &fixture.store, "feature", &local, &external,
+                    &[], Duration::from_secs(30),
+                ),
+                Err(AdvanceComputeError::UnaccountedRemoteCommits { commits }) if commits == [external]
+            ),
+            "the outer count cap names the unaccounted external commit, not a timeout"
+        );
+        {
+            let _maintenance =
+                super::super::object_lease::Reclamation::for_store(&fixture.store).unwrap();
+            assert!(matches!(
+                origin_copy_is_superseded_with_accepted(
+                    &fixture.jj,
+                    &fixture.store,
+                    "feature",
+                    &local,
+                    &local,
+                    &[],
+                    Duration::from_secs(30),
+                ),
+                Err(AdvanceComputeError::Busy)
+            ));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn supersession_follows_exact_amendment_edges_and_refuses_missing_metadata() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let origin = TempDir::new().unwrap();
+        git(origin.path(), &["init", "--bare", "-q", "-b", "main"]);
+        git(
+            fixture.project.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(fixture.project.path(), &["push", "-q", "origin", "feature"]);
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        track_bookmark(&fixture.jj, &fixture.store, "feature").unwrap();
+        let old = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+        fixture.run(&["new", &old, "--no-edit", "-m", "dormant sibling"]);
+        let dormant = fixture.run(&[
+            "log",
+            "-r",
+            "latest(children(feature))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        fixture.run(&["bookmark", "set", "dormant", "-r", &dormant]);
+        let rewrite = |missing: bool| {
+            block_on(async {
+                let repo = crate::load_repo_at_head(&fixture.store)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let id = normal_target(&repo, "feature")?;
+                let old = repo
+                    .store()
+                    .get_commit(&id)
+                    .map_err(|error| error.to_string())?;
+                let mut tx = repo.start_transaction();
+                let first = tx
+                    .repo_mut()
+                    .rewrite_commit(&old)
+                    .set_predecessors(vec![old.id().clone()])
+                    .set_description("owner amendment one")
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let predecessors = if missing {
+                    vec![CommitId::try_from_hex("a".repeat(40)).unwrap()]
+                } else {
+                    vec![first.id().clone()]
+                };
+                let last = tx
+                    .repo_mut()
+                    .rewrite_commit(&first)
+                    .set_predecessors(predecessors)
+                    .set_description("owner amendment two")
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tx.repo_mut()
+                    .add_head(&last)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new("feature"),
+                    jj_lib::op_store::RefTarget::normal(last.id().clone()),
+                );
+                tx.commit("owner amendments")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(last.id().hex())
+            })
+            .unwrap()
+        };
+        let amended = rewrite(false);
+        assert!(
+            origin_copy_is_superseded_with_accepted(
+                &fixture.jj,
+                &fixture.store,
+                "feature",
+                &amended,
+                &old,
+                &[],
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+            "ordinary jj amendments need a transitive exact predecessor walk"
+        );
+        let capped = block_on(async {
+            let repo = crate::load_repo_at_head(&fixture.store)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut old = repo
+                .store()
+                .get_commit(&normal_target(&repo, "feature")?)
+                .map_err(|error| error.to_string())?;
+            let mut tx = repo.start_transaction();
+            for _ in 0..65 {
+                old = tx
+                    .repo_mut()
+                    .rewrite_commit(&old)
+                    .set_predecessors(vec![old.id().clone()])
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            tx.repo_mut()
+                .add_head(&old)
+                .await
+                .map_err(|error| error.to_string())?;
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("feature"),
+                jj_lib::op_store::RefTarget::normal(old.id().clone()),
+            );
+            tx.commit("deep amendment chain")
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(old.id().hex())
+        })
+        .unwrap();
+        assert!(
+            matches!(
+                origin_copy_is_superseded_with_accepted(
+                    &fixture.jj,
+                    &fixture.store,
+                    "feature",
+                    &capped,
+                    &old,
+                    &[],
+                    Duration::from_secs(60),
+                ),
+                Err(AdvanceComputeError::UnaccountedRemoteCommits { .. })
+            ),
+            "a capped predecessor path stays unproven"
+        );
+        let unproven = rewrite(true);
+        assert!(
+            matches!(
+                origin_copy_is_superseded_with_accepted(
+                    &fixture.jj, &fixture.store, "feature", &unproven, &old, &[],
+                    Duration::from_secs(60),
+                ),
+                Err(AdvanceComputeError::UnaccountedRemoteCommits { commits }) if commits == [old]
+            ),
+            "a missing intermediate is unproven even when the change ID matches"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn accepted_drop_evidence_covers_tip_absorption_and_multiple_unpushed_advances() {
+        for drop_tip in [false, true] {
+            let Some(fixture) = ReplayFixture::new(false) else {
+                return;
+            };
+            let first = git_stdout(fixture.project.path(), &["rev-parse", "feature^"]);
+            if drop_tip {
+                fixture.run(&[
+                    "bookmark",
+                    "set",
+                    "feature",
+                    "-r",
+                    &first,
+                    "--allow-backwards",
+                ]);
+                export_bookmark_advance(&fixture.jj, &fixture.store, true, "feature", "fixture")
+                    .unwrap();
+            }
+            git(fixture.project.path(), &["cherry-pick", &first]);
+            import_git(&fixture.jj, &fixture.store).unwrap();
+            let origin = TempDir::new().unwrap();
+            git(origin.path(), &["init", "--bare", "-q", "-b", "main"]);
+            git(
+                fixture.project.path(),
+                &["remote", "add", "origin", origin.path().to_str().unwrap()],
+            );
+            git(fixture.project.path(), &["push", "-q", "origin", "feature"]);
+            import_git(&fixture.jj, &fixture.store).unwrap();
+            track_bookmark(&fixture.jj, &fixture.store, "feature").unwrap();
+            let old = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+            fixture.run(&["new", &old, "--no-edit", "-m", "dormant sibling"]);
+            let dormant = fixture.run(&[
+                "log",
+                "-r",
+                "latest(children(feature))",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ]);
+            fixture.run(&["bookmark", "set", "dormant", "-r", &dormant]);
+            let candidate = compute_branch_advance(
+                &fixture.jj,
+                fixture
+                    .snapshot()
+                    .with_dependent_bookmarks(vec!["dormant".into()]),
+                None,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            assert_eq!(candidate.dropped_commit_ids(), std::slice::from_ref(&first));
+            let installed = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+            installed.export.unwrap();
+            let proof = |local: &str, rows: &[AcceptedAdvanceDrops]| {
+                origin_copy_is_superseded_with_accepted(
+                    &fixture.jj,
+                    &fixture.store,
+                    "feature",
+                    local,
+                    &old,
+                    rows,
+                    Duration::from_secs(60),
+                )
+            };
+            assert!(matches!(proof(&installed.head, &[]),
+                Err(AdvanceComputeError::UnaccountedRemoteCommits { commits }) if commits == [first.clone()]));
+            let claim = AcceptedAdvanceDrops {
+                head_after: installed.head.clone(),
+                dropped_commit_ids: installed.dropped_commit_ids.clone(),
+            };
+            assert!(proof(&installed.head, std::slice::from_ref(&claim)).unwrap());
+            let unrelated = AcceptedAdvanceDrops {
+                head_after: dormant.clone(),
+                dropped_commit_ids: vec![first.clone()],
+            };
+            assert!(matches!(
+                proof(&installed.head, &[unrelated]),
+                Err(AdvanceComputeError::UnaccountedRemoteCommits { .. })
+            ));
+            assert!(matches!(
+                proof(
+                    &installed.head,
+                    &[AcceptedAdvanceDrops {
+                        head_after: "a".repeat(40),
+                        dropped_commit_ids: vec![first.clone()],
+                    }]
+                ),
+                Err(AdvanceComputeError::UnaccountedRemoteCommits { .. })
+            ));
+            assert!(
+                proof(
+                    &installed.head,
+                    &[
+                        AcceptedAdvanceDrops {
+                            head_after: "a".repeat(40),
+                            dropped_commit_ids: vec![first.clone()],
+                        },
+                        claim.clone(),
+                    ]
+                )
+                .unwrap(),
+                "a reclaimed old accepted head cannot block a newer inherited claim"
+            );
+            assert!(matches!(
+                proof(
+                    &installed.head,
+                    &[AcceptedAdvanceDrops {
+                        head_after: installed.head[..12].to_string(),
+                        dropped_commit_ids: vec![first.clone()],
+                    }]
+                ),
+                Err(AdvanceComputeError::UnknownEvidence { .. })
+            ));
+            assert!(matches!(
+                origin_copy_is_superseded_with_accepted(
+                    &fixture.jj,
+                    &fixture.store,
+                    "feature",
+                    &installed.head,
+                    &old,
+                    std::slice::from_ref(&claim),
+                    Duration::ZERO,
+                ),
+                Err(AdvanceComputeError::TimedOut)
+            ));
+            assert!(
+                !origin_copy_is_superseded_with_accepted(
+                    &fixture.jj,
+                    &fixture.store,
+                    "feature",
+                    &installed.head,
+                    &fixture.snapshot().coordinate.base,
+                    &[],
+                    Duration::from_secs(60),
+                )
+                .unwrap(),
+                "a stale tracked-origin coordinate never authorizes publication"
+            );
+            assert!(export_accepted_branch(&fixture.jj, &fixture.store, "feature", &old).is_err());
+            export_accepted_branch(&fixture.jj, &fixture.store, "feature", &installed.head)
+                .unwrap();
+            if drop_tip {
+                let no_op = compute_branch_advance(
+                    &fixture.jj,
+                    fixture.snapshot(),
+                    None,
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+                let local = install_branch_advance_local(&fixture.jj, no_op).unwrap();
+                assert!(local.accepted_operation.is_none());
+                export_installed_branch_advance(&fixture.jj, local)
+                    .export
+                    .unwrap();
+            } else {
+                std::fs::write(fixture.project.path().join("later.txt"), "later base\n").unwrap();
+                git(fixture.project.path(), &["add", "-A"]);
+                git(
+                    fixture.project.path(),
+                    &["commit", "-qm", "second base advance"],
+                );
+                import_git(&fixture.jj, &fixture.store).unwrap();
+                let candidate = compute_branch_advance(
+                    &fixture.jj,
+                    fixture
+                        .snapshot()
+                        .with_dependent_bookmarks(vec!["dormant".into()]),
+                    None,
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+                assert!(candidate.dropped_commit_ids().is_empty());
+                let next = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+                next.export.unwrap();
+                assert!(
+                    matches!(
+                        proof(&next.head, std::slice::from_ref(&claim)),
+                        Err(AdvanceComputeError::UnaccountedRemoteCommits { .. })
+                    ),
+                    "the first accepted head is not an ancestor of its second rewrite"
+                );
+                let inherited = AcceptedAdvanceDrops {
+                    head_after: next.head.clone(),
+                    dropped_commit_ids: claim.dropped_commit_ids,
+                };
+                assert!(proof(&next.head, &[inherited]).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn synchronous_advance_primitives_work_inside_tokio_runtime_contexts() {
+        for multithreaded in [false, true] {
+            let Some(fixture) = ReplayFixture::new(false) else {
+                return;
+            };
+            let origin = TempDir::new().unwrap();
+            git(origin.path(), &["init", "--bare", "-q", "-b", "main"]);
+            git(
+                fixture.project.path(),
+                &["remote", "add", "origin", origin.path().to_str().unwrap()],
+            );
+            git(fixture.project.path(), &["push", "-q", "origin", "feature"]);
+            import_git(&fixture.jj, &fixture.store).unwrap();
+            track_bookmark(&fixture.jj, &fixture.store, "feature").unwrap();
+            let mut builder = if multithreaded {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder.worker_threads(2);
+                builder
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            let runtime = builder.enable_all().build().unwrap();
+            runtime.block_on(async {
+                let before = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+                assert!(origin_copy_is_superseded_with_accepted(
+                    &fixture.jj,
+                    &fixture.store,
+                    "feature",
+                    &before,
+                    &before,
+                    &[],
+                    Duration::from_secs(60),
+                )
+                .unwrap());
+                let snapshot = fixture.snapshot();
+                assert!(snapshot.coordinates_match().unwrap());
+                assert!(snapshot
+                    .already_prepared(Duration::from_secs(60))
+                    .unwrap()
+                    .is_none());
+                let candidate =
+                    compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60))
+                        .unwrap();
+                let local = install_branch_advance_local(&fixture.jj, candidate).unwrap();
+                let head = local.head.clone();
+                export_installed_branch_advance(&fixture.jj, local)
+                    .export
+                    .unwrap();
+                export_accepted_branch(&fixture.jj, &fixture.store, "feature", &head).unwrap();
+                settle_operation_heads(&fixture.jj, &fixture.store).unwrap();
+                tokio::task::spawn_blocking(move || {
+                    assert!(origin_copy_is_superseded_with_accepted(
+                        &fixture.jj,
+                        &fixture.store,
+                        "feature",
+                        &head,
+                        &before,
+                        &[],
+                        Duration::from_secs(60),
+                    )
+                    .unwrap());
+                    assert!(fixture
+                        .snapshot()
+                        .already_prepared(Duration::from_secs(60))
+                        .unwrap()
+                        .is_some());
+                })
+                .await
+                .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn prepared_detection_and_operation_repair_are_explicit() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let snapshot = fixture.snapshot();
+        let malformed = snapshot.coordinate.head[..12].to_string();
+        assert!(matches!(
+            snapshot.reachable_from_head(std::slice::from_ref(&malformed), Duration::from_secs(10)),
+            Err(AdvanceComputeError::UnknownEvidence { commit }) if commit == malformed
+        ));
+        assert!(snapshot
+            .reachable_from_head(&["a".repeat(40)], Duration::from_secs(10))
+            .unwrap()
+            .is_empty());
+        let queries = vec![
+            snapshot.coordinate.head.clone(),
+            snapshot.coordinate.base.clone(),
+            "a".repeat(40),
+        ];
+        assert_eq!(
+            snapshot
+                .reachable_from_head(&queries, Duration::from_secs(10))
+                .unwrap(),
+            std::slice::from_ref(&snapshot.coordinate.head)
+        );
+        assert!(matches!(
+            snapshot.reachable_from_head(&queries, Duration::ZERO),
+            Err(AdvanceComputeError::TimedOut)
+        ));
+        assert!(
+            matches!(
+                snapshot.already_prepared(Duration::ZERO),
+                Err(AdvanceComputeError::TimedOut)
+            ),
+            "an expired budget is a timeout even when the base is not an ancestor"
+        );
+        assert_eq!(
+            snapshot.already_prepared(Duration::from_secs(10)).unwrap(),
+            None
+        );
+        fixture.run(&[
+            "bookmark",
+            "set",
+            "feature",
+            "-r",
+            "main",
+            "--allow-backwards",
+        ]);
+        let snapshot = fixture.snapshot();
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        assert!(
+            matches!(
+                snapshot.already_prepared(Duration::ZERO),
+                Err(AdvanceComputeError::TimedOut)
+            ),
+            "an expired budget is a timeout, not an answer"
+        );
+        assert!(snapshot
+            .already_prepared(Duration::from_secs(10))
+            .unwrap()
+            .is_some());
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        block_on(async {
+            for branch in ["one", "two"] {
+                let mut transaction = snapshot.repo.start_transaction();
+                transaction.repo_mut().set_local_bookmark_target(
+                    RefName::new(branch),
+                    jj_lib::op_store::RefTarget::normal(
+                        CommitId::try_from_hex(&snapshot.coordinate.head).unwrap(),
+                    ),
+                );
+                transaction
+                    .commit("divergent snapshot fixture")
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let error = match capture_branch_advance(&fixture.store, "feature", "main") {
+            Ok(_) => panic!("literal capture must refuse split operations"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, AdvanceCaptureError::UnsettledOperations { heads: 2 }),
+            "{error}"
+        );
+        let settled = settle_operation_heads(&fixture.jj, &fixture.store).unwrap();
+        assert_eq!(settled.before.len(), 2);
+        let again = settle_operation_heads(&fixture.jj, &fixture.store).unwrap();
+        assert_eq!(
+            again.before.as_slice(),
+            std::slice::from_ref(&settled.after)
+        );
+        assert_eq!(again.after, settled.after);
+        let snapshot = fixture.snapshot();
+        assert!(normal_target(&snapshot.repo, "one").is_ok());
+        assert!(normal_target(&snapshot.repo, "two").is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_replay_preserves_merge_commit_and_pins_hidden_graph() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let project = fixture.project.path();
+        let fork = git_stdout(project, &["merge-base", "main", "feature"]);
+        git(project, &["checkout", "-qb", "side", &fork]);
+        std::fs::write(project.join("side.txt"), "side work\n").unwrap();
+        git(project, &["add", "-A"]);
+        git(project, &["commit", "-qm", "side work"]);
+        let side = git_stdout(project, &["rev-parse", "HEAD"]);
+        git(project, &["checkout", "-q", "feature"]);
+        git(project, &["merge", "--no-ff", "-qm", "merge side", "side"]);
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        let snapshot = fixture.snapshot();
+        let original = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+            .unwrap();
+        assert_eq!(original.parent_ids().len(), 2);
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(30))
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(candidate.head.change_id(), original.change_id());
+        assert_eq!(candidate.head.parent_ids().len(), 2);
+        assert!(candidate
+            .head
+            .parent_ids()
+            .contains(&CommitId::try_from_hex(&side).unwrap()));
+        assert_eq!(candidate.head.author(), original.author());
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        assert!(
+            collect_store_garbage(&fixture.store, SystemTime::now(), SystemTime::now()).is_err(),
+            "a candidate's hidden graph and jj metadata remain leased"
+        );
+        assert!(reclaim_unreachable_objects(
+            &store_git_dir(&fixture.store).unwrap(),
+            SystemTime::now()
+        )
+        .is_err());
+        assert_eq!(
+            git_stdout(
+                project,
+                &["show", &format!("{}:side.txt", candidate.head())]
+            ),
+            "side work"
+        );
+        assert_eq!(
+            git_stdout(
+                project,
+                &["show", &format!("{}:owner.txt", candidate.head())]
+            ),
+            "owner two"
+        );
+        assert_eq!(
+            git_stdout(
+                project,
+                &["show", &format!("{}:base.txt", candidate.head())]
+            ),
+            "incoming"
+        );
+        let installed = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        installed.export.unwrap();
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "side").unwrap(),
+            side,
+            "the included side history is preserved without moving its owner's branch"
+        );
+        let repo = block_on(async {
+            crate::load_repo_at_head(&fixture.store)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        let side_commit = repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&side).unwrap())
+            .unwrap();
+        let versions = repo
+            .resolve_change_id(side_commit.change_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            versions.visible_with_offsets().count(),
+            1,
+            "foreign side must not acquire a divergent twin"
+        );
+        let tree = git_stdout(
+            project,
+            &["rev-parse", &format!("{}^{{tree}}", original.id().hex())],
+        );
+        let reverse = git_stdout(
+            project,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &side,
+                "-p",
+                &original.parent_ids()[0].hex(),
+                "-m",
+                "foreign side is first",
+            ],
+        );
+        let side_tree = git_stdout(project, &["rev-parse", &format!("{side}^{{tree}}")]);
+        let advanced_side = git_stdout(
+            project,
+            &[
+                "commit-tree",
+                &side_tree,
+                "-p",
+                &side,
+                "-m",
+                "side owner continues",
+            ],
+        );
+        git(project, &["update-ref", "refs/heads/feature", &reverse]);
+        git(project, &["update-ref", "refs/heads/side", &advanced_side]);
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        let before_reverse = operation_id(&fixture.jj, &fixture.store).unwrap();
+        assert!(
+            matches!(
+                compute_branch_advance(
+                    &fixture.jj,
+                    fixture.snapshot(),
+                    None,
+                    Duration::from_secs(30)
+                ),
+                Err(AdvanceComputeError::AmbiguousOwnership { .. })
+            ),
+            "unknown foreign-first ownership must be a typed refusal"
+        );
+        assert_eq!(
+            operation_id(&fixture.jj, &fixture.store).unwrap(),
+            before_reverse
+        );
+        let candidate = compute_branch_advance(
+            &fixture.jj,
+            fixture.snapshot().with_dependent_bookmarks(Vec::new()),
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(
+            candidate.head.parent_ids()[0].hex(),
+            side,
+            "reversed parent order must not rewrite an ancestor of the foreign owner's tip"
+        );
+        assert_eq!(
+            candidate.tree().unwrap(),
+            installed.tree,
+            "parent order does not change the correctly replayed merge tree"
+        );
+        install_branch_advance_exported(&fixture.jj, candidate)
+            .unwrap()
+            .export
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn replay_names_newly_empty_commits_but_retains_intentional_empty_commits() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let first = git_stdout(fixture.project.path(), &["rev-parse", "feature^"]);
+        git(fixture.project.path(), &["cherry-pick", &first]);
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        fixture.run(&["new", "feature", "--no-edit", "-m", "intentional empty"]);
+        let empty = fixture.run(&[
+            "log",
+            "-r",
+            "latest(children(feature))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        fixture.run(&["bookmark", "set", "feature", "-r", &empty]);
+        let snapshot = fixture.snapshot();
+        let empty_commit = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&empty).unwrap())
+            .unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(30)).unwrap();
+        assert_eq!(candidate.head.change_id(), empty_commit.change_id());
+        assert_eq!(candidate.dropped_commit_ids(), std::slice::from_ref(&first));
+        assert!(!candidate.dropped_commit_ids().contains(&empty));
+        assert_eq!(
+            candidate.healing.dropped,
+            [super::super::emptied::dropped_label(&first, "owner one")]
+        );
+        assert_eq!(
+            candidate.head.tree_ids(),
+            candidate
+                .head
+                .store()
+                .get_commit(&candidate.head.parent_ids()[0])
+                .unwrap()
+                .tree_ids()
+        );
+        let installed = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        installed.export.unwrap();
+        assert_eq!(installed.healing.dropped.len(), 1);
+        assert_eq!(installed.dropped_commit_ids, [first]);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_older_same_change_base_does_not_discard_an_owner_amendment() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let snapshot = fixture.snapshot();
+        let old_tip = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+            .unwrap();
+        let older = snapshot
+            .repo
+            .store()
+            .get_commit(&old_tip.parent_ids()[0])
+            .unwrap();
+        block_on(async {
+            let mut tx = snapshot.repo.start_transaction();
+            let path = RepoPathBuf::from_internal_string("amendment.txt").unwrap();
+            let mut reader = futures::io::Cursor::new(b"owner amendment\n".as_slice());
+            let id = tx
+                .repo()
+                .store()
+                .write_file(&path, &mut reader)
+                .await
+                .unwrap();
+            let mut tree = MergedTreeBuilder::new(older.tree());
+            tree.set_or_remove(
+                path,
+                Merge::resolved(Some(TreeValue::File {
+                    id,
+                    executable: false,
+                    copy_id: CopyId::placeholder(),
+                })),
+            );
+            let tree = tree.write_tree().await.unwrap();
+            let amended = tx
+                .repo_mut()
+                .rewrite_commit(&older)
+                .set_predecessors(
+                    rewrite_predecessors(
+                        &older,
+                        &Deadline(Instant::now() + Duration::from_secs(60)),
+                    )
+                    .unwrap(),
+                )
+                .set_tree(tree)
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            let child = tx
+                .repo_mut()
+                .new_commit(vec![amended.id().clone()], amended.tree())
+                .set_description("owner's intentional empty child")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            tx.repo_mut().add_head(&child).await.unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("main"),
+                jj_lib::op_store::RefTarget::normal(older.id().clone()),
+            );
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("feature"),
+                jj_lib::op_store::RefTarget::normal(child.id().clone()),
+            );
+            tx.commit("older base with owner amendment").await.unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let snapshot = fixture.snapshot();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let head = snapshot
+                    .repo
+                    .store()
+                    .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+                    .unwrap();
+                let commits = branch_commits(
+                    snapshot.repo.as_ref(),
+                    head.id(),
+                    older.id(),
+                    &Deadline(Instant::now() + Duration::from_secs(30)),
+                    None,
+                )
+                .await
+                .unwrap();
+                let (_, mapping) = replay_boundaries(
+                    &snapshot,
+                    &commits,
+                    &head,
+                    &older,
+                    &Deadline(Instant::now() + Duration::from_secs(30)),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    mapping.is_empty(),
+                    "an old version cannot prove a newer amendment was incorporated"
+                );
+            });
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:amendment.txt", candidate.head())]
+            ),
+            "owner amendment"
+        );
+        install_branch_advance_exported(&fixture.jj, candidate)
+            .unwrap()
+            .export
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn missing_predecessor_evidence_replays_instead_of_skipping() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let source = fixture.snapshot();
+        let original = source
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&source.coordinate.head).unwrap())
+            .unwrap();
+        fixture.run(&["bookmark", "set", "old-feature", "-r", &original.id().hex()]);
+        let mut candidate = compute_branch_advance(
+            &fixture.jj,
+            fixture.snapshot(),
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        candidate.head = block_on(async {
+            let mut tx = candidate.snapshot.repo.start_transaction();
+            tx.repo_mut()
+                .rewrite_commit(&candidate.head)
+                .set_predecessors(Vec::new())
+                .set_description(candidate.head.description())
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        install_branch_advance_exported(&fixture.jj, candidate)
+            .unwrap()
+            .export
+            .unwrap();
+        let snapshot = capture_branch_advance(&fixture.store, "old-feature", "feature").unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let base = snapshot
+                    .repo
+                    .store()
+                    .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.base).unwrap())
+                    .unwrap();
+                let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+                let commits = branch_commits(
+                    snapshot.repo.as_ref(),
+                    original.id(),
+                    base.id(),
+                    &deadline,
+                    None,
+                )
+                .await
+                .unwrap();
+                let (_, mapping) =
+                    replay_boundaries(&snapshot, &commits, &original, &base, &deadline)
+                        .await
+                        .unwrap();
+                assert!(!mapping.contains_key(original.id()));
+            });
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(30)).unwrap();
+        assert!(
+            candidate
+                .healing
+                .dropped
+                .iter()
+                .any(|label| label.contains("owner two")),
+            "missing proof executes replay and canonical empty-drop, not a provenance skip"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:owner.txt", candidate.head())]
+            ),
+            "owner two"
+        );
+        install_branch_advance_exported(&fixture.jj, candidate)
+            .unwrap()
+            .export
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn flattened_hidden_predecessors_are_capped_and_keep_newest_versions() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let snapshot = fixture.snapshot();
+        block_on(async {
+            let mut tx = snapshot.repo.start_transaction();
+            let original = snapshot
+                .repo
+                .store()
+                .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+                .unwrap();
+            let mut current = original.clone();
+            let mut previous = current.id().clone();
+            for number in 0..70 {
+                previous = current.id().clone();
+                current = tx
+                    .repo_mut()
+                    .rewrite_commit(&current)
+                    .set_predecessors(
+                        rewrite_predecessors(
+                            &current,
+                            &Deadline(Instant::now() + Duration::from_secs(60)),
+                        )
+                        .unwrap(),
+                    )
+                    .set_description(format!("hidden version {number}"))
+                    .detach()
+                    .write_hidden()
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(current.store_commit().predecessors.len(), 64);
+            assert_eq!(current.store_commit().predecessors[0], previous);
+            assert!(
+                !current.store_commit().predecessors.contains(original.id()),
+                "expired evidence falls back to replay instead of growing forever"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn transitive_dependents_do_not_pin_the_parents_merged_lineage() {
+        let Some(fixture) = ReplayFixture::new(true) else {
+            return;
+        };
+        let old = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+        fixture.run(&["rebase", "-b", "feature", "-o", "main"]);
+        fixture.run(&[
+            "restore",
+            "--from",
+            &old,
+            "--into",
+            "feature",
+            "--",
+            "common.txt",
+        ]);
+        let snapshot = fixture.snapshot();
+        let (child, grandchild) = block_on(async {
+            let head = snapshot
+                .repo
+                .store()
+                .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+                .unwrap();
+            let fork = snapshot
+                .repo
+                .store()
+                .get_commit(&head.parent_ids()[0])
+                .unwrap();
+            let mut tx = snapshot.repo.start_transaction();
+            let child = tx
+                .repo_mut()
+                .new_commit(vec![fork.id().clone()], fork.tree())
+                .set_description("child forked before parent tip")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            let grandchild = tx
+                .repo_mut()
+                .new_commit(vec![child.id().clone()], child.tree())
+                .set_description("grandchild forked from child")
+                .detach()
+                .write_hidden()
+                .await
+                .unwrap();
+            tx.repo_mut().add_head(&grandchild).await.unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("child"),
+                jj_lib::op_store::RefTarget::normal(child.id().clone()),
+            );
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new("grandchild"),
+                jj_lib::op_store::RefTarget::normal(grandchild.id().clone()),
+            );
+            tx.commit("declare dependent fixture heads").await.unwrap();
+            Ok((child.id().hex(), grandchild.id().hex()))
+        })
+        .unwrap();
+        fixture.run(&[
+            "new",
+            "feature",
+            "main",
+            "--no-edit",
+            "-m",
+            "owner merges its base",
+        ]);
+        let merged = fixture.run(&[
+            "log",
+            "-r",
+            "latest(children(feature) & children(main))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        fixture.run(&["bookmark", "set", "feature", "-r", &merged]);
+        std::fs::write(
+            fixture.project.path().join("later.txt"),
+            "later base work\n",
+        )
+        .unwrap();
+        git(fixture.project.path(), &["add", "-A"]);
+        git(
+            fixture.project.path(),
+            &["commit", "-qm", "base advances again"],
+        );
+        import_git(&fixture.jj, &fixture.store).unwrap();
+        let snapshot = fixture
+            .snapshot()
+            .with_dependent_bookmarks(vec!["child".into(), "grandchild".into()]);
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(30)).unwrap();
+        assert!(
+            !candidate.healing.healed.is_empty(),
+            "the owner's conflicted lineage must be healed, not pinned"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:common.txt", candidate.head())]
+            ),
+            "owner two"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:later.txt", candidate.head())]
+            ),
+            "later base work"
+        );
+        let installed = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        installed.export.unwrap();
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "child").unwrap(),
+            child
+        );
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "grandchild").unwrap(),
+            grandchild
+        );
+        assert!(conflicted_commits(&fixture.jj, &fixture.store, "main..feature").is_empty());
+    }
+
+    struct ReplayFixture {
+        _home: TempDir,
+        project: TempDir,
+        jj: JjEnv,
+        store: PathBuf,
+    }
+
+    impl ReplayFixture {
+        fn new(conflict: bool) -> Option<Self> {
+            let bin = jj_bin()?;
+            let home = TempDir::new().unwrap();
+            let project = TempDir::new().unwrap();
+            init_project(project.path());
+            std::fs::write(project.path().join("common.txt"), "original\n").unwrap();
+            git(project.path(), &["add", "-A"]);
+            git(project.path(), &["commit", "-qm", "common ancestor"]);
+            git(project.path(), &["checkout", "-qb", "feature"]);
+            let own_path = if conflict { "common.txt" } else { "owner.txt" };
+            for (content, message) in [("owner one\n", "owner one"), ("owner two\n", "owner two")] {
+                std::fs::write(project.path().join(own_path), content).unwrap();
+                git(project.path(), &["add", "-A"]);
+                git(project.path(), &["commit", "-qm", message]);
+            }
+            git(project.path(), &["checkout", "-q", "main"]);
+            let base_path = if conflict { "common.txt" } else { "base.txt" };
+            std::fs::write(project.path().join(base_path), "incoming\n").unwrap();
+            git(project.path(), &["add", "-A"]);
+            git(project.path(), &["commit", "-qm", "advanced base"]);
+            let jj = JjEnv::resolve(&bin, home.path());
+            let store = home.path().join("store");
+            ensure_project_store(&jj, &store, project.path()).unwrap();
+            Some(Self {
+                _home: home,
+                project,
+                jj,
+                store,
+            })
+        }
+
+        fn run(&self, args: &[&str]) -> String {
+            let mut args = args.to_vec();
+            args.push("--ignore-working-copy");
+            self.jj
+                .run(&self.store, &args, "detached replay fixture")
+                .unwrap()
+        }
+
+        fn snapshot(&self) -> BranchAdvanceSnapshot {
+            capture_branch_advance(&self.store, "feature", "main").unwrap()
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_replay_preserves_stack_and_never_publishes_during_compute() {
+        let Some(fixture) = ReplayFixture::new(false) else {
+            return;
+        };
+        let snapshot = fixture.snapshot();
+        let head_before = snapshot.coordinate.head.clone();
+        let base = snapshot.coordinate.base.clone();
+        let old_tip = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&head_before).unwrap())
+            .unwrap();
+        let old_parent = snapshot
+            .repo
+            .store()
+            .get_commit(&old_tip.parent_ids()[0])
+            .unwrap();
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60))
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),
+            head_before
+        );
+        assert_eq!(
+            git_stdout(fixture.project.path(), &["rev-parse", "feature"]),
+            head_before
+        );
+        assert_eq!(candidate.head.change_id(), old_tip.change_id());
+        // Exercise Cairn's real settings loader, not jj-lib's test defaults.
+        assert!(candidate
+            .head
+            .store_commit()
+            .predecessors
+            .contains(old_tip.id()));
+        let mut transaction = candidate.snapshot.repo.start_transaction();
+        let twice = block_on(async {
+            transaction
+                .repo_mut()
+                .rewrite_commit(&candidate.head)
+                .set_predecessors(
+                    rewrite_predecessors(
+                        &candidate.head,
+                        &Deadline(Instant::now() + Duration::from_secs(60)),
+                    )
+                    .unwrap(),
+                )
+                .set_description("second hidden version")
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(twice.store_commit().predecessors.contains(old_tip.id()));
+        assert!(twice
+            .store_commit()
+            .predecessors
+            .contains(candidate.head.id()));
+        assert!(twice.store_commit().predecessors.len() <= 64);
+        let parent = candidate
+            .head
+            .store()
+            .get_commit(&candidate.head.parent_ids()[0])
+            .unwrap();
+        assert_eq!(parent.change_id(), old_parent.change_id());
+        assert_eq!(
+            parent.parent_ids(),
+            &[CommitId::try_from_hex(&base).unwrap()]
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:owner.txt", candidate.head())]
+            ),
+            "owner two"
+        );
+        assert_eq!(
+            git_stdout(
+                fixture.project.path(),
+                &["show", &format!("{}:base.txt", candidate.head())]
+            ),
+            "incoming"
+        );
+        let local = install_branch_advance_local(&fixture.jj, candidate).unwrap();
+        assert_eq!(
+            operation_id(&fixture.jj, &fixture.store).unwrap(),
+            local.accepted_operation.clone().unwrap()
+        );
+        assert_ne!(local.accepted_operation.as_deref(), Some(before.as_str()));
+        assert_eq!(
+            git_stdout(fixture.project.path(), &["rev-parse", "feature"]),
+            head_before,
+            "local acceptance must not export before the durable witness is recorded"
+        );
+        assert!(super::super::object_lease::Reclamation::for_store(&fixture.store).is_err());
+        let installed = export_installed_branch_advance(&fixture.jj, local);
+        installed.export.unwrap();
+        assert_ne!(installed.head, head_before);
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "main").unwrap(),
+            base
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_conflict_and_timeout_leave_live_views_unchanged() {
+        let Some(fixture) = ReplayFixture::new(true) else {
+            return;
+        };
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        let snapshot = fixture.snapshot();
+        let coordinate = snapshot.coordinate().clone();
+        let outcome = compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60));
+        let Err(AdvanceComputeError::Conflict(diagnostic)) = outcome else {
+            panic!("expected exact conflict refusal")
+        };
+        assert_eq!(diagnostic.ours.as_deref(), Some(coordinate.head.as_str()));
+        assert_eq!(diagnostic.theirs.as_deref(), Some(coordinate.base.as_str()));
+        assert_eq!(diagnostic.conflicting_paths(), vec!["common.txt"]);
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap(),
+            coordinate.head
+        );
+        assert_eq!(
+            git_stdout(fixture.project.path(), &["rev-parse", "feature"]),
+            coordinate.head
+        );
+        assert!(matches!(
+            compute_branch_advance(&fixture.jj, fixture.snapshot(), None, Duration::ZERO),
+            Err(AdvanceComputeError::TimedOut)
+        ));
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn detached_heal_retains_clean_tip_tree_and_does_not_move_child() {
+        let Some(fixture) = ReplayFixture::new(true) else {
+            return;
+        };
+        let ours = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+        fixture.run(&["rebase", "-b", "feature", "-o", "main"]);
+        fixture.run(&[
+            "restore",
+            "--from",
+            &ours,
+            "--into",
+            "feature",
+            "--",
+            "common.txt",
+        ]);
+        assert!(!branch_has_conflict(&fixture.jj, &fixture.store, "feature").unwrap());
+        assert!(!conflicted_commits(&fixture.jj, &fixture.store, "main..feature").is_empty());
+        fixture.run(&[
+            "new",
+            "feature",
+            "--no-edit",
+            "-m",
+            "intentional empty child",
+        ]);
+        let child = fixture.run(&[
+            "log",
+            "-r",
+            "latest(children(feature))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        fixture.run(&["bookmark", "set", "child", "-r", &child]);
+        let child_before = block_on(async {
+            crate::load_repo_at_head(&fixture.store)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .store()
+        .get_commit(&CommitId::try_from_hex(&child).unwrap())
+        .unwrap();
+        let snapshot = fixture.snapshot();
+        let original = snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&snapshot.coordinate.head).unwrap())
+            .unwrap();
+        let before = operation_id(&fixture.jj, &fixture.store).unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(60))
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(candidate.head.tree_ids(), original.tree_ids());
+        assert!(
+            candidate
+                .dropped_commit_ids()
+                .contains(&original.id().hex()),
+            "the absorbed resolution tip is reported by exact original ID"
+        );
+        assert!(candidate
+            .dropped_commit_ids()
+            .iter()
+            .all(|id| id.len() == 40));
+        assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+        let mut next = candidate.head.clone();
+        let base = CommitId::try_from_hex(&candidate.coordinate().base).unwrap();
+        while next.id() != &base {
+            assert!(!next.has_conflict());
+            next = next.store().get_commit(&next.parent_ids()[0]).unwrap();
+        }
+        let installed = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        installed.export.unwrap();
+        assert_eq!(
+            bookmark_commit(&fixture.jj, &fixture.store, "child").unwrap(),
+            child
+        );
+        let repo = block_on(async {
+            crate::load_repo_at_head(&fixture.store)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(
+            !branch_tip_divergent(
+                &repo,
+                "feature",
+                &CommitId::try_from_hex(&installed.head).unwrap()
+            )
+            .unwrap(),
+            "dormant child ownership is not own-branch divergence"
+        );
+        fixture.run(&["bookmark", "set", "no-own-work", "-r", &original.id().hex()]);
+        let no_own = capture_branch_advance(&fixture.store, "no-own-work", "feature").unwrap();
+        let no_own =
+            compute_branch_advance(&fixture.jj, no_own, None, Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            no_own.head(),
+            installed.head,
+            "a child without own commits catches up to the full base"
+        );
+        install_branch_advance_exported(&fixture.jj, no_own)
+            .unwrap()
+            .export
+            .unwrap();
+        let snapshot = capture_branch_advance(&fixture.store, "child", "feature").unwrap();
+        let candidate =
+            compute_branch_advance(&fixture.jj, snapshot, None, Duration::from_secs(30)).unwrap();
+        assert_eq!(candidate.head.change_id(), child_before.change_id());
+        assert_eq!(
+            candidate.head.parent_ids(),
+            &[CommitId::try_from_hex(&installed.head).unwrap()],
+            "old parent versions map onto their proven healed successors"
+        );
+        assert_eq!(candidate.head.tree_ids(), child_before.tree_ids());
+        let child_install = install_branch_advance_exported(&fixture.jj, candidate).unwrap();
+        child_install.export.unwrap();
+        let repo = block_on(async {
+            crate::load_repo_at_head(&fixture.store)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        let versions = repo
+            .resolve_change_id(original.change_id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            !versions.has_visible(original.id()),
+            "catching up the child releases the old parent lineage"
+        );
+        assert!(!versions.is_divergent());
+    }
+
+    /// Construct a hidden object without publishing a transaction. Production
+    /// candidates will additionally run replay, heal and publication guards.
+    fn hidden_candidate(snapshot: BranchAdvanceSnapshot) -> BranchAdvanceCandidate {
+        let head = block_on(async {
+            let id = CommitId::try_from_hex(&snapshot.coordinate.head).unwrap();
+            let old = snapshot.repo.store().get_commit(&id).unwrap();
+            let mut transaction = snapshot.repo.start_transaction();
+            transaction
+                .repo_mut()
+                .new_commit(vec![id], old.tree())
+                .set_description("detached candidate fixture")
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        BranchAdvanceCandidate {
+            snapshot,
+            head,
+            healing: Default::default(),
+            dropped_commit_ids: Vec::new(),
+            expires_at: Instant::now() + std::time::Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn installer_rejects_owner_and_base_races_and_preserves_other_branches() {
+        let Some(bin) = jj_bin() else { return };
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("store");
+        ensure_project_store(&jj, &store, project.path()).unwrap();
+        let run = |args: &[&str]| {
+            let mut args = args.to_vec();
+            args.push("--ignore-working-copy");
+            jj.run(&store, &args, "advance installer fixture").unwrap()
+        };
+        run(&["bookmark", "set", "feature", "-r", "main"]);
+        let before = operation_id(&jj, &store).unwrap();
+        let candidate =
+            hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
+        assert_eq!(
+            operation_id(&jj, &store).unwrap(),
+            before,
+            "hidden compute must not publish"
+        );
+        run(&["new", "main", "--no-edit", "-m", "owner commit"]);
+        let owner = run(&[
+            "log",
+            "-r",
+            "latest(children(main))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        run(&["bookmark", "set", "feature", "-r", &owner]);
+        assert!(matches!(
+            install_branch_advance_exported(&jj, candidate),
+            Err(AdvanceInstallError::CoordinatesChanged)
+        ));
+        assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), owner);
+
+        let candidate =
+            hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
+        run(&["bookmark", "set", "main", "-r", &owner]);
+        assert!(matches!(
+            install_branch_advance_exported(&jj, candidate),
+            Err(AdvanceInstallError::CoordinatesChanged)
+        ));
+        assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), owner);
+
+        let candidate =
+            hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
+        let head = candidate.head();
+        run(&["bookmark", "set", "other", "-r", &owner]);
+        let installed = install_branch_advance_exported(&jj, candidate).unwrap();
+        assert_eq!(installed.head, head);
+        installed.export.unwrap();
+        assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), head);
+        assert_eq!(bookmark_commit(&jj, &store, "other").unwrap(), owner);
+        assert_eq!(bookmark_commit(&jj, &store, "main").unwrap(), owner);
+        assert_eq!(
+            git_stdout(project.path(), &["rev-parse", "refs/heads/feature"]),
+            head
+        );
+
+        let mut invalid =
+            hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
+        let base = invalid
+            .snapshot
+            .repo
+            .store()
+            .get_commit(&CommitId::try_from_hex(&invalid.coordinate().base).unwrap())
+            .unwrap();
+        invalid.head = invalid
+            .snapshot
+            .repo
+            .store()
+            .get_commit(&base.parent_ids()[0])
+            .unwrap();
+        let before_invalid = operation_id(&jj, &store).unwrap();
+        assert!(matches!(install_branch_advance_exported(&jj, invalid),
+            Err(AdvanceInstallError::Repository(error)) if error.contains("does not include its captured base")));
+        assert_eq!(operation_id(&jj, &store).unwrap(), before_invalid);
+
+        let mut candidate =
+            hidden_candidate(capture_branch_advance(&store, "feature", "main").unwrap());
+        candidate.expires_at = Instant::now();
+        let before = operation_id(&jj, &store).unwrap();
+        assert!(matches!(
+            install_branch_advance_exported(&jj, candidate),
+            Err(AdvanceInstallError::Expired)
+        ));
+        assert_eq!(operation_id(&jj, &store).unwrap(), before);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn snapshot_is_literal_and_compares_both_coordinates() {
+        let Some(bin) = jj_bin() else { return };
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("store");
+        ensure_project_store(&jj, &store, project.path()).unwrap();
+        let run = |args: &[&str]| {
+            let mut args = args.to_vec();
+            args.push("--ignore-working-copy");
+            jj.run(&store, &args, "advance snapshot fixture").unwrap()
+        };
+        run(&["bookmark", "set", "feature", "-r", "main"]);
+        let before = operation_id(&jj, &store).unwrap();
+        let snapshot = capture_branch_advance(&store, "feature", "main").unwrap();
+        assert_eq!(snapshot.operation(), before);
+        assert_eq!(operation_id(&jj, &store).unwrap(), before);
+        assert!(snapshot.coordinates_match().unwrap());
+        let old_head = snapshot.coordinate().head.clone();
+        run(&["new", "main", "--no-edit", "-m", "owner commit"]);
+        let owner = run(&[
+            "log",
+            "-r",
+            "latest(children(main))",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ]);
+        run(&["bookmark", "set", "feature", "-r", &owner]);
+        assert!(!snapshot.coordinates_match().unwrap());
+        assert_eq!(snapshot.coordinate().head, old_head);
+        drop(snapshot);
+
+        let snapshot = capture_branch_advance(&store, "feature", "main").unwrap();
+        run(&["bookmark", "set", "main", "-r", &owner]);
+        assert!(!snapshot.coordinates_match().unwrap());
+        assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), owner);
+        let error =
+            collect_store_garbage(&store, SystemTime::now(), SystemTime::now()).unwrap_err();
+        assert!(error.contains("detached advance"), "{error}");
+        let error = truncate_operation_log(&store, SystemTime::now()).unwrap_err();
+        assert!(error.contains("detached advance"), "{error}");
+        let error = reclaim_unreachable_objects(&store_git_dir(&store).unwrap(), SystemTime::now())
+            .unwrap_err();
+        assert!(error.contains("detached advance"), "{error}");
+        drop(snapshot);
+        // Releasing a snapshot permits the same maintenance gate again.
+        let _maintenance =
+            super::super::object_lease::Reclamation::acquire(&store_git_dir(&store).unwrap())
+                .unwrap();
+        assert!(capture_branch_advance(&store, "feature", "main").is_err());
+    }
+}

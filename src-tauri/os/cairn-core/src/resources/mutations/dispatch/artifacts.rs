@@ -72,6 +72,10 @@ async fn require_own_artifact_chain(
     }
 }
 
+/// `held_store` is set when the calling write holds its project's store lock;
+/// a create-pr write then hands its pull-request sync back through
+/// `deferred_pr_sync` instead of running it under the lock.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -79,6 +83,8 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
+    held_store: Option<&crate::orchestrator::JjStoreGuard>,
+    deferred_pr_sync: &mut Option<crate::pr_data::actions::DeferredPrSync>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (
@@ -149,6 +155,16 @@ pub(super) async fn dispatch(
                         index,
                         item,
                         "payload.action and payload.confirmed are mutually exclusive",
+                    ));
+                }
+                // The write preflight refuses this shape in a file batch before
+                // anything applies; a caller that dispatches it directly under
+                // a held store lock is refused here, before any effect.
+                if held_store.is_some() {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        "a pull-request action cannot run while this write holds the project's version-control store lock; send the artifact patch carrying `action` as its own write",
                     ));
                 }
                 let action = payload_str(payload, "action", &[]).ok_or_else(|| {
@@ -364,7 +380,10 @@ pub(super) async fn dispatch(
                 // Saving the PR artifact is a commit barrier on the branch it
                 // presents: a commit an earlier batch sealed but could not
                 // publish lands before the PR is opened or re-synced from it.
-                let barrier = if artifact_label == "create-pr" {
+                // A write holding its store lock has already drained its
+                // branch's held work under that lock and pushes the branch after
+                // releasing it; the barrier's own push would need the lock.
+                let barrier = if artifact_label == "create-pr" && held_store.is_none() {
                     match crate::resources::resolve_node_or_task_job_id(
                         &orch.db.local,
                         project,
@@ -384,7 +403,7 @@ pub(super) async fn dispatch(
                 } else {
                     None
                 };
-                let summary = comments_artifacts::write_artifact_change(
+                let (summary, deferred) = comments_artifacts::write_artifact_change(
                     orch,
                     request,
                     project,
@@ -395,9 +414,11 @@ pub(super) async fn dispatch(
                     name.as_deref(),
                     payload,
                     matches!(mode, ChangeMode::Patch),
+                    held_store.is_some(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
+                *deferred_pr_sync = deferred;
                 match barrier {
                     Some(barrier) => barrier.prefix(barrier.warn_if_held(summary)),
                     None => summary,
@@ -444,7 +465,7 @@ pub(super) async fn dispatch(
                     name.as_deref().unwrap_or("artifact")
                 )
             } else {
-                comments_artifacts::write_artifact_change(
+                let (summary, deferred) = comments_artifacts::write_artifact_change(
                     orch,
                     request,
                     project,
@@ -455,9 +476,12 @@ pub(super) async fn dispatch(
                     name.as_deref(),
                     payload,
                     matches!(mode, ChangeMode::Patch),
+                    held_store.is_some(),
                 )
                 .await
-                .map_err(|error| build_failure(index, item, error))?
+                .map_err(|error| build_failure(index, item, error))?;
+                *deferred_pr_sync = deferred;
+                summary
             }
         }
         _ => return Ok(None),

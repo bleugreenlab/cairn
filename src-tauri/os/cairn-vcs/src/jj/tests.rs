@@ -398,7 +398,7 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
     seal(&jj, &ws, "fifth: take main's wording for shared", None).unwrap();
     let tip = bookmark_commit(&jj, &store, branch).unwrap();
 
-    // The take-committed-tip replay: the tip is resolved, the third commit is not.
+    // Preparation publishes only the fully healed history, never an intermediate conflict.
     assert!(matches!(
         rebase_branch_onto_with_resolution(
             &jj,
@@ -406,15 +406,15 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
             branch,
             "main",
             Some(&ResolutionCarry::from_tip(&tip, &paths)),
-            &RebaseOptions::default(),
         )
         .unwrap(),
-        RebaseOutcome::RebasedOverConflictedAncestry { .. }
+        RebaseOutcome::Rebased
     ));
     let dest = bookmark_commit(&jj, &store, "main").unwrap();
     let range = format!("{dest}..bookmarks(exact:{branch:?})");
     let replayed = commits_oldest_first(&jj, &store, &range);
-    assert_eq!(replayed.len(), 5);
+    assert_eq!(replayed.len(), 4);
+    assert!(conflicted_commits(&jj, &store, &range).is_empty());
 
     let report =
         reconcile_siblings_without_publication(&jj, &store, "main", &[branch.to_string()]).unwrap();
@@ -447,7 +447,7 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
     assert!(
         third.starts_with("third: reword shared\n\nCairn conflict heal:")
             && third.contains("`shared.rs`")
-            && third.contains(&replayed[4].0[..12])
+            && third.contains("Commits this left with no changes were dropped:")
             && third.contains("\"fifth: take main's wording for shared\""),
         "the healed commit says what changed, where it came from, and what was dropped: {third}"
     );
@@ -474,30 +474,13 @@ fn a_take_committed_tip_replay_heals_a_five_commit_branch_in_place() {
 /// cairn/5326's integration-branch shape: a coordinator branch with a child PR
 /// folded into it and a later commit of its own. A take-committed-tip replay of
 /// the coordinator leaves the hub's first commit, the child's landing, and the
-/// later commit conflict-flagged during replay. The replay heals them atomically
-/// before exporting folded landmarks: the
+/// later commit conflict-flagged. The reconcile heals them in place: the
 /// child's landing is still a commit of its own, still the child bookmark's
 /// target, and still changes only the child's file. The coordinator is never
 /// collapsed.
 #[test]
 #[serial_test::serial(jj)]
 fn a_coordinator_with_a_folded_child_is_healed_without_collapsing_it() {
-    folded_coordinator_replay(false, false);
-}
-
-#[test]
-#[serial_test::serial(jj)]
-fn folded_landmark_heal_holds_only_the_child_with_its_own_conflict() {
-    folded_coordinator_replay(true, false);
-}
-
-#[test]
-#[serial_test::serial(jj)]
-fn refused_folded_landmark_heal_restores_the_entire_replay() {
-    folded_coordinator_replay(true, true);
-}
-
-fn folded_coordinator_replay(with_conflicting_child: bool, refuse_heal: bool) {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping a_coordinator_with_a_folded_child_is_healed_without_collapsing_it: jj not resolvable");
         return;
@@ -532,17 +515,6 @@ fn folded_coordinator_replay(with_conflicting_child: bool, refuse_heal: bool) {
     std::fs::write(ws_pending.join("pending.rs"), "pending work\n").unwrap();
     seal(&jj, &ws_pending, "pending child work", None).unwrap();
     forget_workspace(&jj, &store, pending).unwrap();
-    let independent = "agent/independent-conflict";
-    let independent_before = if with_conflicting_child {
-        let workspace = wts.path().join("independent");
-        add_workspace(&jj, &store, &workspace, independent, int, None).unwrap();
-        std::fs::write(workspace.join("shared.rs"), "INDEPENDENT-SIDE\n").unwrap();
-        seal(&jj, &workspace, "independent child edits shared", None).unwrap();
-        forget_workspace(&jj, &store, independent).unwrap();
-        Some(bookmark_commit(&jj, &store, independent).unwrap())
-    } else {
-        None
-    };
     store_commit_on(
         &jj,
         &store,
@@ -568,109 +540,24 @@ fn folded_coordinator_replay(with_conflicting_child: bool, refuse_heal: bool) {
         "coordinator takes main's wording",
     );
     let tip = bookmark_commit(&jj, &store, int).unwrap();
-    // store_commit_on models a native-only edit; synchronize this fixture's
-    // starting export before demanding bit-identical Git refs after rollback.
-    export_selected_bookmarks(&jj, &store, &[(int, tip.as_str())]).unwrap();
-    assert_eq!(
-        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{int}")]),
-        tip
-    );
-    let before = crate::read_local_bookmark_view(&store).unwrap();
-    let git_before = git_stdout(
-        proj.path(),
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-            "refs/heads",
-        ],
-    );
-    if refuse_heal {
-        let (fault_jj, fault_store) = (jj.clone(), store.clone());
-        at_step("ancestry heal: before final proof", move || {
-            store_commit_on(
-                &fault_jj,
-                &fault_store,
-                int,
-                "proof-fault.txt",
-                "unexpected content\n",
-                "inject non-exact heal",
-            );
-        });
-    }
-    let result = rebase_branch_onto_with_resolution(
-        &jj,
-        &store,
-        int,
-        "main",
-        Some(&ResolutionCarry::from_tip(&tip, &paths)),
-        &RebaseOptions::default(),
-    );
-    if refuse_heal {
-        let error = result.unwrap_err();
-        assert!(
-            error.contains("does not hold the tree of its pre-heal tip"),
-            "{error}"
-        );
-        assert!(error.contains("rolled back to operation"), "{error}");
-        assert_eq!(
-            crate::read_local_bookmark_view(&store).unwrap().bookmarks,
-            before.bookmarks
-        );
-        assert_eq!(
-            git_stdout(
-                proj.path(),
-                &[
-                    "for-each-ref",
-                    "--format=%(refname) %(objectname)",
-                    "refs/heads"
-                ]
-            ),
-            git_before
-        );
-        for name in [int, child, pending, independent] {
-            require_clean_tree(&jj, &store, name, "refused folded-heal rollback").unwrap();
-        }
-        return;
-    }
-    let RebaseOutcome::Rebased { held_descendants } = result.unwrap() else {
-        panic!("folded landmarks must heal before export")
-    };
-    if let Some(original) = independent_before.as_ref() {
-        assert_eq!(
-            held_descendants
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec![independent]
-        );
-        assert_eq!(held_descendants[independent].ours.as_ref(), Some(original));
-        assert_eq!(
-            bookmark_commit(&jj, &store, independent).as_ref(),
-            Some(original)
-        );
-        assert!(!branch_has_conflict(&jj, &store, independent).unwrap());
-        assert_eq!(
-            git_stdout(
-                proj.path(),
-                &["rev-parse", &format!("refs/heads/{independent}")]
-            ),
-            *original
-        );
-        let change = change_id_of(&jj, &store, independent);
-        assert_eq!(
-            visible_commit_ids_for_change(&jj, &store, &change),
-            vec![original.clone()]
-        );
-    } else {
-        assert!(held_descendants.is_empty());
-    }
-    assert!(!branch_has_conflict(&jj, &store, child).unwrap());
-    assert!(!branch_has_conflict(&jj, &store, pending).unwrap());
+    let child_before = bookmark_commit(&jj, &store, child).unwrap();
+    let pending_before = bookmark_commit(&jj, &store, pending).unwrap();
+    assert!(matches!(
+        rebase_branch_onto_with_resolution(
+            &jj,
+            &store,
+            int,
+            "main",
+            Some(&ResolutionCarry::from_tip(&tip, &paths)),
+        )
+        .unwrap(),
+        RebaseOutcome::Rebased
+    ));
     let dest = bookmark_commit(&jj, &store, "main").unwrap();
     let range = format!("{dest}..bookmarks(exact:{int:?})");
     assert!(
         conflicted_commits(&jj, &store, &range).is_empty(),
-        "folded landmarks heal atomically before any rewritten bookmark is exported"
+        "the canonical replay publishes only fully healed branch history"
     );
 
     let report =
@@ -695,10 +582,9 @@ fn folded_coordinator_replay(with_conflicting_child: bool, refuse_heal: bool) {
     assert!(conflicted_commits(&jj, &store, &range).is_empty());
     assert_eq!(
         bookmark_commit(&jj, &store, child).as_deref(),
-        Some(healed[1].0.as_str()),
-        "the child bookmark still names its own landing"
+        Some(child_before.as_str()),
+        "the child's original coordinate is not eagerly rewritten"
     );
-    assert!(bookmark_landed_in(&jj, &store, child, int));
     assert_eq!(commit_summary(&jj, &store, &healed[1].0), "A child.rs");
     assert_eq!(
         description_of(&jj, &store, &healed[1].0).trim_end(),
@@ -711,241 +597,24 @@ fn folded_coordinator_replay(with_conflicting_child: bool, refuse_heal: bool) {
         "MAIN-SIDE plus hub\n"
     );
 
-    // The in-flight child the replay dragged onto the flagged lineage now sits
-    // on the healed one: its parent is the healed landing, it is clean, and it
-    // still changes only its own file.
+    // The in-flight child prepares independently at its own demand boundary.
     let pending_tip = bookmark_commit(&jj, &store, pending).unwrap();
     assert_eq!(
-        commits_oldest_first(&jj, &store, &format!("{}..{pending_tip}", healed[1].0)),
-        vec![(pending_tip.clone(), "pending child work".to_string())],
-        "the pending child rides the healed landing, not an abandoned lineage"
+        pending_tip, pending_before,
+        "parent preparation does not rewrite another owner"
     );
     assert!(!branch_has_conflict(&jj, &store, pending).unwrap());
     assert_eq!(commit_summary(&jj, &store, &pending_tip), "A pending.rs");
 }
 
-/// A clean coordinator replay can still conflict on a child's own edits.
-#[test]
-#[serial_test::serial(jj)]
-fn clean_parent_replay_keeps_conflicting_child_at_its_clean_tip() {
-    let bin = jj_bin().expect("real jj required for descendant replay regression");
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("jj-stores").join("proj");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-
-    let parent = "agent/parent";
-    let parent_ws = wts.path().join("parent");
-    add_workspace(&jj, &store, &parent_ws, parent, "main", None).unwrap();
-    std::fs::write(parent_ws.join("parent.txt"), "parent work\n").unwrap();
-    seal(&jj, &parent_ws, "parent work", None).unwrap();
-    forget_workspace(&jj, &store, parent).unwrap();
-    let parent_before = bookmark_commit(&jj, &store, parent).unwrap();
-
-    let child = "agent/child";
-    let child_ws = wts.path().join("child");
-    add_workspace(&jj, &store, &child_ws, child, parent, None).unwrap();
-    std::fs::write(child_ws.join("shared.rs"), "CHILD-SIDE\n").unwrap();
-    seal(&jj, &child_ws, "child changes shared", None).unwrap();
-    forget_workspace(&jj, &store, child).unwrap();
-    let child_before = bookmark_commit(&jj, &store, child).unwrap();
-    let grandchild = "agent/grandchild";
-    let grandchild_ws = wts.path().join("grandchild");
-    add_workspace(&jj, &store, &grandchild_ws, grandchild, child, None).unwrap();
-    std::fs::write(grandchild_ws.join("grandchild.txt"), "grandchild work\n").unwrap();
-    seal(&jj, &grandchild_ws, "grandchild work", None).unwrap();
-    forget_workspace(&jj, &store, grandchild).unwrap();
-    let grandchild_before = bookmark_commit(&jj, &store, grandchild).unwrap();
-
-    let clean = "agent/clean-child";
-    let clean_ws = wts.path().join("clean-child");
-    add_workspace(&jj, &store, &clean_ws, clean, parent, None).unwrap();
-    std::fs::write(clean_ws.join("clean.txt"), "clean child work\n").unwrap();
-    seal(&jj, &clean_ws, "clean child work", None).unwrap();
-    forget_workspace(&jj, &store, clean).unwrap();
-    let clean_before = bookmark_commit(&jj, &store, clean).unwrap();
-
-    let unrelated = "agent/unrelated";
-    let unrelated_ws = wts.path().join("unrelated");
-    add_workspace(&jj, &store, &unrelated_ws, unrelated, "main", None).unwrap();
-    std::fs::write(unrelated_ws.join("shared.rs"), "UNRELATED-SIDE\n").unwrap();
-    seal(&jj, &unrelated_ws, "unrelated work", None).unwrap();
-    forget_workspace(&jj, &store, unrelated).unwrap();
-    let unrelated_git_before = git_stdout(
-        proj.path(),
-        &["rev-parse", &format!("refs/heads/{unrelated}")],
-    );
-
-    advance_main_shared(&jj, &store, wts.path(), "MAIN-SIDE\n");
-    rebase_recording_conflict(&jj, &store, unrelated, "main");
-    let unrelated_flagged = bookmark_commit(&jj, &store, unrelated).unwrap();
-    assert!(branch_has_conflict(&jj, &store, unrelated).unwrap());
-    let outcome = rebase_branch_onto(&jj, &store, parent, "main").unwrap();
-    assert!(
-        !matches!(outcome, RebaseOutcome::Conflicted { .. }),
-        "{outcome:?}"
-    );
-    assert_ne!(bookmark_commit(&jj, &store, parent).unwrap(), parent_before);
-    assert_eq!(
-        bookmark_commit(&jj, &store, child).as_deref(),
-        Some(child_before.as_str()),
-        "a child's own conflict must not block its clean parent or move the child onto scaffolding"
-    );
-    assert!(!branch_has_conflict(&jj, &store, child).unwrap());
-    assert_eq!(
-        bookmark_commit(&jj, &store, grandchild).as_deref(),
-        Some(grandchild_before.as_str())
-    );
-    let parent_after = bookmark_commit(&jj, &store, parent).unwrap();
-    assert_ne!(bookmark_commit(&jj, &store, clean).unwrap(), clean_before);
-    assert!(branch_descends_from(&jj, &store, clean, &parent_after));
-    assert_eq!(
-        bookmark_commit(&jj, &store, unrelated).as_deref(),
-        Some(unrelated_flagged.as_str())
-    );
-    assert_eq!(
-        git_stdout(
-            proj.path(),
-            &["rev-parse", &format!("refs/heads/{unrelated}")]
-        ),
-        unrelated_git_before,
-        "a parent replay must not export an unrelated legacy flagged bookmark"
-    );
-    let RebaseOutcome::Rebased { held_descendants } = outcome else {
-        panic!("the parent itself must be entirely clean");
-    };
-    assert_eq!(held_descendants.len(), 2);
-    for (name, original) in [(child, &child_before), (grandchild, &grandchild_before)] {
-        let diagnostic = &held_descendants[name];
-        assert_eq!(diagnostic.ours.as_deref(), Some(original.as_str()));
-        assert_eq!(diagnostic.theirs.as_deref(), Some(parent_after.as_str()));
-        assert_eq!(diagnostic.conflicting_paths(), vec!["shared.rs"]);
-        assert!(root_conflict_scaffolding(Some(&jj), proj.path(), original)
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{name}")]),
-            *original,
-            "the backing Git ref also stays at the original clean commit"
-        );
-    }
-    for (name, original) in [(child, &child_before), (grandchild, &grandchild_before)] {
-        let change = change_id_of(&jj, &store, name);
-        assert_eq!(
-            visible_commit_ids_for_change(&jj, &store, &change),
-            vec![original.clone()]
-        );
-        let rejected = held_descendants[name].conflicted_tip.as_ref().unwrap();
-        let before_cleanup = operation_id(&jj, &store).unwrap();
-        assert_eq!(
-            super::merge::hide_superseded_history(&jj, &store, rejected, &parent_after).unwrap(),
-            0
-        );
-        assert_eq!(
-            operation_id(&jj, &store).unwrap(),
-            before_cleanup,
-            "already-hidden diagnostics need no abandon operation"
-        );
-        assert!(
-            revset_has_conflict(&jj, &store, rejected).unwrap(),
-            "hidden diagnostic objects remain readable"
-        );
-        assert!(jj
-            .run(
-                &store,
-                &[
-                    "log",
-                    "-r",
-                    &format!("{rejected} & ::visible_heads()"),
-                    "--no-graph",
-                    "-T",
-                    "commit_id",
-                    "--ignore-working-copy"
-                ],
-                "verify diagnostic is hidden from actual heads",
-            )
-            .unwrap()
-            .trim()
-            .is_empty());
-    }
-    for round in 0..2 {
-        store_commit_on(
-            &jj,
-            &store,
-            "main",
-            &format!("advance-{round}.txt"),
-            "advance\n",
-            "advance base again",
-        );
-        let RebaseOutcome::Rebased {
-            held_descendants: again,
-        } = rebase_branch_onto(&jj, &store, parent, "main").unwrap()
-        else {
-            panic!("a repeated clean parent advance must still proceed");
-        };
-        assert!(
-            again.is_empty(),
-            "held branches stay on their original lineage until their own replay"
-        );
-        for (name, original) in [(child, &child_before), (grandchild, &grandchild_before)] {
-            assert_eq!(bookmark_commit(&jj, &store, name).as_ref(), Some(original));
-            let change = change_id_of(&jj, &store, name);
-            assert_eq!(
-                visible_commit_ids_for_change(&jj, &store, &change),
-                vec![original.clone()],
-                "rejected versions must not accumulate"
-            );
-        }
-    }
-    let report =
-        reconcile_siblings_without_publication(&jj, &store, parent, &[child.to_string()]).unwrap();
-    assert_eq!(report.conflicted, vec![child.to_string()]);
-    assert!(report.conflict_diagnostics.contains_key(child));
-
-    let rejected = held_descendants[child].conflicted_tip.as_ref().unwrap();
-    jj.run(
-        &store,
-        &[
-            "bookmark",
-            "set",
-            "agent/diagnostic-anchor",
-            "-r",
-            rejected,
-            "--ignore-working-copy",
-        ],
-        "anchor rejected diagnostic",
-    )
-    .unwrap();
-    let error = super::merge::retire_rejected_replays(
-        &jj,
-        &store,
-        std::slice::from_ref(rejected),
-        &parent_after,
-    )
-    .unwrap_err();
-    assert!(error.contains("remain anchored"), "{error}");
-    assert_eq!(
-        bookmark_commit(&jj, &store, "agent/diagnostic-anchor").as_ref(),
-        Some(rejected)
-    );
-    assert!(revset_has_conflict(&jj, &store, rejected).unwrap());
-    assert_eq!(
-        bookmark_commit(&jj, &store, child).as_ref(),
-        Some(&child_before)
-    );
-}
-
-/// A child's own conflict is not the coordinator's to heal. Holding that child
+/// A child's own conflict is not the coordinator's to heal. Leaving that child
 /// at its exact clean tip lets the coordinator carry its resolution onto the
 /// advanced base and heal its own ancestry without publishing child scaffolding.
 #[test]
 #[serial_test::serial(jj)]
-fn resolved_parent_heal_keeps_conflicting_child_at_its_clean_tip() {
+fn a_parent_heal_leaves_a_conflicting_child_unchanged() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping resolved_parent_heal_keeps_conflicting_child_at_its_clean_tip: jj not resolvable");
+        eprintln!("skipping a_parent_heal_leaves_a_conflicting_child_unchanged: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -996,13 +665,13 @@ fn resolved_parent_heal_keeps_conflicting_child_at_its_clean_tip() {
         &ResolutionCarry::from_tip(&tip, &paths),
     )
     .unwrap();
-    assert_eq!(report.conflicted, vec![child.to_string()], "{report:?}");
+    assert!(report.conflicted.is_empty(), "{report:?}");
     assert_eq!(report.rebased_clean, vec![int.to_string()], "{report:?}");
     assert!(report.failed.is_empty(), "{report:?}");
     let parent_after = bookmark_commit(&jj, &store, int).unwrap();
     assert_ne!(
         parent_after, tip,
-        "the coordinator advances onto the new base"
+        "the coordinator advanced independently of the child's own work"
     );
     assert!(
         super::heal::same_tree(&jj, &store, &tip, &parent_after).unwrap(),
@@ -1022,31 +691,13 @@ fn resolved_parent_heal_keeps_conflicting_child_at_its_clean_tip() {
     assert_eq!(
         bookmark_commit(&jj, &store, child).as_deref(),
         Some(child_before.as_str()),
-        "the child is back where it was, not published conflicted"
+        "and the child is where it was, not published conflicted"
     );
     assert!(!branch_has_conflict(&jj, &store, child).unwrap());
-    require_clean_tree(&jj, &store, &child_before, "held child").unwrap();
+    require_clean_tree(&jj, &store, &child_before, "untouched child").unwrap();
     assert_eq!(
         git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{child}")]),
         child_before
-    );
-    let diagnostic = &report.conflict_diagnostics[child];
-    assert_eq!(diagnostic.ours.as_deref(), Some(child_before.as_str()));
-    assert!(
-        super::heal::same_tree(
-            &jj,
-            &store,
-            diagnostic.theirs.as_deref().unwrap(),
-            &parent_after
-        )
-        .unwrap(),
-        "the child's immutable incoming side holds the healed parent's content"
-    );
-    let child_change = change_id_of(&jj, &store, child);
-    assert_eq!(
-        visible_commit_ids_for_change(&jj, &store, &child_change),
-        vec![child_before],
-        "the held child's conflicting rewrite is not left as a competing version"
     );
 }
 
@@ -1176,21 +827,10 @@ fn a_replay_carrying_a_text_resolution_leaves_no_twin_of_the_superseded_branch()
             CarriedContent::Text("RESOLVED\n".to_string()),
         )],
     };
-    let outcome = rebase_branch_onto_with_resolution(
-        &fx.jj,
-        &fx.store,
-        fx.branch,
-        "main",
-        Some(&carry),
-        &RebaseOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        outcome,
-        RebaseOutcome::Rebased {
-            held_descendants: Default::default()
-        }
-    );
+    let outcome =
+        rebase_branch_onto_with_resolution(&fx.jj, &fx.store, fx.branch, "main", Some(&carry))
+            .unwrap();
+    assert_eq!(outcome, RebaseOutcome::Rebased);
     assert_eq!(
         String::from_utf8_lossy(&file_show(&fx.jj, &fx.store, fx.branch, "shared.rs").unwrap()),
         "RESOLVED\n"
@@ -3331,6 +2971,13 @@ fn reconcile_siblings_idempotent_no_divergence_across_import_round_trips() {
     seal(&jj, &ws_a, "a edits a", None).unwrap();
     std::fs::write(ws_b.join("b.rs"), "b\n").unwrap();
     seal(&jj, &ws_b, "b edits b", None).unwrap();
+    // The workspaces existed only to seal. Agent jobs own no jj workspace, and
+    // a branch advance preserves every working copy and its ancestry, so a
+    // workspace left registered would keep each child's pre-replay commit
+    // visible as a second version of its change.
+    for child in [overlap, clean_a, clean_b] {
+        forget_workspace(&jj, &store, child).unwrap();
+    }
 
     // The integration tip advances with a change that conflicts with overlap.
     jj.run(&store, &["new", int], "new on int").unwrap();
@@ -3528,11 +3175,27 @@ fn reconcile_siblings_preserves_resolved_bookmark() {
         "resolved-by-agent\n",
         "the heal preserves the agent's resolved content"
     );
-    // The resolving commit the heal emptied is dropped: no empty debris.
+    // The resolving commit the heal emptied is dropped from the branch: no
+    // empty debris on it. Hiding the superseded commit is not the heal's job;
+    // replay does no inline history cleanup, and the store sweep owns that
+    // residue (docs/jj-migration.md, "Superseded history stays hidden").
     assert_eq!(
-        visible_commits_for_change(&jj, &store, &resolved_cid),
+        count_commits(
+            &jj,
+            &store,
+            &format!("({dest}..bookmarks(exact:{overlap:?})) & change_id({resolved_cid})")
+        ),
         0,
-        "the emptied resolving commit is abandoned"
+        "the emptied resolving commit is dropped from the branch"
+    );
+    assert_eq!(
+        count_commits(
+            &jj,
+            &store,
+            &format!("{dest}..bookmarks(exact:{overlap:?})")
+        ),
+        1,
+        "the branch is its one healed commit"
     );
 }
 
@@ -5010,9 +4673,15 @@ fn flatten_recovers_clean_tip_conflicted_intermediate() {
     );
     let pre_tree = file_show(&fx.jj, &fx.store, DIV_SIBLING, "shared.rs").unwrap();
 
-    let report =
-        flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened recovery")
-            .unwrap();
+    let report = squash_branch_onto(
+        &fx.jj,
+        &fx.store,
+        DIV_SIBLING,
+        &bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+        &dest,
+        "flattened recovery",
+    )
+    .unwrap();
     assert!(
         report.collapsed_conflicted_commits >= 1,
         "the flatten collapsed at least the conflicted intermediate"
@@ -5084,8 +4753,16 @@ fn flatten_footprint_guard_rejects_wrong_base() {
     let wrong_dest = bookmark_commit(&fx.jj, &fx.store, other).unwrap();
 
     let before = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
-    let err =
-        flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &wrong_dest, "wrong").unwrap_err();
+    let err = squash_branch_onto(
+        &fx.jj,
+        &fx.store,
+        DIV_SIBLING,
+        &bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+        &wrong_dest,
+        "wrong",
+    )
+    .unwrap_err()
+    .to_string();
     assert!(
         err.contains("does not descend"),
         "the pre-guard names the wrong-base cause: {err}"
@@ -5102,7 +4779,7 @@ fn flatten_footprint_guard_rejects_wrong_base() {
 /// conflicted divergent twin) is abandoned — no commit retains the old id.
 #[test]
 #[serial_test::serial(jj)]
-fn flatten_abandons_orphaned_change_id_commits() {
+fn squash_retains_original_change_id_commits() {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping flatten_abandons_orphaned_change_id_commits: jj not resolvable");
         return;
@@ -5115,16 +4792,22 @@ fn flatten_abandons_orphaned_change_id_commits() {
         "precondition: the pre-flatten change-id is visible"
     );
 
-    let report =
-        flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened").unwrap();
-    assert!(
-        !report.abandoned_twins.is_empty(),
-        "the orphaned old lineage tip is abandoned"
-    );
+    let report = squash_branch_onto(
+        &fx.jj,
+        &fx.store,
+        DIV_SIBLING,
+        &bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+        &dest,
+        "flattened",
+    )
+    .unwrap();
     assert_eq!(
-        visible_commits_for_change(&fx.jj, &fx.store, &pre_change),
-        0,
-        "no commit retains the pre-flatten change-id after cleanup"
+        bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+        report.squashed_commit
+    );
+    assert!(
+        visible_commits_for_change(&fx.jj, &fx.store, &pre_change) >= 1,
+        "source-only squash retains old commits; it does not abandon lineage"
     );
     assert_ne!(
         pre_change,
@@ -5199,10 +4882,9 @@ fn a_refused_heal_rolls_the_rebase_back_and_says_why() {
             pre_op: operation_id(&jj, &store).unwrap(),
             pre_tip: Some(pre_tip.clone()),
         };
-        assert!(matches!(
-            rebase_branch_onto(&jj, &store, sibling, int).unwrap(),
-            RebaseOutcome::RebasedOverConflictedAncestry { .. }
-        ));
+        // Construct the historical intermediate state directly. Production
+        // preparation now heals before publication and never exposes it.
+        rebase_recording_conflict(&jj, &store, sibling, int);
         assert_ne!(bookmark_commit(&jj, &store, sibling).unwrap(), pre_tip);
 
         let mut report = ReconcileReport::default();
@@ -5370,16 +5052,6 @@ fn lost_packed_refs_locks_classify_as_infrastructure_never_permanent() {
 #[test]
 #[serial_test::serial(jj)]
 fn reconcile_siblings_heals_intermediate_only_sibling() {
-    reconcile_intermediate_with_held_child(false);
-}
-
-#[test]
-#[serial_test::serial(jj)]
-fn already_current_ancestry_heal_preserves_a_held_clean_childs_exact_cut() {
-    reconcile_intermediate_with_held_child(true);
-}
-
-fn reconcile_intermediate_with_held_child(preserve_child: bool) {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping reconcile_siblings_heals_intermediate_only_sibling: jj not resolvable");
         return;
@@ -5443,37 +5115,9 @@ fn reconcile_intermediate_with_held_child(preserve_child: bool) {
         FlattenState::IntermediateOnly
     );
 
-    let held_cut = bookmark_commit(&jj, &store, sibling).unwrap();
-    let held_branch = "agent/held-behind-heal";
-    let held_before = if preserve_child {
-        let held_ws = wts.path().join("held-behind-heal");
-        add_workspace(&jj, &store, &held_ws, held_branch, sibling, None).unwrap();
-        std::fs::write(held_ws.join("own.txt"), "held own work\n").unwrap();
-        seal(&jj, &held_ws, "held own work", None).unwrap();
-        let tip = bookmark_commit(&jj, &store, held_branch).unwrap();
-        forget_workspace(&jj, &store, held_branch).unwrap();
-        Some(tip)
-    } else {
-        None
-    };
-    // The branch already carries the destination: this exercises direct heal,
-    // not the rebase wrapper's preservation stage.
-    let report = reconcile_siblings_with_options(
-        &jj,
-        &store,
-        int,
-        &[sibling.to_string()],
-        &ReconcileOptions {
-            publish: true,
-            preserve_bookmarks: if preserve_child {
-                [held_branch.to_string()].into_iter().collect()
-            } else {
-                Default::default()
-            },
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    // The reconcile heals the sibling (already-on-dest path), classifies it
+    // clean, and pushes the healed tip to origin.
+    let report = reconcile_siblings(&jj, &store, int, &[sibling.to_string()]).unwrap();
     assert_eq!(report.rebased_clean, vec![sibling.to_string()]);
     assert!(report.conflicted.is_empty());
 
@@ -5506,23 +5150,6 @@ fn reconcile_intermediate_with_held_child(preserve_child: bool) {
         .is_ok(),
         "the healed sibling is pushable"
     );
-    if let Some(held_before) = held_before {
-        assert_eq!(
-            bookmark_commit(&jj, &store, held_branch).as_deref(),
-            Some(held_before.as_str()),
-            "direct heal cannot consume the child's durable source boundary"
-        );
-        rebase_branch_onto_from_cut(&jj, &store, held_branch, sibling, &held_cut).unwrap();
-        assert!(revset_descends_from(&jj, &store, held_branch, sibling));
-        assert_eq!(
-            file_show(&jj, &store, held_branch, "own.txt").unwrap(),
-            b"held own work\n"
-        );
-        assert_eq!(
-            file_show(&jj, &store, held_branch, "shared.rs").unwrap(),
-            b"resolved\n"
-        );
-    }
 }
 
 /// Component C: a sibling bookmark riding a conflicted INTERMEDIATE commit
@@ -5532,7 +5159,7 @@ fn reconcile_intermediate_with_held_child(preserve_child: bool) {
 /// instead of resurrecting the orphaned conflicted lineage.
 #[test]
 #[serial_test::serial(jj)]
-fn flatten_repoints_rider_bookmark_on_conflicted_intermediate() {
+fn squash_preserves_rider_bookmark_on_conflicted_intermediate() {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping flatten_repoints_rider_bookmark_on_conflicted_intermediate: jj not resolvable");
         return;
@@ -5571,24 +5198,23 @@ fn flatten_repoints_rider_bookmark_on_conflicted_intermediate() {
         FlattenState::IntermediateOnly
     );
 
-    let report =
-        flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened").unwrap();
+    let report = squash_branch_onto(
+        &fx.jj,
+        &fx.store,
+        DIV_SIBLING,
+        &bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+        &dest,
+        "flattened",
+    )
+    .unwrap();
 
-    // The rider did not block the flatten and was re-pointed onto the flattened commit.
-    assert!(
-        report.repointed_bookmarks.contains(&rider.to_string()),
-        "the rider is reported as re-pointed: {:?}",
-        report.repointed_bookmarks
-    );
+    assert_ne!(report.squashed_commit, conflicted_intermediate);
     assert_eq!(
         bookmark_commit(&fx.jj, &fx.store, rider).unwrap(),
-        report.flattened_commit,
-        "the rider now points at the flattened commit"
+        conflicted_intermediate,
+        "a rider stays on its exact original commit"
     );
-    // The re-pointed rider is a clean descendant of the dest — pushable, no
-    // orphaned conflicted lineage for a later reconcile to resurrect.
-    assert!(!branch_has_conflict(&fx.jj, &fx.store, rider).unwrap());
-    assert!(branch_descends_from(&fx.jj, &fx.store, rider, &dest));
+    assert!(branch_has_conflict(&fx.jj, &fx.store, rider).unwrap());
 }
 
 /// The GIT half of the same proof. Moving a rider in the store is only half of
@@ -5606,7 +5232,7 @@ fn flatten_repoints_rider_bookmark_on_conflicted_intermediate() {
 /// success, having abandoned lineage on a proof it never obtained.
 #[test]
 #[serial_test::serial(jj)]
-fn flatten_refuses_to_abandon_when_a_rider_ref_never_reaches_git() {
+fn squash_ignores_an_unwritable_unrelated_rider_ref() {
     let Some(bin) = jj_bin() else {
         eprintln!(
             "skipping flatten_refuses_to_abandon_when_a_rider_ref_never_reaches_git: jj not resolvable"
@@ -5669,51 +5295,27 @@ fn flatten_refuses_to_abandon_when_a_rider_ref_never_reaches_git() {
         "the fixture must have a conflicted intermediate for the flatten to collapse"
     );
 
-    let error = flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened")
-        .expect_err(
-            "a rider whose ref never reached git is not a proven surviving target, so the flatten \
-             must refuse rather than abandon its lineage",
-        );
-    assert!(
-        error.contains(rider),
-        "the refusal must name the bookmark that could not be proven: {error}"
-    );
-    assert!(
-        is_export_freeze_error(&error),
-        "the refusal must carry the typed export-freeze cause: {error}"
-    );
-
-    // Fail-closed: the branch is back on its pre-flatten tip and NOTHING was
-    // abandoned, so the whole lineage is still there for a later attempt.
+    let report = squash_branch_onto(
+        &fx.jj,
+        &fx.store,
+        DIV_SIBLING,
+        &bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+        &dest,
+        "flattened",
+    )
+    .unwrap();
     assert_eq!(
         bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
-        pre_tip,
-        "the refused flatten restored the branch to its pre-flatten tip"
+        report.squashed_commit
     );
     assert_eq!(
-        conflicted_commits(&fx.jj, &fx.store, &pre_lineage),
+        conflicted_commits(&fx.jj, &fx.store, &format!("{dest}..{pre_tip}")),
         pre_conflicted,
-        "no candidate lineage was abandoned"
+        "old conflicted history is not abandoned"
     );
-    // The branch's restore is proven in BOTH halves — the backing ref came back
-    // with the store, so nothing is left publishing the rejected flatten.
-    assert_eq!(
-        git_stdout(
-            &checkout,
-            &["rev-parse", &format!("refs/heads/{DIV_SIBLING}")]
-        ),
-        pre_tip,
-        "the restored branch reached git, not just the store"
-    );
-
-    // The rider is put BACK on the commit it rode, not left on the flattened one.
-    // Left there it would be a child of the dest, hence outside `dest..branch`,
-    // hence invisible to a later attempt's rider enumeration — while its git ref
-    // still named a commit on the lineage that attempt would abandon.
     assert_eq!(
         bookmark_commit(&fx.jj, &fx.store, rider).as_deref(),
-        Some(conflicted_intermediate.as_str()),
-        "the refused flatten put the rider back on the commit it rode"
+        Some(conflicted_intermediate.as_str())
     );
     // Its own ref is the one this fixture blocked, so it can never reach git here.
     // Asserting the block held keeps the test honest about which half it proved.
@@ -5878,14 +5480,23 @@ fn restore_bookmark_resets_a_squashed_branch() {
     }
     let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
 
-    squash_branch_onto(&jj, &store, branch, "main", "squashed").unwrap();
+    squash_branch_onto(
+        &jj,
+        &store,
+        branch,
+        &bookmark_commit(&jj, &store, branch).unwrap(),
+        "main",
+        "squashed",
+    )
+    .unwrap();
     assert_ne!(
         bookmark_commit(&jj, &store, branch).unwrap(),
         pre_tip,
         "the squash moved the bookmark off the pre-squash tip"
     );
 
-    restore_bookmark(&jj, &store, branch, &pre_tip).unwrap();
+    let squashed = bookmark_commit(&jj, &store, branch).unwrap();
+    restore_bookmark(&jj, &store, branch, &squashed, &pre_tip).unwrap();
     assert_eq!(
         bookmark_commit(&jj, &store, branch).unwrap(),
         pre_tip,
@@ -5903,7 +5514,7 @@ fn restore_bookmark_resets_a_squashed_branch() {
 /// bookmark and must not stay visible.
 #[test]
 #[serial_test::serial(jj)]
-fn squash_branch_onto_hides_the_history_it_replaced() {
+fn squash_branch_onto_keeps_the_history_it_replaced() {
     let Some(bin) = jj_bin() else {
         eprintln!("skipping squash_branch_onto_hides_the_history_it_replaced: jj not resolvable");
         return;
@@ -5943,12 +5554,20 @@ fn squash_branch_onto_hides_the_history_it_replaced() {
         .collect();
     assert_eq!(old.len(), 3);
 
-    squash_branch_onto(&jj, &store, branch, "main", "Squashed PR title").unwrap();
+    squash_branch_onto(
+        &jj,
+        &store,
+        branch,
+        &bookmark_commit(&jj, &store, branch).unwrap(),
+        "main",
+        "Squashed PR title",
+    )
+    .unwrap();
 
     for commit in &old {
         assert!(
-            !is_visible(&jj, &store, commit),
-            "{commit} of the replaced history is still visible"
+            is_visible(&jj, &store, commit),
+            "{commit} was unexpectedly hidden by the squash"
         );
     }
     assert_eq!(
@@ -5986,7 +5605,15 @@ fn squash_branch_onto_collapses_chain_to_one_commit() {
     }
     let base = bookmark_commit(&jj, &store, "main").unwrap();
 
-    squash_branch_onto(&jj, &store, branch, "main", "Squashed PR title").unwrap();
+    squash_branch_onto(
+        &jj,
+        &store,
+        branch,
+        &bookmark_commit(&jj, &store, branch).unwrap(),
+        "main",
+        "Squashed PR title",
+    )
+    .unwrap();
 
     // One commit: its only parent is the base (the main tip).
     let parents = jj
@@ -6535,11 +6162,20 @@ fn fold_exports_so_a_later_child_bases_on_the_folded_tip() {
     let ws_a = wts.path().join("a");
     add_workspace(&jj, &store, &ws_a, child_a, int, None).unwrap();
     std::fs::write(ws_a.join("a.rs"), "a work\n").unwrap();
-    // Sealing exports ALL store bookmarks to the project git, creating
-    // `refs/heads/<int>` at the *pre-fold* integration tip — the stale ref the
-    // bug would later rev-parse.
     seal(&jj, &ws_a, "child a work", None).unwrap();
     let child_tip = bookmark_commit(&jj, &store, child_a).unwrap();
+    // Put `refs/heads/<int>` in the project git at the *pre-fold* integration
+    // tip: the stale ref the bug would later rev-parse. A seal exports only
+    // the branch it sealed, so the fixture publishes this one by name.
+    let int_pre_fold = bookmark_commit(&jj, &store, int).unwrap();
+    export_git_verified(
+        &jj,
+        &store,
+        true,
+        "fixture: stale integration ref",
+        &[(int, int_pre_fold.as_str())],
+    )
+    .unwrap();
     let int_before = git_stdout(proj.path(), &["rev-parse", int]);
     assert_ne!(
         int_before, child_tip,
@@ -10530,9 +10166,7 @@ fn a_clean_rebase_names_the_files_both_sides_changed() {
 
     assert_eq!(
         rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased {
-            held_descendants: Default::default()
-        },
+        RebaseOutcome::Rebased,
         "edits at opposite ends of one file merge with no conflict recorded"
     );
     let post_tip = bookmark_commit(&jj, &store, branch).unwrap();
@@ -11225,7 +10859,7 @@ fn a_straddled_delta_integrates_onto_the_moved_bookmark_and_lands() {
 /// on top and re-seals, and the base then advances again.
 #[test]
 #[serial_test::serial(jj)]
-fn a_clean_tip_over_conflicted_history_is_never_folded() {
+fn a_clean_tip_over_conflicted_history_is_healed_before_folding() {
     let Some(bin) = jj_bin() else {
         eprintln!(
             "skipping a_clean_tip_over_conflicted_history_is_never_folded: jj not resolvable"
@@ -11302,46 +10936,25 @@ fn a_clean_tip_over_conflicted_history_is_never_folded() {
     )
     .unwrap();
 
-    let outcome = rebase_branch_onto(&jj, &store, branch, "main").unwrap();
-    match &outcome {
-        RebaseOutcome::RebasedOverConflictedAncestry { paths, .. } => {
-            assert!(
-                paths.contains(&"shared.rs".to_string()),
-                "the conflicted ancestry names its file: {paths:?}"
-            );
-        }
-        other => panic!("a clean tip over conflicted history must not read as clean: {other:?}"),
-    }
-
-    // The commit-preserving fold refuses it, and the default branch never moves.
     let main_before = bookmark_commit(&jj, &store, "main").unwrap();
-    let err = rebase_then_fold_into(&jj, &store, "main", branch, "main").unwrap_err();
-    assert!(
-        err.contains("history") && err.contains("conflicted"),
-        "the refusal names the conflicted history rather than a tip conflict: {err}"
+    assert_eq!(
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
+        RebaseOutcome::Rebased
     );
-    assert!(err.contains("shared.rs"), "{err}");
+    assert!(
+        conflicted_commits(&jj, &store, &format!("main..bookmarks(exact:{branch:?})")).is_empty(),
+        "the legacy adapter publishes only fully healed history"
+    );
     assert_eq!(
         bookmark_commit(&jj, &store, "main").unwrap(),
         main_before,
-        "the default branch never gained the conflicted ancestry"
+        "preparation alone does not move the integration target"
     );
-    assert!(
-        conflicted_commits(&jj, &store, "bookmarks(exact:\"main\")").is_empty(),
-        "the default branch tip is still clean"
-    );
-
-    // And the healing path still works: the heal resolves the conflicted commit
-    // in place, after which the same commit-preserving fold succeeds. This is why
-    // such a branch is exported rather than rolled back — the heal can only run
-    // on a branch that has been rebased onto its dest.
     let dest = bookmark_commit(&jj, &store, "main").unwrap();
     heal_conflicted_ancestry(&jj, &store, branch, &dest).unwrap();
     assert_eq!(
         rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased {
-            held_descendants: Default::default()
-        },
+        RebaseOutcome::Rebased,
         "the healed branch is genuinely clean"
     );
     rebase_then_fold_into(&jj, &store, "main", branch, "main").unwrap();
@@ -11799,6 +11412,77 @@ async fn a_publication_waits_out_a_held_then_released_packed_refs_lock() {
         ),
         base,
         "the published commit sits directly on the expected head"
+    );
+}
+
+/// Aborting a publication's caller between the two legs stops neither: the
+/// abort cannot take effect inside the poll that runs them, so the caller is
+/// still running, and the export still lands, after the abort. The store ends
+/// on one operation head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+async fn an_aborted_caller_cannot_stop_a_publication_between_its_legs() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping aborted publication test: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/aborted-publication";
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    create_bookmark_at(&jj, &store, branch, &base).unwrap();
+
+    let pause = super::testing::pause_publication_after_landing(&store);
+    let caller = tokio::spawn({
+        let (jj, store, base) = (jj.clone(), store.clone(), base.clone());
+        async move {
+            publish_logical_head_exported(
+                &jj,
+                &store,
+                branch,
+                &base,
+                ProposedPublication::Mutations(vec![crate::LogicalTreeMutation {
+                    path: "aborted.rs".to_string(),
+                    content: Some(b"aborted\n".to_vec()),
+                }]),
+                None,
+                crate::PublicationMode::Child {
+                    description: "published under an abort".into(),
+                },
+            )
+            .await
+        }
+    });
+    assert!(
+        in_place_blocking(|| pause.wait_until_paused(std::time::Duration::from_secs(30))),
+        "the publication reached the pause between its legs"
+    );
+    caller.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !caller.is_finished(),
+        "an abort cannot end the caller inside the poll that is publishing"
+    );
+    pause.release();
+    let _ = caller.await;
+
+    let head = bookmark_commit(&jj, &store, branch).expect("the bookmark exists");
+    assert_ne!(head, base, "the store transaction landed");
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        head,
+        "the export leg ran after the abort"
+    );
+    assert!(
+        matches!(
+            crate::settled_operation(&store),
+            Ok(crate::SettledOperation::Single(_))
+        ),
+        "one operation head"
     );
 }
 
@@ -12286,12 +11970,7 @@ fn a_base_advance_rebases_a_branch_whose_origin_copy_was_untracked() {
     let new_base = advance_store_main(&jj, &store);
 
     let outcome = rebase_branch_onto(&jj, &store, branch, "main").unwrap();
-    assert_eq!(
-        outcome,
-        RebaseOutcome::Rebased {
-            held_descendants: Default::default()
-        }
-    );
+    assert_eq!(outcome, RebaseOutcome::Rebased);
     assert!(branch_descends_from(&jj, &store, branch, &new_base));
     assert_eq!(origin_tracking(&jj, &store, branch), Some(true));
 
@@ -13133,7 +12812,7 @@ fn rewrite_published_branch(jj: &JjEnv, store: &Path, workspaces: &Path, branch:
     );
     assert!(matches!(
         rebase_branch_onto(jj, store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased { .. }
+        RebaseOutcome::Rebased
     ));
     bookmark_commit(jj, store, branch).unwrap()
 }
@@ -13308,9 +12987,7 @@ fn a_base_advance_drops_the_formatting_commit_it_empties() {
 
     assert_eq!(
         rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
-        RebaseOutcome::Rebased {
-            held_descendants: Default::default()
-        }
+        RebaseOutcome::Rebased
     );
     let main_tip = bookmark_commit(&jj, &store, "main").unwrap();
     let own = commits_oldest_first(
@@ -13846,21 +13523,72 @@ fn assert_rebase_deadline_is_safe(phase: &str) {
             "pre-rebase change identity",
         )
         .unwrap();
-    let (delayed, reached) = delayed_rebase_env(&fx, phase);
-    let budgeted = delayed.with_operation_budget(Duration::from_secs(5));
     let started = std::time::Instant::now();
-    let error = rebase_branch_onto(&budgeted, &fx.store, fx.branch, "main").unwrap_err();
+    let error = if phase == "committed-lock-error" {
+        // The generic CLI rewrite adapter still serves other store operations.
+        // Prove its committed-then-failed command is restored once, not retried.
+        let (delayed, reached) = delayed_rebase_env(&fx, phase);
+        let budgeted = delayed.with_operation_budget(Duration::from_secs(5));
+        let error = run_store_rewrite(
+            &budgeted,
+            &fx.store,
+            &[
+                "rebase",
+                "-b",
+                fx.branch,
+                "-o",
+                "main",
+                "--skip-emptied",
+                "--ignore-working-copy",
+            ],
+            "jj rebase fixture",
+        )
+        .unwrap_err();
+        assert_eq!(std::fs::read_to_string(reached).unwrap(), "landed");
+        assert_eq!(
+            std::fs::read(fx._home.path().join("rebase-reached.attempts")).unwrap(),
+            b"x"
+        );
+        assert_ne!(operation_id(&fx.jj, &fx.store).unwrap(), pre_op);
+        error
+    } else {
+        let snapshot = capture_branch_advance(&fx.store, fx.branch, "main").unwrap();
+        let step = match phase {
+            "before" => "advance: before hidden rewrite",
+            "committed" => "advance: hidden commit written",
+            "postcheck" => "advance: before install commit",
+            _ => panic!("unknown deadline phase"),
+        };
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mark = reached.clone();
+        at_step(step, move || {
+            mark.set(true);
+            std::thread::sleep(Duration::from_millis(5100));
+        });
+        let outcome = compute_branch_advance(&fx.jj, snapshot, None, Duration::from_secs(5));
+        let error = match outcome {
+            Err(error) => error.to_string(),
+            Ok(candidate) if phase == "postcheck" => {
+                install_branch_advance_exported(&fx.jj, candidate)
+                    .unwrap_err()
+                    .to_string()
+            }
+            Ok(_) => panic!("expired computation returned a candidate"),
+        };
+        assert!(
+            reached.get(),
+            "the controlled checkpoint must be exercised: {error}"
+        );
+        assert_eq!(
+            operation_id(&fx.jj, &fx.store).unwrap(),
+            pre_op,
+            "expired immutable work and an uncommitted installer need no live-view restore"
+        );
+        error
+    };
     assert!(is_jj_timeout_error(&error), "{error}");
     assert!(!error.contains(ROLLBACK_INCOMPLETE), "{error}");
     assert!(started.elapsed() < Duration::from_secs(15), "{error}");
-    assert_eq!(
-        std::fs::read_to_string(reached).unwrap(),
-        if phase != "before" {
-            "landed"
-        } else {
-            "before"
-        }
-    );
     assert_eq!(
         bookmark_commit(&fx.jj, &fx.store, fx.branch).as_deref(),
         Some(pre_tip.as_str())
@@ -13868,86 +13596,28 @@ fn assert_rebase_deadline_is_safe(phase: &str) {
     assert_eq!(
         git_stdout(
             fx.proj.path(),
-            &["rev-parse", &format!("refs/heads/{}", fx.branch)],
+            &["rev-parse", &format!("refs/heads/{}", fx.branch)]
         ),
         pre_git
     );
     assert_eq!(
         count_commits(&fx.jj, &fx.store, &format!("change_id({change})")),
         1,
-        "no visible divergent rewrite copy survives the killed command"
+        "no visible divergent rewrite survives expired detached work"
     );
-    if phase == "committed-lock-error" {
-        assert_eq!(
-            std::fs::read(fx._home.path().join("rebase-reached.attempts")).unwrap(),
-            b"x"
-        );
-        let recent = fx
-            .jj
-            .run(
-                &fx.store,
-                &[
-                    "op",
-                    "log",
-                    "--limit",
-                    "3",
-                    "--no-graph",
-                    "-T",
-                    "description ++ \"\\n\"",
-                    "--ignore-working-copy",
-                ],
-                "recent operations after committed lock failure",
-            )
-            .unwrap();
-        assert_eq!(
-            recent
-                .lines()
-                .filter(|line| line.contains("restore to operation"))
-                .count(),
-            1,
-            "the budgeted rewrite is restored once and never fed back into retry: {recent}"
-        );
-    }
-    let post_op = operation_id(&fx.jj, &fx.store).unwrap();
-    if phase != "before" {
-        assert_ne!(post_op, pre_op, "rollback records a new restore operation");
-        let restored = fx
-            .jj
-            .run(
-                &fx.store,
-                &[
-                    "op",
-                    "log",
-                    "--limit",
-                    "1",
-                    "--no-graph",
-                    "-T",
-                    "description",
-                    "--ignore-working-copy",
-                ],
-                "last operation after killed committed rebase",
-            )
-            .unwrap();
-        assert!(restored.contains(&pre_op), "{restored}");
-    } else {
-        assert_eq!(
-            post_op, pre_op,
-            "a killed command that never ran needs no restore"
-        );
-    }
 }
 
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(jj)]
-fn operation_budget_killed_rebase_before_commit_leaves_branch_unchanged() {
+fn operation_budget_expired_before_hidden_rebase_leaves_branch_unchanged() {
     assert_rebase_deadline_is_safe("before");
 }
 
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(jj)]
-fn operation_budget_killed_rebase_after_commit_restores_branch_without_twins() {
+fn operation_budget_expired_hidden_rebase_leaves_branch_without_twins() {
     assert_rebase_deadline_is_safe("committed");
 }
 
@@ -13969,7 +13639,7 @@ fn operation_budget_timeout_classification_keeps_rollback_failure_loudest() {
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(jj)]
-fn operation_budget_postcheck_after_successful_rebase_restores_branch_without_twins() {
+fn operation_budget_expired_detached_install_leaves_branch_without_twins() {
     assert_rebase_deadline_is_safe("postcheck");
 }
 
@@ -14111,6 +13781,73 @@ fn operation_budget_killed_seal_restores_preseal_graph_without_orphan() {
 #[serial_test::serial(jj)]
 fn operation_budget_committed_lock_failure_is_restored_once_without_forward_retry() {
     assert_rebase_deadline_is_safe("committed-lock-error");
+}
+
+/// An assessment reading pinned commits outside the store lock must not settle
+/// the store: pinned to an operation, a read leaves divergent operation heads
+/// exactly as it found them. The unpinned read beside it shows the hazard it
+/// avoids, which is jj merging the heads and writing that merge as an operation.
+#[test]
+#[serial_test::serial(jj)]
+fn a_read_pinned_to_an_operation_never_settles_divergent_heads() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping a_read_pinned_to_an_operation_never_settles_divergent_heads: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let op_heads = || {
+        std::fs::read_dir(
+            store
+                .join(".jj")
+                .join("repo")
+                .join("op_heads")
+                .join("heads"),
+        )
+        .unwrap()
+        .count()
+    };
+
+    let base_op = current_op_id(&jj, &store);
+    for name in ["fork-a", "fork-b"] {
+        jj.run(
+            &store,
+            &[
+                "bookmark",
+                "create",
+                name,
+                "-r",
+                "main",
+                "--ignore-working-copy",
+                "--at-op",
+                &base_op,
+            ],
+            "fork the operation log",
+        )
+        .unwrap();
+    }
+    assert_eq!(op_heads(), 2, "two operations forked from one base");
+
+    let pinned = jj.at_operation(&base_op);
+    let listed = file_list(&pinned, &store, "main", "").unwrap();
+    assert!(!listed.is_empty(), "the pinned read answered");
+    assert!(
+        paths_changed_between(&pinned, &store, "main", "main", &listed)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(op_heads(), 2, "a pinned read settles nothing");
+
+    file_list(&jj, &store, "main", "").unwrap();
+    assert_eq!(
+        op_heads(),
+        1,
+        "an unpinned read merges the divergent heads: the write the pin avoids"
+    );
 }
 
 #[cfg(unix)]
@@ -14513,122 +14250,4 @@ fn operation_budget_subminimum_classification_restores_successful_rebase() {
         "{summary}"
     );
     assert!(summary.contains("[cleanup; spawn attempted]"), "{summary}");
-}
-
-#[test]
-#[serial_test::serial(jj)]
-fn held_cut_replays_owned_range_and_moves_empty_alias() {
-    let bin = jj_bin().expect("real jj required for exact held-cut replay");
-    let home = TempDir::new().unwrap();
-    let proj = TempDir::new().unwrap();
-    let wts = TempDir::new().unwrap();
-    init_project(proj.path());
-    let jj = JjEnv::resolve(&bin, home.path());
-    let store = home.path().join("store");
-    ensure_project_store(&jj, &store, proj.path()).unwrap();
-    let old = wts.path().join("old-parent");
-    add_workspace(&jj, &store, &old, "agent/old-parent", "main", None).unwrap();
-    std::fs::write(old.join("parent.txt"), "obsolete parent\n").unwrap();
-    seal(&jj, &old, "old parent work", None).unwrap();
-    let cut = bookmark_commit(&jj, &store, "agent/old-parent").unwrap();
-    forget_workspace(&jj, &store, "agent/old-parent").unwrap();
-    let child = wts.path().join("owned");
-    add_workspace(&jj, &store, &child, "agent/owned", &cut, None).unwrap();
-    std::fs::write(child.join("owned.txt"), "owned work\n").unwrap();
-    seal(&jj, &child, "owned work", None).unwrap();
-    let before = bookmark_commit(&jj, &store, "agent/owned").unwrap();
-    forget_workspace(&jj, &store, "agent/owned").unwrap();
-    create_bookmark_at(&jj, &store, "agent/alias", &cut).unwrap();
-    let held_ws = wts.path().join("held-owned-descendant");
-    add_workspace(&jj, &store, &held_ws, "agent/held-owned", &before, None).unwrap();
-    std::fs::write(held_ws.join("nested.txt"), "nested own work\n").unwrap();
-    seal(&jj, &held_ws, "nested own work", None).unwrap();
-    let held_before = bookmark_commit(&jj, &store, "agent/held-owned").unwrap();
-    forget_workspace(&jj, &store, "agent/held-owned").unwrap();
-    let new = wts.path().join("new-parent");
-    add_workspace(&jj, &store, &new, "agent/new-parent", "main", None).unwrap();
-    std::fs::write(new.join("parent.txt"), "resolved parent\n").unwrap();
-    std::fs::write(new.join("later.txt"), "later parent work\n").unwrap();
-    seal(&jj, &new, "resolved and later parent work", None).unwrap();
-    let destination = bookmark_commit(&jj, &store, "agent/new-parent").unwrap();
-    forget_workspace(&jj, &store, "agent/new-parent").unwrap();
-
-    let invalid =
-        rebase_branch_onto_from_cut(&jj, &store, "agent/owned", &destination, &destination)
-            .unwrap_err();
-    assert!(invalid.contains("not an ancestor"), "{invalid}");
-    assert_eq!(
-        bookmark_commit(&jj, &store, "agent/owned").as_deref(),
-        Some(before.as_str())
-    );
-    let outcome = rebase_branch_onto_with_options(
-        &jj,
-        &store,
-        "agent/owned",
-        &destination,
-        &RebaseOptions {
-            source_cut: Some(cut.clone()),
-            preserve_bookmarks: ["agent/held-owned".to_string()].into_iter().collect(),
-        },
-    )
-    .unwrap();
-    let RebaseOutcome::Rebased { held_descendants } = &outcome else {
-        panic!("{outcome:?}");
-    };
-    assert!(held_descendants["agent/held-owned"]
-        .conflicting_paths()
-        .is_empty());
-    assert_eq!(
-        bookmark_commit(&jj, &store, "agent/held-owned").as_deref(),
-        Some(held_before.as_str()),
-        "a clean implicit rewrite cannot invalidate an outstanding held source cut"
-    );
-    rebase_branch_onto_from_cut(&jj, &store, "agent/held-owned", "agent/owned", &before).unwrap();
-    assert!(revset_descends_from(
-        &jj,
-        &store,
-        "agent/held-owned",
-        "agent/owned"
-    ));
-    assert_eq!(
-        file_show(&jj, &store, "agent/held-owned", "nested.txt").unwrap(),
-        b"nested own work\n"
-    );
-    assert!(
-        matches!(outcome, RebaseOutcome::Rebased { .. }),
-        "{outcome:?}"
-    );
-    assert!(revset_descends_from(
-        &jj,
-        &store,
-        "agent/owned",
-        &destination
-    ));
-    assert_eq!(
-        file_show(&jj, &store, "agent/owned", "parent.txt").unwrap(),
-        b"resolved parent\n"
-    );
-    assert_eq!(
-        file_show(&jj, &store, "agent/owned", "later.txt").unwrap(),
-        b"later parent work\n"
-    );
-    assert_eq!(
-        file_show(&jj, &store, "agent/owned", "owned.txt").unwrap(),
-        b"owned work\n"
-    );
-    let outcome =
-        rebase_branch_onto_from_cut(&jj, &store, "agent/alias", &destination, &cut).unwrap();
-    assert!(
-        matches!(outcome, RebaseOutcome::Rebased { .. }),
-        "{outcome:?}"
-    );
-    assert_eq!(
-        bookmark_commit(&jj, &store, "agent/alias").as_deref(),
-        Some(destination.as_str())
-    );
-    assert_eq!(
-        bookmark_commit(&jj, &store, "agent/old-parent").as_deref(),
-        Some(cut.as_str()),
-        "other anchors are untouched"
-    );
 }

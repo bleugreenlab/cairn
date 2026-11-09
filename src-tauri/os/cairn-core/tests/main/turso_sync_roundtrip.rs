@@ -851,7 +851,7 @@ async fn routed_lifecycle_mutations_hit_the_team_db_and_sync() {
         .await
         .unwrap();
     crud::set_hidden_db(&by_key, "p-team", true).await.unwrap();
-    crud::set_default_branch_db(&by_key, "p-team", "release")
+    crud::seed_default_branch_db(&by_key, "p-team", "release")
         .await
         .unwrap();
 

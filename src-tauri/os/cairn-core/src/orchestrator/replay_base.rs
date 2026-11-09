@@ -376,18 +376,29 @@ fn resolve_with(
 /// The recorded name has been PROVEN gone, so keeping it is keeping a fact that
 /// is no longer true — and every other surface that reads the column (the PR's
 /// target, the diff range, the next base advance) would go on failing the same
-/// way. Advisory: a branch whose replay is otherwise ready is not blocked on
-/// recording where it landed.
-pub(crate) async fn repoint_recorded_base(db: &LocalDb, job_id: &str, base_branch: &str) {
-    if let Err(error) = db
+/// way. A failed correction refuses the replay rather than advancing against a
+/// relationship the other publication paths cannot see. The caller holds the store writer guard through
+/// resolution and this correction, so an installer cannot miss the relationship
+/// change between its validation and publication.
+pub(crate) async fn repoint_recorded_base(
+    db: &LocalDb,
+    _guard: &crate::orchestrator::JjStoreGuard,
+    job_id: &str,
+    base_branch: &str,
+) -> Result<(), String> {
+    let changed = db
         .execute(
             "UPDATE jobs SET base_branch = ?2, updated_at = ?3 WHERE id = ?1",
             params![job_id, base_branch, chrono::Utc::now().timestamp()],
         )
         .await
-    {
-        log::warn!("could not re-point job {job_id} onto base `{base_branch}`: {error}");
+        .map_err(|error| format!("could not repoint job {job_id} onto `{base_branch}`: {error}"))?;
+    if changed != 1 {
+        return Err(format!(
+            "job {job_id} disappeared before its base could be corrected"
+        ));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -522,8 +533,38 @@ mod tests {
         let db = migrated_db().await;
         seed(&db).await;
 
-        repoint_recorded_base(&db, "job-child", "main").await;
+        let home = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::db::DbState::new(
+            std::sync::Arc::new(migrated_db().await),
+            std::sync::Arc::new(
+                crate::storage::SearchIndex::open_or_create(home.path().join("search.db")).unwrap(),
+            ),
+        ));
+        let orch = crate::orchestrator::Orchestrator::builder(
+            state,
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            home.path().to_path_buf(),
+        )
+        .build();
+        let guard = orch
+            .acquire_jj_store_lock(
+                Path::new("/fixture/store"),
+                crate::orchestrator::StoreLockClass::Foreground,
+                "test replay-base correction",
+            )
+            .await;
+        repoint_recorded_base(&db, &guard, "job-child", "main")
+            .await
+            .unwrap();
 
+        assert_eq!(
+            candidates_for(&db, "job-child").await.recorded.as_deref(),
+            Some("main")
+        );
+        let missing = repoint_recorded_base(&db, &guard, "missing-job", "main")
+            .await
+            .unwrap_err();
+        assert!(missing.contains("disappeared"), "{missing}");
         assert_eq!(
             candidates_for(&db, "job-child").await.recorded.as_deref(),
             Some("main")

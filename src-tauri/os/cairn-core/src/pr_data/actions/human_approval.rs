@@ -487,14 +487,22 @@ fn in_flight() -> &'static Mutex<HashSet<String>> {
 
 /// Marks an attempt as running in this process, so reconciliation leaves it
 /// to the call that is still driving it.
-struct InFlight(String);
+pub(super) struct InFlight(String);
 
 impl InFlight {
-    fn enter(attempt_id: &str) -> Self {
+    pub(super) fn enter(attempt_id: &str) -> Self {
         if let Ok(mut set) = in_flight().lock() {
             set.insert(attempt_id.to_string());
         }
         Self(attempt_id.to_string())
+    }
+
+    /// Enter only when nothing in this process is driving the attempt, so two
+    /// reconcilers that find the same unsettled attempt settle it once.
+    pub(super) fn try_enter(attempt_id: &str) -> Option<Self> {
+        let mut set = in_flight().lock().ok()?;
+        set.insert(attempt_id.to_string())
+            .then(|| Self(attempt_id.to_string()))
     }
 }
 
@@ -1347,38 +1355,96 @@ pub(super) fn store_evidence(
     intent: &BaseMergeIntentV2,
     read: impl Fn(&str) -> Result<LandedShape, String>,
 ) -> LandingEvidence {
-    const MAX_STEPS: usize = 1000;
-    if tip == intent.target_oid {
-        return LandingEvidence::DefinitelyNotLanded(
-            "the target still holds the approved base, and no fold is running".into(),
-        );
+    target_history_evidence(
+        tip,
+        &intent.target_oid,
+        intent.result_tree_oid.as_deref(),
+        1000,
+        read,
+    )
+}
+
+/// Whether the target's history, read from `tip`, holds exactly the squash a
+/// landing built on `expected_old` with `tree`.
+///
+/// This is the one proof of a landing, wherever the target lives: the store
+/// bookmark for a store fold, origin's branch for a fast-forward publication.
+/// It never consults a provider's merged flag, which a squash published
+/// straight onto the target does not set.
+pub(super) fn target_history_evidence(
+    tip: &str,
+    expected_old: &str,
+    tree: Option<&str>,
+    max_steps: usize,
+    read: impl Fn(&str) -> Result<LandedShape, String>,
+) -> LandingEvidence {
+    if let Some(evidence) = unmoved_target(tip, expected_old) {
+        return evidence;
     }
     let mut commit = tip.to_string();
-    for _ in 0..MAX_STEPS {
+    for _ in 0..max_steps {
         let shape = match read(&commit) {
             Ok(shape) => shape,
             Err(error) => return LandingEvidence::Unknown(error),
         };
-        let Some(first) = shape.parents.first().cloned() else {
-            return LandingEvidence::DefinitelyNotLanded(
-                "the target's history no longer passes through the approved base".into(),
-            );
-        };
-        if first == intent.target_oid {
-            let ours = shape.parents.len() == 1
-                && Some(shape.tree.as_str()) == intent.result_tree_oid.as_deref();
-            return if ours {
-                LandingEvidence::Landed { commit, shape }
-            } else {
-                LandingEvidence::DefinitelyNotLanded(format!(
-                    "{} landed on the approved base instead",
-                    short(&commit)
-                ))
-            };
+        match history_step(commit, shape, expected_old, tree) {
+            HistoryStep::Next(parent) => commit = parent,
+            HistoryStep::Done(evidence) => return evidence,
         }
-        commit = first;
     }
+    history_too_long()
+}
+
+/// A target still at the expected old commit has not landed anything, and
+/// with no attempt running it no longer will.
+pub(super) fn unmoved_target(tip: &str, expected_old: &str) -> Option<LandingEvidence> {
+    (tip == expected_old).then(|| {
+        LandingEvidence::DefinitelyNotLanded(
+            "the target still holds the approved base, and no fold is running".into(),
+        )
+    })
+}
+
+pub(super) fn history_too_long() -> LandingEvidence {
     LandingEvidence::Unknown("the approved base is too far behind the target to find".into())
+}
+
+/// One first-parent step of [`target_history_evidence`].
+pub(super) enum HistoryStep {
+    /// Read this commit next.
+    Next(String),
+    /// The walk reached its answer.
+    Done(LandingEvidence),
+}
+
+/// Judge `commit` (whose shape is `shape`) on the way down from the target's
+/// tip. The first commit whose first parent is `expected_old` decides: it is
+/// the landing only if it is exactly the squash (one parent, `tree`); anything
+/// else is another change that landed on `expected_old`, after which this
+/// landing can no longer happen.
+pub(super) fn history_step(
+    commit: String,
+    shape: LandedShape,
+    expected_old: &str,
+    tree: Option<&str>,
+) -> HistoryStep {
+    let Some(first) = shape.parents.first().cloned() else {
+        return HistoryStep::Done(LandingEvidence::DefinitelyNotLanded(
+            "the target's history no longer passes through the approved base".into(),
+        ));
+    };
+    if first != expected_old {
+        return HistoryStep::Next(first);
+    }
+    let ours = shape.parents.len() == 1 && Some(shape.tree.as_str()) == tree;
+    HistoryStep::Done(if ours {
+        LandingEvidence::Landed { commit, shape }
+    } else {
+        LandingEvidence::DefinitelyNotLanded(format!(
+            "{} landed on the approved base instead",
+            short(&commit)
+        ))
+    })
 }
 
 /// A pull request's merge state, as reconciliation reads it.
@@ -1501,7 +1567,11 @@ pub(super) async fn unsettled_attempts(db: &LocalDb) -> Result<Vec<UnsettledAtte
                            FROM merge_attempt_events e
                           WHERE e.state IN ('executing', 'indeterminate')
                             AND e.sequence = (SELECT MAX(l.sequence) FROM merge_attempt_events l
-                                               WHERE l.attempt_id = e.attempt_id)"#,
+                                               WHERE l.attempt_id = e.attempt_id)
+                            AND NOT EXISTS (SELECT 1 FROM merge_attempt_events p
+                                             WHERE p.attempt_id = e.attempt_id
+                                               AND p.state = 'executing'
+                                               AND p.detail LIKE '{"publication":%')"#,
                         (),
                     )
                     .await?;

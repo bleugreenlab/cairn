@@ -148,6 +148,8 @@ pub(crate) fn prepare_workflow_run(
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     super::lifecycle::import_project_store_locked(
         orch,
+        &db,
+        &project_id,
         &jj,
         &store,
         &project_path,

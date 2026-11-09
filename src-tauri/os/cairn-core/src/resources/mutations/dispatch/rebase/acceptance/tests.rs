@@ -2,7 +2,7 @@ use super::*;
 use crate::db::DbState;
 use crate::jj::tests::{git, git_stdout, init_project, rebase_recording_conflict};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
-use crate::orchestrator::base_advance::{held_replay_source, held_replay_source_cut};
+use crate::orchestrator::base_advance::preparation::held_by_parent_conflict;
 use crate::orchestrator::conflict_session::{load_active_session, load_pending_replay_request};
 use crate::orchestrator::Orchestrator;
 use crate::services::testing::TestServicesBuilder;
@@ -144,7 +144,8 @@ impl Fixture {
             grandchild,
             base,
         };
-        // A legacy-flagged child can be held with no machine-proven source cut.
+        // The child's session records an obsolete parent the current base no
+        // longer carries.
         assert!(!crate::jj::revset_descends_from(
             &f.jj,
             &f.store,
@@ -189,8 +190,8 @@ impl Fixture {
         self.db.execute(
             "INSERT INTO jj_reconcile_items
              (intent_id,bookmark,observed_tip,status,updated_at,diagnostic_version,conflict_condition,base_commit,ours_commit,theirs_commit,conflicted_tip,resolution_state,marker_state,
-              held_replay_source_cut,held_replay_source_tip,replay_request_id,replay_requested_at,replay_requested_tip,replay_requested_destination,replay_resolution)
-             VALUES (?1,?2,?3,'completed',1,1,'content_conflict',?4,?3,?5,?3,'open','not_materialized',?4,?3,?6,1,?3,?5,'plain')",
+              replay_request_id,replay_requested_at,replay_requested_tip,replay_requested_destination,replay_resolution)
+             VALUES (?1,?2,?3,'completed',1,1,'content_conflict',?4,?3,?5,?3,'open','not_materialized',?6,1,?3,?5,'plain')",
             params![intent, branch, tip, cut, destination, format!("request-{intent}")],
         ).await.unwrap();
     }
@@ -212,13 +213,23 @@ impl Fixture {
     }
 
     async fn request(&self, dry_run: bool, expected: &str) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "action":"rebuild", "source_commit":self.source, "source_base":self.cut,
+            "source_base_reason":"fixture original isolated mint", "expected_tip":expected,
+        });
+        self.rebuild_node("child", payload, dry_run).await
+    }
+
+    async fn rebuild_node(
+        &self,
+        node_id: &str,
+        payload: serde_json::Value,
+        dry_run: bool,
+    ) -> Result<String, String> {
         let item = ChangeItem {
-            target: "cairn://p/proj/1/1/child/rebase".into(),
+            target: format!("cairn://p/proj/1/1/{node_id}/rebase"),
             mode: ChangeMode::Patch,
-            payload: Some(serde_json::json!({
-                "action":"rebuild", "source_commit":self.source, "source_base":self.cut,
-                "source_base_reason":"fixture original isolated mint", "expected_tip":expected,
-            })),
+            payload: Some(payload),
         };
         let request = McpCallbackRequest {
             thread_id: None,
@@ -234,7 +245,7 @@ impl Fixture {
             project: "proj".into(),
             number: 1,
             exec_seq: 1,
-            node_id: "child".into(),
+            node_id: node_id.into(),
         };
         super::super::dispatch(&self.orch, &request, 0, &item, dry_run, &resource)
             .await
@@ -269,10 +280,11 @@ async fn rebuild_acceptance_retires_only_parent_metadata_even_after_export_or_da
         let before = f.metadata(CHILD).await;
         let grandchild = f.metadata(GRANDCHILD).await;
         assert!(load_active_session(&f.db, CHILD).await.unwrap().is_some());
-        let error = held_replay_source_cut(&f.orch, &f.db, &f.jj, &f.store, GRANDCHILD, CHILD)
+        let hold = held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
             .await
-            .unwrap_err();
-        assert!(error.contains("waits for immediate parent"), "{error}");
+            .unwrap()
+            .expect("the grandchild is held behind the child's open session");
+        assert_eq!(hold.session, "old-c");
         assert!(f
             .request(true, &f.flagged)
             .await
@@ -311,13 +323,6 @@ async fn rebuild_acceptance_retires_only_parent_metadata_even_after_export_or_da
         } else {
             result.unwrap();
         }
-        assert!(
-            held_replay_source(&f.db, &f.store, CHILD)
-                .await
-                .unwrap()
-                .is_none(),
-            "including NULL-cut receipts"
-        );
         assert!(load_active_session(&f.db, CHILD).await.unwrap().is_none());
         assert_eq!(
             f.db.query_opt_text(
@@ -334,11 +339,11 @@ async fn rebuild_acceptance_retires_only_parent_metadata_even_after_export_or_da
             .unwrap()
             .is_none());
         assert_eq!(
-            held_replay_source_cut(&f.orch, &f.db, &f.jj, &f.store, GRANDCHILD, CHILD)
+            held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
                 .await
-                .unwrap()
-                .as_deref(),
-            Some(f.source.as_str())
+                .unwrap(),
+            None,
+            "superseding the child's session releases its descendant with nothing recorded"
         );
         assert_eq!(
             f.db.query_opt_text("SELECT base_commit FROM jobs WHERE id='c'", ())
@@ -384,7 +389,12 @@ async fn rebuild_retry_preserves_a_new_parent_hold_not_covered_by_the_original_r
         "import P2",
     )
     .unwrap();
-    f.db.execute("UPDATE jj_reconcile_items SET held_replay_source_cut=NULL,held_replay_source_tip=NULL,resolution_state='superseded' WHERE bookmark=?1", (CHILD,)).await.unwrap();
+    f.db.execute(
+        "UPDATE jj_reconcile_items SET resolution_state='superseded' WHERE bookmark=?1",
+        (CHILD,),
+    )
+    .await
+    .unwrap();
     f.install("new-c", CHILD, "main", &p2, Some(&f.base), &rebuilt)
         .await;
     let newer = f
@@ -399,13 +409,13 @@ async fn rebuild_retry_preserves_a_new_parent_hold_not_covered_by_the_original_r
         f.metadata(CHILD).await.contains(&newer),
         "an export-only retry cannot discharge P2"
     );
+    let hold = held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
+        .await
+        .unwrap()
+        .expect("the new parent session still holds the grandchild");
     assert_eq!(
-        held_replay_source(&f.db, &f.store, CHILD)
-            .await
-            .unwrap()
-            .unwrap()
-            .destination,
-        p2
+        (hold.session.as_str(), hold.parent_destination),
+        ("new-c", p2)
     );
     assert!(load_active_session(&f.db, CHILD).await.unwrap().is_some());
     assert!(load_pending_replay_request(&f.db, &f.store, CHILD)
@@ -414,4 +424,48 @@ async fn rebuild_retry_preserves_a_new_parent_hold_not_covered_by_the_original_r
         .is_some());
     f.assert_descendant_and_observers_unchanged(&grandchild)
         .await;
+}
+
+/// Rebuild reads the branch's one hold source: a branch whose immediate parent
+/// has an open conflict session is refused, preview included, and nothing it
+/// owns moves; once the parent's session is no longer open the same read
+/// releases it with nothing recorded to clean up.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn rebuild_refuses_a_branch_held_behind_its_parents_open_conflict_session() {
+    let f = Fixture::new().await;
+    let child = f.metadata(CHILD).await;
+    let grandchild = f.metadata(GRANDCHILD).await;
+    let payload = serde_json::json!({
+        "action":"rebuild", "source_commit":f.grandchild, "source_base":f.source,
+        "source_base_reason":"fixture grandchild mint", "expected_tip":f.grandchild,
+    });
+    for dry_run in [true, false] {
+        let error = f
+            .rebuild_node("grandchild", payload.clone(), dry_run)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("held behind its parent `agent/child`") && error.contains("old-c"),
+            "{error}"
+        );
+        assert_eq!(f.metadata(CHILD).await, child);
+        f.assert_descendant_and_observers_unchanged(&grandchild)
+            .await;
+    }
+    f.db.execute(
+        "UPDATE jj_reconcile_items SET resolution_state='resolved' WHERE bookmark=?1",
+        (CHILD,),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
+            .await
+            .unwrap(),
+        None
+    );
+    if let Err(error) = f.rebuild_node("grandchild", payload, true).await {
+        assert!(!error.contains("held behind"), "{error}");
+    }
 }

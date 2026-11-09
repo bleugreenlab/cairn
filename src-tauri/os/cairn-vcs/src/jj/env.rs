@@ -54,6 +54,7 @@ pub struct JjEnv {
     bin: String,
     config_path: PathBuf,
     pub(super) checkout_repair_policy: crate::checkout::CheckoutRepairPolicy,
+    pinned_operation: Option<Arc<str>>,
 }
 
 #[cfg(test)]
@@ -84,6 +85,68 @@ impl JjEnv {
         scoped.operation_phases = Some(Default::default());
         scoped.ledger = Default::default();
         scoped
+    }
+
+    /// Clone this environment with every command loaded at `operation`.
+    ///
+    /// jj merges divergent operation heads, and writes the merge as a new
+    /// operation, whenever a command loads the repository at its head; a read
+    /// loaded at a fixed operation sees exactly that view and writes nothing.
+    /// An assessment that reads pinned commits outside the store lock runs
+    /// through this, so it cannot settle the store behind the writer's back.
+    ///
+    /// Read-only use only: a mutating command at a fixed operation forks the
+    /// operation log (`forked_op_rebase_diverges_but_reconcile_converges`). A
+    /// caller that passes its own `--at-op` must not also pin.
+    pub fn at_operation(&self, operation: &str) -> Self {
+        let mut pinned = self.clone();
+        pinned.pinned_operation = Some(Arc::from(operation));
+        pinned
+    }
+
+    /// The operation every command of this environment loads at, if pinned.
+    pub fn pinned_operation(&self) -> Option<&str> {
+        self.pinned_operation.as_deref()
+    }
+
+    /// Pin every command to the store's one settled operation, for a read that
+    /// resolves symbolic names: bookmarks, and revsets built over them.
+    ///
+    /// The operation comes from [`crate::settled_operation`], which reads jj's
+    /// operation heads in process, so finding it settles nothing. A split log is
+    /// refused rather than pinned to one side: each side holds a different
+    /// bookmark view, and either would describe a view the store may never
+    /// take. Capture once per pass and reuse the returned environment, so every
+    /// answer in the pass comes from the same view. Read-only use only; see
+    /// [`Self::at_operation`].
+    pub fn pin_settled_read(&self, store: &Path) -> Result<Self, String> {
+        match crate::settled_operation(store)? {
+            crate::SettledOperation::Single(operation) => Ok(self.at_operation(&operation)),
+            crate::SettledOperation::Split(heads) => Err(format!(
+                "the store has {} concurrent operation heads; a read does not reconcile them, so \
+                 its answer is unknown until a writer settles the store",
+                heads.len()
+            )),
+        }
+    }
+
+    /// Pin every command to an operation whose index holds every commit in
+    /// `commits`, for a read addressed only by immutable commit IDs.
+    ///
+    /// Immutable IDs alone do not make a CLI read safe: `jj file show -r <id>`
+    /// still loads the repository at its head and so merges a split log. This
+    /// pins instead, and because such a read needs no bookmark view, a split
+    /// log is no reason to refuse it (see [`crate::operation_indexing`]).
+    /// Read-only use only; see [`Self::at_operation`].
+    pub fn pin_immutable_read(&self, store: &Path, commits: &[&str]) -> Result<Self, String> {
+        crate::operation_indexing(store, commits).map(|operation| self.at_operation(&operation))
+    }
+
+    /// The operation deadline as the cooperative check in-process merge work
+    /// observes; [`super::MergeDeadline::NONE`] on an unbudgeted environment.
+    pub fn merge_deadline(&self) -> super::MergeDeadline {
+        self.operation_deadline
+            .map_or(super::MergeDeadline::NONE, super::MergeDeadline::at)
     }
 
     /// Whether this environment runs one budgeted transaction, whose rollback
@@ -359,6 +422,7 @@ impl JjEnv {
             ledger: Default::default(),
             preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
+            pinned_operation: None,
         }
     }
 
@@ -379,6 +443,7 @@ impl JjEnv {
             ledger: Default::default(),
             preserved_import_bookmarks: Default::default(),
             checkout_repair_policy: Default::default(),
+            pinned_operation: None,
         }
     }
 
@@ -439,6 +504,9 @@ impl JjEnv {
             .env("JJ_EDITOR", "true")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "true");
+        if let Some(operation) = self.pinned_operation.as_deref() {
+            c.args(["--at-op", operation]);
+        }
         c
     }
 
@@ -1347,6 +1415,7 @@ mod tests {
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
+            pinned_operation: None,
         };
 
         // The timeout has to outlast the child's own startup, not merely be
@@ -1402,6 +1471,7 @@ mod tests {
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
+            pinned_operation: None,
         };
 
         // Same load-sensitivity as `managed_command_times_out_and_kills_child`,
@@ -1446,6 +1516,7 @@ mod tests {
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
+            pinned_operation: None,
         };
 
         assert_eq!(jj.run(home.path(), &[], "env jj").unwrap(), "0:true");

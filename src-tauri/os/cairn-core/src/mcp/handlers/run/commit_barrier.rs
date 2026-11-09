@@ -17,15 +17,12 @@ pub(super) struct CommitBarrierOutcome {
     pub committed: bool,
 }
 
-/// Why a barrier that would otherwise roll a checkout back left it dirty
-/// instead. Shared by all three non-revertable arms because it states one fact:
-/// a revert is a destructive publication (it takes every uncommitted change
-/// with it, not just this batch's), so it is only Cairn's to perform in a
-/// checkout Cairn provisioned — as judged BEFORE the batch ran. See
-/// [`crate::mcp::vcs::WorktreeVcs::can_revert`].
-const UNOWNED_CHECKOUT_NOTE: &str = "the changes were left in place, because this checkout is not \
-     one Cairn provisioned and reverting it would take every uncommitted change with it, not just \
-     this run's. Review them (`git status`) and commit or discard them yourself.";
+/// Why the barrier leaves an ambient checkout as the batch left it: a revert
+/// would take every uncommitted change with it, not just this batch's, and
+/// none of these checkouts is Cairn's to roll back.
+const LEFT_IN_PLACE_NOTE: &str = "the changes were left in place, because Cairn never reverts \
+     this checkout: a revert would take every uncommitted change with it, not just this run's. \
+     Review them (`git status`) and commit or discard them yourself.";
 
 /// The request field an agent sets to commit deliberate literal conflict
 /// markers from a `run` batch.
@@ -71,17 +68,17 @@ fn aggregate_diff_stat(patch: &str) -> (i32, i32) {
         })
 }
 
-/// Enforce the worktree==HEAD invariant after a `run` batch.
+/// Settle an ambient `run` batch's physical checkout: commit it, or report what
+/// the batch left behind.
 ///
-/// The single decision point for what happens to the worktree once a batch
-/// finishes: commit it, restore it to HEAD, or leave it alone. It touches git
-/// only inside `checkout_path` and returns the user-facing message plus whether
-/// the worktree changed, so it is testable without an `Orchestrator`.
+/// It touches the checkout only through `vcs` and returns the user-facing
+/// message plus whether a commit landed, so it is testable without an
+/// `Orchestrator`. It never rolls the checkout back; see [`LEFT_IN_PLACE_NOTE`].
 ///
-/// - `Some(msg)`: commit the worktree if dirty, even on partial item failure;
-///   a commit failure restores the worktree to HEAD.
-/// - `None`: when the batch fully succeeded and changed the worktree, restore
-///   it to HEAD — no commit_msg means the new dirt must not persist.
+/// - `Some(msg)`: commit the checkout if dirty, even on partial item failure. A
+///   refused or failed commit leaves the checkout exactly as it was.
+/// - `None`: when the whole batch succeeded and left new changes, warn that they
+///   were left in place.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_commit_barrier(
     vcs: &dyn crate::mcp::vcs::WorktreeVcs,
@@ -93,23 +90,20 @@ pub(super) fn run_commit_barrier(
     marker_escape: Option<&str>,
 ) -> CommitBarrierOutcome {
     let mut message = String::new();
-    let mut worktree_changed = false;
     let mut committed = false;
 
     match commit_msg {
         Some(commit_msg) => {
-            // Commit the worktree even when some items failed: a partial-success
-            // batch must not silently leave the successful items' dirt behind.
+            // Commit even when some items failed: a partial-success batch must
+            // not silently leave the successful items' changes behind.
             if !matches!(vcs.is_dirty(checkout_path), Ok(false)) {
-                // Capture the working-copy patch BEFORE the seal empties `@`, so a
-                // successful commit can record its file changes on the run path.
+                // Captured BEFORE the seal empties `@`, so a successful commit
+                // can report its line counts.
                 let patch = vcs.capture_patch(checkout_path);
 
                 // The durable boundary for conflict scaffolding, on the carrier
-                // where markers genuinely sit on disk. The refusal deliberately
-                // does NOT discard: rolling the tree back here would erase the
-                // resolution session the markers belong to, which is the one
-                // outcome worse than refusing the commit.
+                // where markers genuinely sit on disk. A refusal leaves the tree
+                // exactly as it is, mid-resolution markers included.
                 let marker_hits = working_tree_conflict_markers(checkout_path, patch.as_deref());
                 if !marker_hits.is_empty() {
                     match marker_escape {
@@ -143,8 +137,8 @@ pub(super) fn run_commit_barrier(
                             );
                             return CommitBarrierOutcome {
                                 message,
-                                worktree_changed,
-                                committed,
+                                worktree_changed: false,
+                                committed: false,
                             };
                         }
                     }
@@ -152,9 +146,7 @@ pub(super) fn run_commit_barrier(
 
                 match vcs.seal_all(checkout_path, commit_msg, author) {
                     Ok(commit_result) => {
-                        worktree_changed = true;
                         committed = true;
-                        let committed_patch = patch;
                         let pr_suffix = commit_result
                             .pr_number
                             .map(|pr| format!(" updated PR#{}", pr))
@@ -167,7 +159,7 @@ pub(super) fn run_commit_barrier(
                         // render a diff stat like a write's per-file rows. Omitted
                         // for a zero-line change (a pure rename or mode change),
                         // where the row's DiffStat renders nothing anyway.
-                        let stat_suffix = committed_patch
+                        let stat_suffix = patch
                             .as_deref()
                             .map(aggregate_diff_stat)
                             .filter(|&(add, del)| add > 0 || del > 0)
@@ -189,145 +181,31 @@ pub(super) fn run_commit_barrier(
                         // Tree was (or became) clean; already equals HEAD.
                         log::info!("run commit_msg given but nothing to commit: {}", e);
                     }
-                    Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {
-                        // The seal was refused because the branch bookmark tip
-                        // carries a recorded conflict and `@` has diverged from it
-                        // — a deliberate resolve-at-base flatten away from a
-                        // conflicted intermediate stack. Unlike a stale/lost-seal
-                        // advance, discarding here would DESTROY the agent's
-                        // resolved work: jj will not fold a conflicted history, so
-                        // advancing onto the bookmark lands back on the conflict.
-                        // The only safe automatic action is to PRESERVE the working
-                        // copy exactly as the agent arranged it, so this does NOT
-                        // discard. That deliberately leaves `@` dirty (worktree !=
-                        // bookmark HEAD); the flatten the message points to
-                        // converges the invariant — its final `jj new` leaves `@`
-                        // clean on the moved bookmark.
-                        worktree_changed = false;
-                        committed = false;
-                        message.push_str(&format!(
-                            "\u{26a0}\u{fe0f} Seal refused: this branch has conflicted intermediate commits jj will not fold, so sealing `@` forward can't clear them: {}. The working copy was PRESERVED (not discarded). To land a flattened resolution, run the pure-jj resolve-at-base flatten with NO commit_msg (see the git-workflow skill); do not retry with commit_msg.",
-                            e
-                        ));
+                    Err(e) if crate::mcp::vcs::is_cairn_residence_refusal(&e) => {
+                        // Refused before jj ran: nothing in the checkout or the
+                        // shared store moved.
+                        message.push_str(&format!("\u{26a0}\u{fe0f} {e}"));
                     }
-                    Err(e)
-                        if crate::jj::is_lost_seal_error(&e) || crate::jj::is_stale_error(&e) =>
-                    {
-                        // A concurrent store advance reset `@` out from under the
-                        // seal (the lost-seal case, already backed out in
-                        // `seal_paths`) or left the workspace stale. The run can't
-                        // re-derive command side effects, so revert-and-retry is the
-                        // ceiling: discard to HEAD and tell the agent to re-run.
-                        if !vcs.can_revert() {
-                            message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Hit a concurrent store advance: {e}; {UNOWNED_CHECKOUT_NOTE}"
-                            ));
-                            return CommitBarrierOutcome {
-                                message,
-                                worktree_changed,
-                                committed,
-                            };
-                        }
-                        let restore = vcs.discard(checkout_path);
-                        worktree_changed = true;
-                        match restore {
-                            Ok(()) => message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Hit a concurrent store advance: {}; the worktree was restored to HEAD and nothing was committed. Retry the run with commit_msg to land the changes.",
-                                e
-                            )),
-                            Err(re) => message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Hit a concurrent store advance: {}; additionally failed to restore the worktree to HEAD: {}",
-                                e, re
-                            )),
-                        }
-                    }
-                    Err(e) => {
-                        if !vcs.can_revert() {
-                            message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Failed to commit: {e}; {UNOWNED_CHECKOUT_NOTE}"
-                            ));
-                            return CommitBarrierOutcome {
-                                message,
-                                worktree_changed,
-                                committed,
-                            };
-                        }
-                        let restore = vcs.discard(checkout_path);
-                        worktree_changed = true;
-                        match restore {
-                            Ok(()) => message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Failed to commit: {}; the worktree was restored to HEAD.",
-                                e
-                            )),
-                            Err(re) => message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Failed to commit: {}; additionally failed to restore the worktree to HEAD: {}",
-                                e, re
-                            )),
-                        }
-                    }
+                    Err(e) => message.push_str(&format!(
+                        "\u{26a0}\u{fe0f} Failed to commit: {e}; {LEFT_IN_PLACE_NOTE}"
+                    )),
                 }
             }
         }
         None => {
-            // No commit_msg: the run must not leave new dirt. When the whole
-            // batch succeeded and changed the worktree, restore to HEAD. Gate on
-            // `all_ok` — a failed batch's own error is the headline, and the
-            // hygiene gate must not mask it.
-            if all_ok {
-                if let Some(before) = before {
-                    // A stale `@` blocks `changed_since` too (jj's diff snapshots,
-                    // and snapshotting is what staleness refuses), so it returns
-                    // `Err`, not `Ok(true)`. Treat a stale read as "changed": the
-                    // batch's loose edits are real dirt that must not persist, and
-                    // the stale-resilient `discard` self-heals them to HEAD.
-                    match vcs.changed_since(checkout_path, before) {
-                        Ok(true) => {
-                            // A checkout Cairn does not own — the project's live
-                            // checkout, or a jj repo the user colocated themselves
-                            // — is never rolled back: the revert would take the
-                            // user's own uncommitted work with it. The stray dirt is
-                            // left in place and the agent is warned loudly instead
-                            // of (falsely) told it was reverted. See
-                            // `docs/worktree-fence.md`.
-                            if !vcs.can_revert() {
-                                message.push_str(&format!(
-                                    "\u{26a0}\u{fe0f} Run changed this checkout but no commit_msg was given; {UNOWNED_CHECKOUT_NOTE} To make changes that persist, run in a worktree Cairn provisioned and pass commit_msg."
-                                ));
-                                return CommitBarrierOutcome {
-                                    message,
-                                    worktree_changed,
-                                    committed,
-                                };
-                            }
-                            let reset_ok = vcs.discard(checkout_path);
-                            worktree_changed = true;
-                            if let Err(e) = reset_ok {
-                                message.push_str(&format!(
-                                    "\u{26a0}\u{fe0f} Run changed the worktree but no commit_msg was given. Failed to restore the worktree to HEAD: {}. Run with commit_msg like `run({{commands:[…], commit_msg)`, then retry.",
-                                    e
-                                ));
-                            } else {
-                                message.push_str(
-                                    "\u{26a0}\u{fe0f} Run reverted: it changed the worktree but no commit_msg was given. Run with commit_msg like `run({commands:[…], commit_msg)`, then retry.",
-                                );
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) if crate::jj::is_stale_error(&e) && vcs.can_revert() => {
-                            // A sibling advanced `@` out from under this run mid-batch.
-                            // The dirt can't be inspected (jj won't snapshot a stale
-                            // copy), so reconcile to the fresh HEAD via the
-                            // stale-resilient discard and tell the agent to retry.
-                            let _ = vcs.discard(checkout_path);
-                            worktree_changed = true;
-                            message.push_str(
-                                "\u{26a0}\u{fe0f} Run hit a concurrent worktree advance and was reconciled to HEAD; no commit_msg was given. Re-run with commit_msg to keep changes.",
-                            );
-                        }
-                        // A non-stale read error (or a non-revertable backend) is
-                        // best-effort: leave the worktree as-is, as before.
-                        Err(_) => {}
+            // Gated on `all_ok`: a failed batch's own error is the headline, and
+            // the hygiene warning must not mask it.
+            if let (true, Some(before)) = (all_ok, before) {
+                match vcs.changed_since(checkout_path, before) {
+                    Ok(true) => message.push_str(&format!(
+                        "\u{26a0}\u{fe0f} Run changed this checkout but no commit_msg was given; {LEFT_IN_PLACE_NOTE}"
+                    )),
+                    Err(e) if crate::mcp::vcs::is_cairn_residence_refusal(&e) => {
+                        message.push_str(&format!("\u{26a0}\u{fe0f} {e}"));
                     }
+                    // Detection is advisory: an unreadable checkout produces no
+                    // warning rather than a failed run.
+                    Ok(false) | Err(_) => {}
                 }
             }
         }
@@ -335,7 +213,7 @@ pub(super) fn run_commit_barrier(
 
     CommitBarrierOutcome {
         message,
-        worktree_changed,
+        worktree_changed: committed,
         committed,
     }
 }
@@ -345,6 +223,159 @@ mod commit_barrier_tests {
     use super::*;
     use crate::mcp::vcs::{FakeVcs, VcsSnapshot};
     use std::path::Path;
+
+    const RESERVED: &str = "agent/cairn-5387-builder-1";
+
+    fn git(repo: &Path, args: &[&str]) -> Option<String> {
+        let out = crate::env::git()
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// One `jj` read of the shared store that never snapshots a working copy.
+    fn jj_read(bin: &str, home: &Path, store: &Path, args: &[&str]) -> String {
+        let out = crate::env::command(bin)
+            .args(args)
+            .arg("--ignore-working-copy")
+            .current_dir(store)
+            .env("JJ_CONFIG", home.join("jj").join("config.toml"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "jj {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The store's operation head, the reserved branch's bookmark, and its git ref.
+    fn store_state(bin: &str, home: &Path, store: &Path, proj: &Path) -> [Option<String>; 3] {
+        let bookmark = format!("bookmarks(exact:{RESERVED:?})");
+        [
+            Some(jj_read(
+                bin,
+                home,
+                store,
+                &["op", "log", "--no-graph", "-n", "1", "-T", "id"],
+            )),
+            Some(jj_read(
+                bin,
+                home,
+                store,
+                &["log", "-r", &bookmark, "--no-graph", "-T", "commit_id"],
+            )),
+            git(
+                proj,
+                &["rev-parse", "--verify", &format!("refs/heads/{RESERVED}")],
+            ),
+        ]
+    }
+
+    async fn orchestrator(config_dir: &Path) -> crate::orchestrator::Orchestrator {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+        let db = crate::storage::migrated_test_db("ambient_residence_barrier").await;
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        crate::orchestrator::Orchestrator::builder(db_state, services, config_dir.to_path_buf())
+            .build()
+    }
+
+    /// An ambient run (no run identity) whose cwd is a legacy agent residence
+    /// of branch X, while a landing holds X's reservation. Whether the marker
+    /// survives and whether the run asked to commit, the real barrier over the
+    /// backend preflight resolves moves nothing: not X's bookmark, not its git
+    /// ref, not the shared store's operation log. The run's edit stays on disk
+    /// and the run is told why.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn an_ambient_run_in_a_reserved_cairn_residence_moves_nothing() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            eprintln!("skipping an_ambient_run_in_a_reserved_cairn_residence: jj not resolvable");
+            return;
+        };
+        for (keep_marker, commit_msg) in [
+            (true, Some("ambient commit")),
+            (false, Some("ambient commit")),
+            (true, None),
+            (false, None),
+        ] {
+            let case = format!("marker kept: {keep_marker}, commit_msg: {commit_msg:?}");
+            let home = tempfile::tempdir().unwrap();
+            let proj = tempfile::tempdir().unwrap();
+            let wts = tempfile::tempdir().unwrap();
+            for args in [
+                &["init", "-q", "-b", "main"][..],
+                &["config", "user.email", "p@e.com"],
+                &["config", "user.name", "p"],
+            ] {
+                git(proj.path(), args).unwrap();
+            }
+            std::fs::write(proj.path().join("shared.rs"), "base\n").unwrap();
+            git(proj.path(), &["add", "-A"]).unwrap();
+            git(proj.path(), &["commit", "-q", "-m", "base"]).unwrap();
+
+            let jj = crate::jj::environment(&bin, home.path());
+            let store = crate::jj::project_store_dir(home.path(), proj.path());
+            crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+            let ws = wts.path().join("residence");
+            crate::jj::add_workspace(&jj, &store, &ws, RESERVED, "main", None).unwrap();
+            if !keep_marker {
+                std::fs::remove_file(ws.join(".jj").join(crate::jj::BRANCH_MARKER)).unwrap();
+            }
+
+            let orch = orchestrator(home.path()).await;
+            let reservation = orch
+                .reserve_branches(
+                    &store,
+                    &[RESERVED],
+                    "landing the reserved branch",
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let vcs = crate::mcp::vcs::resolve_worktree_vcs(&orch, &ws);
+            let before_batch = vcs.snapshot(&ws).ok();
+            std::fs::write(ws.join("ambient.rs"), "ambient edit\n").unwrap();
+            let before = store_state(&bin, home.path(), &store, proj.path());
+
+            let out = run_commit_barrier(
+                vcs.as_ref(),
+                &ws,
+                commit_msg,
+                true,
+                before_batch.as_ref(),
+                None,
+                None,
+            );
+
+            assert!(!out.committed, "{case}");
+            assert!(!out.worktree_changed, "{case}");
+            assert!(
+                crate::mcp::vcs::is_cairn_residence_refusal(
+                    out.message.trim_start_matches("\u{26a0}\u{fe0f} ")
+                ),
+                "{case}: {}",
+                out.message
+            );
+            assert_eq!(
+                store_state(&bin, home.path(), &store, proj.path()),
+                before,
+                "{case}: the shared store, X's bookmark and its git ref are untouched"
+            );
+            assert_eq!(
+                std::fs::read_to_string(ws.join("ambient.rs")).unwrap(),
+                "ambient edit\n",
+                "{case}: the run's edit is left exactly where it was"
+            );
+            assert!(reservation.covers(&store, RESERVED), "{case}");
+        }
+    }
 
     // The barrier touches the VCS only through the `WorktreeVcs` seam, so a
     // FakeVcs double covers its commit/restore/no-op control flow deterministically
@@ -390,11 +421,6 @@ mod commit_barrier_tests {
         );
 
         assert_eq!(vcs.seals(), 0, "a marker-bearing tree is never sealed");
-        assert_eq!(
-            vcs.discards(),
-            0,
-            "the refusal must not discard the resolution session"
-        );
         assert!(!out.committed);
         assert!(!out.worktree_changed, "Cairn mutated nothing");
         assert!(out.message.contains("src/main.rs"), "got: {}", out.message);
@@ -503,7 +529,6 @@ mod commit_barrier_tests {
         let vcs = FakeVcs::new().dirty(Ok(true));
         let out = run_commit_barrier(&vcs, wt(), Some("add file"), false, None, None, None);
         assert_eq!(vcs.seals(), 1, "a dirty worktree must be sealed");
-        assert_eq!(vcs.discards(), 0);
         assert!(out.worktree_changed);
         assert!(out.committed, "a real commit must set committed");
         assert!(out.message.contains("Committed"), "got: {}", out.message);
@@ -558,65 +583,80 @@ mod commit_barrier_tests {
         let vcs = FakeVcs::new().dirty(Ok(false));
         let out = run_commit_barrier(&vcs, wt(), Some("nothing"), true, None, None, None);
         assert_eq!(vcs.seals(), 0, "a clean worktree is not sealed");
-        assert_eq!(vcs.discards(), 0);
         assert!(!out.worktree_changed);
         assert!(!out.committed, "a clean no-op must not set committed");
         assert!(out.message.is_empty());
     }
 
+    /// A failed seal is reported and the checkout is left exactly as it was,
+    /// whatever the failure; the barrier never claims a restore.
     #[test]
-    fn commit_failure_restores_worktree_to_head() {
-        let vcs = FakeVcs::new()
-            .dirty(Ok(true))
-            .seal(Err("pre-commit hook failed".to_string()));
-        let out = run_commit_barrier(&vcs, wt(), Some("will fail"), true, None, None, None);
-        assert_eq!(vcs.seals(), 1);
-        assert_eq!(
-            vcs.discards(),
-            1,
-            "a failed seal restores the worktree to HEAD"
-        );
-        assert!(!out.committed, "a failed commit must not set committed");
-        assert!(
-            out.message.contains("Failed to commit"),
-            "got: {}",
-            out.message
-        );
-        assert!(
-            out.message.contains("restored to HEAD"),
-            "got: {}",
-            out.message
-        );
+    fn a_failed_seal_is_reported_and_left_in_place() {
+        for failure in [
+            "pre-commit hook failed",
+            "Error: The working copy is stale (not updated since operation abc).",
+            crate::jj::CONFLICTED_BRANCH_SEAL_MSG,
+        ] {
+            let vcs = FakeVcs::new()
+                .dirty(Ok(true))
+                .seal(Err(failure.to_string()));
+            let out = run_commit_barrier(&vcs, wt(), Some("will fail"), true, None, None, None);
+            assert_eq!(vcs.seals(), 1, "{failure}");
+            assert!(!out.committed, "{failure}");
+            assert!(!out.worktree_changed, "{failure}: Cairn mutated nothing");
+            assert!(
+                out.message.contains("Failed to commit")
+                    && out.message.contains(failure)
+                    && out.message.contains("left in place"),
+                "got: {}",
+                out.message
+            );
+        }
     }
 
     #[test]
     fn commit_msg_nothing_to_commit_is_clean_noop() {
         // The seal reports "nothing to commit" when the tree became clean; that is
-        // already==HEAD, not a failure — no restore, no message.
+        // already==HEAD, not a failure, so there is no message.
         let vcs = FakeVcs::new()
             .dirty(Ok(true))
             .seal(Err("nothing to commit, working tree clean".to_string()));
         let out = run_commit_barrier(&vcs, wt(), Some("noop"), true, None, None, None);
-        assert_eq!(vcs.discards(), 0, "nothing-to-commit must not restore");
         assert!(!out.committed);
         assert!(out.message.is_empty(), "got: {}", out.message);
     }
 
+    /// A residence refusal is reported as itself, not as a failed commit in
+    /// somebody else's checkout.
     #[test]
-    fn none_commit_msg_reverts_changed_worktree() {
-        // No commit_msg + a fully-successful batch that changed the worktree must
-        // restore to HEAD: new dirt must not persist across calls.
+    fn a_residence_refusal_is_reported_verbatim() {
+        let vcs = FakeVcs::new().dirty(Ok(true)).seal(Err(
+            "This checkout is a Cairn-managed agent workspace, and this run carries no agent \
+             identity, so it cannot commit here."
+                .to_string(),
+        ));
+        let out = run_commit_barrier(&vcs, wt(), Some("ambient"), true, None, None, None);
+        assert!(!out.committed);
+        assert!(!out.message.contains("Failed to commit"), "{}", out.message);
+        assert!(
+            out.message.contains("Cairn-managed agent workspace"),
+            "{}",
+            out.message
+        );
+    }
+
+    /// No commit_msg and new changes: the run is warned, and nothing is
+    /// reverted.
+    #[test]
+    fn none_commit_msg_warns_about_new_changes_and_leaves_them() {
         let before = VcsSnapshot("entry".to_string());
         let vcs = FakeVcs::new().changed(Ok(true));
         let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None, None);
         assert_eq!(vcs.seals(), 0);
-        assert_eq!(vcs.discards(), 1, "new dirt without commit_msg is reverted");
-        assert!(out.worktree_changed);
-        assert!(!out.committed, "a restore must not set committed");
-        assert!(out.message.contains("reverted"), "got: {}", out.message);
+        assert!(!out.worktree_changed, "Cairn mutated nothing");
+        assert!(!out.committed);
         assert!(
-            out.message
-                .contains("Run with commit_msg like `run({commands:[…], commit_msg)`"),
+            out.message.contains("no commit_msg") && out.message.contains("left in place"),
             "got: {}",
             out.message
         );
@@ -627,87 +667,21 @@ mod commit_barrier_tests {
         let before = VcsSnapshot("entry".to_string());
         let vcs = FakeVcs::new().changed(Ok(false));
         let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None, None);
-        assert_eq!(vcs.discards(), 0);
         assert!(!out.worktree_changed);
         assert!(out.message.is_empty());
     }
 
+    /// A change set the backend could not read is advisory: no warning, no
+    /// failure, nothing touched.
     #[test]
-    fn none_commit_msg_warns_without_reverting_when_backend_cannot_revert() {
-        // A backend that does not own its checkout must NOT discard on a
-        // no-commit_msg run that left dirt: the revert would take the user's own
-        // uncommitted work with it. It warns instead.
+    fn none_commit_msg_with_an_unreadable_checkout_says_nothing() {
         let before = VcsSnapshot("entry".to_string());
-        let vcs = FakeVcs::new().changed(Ok(true)).can_revert(false);
+        let vcs = FakeVcs::new().changed(Err(
+            "Error: The working copy is stale (not updated since operation abc).".to_string(),
+        ));
         let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None, None);
-        assert_eq!(
-            vcs.discards(),
-            0,
-            "a checkout Cairn does not own is never reverted"
-        );
-        assert_eq!(vcs.seals(), 0);
-        assert!(!out.worktree_changed, "Cairn mutated nothing");
-        assert!(!out.committed);
-        assert!(
-            out.message.contains("left in place") && out.message.contains("worktree"),
-            "the agent is told the dirt stayed and where changes do persist: {}",
-            out.message
-        );
-    }
-
-    /// The seal-failure arms carry the same hazard as the hygiene revert and are
-    /// gated the same way: a failed seal in a checkout Cairn does not own must
-    /// not be "recovered" by discarding it, because `discard` takes every
-    /// uncommitted change with it, not just the batch's.
-    #[test]
-    fn seal_failure_warns_without_reverting_when_backend_cannot_revert() {
-        let vcs = FakeVcs::new()
-            .dirty(Ok(true))
-            .seal(Err("pre-commit hook failed".to_string()))
-            .can_revert(false);
-        let out = run_commit_barrier(&vcs, wt(), Some("will fail"), true, None, None, None);
-        assert_eq!(vcs.seals(), 1, "the seal is still attempted");
-        assert_eq!(
-            vcs.discards(),
-            0,
-            "a failed seal must not roll back a checkout Cairn does not own"
-        );
-        assert!(!out.committed);
-        assert!(!out.worktree_changed, "Cairn mutated nothing");
-        assert!(
-            out.message.contains("Failed to commit") && out.message.contains("left in place"),
-            "got: {}",
-            out.message
-        );
-        assert!(
-            !out.message.contains("restored to HEAD"),
-            "the barrier must not claim a restore it did not perform: {}",
-            out.message
-        );
-    }
-
-    /// The concurrent-store-advance arm is gated too. Its normal recovery is a
-    /// discard-and-retry, which is exactly the destructive action an unowned
-    /// checkout must not receive.
-    #[test]
-    fn stale_seal_failure_warns_without_reverting_when_backend_cannot_revert() {
-        let vcs = FakeVcs::new()
-            .dirty(Ok(true))
-            .seal(Err(
-                "Error: The working copy is stale (not updated since operation abc).".to_string(),
-            ))
-            .can_revert(false);
-        let out = run_commit_barrier(&vcs, wt(), Some("write batch"), true, None, None, None);
-        assert_eq!(vcs.seals(), 1);
-        assert_eq!(vcs.discards(), 0);
-        assert!(!out.committed);
         assert!(!out.worktree_changed);
-        assert!(
-            out.message.contains("concurrent store advance")
-                && out.message.contains("left in place"),
-            "got: {}",
-            out.message
-        );
+        assert!(out.message.is_empty(), "got: {}", out.message);
     }
 
     #[test]
@@ -718,16 +692,13 @@ mod commit_barrier_tests {
         let before = VcsSnapshot("entry".to_string());
         let vcs = FakeVcs::new().changed(Ok(true));
         let out = run_commit_barrier(&vcs, wt(), None, false, Some(&before), None, None);
-        assert_eq!(vcs.discards(), 0, "a failed batch's dirt is not reverted");
         assert!(!out.worktree_changed);
         assert!(out.message.is_empty());
     }
 
     /// Over the read-only non-worktree sentinel the barrier is a clean no-op in
     /// both directions: with commit_msg it never seals (is_dirty=false), and
-    /// without commit_msg it never discards (changed_since=false) — so an agent
-    /// on the project's live checkout never has its working copy sealed or
-    /// reverted by Cairn.
+    /// without it there is nothing new to report (changed_since=false).
     #[test]
     fn non_worktree_barrier_is_a_safe_noop_both_directions() {
         use crate::mcp::vcs::NonWorktreeVcs;
@@ -743,99 +714,5 @@ mod commit_barrier_tests {
             run_commit_barrier(&NonWorktreeVcs, wt(), None, true, Some(&before), None, None);
         assert!(!no_msg.worktree_changed);
         assert!(no_msg.message.is_empty());
-    }
-
-    #[test]
-    fn commit_msg_stale_seal_restores_worktree_to_head() {
-        // A stale-`@` seal failure routes through the (now stale-resilient)
-        // discard exactly like any other seal failure: the barrier restores and
-        // never claims a commit. The self-heal itself lives in `jj::discard`; here
-        // the FakeVcs feeds a genuine stale string so the path is exercised.
-        let vcs = FakeVcs::new().dirty(Ok(true)).seal(Err(
-            "Error: The working copy is stale (not updated since operation abc).".to_string(),
-        ));
-        let out = run_commit_barrier(&vcs, wt(), Some("write batch"), true, None, None, None);
-        assert_eq!(vcs.seals(), 1);
-        assert_eq!(vcs.discards(), 1, "a stale seal failure restores to HEAD");
-        assert!(!out.committed, "a failed stale seal must not set committed");
-        assert!(
-            out.message.contains("restored to HEAD"),
-            "got: {}",
-            out.message
-        );
-    }
-
-    #[test]
-    fn commit_msg_conflicted_branch_seal_preserves_worktree() {
-        // The explicit regression guard for the silent-data-loss bug: a seal
-        // refused because the branch bookmark tip carries a recorded conflict (a
-        // deliberate resolve-at-base flatten) must NOT discard — discarding would
-        // destroy the agent's resolved flatten — and must NOT advise "retry with
-        // commit_msg". The barrier preserves the worktree and points at the
-        // pure-jj flatten procedure instead.
-        let vcs = FakeVcs::new()
-            .dirty(Ok(true))
-            .seal(Err(crate::jj::CONFLICTED_BRANCH_SEAL_MSG.to_string()));
-        let out = run_commit_barrier(&vcs, wt(), Some("flatten"), true, None, None, None);
-        assert_eq!(vcs.seals(), 1, "the seal is attempted");
-        assert_eq!(
-            vcs.discards(),
-            0,
-            "a conflicted-branch refusal must NOT discard the resolved flatten"
-        );
-        assert!(!out.committed, "a refused seal must not set committed");
-        assert!(
-            !out.worktree_changed,
-            "the worktree is preserved as the agent arranged it"
-        );
-        assert!(
-            out.message.contains("PRESERVED"),
-            "the message names that the working copy was preserved: {}",
-            out.message
-        );
-        assert!(
-            out.message.contains("NO commit_msg")
-                && !out.message.contains("Retry the run with commit_msg"),
-            "the message points at the no-commit_msg flatten, not a futile retry: {}",
-            out.message
-        );
-    }
-
-    #[test]
-    fn none_commit_msg_reconciles_when_changed_since_is_stale() {
-        // No commit_msg + a stale `changed_since` read (jj can't snapshot a stale
-        // copy, so it errors rather than returning Ok(true)) must still reconcile
-        // to HEAD via the stale-resilient discard, not skip the revert and orphan
-        // the dirt. Classification flows through the real `crate::jj::is_stale_error`.
-        let before = VcsSnapshot("entry".to_string());
-        let vcs = FakeVcs::new().changed(Err(
-            "Error: The working copy is stale (not updated since operation abc).".to_string(),
-        ));
-        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None, None);
-        assert_eq!(vcs.discards(), 1, "a stale read reconciles to HEAD");
-        assert!(out.worktree_changed);
-        assert!(!out.committed);
-        assert!(
-            out.message.contains("concurrent worktree advance"),
-            "got: {}",
-            out.message
-        );
-    }
-
-    #[test]
-    fn none_commit_msg_stale_read_left_alone_when_backend_cannot_revert() {
-        // The non-revertable live checkout must NOT discard even on a stale read:
-        // reverting it could destroy the user's own work. The stale arm is gated
-        // on `can_revert`, so a false backend leaves the worktree untouched.
-        let before = VcsSnapshot("entry".to_string());
-        let vcs = FakeVcs::new()
-            .changed(Err(
-                "Error: The working copy is stale (not updated since operation abc).".to_string(),
-            ))
-            .can_revert(false);
-        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None, None);
-        assert_eq!(vcs.discards(), 0, "the live checkout is never reverted");
-        assert!(!out.worktree_changed);
-        assert!(out.message.is_empty(), "got: {}", out.message);
     }
 }

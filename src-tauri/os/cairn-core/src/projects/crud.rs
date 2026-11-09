@@ -72,15 +72,14 @@ pub async fn create(
     };
 
     // Establish that the row can be inserted before mutating a user-selected
-    // folder. The detected branch is part of that same insert, so creation
-    // cannot fail later with a durable row left behind.
-    let db_project = create_db_with_default_branch(
-        db,
-        clock,
-        &input,
-        detected_branch.as_deref().unwrap_or("main"),
-    )
-    .await?;
+    // folder. The default is part of that same insert, so creation cannot fail
+    // later with a durable row left behind; it is the effective default, so a
+    // repository that declares one is mirrored from the first write.
+    let initial_default = crate::config::project_settings::effective_default_branch(
+        (!input.repo_path.is_empty()).then(|| Path::new(&input.repo_path)),
+        detected_branch.as_deref(),
+    );
+    let db_project = create_db_with_default_branch(db, clock, &input, &initial_default).await?;
 
     if !input.repo_path.is_empty() {
         let repo_path = Path::new(&input.repo_path);
@@ -934,7 +933,33 @@ pub async fn update_timestamp_db(
     Ok(())
 }
 
-pub async fn set_default_branch_db(db: &LocalDb, id: &str, branch: &str) -> Result<(), CairnError> {
+/// Persist a project's default branch while holding its store writer guard.
+///
+/// The default is the effective base of every job that records no base of its
+/// own, so it is a declared-base relationship: base preparation and publication
+/// read it under the same guard, and this write cannot land between their
+/// validation and their install. The stored column mirrors the effective default
+/// (see [`crate::config::project_settings::effective_default_branch`]), so
+/// callers write the value that resolution yields; the canonical caller is
+/// [`crate::projects::default_branch::write_project_settings`].
+pub async fn set_default_branch_db(
+    db: &LocalDb,
+    _store: &crate::orchestrator::JjStoreGuard,
+    id: &str,
+    branch: &str,
+) -> Result<(), CairnError> {
+    seed_default_branch_db(db, id, branch).await
+}
+
+/// Persist a default branch with no store guard. Valid only for a project no
+/// job can reference yet: the create path and test fixtures that set the row
+/// up before any work exists. Every other writer goes through
+/// [`set_default_branch_db`].
+pub async fn seed_default_branch_db(
+    db: &LocalDb,
+    id: &str,
+    branch: &str,
+) -> Result<(), CairnError> {
     let id = id.to_string();
     let branch = branch.to_string();
     db.write(|conn| {
@@ -968,7 +993,15 @@ pub async fn set_default_branch_db(db: &LocalDb, id: &str, branch: &str) -> Resu
 /// detected one, and a per-project detection or persist failure is logged and
 /// never aborts the sweep (the same discipline as the local default-advance
 /// sweep).
-pub(crate) async fn reconcile_default_branches(db: &LocalDb) {
+///
+/// A checkout whose config declares `defaultBranch` has that as its effective
+/// default, so the column is brought to the declared value rather than to a
+/// detection the config overrides. Detection may ask the remote, so it runs
+/// before the store guard is taken; under the guard the sweep only re-reads the
+/// row and writes it, and skips a project whose default another writer changed
+/// since the sweep first read it.
+pub(crate) async fn reconcile_default_branches(orch: &crate::orchestrator::Orchestrator) {
+    let db: &LocalDb = &orch.db.local;
     let projects = match list_db(db).await {
         Ok(projects) => projects,
         Err(e) => {
@@ -985,26 +1018,58 @@ pub(crate) async fn reconcile_default_branches(db: &LocalDb) {
             continue;
         }
         let stored = project.default_branch.unwrap_or_default();
-        let Some((detected, source)) = detect_default_branch_with_source(repo_path) else {
-            continue;
+        let declared = crate::config::project_settings::load_project_settings_read_only(repo_path)
+            .default_branch;
+        let target = match declared {
+            Some(declared) => declared,
+            None => {
+                let Some((detected, source)) = detect_default_branch_with_source(repo_path) else {
+                    continue;
+                };
+                // Persist ONLY an authoritative detection. The checked-out-branch
+                // fallback names whatever branch the working tree happens to be on
+                // at startup (a feature or integration branch, or a stale checkout
+                // when the remote is unreachable) — overwriting the stored default
+                // with that would corrupt it the same way the unverified 'main'
+                // did, just in the other direction.
+                if source != DefaultBranchSource::Authoritative {
+                    continue;
+                }
+                detected
+            }
         };
-        // Persist ONLY an authoritative detection. The checked-out-branch fallback
-        // names whatever branch the working tree happens to be on at startup (a
-        // feature or integration branch, or a stale checkout when the remote is
-        // unreachable) — overwriting the stored default with that would corrupt it
-        // the same way the unverified 'main' did, just in the other direction.
-        if source != DefaultBranchSource::Authoritative {
+        if target == stored {
             continue;
         }
-        if detected == stored {
-            continue;
+        let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
+        let guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!(
+                    "startup default-branch reconcile for project {}",
+                    project.id
+                ),
+            )
+            .await;
+        match get_db(db, &project.id).await {
+            Ok(Some(current))
+                if current.default_branch.as_deref().unwrap_or_default() == stored => {}
+            Ok(_) => continue,
+            Err(e) => {
+                log::warn!(
+                    "default-branch backfill: failed to re-read project {}: {e}",
+                    project.id
+                );
+                continue;
+            }
         }
-        match set_default_branch_db(db, &project.id, &detected).await {
+        match set_default_branch_db(db, &guard, &project.id, &target).await {
             Ok(()) => log::info!(
                 "default-branch backfill: corrected project {} default '{}' -> '{}'",
                 project.id,
                 stored,
-                detected
+                target
             ),
             Err(e) => log::warn!(
                 "default-branch backfill: failed to persist default for project {}: {e}",
@@ -1163,6 +1228,17 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    fn orchestrator_over(db: LocalDb) -> crate::orchestrator::Orchestrator {
+        let root = tempdir().unwrap().keep();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        crate::orchestrator::Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(Arc::new(db), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root,
+        )
+        .build()
     }
 
     #[tokio::test]
@@ -1432,6 +1508,63 @@ mod tests {
 
         assert_eq!(git_stdout(repo.path(), &["rev-parse", "HEAD"]), head_before);
         assert_eq!(project.default_branch.as_deref(), Some("trunk"));
+    }
+
+    /// A repository that declares its default is mirrored into the row by the
+    /// create itself, not left to the startup reconcile.
+    #[tokio::test]
+    async fn create_mirrors_a_declared_default_over_the_detected_branch() {
+        let db = migrated_db().await;
+        let repo = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", "trunk"], repo.path()).unwrap();
+        std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
+        std::fs::write(
+            repo.path().join(".cairn/config.yaml"),
+            "defaultBranch: develop\n",
+        )
+        .unwrap();
+        run_git(&["add", "-A"], repo.path()).unwrap();
+        run_git(
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@local.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "declare",
+            ],
+            repo.path(),
+        )
+        .unwrap();
+
+        let project = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("declared".to_string()),
+                name: "Declared".to_string(),
+                key: "DECLARED".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(project.default_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            get_db(&db, "declared")
+                .await
+                .unwrap()
+                .unwrap()
+                .default_branch
+                .as_deref(),
+            Some("develop")
+        );
     }
 
     #[tokio::test]
@@ -1989,15 +2122,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(project.default_branch.as_deref(), Some("main"));
+        let orch = orchestrator_over(db);
 
-        reconcile_default_branches(&db).await;
-        let corrected = get_db(&db, "p").await.unwrap().unwrap();
+        reconcile_default_branches(&orch).await;
+        let corrected = get_db(&orch.db.local, "p").await.unwrap().unwrap();
         assert_eq!(corrected.default_branch.as_deref(), Some("staging"));
 
         // Idempotent: a second run leaves the corrected value in place.
-        reconcile_default_branches(&db).await;
-        let again = get_db(&db, "p").await.unwrap().unwrap();
+        reconcile_default_branches(&orch).await;
+        let again = get_db(&orch.db.local, "p").await.unwrap().unwrap();
         assert_eq!(again.default_branch.as_deref(), Some("staging"));
+    }
+
+    /// A checkout whose config declares `defaultBranch` has that as its
+    /// effective default, so the backfill mirrors the declaration into the
+    /// column rather than the remote's detected head.
+    #[tokio::test]
+    async fn reconcile_default_branches_mirrors_a_declared_default() {
+        let db = migrated_db().await;
+        let (_remote, local) = remote_and_local_repos("staging");
+        std::fs::create_dir_all(local.path().join(".cairn")).unwrap();
+        std::fs::write(
+            local.path().join(".cairn/config.yaml"),
+            "defaultBranch: develop\n",
+        )
+        .unwrap();
+        create_db(
+            &db,
+            &FixedClock,
+            &CreateProject {
+                id: Some("p3".to_string()),
+                name: "p3".to_string(),
+                key: "p3".to_string(),
+                repo_path: local.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let orch = orchestrator_over(db);
+
+        reconcile_default_branches(&orch).await;
+        let after = get_db(&orch.db.local, "p3").await.unwrap().unwrap();
+        assert_eq!(after.default_branch.as_deref(), Some("develop"));
     }
 
     /// The backfill must NOT persist the checked-out-branch fallback: when the
@@ -2041,8 +2208,9 @@ mod tests {
         .await
         .unwrap();
 
-        reconcile_default_branches(&db).await;
-        let after = get_db(&db, "p2").await.unwrap().unwrap();
+        let orch = orchestrator_over(db);
+        reconcile_default_branches(&orch).await;
+        let after = get_db(&orch.db.local, "p2").await.unwrap().unwrap();
         assert_eq!(
             after.default_branch.as_deref(),
             Some("main"),

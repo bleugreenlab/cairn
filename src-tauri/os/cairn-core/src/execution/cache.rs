@@ -1759,67 +1759,6 @@ pub(crate) fn list_latest_passing_check_results_for_job(
     })
 }
 
-/// List the most recent cached result per check name for one job, independent of
-/// the current worktree/tree pointer. This is the durable fallback for node-level
-/// surfaces after worktree teardown or movement.
-///
-/// The synchronous bridge over [`latest_check_results_for_job`], for the blocking
-/// cache path; callers already on a runtime await that one directly.
-pub(crate) fn list_check_results_for_job(
-    db: Arc<LocalDb>,
-    job_id: &str,
-) -> Result<Vec<crate::execution::checks_status::LaneRow>, String> {
-    let job_id = job_id.to_string();
-    run_checkpoint_cache_db(async move { latest_check_results_for_job(&db, &job_id).await })
-}
-
-/// The commit `job_id`'s own evaluation of `row` was recorded against: the
-/// newest observation of that check, inputs, and tree that this job produced.
-/// `None` when the job has no such observation (the row was reused from
-/// elsewhere, or predates observations).
-pub(crate) fn observed_commit_for_job(
-    db: Arc<LocalDb>,
-    job_id: &str,
-    row: &CheckResultCacheEntry,
-) -> Result<Option<String>, String> {
-    let keys = (
-        row.project_id.clone(),
-        row.check_name.clone(),
-        row.input_hash.clone(),
-        row.tree_hash.clone(),
-        job_id.to_string(),
-    );
-    run_checkpoint_cache_db(async move {
-        db.read(|conn| {
-            let keys = keys.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT commit_sha FROM check_result_observations
-                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                            AND tree_hash = ?4 AND job_id = ?5
-                          ORDER BY ran_at DESC
-                          LIMIT 1",
-                        params![
-                            keys.0.as_str(),
-                            keys.1.as_str(),
-                            keys.2.as_str(),
-                            keys.3.as_str(),
-                            keys.4.as_str()
-                        ],
-                    )
-                    .await?;
-                match rows.next().await? {
-                    Some(row) => Ok::<_, crate::storage::DbError>(Some(row.text(0)?)),
-                    None => Ok(None),
-                }
-            })
-        })
-        .await
-        .map_err(|e| format!("Failed to read the commit a job's verdict was observed on: {e}"))
-    })
-}
-
 /// The most recent cached result per check name for one job — one indexed query,
 /// no worktree and no VCS. Cheap enough to render inside resume assembly, which
 /// is why the attention wake body reads verdicts through here rather than through
@@ -8107,8 +8046,10 @@ pub(crate) mod tests {
         );
     }
 
+    // The wake body intentionally reads last-recorded history, not current
+    // lanes. Current-input admission is tested in checks_status instead.
     #[tokio::test]
-    async fn job_listing_picks_latest_per_check_and_isolates_jobs() {
+    async fn historical_job_listing_picks_latest_per_check_and_isolates_jobs() {
         let db = cache_db().await;
         db.execute_script(
             "
@@ -8125,7 +8066,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let rows = list_check_results_for_job(db, "job-1").unwrap();
+        let rows = latest_check_results_for_job(&db, "job-1").await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].row.check_name, "frontend");
         assert_eq!(rows[1].row.check_name, "rust");
@@ -8139,7 +8080,7 @@ pub(crate) mod tests {
     /// lane still reads as the pass, with the failed attempt noted beside it.
     /// The order they were recorded in does not change the answer.
     #[tokio::test]
-    async fn job_listing_keeps_the_verdict_over_a_newer_attempt_that_produced_none() {
+    async fn historical_job_listing_keeps_the_verdict_over_a_newer_attempt_that_produced_none() {
         for (pass_at, infra_at) in [(100, 200), (200, 100)] {
             let db = cache_db().await;
             db.execute_script(format!(
@@ -8159,7 +8100,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            let lanes = list_check_results_for_job(db, "job-1").unwrap();
+            let lanes = latest_check_results_for_job(&db, "job-1").await.unwrap();
             assert_eq!(lanes.len(), 1);
             assert!(lanes[0].row.passed, "the pass answers the lane");
             assert_eq!(lanes[0].row.failure_kind, None);

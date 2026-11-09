@@ -471,6 +471,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("jj_reconcile_items", "intent_id IN (SELECT id FROM jj_reconcile_intents WHERE project_id = ?1)"),
     delete_only("jj_reconcile_incoming_files", "intent_id IN (SELECT id FROM jj_reconcile_intents WHERE project_id = ?1)"),
     delete_only("jj_reconcile_quarantines", "project_id = ?1"),
+    delete_only("branch_advance_acceptances", "project_id = ?1"),
     delete_only("jj_branch_recoveries", "project_id = ?1"),
     delete_only("branch_catch_up_modes", "project_id = ?1"),
     delete_only("branch_catch_up_events", "project_id = ?1"),
@@ -1785,6 +1786,17 @@ pub(super) mod tests {
               VALUES ('project-delete', 'thread-delete', 'tutor', 'lifecycle', 'started', 1);
             INSERT INTO service_schedules(project_id, owner_thread, service, entry_key, method, every_ms, anchor_at, created_at, updated_at)
               VALUES ('project-delete', 'thread-delete', 'tutor', 'entry', 'tick', 1000, 1, 1, 1);
+            "#,
+        )
+        .await
+        .unwrap();
+        // Its own statement: in the batch above, its base_commit column would sit
+        // in one literal with `INSERT INTO jobs` and read to cairn-db's
+        // jobs.base_commit reach guard as a query of the jobs row.
+        db.execute_batch(
+            r#"
+            INSERT INTO branch_advance_acceptances(id, project_id, store_path, branch, head_before, head_after, base_branch, base_commit, captured_operation, accepted_operation, dropped_commits_json, inherited_drops_json, status, created_at, settled_at, export_state)
+              VALUES ('acceptance-delete', 'project-delete', '/store', 'bookmark', 'before', 'after', 'main', 'dest', 'op-captured', 'op-accepted', '[]', '[]', 'accepted', 1, 1, 'exported');
             "#,
         )
         .await

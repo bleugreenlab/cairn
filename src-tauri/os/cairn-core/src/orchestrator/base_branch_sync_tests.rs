@@ -897,10 +897,12 @@ async fn seed_job(db: &LocalDb, id: &str, branch: &str, base_branch: &str) {
 /// The specimen of cairn/5038: a child's pull request into its parent's
 /// integration branch is merged in GitHub's UI, so origin's copy of the parent
 /// moves and Cairn is told nothing. One poll pass must bring it into the store,
-/// a child cut afterwards must start from the new tip, and the child already
-/// cut from the old tip must be replayed onto it.
+/// and a child cut afterwards must start from the new tip. The child already
+/// cut from the old tip is not rewritten by the parent's move: the next demand
+/// for it (here a verdict-only branch run) carries it onto the advanced parent.
 #[tokio::test(flavor = "multi_thread")]
-async fn one_poll_pass_takes_an_outside_merge_into_a_parent_branch_and_replays_its_child() {
+async fn one_poll_pass_takes_an_outside_merge_into_a_parent_branch_and_a_demand_carries_its_child()
+{
     if crate::jj::tests::jj_bin().is_none() {
         eprintln!("skipping: jj not resolvable");
         return;
@@ -1042,19 +1044,33 @@ async fn one_poll_pass_takes_an_outside_merge_into_a_parent_branch_and_replays_i
         "a child created after the sync is cut from the new tip"
     );
 
-    // And the child cut from the old tip is replayed onto it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        let tip = crate::jj::bookmark_commit(&jj, &store, CHILD).unwrap();
-        if tip != child_tip && crate::jj::revset_descends_from(&jj, &store, &tip, &landed) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the existing child was never replayed onto the advanced parent"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // The parent's move rewrites nothing on its own.
+    assert_eq!(
+        crate::jj::bookmark_commit(&jj, &store, CHILD).as_deref(),
+        Some(child_tip.as_str()),
+        "the parent's move must not replay the child eagerly"
+    );
+
+    // A demand for the child carries it onto the advanced parent.
+    use crate::orchestrator::base_advance::preparation::{prepare_branch, PreparationRequest};
+    let prepared = prepare_branch(
+        &orch,
+        PreparationRequest::for_run("proj-parent", CHILD, Some("child".to_string())),
+    )
+    .await
+    .unwrap_or_else(|refusal| panic!("the child's preparation was refused: {refusal}"));
+    assert!(prepared.advanced, "the child was carried onto the new tip");
+    assert_eq!(prepared.base_commit, landed);
+    let tip = crate::jj::bookmark_commit(&jj, &store, CHILD).unwrap();
+    assert_eq!(
+        tip, prepared.head_after,
+        "the store holds the prepared child"
+    );
+    assert_ne!(tip, child_tip);
+    assert!(
+        crate::jj::revset_descends_from(&jj, &store, &tip, &landed),
+        "the prepared child descends from the advanced parent"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,17 +1192,18 @@ impl PublishedParent {
     }
 }
 
-/// The specimen of sink report #398: `main` advances, base advance replays the
-/// already-published parent onto it (every commit gets a new id), and origin
-/// still holds the pre-rewrite tip, which the poll has just confirmed. That tip
-/// is the store's own replaced publication, not drift: the replay's publication
-/// goes ahead, as a sideways move leased on exactly that tip.
+/// The specimen of sink report #398: `main` advances, the parent owner's next
+/// commit prepares the already-published parent onto it (every commit gets a
+/// new id), and origin still holds the pre-rewrite tip, which the poll has just
+/// confirmed. That tip is the store's own replaced publication, not drift: the
+/// replay's publication goes ahead, as a sideways move leased on exactly that
+/// tip.
 ///
 /// A poll that asked origin before the publication and is answered after it
 /// still holds the pre-rewrite tip; recording that answer last must not make
 /// the store's own replaced publication read as drift again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_base_advance_replay_of_a_published_parent_is_published_over_its_old_tip() {
+async fn a_prepared_replay_of_a_published_parent_is_published_over_its_old_tip() {
     let Some(f) = PublishedParent::new("base-advance-republish.db").await else {
         eprintln!("skipping: jj not resolvable");
         return;
@@ -1210,33 +1227,39 @@ async fn a_base_advance_replay_of_a_published_parent_is_published_over_its_old_t
 
     let main = f.push_outside("main", "main-advance.rs");
     sync(&f.orch, "proj-parent", "main").await;
+    assert_eq!(
+        f.store_tip(),
+        f.published,
+        "main's move must not replay the parent eagerly"
+    );
 
-    // Origin moves inside the publication's push, before the publication is
-    // recorded, so the replay is done only once the record names it.
-    let published_replay = || {
-        registry
-            .snapshot("proj-parent", PARENT)
-            .filter(|state| state.remote_tip_source == Some(Source::Publish))
-            .and_then(|state| state.remote_tip)
-            .filter(|tip| *tip != f.published)
+    // The parent owner's commit demands the current base, then publishes.
+    use crate::orchestrator::base_advance::preparation::{
+        prepare_branch, PreparationPurpose, PreparationRequest,
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let recorded = loop {
-        if let Some(tip) = published_replay() {
-            break tip;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "the replayed parent's publication was never recorded (store at {}, origin at \
-                 {}); publishing now says: {:?}",
-                f.store_tip(),
-                f.origin_tip(PARENT),
-                f.publish().await
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    let prepared = prepare_branch(
+        &f.orch,
+        PreparationRequest::new(
+            "proj-parent",
+            PARENT,
+            Some("parent".to_string()),
+            PreparationPurpose::OwnerCommit,
+        ),
+    )
+    .await
+    .unwrap_or_else(|refusal| panic!("the parent's preparation was refused: {refusal}"));
+    assert!(prepared.advanced, "the parent was carried onto main");
+    f.publish()
+        .await
+        .expect("the replay is published over the store's own old tip");
+    let recorded = registry
+        .snapshot("proj-parent", PARENT)
+        .filter(|state| state.remote_tip_source == Some(Source::Publish))
+        .and_then(|state| state.remote_tip)
+        .expect("the publication is recorded");
     let tip = f.store_tip();
+    assert_eq!(tip, prepared.head_after);
+    assert_ne!(tip, f.published, "the replay rewrote the published parent");
     assert_eq!(recorded, tip, "the publication recorded the replayed tip");
     assert!(crate::jj::revset_descends_from(
         &f.jj, &f.store, &tip, &main

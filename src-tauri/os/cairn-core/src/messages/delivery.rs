@@ -273,22 +273,6 @@ pub(crate) enum DirectQueueDisposition {
     Undeliverable,
 }
 
-pub(crate) fn queue_system_direct_once_confirmed(
-    orch: &Orchestrator,
-    recipient_run_id: &str,
-    content: &str,
-    urgency: DeliveryUrgency,
-    idempotency_key: &str,
-) -> Result<DirectQueueDisposition, String> {
-    queue_system_direct_impl(
-        orch,
-        recipient_run_id,
-        content,
-        urgency,
-        Some(idempotency_key),
-    )
-}
-
 /// What a job's head turn says its agent is doing right now.
 ///
 /// Head turn = `jobs.current_turn_id` when present, mirroring the canonical
@@ -1328,7 +1312,21 @@ pub(crate) fn nudge_for_direct_message(
     nudge(orch, job_id, urgency, Some(message))
 }
 
+/// Every wake request passes through here; its outcome is reported to the
+/// merge attempt whose task requested it, if any
+/// (`pr_data::actions::merge_metrics`).
 fn nudge(
+    orch: &Orchestrator,
+    job_id: &str,
+    urgency: DeliveryUrgency,
+    message: Option<&DirectMessageRef>,
+) -> Result<NudgeOutcome, String> {
+    let outcome = nudge_unobserved(orch, job_id, urgency, message);
+    crate::pr_data::actions::merge_metrics::note_wake(job_id, &outcome);
+    outcome
+}
+
+fn nudge_unobserved(
     orch: &Orchestrator,
     job_id: &str,
     urgency: DeliveryUrgency,

@@ -40,7 +40,10 @@ tempfile = "3"
 # Keep this exactly aligned with the bundled jj sidecar in scripts/fetch-jj.ts.
 jj-lib = "=0.42.0"
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "time"] }
+# `rt-multi-thread` is what provides `block_in_place`, which `in_place_blocking`
+# needs in every build, not only where dev-dependency feature unification
+# happens to enable it.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 # gix's broad kstring range otherwise selects 2.0.3, whose MSRV is newer than
 # the toolchain supported by jj-lib 0.42/Cairn.
 kstring = "=2.0.2"

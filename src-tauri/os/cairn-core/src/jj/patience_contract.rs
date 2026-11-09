@@ -50,16 +50,13 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         "fn recreate_keep_refs(",
     ),
     // Every jj rewrite writes a `refs/jj/keep/<commit>` ref per commit it
-    // mints, so the store replay and flatten contend for the lock too.
+    // mints, so the store replay and flatten contend for the lock too. The
+    // replay mints its commits while it computes the candidate, so that is
+    // the step held to patience.
     (
         "store replay rebase",
-        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
-        "pub(crate) fn rebase_branch_onto_with_resolution(",
-    ),
-    (
-        "resolution carry",
-        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
-        "fn apply_resolution_carry(",
+        include_str!("../../../cairn-vcs/src/jj/advance.rs"),
+        "fn compute_with_recovery(",
     ),
     (
         "empty-commit drop",
@@ -68,13 +65,8 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
     ),
     (
         "flatten squash",
-        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
-        "pub fn squash_branch_onto(",
-    ),
-    (
-        "superseded-history hide",
-        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
-        "pub(crate) fn hide_superseded_history(",
+        include_str!("../../../cairn-vcs/src/jj/advance.rs"),
+        "pub(super) fn compute_branch_squash(",
     ),
     (
         "store view sweep",
@@ -90,11 +82,6 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         "replayed-twin bookmark settle",
         include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
         "fn resolve_twin_bookmark_conflicts(",
-    ),
-    (
-        "flatten twin cleanup",
-        include_str!("../../../cairn-vcs/src/jj/reconcile.rs"),
-        "pub fn flatten_branch_recovery(",
     ),
     (
         "operation restore",

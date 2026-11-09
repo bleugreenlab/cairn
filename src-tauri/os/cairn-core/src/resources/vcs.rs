@@ -1158,8 +1158,18 @@ async fn read_ancestry(
     let to = resolve_or_default(orch, request, project_id, "to", query.to.as_deref()).await?;
     let store = to.resolution.repository_path.clone();
     let (from_id, to_id) = (from.commit().to_string(), to.commit().to_string());
+    let answer = ancestry_answer(project_id, store, from_id, to_id).await?;
+    render_ancestry(project, query, from, to, answer)
+}
+
+async fn ancestry_answer(
+    project_id: &str,
+    store: std::path::PathBuf,
+    from_id: String,
+    to_id: String,
+) -> Result<AncestryAnswer, String> {
     let key = format!("ancestry|{project_id}|{from_id}|{to_id}");
-    let answer = cached("ancestry", &key, async move {
+    cached("ancestry", &key, async move {
         let ancestry = history::ancestry(&store, &from_id, &to_id, COUNT_CAP, QUERY_LIMIT)
             .await
             .map_err(|error| history_error("ancestry", error))?;
@@ -1173,7 +1183,16 @@ async fn read_ancestry(
             behind_capped: ancestry.behind.capped,
         })
     })
-    .await?;
+    .await
+}
+
+fn render_ancestry(
+    project: &str,
+    query: &VcsQuery,
+    from: Endpoint,
+    to: Endpoint,
+    answer: AncestryAnswer,
+) -> Result<String, String> {
     if query.json {
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "from": from.json(),
@@ -1337,6 +1356,9 @@ async fn read_blame(
     out.push_str("```\n");
     Ok(out)
 }
+
+mod summaries;
+pub(super) use summaries::{branch_summaries, BranchSummaryScope};
 
 #[cfg(test)]
 mod tests;

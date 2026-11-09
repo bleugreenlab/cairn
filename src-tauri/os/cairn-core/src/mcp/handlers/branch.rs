@@ -64,38 +64,23 @@ pub(crate) async fn resolve_current_for_read(
     let project_path = project
         .project_path
         .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;
-    let repository_path = {
-        let jj_binary_path = orch.jj_binary_path.clone();
-        let config_dir = orch.config_dir.clone();
-        let project_repo = project_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-        })
+    let repository_path = crate::jj::project_store_dir(&orch.config_dir, &project_path);
+    let commit_id = cairn_vcs::resolve_coordinate(&repository_path, &rev)
         .await
-        .map_err(|error| format!("coordinate repository task failed: {error}"))??
-    };
-    let commit_id = resolve_coordinate_repairing_conflicts(
-        orch,
-        &repository_path,
-        &rev,
-        &project.default_branch,
-    )
-    .await
-    .map_err(|error| {
-        let error = map_own_coordinate_error(error, &rev, own_branch.as_deref());
-        if matches!(error, BranchRefResolutionError::OwnBranchLost { .. }) {
-            log::error!(
-                "run {} (job {}) lost its own branch `{rev}`: it no longer resolves in {}",
-                run.run_id,
-                run.job_id,
-                repository_path.display()
-            );
-        }
-        error.to_string()
-    })?;
+        .map_err(|error| {
+            let error = map_own_coordinate_error(error, &rev, own_branch.as_deref());
+            if matches!(error, BranchRefResolutionError::OwnBranchLost { .. }) {
+                log::error!(
+                    "run {} (job {}) lost its own branch `{rev}`: it no longer resolves in {}",
+                    run.run_id,
+                    run.job_id,
+                    repository_path.display()
+                );
+            }
+            error.to_string()
+        })?;
     let default_commit_id =
-        resolve_default_for_read(orch, &repository_path, &project.default_branch, &commit_id).await;
+        resolve_default_for_read(&repository_path, &project.default_branch, &commit_id).await;
     Ok(BranchResolution {
         project_id: project.project_id,
         repository_path,
@@ -137,6 +122,85 @@ pub(crate) async fn current_base_branch(
         .map_err(|error| error.to_string())?
         .filter(|base| !base.trim().is_empty());
     Ok((run.project_id, base))
+}
+
+/// The integration coordinate against which a publication was interpreted.
+/// Keep the declaration as well as its resolved name: changing from an inherited
+/// target to an explicit one invalidates work even if both currently name one tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicationBase {
+    pub(crate) branch: String,
+    pub(crate) commit: String,
+    declared: Option<String>,
+    default_branch: String,
+}
+
+impl PublicationBase {
+    /// The base a managed branch was prepared against, read from the one
+    /// relationship its preparation captured, so publication validates exactly
+    /// the coordinate preparation installed.
+    pub(crate) fn from_prepared(
+        prepared: &crate::orchestrator::base_advance::preparation::PreparedBranch,
+    ) -> Self {
+        Self {
+            branch: prepared.relationship.base_branch.clone(),
+            commit: prepared.base_commit.clone(),
+            declared: prepared.relationship.declared.clone(),
+            default_branch: prepared.relationship.project_default.clone(),
+        }
+    }
+}
+
+/// A declared base as preparation reads it: trimmed, and an empty declaration
+/// is no declaration. Both capture paths normalize alike, so whitespace in a
+/// row can never make the same relationship compare unequal.
+fn normalized_base(declared: Option<String>) -> Option<String> {
+    declared
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+pub(crate) async fn capture_publication_base(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    resolution: &BranchResolution,
+) -> Result<PublicationBase, String> {
+    let (run, db) = super::run_context::lookup_run_routed(&orch.db, request).await?;
+    if run.project_id != resolution.project_id {
+        return Err("publication belongs to a different project".to_string());
+    }
+    let job_id = run.job_id;
+    let declared = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT base_branch FROM jobs WHERE id = ?1 LIMIT 1",
+                        params![job_id],
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    crate::storage::DbError::Row("publication job is missing".to_string())
+                })?;
+                row.opt_text(0)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let declared = normalized_base(declared);
+    let project = project_context_by_id_in_db(&db, &resolution.project_id).await?;
+    let branch = declared
+        .clone()
+        .unwrap_or_else(|| project.default_branch.clone());
+    let commit = cairn_vcs::resolve_coordinate(&resolution.repository_path, &branch)
+        .await
+        .map_err(|error| format!("publication base `{branch}` is unresolved: {error}"))?;
+    Ok(PublicationBase {
+        branch,
+        commit,
+        declared,
+        default_branch: project.default_branch,
+    })
 }
 
 /// Map a failure to resolve the run's OWN coordinate.
@@ -190,19 +254,11 @@ fn resolve_job_rev(
 /// diagnose any of them. A read that can be served from an unambiguous commit is
 /// served.
 async fn resolve_default_for_read(
-    orch: &Orchestrator,
     repository_path: &Path,
     default_branch: &str,
     commit_id: &str,
 ) -> String {
-    match resolve_coordinate_repairing_conflicts(
-        orch,
-        repository_path,
-        default_branch,
-        default_branch,
-    )
-    .await
-    {
+    match cairn_vcs::resolve_coordinate(repository_path, default_branch).await {
         Ok(default_commit_id) => default_commit_id,
         Err(error) => {
             log::warn!(
@@ -214,79 +270,484 @@ async fn resolve_default_for_read(
     }
 }
 
-/// Resolve a coordinate, repairing a conflicted branch NAME once rather than
-/// failing the verb that asked for it.
+/// What naming a revision authorizes a demand capture (a configured check or a
+/// verdict-only `run branch:`) to do with it.
 ///
-/// A conflicted name used to be terminal from inside a job. Every surface that
-/// resolves a branch — running a command, writing a file, reading one — shares
-/// this function, so one conflicted name took all three down at once and left
-/// the agent unable to diagnose or repair anything from where it stood. The
-/// state was always repairable; it was only unreachable. Now the first verb to
-/// meet it performs the repair and proceeds.
-///
-/// Only a conflicted name is retried. Absence and ambiguity are answers about
-/// the coordinate, not damage to the store, and repairing them is not a thing
-/// that exists.
-async fn resolve_coordinate_repairing_conflicts(
-    orch: &Orchestrator,
-    repository_path: &Path,
-    coordinate: &str,
-    default_branch: &str,
-) -> Result<String, cairn_vcs::CoordinateResolutionError> {
-    let error = match cairn_vcs::resolve_coordinate(repository_path, coordinate).await {
-        Ok(commit) => return Ok(commit),
-        Err(error) => error,
-    };
-    let cairn_vcs::CoordinateResolutionError::Conflicted { targets, .. } = &error else {
-        return Err(error);
-    };
-    if !crate::jj::is_jj_dir(repository_path) {
-        return Err(error);
-    }
-    log::warn!(
-        "branch `{coordinate}` has competing targets {targets:?}; repairing before serving the \
-         request that resolved it"
-    );
-
-    let authority = if coordinate == default_branch {
-        crate::jj::BranchAuthority::Origin
-    } else {
-        crate::jj::BranchAuthority::Store
-    };
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let guard = orch
-        .acquire_jj_store_lock(
-            repository_path,
-            crate::orchestrator::StoreLockClass::Foreground,
-            format!("repair conflicted branch name `{coordinate}`"),
-        )
-        .await;
-    let _phase = guard.phase("conflicted branch name repair");
-    if let Err(repair_error) =
-        crate::jj::repair_conflicted_branch_name(&jj, repository_path, coordinate, authority)
-    {
-        log::error!("branch `{coordinate}` could not be repaired: {repair_error}");
-        return Err(cairn_vcs::CoordinateResolutionError::Conflicted {
-            coordinate: coordinate.to_string(),
-            targets: targets.clone(),
-            refusal: repair_error.refusal().cloned().map(Box::new),
-        });
-    }
-    // Re-resolve rather than trusting the repair's own answer: what has to hold
-    // is that this path now works, not that the repair reported success.
-    cairn_vcs::resolve_coordinate(repository_path, coordinate).await
+/// Decided from the request's form and the project's live jobs before anything
+/// resolves, never from where a commit happens to sit: a commit id equal to a
+/// managed branch's head is still an exact snapshot, and grants no authority to
+/// prepare that branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RevisionAuthority {
+    /// A branch a live job owns, named directly or through a node URI, whether
+    /// the requester's own or another owner's. Capturing it first prepares the
+    /// branch against its declared integration target.
+    Managed {
+        branch: String,
+        /// The job a node URI named. `None` for a bare branch name, whose
+        /// canonical live owner the preparer chooses.
+        owner_job_id: Option<String>,
+    },
+    /// A revision captured exactly as it stands: never prepared, repaired, or
+    /// otherwise mutated.
+    Exact {
+        rev: String,
+        kind: ExactRevisionKind,
+    },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactRevisionKind {
+    /// The project's default branch, which `main` names whatever it is called.
+    IntegrationBaseline,
+    /// A full or abbreviated commit id.
+    Commit,
+    /// Anything else: a branch no live job owns, a change id, a revset.
+    UnmanagedRef,
+}
+
+impl RevisionAuthority {
+    /// The name the store resolves for this revision.
+    pub(crate) fn rev(&self) -> &str {
+        match self {
+            Self::Managed { branch, .. } => branch,
+            Self::Exact { rev, .. } => rev,
+        }
+    }
+}
+
+/// A requested revision bound to its project and to what naming it authorizes.
 #[derive(Debug, Clone)]
-pub(crate) struct RunBranchResolution {
-    pub project_id: String,
-    pub repository_path: PathBuf,
-    /// The repository `commit_id` was resolved in: the managed jj store when
-    /// one exists, otherwise the project checkout.
-    pub revision_store: PathBuf,
-    pub rev: String,
-    pub commit_id: String,
-    pub default_branch: String,
+pub(crate) struct TypedRevision {
+    pub(crate) project_id: String,
+    /// The project's checkout, whose object database holds every commit.
+    pub(crate) project_path: PathBuf,
+    pub(crate) default_branch: String,
+    /// The text the caller supplied, for refusals.
+    pub(crate) requested: String,
+    pub(crate) authority: RevisionAuthority,
+}
+
+/// The project a request's bare refs resolve in.
+#[derive(Clone, Copy)]
+pub(crate) enum RevisionScope<'a> {
+    /// The calling run's project. A node URI resolves in its own project.
+    Caller(&'a McpCallbackRequest),
+    /// One project, which a node URI must belong to as well: quietly
+    /// substituting another project's branch would answer a different question.
+    Project(&'a str),
+}
+
+/// Classify the revision a check or a branch-scoped run names, taking every form
+/// `read ?branch=` takes: a branch name (`main` standing for the project's
+/// default branch), a commit or change id, or a node URI standing for the
+/// branch that node recorded.
+///
+/// Resolves nothing in the store. This is the first step of a capture, so the
+/// authority is fixed before any configuration, changed-file set, cache entry,
+/// observation, or checkout depends on it.
+pub(crate) async fn resolve_typed_revision(
+    orch: &Orchestrator,
+    scope: RevisionScope<'_>,
+    requested: &str,
+) -> Result<TypedRevision, BranchRefResolutionError> {
+    let unresolvable = |diagnostic: String| BranchRefResolutionError::Unresolvable {
+        requested: requested.to_string(),
+        diagnostic,
+    };
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return Err(BranchRefResolutionError::Invalid {
+            requested: requested.to_string(),
+        });
+    }
+    let (project, named_node, rev) = match resolve_node_uri(orch, trimmed)
+        .await
+        .map_err(unresolvable)?
+    {
+        Some(job) => {
+            if let RevisionScope::Project(project_id) = scope {
+                if job.project_id != project_id {
+                    return Err(unresolvable(format!(
+                        "it names a node of another project, and this request belongs to project \
+                         '{project_id}'"
+                    )));
+                }
+            }
+            let branch = job
+                .branch
+                .filter(|branch| !branch.trim().is_empty())
+                .ok_or_else(|| unresolvable("the node has no recorded branch".into()))?;
+            let project = project_context_by_id(orch, &job.project_id)
+                .await
+                .map_err(unresolvable)?;
+            (project, Some(job.job_id), branch)
+        }
+        None => {
+            let project = match scope {
+                RevisionScope::Caller(request) => project_context_for_request(orch, request).await,
+                RevisionScope::Project(project_id) => project_context_by_id(orch, project_id).await,
+            }
+            .map_err(unresolvable)?;
+            let rev = raw_read_rev(trimmed, &project);
+            (project, None, rev)
+        }
+    };
+    let project_path = project.project_path.clone().ok_or_else(|| {
+        unresolvable(format!(
+            "project '{}' has no local repository",
+            project.project_id
+        ))
+    })?;
+    let authority = if named_node.is_none() && rev == project.default_branch {
+        RevisionAuthority::Exact {
+            rev,
+            kind: ExactRevisionKind::IntegrationBaseline,
+        }
+    } else if live_branch_owner(orch, &project.project_id, &rev)
+        .await
+        .map_err(unresolvable)?
+        .is_some()
+    {
+        RevisionAuthority::Managed {
+            branch: rev,
+            owner_job_id: named_node,
+        }
+    } else {
+        let kind = if named_node.is_none() && looks_like_commit_id(&rev) {
+            ExactRevisionKind::Commit
+        } else {
+            ExactRevisionKind::UnmanagedRef
+        };
+        RevisionAuthority::Exact { rev, kind }
+    };
+    Ok(TypedRevision {
+        project_id: project.project_id,
+        project_path,
+        default_branch: project.default_branch,
+        requested: requested.to_string(),
+        authority,
+    })
+}
+
+/// A job's own branch as the managed revision that job owns: what a check of the
+/// job's own head, and its turn-end review wave, prepare and capture. The job
+/// names itself as owner, so its own declaration governs the base even after
+/// its run has ended.
+pub(crate) async fn resolve_own_branch_revision(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    job_id: &str,
+) -> Result<TypedRevision, String> {
+    let project = project_context_by_id(orch, project_id).await?;
+    let project_path = project
+        .project_path
+        .clone()
+        .ok_or_else(|| format!("project '{project_id}' has no local repository"))?;
+    Ok(TypedRevision {
+        project_id: project.project_id,
+        project_path,
+        default_branch: project.default_branch,
+        requested: branch.to_string(),
+        authority: RevisionAuthority::Managed {
+            branch: branch.to_string(),
+            owner_job_id: Some(job_id.to_string()),
+        },
+    })
+}
+
+/// The live job owning `branch`, by the predicate the preparer selects a
+/// branch's owner with, so classification and preparation never disagree about
+/// which branches are managed.
+async fn live_branch_owner(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::orchestrator::base_advance::preparation::live_branch_owner(&db, project_id, branch).await
+}
+
+/// A full or abbreviated hexadecimal commit id. Only a label: an id and an
+/// unmanaged ref are both exact snapshots.
+fn looks_like_commit_id(rev: &str) -> bool {
+    (7..=64).contains(&rev.len()) && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Why a capture is happening, which decides the preparation's budget and
+/// whether a conflict it meets is anyone's to act on. None is: a check, a
+/// review wave, or a branch-scoped run that meets a conflict wakes nobody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CapturePurpose {
+    Check,
+    /// The turn-end review wave of `job_id`, capturing its own head. A replay
+    /// this capture installs must not withdraw the very wave capturing it.
+    ReviewWave {
+        job_id: String,
+    },
+    Run,
+}
+
+/// The preparation a managed capture ran, named in every result it produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedCapture {
+    pub(crate) branch: String,
+    pub(crate) head_before: String,
+    /// The commit judged. Equal to `head_before` when the branch already
+    /// contained its base.
+    pub(crate) head_after: String,
+    /// The branch's declared integration target.
+    pub(crate) base_branch: String,
+    /// The exact commit of `base_branch` that `head_after` contains.
+    pub(crate) base_commit: String,
+    /// The Git tree object id of `head_after`. Not the logical tree hash checks
+    /// key on; a result reports both under distinct names.
+    pub(crate) git_tree: String,
+    pub(crate) advanced: bool,
+    /// Compare-and-swap attempts the preparation took.
+    pub(crate) attempts: u32,
+    /// Follow-up work an accepted install left incomplete, including a failed
+    /// Git export. The coordinate stands regardless; the result says so.
+    pub(crate) warnings: Vec<String>,
+}
+
+/// One immutable capture of a requested revision. Every later stage (contract,
+/// changed files, cache, observation, checkout, result) reads `commit_id` from
+/// here, and none resolves the requested name again.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedRevision {
+    pub(crate) revision: TypedRevision,
+    /// The store `commit_id` was captured in.
+    pub(crate) store: PathBuf,
+    pub(crate) commit_id: String,
+    /// Present exactly when `revision` is managed.
+    pub(crate) prepared: Option<PreparedCapture>,
+}
+
+impl CapturedRevision {
+    pub(crate) fn rev(&self) -> &str {
+        self.revision.authority.rev()
+    }
+
+    /// What the captured change is measured against: the branch label, and the
+    /// exact commit to measure from when the capture fixed one. A managed
+    /// revision is measured against its own declared target at the commit it was
+    /// prepared onto, never against the caller's default. An exact snapshot has
+    /// no target of its own and is measured against the project default.
+    pub(crate) fn attribution(&self) -> (String, Option<String>) {
+        match &self.prepared {
+            Some(prepared) => (
+                prepared.base_branch.clone(),
+                Some(prepared.base_commit.clone()),
+            ),
+            None => (self.revision.default_branch.clone(), None),
+        }
+    }
+
+    /// How the judged commit was captured, for the result that reports it.
+    pub(crate) fn provenance(&self) -> String {
+        let exact = |what: &str| {
+            format!(
+                "exact snapshot of {what} `{}` at {}; not prepared against any base",
+                self.rev(),
+                short_commit(&self.commit_id)
+            )
+        };
+        let mut text = match (&self.prepared, &self.revision.authority) {
+            (Some(prepared), _) if prepared.advanced => format!(
+                "prepared `{}` onto its base `{}@{}`: head {} became {}",
+                prepared.branch,
+                prepared.base_branch,
+                short_commit(&prepared.base_commit),
+                short_commit(&prepared.head_before),
+                short_commit(&prepared.head_after),
+            ),
+            (Some(prepared), _) => format!(
+                "`{}` at {} already contains its base `{}@{}`; nothing was changed",
+                prepared.branch,
+                short_commit(&prepared.head_after),
+                prepared.base_branch,
+                short_commit(&prepared.base_commit),
+            ),
+            (None, RevisionAuthority::Exact { kind, .. }) => exact(match kind {
+                ExactRevisionKind::IntegrationBaseline => "the default branch",
+                ExactRevisionKind::Commit => "commit",
+                ExactRevisionKind::UnmanagedRef => "ref",
+            }),
+            (None, RevisionAuthority::Managed { .. }) => exact("branch"),
+        };
+        if let Some(prepared) = &self.prepared {
+            text.push_str(&format!(" (git tree {})", short_commit(&prepared.git_tree)));
+            for warning in &prepared.warnings {
+                text.push_str(&format!("; warning: {warning}"));
+            }
+        }
+        text
+    }
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..commit.len().min(12)]
+}
+
+/// Why a revision could not be captured.
+#[derive(Debug)]
+pub(crate) enum RevisionCaptureError {
+    Resolution(BranchRefResolutionError),
+    /// A managed branch the preparer refused. Nothing was installed.
+    Preparation {
+        branch: String,
+        refusal: Box<crate::orchestrator::base_advance::preparation::PreparationRefusal>,
+    },
+}
+
+impl RevisionCaptureError {
+    /// The managed branch cannot take its base cleanly: an outcome of its own,
+    /// recorded as "conflicts with base", never as a test result.
+    pub(crate) fn conflicts_with_base(&self) -> bool {
+        matches!(
+            self,
+            Self::Preparation { refusal, .. }
+                if matches!(
+                    **refusal,
+                    crate::orchestrator::base_advance::preparation::PreparationRefusal::Conflict(_)
+                )
+        )
+    }
+}
+
+impl std::fmt::Display for RevisionCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::orchestrator::base_advance::preparation::PreparationRefusal;
+        match self {
+            Self::Resolution(error) => write!(f, "{error}"),
+            Self::Preparation {
+                branch: prepared_branch,
+                refusal,
+            } => match &**refusal {
+                PreparationRefusal::Conflict(conflict) => {
+                    let crate::orchestrator::base_advance::preparation::BaseConflict {
+                        branch,
+                        head,
+                        base_branch,
+                        base_commit,
+                        paths,
+                        ..
+                    } = &**conflict;
+                    write!(
+                        f,
+                        "Conflicts with base: branch `{branch}` at {} cannot take its base \
+                     `{base_branch}@{}` cleanly (conflicting paths: {}). Nothing on the branch \
+                     changed, nobody was woken, and nothing ran, so this is not a test result. \
+                     The branch's owner meets this conflict at its next commit or merge; to test \
+                     the branch as it stands, name its commit {} instead.",
+                        short_commit(head),
+                        short_commit(base_commit),
+                        if paths.is_empty() {
+                            "none reported".to_string()
+                        } else {
+                            paths.join(", ")
+                        },
+                        short_commit(head),
+                    )
+                }
+                refusal => write!(
+                    f,
+                    "Branch `{prepared_branch}` could not be prepared against its base, so \
+                     nothing ran and there is no verdict: {refusal}"
+                ),
+            },
+        }
+    }
+}
+
+/// Capture `revision` once. A managed branch is prepared against its declared
+/// integration target and captured at the prepared head; an exact revision is
+/// resolved literally in `store`, with no repair of any kind.
+pub(crate) async fn capture_revision(
+    orch: &Orchestrator,
+    revision: TypedRevision,
+    store: PathBuf,
+    purpose: CapturePurpose,
+) -> Result<CapturedRevision, RevisionCaptureError> {
+    use crate::orchestrator::base_advance::preparation::{prepare_branch, PreparationRequest};
+    let RevisionAuthority::Managed {
+        branch,
+        owner_job_id,
+    } = &revision.authority
+    else {
+        let commit_id = cairn_vcs::resolve_coordinate(&store, revision.authority.rev())
+            .await
+            .map_err(|error| {
+                RevisionCaptureError::Resolution(map_coordinate_error(error, &revision.requested))
+            })?;
+        return Ok(CapturedRevision {
+            revision,
+            store,
+            commit_id,
+            prepared: None,
+        });
+    };
+    let (project_id, owner) = (revision.project_id.clone(), owner_job_id.clone());
+    let request = match purpose {
+        CapturePurpose::Check => PreparationRequest::for_check(project_id, branch.clone(), owner),
+        CapturePurpose::ReviewWave { job_id } => PreparationRequest {
+            capturing_review_of: Some(job_id),
+            ..PreparationRequest::for_check(project_id, branch.clone(), owner)
+        },
+        CapturePurpose::Run => PreparationRequest::for_run(project_id, branch.clone(), owner),
+    };
+    let prepared = prepare_branch(orch, request).await.map_err(|refusal| {
+        RevisionCaptureError::Preparation {
+            branch: branch.clone(),
+            refusal: Box::new(refusal),
+        }
+    })?;
+    use crate::orchestrator::base_advance::preparation::PreparedExport;
+    let mut warnings = prepared.warnings.clone();
+    if let PreparedExport::Failed { error, recorded } = &prepared.export {
+        warnings.push(match recorded {
+            Some(intent) => format!(
+                "the prepared head is installed but its Git export failed ({error}); the next \
+                 preparation of this branch recovers it from record {intent}"
+            ),
+            None => format!(
+                "the prepared head is installed but its Git export failed ({error}) and no \
+                 recovery record could be kept"
+            ),
+        });
+    }
+    let captured = PreparedCapture {
+        branch: branch.clone(),
+        head_before: prepared.head_before.clone(),
+        head_after: prepared.head_after.clone(),
+        base_branch: prepared.relationship.base_branch.clone(),
+        base_commit: prepared.base_commit.clone(),
+        git_tree: prepared.tree.clone(),
+        advanced: prepared.advanced,
+        attempts: prepared.attempts,
+        warnings,
+    };
+    Ok(CapturedRevision {
+        revision,
+        store: prepared.store.clone(),
+        commit_id: captured.head_after.clone(),
+        prepared: Some(captured),
+    })
+}
+
+/// The store a branch-scoped run resolves in: the managed store when one
+/// exists, otherwise the project checkout.
+pub(crate) fn run_revision_store(orch: &Orchestrator, project_path: &Path) -> PathBuf {
+    let managed_store = crate::jj::project_store_dir(&orch.config_dir, project_path);
+    if crate::jj::is_jj_dir(&managed_store) {
+        managed_store
+    } else {
+        project_path.to_path_buf()
+    }
 }
 
 /// The stable code a retired-branch refusal leads with, so a tool report, a
@@ -639,6 +1100,7 @@ struct ProjectBranchContext {
 struct JobBranchContext {
     branch: Option<String>,
     project_id: String,
+    job_id: String,
 }
 
 fn map_coordinate_error(
@@ -737,28 +1199,13 @@ async fn resolve_read_in_project(
     let project_path = project
         .project_path
         .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;
-    let repository_path = {
-        let jj_binary_path = orch.jj_binary_path.clone();
-        let config_dir = orch.config_dir.clone();
-        let project_repo = project_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-        })
-        .await
-        .map_err(|error| format!("coordinate repository task failed: {error}"))??
-    };
+    let repository_path = crate::jj::project_store_dir(&orch.config_dir, &project_path);
     let requested = branch.to_string();
-    let commit_id = resolve_coordinate_repairing_conflicts(
-        orch,
-        &repository_path,
-        &rev,
-        &project.default_branch,
-    )
-    .await
-    .map_err(|error| map_coordinate_error(error, &requested).to_string())?;
+    let commit_id = cairn_vcs::resolve_coordinate(&repository_path, &rev)
+        .await
+        .map_err(|error| map_coordinate_error(error, &requested).to_string())?;
     let default_commit_id =
-        resolve_default_for_read(orch, &repository_path, &project.default_branch, &commit_id).await;
+        resolve_default_for_read(&repository_path, &project.default_branch, &commit_id).await;
     Ok(BranchResolution {
         project_id: project.project_id,
         repository_path,
@@ -770,128 +1217,19 @@ async fn resolve_read_in_project(
     })
 }
 
-pub(crate) async fn resolve_for_run(
+/// Capture the revision a verdict-only `run branch:` names: classified, then
+/// prepared once if it is a managed branch, in the store the run materializes
+/// from. The batch checks out the captured commit and its result names it.
+pub(crate) async fn capture_for_run(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     branch: &str,
-) -> Result<RunBranchResolution, BranchRefResolutionError> {
-    let requested = branch.to_string();
-    if branch.trim().is_empty() {
-        return Err(BranchRefResolutionError::Invalid { requested });
-    }
-
-    let (project, rev) = match resolve_node_uri(orch, branch).await.map_err(|diagnostic| {
-        BranchRefResolutionError::Unresolvable {
-            requested: requested.clone(),
-            diagnostic,
-        }
-    })? {
-        Some(job) => {
-            let rev = job
-                .branch
-                .ok_or_else(|| BranchRefResolutionError::Unresolvable {
-                    requested: requested.clone(),
-                    diagnostic: "the node has no recorded branch".into(),
-                })?;
-            let project =
-                project_context_by_id(orch, &job.project_id)
-                    .await
-                    .map_err(|diagnostic| BranchRefResolutionError::Unresolvable {
-                        requested: requested.clone(),
-                        diagnostic,
-                    })?;
-            (project, rev)
-        }
-        None => {
-            let project =
-                project_context_for_request(orch, request)
-                    .await
-                    .map_err(|diagnostic| BranchRefResolutionError::Unresolvable {
-                        requested: requested.clone(),
-                        diagnostic,
-                    })?;
-            let rev = if branch.trim() == "main" {
-                project.default_branch.clone()
-            } else {
-                branch.trim().to_string()
-            };
-            (project, rev)
-        }
-    };
-
-    let repository_path =
-        project
-            .project_path
-            .ok_or_else(|| BranchRefResolutionError::Unresolvable {
-                requested: requested.clone(),
-                diagnostic: format!("project '{}' has no local repository", project.project_id),
-            })?;
-    let managed_store = crate::jj::project_store_dir(&orch.config_dir, &repository_path);
-    let revision_store = if crate::jj::is_jj_dir(&managed_store) {
-        managed_store.as_path()
-    } else {
-        repository_path.as_path()
-    };
-    let commit_id =
-        resolve_coordinate_repairing_conflicts(orch, revision_store, &rev, &project.default_branch)
-            .await
-            .map_err(|error| map_coordinate_error(error, &requested))?;
-    let revision_store = revision_store.to_path_buf();
-
-    Ok(RunBranchResolution {
-        project_id: project.project_id,
-        repository_path,
-        revision_store,
-        rev,
-        commit_id,
-        default_branch: project.default_branch,
-    })
-}
-
-/// Resolve a revision named for a surface already bound to one project, taking
-/// every form `read ?branch=` and `run branch:` take: a branch name (`main`
-/// standing for the project's default branch), a commit or change id, or a node
-/// URI standing for the branch that node recorded. Resolution runs through the
-/// same conflict-repairing path, in `repository`.
-///
-/// A node URI must name a node of `project_id`. The answer is about this
-/// project's repository, and quietly substituting another project's branch would
-/// answer a different question.
-pub(crate) async fn resolve_in_project(
-    orch: &Orchestrator,
-    project_id: &str,
-    repository: &Path,
-    default_branch: &str,
-    requested: &str,
-) -> Result<String, BranchRefResolutionError> {
-    let unresolvable = |diagnostic: String| BranchRefResolutionError::Unresolvable {
-        requested: requested.to_string(),
-        diagnostic,
-    };
-    if requested.trim().is_empty() {
-        return Err(BranchRefResolutionError::Invalid {
-            requested: requested.to_string(),
-        });
-    }
-    let rev = match resolve_node_uri(orch, requested)
+) -> Result<CapturedRevision, RevisionCaptureError> {
+    let revision = resolve_typed_revision(orch, RevisionScope::Caller(request), branch)
         .await
-        .map_err(unresolvable)?
-    {
-        Some(job) if job.project_id != project_id => {
-            return Err(unresolvable(format!(
-                "it names a node of another project, and this request belongs to project \
-                 '{project_id}'"
-            )));
-        }
-        Some(job) => job
-            .branch
-            .ok_or_else(|| unresolvable("the node has no recorded branch".into()))?,
-        None if requested.trim() == "main" => default_branch.to_string(),
-        None => requested.trim().to_string(),
-    };
-    resolve_coordinate_repairing_conflicts(orch, repository, &rev, default_branch)
-        .await
-        .map_err(|error| map_coordinate_error(error, requested))
+        .map_err(RevisionCaptureError::Resolution)?;
+    let store = run_revision_store(orch, &revision.project_path);
+    capture_revision(orch, revision, store, CapturePurpose::Run).await
 }
 
 async fn project_context_for_request(
@@ -930,20 +1268,10 @@ async fn project_context_by_id_in_db(
             };
             let repo_path = row.opt_text(0)?;
             let stored_default = row.opt_text(1)?;
-            let default_branch = if let Some(path) = repo_path.as_deref() {
-                let settings = crate::config::project_settings::load_project_settings_read_only(
-                    Path::new(path),
-                );
-                crate::config::project_settings::resolve_default_branch(
-                    &settings,
-                    stored_default.as_deref(),
-                )
-            } else {
-                crate::config::project_settings::resolve_default_branch(
-                    &crate::config::project_settings::ProjectSettingsFile::default(),
-                    stored_default.as_deref(),
-                )
-            };
+            let default_branch = crate::config::project_settings::effective_default_branch(
+                repo_path.as_deref().map(Path::new),
+                stored_default.as_deref(),
+            );
             Ok(ProjectBranchContext {
                 project_id,
                 project_path: repo_path.map(PathBuf::from),
@@ -1004,7 +1332,7 @@ async fn job_by_node_uri(
             Box::pin(async move {
                 let mut rows = if let Some(task_name) = task_name {
                     conn.query(
-                        "SELECT child.branch, p.id
+                        "SELECT child.branch, p.id, child.id
                          FROM jobs parent
                          JOIN jobs child ON child.parent_job_id = parent.id
                          JOIN issues i ON parent.issue_id = i.id
@@ -1029,7 +1357,7 @@ async fn job_by_node_uri(
                     .await?
                 } else {
                     conn.query(
-                        "SELECT j.branch, p.id
+                        "SELECT j.branch, p.id, j.id
                          FROM jobs j
                          JOIN issues i ON j.issue_id = i.id
                          JOIN projects p ON i.project_id = p.id
@@ -1064,6 +1392,7 @@ fn job_context_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<
     Ok(JobBranchContext {
         branch: row.opt_text(0)?,
         project_id: row.text(1)?,
+        job_id: row.text(2)?,
     })
 }
 
@@ -1076,7 +1405,7 @@ mod tests {
 
     async fn authority_db(issue_status: &str, job_status: &str) -> crate::storage::LocalDb {
         let db = crate::storage::migrated_test_db("publication-authority.db").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -1149,6 +1478,164 @@ mod tests {
             publication_authority_in(&db, "job-missing", None, Some("main")).await,
             PublicationAuthority::Authorized
         );
+    }
+
+    #[test]
+    fn pure_branch_read_resolution_never_repairs_names() {
+        let source = include_str!("branch.rs");
+        for (start, end) in [
+            (
+                "pub(crate) async fn resolve_current_for_read(",
+                "pub(crate) async fn current_base_branch(",
+            ),
+            (
+                "async fn resolve_default_for_read(",
+                "pub(crate) enum RevisionAuthority {",
+            ),
+            (
+                "async fn resolve_read_in_project(",
+                "pub(crate) async fn capture_for_run(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(body.contains("cairn_vcs::resolve_coordinate("), "{start}");
+            for forbidden in [
+                "resolve_coordinate_repairing_conflicts(",
+                "acquire_jj_store_lock(",
+                "repair_conflicted_branch_name(",
+                "coordinate_repository(",
+                "ensure_store_initialized(",
+                "reconcile_siblings",
+            ] {
+                assert!(!body.contains(forbidden), "{start} gained {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn publication_base_identity_includes_target_declaration_and_commit() {
+        let captured = super::PublicationBase {
+            branch: "main".into(),
+            commit: "base-a".into(),
+            declared: None,
+            default_branch: "main".into(),
+        };
+        assert_eq!(captured, captured.clone());
+        for changed in [
+            super::PublicationBase {
+                commit: "base-b".into(),
+                ..captured.clone()
+            },
+            super::PublicationBase {
+                branch: "parent".into(),
+                ..captured.clone()
+            },
+            super::PublicationBase {
+                declared: Some("main".into()),
+                ..captured.clone()
+            },
+            super::PublicationBase {
+                default_branch: "trunk".into(),
+                ..captured.clone()
+            },
+        ] {
+            assert_ne!(captured, changed);
+        }
+    }
+
+    /// A timed-out or cooling-down preparation reaches the caller as an
+    /// explicit preparation outcome: never "conflicts with base", never a
+    /// verdict, and naming the refusal itself. (The preparer's own runtime test
+    /// `an_expired_budget_times_the_fast_path_out_with_a_cooldown_and_installs_nothing`
+    /// proves the refusal and cooldown are produced; this proves what a check
+    /// or run makes of them.)
+    #[test]
+    fn timeout_and_cooldown_refusals_are_preparation_outcomes_not_verdicts() {
+        use crate::orchestrator::base_advance::preparation::PreparationRefusal;
+        for refusal in [
+            PreparationRefusal::TimedOut {
+                head: "h".repeat(40),
+                base_branch: "main".into(),
+                base_commit: "b".repeat(40),
+                budget: std::time::Duration::from_secs(30),
+            },
+            PreparationRefusal::Cooldown {
+                fingerprint: "tip:destination".into(),
+                retry_at: 1_793_926_013,
+            },
+        ] {
+            let shown = refusal.to_string();
+            let error = super::RevisionCaptureError::Preparation {
+                branch: "agent/x".into(),
+                refusal: Box::new(refusal),
+            };
+            assert!(!error.conflicts_with_base());
+            let text = error.to_string();
+            assert!(text.contains("`agent/x` could not be prepared"), "{text}");
+            assert!(text.contains("there is no verdict"), "{text}");
+            assert!(text.contains(&shown), "{text}");
+            assert!(!text.contains("Conflicts with base"), "{text}");
+        }
+    }
+
+    /// Capturing never delivers anything itself: every message, wake, steer, or
+    /// interrupt about a preparation is the preparer's to decide, and for a
+    /// check or run purpose it decides none.
+    #[test]
+    fn capturing_delivers_nothing_itself() {
+        let source = include_str!("branch.rs");
+        for start in [
+            "pub(crate) async fn capture_revision(",
+            "pub(crate) async fn capture_for_run(",
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once("\n}\n")
+                .unwrap()
+                .0;
+            for forbidden in [
+                "queue_system",
+                "attention",
+                "Steer",
+                "Interrupt",
+                "record_conflict_session",
+            ] {
+                assert!(!body.contains(forbidden), "{start} reaches {forbidden}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_declared_base_normalizes_like_the_preparer() {
+        assert_eq!(
+            super::normalized_base(Some("  agent/p  ".into())).as_deref(),
+            Some("agent/p")
+        );
+        assert_eq!(super::normalized_base(Some("   ".into())), None);
+        assert_eq!(super::normalized_base(None), None);
+    }
+
+    #[test]
+    fn only_a_hex_id_is_labelled_a_commit() {
+        assert!(super::looks_like_commit_id("0123abcd"));
+        assert!(super::looks_like_commit_id(&"a".repeat(40)));
+        for not_a_commit in [
+            "main",
+            "trunk",
+            "abc",
+            "agent/cairn-1-builder-0",
+            "zzzzzzzz",
+        ] {
+            assert!(!super::looks_like_commit_id(not_a_commit), "{not_a_commit}");
+        }
     }
 
     fn absent(coordinate: &str) -> cairn_vcs::CoordinateResolutionError {

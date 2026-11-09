@@ -107,9 +107,13 @@ pub struct PublicationTimings {
 /// verifies that the git ref moved, repairs a frozen export, and reattaches a
 /// checkout HEAD the export detached using the host's checkout repair policy.
 ///
-/// Both legs run inside one blocking task under the caller's already-held store
-/// lock: the export must observe exactly the bookmark this transaction wrote,
-/// with no other writer in between.
+/// Both legs run under the caller's already-held store lock: the export must
+/// observe exactly the bookmark this transaction wrote, with no other writer in
+/// between. They run through [`super::in_place_blocking`], with no `.await`
+/// anywhere in the body, so the future completes in the poll that starts it. A caller
+/// that is cancelled therefore cannot release its guard while either leg is
+/// still writing, which a detached `spawn_blocking` task would allow. Keep the
+/// body free of `.await`; the first-poll tests pin it.
 pub async fn publish_logical_head_exported(
     jj: &JjEnv,
     store: &Path,
@@ -119,11 +123,7 @@ pub async fn publish_logical_head_exported(
     identity: Option<crate::PublicationIdentity>,
     mode: crate::PublicationMode,
 ) -> Result<PublishedLogicalHead, String> {
-    let jj = jj.clone();
-    let store = store.to_path_buf();
-    let branch = branch.to_string();
-    let expected_head = expected_head.to_string();
-    tokio::task::spawn_blocking(move || {
+    super::in_place_blocking(|| {
         // jj-lib protects every commit it writes with a `refs/jj/keep/<id>`
         // ref whose update gix checks against `packed-refs`, so this in-process
         // transaction contends for `packed-refs.lock` exactly like the export
@@ -137,11 +137,11 @@ pub async fn publish_logical_head_exported(
         let _ = super::packed_refs::take_packed_refs_waited();
         let land_started = std::time::Instant::now();
         let landed =
-            with_packed_refs_patience(PackedRefs::JjStore(&store), "publish logical head", || {
+            with_packed_refs_patience(PackedRefs::JjStore(store), "publish logical head", || {
                 land_logical_head(
-                    &store,
-                    &branch,
-                    &expected_head,
+                    store,
+                    branch,
+                    expected_head,
                     proposed.clone(),
                     identity.clone(),
                     mode.clone(),
@@ -149,12 +149,14 @@ pub async fn publish_logical_head_exported(
             })?;
         let land = land_started.elapsed();
         let land_packed_refs = super::packed_refs::take_packed_refs_waited();
+        #[cfg(any(test, feature = "test-utils"))]
+        super::testing::publication_landed(store);
         let export_started = std::time::Instant::now();
         let export = export_bookmark_advance(
-            &jj,
-            &store,
+            jj,
+            store,
             true,
-            &branch,
+            branch,
             &format!("publish `{branch}` at the logical head"),
         );
         let timings = PublicationTimings {
@@ -171,8 +173,6 @@ pub async fn publish_logical_head_exported(
             timings,
         })
     })
-    .await
-    .map_err(|error| format!("logical-head publication worker failed: {error}"))?
 }
 
 /// Export `branch` as the store holds it now into the backing checkout's
@@ -615,11 +615,14 @@ pub fn pin_validated_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn revert_publication_refuses_amend_before_touching_the_store() {
+    use futures::FutureExt as _;
+
+    /// Run a publication the store refuses before writing anything, polling
+    /// it exactly once. `None` means the first poll left it pending.
+    fn refused_amend_in_one_poll() -> Option<Result<PublishedLogicalHead, String>> {
         let temp = tempfile::tempdir().unwrap();
         let jj = JjEnv::resolve("jj", temp.path());
-        let error = publish_logical_head_exported(
+        publish_logical_head_exported(
             &jj,
             temp.path(),
             "feature",
@@ -628,9 +631,39 @@ mod tests {
             None,
             crate::PublicationMode::Amend,
         )
-        .await
-        .err()
-        .expect("amend must be refused");
+        .now_or_never()
+    }
+
+    #[tokio::test]
+    async fn revert_publication_refuses_amend_before_touching_the_store() {
+        let error = refused_amend_in_one_poll()
+            .expect("finished in one poll")
+            .err()
+            .expect("amend must be refused");
         assert_eq!(error, "logical revert must publish a child commit");
+    }
+
+    /// Both legs run inside the poll that starts the publication, so no await
+    /// point exists where a cancelled caller could drop its store guard while
+    /// the writer runs on. On a current-thread runtime the work runs on a
+    /// thread the poll joins.
+    #[test]
+    fn a_publication_finishes_in_its_first_poll_on_a_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let polled = runtime.block_on(async { refused_amend_in_one_poll() });
+        assert!(polled.is_some(), "the publication awaited mid-write");
+    }
+
+    /// The same on a multi-thread runtime's worker, where the work runs in
+    /// place after handing the worker's core off rather than on a pooled task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publication_finishes_in_its_first_poll_on_a_multi_thread_worker() {
+        let polled = tokio::spawn(async { refused_amend_in_one_poll().is_some() })
+            .await
+            .unwrap();
+        assert!(polled, "the publication awaited mid-write");
     }
 }

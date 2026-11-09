@@ -96,6 +96,7 @@ use crate::execution::wire::{
     declared_check_reservation, CheckResourceIdentityInput, ReviewCheckWireInput,
 };
 use crate::fleet::{CellOutcome, CellPriority, CellRequest, MutationPolicy};
+use crate::mcp::handlers::branch::{CapturedRevision, TypedRevision};
 #[cfg(test)]
 use cairn_common::executor_protocol::{CellCommandClass, ResourceReservationSource};
 use cairn_common::executor_protocol::{
@@ -1219,6 +1220,60 @@ pub(crate) struct CheckContractSnapshot {
     placement: crate::execution::check_placement::EffectiveCheckPlacement,
     plan: CheckPlan,
     timeout_ms: u64,
+    /// How a manual run captured the commit it judges. `None` for the main
+    /// cadence and the pinBump lanes, which are handed an exact commit.
+    capture: Option<CheckCapture>,
+}
+
+/// How a manual check's judged commit was captured, reported in its result so
+/// a verdict always names the exact head and base it is about.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckCapture {
+    /// `managed` when the named branch was prepared against its base first,
+    /// `exact` when the revision was captured as it stands.
+    pub authority: String,
+    pub revision: String,
+    pub head_before: Option<String>,
+    /// The judged commit. For an exact capture it is also the head before.
+    pub head_after: String,
+    /// The Git tree object id of `head_after`, for a managed capture. Distinct
+    /// from the logical tree hash a check result reports as `treeHash`.
+    pub git_tree: Option<String>,
+    pub base_branch: Option<String>,
+    pub base_commit: Option<String>,
+    pub advanced: bool,
+    pub attempts: Option<u32>,
+    /// Incomplete follow-up of an accepted install, such as a failed export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    pub provenance: String,
+}
+
+impl CheckCapture {
+    pub(crate) fn of(captured: &CapturedRevision) -> Self {
+        let prepared = captured.prepared.as_ref();
+        Self {
+            authority: if prepared.is_some() {
+                "managed"
+            } else {
+                "exact"
+            }
+            .to_string(),
+            revision: captured.rev().to_string(),
+            head_before: prepared.map(|prepared| prepared.head_before.clone()),
+            head_after: captured.commit_id.clone(),
+            git_tree: prepared.map(|prepared| prepared.git_tree.clone()),
+            base_branch: prepared.map(|prepared| prepared.base_branch.clone()),
+            base_commit: prepared.map(|prepared| prepared.base_commit.clone()),
+            advanced: prepared.is_some_and(|prepared| prepared.advanced),
+            attempts: prepared.map(|prepared| prepared.attempts),
+            warnings: prepared
+                .map(|prepared| prepared.warnings.clone())
+                .unwrap_or_default(),
+            provenance: captured.provenance(),
+        }
+    }
 }
 
 /// Why a check requested from a thread session cannot resolve its own coordinate.
@@ -1246,11 +1301,12 @@ struct ManualRunRow {
     project_id: String,
     project_key: String,
     repository_path: String,
-    default_branch: String,
     /// The branch the job's work merges into: its parent issue's branch for a
     /// stacked child, the project default otherwise. The same expression the
     /// rendered diff and the merge gate resolve a node's base from.
     integration_target: String,
+    /// The branch the job minted for itself, when it has one.
+    branch: Option<String>,
 }
 
 /// Read a manual run's coordinates from `db`, which must be the run's OWNING
@@ -1264,8 +1320,8 @@ async fn load_manual_run_row(db: &LocalDb, run_id: &str) -> Result<ManualRunRow,
             let mut rows = conn
                 .query(
                     "SELECT r.job_id, r.project_id, p.key, p.repo_path,
-                            COALESCE(p.default_branch, 'main'),
-                            COALESCE(j.base_branch, p.default_branch, 'main')
+                            COALESCE(j.base_branch, p.default_branch, 'main'),
+                            j.branch
                      FROM runs r
                      JOIN projects p ON p.id = r.project_id
                      JOIN jobs j ON j.id = r.job_id
@@ -1284,8 +1340,8 @@ async fn load_manual_run_row(db: &LocalDb, run_id: &str) -> Result<ManualRunRow,
                 project_id: row.text(1)?,
                 project_key: row.text(2)?,
                 repository_path: row.text(3)?,
-                default_branch: row.text(4)?,
-                integration_target: row.text(5)?,
+                integration_target: row.text(4)?,
+                branch: row.opt_text(5)?.filter(|branch| !branch.trim().is_empty()),
             })
         })
     })
@@ -1293,19 +1349,150 @@ async fn load_manual_run_row(db: &LocalDb, run_id: &str) -> Result<ManualRunRow,
     .map_err(|error| error.to_string())
 }
 
-/// The branch a manual run's attribution is measured against. Checking the job's
-/// own head, it is the job's integration target, the same branch its merge gate
-/// measures it against. A revision named with `--branch` belongs to no job this
-/// run can see, so it is measured against the project's default branch.
-fn manual_attribution_target<'a>(
-    branch: Option<&str>,
-    job_integration_target: &'a str,
-    default_branch: &'a str,
-) -> &'a str {
-    match branch {
-        None => job_integration_target,
-        Some(_) => default_branch,
+/// The revision a manual check judges, as the check-run handler classified it
+/// before any observation existed.
+#[derive(Debug, Clone)]
+pub(crate) enum ManualCheckRevision {
+    /// The requesting job's own head. When the job owns a managed branch, the
+    /// run prepares it against its declared base first, exactly once.
+    OwnHead,
+    /// The requesting job's logical head exactly as it stands. A lookup that
+    /// only reads (the cache context) never prepares anything.
+    OwnHeadLiteral,
+    /// An exact revision, already captured at its commit.
+    Captured(Box<CapturedRevision>),
+    /// A managed branch named with `--branch`, the requester's or another
+    /// owner's, prepared once when the run starts.
+    Managed(Box<TypedRevision>),
+}
+
+/// The commit a manual check judges and what its change is measured against,
+/// captured once and carried unchanged through contract loading, keying,
+/// execution, and recording.
+struct ManualCheckCoordinate {
+    commit: String,
+    attribution_label: String,
+    /// The exact commit to measure from, when the capture fixed one.
+    attribution_commit: Option<String>,
+    capture: Option<CheckCapture>,
+}
+
+/// Preparation refusals remain typed until the request's durable terminal reply.
+#[derive(Debug)]
+pub(crate) enum ManualCheckError {
+    Capture(crate::mcp::handlers::branch::RevisionCaptureError),
+    Other(String),
+}
+
+impl From<String> for ManualCheckError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
     }
+}
+
+impl std::fmt::Display for ManualCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture(error) => write!(f, "{error}"),
+            Self::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+async fn capture_manual_check_coordinate(
+    orch: &Orchestrator,
+    row: &ManualRunRow,
+    revision: ManualCheckRevision,
+    check_name: &str,
+) -> Result<ManualCheckCoordinate, ManualCheckError> {
+    let captured = match revision {
+        ManualCheckRevision::Captured(captured) => *captured,
+        ManualCheckRevision::Managed(revision) => {
+            capture_managed_for_check(orch, *revision).await?
+        }
+        // A job with no branch of its own works directly on its base, which it
+        // does not manage: its head is taken as it stands.
+        ManualCheckRevision::OwnHead => match row.branch.as_deref() {
+            Some(branch) => {
+                let revision = crate::mcp::handlers::branch::resolve_own_branch_revision(
+                    orch,
+                    &row.project_id,
+                    branch,
+                    &row.job_id,
+                )
+                .await?;
+                capture_managed_for_check(orch, revision).await?
+            }
+            None => {
+                return own_logical_head(orch, row, check_name)
+                    .await
+                    .map_err(Into::into)
+            }
+        },
+        ManualCheckRevision::OwnHeadLiteral => {
+            return own_logical_head(orch, row, check_name)
+                .await
+                .map_err(Into::into);
+        }
+    };
+    let (attribution_label, attribution_commit) = captured.attribution();
+    Ok(ManualCheckCoordinate {
+        commit: captured.commit_id.clone(),
+        attribution_label,
+        attribution_commit,
+        capture: Some(CheckCapture::of(&captured)),
+    })
+}
+
+/// The job's logical head as it stands, measured against its integration
+/// target: a job with no managed branch of its own, or a pure lookup.
+async fn own_logical_head(
+    orch: &Orchestrator,
+    row: &ManualRunRow,
+    check_name: &str,
+) -> Result<ManualCheckCoordinate, String> {
+    let commit = crate::execution::cache::resolve_job_logical_head(orch, &row.job_id)
+        .await
+        .map_err(|error| match error {
+            crate::execution::cache::JobLogicalHeadError::Branchless {
+                thread_owned: true, ..
+            } => thread_session_coordinate_refusal(check_name),
+            other => other.to_string(),
+        })?;
+    Ok(ManualCheckCoordinate {
+        commit,
+        attribution_label: row.integration_target.clone(),
+        attribution_commit: None,
+        capture: None,
+    })
+}
+
+async fn capture_managed_for_check(
+    orch: &Orchestrator,
+    revision: TypedRevision,
+) -> Result<CapturedRevision, ManualCheckError> {
+    let store = manual_check_store(orch, &revision.project_path).await?;
+    crate::mcp::handlers::branch::capture_revision(
+        orch,
+        revision,
+        store,
+        crate::mcp::handlers::branch::CapturePurpose::Check,
+    )
+    .await
+    .map_err(ManualCheckError::Capture)
+}
+
+/// The managed store a manual check resolves and reads in, initialized if absent.
+async fn manual_check_store(orch: &Orchestrator, project_path: &Path) -> Result<PathBuf, String> {
+    let jj_binary_path = orch.jj_binary_path.clone();
+    let config_dir = orch.config_dir.clone();
+    let project_repo = project_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let jj = crate::jj::environment(&jj_binary_path, &config_dir);
+        crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+    })
+    .await
+    .map_err(|error| format!("manual check coordinate repository task failed: {error}"))?
 }
 
 /// Resolve every mutable input to a manual check exactly once. The returned owned
@@ -1315,41 +1502,25 @@ async fn resolve_manual_check_contract_snapshot(
     orch: &Orchestrator,
     run_id: &str,
     check_name: &str,
-    branch: Option<&str>,
+    revision: ManualCheckRevision,
     placement_override: Option<&crate::execution::check_placement::CheckPlacementOverride>,
-) -> Result<CheckContractSnapshot, String> {
+) -> Result<CheckContractSnapshot, ManualCheckError> {
     let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
         .await
         .map_err(|error| error.to_string())?;
+    let row = load_manual_run_row(&db, run_id).await?;
+    // Capture the coordinate FIRST: the captured commit supplies the content to
+    // check AND the definition to check it with, and nothing after this point
+    // resolves the requested name again.
+    let coordinate = capture_manual_check_coordinate(orch, &row, revision, check_name).await?;
     let ManualRunRow {
         job_id,
         project_id,
         project_key,
         repository_path,
-        default_branch,
-        integration_target,
-    } = load_manual_run_row(&db, run_id).await?;
-    let attribution_target =
-        manual_attribution_target(branch, &integration_target, &default_branch).to_string();
-    let repository = PathBuf::from(&repository_path);
-    // Resolve the coordinate FIRST: the requested branch (or the job's logical
-    // head) supplies the content to check AND the definition to check it with.
-    let commit = match branch {
-        Some(branch) => {
-            resolve_manual_check_branch(orch, &project_id, &repository, &default_branch, branch)
-                .await?
-        }
-        None => crate::execution::cache::resolve_job_logical_head(orch, &job_id)
-            .await
-            .map_err(|error| match error {
-                crate::execution::cache::JobLogicalHeadError::Branchless {
-                    thread_owned: true,
-                    ..
-                } => thread_session_coordinate_refusal(check_name),
-                other => other.to_string(),
-            })?,
-    };
-    resolve_check_contract_at_commit(
+        ..
+    } = row;
+    let mut snapshot = resolve_check_contract_at_commit(
         orch,
         db,
         CheckRunTarget {
@@ -1357,13 +1528,102 @@ async fn resolve_manual_check_contract_snapshot(
             project_id,
             project_key,
             repository_path,
-            attribution_target,
+            attribution_target: coordinate.attribution_label,
+            attribution_commit: coordinate.attribution_commit,
         },
-        commit,
+        coordinate.commit,
         check_name,
         placement_override,
     )
-    .await
+    .await?;
+    snapshot.capture = coordinate.capture;
+    Ok(snapshot)
+}
+
+/// What a manual check's one snapshot fixed, for boundary tests: the judged
+/// commit and every stage's view of it.
+#[cfg(test)]
+pub(crate) struct ManualCaptureEvidence {
+    pub(crate) commit: String,
+    pub(crate) defined_by: String,
+    pub(crate) tree_hash: String,
+    pub(crate) input_hash: String,
+    pub(crate) change_head: String,
+    pub(crate) change_base: String,
+    pub(crate) changed: Vec<String>,
+    pub(crate) capture: Option<CheckCapture>,
+}
+
+#[cfg(test)]
+pub(crate) async fn manual_capture_evidence(
+    orch: &Orchestrator,
+    run_id: &str,
+    check_name: &str,
+    revision: ManualCheckRevision,
+) -> Result<ManualCaptureEvidence, String> {
+    let snapshot = resolve_manual_check_contract_snapshot(orch, run_id, check_name, revision, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ManualCaptureEvidence {
+        commit: snapshot.context.commit_sha.clone(),
+        defined_by: snapshot.defined_by_commit.clone(),
+        tree_hash: snapshot.context.tree_hash.clone(),
+        input_hash: snapshot.context.input_hash.clone(),
+        change_head: snapshot.change.head.clone(),
+        change_base: snapshot.change.base.clone(),
+        changed: snapshot
+            .change
+            .changed
+            .iter()
+            .map(|change| change.path.clone())
+            .collect(),
+        capture: snapshot.capture.clone(),
+    })
+}
+
+#[cfg(test)]
+mod capture_boundary_tests {
+    /// After the one capture, no stage of a manual check (contract, tree,
+    /// changed files, key, cache, observation, materialization, result) resolves
+    /// a moving name or captures again: each reads the commit it is handed.
+    #[test]
+    fn no_stage_after_the_capture_resolves_a_name_again() {
+        let source = include_str!("checks.rs");
+        // Anchored at a line start, so the markers quoted in this test never
+        // match themselves: only the definition does.
+        let body = |start: &str| {
+            source
+                .split_once(&format!("\n{start}"))
+                .unwrap_or_else(|| panic!("{start} is gone"))
+                .1
+                .split_once("\n}\n")
+                .unwrap()
+                .0
+                .to_string()
+        };
+        let snapshot = body("async fn resolve_manual_check_contract_snapshot(");
+        assert_eq!(
+            snapshot.matches("capture_manual_check_coordinate(").count(),
+            1,
+            "exactly one capture per manual check"
+        );
+        for start in [
+            "pub(crate) async fn resolve_check_contract_at_commit(",
+            "pub(crate) async fn execute_check_contract(",
+            "async fn resolve_base_relative_change(",
+        ] {
+            let stage = body(start);
+            for forbidden in [
+                "resolve_coordinate(",
+                "resolve_job_logical_head(",
+                "capture_revision(",
+                "prepare_branch(",
+                "resolve_typed_revision(",
+            ] {
+                assert!(!stage.contains(forbidden), "{start} calls {forbidden}");
+            }
+        }
+    }
 }
 
 /// The forms `--branch` takes, named in each refusal that would otherwise leave
@@ -1372,57 +1632,41 @@ const MANUAL_CHECK_BRANCH_FORMS: &str = "--branch takes a branch name (`main`, \
      `agent/cairn-123-builder-0`), a commit id, or a node URI \
      (`cairn://p/PROJECT/ISSUE/EXEC/NODE`), the same forms `read ?branch=` and `run branch:` take";
 
-/// Resolve the revision a manual check names with `--branch` to the commit it
-/// evaluates, in the project of the run that asked.
+/// Classify the revision a manual check names with `--branch`, in the project
+/// of the run that asked.
 ///
 /// The check-run handler calls this before it mints an observation, so a
-/// revision that names nothing is refused before anything is queued.
-pub(crate) async fn resolve_manual_check_revision(
+/// revision that names nothing is refused before anything is queued. An exact
+/// revision is captured here, at its commit; a managed branch is only
+/// classified, because preparing it can take the whole preparation budget and
+/// belongs to the run, which prepares it exactly once.
+pub(crate) async fn classify_manual_check_revision(
     orch: &Orchestrator,
     run_id: &str,
     branch: &str,
-) -> Result<String, String> {
+) -> Result<ManualCheckRevision, String> {
+    use crate::mcp::handlers::branch::{
+        capture_revision, resolve_typed_revision, CapturePurpose, RevisionAuthority,
+        RevisionCaptureError, RevisionScope,
+    };
     let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
         .await
         .map_err(|error| error.to_string())?;
     let row = load_manual_run_row(&db, run_id).await?;
-    resolve_manual_check_branch(
-        orch,
-        &row.project_id,
-        Path::new(&row.repository_path),
-        &row.default_branch,
-        branch,
-    )
-    .await
-}
-
-async fn resolve_manual_check_branch(
-    orch: &Orchestrator,
-    project_id: &str,
-    repository: &Path,
-    default_branch: &str,
-    branch: &str,
-) -> Result<String, String> {
-    let coordinate_repository = {
-        let jj_binary_path = orch.jj_binary_path.clone();
-        let config_dir = orch.config_dir.clone();
-        let project_repo = repository.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-        })
+    let revision = resolve_typed_revision(orch, RevisionScope::Project(&row.project_id), branch)
         .await
-        .map_err(|error| format!("manual check coordinate repository task failed: {error}"))??
-    };
-    crate::mcp::handlers::branch::resolve_in_project(
-        orch,
-        project_id,
-        &coordinate_repository,
-        default_branch,
-        branch,
-    )
-    .await
-    .map_err(|error| manual_check_branch_refusal(&error))
+        .map_err(|error| manual_check_branch_refusal(&error))?;
+    if matches!(revision.authority, RevisionAuthority::Managed { .. }) {
+        return Ok(ManualCheckRevision::Managed(Box::new(revision)));
+    }
+    let store = manual_check_store(orch, &revision.project_path).await?;
+    capture_revision(orch, revision, store, CapturePurpose::Check)
+        .await
+        .map(|captured| ManualCheckRevision::Captured(Box::new(captured)))
+        .map_err(|error| match error {
+            RevisionCaptureError::Resolution(error) => manual_check_branch_refusal(&error),
+            other => other.to_string(),
+        })
 }
 
 fn manual_check_branch_refusal(
@@ -1453,8 +1697,12 @@ pub(crate) struct CheckRunTarget {
     pub(crate) project_key: String,
     pub(crate) repository_path: String,
     /// The branch whose fork point with the evaluated commit is this run's
-    /// base. See [`manual_attribution_target`].
+    /// base: a managed revision's declared integration target, the project
+    /// default for an exact one, the job's target for its own literal head.
     pub(crate) attribution_target: String,
+    /// The exact commit of `attribution_target` to measure from, when the
+    /// capture fixed one. `None` resolves the target by name.
+    pub(crate) attribution_commit: Option<String>,
 }
 
 /// Resolve every mutable input to one configured check at one already-resolved
@@ -1475,6 +1723,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
         project_key,
         repository_path,
         attribution_target,
+        attribution_commit,
     } = target;
     let repository = PathBuf::from(&repository_path);
     let CommitChecksContract {
@@ -1506,7 +1755,11 @@ pub(crate) async fn resolve_check_contract_at_commit(
         placement_override,
         |name| orch.fleet.executor_os_named(name),
     )?;
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let jj = immutable_read_jj(
+        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        &repository,
+        &[&commit],
+    )?;
     let tree_hash = crate::jj::logical_tree_hash(&jj, &repository, &commit)?;
     let entries = crate::jj::tree_entries(&jj, &repository, &commit).ok();
     let blobs = TreeBlobs {
@@ -1521,6 +1774,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
         &repository,
         &commit,
         &attribution_target,
+        attribution_commit.as_deref().unwrap_or(&attribution_target),
         check_name,
     )
     .await
@@ -1576,6 +1830,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
         placement,
         plan,
         timeout_ms: timeout_ms.into(),
+        capture: None,
     })
 }
 
@@ -1608,6 +1863,7 @@ async fn base_relative_transport(
         config_dir,
         project_repository,
         head,
+        target,
         target,
         check_name,
     )
@@ -1661,12 +1917,38 @@ impl BaseRelativeChange {
     }
 }
 
+/// `jj` pinned for a read addressed only by the immutable `commits` in
+/// `repository`. An unpinned command (even `jj git root`, or a diff between two
+/// commit ids) loads the store at its head and merges a split operation log on
+/// the way, which a read must never do. A plain Git checkout has no operation
+/// log, so its reads run unpinned. A commit no operation indexes is an error,
+/// never a fall back to the moving head.
+pub(crate) fn immutable_read_jj(
+    jj: &JjEnv,
+    repository: &Path,
+    commits: &[&str],
+) -> Result<JjEnv, String> {
+    if !crate::jj::is_jj_dir(repository) {
+        return Ok(jj.clone());
+    }
+    jj.pin_immutable_read(repository, commits).map_err(|error| {
+        format!(
+            "the captured commits {} cannot be read without reconciling the store: {error}",
+            commits.join(", ")
+        )
+    })
+}
+
+/// `target` labels the integration target; `target_revision` is what the fork
+/// point is computed from: the same name, or the exact commit a capture fixed so
+/// a target that moves after capture cannot change this run's base.
 async fn resolve_base_relative_change(
     jj_binary_path: &str,
     config_dir: &Path,
     project_repository: &Path,
     head: &str,
     target: &str,
+    target_revision: &str,
     check_name: &str,
 ) -> Result<BaseRelativeChange, String> {
     let jj = crate::jj::environment(jj_binary_path, config_dir);
@@ -1680,12 +1962,16 @@ async fn resolve_base_relative_change(
         .await
         .map_err(|error| format!("coordinate repository task failed: {error}"))??
     };
-    let base = cairn_vcs::merge_base(&repository, head, target)
+    let base = cairn_vcs::merge_base(&repository, head, target_revision)
         .await
         .map_err(|error| {
-            format!("the fork point of {head} with integration target {target:?} is unresolvable: {error}")
+            format!(
+                "the fork point of {head} with integration target {target:?} at \
+                 {target_revision} is unresolvable: {error}"
+            )
         })?
         .base;
+    let jj = immutable_read_jj(&jj, &repository, &[head, base.as_str()])?;
     let head = head.to_string();
     let names_base_blobs = needs_executor_base_content(check_name);
     let target = target.to_string();
@@ -1796,17 +2082,24 @@ fn manual_check_batch_item(
 /// Resolve manual check evidence from an authenticated run's durable coordinate.
 /// The logical head is sealed by construction, so process cwd and loose host files
 /// cannot influence cache ownership or the computed tree.
+///
+/// A lookup only reads: it keys the job's logical head as it stands and never
+/// prepares the branch against its base.
 pub async fn manual_check_cache_context(
     orch: &Orchestrator,
     run_id: &str,
     check_name: &str,
-    branch: Option<&str>,
 ) -> Result<ManualCheckCacheContext, String> {
-    Ok(
-        resolve_manual_check_contract_snapshot(orch, run_id, check_name, branch, None)
-            .await?
-            .context,
+    Ok(resolve_manual_check_contract_snapshot(
+        orch,
+        run_id,
+        check_name,
+        ManualCheckRevision::OwnHeadLiteral,
+        None,
     )
+    .await
+    .map_err(|error| error.to_string())?
+    .context)
 }
 
 /// Result of a trusted, agent-initiated configured check run.
@@ -1879,6 +2172,9 @@ pub struct ManualConfiguredCheckResult {
     /// Why the reported verdict does not answer the placement this request
     /// demanded, when it does not. Such a verdict is not this request's answer.
     pub placement_unmet: Option<String>,
+    /// How the judged commit was captured: the head before and after any
+    /// preparation and the exact base it contains.
+    pub capture: Option<CheckCapture>,
 }
 
 /// A machine as a check result names it.
@@ -2009,6 +2305,7 @@ fn manual_configured_check_result(
         runtime: None,
         placement_note: None,
         placement_unmet: None,
+        capture: None,
     }
 }
 
@@ -2051,35 +2348,6 @@ fn manual_check_no_verdict(outcome: &CheckOutcome) -> Option<ManualCheckNoVerdic
         after_failures: outcome.suppressed_after,
         cause: outcome.output_tail.clone(),
     })
-}
-
-/// Execute one named configured suite at an authenticated agent run's sealed head.
-///
-/// This is the trusted manual producer. It deliberately accepts no raw command or
-/// caller-asserted result metadata: the durable run resolves ownership and commit,
-/// the live project contract supplies the command, and the normal planned-check
-/// path computes identities, performs conservative reuse, executes misses, parses
-/// results, and records immutable observations.
-pub async fn run_manual_configured_check(
-    orch: &Orchestrator,
-    run_id: &str,
-    check_name: &str,
-    branch: Option<&str>,
-    placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
-) -> Result<ManualConfiguredCheckResult, String> {
-    run_manual_configured_check_with_progress(
-        orch,
-        run_id,
-        ManualCheckRequest {
-            check_name,
-            branch,
-            placement,
-            retry: false,
-            manual_handle: None,
-        },
-        Arc::new(|_| {}),
-    )
-    .await
 }
 
 /// One step of a manual check's progress, as its requester is shown it.
@@ -2125,23 +2393,35 @@ fn manual_progress_update(
     }
 }
 
+/// One manual check request: the configured suite, the revision its run
+/// names (captured at most once, by the run), and the durable request handle
+/// its answer is recorded under, when the request has one.
 pub(crate) struct ManualCheckRequest<'a> {
     pub check_name: &'a str,
-    pub branch: Option<&'a str>,
+    pub revision: ManualCheckRevision,
     pub placement: Option<crate::execution::check_placement::CheckPlacementOverride>,
     pub retry: bool,
     pub manual_handle: Option<&'a str>,
 }
 
+/// Execute one named configured suite at the revision a run's check names,
+/// reporting progress as it goes.
+///
+/// This is the trusted manual producer. It deliberately accepts no raw command or
+/// caller-asserted result metadata: the durable run resolves ownership, the
+/// one capture of `revision` fixes the commit, the contract that commit declares
+/// supplies the command, and the normal planned-check path computes identities,
+/// performs conservative reuse, executes misses, parses results, and records
+/// immutable observations.
 pub(crate) async fn run_manual_configured_check_with_progress(
     orch: &Orchestrator,
     run_id: &str,
     request: ManualCheckRequest<'_>,
     progress: ManualCheckProgress,
-) -> Result<ManualConfiguredCheckResult, String> {
+) -> Result<ManualConfiguredCheckResult, ManualCheckError> {
     let ManualCheckRequest {
         check_name,
-        branch,
+        revision,
         placement,
         retry,
         manual_handle,
@@ -2150,7 +2430,7 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         orch,
         run_id,
         check_name,
-        branch,
+        revision,
         placement.as_ref(),
     )
     .await?;
@@ -2163,6 +2443,7 @@ pub(crate) async fn run_manual_configured_check_with_progress(
             project_key: contract.context.project_key.clone(),
             command: Some(contract.plan.command.clone()),
             placement: contract.placement.clone(),
+            capture: contract.capture.clone(),
             runtime_instruments: contract
                 .plan
                 .verdict_runtime
@@ -2184,7 +2465,9 @@ pub(crate) async fn run_manual_configured_check_with_progress(
             .await
             .map_err(|error| format!("could not persist manual check request context: {error}"))?;
         if updated != 1 {
-            return Err("manual check request has no durable handle".into());
+            return Err(ManualCheckError::Other(
+                "manual check request has no durable handle".to_string(),
+            ));
         }
     }
     execute_check_contract(
@@ -2204,6 +2487,7 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         progress,
     )
     .await
+    .map_err(Into::into)
 }
 
 /// The producer a configured check run records itself as.
@@ -2234,6 +2518,7 @@ pub(crate) async fn execute_check_contract(
 ) -> Result<ManualConfiguredCheckResult, String> {
     let check_name = contract.plan.name.clone();
     let check_name = check_name.as_str();
+    let capture = contract.capture;
     let placement = contract.placement;
     let context = contract.context;
     let repository_path = contract.repository_path;
@@ -2411,6 +2696,7 @@ pub(crate) async fn execute_check_contract(
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     enrich_manual_check_result(orch, &mut result, machine, &placement, &instruments);
+    result.capture = capture;
     Ok(result)
 }
 
@@ -2423,6 +2709,11 @@ struct ManualCheckRecoveryContext {
     #[serde(default)]
     command: Option<String>,
     placement: crate::execution::check_placement::EffectiveCheckPlacement,
+    /// How the request captured the commit it judged, so a recovered reply
+    /// names the same head and base the live one did. Absent from requests
+    /// recorded before it was kept.
+    #[serde(default)]
+    capture: Option<CheckCapture>,
     runtime_instruments: Vec<String>,
 }
 
@@ -2534,6 +2825,7 @@ pub(crate) async fn recover_manual_check_result(
         &context.placement,
         &context.runtime_instruments,
     );
+    result.capture = context.capture;
     Ok(result)
 }
 
@@ -7324,6 +7616,20 @@ pub(crate) async fn cancel_stale_review_on_branch_advance(
     job_id: &str,
     advance: BranchAdvance,
 ) {
+    cancel_stale_review_on_branch_advance_except(orch, job_id, advance, None).await;
+}
+
+/// [`cancel_stale_review_on_branch_advance`], sparing the wave of `except`: a
+/// review wave whose own capture prepared the branch. That wave has not planned
+/// anything yet and judges the head the advance produced, so withdrawing it
+/// would only cancel the review the advance was performed for. Every other wave
+/// sharing the branch still follows the rule.
+pub(crate) async fn cancel_stale_review_on_branch_advance_except(
+    orch: &Orchestrator,
+    job_id: &str,
+    advance: BranchAdvance,
+    except: Option<&str>,
+) {
     if !advance.supersedes_review() {
         if orch.turn_end_checks_in_flight(job_id) {
             log::info!(
@@ -7334,6 +7640,9 @@ pub(crate) async fn cancel_stale_review_on_branch_advance(
         return;
     }
     for stale in jobs_sharing_branch(&orch.db.local, job_id).await {
+        if except == Some(stale.as_str()) {
+            continue;
+        }
         // Name the tree the withdrawn wave was verifying. A supersession logged
         // as "cancelled" alone leaves a reader unable to tell a wave stopped for
         // the right reason — the tree it holds is no longer the node's — from
@@ -12785,8 +13094,14 @@ async fn run_prospective_tree_checks(
     );
     // The gate evaluates the PROSPECTIVE tree, so its input closures are derived
     // from that tree's manifests — the same entries it keys verdicts by.
-    let gate_jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let gate_repository = PathBuf::from(repository);
+    // The prospective commit may be hidden (built and not installed); the pin
+    // indexes it anyway, and the caller's object lease keeps it readable.
+    let gate_jj = immutable_read_jj(
+        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        &gate_repository,
+        &[commit_id, base_commit_id],
+    )?;
     let blobs = TreeBlobs {
         jj: &gate_jj,
         repository: &gate_repository,
@@ -16144,6 +16459,9 @@ cairn-common = { path = "../cairn-common" }
             "src-tauri/os/cairn-models/codex-pin.json",
             "scripts/tool-pin.ts",
             "scripts/lib/managed-tools.ts",
+            "scripts/lib/codex-app-server-smoke.ts",
+            "scripts/lib/pinned-download.ts",
+            "package.json",
         ] {
             assert_ne!(base, key_with(input, "v2"), "{input} must re-key codex-pin");
         }
@@ -26607,7 +26925,7 @@ mod manual_transport_tests {
             home.path(),
             repo,
             &head,
-            manual_attribution_target(Some("feature"), "ignored", "main"),
+            "main",
             EXECUTOR_PROTOCOL_CHECK,
             None,
         )
@@ -26655,7 +26973,7 @@ mod manual_transport_tests {
             home.path(),
             repo,
             &head,
-            manual_attribution_target(None, "agent/parent", "main"),
+            "agent/parent",
             "rust-lint",
             None,
         )
@@ -26711,7 +27029,7 @@ mod manual_transport_tests {
                 home.path(),
                 repo,
                 &head,
-                manual_attribution_target(Some("feature"), "ignored", "main"),
+                "main",
                 "lint",
                 Some((db.clone(), "project-a".to_string())),
             )
@@ -26848,15 +27166,7 @@ mod manual_transport_tests {
 
         let child = load_manual_run_row(&db, "run-child").await.unwrap();
         assert_eq!(child.integration_target, "agent/parent");
-        assert_eq!(child.default_branch, "main");
-        assert_eq!(
-            manual_attribution_target(None, &child.integration_target, &child.default_branch),
-            "agent/parent"
-        );
-        assert_eq!(
-            manual_attribution_target(Some("x"), &child.integration_target, &child.default_branch),
-            "main"
-        );
+        assert_eq!(child.branch.as_deref(), Some("agent/child"));
 
         let root = load_manual_run_row(&db, "run-root").await.unwrap();
         assert_eq!(root.integration_target, "main");
@@ -27512,7 +27822,7 @@ mod write_check_stack_headroom {
     };
     use tokio::sync::mpsc;
 
-    fn commit(repo: &Path, files: &[(&str, &str)], message: &str) -> String {
+    pub(super) fn commit(repo: &Path, files: &[(&str, &str)], message: &str) -> String {
         for (path, content) in files {
             let path = repo.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -27525,7 +27835,11 @@ mod write_check_stack_headroom {
 
     /// The colocated machine's answer to the one-item batch it was granted:
     /// the item ran and exited zero.
-    fn passed_batch(request: &CellRequest, header: &str, generation: u64) -> CellOutcome {
+    pub(super) fn passed_batch(
+        request: &CellRequest,
+        header: &str,
+        generation: u64,
+    ) -> CellOutcome {
         let item = ProcessBatchItemOutcome {
             header: header.into(),
             body: String::new(),
@@ -27754,6 +28068,288 @@ mod write_check_stack_headroom {
                 "the write check was placed, run, and answered passed: {summary}"
             );
             machine.await.unwrap();
+        });
+    }
+}
+
+/// A manual check captured, then queued: everything about it was fixed at the
+/// capture, so moving the branch, its base, and the contract while it waits for
+/// a machine changes nothing it materializes, runs, or records.
+#[cfg(test)]
+mod queued_capture_tests {
+    use super::write_check_stack_headroom::{commit, passed_batch};
+    use super::*;
+    use crate::db::DbState;
+    use crate::jj::tests::{git, init_project, jj_bin};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::stack_headroom::within_budget;
+    use crate::storage::{RowExt, SearchIndex};
+    use cairn_common::executor_protocol::ExecutorMessage;
+    use tokio::sync::{mpsc, oneshot};
+
+    const FOREIGN: &str = "agent/foreign";
+    const OLD_CONTRACT: &str =
+        "checks:\n  unit:\n    command: echo old-contract\n    when: review\n";
+    const NEW_CONTRACT: &str =
+        "checks:\n  unit:\n    command: echo new-contract\n    when: review\n";
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_queued_manual_check_stays_on_its_capture_while_branch_base_and_contract_move() {
+        let Some(bin) = jj_bin() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path().to_path_buf();
+        init_project(&repo);
+        commit(
+            &repo,
+            &[(".cairn/config.yaml", OLD_CONTRACT)],
+            "declare unit",
+        );
+        git(&repo, &["checkout", "-q", "-b", FOREIGN]);
+        let foreign_before = commit(&repo, &[("foreign.rs", "foreign\n")], "foreign work");
+        git(&repo, &["checkout", "-q", "main"]);
+        let base = commit(&repo, &[("main.rs", "main\n")], "main moves first");
+
+        within_budget("queued manual check capture", move || async move {
+            let config_dir = home.path().to_path_buf();
+            let jj = crate::jj::environment(&bin, &config_dir);
+            let store = {
+                let (jj, config_dir, repo) = (jj.clone(), config_dir.clone(), repo.clone());
+                tokio::task::spawn_blocking(move || {
+                    crate::jj::coordinate_repository(&jj, &config_dir, &repo)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+            };
+            let local = LocalDb::open_migrated_for_test(config_dir.join("checks.db"))
+                .await
+                .unwrap();
+            let repo_path = repo.to_string_lossy().into_owned();
+            local
+                .execute(
+                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
+                    (),
+                )
+                .await
+                .unwrap();
+            local
+                .execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj','ws','P','p',?1,'main',1,1)",
+                    (repo_path.as_str(),),
+                )
+                .await
+                .unwrap();
+            for statement in [
+                "INSERT INTO jobs(id, project_id, branch, status, created_at, updated_at)
+                 VALUES ('job','proj','agent/requester','running',1,1)",
+                "INSERT INTO jobs(id, project_id, branch, status, created_at, updated_at)
+                 VALUES ('other','proj','agent/foreign','running',1,1)",
+                "INSERT INTO runs(id, project_id, job_id, created_at, updated_at)
+                 VALUES ('run','proj','job',1,1)",
+            ] {
+                local.execute(statement, ()).await.unwrap();
+            }
+            let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+            let orch = Orchestrator::builder(
+                Arc::new(DbState::new(Arc::new(local), search)),
+                Arc::new(TestServicesBuilder::new().build()),
+                config_dir.clone(),
+            )
+            .jj_binary_path(bin.clone())
+            .build();
+
+            // The colocated machine holds the offer (the check is queued) until
+            // the test lets it claim, then reports what it was granted.
+            let (sender, mut executor) = mpsc::unbounded_channel();
+            let generation = orch.fleet.attach_executor(sender);
+            let fleet = orch.fleet.clone();
+            let (offered_tx, offered) = oneshot::channel::<()>();
+            let (go, go_rx) = oneshot::channel::<()>();
+            let (granted_tx, granted) = oneshot::channel();
+            let machine = tokio::spawn(async move {
+                let entry_id = loop {
+                    match executor.recv().await {
+                        Some(ExecutorMessage::Offer { entry_id, .. }) => break entry_id,
+                        Some(_) => continue,
+                        None => panic!("the check is offered to the colocated executor"),
+                    }
+                };
+                offered_tx.send(()).unwrap();
+                go_rx.await.unwrap();
+                fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Claim { entry_id },
+                );
+                let (request, batch) = loop {
+                    match executor.recv().await {
+                        Some(ExecutorMessage::Granted {
+                            request,
+                            batch: Some(batch),
+                            ..
+                        }) => break (request, batch),
+                        Some(_) => continue,
+                        None => panic!("the claimed check is granted with its batch"),
+                    }
+                };
+                let outcome = passed_batch(&request, &batch.items[0].header, generation);
+                let materialized = (
+                    request.base_commit.clone(),
+                    serde_json::to_string(&batch).unwrap(),
+                );
+                fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::Result {
+                        request_id: request.request_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        outcome,
+                    },
+                );
+                granted_tx.send(materialized).unwrap();
+            });
+
+            let revision = classify_manual_check_revision(&orch, "run", FOREIGN)
+                .await
+                .unwrap();
+            assert!(
+                matches!(revision, ManualCheckRevision::Managed(_)),
+                "{revision:?}"
+            );
+            let check_orch = orch.clone();
+            let check = tokio::spawn(async move {
+                run_manual_configured_check_with_progress(
+                    &check_orch,
+                    "run",
+                    ManualCheckRequest {
+                        check_name: "unit",
+                        revision,
+                        placement: None,
+                        retry: false,
+                        manual_handle: None,
+                    },
+                    Arc::new(|_| {}),
+                )
+                .await
+            });
+
+            offered.await.expect("the captured check reaches the queue");
+            let captured = cairn_vcs::resolve_coordinate(&store, FOREIGN)
+                .await
+                .unwrap();
+            assert_ne!(captured, foreign_before, "the capture prepared the branch");
+            let captured_tree = crate::jj::logical_tree_hash(&jj, &repo, &captured).unwrap();
+
+            // While it is queued: the base advances with a new contract and a
+            // new file, and the branch name moves off the captured head.
+            git(&repo, &["checkout", "-q", "main"]);
+            let moved_base = commit(
+                &repo,
+                &[
+                    (".cairn/config.yaml", NEW_CONTRACT),
+                    ("moved.rs", "moved\n"),
+                ],
+                "base moves while the check is queued",
+            );
+            crate::jj::ensure_project_store(&jj, &store, &repo).unwrap();
+            jj.run(
+                &store,
+                &[
+                    "--ignore-working-copy",
+                    "bookmark",
+                    "set",
+                    FOREIGN,
+                    "--allow-backwards",
+                    "-r",
+                    &foreign_before,
+                ],
+                "move the branch while the check is queued",
+            )
+            .unwrap();
+            assert_eq!(
+                cairn_vcs::resolve_coordinate(&store, "main").await.unwrap(),
+                moved_base
+            );
+            assert_eq!(
+                cairn_vcs::resolve_coordinate(&store, FOREIGN)
+                    .await
+                    .unwrap(),
+                foreign_before
+            );
+
+            go.send(()).unwrap();
+            let (materialized_commit, batch) = granted.await.unwrap();
+            let result = check.await.unwrap().expect("the queued check completes");
+            machine.await.unwrap();
+
+            assert_eq!(
+                materialized_commit, captured,
+                "the cell checks out the captured head"
+            );
+            assert!(
+                batch.contains("old-contract"),
+                "the captured contract runs: {batch}"
+            );
+            assert!(
+                !batch.contains("new-contract"),
+                "the moved contract leaked in: {batch}"
+            );
+            assert!(
+                batch.contains("foreign.rs"),
+                "the captured change rides: {batch}"
+            );
+            assert!(
+                !batch.contains("moved.rs"),
+                "the base's later file leaked in: {batch}"
+            );
+
+            assert!(result.passed);
+            assert_eq!(
+                result.commit_sha, captured,
+                "the result names the captured head"
+            );
+            assert_eq!(result.tree_hash, captured_tree);
+            let capture = result
+                .capture
+                .clone()
+                .expect("the result reports its capture");
+            assert_eq!(
+                capture.head_before.as_deref(),
+                Some(foreign_before.as_str())
+            );
+            assert_eq!(capture.head_after, captured);
+            assert_eq!(capture.base_branch.as_deref(), Some("main"));
+            assert_eq!(capture.base_commit.as_deref(), Some(base.as_str()));
+            assert!(result.observation_ref.is_some(), "the verdict was recorded");
+
+            let (input_hash, tree) = (result.input_hash.clone(), captured_tree.clone());
+            let recorded: i64 = orch
+                .db
+                .local
+                .read(move |conn| {
+                    let (input_hash, tree) = (input_hash.clone(), tree.clone());
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT COUNT(*) FROM check_result_cache
+                                  WHERE check_name = 'unit' AND tree_hash = ?1 AND input_hash = ?2",
+                                (tree.as_str(), input_hash.as_str()),
+                            )
+                            .await?;
+                        rows.next().await?.unwrap().i64(0)
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                recorded, 1,
+                "the verdict is keyed by the captured tree and input"
+            );
         });
     }
 }

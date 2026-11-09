@@ -6,7 +6,7 @@ use super::super::projects::{
 };
 use super::super::{build_failure, payload_non_empty_str, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{JjStoreGuard, Orchestrator};
 use cairn_uri::CairnResource;
 
 pub(super) async fn dispatch(
@@ -16,6 +16,7 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
+    held_store: Option<&JjStoreGuard>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary =
         match (resource, item.mode) {
@@ -81,7 +82,7 @@ pub(super) async fn dispatch(
                     .payload
                     .as_ref()
                     .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
-                apply_project_settings_patch(orch, project, payload, dry_run)
+                apply_project_settings_patch(orch, project, payload, dry_run, held_store)
                     .await
                     .map_err(|error| build_failure(index, item, error))?
             }

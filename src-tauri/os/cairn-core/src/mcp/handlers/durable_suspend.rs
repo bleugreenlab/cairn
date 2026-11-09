@@ -995,6 +995,9 @@ pub(crate) async fn convert_hold_to_park(
 /// [`suspend`] parks a call. One that had already parked keeps the park it
 /// has, so the turn is parked once.
 ///
+/// A row whose batch held the branch stops holding it here, so the takeover
+/// releases that hold through the same seam a batch's resolution does.
+///
 /// Fails, writing nothing, when the row is no longer the batch's pending
 /// wait: a stop cancelled it, or its own resolver claimed it first.
 pub(crate) async fn take_over_run_batch(
@@ -1021,6 +1024,13 @@ pub(crate) async fn take_over_run_batch(
     let goal_pause = pause_goal_for_park(orch, &record)?;
     let converted = convert_run_batch(db, &record).await;
     let (yielded, parks) = settle_goal_pause(orch, &record, goal_pause, converted)?;
+    // A pending batch row holds the branch; the continuation it became holds
+    // nothing and will never resolve as a batch. So this is where that hold
+    // ends, and the replay deferred behind it is served from here, as from
+    // every other exit of a batch's wait.
+    if batch.condition.holds_branch() {
+        crate::orchestrator::base_advance::on_branch_hold_released(orch, &batch.job_id);
+    }
     if parks {
         // Nothing awaits this park: the continuation's scheduler is what
         // holds its first transition back.
@@ -1281,7 +1291,7 @@ async fn supersede_abandoned(orch: &Orchestrator, db: &LocalDb, r: &Record) -> R
         }
         // A row whose resolver already claimed its successor and delivered its
         // result is finished in fact; its own columns say so.
-        complete_resolution_in_fact(db, &wait.id).await?;
+        complete_resolution_in_fact(orch, db, &wait).await?;
         let evidence = if wait.tool_use_id == r.tool_use_id {
             "its call is the one suspending now"
         } else {
@@ -1361,7 +1371,7 @@ async fn abandon(
         // waiting single-use for the rest of the job's life. Complete it instead.
         // A resolver genuinely mid-flight is left alone; this suspension is then
         // refused rather than raced, and the retry succeeds.
-        complete_resolution_in_fact(db, &call.id).await?;
+        complete_resolution_in_fact(orch, db, call).await?;
         return Ok(false);
     }
     // Answering holds the resolver guard when it is free, so the periodic sweep
@@ -1395,8 +1405,12 @@ async fn finish_abandonment(
 /// life. The evidence for finishing it is the row's own columns, so this claims
 /// nothing and races nothing: a resolver still mid-flight has not set them yet
 /// and is left alone.
-async fn complete_resolution_in_fact(db: &LocalDb, id: &str) -> Result<(), String> {
-    let id = id.to_string();
+async fn complete_resolution_in_fact(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    call: &SuspendedCall,
+) -> Result<(), String> {
+    let id = call.id.clone();
     let now = chrono::Utc::now().timestamp_millis();
     db.write(|c| {
         let id = id.clone();
@@ -1414,7 +1428,14 @@ async fn complete_resolution_in_fact(db: &LocalDb, id: &str) -> Result<(), Strin
         })
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if matches!(
+        call.condition,
+        Some(Condition::RunBatch { host: false, .. })
+    ) {
+        crate::orchestrator::base_advance::on_branch_hold_released_for_run(orch, &call.run_id);
+    }
+    Ok(())
 }
 
 /// Record the decision to abandon a suspension, reporting whether abandonment
@@ -1623,6 +1644,23 @@ async fn cancel_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result
 /// cannot resume while one of its own calls is still unanswered, so it is the
 /// only correct rule.
 pub(crate) async fn resolve(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    r: &Record,
+    result: &str,
+    replay: bool,
+) -> Result<(), String> {
+    let outcome = resolve_inner(orch, db, r, result, replay).await;
+    // Every exit may follow a terminal state write, including sibling stand-down
+    // and diversion to the job. The seam rechecks all branch holds, so an error
+    // or a duplicate resolver that left this row active cannot release it early.
+    if let Condition::RunBatch { host: false, .. } = &r.condition {
+        crate::orchestrator::base_advance::on_branch_hold_released(orch, &r.job_id);
+    }
+    outcome
+}
+
+async fn resolve_inner(
     orch: &Orchestrator,
     db: &LocalDb,
     r: &Record,
@@ -2562,7 +2600,7 @@ async fn drive_claimed(
             }
             return;
         }
-        if settle_if_unresumable(db, record).await {
+        if settle_if_unresumable(orch, db, record).await {
             return;
         }
         if state == "pending" {
@@ -2628,7 +2666,7 @@ fn unresumable_resolution(cause: &str, stored: Option<&str>) -> String {
 /// Settle a suspension whose node can no longer take a turn, the way a Stop
 /// settles one: `cancelled`, with a resolution naming why. Reports whether it
 /// settled the row.
-async fn settle_if_unresumable(db: &LocalDb, record: &Record) -> bool {
+async fn settle_if_unresumable(orch: &Orchestrator, db: &LocalDb, record: &Record) -> bool {
     let Some(cause) = unresumable_cause(db, record).await else {
         return false;
     };
@@ -2662,6 +2700,12 @@ async fn settle_if_unresumable(db: &LocalDb, record: &Record) -> bool {
         Ok(settled) => {
             if settled {
                 log::warn!("suspension {} settled without resuming: {cause}", record.id);
+                if let Condition::RunBatch { host: false, .. } = &record.condition {
+                    crate::orchestrator::base_advance::on_branch_hold_released(
+                        orch,
+                        &record.job_id,
+                    );
+                }
             }
             settled
         }
@@ -2978,7 +3022,7 @@ pub(crate) async fn sweep_stuck_resolutions(orch: &Orchestrator) -> SweepOutcome
                 continue;
             }
             if !is_abandonment(stored_result.as_deref())
-                && settle_if_unresumable(&db, &record).await
+                && settle_if_unresumable(orch, &db, &record).await
             {
                 outcome.settled += 1;
                 continue;
@@ -3998,11 +4042,38 @@ mod tests {
                 eprintln!("skipping an_adopted_commit_is_published_once: jj not resolvable");
                 return;
             };
-            let (orch, base, _) = durable_env().await;
+            let (seeded, base, _) = durable_env().await;
+            // Publication resolves the project's store from its row under the
+            // orchestrator's config directory, so this orchestrator shares the
+            // seed's database and the fixture's store, and the seed's project
+            // and job are the fixture's.
+            let orch = Orchestrator::builder(
+                seeded.db.clone(),
+                Arc::new(TestServicesBuilder::new().build()),
+                fx.home().to_path_buf(),
+            )
+            .jj_binary_path(fx.jj_bin())
+            .build();
+            orch.db
+                .local
+                .execute(
+                    "UPDATE projects SET repo_path=?1, default_branch='main' WHERE id='p'",
+                    params![fx.repository.to_string_lossy().into_owned()],
+                )
+                .await
+                .unwrap();
+            orch.db
+                .local
+                .execute("UPDATE jobs SET branch='feature' WHERE id='job-1'", ())
+                .await
+                .unwrap();
             // The placement template the suspended batch persisted, in this
             // seed's project.
             fx.request.request_id = "request-1".into();
             fx.request.project_id = "p".into();
+            // The parked job's own request: its sealed delta is exempt from the
+            // hold its still-pending wait makes on the branch.
+            fx.request.requesting_job_id = Some("job-1".into());
             fx.request.repository = RepositoryLocator::ColocatedPath {
                 project_id: "p".into(),
                 repository_id: "repository".into(),
@@ -4016,7 +4087,13 @@ mod tests {
                     Some(fx.request.clone()),
                     None,
                 )
-                .publishing_to_for_test("p", &fx.repository, "feature", &fx.base),
+                .publishing_to_for_test(
+                    "p",
+                    &fx.repository,
+                    fx.store(),
+                    "feature",
+                    &fx.base,
+                ),
             );
             parked(&orch, &record).await;
             let mut frames = orch
@@ -4320,6 +4397,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(wait_state(&orch).await, "resolved");
+
         let resolution = orch
             .db
             .local

@@ -166,6 +166,11 @@ pub(crate) struct WavePlan {
     )]
     pub unsupported:
         std::collections::BTreeMap<String, crate::config::project_settings::UnsupportedCheck>,
+    /// How the wave captured `head`: the head before and after preparation, its
+    /// Git tree, the exact base, and any accepted-install warning. Absent from a
+    /// plan recorded before captures existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<crate::execution::checks::CheckCapture>,
 }
 
 /// [`WavePlan::unsupported`] as recorded in `plan_json`: each check together
@@ -264,11 +269,20 @@ enum TurnEndDisposition {
     Withdrawn(String),
     CacheCovered(&'static str),
     Cancelled(String),
+    /// The node's branch cannot take its base cleanly. Nothing was installed,
+    /// nothing ran, and nobody is woken: the owner meets the conflict at its
+    /// next commit or merge.
+    ConflictsWithBase(String),
+    /// Preparation refused for another stated reason (busy, cooldown, timed
+    /// out, unresolved). No verdict, no wake.
+    Unprepared(String),
     CompletedWithDelivery,
 }
 impl TurnEndDisposition {
     fn terminal(&self) -> (&'static str, String) {
         match self {
+            Self::ConflictsWithBase(r) => ("conflicts_with_base", r.clone()),
+            Self::Unprepared(r) => ("unprepared", r.clone()),
             Self::Skipped(r) => ("skipped", (*r).into()),
             Self::Withdrawn(r) => ("withdrawn", r.clone()),
             Self::CacheCovered(r) => ("cache_covered", (*r).into()),
@@ -1268,42 +1282,41 @@ async fn run_turn_end_checks_inner(
         .map_err(|error| format!("turn-end coordinate repository task failed: {error}"))??
     };
     let store_dir = logical_repository.clone();
-    let sealed_commit = cairn_vcs::resolve_coordinate(&logical_repository, &coords.branch)
-        .await
-        .map_err(|error| {
-            format!(
-                "turn-end branch '{}' is unresolvable: {error}",
-                coords.branch
-            )
-        })?;
-    // The node's own delta starts at the LIVE fork point of its branch from its
-    // integration target. The recorded `jobs.base_commit` row is the coordinate
-    // the branch was cut at and does not follow a base advance, so diffing from
-    // it absorbs every commit the target merged in the meantime — which is how a
-    // zero-delta planner selected a full review suite (CAIRN-3108).
-    let (base, target_head) = match crate::diff::live_job_branch_range(
-        &orch.db.local,
-        job_id,
-        &orch.jj_binary_path,
-        &orch.config_dir,
-    )
-    .await
+    // Capture the wave's coordinate exactly once: prepare the node's own branch
+    // against its declared integration target and judge the prepared head. The
+    // base the prepared head contains is then both the node's fork point and the
+    // target tip this wave reads, so nothing below resolves a moving name, and
+    // a base that moves after this point does not change what the wave is
+    // about. The recorded `jobs.base_commit` row is never consulted: it is the
+    // coordinate the branch was cut at and does not follow a base advance
+    // (CAIRN-3108).
+    let capture = match capture_review_head(orch, job_id, &coords, logical_repository.clone()).await
     {
-        Ok(Some(range)) => (range.base, range.target_head),
-        other => {
-            log::warn!(
-                "turn-end checks for job {}: no live base coordinate ({}); nothing to run",
-                short_id(job_id),
-                match other {
-                    Err(error) => error,
-                    _ => "the job has no branch of its own".to_string(),
-                }
+        Ok(capture) => capture,
+        Err(refusal) => {
+            log::info!(
+                "turn-end checks for job {}: nothing to run: {refusal}",
+                short_id(job_id)
             );
-            return Ok(TurnEndDisposition::Skipped(
-                "job has no live base coordinate",
-            ));
+            return Ok(if refusal.conflicts_with_base() {
+                TurnEndDisposition::ConflictsWithBase(refusal.to_string())
+            } else {
+                TurnEndDisposition::Unprepared(refusal.to_string())
+            });
         }
     };
+    let prepared = capture
+        .prepared
+        .clone()
+        .expect("a review wave captures its node's managed branch");
+    log::info!(
+        "turn-end checks for job {}: {}",
+        short_id(job_id),
+        capture.provenance()
+    );
+    let sealed_commit = capture.commit_id.clone();
+    let base = prepared.base_commit.clone();
+    let target_head = prepared.base_commit.clone();
 
     // 2. Load the checks contract DECLARED BY the sealed commit this turn is
     // about. Definition and content come from the same tree, so a branch's own
@@ -1345,7 +1358,23 @@ async fn run_turn_end_checks_inner(
     let wave_base = base.clone();
     let baseline_base = base.clone();
     let key_base = base.clone();
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    // Every read below is addressed by the captured head and base alone, so it
+    // runs pinned to an operation indexing them and can never settle a split
+    // operation log the way a store loaded at its head would.
+    let jj = match crate::execution::checks::immutable_read_jj(
+        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        &logical_repository,
+        &[sealed_commit.as_str(), base.as_str()],
+    ) {
+        Ok(jj) => jj,
+        Err(error) => {
+            log::warn!(
+                "turn-end checks for job {}: nothing to run: {error}",
+                short_id(job_id)
+            );
+            return Ok(TurnEndDisposition::Unprepared(error));
+        }
+    };
     let changed_jj = jj.clone();
     let changed_repo = logical_repository.clone();
     let changed_head = sealed_commit.clone();
@@ -1497,35 +1526,21 @@ async fn run_turn_end_checks_inner(
         .collect::<std::collections::HashSet<_>>();
     let canonical_repo = coords.repository_path.clone();
 
-    // Is this node's sealed tree byte-identical to its base's? See
-    // `base_tree_coordinate` for why the coordinate is resolved the way it is.
-    // Unresolvable leaves this false, which preserves the pre-existing behaviour
-    // of running the suite.
-    let tree_matches_base = match base_tree_coordinate(&coords) {
-        Some(coordinate) => {
-            match cairn_vcs::resolve_coordinate(&logical_repository, coordinate).await {
-                Ok(base_commit) => {
-                    let base_jj = jj.clone();
-                    let base_repo = logical_repository.clone();
-                    tokio::task::spawn_blocking(move || {
-                        logical_tree_hash(&base_jj, &base_repo, &base_commit)
-                    })
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .is_some_and(|base_tree| base_tree == tree_hash)
-                }
-                Err(error) => {
-                    log::debug!(
-                        "turn-end checks for job {}: base coordinate '{coordinate}' is \
-                         unresolvable ({error}); falling through to the changed-file gate",
-                        short_id(job_id)
-                    );
-                    false
-                }
-            }
-        }
-        None => false,
+    // Is this node's sealed tree byte-identical to the tree of the exact base
+    // commit it was prepared onto? Compared as trees, so the answer is a fact
+    // about content rather than bookkeeping. Unreadable leaves this false, which
+    // runs the suite.
+    let tree_matches_base = {
+        let (base_jj, base_repo, base_commit) = (
+            jj.clone(),
+            logical_repository.clone(),
+            prepared.base_commit.clone(),
+        );
+        tokio::task::spawn_blocking(move || logical_tree_hash(&base_jj, &base_repo, &base_commit))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|base_tree| base_tree == tree_hash)
     };
 
     // Publish the immutable facts this wave planned with: on its attempt row
@@ -1541,6 +1556,7 @@ async fn run_turn_end_checks_inner(
         input_hashes: input_hashes.clone(),
         expected_toolchain,
         unsupported,
+        capture: Some(crate::execution::checks::CheckCapture::of(&capture)),
     });
     record_wave_plan(&owning_db, job_id, attempt_id, &plan).await;
     cancel.set_runtime_status(attempt_id, plan);
@@ -1757,7 +1773,7 @@ async fn run_turn_end_checks_inner(
             sealed_commit.clone(),
             db.clone(),
             coords.project_id.clone(),
-            coords.base_branch.clone(),
+            Some(prepared.base_branch.clone()),
         );
         let baseline = tokio::task::spawn_blocking(move || {
             crate::execution::lint_baseline::lint_baseline_env(
@@ -2244,6 +2260,7 @@ async fn run_pin_bump_lane(
             project_key: scope.project_key.clone(),
             repository_path: scope.repository_path.clone(),
             attribution_target: scope.target_head.clone(),
+            attribution_commit: None,
         },
         scope.head.clone(),
         &lane.check,
@@ -2501,8 +2518,28 @@ pub(crate) async fn render_turn_end_checks_section(
         let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await;
         return Some(format_retired_checks_section(&retired, statuses.as_deref()));
     }
-    let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
-    let header = review_progress_header(orch, job_id).await;
+    let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await;
+    let live = orch.turn_end_check_runtime_status(job_id).is_some();
+    let capture = if live {
+        None
+    } else {
+        crate::execution::checks_status::recorded_wave_capture(orch, job_id).await
+    };
+    let progress = review_progress_header(orch, job_id).await;
+    let Some(statuses) = statuses else {
+        if !live && capture.is_none() && orch.review_deferrals.unreviewed_for(job_id).is_none() {
+            return None;
+        }
+        let header = match &capture {
+            Some(capture) => format!("{capture}\n\n{progress}"),
+            None => progress,
+        };
+        return Some(format!("\n### Systematic checks\n\n{header}\n\nCurrent lanes could not be read; this recorded capture supplies no current verdict.\n"));
+    };
+    let header = match capture {
+        Some(capture) => format!("{capture}\n\n{progress}"),
+        None => progress,
+    };
     format_checks_section_under(
         Some(&header),
         &statuses,
@@ -2521,7 +2558,7 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
     use crate::execution::checks_status::human_duration;
     let head = &status.plan.head[..status.plan.head.len().min(12)];
     let attempt = &status.attempt_id;
-    match status.submitted_at_unix_ms {
+    let mut header = match status.submitted_at_unix_ms {
         Some(at) => {
             let machine = status
                 .board
@@ -2556,7 +2593,12 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
             "Review wave for `{head}`: planned {} ago, not yet submitted (attempt `{attempt}`)",
             human_duration(now.saturating_sub(status.planned_at_unix_ms))
         ),
-    }
+    };
+    header.push_str("\n\n");
+    header.push_str(&crate::execution::checks_status::format_wave_capture(
+        &status.plan,
+    ));
+    header
 }
 
 /// Use the lane projection's own dispatch facts, without conflating one placement
@@ -2708,7 +2750,7 @@ fn format_checks_section_under(
     statuses: &[crate::execution::checks_status::NodeCheckStatus],
     cadence: crate::execution::checks_status::WaveCadence,
 ) -> Option<String> {
-    if statuses.is_empty() {
+    if statuses.is_empty() && header.is_none() {
         return None;
     }
     let mut out = String::from("\n### Systematic checks\n\n");
@@ -2716,7 +2758,11 @@ fn format_checks_section_under(
         out.push_str(header);
         out.push_str("\n\n");
     }
-    push_check_lines(&mut out, statuses, Some(cadence));
+    if statuses.is_empty() {
+        out.push_str("No lanes are present in this projection.\n");
+    } else {
+        push_check_lines(&mut out, statuses, Some(cadence));
+    }
     Some(out)
 }
 
@@ -2732,8 +2778,8 @@ fn format_retired_checks_section(
     let mut out = String::from("\n### Systematic checks\n\n");
     let Some(head) = retired.head() else {
         out.push_str(&format!(
-            "This node was {outcome} before any review wave recorded a plan, so no lanes are \
-             on record for it.\n"
+            "This node was {outcome}. No readable review-wave plan is on record, so its \
+             captured coordinates and lanes are unknown.\n"
         ));
         return out;
     };
@@ -2742,6 +2788,10 @@ fn format_retired_checks_section(
         "This node was {outcome}. Its branch is retired, so these are the lanes recorded for \
          its last head, `{head}`, and nothing will run them again.\n\n"
     ));
+    if let Some(plan) = &retired.plan {
+        out.push_str(&crate::execution::checks_status::format_wave_capture(plan));
+        out.push_str("\n\n");
+    }
     match statuses {
         Some([]) => out.push_str("That head configured no checks.\n"),
         Some(statuses) => push_check_lines(&mut out, statuses, None),
@@ -2958,20 +3008,40 @@ fn turn_end_launch(uncached: Vec<(CheckPlan, String)>, tree_matches_base: bool) 
     TurnEndLaunch::Launch(uncached)
 }
 
-/// The coordinate whose TREE defines "unchanged" for this node.
-///
-/// This is the integration target's CURRENT tip, in deliberate contrast to the
-/// changed-file diff in `run_turn_end_checks_inner`, which wants the node's own
-/// delta and so starts at its fork point. A node whose sealed tree equals the
-/// tree the base branch holds right now changed nothing that anyone will review,
-/// whatever its history looks like.
-///
-/// A branch name resolves fresh from the store on every evaluation, so it cannot
-/// go stale the way `jobs.base_commit` does, and comparing trees rather than
-/// coordinates makes the answer a fact about content rather than about
-/// bookkeeping (CAIRN-3108).
-fn base_tree_coordinate(coords: &JobCoords) -> Option<&str> {
-    coords.base_branch.as_deref()
+/// Capture the head a review wave judges: the node's own branch, prepared once
+/// against its declared integration target. A conflict with the base, and every
+/// other refusal, is an outcome of its own that installs nothing, records no
+/// verdict, and wakes nobody.
+async fn capture_review_head(
+    orch: &Orchestrator,
+    job_id: &str,
+    coords: &JobCoords,
+    store: PathBuf,
+) -> Result<
+    crate::mcp::handlers::branch::CapturedRevision,
+    crate::mcp::handlers::branch::RevisionCaptureError,
+> {
+    use crate::mcp::handlers::branch::{
+        capture_revision, resolve_own_branch_revision, BranchRefResolutionError, CapturePurpose,
+        RevisionCaptureError,
+    };
+    let revision = resolve_own_branch_revision(orch, &coords.project_id, &coords.branch, job_id)
+        .await
+        .map_err(|diagnostic| {
+            RevisionCaptureError::Resolution(BranchRefResolutionError::Unresolvable {
+                requested: coords.branch.clone(),
+                diagnostic,
+            })
+        })?;
+    capture_revision(
+        orch,
+        revision,
+        store,
+        CapturePurpose::ReviewWave {
+            job_id: job_id.to_string(),
+        },
+    )
+    .await
 }
 
 pub(crate) fn checks_uri_for_job(coords: &JobCoords) -> String {
@@ -4739,6 +4809,7 @@ mod tests {
     fn retired_section_names_its_head_and_never_reads_as_awaiting_results() {
         use crate::execution::checks_status::RetiredNode;
         let plan = WavePlan {
+            capture: None,
             head: "0123456789abcdef".to_string(),
             base: "base".to_string(),
             tree_hash: "tree".to_string(),
@@ -4769,7 +4840,7 @@ mod tests {
         };
         let s = format_retired_checks_section(&unrecorded, None);
         assert!(
-            s.contains("closed before any review wave recorded a plan"),
+            s.contains("No readable review-wave plan is on record"),
             "{s}"
         );
     }
@@ -5191,34 +5262,48 @@ mod tests {
         );
     }
 
-    /// The zero-delta gate resolves a branch NAME, never a recorded commit.
-    ///
-    /// `jobs.base_commit` is the row that goes stale when the base-advance
-    /// fanout loses its compare-and-swap race, and gating a rebased zero-delta
-    /// branch on a stale coordinate is what fired full review suites on planner
-    /// nodes (CAIRN-3108). `JobCoords` no longer carries that row at all, so
-    /// this pins the only remaining input: a name the store resolves fresh on
-    /// every evaluation.
+    /// The wave's head, fork point, target tip, and zero-delta tree all come
+    /// from its one capture. None of them is a second resolution of a moving
+    /// name, and `jobs.base_commit` (the row that goes stale, CAIRN-3108) is
+    /// never read.
     #[test]
-    fn the_zero_delta_gate_resolves_a_branch_name_not_a_recorded_commit() {
-        let mut coords = JobCoords {
-            project_id: "p".into(),
-            repository_path: "/repo".into(),
-            branch: "agent/test".into(),
-            base_branch: Some("main".into()),
-            project_key: "cairn".into(),
-            number: 42,
-            exec_seq: 1,
-            node_segment: "planner".into(),
-            parent_segment: None,
-            is_workflow: false,
-        };
-        assert_eq!(base_tree_coordinate(&coords), Some("main"));
+    fn the_wave_reads_every_coordinate_from_its_one_capture() {
+        let source = include_str!("checks_turn_end.rs");
+        let body = source
+            .split_once("async fn run_turn_end_checks_inner(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert_eq!(body.matches("capture_review_head(").count(), 1);
+        for forbidden in [
+            "cairn_vcs::resolve_coordinate(",
+            "live_job_branch_range(",
+            // Split so this needle is not itself a jobs.base_commit SQL site to
+            // the cairn-db reach guard; this file stays unsanctioned there.
+            concat!("base_commit", " FROM jobs"),
+            "merge_base(",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the wave re-resolves via {forbidden}"
+            );
+        }
+    }
 
-        // No integration target is no gate: the suite runs rather than skipping
-        // on a coordinate nobody resolved.
-        coords.base_branch = None;
-        assert_eq!(base_tree_coordinate(&coords), None);
+    /// A conflict with the base is its own terminal outcome: never a failure
+    /// (which a session is woken for) and never a skip that hides it.
+    #[test]
+    fn a_conflict_with_the_base_settles_as_its_own_outcome() {
+        assert_eq!(
+            TurnEndDisposition::ConflictsWithBase("Conflicts with base: x".into()).terminal(),
+            ("conflicts_with_base", "Conflicts with base: x".to_string())
+        );
+        assert_eq!(
+            TurnEndDisposition::Unprepared("busy".into()).terminal(),
+            ("unprepared", "busy".to_string())
+        );
     }
 
     const CODEX_PIN: &str = "src-tauri/os/cairn-models/codex-pin.json";
@@ -6385,5 +6470,95 @@ pinBumps:
             assert_eq!(state, expected_state);
             assert_eq!(reason, expected_reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_provenance_tests {
+    use super::*;
+
+    fn plan() -> std::sync::Arc<WavePlan> {
+        std::sync::Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "head": "original-judged-head", "base": "original-fork",
+                "treeHash": "original-logical-hash", "checks": {},
+                "applicableNames": [], "inputHashes": {},
+                "capture": {
+                    "authority": "managed", "revision": "review-branch",
+                    "headBefore": "original-before-preparation",
+                    "headAfter": "original-judged-head",
+                    "gitTree": "original-git-tree", "baseBranch": "main",
+                    "baseCommit": "original-exact-base", "advanced": true,
+                    "attempts": 1, "warnings": ["accepted export recovery pending"],
+                    "provenance": "original capture, not a newer branch coordinate"
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn running_header_keeps_captured_coordinates_and_warning_before_submission() {
+        for submitted in [None, Some(2)] {
+            let status = crate::orchestrator::TurnEndCheckRuntimeStatus {
+                plan: plan(),
+                request_ids: Default::default(),
+                attempt_id: "attempt".into(),
+                planned_at_unix_ms: 1,
+                board: None,
+                submitted_at_unix_ms: submitted,
+            };
+            let header = wave_header(&status, 3);
+            assert!(header.contains("original-before-preparation"));
+            assert!(header.contains("judged head `original-judged-head`"));
+            assert!(header.contains("logical tree `original-logical-hash`"));
+            assert!(header.contains("Git tree `original-git-tree`"));
+            assert!(header.contains("exact target `main` at `original-exact-base`"));
+            assert!(header.contains("accepted export recovery pending"));
+            assert!(header.contains("not current-verdict authority"));
+            assert_eq!(status.plan.head, "original-judged-head");
+        }
+    }
+
+    #[test]
+    fn retired_rowless_capture_keeps_original_tree_base_and_accepted_warning() {
+        let retired = crate::execution::checks_status::RetiredNode {
+            outcome: "merged".into(),
+            plan: Some(plan()),
+        };
+        for statuses in [None, Some(&[][..])] {
+            let text = format_retired_checks_section(&retired, statuses);
+            assert!(text.contains("This node was merged"));
+            assert!(text.contains("judged head `original-judged-head`"));
+            assert!(text.contains("logical tree `original-logical-hash`"));
+            assert!(text.contains("fork `original-fork`"));
+            assert!(text.contains("Git tree `original-git-tree`"));
+            assert!(text.contains("original-exact-base"));
+            assert!(text.contains("accepted export recovery pending"));
+        }
+    }
+
+    #[test]
+    fn settled_header_is_kept_without_lanes_and_legacy_capture_stays_unknown() {
+        let mut legacy = (*plan()).clone();
+        legacy.capture = None;
+        let header = crate::execution::checks_status::format_wave_capture(&legacy);
+        let text = format_checks_section_under(
+            Some(&header),
+            &[],
+            crate::execution::checks_status::WaveCadence::default(),
+        )
+        .unwrap();
+        assert!(text.contains("original-judged-head"));
+        assert!(text.contains("Preparation capture unknown"));
+        assert!(text.contains("No lanes are present"));
+        assert!(!text.contains("head before `original-judged-head`"));
+        assert!(!text.contains("Git tree `original-logical-hash`"));
+        assert!(format_checks_section_under(
+            None,
+            &[],
+            crate::execution::checks_status::WaveCadence::default(),
+        )
+        .is_none());
     }
 }

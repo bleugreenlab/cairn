@@ -336,6 +336,7 @@ pub fn reclaim_unreachable_objects(
     git_dir: &Path,
     keep_newer: SystemTime,
 ) -> Result<ObjectStoreCompaction, String> {
+    let _reclamation = super::object_lease::Reclamation::acquire(git_dir)?;
     require_git(git_dir, (2, 37), "a cruft reclaim of unreferenced objects")?;
     let keep_newer = keep_newer
         .duration_since(UNIX_EPOCH)
@@ -465,6 +466,7 @@ pub fn truncate_operation_log(
     store: &Path,
     older_than: SystemTime,
 ) -> Result<OperationLogTruncation, String> {
+    let _reclamation = super::object_lease::Reclamation::for_store(store)?;
     block_on(truncate_operation_log_inner(store, older_than))
 }
 
@@ -702,6 +704,7 @@ pub fn collect_store_garbage(
     keep_newer: SystemTime,
     keep_refs_newer: SystemTime,
 ) -> Result<StoreGarbageCollection, String> {
+    let _reclamation = super::object_lease::Reclamation::for_store(store)?;
     block_on(collect_store_garbage_inner(
         store,
         keep_newer,

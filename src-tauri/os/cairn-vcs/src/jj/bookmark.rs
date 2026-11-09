@@ -472,11 +472,14 @@ pub enum OriginFastForward {
 ///
 /// `observed` is what [`fetch_origin_observation`] just parked. Only once it is
 /// known to descend from the bookmark is it promoted into
-/// `refs/remotes/origin/<branch>` and imported, so no import, this one or
-/// anyone's, ever sees a diverged copy as the remote's state and merges it into a
-/// conflicted name. The bookmark is then set explicitly, because a copy the store
-/// never tracked is imported without moving it, and the advance is exported and
-/// verified.
+/// `refs/remotes/origin/<branch>`, so no import anyone runs ever sees a diverged
+/// copy as the remote's state. The take is then ONE refs-only jj transaction
+/// ([`crate::record_origin_bookmarks`] with a local advance): `<branch>@origin`
+/// becomes the observed commit, tracked; the local bookmark moves to it by
+/// compare-and-swap from the tip judged here; and only this branch is exported,
+/// with the checkout's HEAD repaired as every export does. No other bookmark,
+/// remote record or git ref is imported, exported or moved, so the take is a
+/// single-branch write. It is verified afterwards.
 ///
 /// The observation ref is deleted once this answers, whatever the answer or
 /// error: its lifecycle is one fetch-and-judge. The observed commit is named in
@@ -543,43 +546,130 @@ fn judge_and_take_origin_copy(
         );
     }
 
+    // The same tree refusal every export of a branch makes: a commit whose root
+    // carries jj conflict scaffolding is never exported to a checkout.
+    let scaffolding = super::export::root_conflict_scaffolding(Some(jj), checkout, observed)
+        .map_err(|error| {
+            format!(
+                "fast-forward `{branch}` from origin: origin's {observed} could not be checked for \
+                 jj conflict scaffolding, and an unchecked tree is not a clean one: {error}"
+            )
+        })?;
+    if !scaffolding.is_empty() {
+        return Err(format!(
+            "{CONFLICT_SCAFFOLDING_EXPORT_REFUSAL} (`{branch}`): origin's {observed} carries {}",
+            scaffolding.join(", ")
+        ));
+    }
     let tracking = format!("refs/remotes/origin/{branch}");
-    super::packed_refs::with_packed_refs_patience_for(
-        jj,
-        PackedRefs::Checkout(checkout),
-        "promote origin observation",
-        || {
-            let output = jj.command_output(
-                cairn_platform::env::git()
-                    .args(["update-ref", &tracking, observed])
-                    .current_dir(checkout),
-                JJ_DEFAULT_TIMEOUT,
-                "git update-ref (promote origin observation)",
-            )?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "git update-ref {tracking}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ))
-            }
+    let tracking_before = jj
+        .command_output(
+            cairn_platform::env::git()
+                .args(["rev-parse", "--verify", "--quiet", &tracking])
+                .current_dir(checkout),
+            JJ_DEFAULT_TIMEOUT,
+            "git rev-parse (origin tracking ref)",
+        )?
+        .stdout;
+    let tracking_before = String::from_utf8_lossy(&tracking_before).trim().to_string();
+    let (recorded, _) = crate::recorded_origin_bookmark(store, branch)?;
+    let git_writes = [
+        super::leased_push::GitRefWrite {
+            name: tracking,
+            prior: (!tracking_before.is_empty()).then_some(tracking_before),
+            written: Some(observed.to_string()),
+            by_transaction: false,
         },
-    )?;
-    import_git(jj, store)?;
-    if bookmark_commit_checked(jj, store, branch)?.as_deref() != Some(observed) {
-        set_bookmark_at(jj, store, branch, observed)?;
+        super::leased_push::GitRefWrite {
+            name: format!("refs/heads/{branch}"),
+            prior: Some(local.clone()),
+            written: Some(observed.to_string()),
+            by_transaction: true,
+        },
+    ];
+    let record = crate::OriginRecord {
+        branch: branch.to_string(),
+        expected: recorded,
+        target: Some(observed.to_string()),
+        advance_local_from: Some(local.clone()),
+    };
+    let outcome = super::export::with_checkout_head_preserved(jj, store, || {
+        super::leased_push::record_with_rollback(
+            jj,
+            checkout,
+            store,
+            &git_writes,
+            std::slice::from_ref(&record),
+            &format!("take origin's fast-forward of {branch}"),
+        )
+    })
+    .map_err(|error| format!("fast-forward `{branch}` from origin: {error}"))?;
+    // The transaction committed: the bookmark moved. Anything that goes wrong
+    // reading that back is a warning on an Advanced answer, never a refusal of
+    // a move that happened.
+    let unverified = match outcome {
+        super::leased_push::RecordOutcome::CommittedUnverified { note } => Some(note),
+        super::leased_push::RecordOutcome::Committed => {
+            verify_taken_branch(jj, store, checkout, branch, observed).err()
+        }
+    };
+    if let Some(note) = unverified {
+        log::warn!(
+            "store bookmark `{branch}` fast-forwarded from {local} to origin's {observed}, but \
+             it could not be verified: {note}"
+        );
     }
-    // A copy imported untracked would refuse the branch's next push.
-    if let Err(error) = track_bookmark(jj, store, branch) {
-        log::debug!("fast-forward `{branch}` from origin: track (continuing): {error}");
-    }
-    export_bookmark_advance(jj, store, true, branch, "fast-forward from origin")?;
     log::info!("store bookmark `{branch}` fast-forwarded from {local} to origin's {observed}");
     Ok(OriginFastForward::Advanced {
         from: local,
         to: observed.to_string(),
     })
+}
+
+/// Read back a committed fast-forward take: the bookmark, the tracked origin
+/// record and the exported git ref all at `observed`.
+fn verify_taken_branch(
+    jj: &JjEnv,
+    store: &Path,
+    checkout: &Path,
+    branch: &str,
+    observed: &str,
+) -> Result<(), String> {
+    let now = crate::local_bookmark_targets(store, branch)?;
+    let (recorded, tracked) = crate::recorded_origin_bookmark(store, branch)?;
+    let exported = jj
+        .command_output(
+            cairn_platform::env::git()
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .current_dir(checkout),
+            JJ_DEFAULT_TIMEOUT,
+            "git rev-parse (taken branch)",
+        )?
+        .stdout;
+    let exported = String::from_utf8_lossy(&exported).trim().to_string();
+    if now.as_slice() == [observed]
+        && recorded.as_deref() == Some(observed)
+        && tracked
+        && exported == observed
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "bookmark {}, {branch}@origin {}{}, refs/heads/{branch} {}",
+        now.join(" and "),
+        recorded.as_deref().unwrap_or("<absent>"),
+        if tracked { "" } else { " (untracked)" },
+        if exported.is_empty() {
+            "<absent>"
+        } else {
+            &exported
+        }
+    ))
 }
 
 /// Whether origin's copy of a store-owned `branch`, at `remote`, is this store's
@@ -588,16 +678,16 @@ fn judge_and_take_origin_copy(
 ///
 /// The store does not contain origin's tip then, yet origin holds nothing the
 /// store never had, and the sideways move is exactly what publishing is for.
-/// Two facts jj recorded itself establish it, with no patch-equivalence guess:
+/// The canonical bounded proof uses exact jj facts, never patch equivalence:
 ///
 /// - `remote` is the target of the TRACKED `<branch>@origin`, which is what this
 ///   store last pushed there or took from there. It is also the commit jj's
 ///   push leases against, so the publication moves origin only while origin
 ///   still holds exactly it.
-/// - every commit `remote` holds that `local` lacks is hidden, meaning this
-///   store itself rewrote or abandoned it. A commit made outside Cairn and
-///   imported into `<branch>@origin` (stale-publication recovery fetches there)
-///   is visible, so origin's copy is never superseded while it holds one.
+/// - every origin-only commit is hidden or an exact predecessor (possibly
+///   transitively) of an ancestor of `local`. Visible external work lacking
+///   that evidence refuses. Accepted-drop witnesses are supplied only through
+///   `origin_copy_is_superseded_with_accepted`, not this no-witness adapter.
 ///
 /// Pure read; the caller need not hold the store lock.
 pub fn origin_copy_is_superseded(
@@ -607,28 +697,22 @@ pub fn origin_copy_is_superseded(
     local: &str,
     remote: &str,
 ) -> Result<bool, String> {
-    let tracked = revset_commit_checked(
+    match super::origin_copy_is_superseded_with_accepted(
         jj,
         store,
-        &format!("tracked_remote_bookmarks(exact:{branch:?}, remote=exact:\"origin\")"),
-    )?;
-    if !tracked.is_some_and(|tracked| tracked.eq_ignore_ascii_case(remote)) {
-        return Ok(false);
+        branch,
+        local,
+        remote,
+        &[],
+        JJ_DEFAULT_TIMEOUT,
+    ) {
+        Ok(answer) => Ok(answer),
+        Err(
+            super::AdvanceComputeError::UnaccountedRemoteCommits { .. }
+            | super::AdvanceComputeError::CoordinatesChanged,
+        ) => Ok(false),
+        Err(error) => Err(error.to_string()),
     }
-    let visible = jj.run(
-        store,
-        &[
-            "log",
-            "-r",
-            &format!("::{remote} ~ ::{local}"),
-            "--no-graph",
-            "-T",
-            "if(hidden, \"\", commit_id ++ \"\\n\")",
-            "--ignore-working-copy",
-        ],
-        "jj log origin-only commits the store has not replaced",
-    )?;
-    Ok(visible.trim().is_empty())
 }
 
 /// Outcome of converging a store-authoritative managed branch after origin was

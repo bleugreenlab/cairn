@@ -498,49 +498,6 @@ pub(crate) fn get_repo_remote(repo_path: &str) -> Result<String, String> {
 
 // ── API Operations ──────────────────────────────────────────────
 
-/// Merge a PR via REST API.
-///
-/// `expected_head_sha` binds the merge to one head: GitHub refuses (409) when
-/// the PR's head is no longer that commit, so a branch that moved after the
-/// caller verified it cannot land in its place.
-pub(crate) async fn merge_pr(
-    http: &dyn HttpClient,
-    auth: &InstallationAuthority,
-    owner: &str,
-    repo: &str,
-    pr_number: i32,
-    merge_method: &str,
-    expected_head_sha: Option<&str>,
-) -> Result<Option<String>, String> {
-    let url = format!(
-        "{}/repos/{}/{}/pulls/{}/merge",
-        GITHUB_API_BASE, owner, repo, pr_number
-    );
-
-    let mut body = serde_json::json!({ "merge_method": merge_method });
-    if let Some(sha) = expected_head_sha {
-        body["sha"] = serde_json::Value::String(sha.to_string());
-    }
-    let resp = auth.put(http, &url, body).await?;
-
-    check_rate_limit(&resp)?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "Failed to merge PR: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    // The merge commit GitHub just wrote to the base branch. Absent only if
-    // the response body is not what GitHub documents; the merge still stands.
-    Ok(resp
-        .json::<serde_json::Value>()
-        .ok()
-        .and_then(|body| body["sha"].as_str().map(str::to_string)))
-}
-
 /// A repository's stable numeric id and its current `owner/name`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RepositoryIdentity {
@@ -623,51 +580,6 @@ pub(crate) async fn fetch_pr_merge_state(
         GITHUB_API_BASE, owner, repo, pr_number
     );
     github_get_json(http, auth, &url).await
-}
-
-/// Delete a branch via REST API.
-pub(crate) async fn delete_branch(
-    http: &dyn HttpClient,
-    auth: &InstallationAuthority,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-) -> Result<(), String> {
-    let url = format!(
-        "{}/repos/{}/{}/git/refs/heads/{}",
-        GITHUB_API_BASE, owner, repo, branch
-    );
-
-    let resp = auth.delete(http, &url).await?;
-
-    check_rate_limit(&resp)?;
-
-    // 204 No Content is success, 422 means already deleted
-    if !resp.is_success() && resp.status != 422 {
-        return Err(format!(
-            "Failed to delete branch: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    Ok(())
-}
-
-/// Delete remote branches via GitHub API (non-fatal, logs warnings).
-pub(crate) async fn delete_remote_branches(
-    http: &dyn HttpClient,
-    auth: &InstallationAuthority,
-    owner: &str,
-    repo: &str,
-    branches: &[String],
-) {
-    for branch in branches {
-        match delete_branch(http, auth, owner, repo, branch).await {
-            Ok(()) => log::info!("Deleted remote branch: {}", branch),
-            Err(e) => log::warn!("Failed to delete remote branch {}: {}", branch, e),
-        }
-    }
 }
 
 // ── PR API Operations ──────────────────────────────────────────
@@ -768,6 +680,78 @@ pub(crate) async fn close_pr(
     }
 
     Ok(())
+}
+
+/// The commit a branch on GitHub points at.
+pub(crate) async fn fetch_branch_head(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Object {
+        sha: String,
+    }
+    #[derive(Deserialize)]
+    struct GitRef {
+        object: Object,
+    }
+    let url = format!("{GITHUB_API_BASE}/repos/{owner}/{repo}/git/ref/heads/{branch}");
+    let reference: GitRef = github_get_json(http, auth, &url).await?;
+    Ok(reference.object.sha)
+}
+
+/// Every comment body on an issue or pull request, oldest first, reading at
+/// most `max_pages` pages of 100. More comments than that is an error rather
+/// than a silently partial answer.
+pub(crate) async fn list_issue_comment_bodies(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+    number: i32,
+    max_pages: u32,
+) -> Result<Vec<String>, String> {
+    #[derive(Deserialize)]
+    struct Comment {
+        #[serde(default)]
+        body: Option<String>,
+    }
+    const PER_PAGE: usize = 100;
+    let mut bodies = Vec::new();
+    for page in 1..=max_pages {
+        let url = format!(
+            "{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}"
+        );
+        let comments: Vec<Comment> = github_get_json(http, auth, &url).await?;
+        let count = comments.len();
+        bodies.extend(comments.into_iter().filter_map(|comment| comment.body));
+        if count < PER_PAGE {
+            return Ok(bodies);
+        }
+    }
+    Err(format!(
+        "#{number} has more than {} comments, which were not all read",
+        max_pages as usize * PER_PAGE
+    ))
+}
+
+/// Comment on an issue or pull request.
+pub(crate) async fn create_issue_comment(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+    number: i32,
+    body: &str,
+) -> Result<(), String> {
+    let url = format!("{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{number}/comments");
+    let resp = auth
+        .post(http, &url, serde_json::json!({ "body": body }))
+        .await?;
+    ensure_github_api_success(&resp)
 }
 
 /// Fetch workflow run jobs via REST API.
@@ -1161,7 +1145,7 @@ mod tests {
         assert!(check_rate_limit(&resp).is_ok());
     }
 
-    // ── merge_pr ─────────────────────────────────────────────────
+    // ── authenticated request fixtures ──────────────────────────────
 
     const TEST_KEY: &str = include_str!("../../tests/fixtures/test_rsa_key.pem");
 
@@ -1188,106 +1172,6 @@ mod tests {
                 HttpResponse::new(201, serde_json::to_vec(&token_body).unwrap()),
             )
             .respond_to(url_pattern, HttpResponse::new(status, vec![]))
-    }
-
-    #[tokio::test]
-    async fn merge_pr_success() {
-        let http = mock_with_token_and("pulls/42/merge", 200);
-        let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash", None).await;
-        assert_eq!(result, Ok(None), "an empty body still merged");
-        let merge = http
-            .requests()
-            .into_iter()
-            .find(|request| request.url.contains("pulls/42/merge"))
-            .unwrap();
-        assert_eq!(
-            merge.body,
-            Some(serde_json::json!({"merge_method": "squash"})),
-            "no expected head means no `sha` binding"
-        );
-    }
-
-    #[tokio::test]
-    async fn merge_pr_binds_the_expected_head_through_sha() {
-        let http = mock_with_token_and("pulls/42/merge", 200);
-        let auth = test_authority();
-        merge_pr(
-            &http,
-            &auth,
-            "owner",
-            "repo",
-            42,
-            "squash",
-            Some("0123abcd"),
-        )
-        .await
-        .unwrap();
-        let merge = http
-            .requests()
-            .into_iter()
-            .find(|request| request.url.contains("pulls/42/merge"))
-            .unwrap();
-        assert_eq!(
-            merge.body,
-            Some(serde_json::json!({"merge_method": "squash", "sha": "0123abcd"}))
-        );
-    }
-
-    #[tokio::test]
-    async fn merge_pr_reports_the_merge_commit() {
-        let http = mock_with_token_and_body(
-            "pulls/42/merge",
-            200,
-            serde_json::json!({"sha": "9e77a275", "merged": true, "message": "Pull Request successfully merged"}),
-        );
-        let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash", None).await;
-        assert_eq!(result, Ok(Some("9e77a275".to_string())));
-    }
-
-    #[tokio::test]
-    async fn merge_pr_failure_returns_error() {
-        let http = mock_with_token_and("pulls/42/merge", 405);
-        let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 42, "merge", None).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn merge_pr_rate_limited() {
-        let http = mock_with_token_and("pulls/1/merge", 429);
-        let auth = test_authority();
-        let result = merge_pr(&http, &auth, "owner", "repo", 1, "merge", None).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("rate limit"));
-    }
-
-    // ── delete_branch ────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn delete_branch_success() {
-        let http = mock_with_token_and("refs/heads/feature", 204);
-        let auth = test_authority();
-        let result = delete_branch(&http, &auth, "owner", "repo", "feature").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn delete_branch_already_deleted_is_ok() {
-        // 422 means branch already deleted — should not error
-        let http = mock_with_token_and("refs/heads/old", 422);
-        let auth = test_authority();
-        let result = delete_branch(&http, &auth, "owner", "repo", "old").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn delete_branch_forbidden_returns_error() {
-        let http = mock_with_token_and("refs/heads/protected", 403);
-        let auth = test_authority();
-        let result = delete_branch(&http, &auth, "owner", "repo", "protected").await;
-        assert!(result.is_err());
     }
 
     // ── fetch_pr ─────────────────────────────────────────────────

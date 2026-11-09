@@ -596,21 +596,30 @@ pub(crate) fn touches_identifiers(
         }))
 }
 
-/// Bind `branch`, which must already descend from `target` (the tip of
-/// `target_branch`), against `target`, and seal the bind commit onto it when
+/// Bind `branch` at exactly `expected_head`, which must already descend from
+/// `target` (the tip of `target_branch`), and seal the bind commit onto it when
 /// there is anything to bind. A rule that refuses the branch is reported as a
 /// landing refusal. The caller holds the store lock.
 pub(crate) fn bind_onto(
     jj: &crate::jj::JjEnv,
     store: &Path,
     branch: &str,
+    expected_head: &str,
     target: &str,
     target_branch: &str,
     rules: &[(String, IdentifierRule)],
 ) -> Result<BoundLanding, String> {
-    let tip = crate::jj::bookmark_commit(jj, store, branch)
-        .ok_or_else(|| format!("bookmark `{branch}` did not resolve to one commit"))?;
+    let targets = cairn_vcs::local_bookmark_targets(store, branch)?;
+    let [tip] = targets.as_slice() else {
+        return Err(format!("bookmark `{branch}` did not resolve to one commit"));
+    };
+    let tip = tip.clone();
     let refuse = |error: String| landing_refusal(branch, target_branch, &error);
+    if tip != expected_head {
+        return Err(refuse(format!(
+            "the prepared source moved from {expected_head} to {tip}; prepare the landing again"
+        )));
+    }
     let mut plan = BindPlan::default();
     let mut changed: Option<Vec<(String, String)>> = None;
     for (kind, rule) in rules {

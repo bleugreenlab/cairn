@@ -108,7 +108,6 @@ fn auth_line_host(line: &str, remote_unreadable: bool) -> Option<Option<String>>
     if lower.starts_with(LIBGIT2) {
         let url = line[LIBGIT2.len()..]
             .trim_start_matches(':')
-            .trim()
             .split_whitespace()
             .next();
         return Some(url.and_then(url_host));

@@ -1,7 +1,7 @@
 //! Sync an edited `create-pr` artifact's prose into the PR it already produced.
 
 use crate::orchestrator::Orchestrator;
-use crate::storage::LocalDb;
+use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
 use super::context::{db_error, query_mr_context_for_create_pr_artifact_job};
@@ -331,6 +331,134 @@ pub(crate) async fn sync_create_pr_artifact_for_job(
     title: &str,
     body: Option<&str>,
 ) -> Result<bool, String> {
+    sync_pr_prose(orch, job_id, title, body, None).await
+}
+
+/// Appended to a create-pr artifact write's summary when its pull-request
+/// sync waits for the write to release its store lock. It stays in the report
+/// recorded at the seal, so an interrupted write is replayed as pending, never
+/// as synced; completion replaces it with what actually happened.
+pub(crate) const DEFERRED_PR_SYNC_PENDING: &str =
+    "pull request sync pending until this write releases its store lock (if this write is \
+     interrupted, patch the artifact with action:\"publish\" or save it again to sync)";
+
+/// A create-pr artifact version stored by a write that held its project's
+/// store lock. Publishing the branch and editing the pull request are network
+/// I/O that must not run under that lock, so the write runs this after it
+/// releases the lock and its branch reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredPrSync {
+    pub(crate) job_id: String,
+    pub(crate) output_name: String,
+    pub(crate) artifact_id: String,
+    pub(crate) version: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeferredPrSyncOutcome {
+    /// The pull request carries the artifact's latest version.
+    Synced,
+    /// The job has no pull request yet; there is nothing to sync.
+    NoPullRequest,
+    /// A newer version replaced this one before its sync ran; that version's
+    /// own write syncs it, and this older one must not overwrite it.
+    Superseded { by_version: i32 },
+}
+
+/// How many times [`complete_deferred_pr_sync`] re-syncs when a newer artifact
+/// version lands while it is editing the pull request.
+const DEFERRED_PR_SYNC_ATTEMPTS: usize = 3;
+
+async fn latest_artifact_version(
+    orch: &Orchestrator,
+    job_id: &str,
+    output_name: &str,
+) -> Result<(String, i32, serde_json::Value), String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (job_id, output_name) = (job_id.to_string(), output_name.to_string());
+    let row = db
+        .read(|conn| {
+            let (job_id, output_name) = (job_id.clone(), output_name.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, version, data FROM artifacts
+                          WHERE job_id = ?1 AND output_name = ?2
+                          ORDER BY version DESC LIMIT 1",
+                        params![job_id.as_str(), output_name.as_str()],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((row.text(0)?, row.i64(1)? as i32, row.text(2)?))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|e| db_error("Failed to load the create-pr artifact", e))?
+        .ok_or_else(|| format!("job {job_id} has no `{output_name}` artifact to sync"))?;
+    let data = serde_json::from_str(&row.2)
+        .map_err(|error| format!("the stored create-pr artifact does not parse: {error}"))?;
+    Ok((row.0, row.1, data))
+}
+
+/// Sync a deferred create-pr artifact into its pull request. Runs with no store
+/// lock or branch reservation held. `published_branch` is a branch the write
+/// already pushed after releasing the lock; it is not pushed again.
+///
+/// The pull request always receives the artifact's latest version, and only
+/// while the deferred one is still the latest when the sync starts: a newer
+/// version is that version's own write to sync. A version that lands during the
+/// edit is followed, a bounded number of times, so an older edit never has the
+/// last word.
+pub(crate) async fn complete_deferred_pr_sync(
+    orch: &Orchestrator,
+    deferral: &DeferredPrSync,
+    published_branch: Option<&str>,
+) -> Result<DeferredPrSyncOutcome, String> {
+    let mut synced_id = deferral.artifact_id.clone();
+    for attempt in 0..DEFERRED_PR_SYNC_ATTEMPTS {
+        let (id, version, data) =
+            latest_artifact_version(orch, &deferral.job_id, &deferral.output_name).await?;
+        if attempt == 0 && id != deferral.artifact_id {
+            return Ok(DeferredPrSyncOutcome::Superseded {
+                by_version: version,
+            });
+        }
+        if attempt > 0 && id == synced_id {
+            return Ok(DeferredPrSyncOutcome::Synced);
+        }
+        let title = data
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("create-pr artifact version {version} has no title"))?;
+        let body = data.get("body").and_then(serde_json::Value::as_str);
+        if !sync_pr_prose(orch, &deferral.job_id, title, body, published_branch).await? {
+            return Ok(DeferredPrSyncOutcome::NoPullRequest);
+        }
+        synced_id = id;
+    }
+    let (id, version, _) =
+        latest_artifact_version(orch, &deferral.job_id, &deferral.output_name).await?;
+    if id == synced_id {
+        Ok(DeferredPrSyncOutcome::Synced)
+    } else {
+        Err(format!(
+            "create-pr artifact versions kept landing while the pull request was synced (now \
+             version {version}); save the artifact again to sync it"
+        ))
+    }
+}
+
+async fn sync_pr_prose(
+    orch: &Orchestrator,
+    job_id: &str,
+    title: &str,
+    body: Option<&str>,
+    published_branch: Option<&str>,
+) -> Result<bool, String> {
     let job_id = job_id.to_string();
     let Some(mr_context) = orch
         .db
@@ -350,8 +478,29 @@ pub(crate) async fn sync_create_pr_artifact_for_job(
     // Only a bound remote PR has a head to advance; a local-only change has no
     // origin to publish to and nothing external reading it.
     if let Some(pr_number) = mr_context.github_pr_number {
-        publish_branch_for_artifact_sync(orch, &mr_context.repo_path, &mr_context.mr_id).await?;
-        edit_github_pr_title_body(&mr_context.repo_path, pr_number, title, body).await?;
+        let already_published = match published_branch {
+            Some(published) => {
+                source_branch_for_merge_request(&orch.db.local, &mr_context.mr_id).await?
+                    == published
+            }
+            None => false,
+        };
+        if !already_published {
+            publish_branch_for_artifact_sync(orch, &mr_context.repo_path, &mr_context.mr_id)
+                .await?;
+        }
+        #[cfg(feature = "test-utils")]
+        let scripted =
+            prose_edit_seam::intercept(orch, &mr_context.repo_path, &mr_context.mr_id, pr_number)
+                .await;
+        #[cfg(not(feature = "test-utils"))]
+        let scripted: Option<Result<(), String>> = None;
+        match scripted {
+            Some(result) => result?,
+            None => {
+                edit_github_pr_title_body(&mr_context.repo_path, pr_number, title, body).await?
+            }
+        }
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -368,6 +517,81 @@ pub(crate) async fn sync_create_pr_artifact_for_job(
         ),
     );
     Ok(true)
+}
+
+/// Lets an integration test stand in for `gh pr edit` on one repository and
+/// observe the locks held at the moment the pull request would be edited.
+#[cfg(feature = "test-utils")]
+pub mod prose_edit_seam {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    /// What was held when a pull-request edit ran.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ProseEditProbe {
+        pub pr_number: i32,
+        pub store_lock_holder: Option<String>,
+        pub branch_reservation_holder: Option<String>,
+    }
+
+    type Script = Arc<dyn Fn(&ProseEditProbe) -> Result<(), String> + Send + Sync>;
+    type Installed = (Script, Arc<Mutex<Vec<ProseEditProbe>>>);
+    static SEAMS: LazyLock<Mutex<HashMap<String, Installed>>> = LazyLock::new(Default::default);
+
+    /// The installed stand-in; dropping it removes it.
+    pub struct ProseEdits {
+        repo_path: String,
+        probes: Arc<Mutex<Vec<ProseEditProbe>>>,
+    }
+
+    impl ProseEdits {
+        pub fn probes(&self) -> Vec<ProseEditProbe> {
+            self.probes.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for ProseEdits {
+        fn drop(&mut self) {
+            SEAMS.lock().unwrap().remove(&self.repo_path);
+        }
+    }
+
+    /// Answer every pull-request edit for the checkout at `repo_path` with
+    /// `script` instead of running `gh`.
+    pub fn install(
+        repo_path: &std::path::Path,
+        script: impl Fn(&ProseEditProbe) -> Result<(), String> + Send + Sync + 'static,
+    ) -> ProseEdits {
+        let repo_path = repo_path.to_string_lossy().into_owned();
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        SEAMS
+            .lock()
+            .unwrap()
+            .insert(repo_path.clone(), (Arc::new(script), probes.clone()));
+        ProseEdits { repo_path, probes }
+    }
+
+    pub(super) async fn intercept(
+        orch: &crate::orchestrator::Orchestrator,
+        repo_path: &str,
+        mr_id: &str,
+        pr_number: i32,
+    ) -> Option<Result<(), String>> {
+        let (script, probes) = SEAMS.lock().unwrap().get(repo_path).cloned()?;
+        let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
+        let branch = super::source_branch_for_merge_request(&orch.db.local, mr_id)
+            .await
+            .unwrap_or_default();
+        let probe = ProseEditProbe {
+            pr_number,
+            store_lock_holder: orch
+                .store_lock_status(&store)
+                .and_then(|status| status.holder.map(|(operation, _)| operation)),
+            branch_reservation_holder: orch.branch_reservation_holder(&store, &branch),
+        };
+        probes.lock().unwrap().push(probe.clone());
+        Some(script(&probe))
+    }
 }
 
 #[cfg(test)]
@@ -512,7 +736,7 @@ mod tests {
             let repo = tempfile::tempdir().unwrap();
             seed_remote_open_merge_request(&db, "owner-job", &repo.path().to_string_lossy()).await;
             db.execute(
-                &format!("UPDATE merge_requests SET {column} = ?1 WHERE id = 'mr-remote'"),
+                format!("UPDATE merge_requests SET {column} = ?1 WHERE id = 'mr-remote'"),
                 params![value],
             )
             .await

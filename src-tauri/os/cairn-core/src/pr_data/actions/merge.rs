@@ -1,9 +1,11 @@
-//! Merge orchestration: the conflict gate, GitHub-vs-local routing, merge-method
-//! resolution, and post-merge reconciliation.
+//! Merge orchestration: the conflict gate, default-branch vs child landing,
+//! merge-method resolution, and post-merge reconciliation. Every landing is a
+//! store fold; a remote one is published by a leased fast-forward of origin's
+//! target, never through GitHub's merge API.
 
 use crate::execution::teardown::{cleanup_issue_jobs, TeardownReason, TeardownScope};
 use crate::github::api;
-use crate::github::credentials::{get_owner_repo, get_owner_repo_for_pr};
+use crate::github::credentials::get_owner_repo_for_pr;
 use crate::orchestrator::Orchestrator;
 use crate::pr_data::helpers::{
     assert_main_checkout_clean_for_default_merge, local_pr_files,
@@ -264,15 +266,11 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::conflict::{conflict_recovery_hint, format_conflicted_commits, source_conflict_report};
-use super::context::{
-    db_error, resolve_merge_mr_context_for_job, MergeMrContext, PrNodeResolution,
-};
+use super::context::{db_error, resolve_merge_mr_context_for_job, MergeMrContext};
+use super::default_landing::PublishedLanding;
+use super::landing_record::{journal_publication_outcome, PublicationOutcome};
 use super::refresh::refresh_pr_for_job;
-use super::resolution::resolve_pr_node;
-use super::store_merge::{
-    land_verified_store_merge_child, prospective_store_merge_child, VerifiedLanding,
-};
+use super::resolution::{resolve_pr_node_landed, Landed};
 
 /// Resolve a PR owner id to the `jobs.id` used by `file_changes.job_id`.
 async fn resolve_file_change_job_id(
@@ -583,23 +581,34 @@ fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<S
     }
 }
 
-/// The merge method a DEFAULT-BRANCH landing will actually use, resolved per
-/// route: the GitHub route (`default_landing`'s GitHub merge) passes the caller's
-/// method straight through (defaulting to squash), while the local fold applies
-/// the workspace forcing (`effective_merge_method`). Only
-/// meaningful when the target IS the default branch. The merge gate uses this to
-/// refuse a clean-tip / conflicted-intermediate source under a non-`squash`
-/// (preserve-every-commit) landing on BOTH routes uniformly — a squash landing
-/// flattens the intermediate away, a preserve landing cannot.
+/// The merge method a DEFAULT-BRANCH landing uses. Only meaningful when the
+/// target IS the default branch.
+///
+/// A remote pull request's landing is published as ONE commit whose only parent
+/// is origin's expected old target, by a leased fast-forward, and is journaled
+/// and recovered as that shape (`default_landing`, `PublicationShape::Squash`).
+/// It therefore takes only `squash`: any other requested method is refused by
+/// name, never silently squashed or published under a shape the journal does
+/// not describe. A local fold applies the workspace forcing
+/// (`effective_merge_method`).
 fn default_landing_method(
     ctx: &MergeMrContext,
     resolved_default: &str,
     merge_method: Option<String>,
-) -> String {
-    if should_route_to_github(ctx, resolved_default) {
-        merge_method.unwrap_or_else(|| "squash".to_string())
-    } else {
-        effective_merge_method(ctx, merge_method)
+) -> Result<String, String> {
+    if !is_remote_default_landing(ctx, resolved_default) {
+        return Ok(effective_merge_method(ctx, merge_method));
+    }
+    match merge_method.as_deref() {
+        None | Some("squash") => Ok("squash".to_string()),
+        Some(other) => Err(format!(
+            "Refusing to merge `{source}` into `{target}` with method `{other}`: a pull \
+             request lands on the default branch as one squash commit, published by a \
+             fast-forward of origin's `{target}`, so only `squash` is available. \
+             `{target}` was not advanced.",
+            source = ctx.source_branch,
+            target = ctx.target_branch,
+        )),
     }
 }
 
@@ -609,174 +618,29 @@ fn default_landing_method(
 /// worktrees were based — stopping short of trusting the raw DB column the merge
 /// used to read directly.
 fn resolve_project_default_branch(repo_path: &str, stored_default: &str) -> String {
-    let config =
-        crate::config::project_settings::load_project_settings_read_only(Path::new(repo_path));
-    crate::config::project_settings::resolve_default_branch(&config, Some(stored_default))
+    crate::config::project_settings::effective_default_branch(
+        Some(Path::new(repo_path)),
+        Some(stored_default),
+    )
 }
 
-/// Whether this merge should go through GitHub's merge API rather than the local
-/// jj fold. Pure so the routing is unit-testable without an `Orchestrator`:
-/// `resolved_default` is the config-aware default resolved by the caller.
+/// Whether this merge is a remote pull request's landing on the default branch,
+/// which publishes one squash commit to origin, rather than a local fold. Every
+/// default landing is a store fold (`default_landing`); this decides only the
+/// method it may use (`default_landing_method`). Pure so it is unit-testable
+/// without an `Orchestrator`: `resolved_default` is the config-aware default
+/// resolved by the caller.
 ///
 /// True only for a real remote PR (`github_pr_number` present, not a local-only
 /// project) that lands on the default branch and is not a workspace PR. A
 /// Coordinator child→integration PR (`target_branch` is the integration branch,
-/// not the default) and a local-only project both stay on the local fold;
-/// workspace PRs that force the keep-every-commit `merge` method are out of
-/// scope and also stay local.
-fn should_route_to_github(ctx: &MergeMrContext, resolved_default: &str) -> bool {
+/// not the default) and a local-only project are local folds; workspace PRs
+/// force the keep-every-commit `merge` method and are excluded too.
+fn is_remote_default_landing(ctx: &MergeMrContext, resolved_default: &str) -> bool {
     ctx.mr.github_pr_number.is_some()
         && !ctx.mr.is_local
         && !ctx.is_workspace
         && ctx.target_branch == resolved_default
-}
-
-/// `should_route_to_github` against the project's config-aware default branch.
-fn should_merge_via_github(ctx: &MergeMrContext) -> bool {
-    let resolved_default = resolve_project_default_branch(&ctx.mr.repo_path, &ctx.default_branch);
-    should_route_to_github(ctx, &resolved_default)
-}
-
-/// Map a `github::api::merge_pr` failure to user-facing guidance. GitHub refuses
-/// a merge with 405 or 409, and the source was clean *locally* (the conflict gate
-/// passed), so there are no local markers to point at — the guidance points at
-/// the PR instead, distinct from the local-fold conflict message.
-///
-/// The status alone is not the cause. GitHub returns 405 both for "Pull Request
-/// is not mergeable" and for "Merge already in progress", which call for opposite
-/// responses: the first wants the PR fixed and the merge retried, the second
-/// means somebody (or something) is already merging this very PR and the only
-/// correct move is to look again. Reporting the second as conflicts or failing
-/// checks sends the reader off to fix a PR that is in the middle of merging
-/// cleanly — which is exactly what happened when one wake produced two agent
-/// contexts and both tried to merge the same PR (CAIRN-3283). So the body text
-/// GitHub returned, carried verbatim in `error`, decides the message.
-pub(super) fn map_github_merge_error(
-    source_branch: &str,
-    target_branch: &str,
-    error: String,
-) -> String {
-    let refused = error.contains("PR: 405") || error.contains("PR: 409");
-    if !refused {
-        return format!(
-            "Failed to merge `{source_branch}` into `{target_branch}` via GitHub: {error}"
-        );
-    }
-    let body = error.to_lowercase();
-    // "Merge already in progress" (405): the merge this call asked for is
-    // happening. Nothing to fix and nothing to retry — read the PR's state.
-    if body.contains("already in progress") {
-        return format!(
-            "GitHub is already merging `{source_branch}` into `{target_branch}` — another merge of this PR is in flight, so this one was refused. Nothing is wrong with the PR; read its current state with action:\"refresh\" before doing anything else. (GitHub: {error})"
-        );
-    }
-    // 409, and 405 "Base branch was modified": the PR moved under this call.
-    // Refreshing picks up the new head; only then is a retry meaningful.
-    if error.contains("PR: 409") || body.contains("was modified") {
-        return format!(
-            "GitHub refused the merge of `{source_branch}` into `{target_branch}` because the PR moved while the merge was in flight. Re-read it with action:\"refresh\", then merge again. (GitHub: {error})"
-        );
-    }
-    format!(
-        "GitHub refused the merge of `{source_branch}` into `{target_branch}` — the PR has conflicts or failing required checks on GitHub's side. Resolve them on the PR, then retry the merge. (GitHub: {error})"
-    )
-}
-
-/// After GitHub merged a remote PR (`default_landing`), resolve it and
-/// reconcile locally.
-///
-/// GitHub performed the squash-merge, closed the PR, and advanced the base
-/// branch on origin. The ordering is fail-closed: the GitHub call was the
-/// load-bearing step, and only once it succeeded do we mark the merge request
-/// merged / resolve the issue locally (`resolve_pr_node`). Local reconciliation
-/// is then proactive and best-effort — origin is already authoritative, the
-/// GitHub `push` webhook and the local sweep also perform this work, and the
-/// before/after commit-id guards in `base_advance` make the double-fire a no-op.
-async fn after_github_merge(
-    orch: &Orchestrator,
-    db: Arc<LocalDb>,
-    job_id: &str,
-    merge_context: MergeMrContext,
-    merge_started: std::time::Instant,
-    attribution: Option<super::PrResolutionAttribution>,
-    merged_commit: Option<String>,
-) -> Result<String, String> {
-    let repo_path = merge_context.mr.repo_path.clone();
-    let source_branch = merge_context.source_branch.clone();
-    let target_branch = merge_context.target_branch.clone();
-    let (owner, repo) = get_owner_repo(&repo_path)?;
-    let auth = installation_authority(&orch.db.local, &owner).await?;
-    let http = &*orch.services.http;
-
-    // GitHub merged: mark the merge request merged, then resolve the issue
-    // through the terminal cascade (live work stopped, sessions closed, warm
-    // processes evicted). Runs only after the GitHub call succeeded.
-    crate::orchestrator::catch_up::end_on_landing(
-        orch,
-        &db,
-        &merge_context.project_id,
-        &repo_path,
-        &source_branch,
-    )
-    .await;
-    let resolve_started = std::time::Instant::now();
-    resolve_pr_node(
-        orch,
-        job_id,
-        PrNodeResolution::Merge,
-        attribution,
-        merged_commit.as_deref(),
-    )
-    .await
-    .map_err(|error| {
-        log::error!(
-            "GitHub merged PR but failed to mark merge request merged for job {job_id}: {error}"
-        );
-        error
-    })?;
-    log::info!(
-        "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
-        resolve_started.elapsed()
-    );
-
-    // BEST-EFFORT: delete the merged source branch on GitHub. Nothing downstream
-    // depends on it.
-    if let Err(e) = api::delete_branch(http, &auth, &owner, &repo, &source_branch).await {
-        log::warn!("Best-effort delete of merged source branch {source_branch} failed: {e}");
-    }
-
-    // BEST-EFFORT, proactive local reconcile. This path only handles remote PRs
-    // whose real base is the project default branch, so the shared reconcile may
-    // safely update the user's main checkout.
-    let reconcile_ctx = merge_context;
-    let orch_clone = orch.clone();
-    tokio::spawn(async move {
-        // Fetch origin into the shared store and rebase in-flight siblings onto
-        // the advanced `<base>@origin` tip. The `push` webhook for this same
-        // merge lands on the same single-flight sync, which waits for this one
-        // rather than racing it; failures are recorded where reads report them.
-        crate::orchestrator::base_branch_sync::sync(
-            &orch_clone,
-            &reconcile_ctx.project_id,
-            &target_branch,
-        )
-        .await;
-        // File capture, user-checkout fast-forward pull (forced — no local fold
-        // moved it), worktree teardown, PR refresh.
-        reconcile_after_merge(
-            orch_clone,
-            db,
-            reconcile_ctx,
-            CheckoutReconciliation::PullRemoteLanding,
-        )
-        .await;
-    });
-
-    log::info!(
-        "merge_pr_for_job[{job_id}]: GitHub merge path took {:?}",
-        merge_started.elapsed()
-    );
-    Ok("PR merged via GitHub".to_string())
 }
 
 /// Merge a PR, mark the issue merged, and run post-merge reconciliation (file
@@ -794,10 +658,34 @@ pub async fn merge_pr_for_job(
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
 ) -> Result<String, String> {
+    // One measured record per call, refusals included (`merge_metrics`).
+    let attempt = super::merge_metrics::MergeAttempt::begin(job_id);
+    let result = super::merge_metrics::measured(
+        Arc::clone(&attempt),
+        merge_pr_for_job_measured(orch, job_id, merge_method, attribution, precondition),
+    )
+    .await;
+    attempt.finish(&result);
+    result
+}
+
+async fn merge_pr_for_job_measured(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_method: Option<String>,
+    attribution: Option<super::PrResolutionAttribution>,
+    precondition: Option<MergePrecondition>,
+) -> Result<String, String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|e| e.to_string())?;
     let merge_context = resolve_merge_mr_context_for_job(&db, job_id).await?;
+    super::merge_metrics::identify(
+        &merge_context.mr.mr_id,
+        merge_context.mr.github_pr_number,
+        &merge_context.source_branch,
+        &merge_context.target_branch,
+    );
     let barrier = crate::mcp::handlers::run::held::pr_commit_barrier(
         orch,
         &merge_context.project_id,
@@ -869,6 +757,7 @@ async fn merge_pr_for_job_past_barrier(
         detail,
     )
     .await?;
+    super::merge_metrics::journaled(&attempt_id);
 
     // Evaluated ahead of the ordinary policy refusal so a pin bump that cannot
     // land names its own condition rather than the generic policy message.
@@ -968,74 +857,21 @@ async fn merge_pr_for_job_past_barrier(
         }
     }
     let mut config_notice: Option<String> = None;
-    let mut dropped_detail: Option<String> = None;
+    // A landing origin accepted, whose journal outcome is written once the
+    // merge is recorded.
+    let mut published: Option<PublishedLanding> = None;
+    let mut settles_github = false;
     // Once the ceremony starts it journals the attempt's outcome itself; a
     // gated attempt refused before then is journaled here like any other.
     let mut ceremony_started = false;
     let merge_result = async {
         let db = db.clone();
-        // Gate on the TIP, not the whole range. A genuinely conflicted tip needs
-    // manual marker resolution and can never fold, so it is refused here. A clean
-    // tip with conflicted INTERMEDIATE commits is auto-recoverable: it is allowed
-    // through to `store_merge_child`, which decides per-path whether to flatten
-    // (squash-to-default, child→integration) or refuse (non-squash preserve). The
-    // range is still enumerated, solely to build the refusal message.
-    if let Some(report) = source_conflict_report(
-        &orch.jj_binary_path,
-        &orch.config_dir,
-        &repo_path,
-        &merge_context.source_branch,
-        Some(&merge_context.target_branch),
-    ) {
-        if report.tip_conflicted {
-            return Err(format!(
-                "Refusing to merge: the jj source bookmark `{source}` carries a recorded conflict on its tip — a conflicted history cannot fold into `{target}`.\n{commits}\n{recovery}",
-                source = merge_context.source_branch,
-                target = merge_context.target_branch,
-                commits = format_conflicted_commits(&report.commits),
-                recovery = conflict_recovery_hint(
-                    &merge_context.source_branch,
-                    Some(&merge_context.target_branch)
-                ),
-            ));
-        }
-        // Clean tip, conflicted intermediate(s): auto-recoverable only for a SQUASH
-        // landing (which flattens). A preserve-every-commit landing on the default
-        // branch cannot flatten, so it must refuse — and the refusal must cover BOTH
-        // routes: the local non-squash fold (`store_merge_child`) AND the remote
-        // GitHub `merge` route (`default_landing`), which passes the
-        // method straight to GitHub and would otherwise carry the conflicted
-        // intermediate onto the default branch as a merge commit, bypassing the
-        // local refusal. The two routes resolve the method differently, so mirror
-        // each here. (Child→integration landings always flatten, so they are exempt.)
-        if merge_context.target_branch == resolved_default {
-            let route_method =
-                default_landing_method(&merge_context, &resolved_default, merge_method.clone());
-            if route_method != "squash" {
-                return Err(format!(
-                    "Refusing to merge: `{source}` has a clean tip but conflicted intermediate commit(s), and the `{route_method}` method preserves every commit — a conflicted intermediate cannot land on the default branch `{target}`. Resolve the conflict markers and re-seal, or merge with the squash method (which flattens the intermediate history).\n{commits}",
-                    source = merge_context.source_branch,
-                    target = merge_context.target_branch,
-                    commits = format_conflicted_commits(&report.commits),
-                ));
-            }
-        }
-        log::info!(
-            "merge_pr_for_job[{job_id}]: source `{source}` has a clean tip with {n} conflicted intermediate(s); allowing through to the guarded flatten",
-            source = merge_context.source_branch,
-            n = report.commits.len(),
-        );
-    }
+        // A conflicted source history is the shared owner-merge preparation's
+        // to heal or refuse (opening the conflict session), and the landing
+        // then validates the exact combined tree. The default landing judges
+        // the configuration it would land on that same exact tree.
     if merge_context.target_branch == resolved_default {
         assert_main_checkout_clean_for_default_merge(&*orch.services.git, &repo_path)?;
-    }
-    // The running app reads the default branch's .cairn/config.yaml, so the
-    // build that is running judges the copy this landing puts there: a file it
-    // cannot load is refused, and one that sets checks aside lands with a
-    // notice.
-    if merge_context.target_branch == resolved_default {
-        config_notice =
-            super::config_preflight::preflight_landing_config(orch, &merge_context).await?;
     }
     let fold_started = std::time::Instant::now();
     // Serialize every fold behind the per-store mutex so a merge fold and a
@@ -1044,20 +880,27 @@ async fn merge_pr_for_job_past_barrier(
     // downstream reconcile spawned later inside `resolve_pr_node` acquires the
     // same lock, after this guard drops — no nested acquisition.
     let merge_store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-    let mut landed_on_default = None;
-    let merged_commit = if merge_context.target_branch == resolved_default {
-        // The default branch takes only a merge result that was bound and
-        // validated, and only if neither tip moved since
-        // (`default_landing`). A real remote PR lands through GitHub's merge
-        // API, bound to the judged head (GitHub squash-merges, closes the PR,
-        // and advances origin; Cairn then reconciles locally). Everything else
-        // lands by the store fold: local-only projects, and workspace PRs that
-        // deliberately preserve every commit. The method selects the shape:
-        // `squash` collapses the source to one commit; `merge` keeps every
-        // sealed commit.
-        let via_github = should_merge_via_github(&merge_context);
+    super::merge_metrics::route(
+        match (
+            merge_context.target_branch == resolved_default,
+            merge_context.mr.is_local,
+            approval_enrollment.is_some(),
+        ) {
+            (false, _, _) => "child",
+            (true, true, false) => "store",
+            (true, true, true) => "store-approval",
+            (true, false, false) => "origin",
+            (true, false, true) => "origin-approval",
+        },
+    );
+    let (merged_commit, landed) = if merge_context.target_branch == resolved_default {
+        // The default branch takes only a merge result prepared onto its
+        // exact target, bound and validated there, and only if the source, the
+        // target and the relationship are unchanged since (`default_landing`).
+        // It lands by the store fold, published to origin (when there is one)
+        // by a leased fast-forward of the target alone.
         let method =
-            default_landing_method(&merge_context, &resolved_default, merge_method.clone());
+            default_landing_method(&merge_context, &resolved_default, merge_method.clone())?;
         let landed = match approval_enrollment.as_deref() {
             Some(enrollment_id) => {
                 ceremony_started = true;
@@ -1066,7 +909,6 @@ async fn merge_pr_for_job_past_barrier(
                     job_id,
                     &merge_context,
                     &method,
-                    via_github,
                     super::default_landing::ApprovalGate {
                         db: &db,
                         enrollment_id,
@@ -1094,120 +936,74 @@ async fn merge_pr_for_job_past_barrier(
                     job_id,
                     &merge_context,
                     &method,
-                    via_github,
                     verified_head.as_deref(),
+                    &MergeAttemptJournal {
+                        attempt_id: &attempt_id,
+                        project_id: &journal_project_id,
+                        merge_request_id: &journal_merge_request_id,
+                        job_id,
+                        target_ref: &journal_target_ref,
+                        source_ref: &journal_source_ref,
+                        policy_json: &stored_policy,
+                    },
                 )
                 .await?
             }
         };
-        dropped_detail = dropped_commits_detail(&landed.dropped);
+        if let Some(notice) = landed.config_notice.as_deref() {
+            config_notice = merge_journal_detail(&[config_notice.as_deref(), Some(notice)]);
+        }
         log::info!(
             "merge_pr_for_job[{job_id}]: merge gates and the default-branch landing took {:?}",
             gate_started.elapsed()
         );
-        if via_github {
-            super::default_landing::record_allocations(orch, &db, &merge_context, &landed).await;
-            let notice = config_notice.clone();
-            return after_github_merge(
-                orch,
-                db,
-                job_id,
-                merge_context,
-                merge_started,
-                attribution,
-                landed.landed_commit.clone(),
-            )
-            .await
-            .map(|reply| with_merge_notice(reply, notice.as_deref()));
-        }
+        published = landed.published.clone();
+        settles_github = !merge_context.mr.is_local;
         let commit = landed
             .landed_commit
             .clone()
             .ok_or_else(|| "the store fold reported no landed commit".to_string())?;
-        landed_on_default = Some(landed);
-        commit
+        (commit, landed)
     } else {
         log::info!(
             "merge_pr_for_job[{job_id}]: merge gates took {:?}",
             gate_started.elapsed()
         );
-        let method = effective_merge_method(&merge_context, merge_method);
-        const MAX_VERIFY_ATTEMPTS: usize = 8;
-        let mut landed = None;
-        for _attempt in 0..MAX_VERIFY_ATTEMPTS {
-            let prospective = {
-                let _store_guard = orch
-                    .acquire_jj_store_lock(
-                        &merge_store, crate::orchestrator::StoreLockClass::Foreground,
-                        format!("prospective merge fold for {}", merge_context.source_branch),
-                    )
-                    .await;
-                prospective_store_merge_child(orch, &merge_context, &method).await?
-            };
-            match crate::execution::checks::verify_review_tree(
-                orch,
-                db.clone(),
-                &merge_context.project_id,
-                &repo_path,
-                Path::new(&repo_path),
-                &prospective.commit_id,
-                &prospective.target_tip,
-                &prospective.tree_hash,
-                &prospective.tree_entries,
-                &prospective.changed_files,
+        // A child lands on its integration branch by the same reserved,
+        // two-phase protocol, as a fast-forward of the integration branch to
+        // the prepared source head (`child_landing`).
+        let landed = super::child_landing::land_on_integration(
+            orch,
+            job_id,
+            &db,
+            &merge_context,
+            &MergeAttemptJournal {
+                attempt_id: &attempt_id,
+                project_id: &journal_project_id,
+                merge_request_id: &journal_merge_request_id,
                 job_id,
-                crate::fleet::CellPriority::ReviewCheck,
-            )
-            .await
-            {
-                crate::execution::checks::ReviewTreeGateResult::Green => {}
-                crate::execution::checks::ReviewTreeGateResult::CheckFailed { name, detail } => {
-                    return Err(format!("Combined-tree check '{name}' failed: {detail}"));
-                }
-                crate::execution::checks::ReviewTreeGateResult::InfrastructureFailure(error) => {
-                    return Err(format!(
-                        "Combined-tree verification infrastructure failure: {error}. Retry the merge."
-                    ));
-                }
-                crate::execution::checks::ReviewTreeGateResult::Cancelled(detail) => {
-                    return Err(format!(
-                        "Combined-tree verification was cancelled ({detail}); retry the merge."
-                    ));
-                }
-            }
-            let landing = {
-                let store_guard = orch
-                    .acquire_jj_store_lock(
-                        &merge_store, crate::orchestrator::StoreLockClass::Foreground,
-                        format!("verified merge landing for {}", merge_context.source_branch),
-                    )
-                    .await;
-                land_verified_store_merge_child(
-                    orch,
-                    &merge_context,
-                    &method,
-                    &prospective,
-                    &store_guard.trace(),
-                )
-                .await?
-            };
-            match landing {
-                VerifiedLanding::Landed(commit) => {
-                    landed = Some(commit);
-                    break;
-                }
-                VerifiedLanding::Stale => continue,
-            }
-        }
-        landed.ok_or_else(|| {
-            "Combined-tree verification could not stabilize because the source or integration branch kept moving. Retry the merge."
-                .to_string()
-        })?
+                target_ref: &journal_target_ref,
+                source_ref: &journal_source_ref,
+                policy_json: &stored_policy,
+            },
+        )
+        .await?;
+        published = landed.published.clone();
+        settles_github = !merge_context.mr.is_local;
+        let commit = landed
+            .landed_commit
+            .clone()
+            .ok_or_else(|| "the child landing reported no landed commit".to_string())?;
+        (commit, landed)
     };
+    // Held until the merge is recorded: it carries the landing's reservation.
+    let mut landing = Some(landed);
     log::info!(
-        "merge_pr_for_job[{job_id}]: store_merge_child (fold + origin) took {:?}",
+        "merge_pr_for_job[{job_id}]: the landing (preparation, validation and publication) took \
+         {:?}",
         fold_started.elapsed()
     );
+    let _bookkeeping = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
 
     // Merge postcondition: the fold must have advanced the target bookmark to
     // contain the source tip. Verify it BEFORE `resolve_pr_node` marks the PR
@@ -1232,25 +1028,36 @@ async fn merge_pr_for_job_past_barrier(
             ));
         }
     }
-    if let Some(landed) = landed_on_default.as_ref() {
+    super::merge_metrics::landed(&merged_commit);
+    if let Some(landed) = landing.as_ref() {
         super::default_landing::record_allocations(orch, &db, &merge_context, landed).await;
     }
 
+    match crate::orchestrator::catch_up::mode_for_project(
+        orch, &merge_context.project_id, &merge_store, &merge_context.source_branch,
+    ).await {
+        Ok(Some(mode)) => crate::orchestrator::catch_up::record_landing_merged(
+            orch, &mode, &merge_store, &merge_context.target_branch, Some(&merged_commit),
+        ).await,
+        Ok(None) => {},
+        Err(error) => log::warn!("landing accepted but catch-up event lookup failed: {error}"),
+    }
     crate::orchestrator::catch_up::end_on_landing(
-        orch,
-        &db,
-        &merge_context.project_id,
-        &merge_context.mr.repo_path,
-        &merge_context.source_branch,
-    )
-    .await;
+        orch, &db, &merge_context.project_id, &repo_path, &merge_context.source_branch,
+    ).await;
     let resolve_started = std::time::Instant::now();
-    resolve_pr_node(
+    // Every landing moves the source and the target to the same landing
+    // commit (a default landing's squash, a child's prepared head), so that
+    // commit is the source's exact merged identity.
+    let merged_source = landing.as_ref().map(|_| merged_commit.as_str());
+    resolve_pr_node_landed(
         orch,
         job_id,
-        PrNodeResolution::Merge,
         attribution,
-        Some(merged_commit.as_str()),
+        Landed {
+            commit: Some(merged_commit.as_str()),
+            source: merged_source,
+        },
     )
     .await
     .map_err(|error| {
@@ -1261,6 +1068,11 @@ async fn merge_pr_for_job_past_barrier(
             );
             error
         })?;
+    // The merge is recorded: the landing's source reads merged, so the final
+    // check refuses any child still naming it, and its reservation can go.
+    if let Some(landed) = landing.as_mut() {
+        landed.reservation = None;
+    }
     log::info!(
         "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
         resolve_started.elapsed()
@@ -1287,6 +1099,37 @@ async fn merge_pr_for_job_past_barrier(
     }
     .await;
 
+    if merge_result.is_ok() && settles_github {
+        let _settle = super::merge_metrics::time(super::merge_metrics::Phase::Settle);
+        super::landing_record::settle_github_best_effort(orch, job_id).await;
+    }
+    let _journal = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
+    // A publication origin accepted journals its own outcome under its own
+    // attempt, and only once the merge is recorded; until then its intent is
+    // what recovery records it from.
+    if let (Some(published), Ok(_)) = (&published, &merge_result) {
+        let attempt = MergeAttemptJournal {
+            attempt_id: &published.attempt_id,
+            project_id: &journal_project_id,
+            merge_request_id: &journal_merge_request_id,
+            job_id,
+            target_ref: &journal_target_ref,
+            source_ref: &journal_source_ref,
+            policy_json: &stored_policy,
+        };
+        journal_publication_outcome(
+            &db,
+            &attempt,
+            &published.publication,
+            &PublicationOutcome::Accepted {
+                detail: merge_journal_detail(&[
+                    pin_bump_detail.as_deref(),
+                    config_notice.as_deref(),
+                ]),
+            },
+        )
+        .await?;
+    }
     // An approval-gated attempt's ceremony journals its own outcome, which
     // only a proven landing makes `succeeded`.
     if approval_enrollment.is_none() || !ceremony_started {
@@ -1302,12 +1145,8 @@ async fn merge_pr_for_job_past_barrier(
                 policy_json: &stored_policy,
             },
             &merge_result,
-            merge_journal_detail(&[
-                pin_bump_detail.as_deref(),
-                config_notice.as_deref(),
-                dropped_detail.as_deref(),
-            ])
-            .as_deref(),
+            merge_journal_detail(&[pin_bump_detail.as_deref(), config_notice.as_deref()])
+                .as_deref(),
         )
         .await?;
     }
@@ -1338,18 +1177,6 @@ fn merge_journal_detail(details: &[Option<&str>]) -> Option<String> {
     (!details.is_empty()).then(|| details.join("; "))
 }
 
-/// The merge record's account of the empty commits dropped from the branch
-/// before it was published.
-fn dropped_commits_detail(dropped: &[String]) -> Option<String> {
-    (!dropped.is_empty()).then(|| {
-        format!(
-            "dropped {} emptied commit(s): {}",
-            dropped.len(),
-            dropped.join(", ")
-        )
-    })
-}
-
 /// A merge's reply with a notice the person who merged must read, set apart
 /// as a `⚠️` paragraph: the PR view raises each such paragraph on its own.
 fn with_merge_notice(reply: String, notice: Option<&str>) -> String {
@@ -1364,22 +1191,6 @@ mod tests {
     use super::super::context::MrContext;
     use super::*;
     use crate::storage::RowExt;
-
-    #[test]
-    fn the_merge_record_names_the_empty_commits_a_landing_dropped() {
-        assert_eq!(dropped_commits_detail(&[]), None);
-        let dropped =
-            dropped_commits_detail(
-                &["862031e36cc7 \"fix: apply write-check changes\"".to_string()],
-            );
-        assert_eq!(
-            merge_journal_detail(&[Some("config notice"), dropped.as_deref()]).as_deref(),
-            Some(
-                "config notice; dropped 1 emptied commit(s): 862031e36cc7 \"fix: apply \
-                 write-check changes\""
-            )
-        );
-    }
 
     async fn merge_journal_test_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap();
@@ -1643,34 +1454,44 @@ mod tests {
         );
     }
 
-    /// `default_landing_method` mirrors each route's method resolution so the merge
-    /// gate refuses a conflicted-intermediate source under a preserve landing on
-    /// BOTH routes. The load-bearing case is the GitHub route: a remote default PR
-    /// that requests `merge` resolves to `merge` (passed straight to GitHub), so
-    /// the gate catches it before it carries a conflicted intermediate onto the
-    /// default branch — the bypass the local `store_merge_child` refusal missed.
+    /// A remote PR's default landing is one squash commit, so it takes only
+    /// `squash` and refuses any other method by name instead of silently
+    /// squashing it; a local fold keeps the workspace forcing.
     #[test]
-    fn default_landing_method_resolves_per_route_for_the_preserve_gate() {
-        // Remote default PR (routes to GitHub): default is squash (safe — flattens).
+    fn a_remote_default_landing_takes_only_squash_and_refuses_other_methods_by_name() {
         let mut remote = merge_context(false, false);
         remote.mr.github_pr_number = Some(7);
-        assert_eq!(default_landing_method(&remote, "main", None), "squash");
-        // Remote default PR requesting `merge`: resolves to merge (the bypass case).
         assert_eq!(
-            default_landing_method(&remote, "main", Some("merge".to_string())),
-            "merge",
-            "a GitHub `merge` request must be seen by the gate as a preserve landing"
+            default_landing_method(&remote, "main", None).unwrap(),
+            "squash"
         );
+        assert_eq!(
+            default_landing_method(&remote, "main", Some("squash".to_string())).unwrap(),
+            "squash"
+        );
+        for method in ["merge", "rebase"] {
+            let refusal = default_landing_method(&remote, "main", Some(method.to_string()))
+                .expect_err("a non-squash remote default landing is refused");
+            assert!(
+                refusal.contains(&format!("with method `{method}`"))
+                    && refusal.contains("only `squash` is available")
+                    && refusal.contains(&format!("`{}` was not advanced", remote.target_branch)),
+                "the refusal names the method, the one available, and that nothing moved: {refusal}"
+            );
+        }
 
-        // Local-only default PR (stays on the local fold): a normal PR defaults to
-        // squash, a workspace PR is forced to merge (preserve) — both surfaced here.
+        // Local-only default PR (a local fold): a normal PR defaults to squash,
+        // a workspace PR is forced to merge (preserve).
         let mut local = merge_context(false, false);
         local.mr.is_local = true;
-        assert_eq!(default_landing_method(&local, "main", None), "squash");
+        assert_eq!(
+            default_landing_method(&local, "main", None).unwrap(),
+            "squash"
+        );
         let mut local_ws = merge_context(true, false);
         local_ws.mr.is_local = true;
         assert_eq!(
-            default_landing_method(&local_ws, "main", Some("squash".to_string())),
+            default_landing_method(&local_ws, "main", Some("squash".to_string())).unwrap(),
             "merge",
             "a workspace PR forces a preserve landing even when squash is requested"
         );
@@ -1678,50 +1499,50 @@ mod tests {
         let mut local_triage = merge_context(false, true);
         local_triage.mr.is_local = true;
         assert_eq!(
-            default_landing_method(&local_triage, "main", None),
+            default_landing_method(&local_triage, "main", None).unwrap(),
             "squash",
             "a local memory-triage PR defaults to squash like a normal PR"
         );
     }
 
-    /// A remote PR landing on the default branch routes to GitHub; everything
-    /// else (local-only, child→integration, workspace) stays on the local jj fold.
+    /// A remote PR landing on the default branch is a remote default landing;
+    /// everything else (local-only, child→integration, workspace) is a local fold.
     #[test]
-    fn should_route_to_github_only_for_remote_default_branch_pr() {
+    fn is_remote_default_landing_only_for_remote_default_branch_pr() {
         // Base case: a real remote PR on the default branch.
         let mut ctx = merge_context(false, false);
         ctx.mr.github_pr_number = Some(7);
-        assert!(should_route_to_github(&ctx, "main"));
+        assert!(is_remote_default_landing(&ctx, "main"));
 
-        // Local-only project (no GitHub PR) stays on the local fold.
+        // Local-only project (no GitHub PR) is a local fold.
         let mut local = ctx.clone();
         local.mr.github_pr_number = None;
-        assert!(!should_route_to_github(&local, "main"));
+        assert!(!is_remote_default_landing(&local, "main"));
         let mut is_local = ctx.clone();
         is_local.mr.is_local = true;
-        assert!(!should_route_to_github(&is_local, "main"));
+        assert!(!is_remote_default_landing(&is_local, "main"));
 
-        // Coordinator child→integration PR (target ≠ default) stays local.
+        // Coordinator child→integration PR (target ≠ default) is a local fold.
         let mut child = ctx.clone();
         child.target_branch = "agent/cairn-1-coordinator-0".to_string();
-        assert!(!should_route_to_github(&child, "main"));
+        assert!(!is_remote_default_landing(&child, "main"));
 
-        // Workspace PRs stay on the local fold (keep-every-commit); memory-triage
-        // PRs route like normal PRs.
+        // Workspace PRs (keep-every-commit) are excluded; memory-triage PRs land
+        // like normal PRs.
         let mut workspace = ctx.clone();
         workspace.is_workspace = true;
-        assert!(!should_route_to_github(&workspace, "main"));
+        assert!(!is_remote_default_landing(&workspace, "main"));
         let mut triage = ctx.clone();
         triage.has_triage_batch = true;
-        assert!(should_route_to_github(&triage, "main"));
+        assert!(is_remote_default_landing(&triage, "main"));
 
-        // A stale stored default that disagrees with the real base routes off the
-        // PR's actual base: target "staging" against resolved "staging" routes,
-        // against a stale "main" does not.
+        // A stale stored default that disagrees with the real base is judged by
+        // the PR's actual base: target "staging" against resolved "staging" is a
+        // remote default landing, against a stale "main" it is not.
         let mut staging = ctx.clone();
         staging.target_branch = "staging".to_string();
-        assert!(should_route_to_github(&staging, "staging"));
-        assert!(!should_route_to_github(&staging, "main"));
+        assert!(is_remote_default_landing(&staging, "staging"));
+        assert!(!is_remote_default_landing(&staging, "main"));
     }
 
     #[test]
@@ -1762,82 +1583,5 @@ mod tests {
             "agent/cairn-1-coordinator-0",
             "main"
         ));
-    }
-
-    /// A GitHub 405/409 refusal points at the PR (no local markers exist); any
-    /// other failure is reported as a plain GitHub merge error.
-    #[test]
-    fn map_github_merge_error_distinguishes_refusal_from_other_failures() {
-        let refusal = map_github_merge_error(
-            "feature",
-            "main",
-            "Failed to merge PR: 405 - {\"message\":\"Pull Request is not mergeable\"}".to_string(),
-        );
-        assert!(refusal.contains("GitHub refused"), "{refusal}");
-        assert!(
-            refusal.contains("conflicts or failing required checks"),
-            "{refusal}"
-        );
-        assert!(
-            refusal.contains("feature") && refusal.contains("main"),
-            "{refusal}"
-        );
-
-        let other = map_github_merge_error(
-            "feature",
-            "main",
-            "Failed to merge PR: 500 - server error".to_string(),
-        );
-        assert!(!other.contains("GitHub refused"), "{other}");
-        assert!(other.contains("via GitHub"), "{other}");
-    }
-
-    /// 405 carries two opposite causes. "Merge already in progress" means the
-    /// merge is happening — telling the reader to resolve conflicts and retry
-    /// sends them to fix a PR that is merging cleanly.
-    #[test]
-    fn a_merge_already_in_progress_is_not_reported_as_a_broken_pr() {
-        let in_progress = map_github_merge_error(
-            "feature",
-            "main",
-            "Failed to merge PR: 405 - {\"message\":\"Merge already in progress\"}".to_string(),
-        );
-
-        assert!(in_progress.contains("already merging"), "{in_progress}");
-        assert!(in_progress.contains("refresh"), "{in_progress}");
-        assert!(
-            !in_progress.contains("conflicts or failing required checks"),
-            "the cause must not be reported as the opposite one: {in_progress}"
-        );
-        assert!(
-            in_progress.contains("Merge already in progress"),
-            "GitHub's own words must survive the mapping: {in_progress}"
-        );
-    }
-
-    /// A PR that moved under the merge (409 head changed, 405 base modified)
-    /// needs a re-read before a retry means anything.
-    #[test]
-    fn a_pr_that_moved_asks_for_a_refresh_before_retrying() {
-        let head_changed = map_github_merge_error(
-            "feature",
-            "main",
-            "Failed to merge PR: 409 - {\"message\":\"Head branch was modified. Review and try the merge again.\"}".to_string(),
-        );
-        assert!(
-            head_changed.contains("moved while the merge was in flight"),
-            "{head_changed}"
-        );
-        assert!(head_changed.contains("refresh"), "{head_changed}");
-
-        let base_modified = map_github_merge_error(
-            "feature",
-            "main",
-            "Failed to merge PR: 405 - {\"message\":\"Base branch was modified. Review and try the merge again.\"}".to_string(),
-        );
-        assert!(
-            base_modified.contains("moved while the merge was in flight"),
-            "{base_modified}"
-        );
     }
 }

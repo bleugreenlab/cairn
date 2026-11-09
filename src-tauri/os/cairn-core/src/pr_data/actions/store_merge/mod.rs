@@ -1,49 +1,169 @@
-//! The low-level jj store fold that lands a child branch into its target, with
-//! the transactional rollback and worktree-refresh helpers it depends on.
+//! What every landing route shares about its source: carrying it onto the
+//! target it lands on (`prepare_landing_source`) and the final check before it
+//! publishes (`prepared_landing_holds`). And the store fold a default-branch
+//! landing builds its landing commit with, onto an exact prepared target, with
+//! its transactional rollback.
 
-use crate::orchestrator::Orchestrator;
-use crate::storage::{LocalDb, RowExt};
-use cairn_db::turso::params;
+use crate::orchestrator::base_advance::preparation::{
+    prepare_branch, PreparationPurpose, PreparationRefusal, PreparationRequest, PreparedBranch,
+};
+use crate::orchestrator::{JjStoreGuard, Orchestrator};
 use std::path::Path;
 
-use super::conflict::{conflict_recovery_hint, conflicted_history_detail};
+use super::conflict::conflicted_history_detail;
 use super::context::MergeMrContext;
 
 #[cfg(test)]
 mod tests;
 
-/// [`store_merge_child_inner`] for a default-branch landing whose tree was already
+/// The exact target commit a default-branch landing folds onto, and, once it
+/// was judged, the tree it must produce. The fold never fetches a target of its
+/// own: the landing took origin's copy into the store before preparing.
+#[derive(Clone, Copy)]
+pub(super) struct ExactTarget<'a> {
+    pub target: &'a str,
+    pub source: &'a str,
+    pub tree: Option<&'a str>,
+}
+
+/// [`fold_onto_exact_target`] for a default-branch landing whose tree was already
 /// validated and judged off the store lock: under the lock the fold proves it
-/// is folding `validated_tree` rather than re-reading every changed file for
-/// the parse gate. The caller holds the store lock.
-pub(super) async fn land_validated_default(
+/// is folding `validated.tree` onto exactly `validated.target`, rather than
+/// re-reading every changed file for the parse gate or fetching a target that
+/// may have moved since. It moves only the store: publishing the folded commit
+/// to origin is the caller's, with `validated.target` as the push's expected
+/// old value. The caller holds the store lock and has checked that the target
+/// bookmark (and, with a remote, `<target>@origin`) is at `validated.target`.
+pub(super) async fn fold_validated_default(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
-    validated_tree: &str,
+    validated: ExactTarget<'_>,
+    guard: &JjStoreGuard,
+    reservation: &crate::orchestrator::BranchReservation,
 ) -> Result<String, String> {
-    store_merge_child_inner(orch, merge_context, method, true, Some(validated_tree)).await
+    fold_onto_exact_target(orch, merge_context, method, validated, guard, reservation).await
 }
 
-/// Push a landing's source branch to origin, so the pull request's head is the
-/// commit the landing judged. The head pushed is [`SourcePublication::head`]: the
-/// judged tree, possibly on a different commit once empty commits are dropped,
-/// and the head the GitHub merge must be bound to. The caller holds the store
-/// lock.
-pub(super) fn publish_landing_source(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    target_branch: &str,
-    source_branch: &str,
-    merge_mode: bool,
-) -> Result<SourcePublication, String> {
-    let publication =
-        prepare_source_for_publication(jj, store, target_branch, source_branch, merge_mode)?;
-    if let Err(error) = crate::jj::track_bookmark(jj, store, source_branch) {
-        log::debug!("landing: track {source_branch} (continuing): {error}");
+/// Carry a landing's source onto the target it actually lands on, by the
+/// canonical branch preparer, as its owner's merge. Every landing route starts
+/// here: no landing carries a source onto its target by any other means, and
+/// what it binds, validates and publishes is the returned coordinate.
+///
+/// `reservation` is the landing's own reservation of its source and target,
+/// inherited by the preparation: it installs the source's advance under it
+/// instead of reserving the source again, which from the landing's task
+/// would be re-entrant.
+pub(super) async fn prepare_landing_source(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_context: &MergeMrContext,
+    reservation: &std::sync::Arc<crate::orchestrator::BranchReservation>,
+) -> Result<PreparedBranch, String> {
+    let mut request = PreparationRequest::new(
+        merge_context.project_id.clone(),
+        merge_context.source_branch.clone(),
+        Some(job_id.to_string()),
+        PreparationPurpose::OwnerMerge,
+    );
+    request.target_override = Some(merge_context.target_branch.clone());
+    request.reservation = Some(reservation.clone());
+    prepare_branch(orch, request)
+        .await
+        .map_err(|refusal| landing_preparation_refusal(merge_context, &refusal))
+}
+
+fn landing_preparation_refusal(
+    merge_context: &MergeMrContext,
+    refusal: &PreparationRefusal,
+) -> String {
+    let source = &merge_context.source_branch;
+    // A conflict is the one refusal the merger cannot retry past: say where it
+    // is resolved. The owner's merge opened (or kept) its conflict session.
+    let recovery = match refusal {
+        PreparationRefusal::Conflict(_) => format!(
+            " Recovery: resolve the conflict in `{source}`'s conflict session (`cairn:~/rebase` \
+             on its owner's node), then merge again."
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "Refusing to merge `{source}` into `{target}`: it could not be prepared onto `{target}` \
+         ({kind}): {refusal}. `{target}` was not advanced.{recovery}",
+        target = merge_context.target_branch,
+        kind = refusal.kind(),
+    )
+}
+
+/// The final comparison before a landing publishes, under the caller's writer
+/// guard: the prepared source head, the prepared target commit and the declared
+/// relationship all still hold. `Ok(false)` when any of them moved, which
+/// restarts the landing from preparation; any other refusal refuses it.
+pub(super) async fn prepared_landing_holds(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    prepared: &PreparedBranch,
+    guard: &JjStoreGuard,
+) -> Result<bool, String> {
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
+        .await
+        .map_err(|error| format!("the project's database is unavailable: {error}"))?;
+    // The landing's target is part of its relationship: a pull request
+    // retargeted since this merge read it (its parent merged, say) must not
+    // land where it used to point. The loop cannot change target, so this
+    // refuses rather than preparing again onto the stale one.
+    let target_now = db
+        .query_opt_text(
+            "SELECT target_branch FROM merge_requests WHERE id = ?1",
+            (merge_context.mr.mr_id.clone(),),
+        )
+        .await
+        .map_err(|error| format!("the pull request's target is unreadable: {error}"))?;
+    if target_now.as_deref().map(str::trim) != Some(merge_context.target_branch.as_str()) {
+        return Err(format!(
+            "Refusing to merge `{}` into `{}`: its pull request now targets {}. Nothing was \
+             published; merge again to land it on its current target.",
+            merge_context.source_branch,
+            merge_context.target_branch,
+            target_now
+                .as_deref()
+                .map(|target| format!("`{target}`"))
+                .unwrap_or_else(|| "nothing".to_string())
+        ));
     }
-    crate::jj::push_store_bookmark(jj, store, source_branch)?;
-    Ok(publication)
+    // A target that has itself landed takes nothing more: its children belong
+    // on what it landed on. This holds even when re-pointing them failed or
+    // has not run yet.
+    let target_landed = db
+        .query_opt_text(
+            "SELECT id FROM merge_requests
+              WHERE project_id = ?1 AND source_branch = ?2 AND status = 'merged'
+              LIMIT 1",
+            (
+                merge_context.project_id.clone(),
+                merge_context.target_branch.clone(),
+            ),
+        )
+        .await
+        .map_err(|error| format!("whether the target already landed is unreadable: {error}"))?;
+    if target_landed.is_some() {
+        return Err(format!(
+            "Refusing to merge `{}` into `{}`: `{}` has itself already merged, so this pull \
+             request belongs on the branch it merged into. Nothing was published.",
+            merge_context.source_branch, merge_context.target_branch, merge_context.target_branch
+        ));
+    }
+    match prepared.revalidate(&db, guard).await {
+        Ok(()) => Ok(true),
+        Err(PreparationRefusal::Moved { what }) => {
+            log::info!(
+                "landing: the prepared coordinate of `{}` moved: {what}",
+                merge_context.source_branch
+            );
+            Ok(false)
+        }
+        Err(refusal) => Err(landing_preparation_refusal(merge_context, &refusal)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,134 +176,34 @@ pub(super) struct ProspectiveMerge {
     pub changed_files: Vec<crate::jj::GraphFileChange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum VerifiedLanding {
-    Landed(String),
-    Stale,
-}
-
-pub(super) async fn prospective_store_merge_child(
-    orch: &Orchestrator,
-    merge_context: &MergeMrContext,
-    method: &str,
-) -> Result<ProspectiveMerge, String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    let operation = crate::jj::operation_id(&jj, &store)?;
-    let source_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch)
-        .ok_or_else(|| {
-            format!(
-                "source bookmark `{}` did not resolve",
-                merge_context.source_branch
-            )
-        })?;
-    let target_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch)
-        .ok_or_else(|| {
-            format!(
-                "target bookmark `{}` did not resolve",
-                merge_context.target_branch
-            )
-        })?;
-    let mut local = merge_context.clone();
-    local.mr.is_local = true;
-    let transformed = store_merge_child_mutation(orch, &local, method, false, None)
-        .await
-        .map(|fold| fold.commit);
-    let result = transformed.and_then(|commit_id| {
-        let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
-        let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
-        let patch = jj.run(
-            &store,
-            &[
-                "diff",
-                "--ignore-working-copy",
-                "--git",
-                "--from",
-                &target_tip,
-                "--to",
-                &commit_id,
-            ],
-            "jj diff prospective merge",
-        )?;
-        Ok(ProspectiveMerge {
-            source_tip,
-            target_tip,
-            commit_id,
-            tree_hash,
-            tree_entries,
-            changed_files: crate::jj::parse_git_diff(&patch),
-        })
-    });
-    let restore = crate::jj::restore_operation(&jj, &store, &operation);
-    match (result, restore) {
-        (Ok(plan), Ok(())) => Ok(plan),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(format!(
-            "failed to restore prospective merge operation: {error}"
-        )),
-        (Err(error), Err(restore_error)) => Err(format!(
-            "{error} (also failed to restore prospective merge operation: {restore_error})"
-        )),
-    }
-}
-
-/// The commit a landing on the project DEFAULT branch would produce right now,
-/// built in the store and then undone, so the landing can validate the merge
-/// result before anything moves.
-///
-/// Unlike [`prospective_store_merge_child`], this fetches origin's live tip for
-/// a project with a remote and builds onto it, because the default branch
-/// advances outside Cairn's fold chain (another PR merged through GitHub, an
-/// external push) and a merge result built on the store's last-seen tip would
-/// be a tree that never lands. `target_tip` is the tip it was built on.
-/// The caller holds the store lock.
+/// The commit a landing on the project DEFAULT branch would produce on exactly
+/// `target_tip`, the prepared target, built in the store and then undone, so
+/// the landing can validate the merge result before anything moves. Nothing
+/// is fetched: the landing took origin's copy of the target into the store
+/// before it prepared. The caller holds the store lock.
 pub(super) async fn prospective_default_landing(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
+    target_tip: &str,
+    source_tip: &str,
+    guard: &JjStoreGuard,
+    reservation: &crate::orchestrator::BranchReservation,
 ) -> Result<ProspectiveMerge, String> {
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store =
         crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    let operation = crate::jj::operation_id(&jj, &store)?;
-    let source_tip = crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch)
-        .ok_or_else(|| {
-            format!(
-                "source bookmark `{}` did not resolve",
-                merge_context.source_branch
-            )
-        })?;
-    // A local fold advances the target bookmark itself, so its base is read
-    // before the fold; read after, it would name the prospective result.
-    let local_target_tip = if merge_context.mr.is_local {
-        Some(
-            crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch).ok_or_else(
-                || {
-                    format!(
-                        "target bookmark `{}` did not resolve",
-                        merge_context.target_branch
-                    )
-                },
-            )?,
-        )
-    } else {
-        None
+    let operation = guard.capture_operation(&jj)?;
+    let source_tip = source_tip.to_string();
+    let exact = ExactTarget {
+        target: target_tip,
+        source: &source_tip,
+        tree: None,
     };
-    let transformed = store_merge_child_mutation(orch, merge_context, method, false, None)
-        .await
-        .map(|fold| fold.commit);
+    let transformed =
+        fold_onto_exact_target(orch, merge_context, method, exact, guard, reservation).await;
     let result = transformed.and_then(|commit_id| {
-        // A remote fold fetched and built onto `main@origin`, which a
-        // prospective fold never moves because nothing is pushed.
-        let target_tip = match local_target_tip {
-            Some(tip) => tip,
-            None => {
-                let base_revision = format!("{}@origin", merge_context.target_branch);
-                crate::jj::revset_commit(&jj, &store, &base_revision)
-                    .ok_or_else(|| format!("landing base `{base_revision}` did not resolve"))?
-            }
-        };
+        let target_tip = target_tip.to_string();
         let tree_hash = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit_id)?;
         let tree_entries = crate::jj::tree_entries(&jj, &store, &commit_id)?;
         let patch = jj.run(
@@ -208,7 +228,7 @@ pub(super) async fn prospective_default_landing(
             changed_files: crate::jj::parse_git_diff(&patch),
         })
     });
-    let restore = crate::jj::restore_operation(&jj, &store, &operation);
+    let restore = guard.undo_own_operations(&jj, &operation);
     match (result, restore) {
         (Ok(plan), Ok(())) => Ok(plan),
         (Err(error), Ok(())) => Err(error),
@@ -221,1141 +241,158 @@ pub(super) async fn prospective_default_landing(
     }
 }
 
-/// The live tips a landing on the default branch would use now: the source
-/// bookmark, and the target as origin holds it (fetched) or as the store
-/// holds it for a project with no remote. The caller holds the store lock.
-pub(super) async fn live_default_landing_tips(
-    orch: &Orchestrator,
-    merge_context: &MergeMrContext,
-) -> Result<(String, String), String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    let target = merge_context.target_branch.as_str();
-    let source =
-        crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).ok_or_else(|| {
-            format!(
-                "source bookmark `{}` did not resolve",
-                merge_context.source_branch
-            )
-        })?;
-    let target_revision = if merge_context.mr.is_local {
-        target.to_string()
-    } else {
-        let _ = crate::jj::track_bookmark(&jj, &store, target);
-        crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
-            crate::jj::fetch_remote_branch(&jj, &store, "origin", target)
-        })
-        .await
-        .map_err(|error| format!("fetch origin's `{target}`: {error}"))?;
-        format!("{target}@origin")
-    };
-    let target_tip = crate::jj::revset_commit(&jj, &store, &target_revision)
-        .ok_or_else(|| format!("`{target_revision}` did not resolve"))?;
-    Ok((source, target_tip))
-}
-
-pub(super) async fn land_verified_store_merge_child(
+/// Fold the source into the default branch in the store, onto exactly
+/// `exact.target`: the target the landing prepared the source onto, judged, and
+/// rechecked under the store lock the caller holds. Nothing is fetched and
+/// nothing is published; the landing publishes the folded commit itself, leased
+/// on `exact.target`. Returns the commit the default bookmark now holds.
+///
+/// The `squash` method (the default) collapses the source to one commit on the
+/// target, so the default branch gains exactly one commit per pull request. The
+/// `merge` method (workspace pull requests) keeps every commit, and so refuses
+/// any recorded conflict in the history it would preserve. The fold parse-gates
+/// what it folds or, given `exact.tree`, proves it folds that already-judged
+/// tree. A failed step rolls the store back to its state before the fold.
+async fn fold_onto_exact_target(
     orch: &Orchestrator,
     merge_context: &MergeMrContext,
     method: &str,
-    verified: &ProspectiveMerge,
-    trace: &crate::orchestrator::JjStoreOperationTrace,
-) -> Result<VerifiedLanding, String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    let revalidating = trace.phase("revalidate verified tips");
-    // Under the caller's landing guard: a fenced source or target is never
-    // folded and published, whatever verified it before the fence was laid.
-    let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
-    crate::orchestrator::branch_recovery::refuse_if_fenced(
-        &fence_db,
-        &store,
-        &[
-            merge_context.source_branch.as_str(),
-            merge_context.target_branch.as_str(),
-        ],
-        "Merging this pull request",
-    )
-    .await?;
-    if crate::jj::bookmark_commit(&jj, &store, &merge_context.source_branch).as_deref()
-        != Some(&verified.source_tip)
-        || crate::jj::bookmark_commit(&jj, &store, &merge_context.target_branch).as_deref()
-            != Some(&verified.target_tip)
-    {
-        return Ok(VerifiedLanding::Stale);
-    }
-    let operation = crate::jj::operation_id(&jj, &store)?;
-    drop(revalidating);
-    let mut local = merge_context.clone();
-    local.mr.is_local = true;
-    let folding = trace.phase("fold");
-    let fold = match store_merge_child_mutation(orch, &local, method, false, None).await {
-        Ok(fold) => fold,
-        Err(error) => return Err(error),
-    };
-    let commit = fold.commit;
-    drop(folding);
-    let verifying = trace.phase("verify landed tree");
-    let actual_tree = crate::jj::sealed_tree_hash_via_git(&jj, &store, &commit)?;
-    if actual_tree != verified.tree_hash {
-        crate::jj::restore_operation(&jj, &store, &operation)?;
-        return Ok(VerifiedLanding::Stale);
-    }
-    drop(verifying);
-    if !merge_context.mr.is_local {
-        // Network I/O inside the hold: a failed push rolls the store back to
-        // `operation`, which only stays exact while no other writer runs.
-        let _publishing = trace.phase("push and reflect on origin");
-        if let Err(error) = publish_integration_merge(
-            &jj,
-            &store,
-            &merge_context.source_branch,
-            &merge_context.target_branch,
-        ) {
-            return Err(rollback_merge(
-                orch,
-                &merge_context.project_id,
-                &jj,
-                &store,
-                &operation,
-                &merge_context.source_branch,
-                Some(&merge_context.target_branch),
-                error,
-            )
-            .await);
-        }
-    }
-    crate::orchestrator::base_advance::persist_held_descendant_sessions(
-        orch,
-        &orch.db.local,
-        &merge_context.project_id,
-        &store,
-        &fold.held_descendants,
-    )
-    .await?;
-    crate::orchestrator::base_advance::clear_held_replay_source(
-        &fold.held_db,
-        &jj,
-        &store,
-        &merge_context.source_branch,
-        &commit,
-        &commit,
-        fold.held_source.as_ref(),
-    )
-    .await?;
-    Ok(VerifiedLanding::Landed(commit))
-}
-
-fn publish_integration_merge(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    source_branch: &str,
-    target_branch: &str,
-) -> Result<(), String> {
-    prepare_source_for_publication(jj, store, target_branch, source_branch, false)?;
-    let _ = crate::jj::track_bookmark(jj, store, source_branch);
-    crate::jj::push_store_bookmark(jj, store, source_branch)?;
-    let _ = crate::jj::track_bookmark(jj, store, target_branch);
-    reflect_child_merge_on_github(jj, store, target_branch)
-}
-
-/// Perform a jj source-to-target merge entirely in the shared store: fold the
-/// source's commit into the target bookmark, then (for a project with a
-/// remote, when `publish`) push the target to origin. The push advances the
-/// target branch and — because the source's head commit is now an ancestor of
-/// the target — GitHub's out-of-band "merged outside GitHub" detection marks
-/// the source PR Merged (the way `git merge feature; git push` does). Returns
-/// the new target-tip commit id to persist as `merge_requests.merged_commit`.
-/// For a no-remote project the push is skipped and the fold is purely local.
-///
-/// Two fold shapes, discriminated by whether the target IS the project default
-/// branch:
-///
-/// - target ≠ default (a child PR into a Coordinator integration branch): the
-///   integration tip advances within Cairn's local fold chain as earlier
-///   siblings merge in, and downstream sibling reconciliation now runs deferred
-///   off the synchronous merge path — so the source may lag the live tip. Rebase
-///   the source onto the current integration tip before the forward-only fold
-///   (materializing any conflict and failing closed, as the default path does),
-///   then — because the rebase rewrites the source's commit id — push the rebased
-///   source's PR head before advancing the target on origin so GitHub still marks
-///   the child PR Merged.
-/// - target == default: the default branch advances OUTSIDE Cairn's fold chain
-///   (another PR merged into it, or an external push), so the source's fork
-///   point may now lag the live tip and a bare FF would be refused. Fetch the
-///   live tip and rebase the source onto it, then FF. For the default `squash`
-///   method the rebased chain is first collapsed to a single commit on the live
-///   tip (`squash_branch_onto`) so the default branch gains exactly one commit
-///   per PR; the `merge` method (workspace PRs) keeps the real per-commit fold
-///   via `rebase_then_fold_into`. Either way the rebase/squash
-///   rewrites the source's commit id, so origin's PR head SHA is no longer
-///   reachable from the new target; push the rewritten source first so its PR
-///   head matches the commit that lands on the default branch, then advance the
-///   target to mark the PR Merged out of band. The fold onto the default branch
-///   parse-gates what it folds, or, given `validated_tree`, proves it folds
-///   that already-judged tree.
-async fn store_merge_child_inner(
-    orch: &Orchestrator,
-    merge_context: &MergeMrContext,
-    method: &str,
-    publish: bool,
-    validated_tree: Option<&str>,
+    exact: ExactTarget<'_>,
+    guard: &JjStoreGuard,
+    reservation: &crate::orchestrator::BranchReservation,
 ) -> Result<String, String> {
-    let fold =
-        store_merge_child_mutation(orch, merge_context, method, publish, validated_tree).await?;
-    let store =
-        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
-    crate::orchestrator::base_advance::persist_held_descendant_sessions(
-        orch,
-        &orch.db.local,
-        &merge_context.project_id,
-        &store,
-        &fold.held_descendants,
-    )
-    .await?;
-    crate::orchestrator::base_advance::clear_held_replay_source(
-        &fold.held_db,
-        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-        &store,
-        &merge_context.source_branch,
-        &fold.commit,
-        &fold.commit,
-        fold.held_source.as_ref(),
-    )
-    .await?;
-    Ok(fold.commit)
-}
-
-struct StoreFold {
-    commit: String,
-    held_source: Option<crate::orchestrator::base_advance::HeldReplaySource>,
-    held_db: std::sync::Arc<crate::storage::LocalDb>,
-    held_descendants: std::collections::BTreeMap<String, crate::jj::ConflictDiagnostic>,
-}
-
-/// A speculative fold returns its held diagnostics as data: only a caller that
-/// accepts the mutation may persist sessions or project markers into checkouts.
-async fn store_merge_child_mutation(
-    orch: &Orchestrator,
-    merge_context: &MergeMrContext,
-    method: &str,
-    publish: bool,
-    validated_tree: Option<&str>,
-) -> Result<StoreFold, String> {
-    // A default-branch fold either parse-gates what it folds, or, when the
-    // landing already validated a tree off the lock, proves it is that tree.
+    // Every fold moves the source and the target, the prospective one too
+    // (before it is undone): both writers are admitted under this guard.
+    super::default_landing::admit_landing_writers(orch, guard, reservation, merge_context).await?;
     let fold_onto_default =
-        |jj: &crate::jj::JjEnv, store: &Path, target: &str, source: &str| match validated_tree {
+        |jj: &crate::jj::JjEnv, store: &Path, target: &str, source: &str| match exact.tree {
             Some(tree) => crate::jj::fold_validated_into_bookmark(jj, store, target, source, tree),
             None => crate::jj::merge_into_bookmark(jj, store, target, source),
         };
-    let repo_path = merge_context.mr.repo_path.as_str();
     let target_branch = merge_context.target_branch.as_str();
     let source_branch = merge_context.source_branch.as_str();
-    let default_branch = merge_context.default_branch.as_str();
-    let project_id = merge_context.project_id.as_str();
-    let has_remote = !merge_context.mr.is_local;
-    let squash_title = merge_context.title.as_str();
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    // A branch that catches up by merge is never rebased here: its landing
-    // already merged the live target into it, so it must descend from it.
-    let merge_mode =
-        crate::orchestrator::catch_up::mode_for_project(orch, project_id, &store, source_branch)
-            .await?
-            .is_some();
+    let store =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
+    let dest = exact.target;
+    // A later fold failure rolls the store back to exactly this state: every
+    // operation since is this fold's own, under the caller's same hold.
+    let op_id = guard.capture_operation(&jj)?;
 
-    let held_db = crate::projects::crud::owning_db(&orch.db, project_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let held_source =
-        crate::orchestrator::base_advance::held_replay_source(&held_db, &store, source_branch)
-            .await?;
-    let source_cut = crate::orchestrator::base_advance::held_replay_source_cut(
-        orch,
-        &held_db,
-        &jj,
-        &store,
-        source_branch,
-        target_branch,
-    )
-    .await?;
-    let preserve_bookmarks =
-        crate::orchestrator::base_advance::held_replay_bookmarks_for_repository(&orch.db, &store)
-            .await?;
-    let replay = |dest: &str| {
-        crate::jj::rebase_branch_onto_with_options(
-            &jj,
-            &store,
-            source_branch,
-            dest,
-            &crate::jj::RebaseOptions {
-                source_cut: source_cut
-                    .as_ref()
-                    .filter(|_| !crate::jj::revset_descends_from(&jj, &store, source_branch, dest))
-                    .cloned(),
-                preserve_bookmarks: preserve_bookmarks.clone(),
-            },
-        )
-    };
-    let mut held_descendants = std::collections::BTreeMap::new();
-    if target_branch == default_branch {
-        // The default branch advances out of band. Bring its live tip into the
-        // store (it may have moved via another Cairn merge OR externally — a
-        // fetch covers both) and rebase the source onto it before the FF fold,
-        // so the fold can never go backwards.
-        let dest = if has_remote {
-            // Track + fetch so `<target>@origin` resolves to the live tip
-            // (mirrors how `base_advance.rs` learns an external default advance).
-            // Best-effort: warn and fall back to whatever the store last saw.
-            if let Err(e) = crate::jj::track_bookmark(&jj, &store, target_branch) {
-                log::debug!("jj store merge: track {target_branch} (continuing): {e}");
-            }
-            // The caller holds the store lock; the fetch lock is only ever
-            // taken inside it, never the other way round.
-            let fetched =
-                crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
-                    crate::jj::fetch_remote_branch(&jj, &store, "origin", target_branch)
-                })
-                .await;
-            if let Err(e) = fetched {
-                log::warn!(
-                    "jj store merge: fetch origin before rebase-then-fold (continuing): {e}"
-                );
-            }
-            format!("{target_branch}@origin")
-        } else {
-            target_branch.to_string()
-        };
+    // Preparation is the only catch-up operation. A fold verifies its
+    // prerequisite rather than replaying the source a second time.
+    let source_head = crate::jj::bookmark_commit(&jj, &store, source_branch)
+        .ok_or_else(|| format!("the prepared source `{source_branch}` is unreadable"))?;
+    if source_head != exact.source {
+        return Err(format!(
+            "Refusing to fold `{source_branch}`: the prepared source moved from {} to \
+             {source_head}; prepare the landing again",
+            exact.source
+        ));
+    }
 
-        // Snapshot the store AFTER the read-only preamble (track/fetch) so a later
-        // fold/push failure rolls the merge back to exactly this pre-mutation
-        // state — exact under the per-store lock the caller holds.
-        let op_id = crate::jj::operation_id(&jj, &store)?;
+    // This holds for replay and merge catch-up alike: preparation, not the
+    // fold, must have made the exact target an ancestor of the source.
+    if !crate::jj::revset_descends_from(&jj, &store, &source_head, dest) {
+        return Err(format!(
+            "Refusing to fold `{source_branch}` into `{target_branch}`: the prepared source \
+             does not contain the exact target {dest}; prepare the landing again"
+        ));
+    }
 
-        if method == "squash" {
-            // Squash landing: rebase the source onto the live default tip, then
-            // collapse the rebased chain to a single commit on that tip before
-            // the FF — so the default branch gains exactly one commit per PR
-            // instead of every per-change commit the agent sealed.
-            // A conflicting rebase is rolled back inside `rebase_branch_onto`, so
-            // by the time this returns the source is bit-identical to its
-            // pre-merge tip and the default bookmark never moved. Branch on the
-            // outcome rather than re-probing for a conflict: the probe would now
-            // report a clean branch and read a refusal as a success.
-            if merge_mode {
-                require_merged_with(&jj, &store, target_branch, source_branch, &dest)?;
-            } else {
-                match replay(&dest)? {
-                    crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
-                        return Err(crate::jj::base_conflict_refusal(
-                            target_branch,
-                            source_branch,
-                            &diagnostic.conflicting_paths(),
-                        ))
-                    }
-                    // A clean tip over conflicted history is safe HERE and only here:
-                    // this path lands exactly one commit whose tree equals the source
-                    // tip, so `flatten_branch_recovery` below discards the conflicted
-                    // ancestry rather than folding it onto the default branch.
-                    crate::jj::RebaseOutcome::RebasedOverConflictedAncestry {
-                        held_descendants: held,
-                        ..
-                    }
-                    | crate::jj::RebaseOutcome::Rebased {
-                        held_descendants: held,
-                    } => held_descendants.extend(held),
-                }
-            }
-            // Idempotence guard (mirrors the old real-fold path's no-op on a
-            // retry): if the source already resolves to the LOCAL default
-            // bookmark, a prior attempt's fold already landed this PR's content
-            // and only local resolution / DB marking failed. Squashing again
-            // would mint a fresh empty commit on the default tip and FF onto it,
-            // adding one empty commit per retry. Skip the squash+fold and fall
-            // through to the return. Compared against the LOCAL target (not
-            // `dest`): when an interrupted retry still needs to advance origin,
-            // the source already equals the local tip while `dest@origin` may
-            // lag, and re-squashing against the lagging origin tip would mint a
-            // sideways commit the FF then refuses. The remote push block below
-            // still runs, idempotently finishing any unpushed origin advance.
-            let already_landed = matches!(
-                (
-                    crate::jj::bookmark_commit(&jj, &store, source_branch),
-                    crate::jj::bookmark_commit(&jj, &store, target_branch),
-                ),
-                (Some(source_tip), Some(target_tip)) if source_tip == target_tip
-            );
-            if !already_landed {
-                // Collapse to one commit whose parent is the live default tip and
-                // whose tree equals the rebased source, then FF the default to it.
-                // Routed through the footprint-guarded flatten so a clean-tip /
-                // conflicted-intermediate source is recovered (the squash discards
-                // the conflicted intermediates), while the footprint guard refuses
-                // a wrong-base/wrong-tip collapse rather than landing it. The
-                // fully-clean case is unchanged (a plain squash plus orphan cleanup).
-                if let Err(e) = crate::jj::flatten_branch_recovery(
+    if method == "squash" {
+        // Idempotence: a source that already resolves to the default bookmark
+        // was folded by an earlier attempt whose resolution failed. Squashing
+        // again would mint an empty commit on the default tip per retry.
+        let already_landed = matches!(
+            (
+                crate::jj::bookmark_commit(&jj, &store, source_branch),
+                crate::jj::bookmark_commit(&jj, &store, target_branch),
+            ),
+            (Some(source_tip), Some(target_tip)) if source_tip == target_tip
+        );
+        if !already_landed {
+            // One commit whose parent is the target and whose tree is the
+            // source's, through the branch-only native factory: a clean tip over
+            // conflicted intermediates is recovered (the squash discards them),
+            // and a wrong-base or wrong-tip collapse is refused, not landed.
+            if let Err(e) = crate::jj::squash_branch_onto(
+                &jj,
+                &store,
+                source_branch,
+                exact.source,
+                dest,
+                &merge_context.title,
+            ) {
+                return Err(rollback_merge(
+                    guard,
                     &jj,
-                    &store,
-                    source_branch,
-                    &dest,
-                    squash_title,
-                ) {
-                    return Err(rollback_merge(
-                        orch,
-                        project_id,
-                        &jj,
-                        &store,
-                        &op_id,
-                        source_branch,
-                        None,
-                        format!(
-                            "Refusing to merge: could not safely flatten `{source_branch}` onto the default branch `{target_branch}` ({e})."
-                        ),
-                    )
-                    .await);
-                }
-                if let Err(e) = fold_onto_default(&jj, &store, target_branch, source_branch) {
-                    return Err(rollback_merge(
-                        orch,
-                        project_id,
-                        &jj,
-                        &store,
-                        &op_id,
-                        source_branch,
-                        None,
-                        e,
-                    )
-                    .await);
-                }
-            }
-        } else {
-            // Non-squash (workspace): keep the real fold so the
-            // default branch carries every sealed commit. This method exists to
-            // PRESERVE every commit, so flattening would contradict its intent —
-            // instead it refuses on ANY recorded conflict (tip or intermediate) so
-            // the relaxed merge gate cannot let a conflicted-ancestor branch poison
-            // the default branch via a preserved fold. Rebase onto the live default
-            // tip, gate, then FF the default to it.
-            // This method preserves every commit, so conflict-flagged ancestry
-            // cannot be flattened away and must be refused outright.
-            if merge_mode {
-                require_merged_with(&jj, &store, target_branch, source_branch, &dest)?;
-            } else {
-                match replay(&dest)? {
-                    crate::jj::RebaseOutcome::Rebased {
-                        held_descendants: held,
-                    } => held_descendants.extend(held),
-                    crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
-                        return Err(crate::jj::base_conflict_refusal(
-                            target_branch,
-                            source_branch,
-                            &diagnostic.conflicting_paths(),
-                        ))
-                    }
-                    crate::jj::RebaseOutcome::RebasedOverConflictedAncestry { paths, .. } => {
-                        return Err(crate::jj::conflicted_ancestry_refusal(
-                            target_branch,
-                            source_branch,
-                            &paths,
-                        ))
-                    }
-                }
-            }
-            // Belt and braces on the same question, from the other side: this
-            // also catches a conflicted intermediate that predates the rebase
-            // dest and so falls outside the rebased range.
-            let clean = match crate::jj::flatten_state(&jj, &store, &dest, source_branch) {
-                Ok(crate::jj::FlattenState::Clean) => true,
-                Ok(_) => false,
-                // Liveness: fall back to the bare tip-conflict check on a probe error.
-                Err(e) => {
-                    log::warn!(
-                        "non-squash preserve: flatten_state check for {source_branch} failed: {e}; falling back to tip check"
-                    );
-                    !crate::jj::branch_has_conflict(&jj, &store, source_branch).unwrap_or(false)
-                }
-            };
-            if !clean {
-                // Pre-existing conflict-flagged commits in the source's history.
-                // This PR method exists to preserve every commit, so they cannot
-                // be flattened away; the default bookmark was NOT moved.
-                return Err(format!(
-                    "Refusing to merge: `{source_branch}`'s own history contains conflict-flagged commit(s), and this PR preserves every commit, so they cannot be flattened away. `{target_branch}` was not advanced. Rebuild `{source_branch}` on clean content before merging again.{detail}",
-                    detail = conflicted_history_detail(
-                        &jj,
-                        &store,
-                        &format!(
-                            "bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})"
-                        ),
-                        source_branch,
-                        Some(target_branch),
+                    &op_id,
+                    format!(
+                        "Refusing to merge: could not safely flatten `{source_branch}` onto the \
+                         default branch `{target_branch}` ({e})."
                     ),
                 ));
             }
-            // Clean: the source now descends from the advanced default tip, so this
-            // FF can never go backwards.
             if let Err(e) = fold_onto_default(&jj, &store, target_branch, source_branch) {
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    None,
-                    e,
-                )
-                .await);
-            }
-        }
-
-        // A prospective landing fetches origin's live tip like a real one, so it
-        // builds exactly the tree that would land, and then publishes nothing.
-        if has_remote && publish {
-            // Advance the rebased source's PR head on origin BEFORE advancing the
-            // target. The rebase rewrote the source's commit id, so origin's PR
-            // head must move to the rebased commit or GitHub never marks the PR
-            // Merged (its old head SHA is not reachable from the advanced
-            // default). Load-bearing, so fail closed: do NOT advance the target
-            // on origin while the PR head still points at the abandoned commit —
-            // that would land the content but leave the PR unmerged. A retry is
-            // idempotent (the source already sits on the fetched tip).
-            if let Err(e) = prepare_source_for_publication(
-                &jj,
-                &store,
-                target_branch,
-                source_branch,
-                merge_mode,
-            ) {
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    None,
-                    e,
-                )
-                .await);
-            }
-            if let Err(e) = crate::jj::track_bookmark(&jj, &store, source_branch) {
-                log::debug!("jj store merge: track {source_branch} (continuing): {e}");
-            }
-            if let Err(e) = crate::jj::push_store_bookmark(&jj, &store, source_branch) {
-                let recovery = if e.contains("conflict") {
-                    format!(
-                        "\n{}",
-                        conflict_recovery_hint(source_branch, Some(target_branch))
-                    )
-                } else {
-                    String::new()
-                };
-                let base_err = format!(
-                    "Refusing to complete the merge: could not advance the rebased source `{source_branch}` on origin ({e}). The default branch was not advanced on origin; retry the merge.{recovery}"
-                );
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    None,
-                    base_err,
-                )
-                .await);
-            }
-            if let Err(e) = reflect_child_merge_on_github(&jj, &store, target_branch) {
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    None,
-                    e,
-                )
-                .await);
+                return Err(rollback_merge(guard, &jj, &op_id, e));
             }
         }
     } else {
-        // Child→integration: rebase the source onto the live integration tip
-        // before the forward-only fold, so this merge is self-contained. The
-        // integration tip advances within Cairn's local fold chain as earlier
-        // siblings merge into it; downstream sibling reconciliation — which used
-        // to rebase the not-yet-merged siblings onto each advance — now runs
-        // deferred off the synchronous merge path, so this fold can no longer
-        // assume the source already sits on the current tip. Without this rebase a
-        // second child merged into the same integration branch before the
-        // background reconcile lands would still be based on the pre-advance tip,
-        // and `merge_into_bookmark`'s forward-only `bookmark set` would refuse it
-        // ("source is not a descendant of the target"). Rebasing here mirrors the
-        // default-branch path and keeps sequential Coordinator child merges
-        // correct regardless of reconcile timing.
-        // Snapshot the store BEFORE the target preflight so a preflight failure (a
-        // flatten guard refusal, or a failed PUBLISH of the repair) rewinds cleanly
-        // to the pre-merge state (exact under the per-store lock the caller holds).
-        // Origin's copy of the integration branch can be ahead of the store's:
-        // a sibling's pull request merged in GitHub's UI. Folding onto the
-        // store's stale tip would push a commit origin refuses. Take origin's
-        // copy first when it is a pure fast-forward, and refuse, naming both
-        // commits, when the two have diverged. The caller holds the store lock;
-        // the fetch lock is only ever taken inside it.
-        if has_remote {
-            let preserved = crate::orchestrator::branch_recovery::preserved_import_bookmarks(
-                orch,
-                &store,
-                &[target_branch, source_branch],
-                &format!("Taking origin's `{target_branch}` before this merge"),
-            )
-            .await?;
-            let jj = jj.preserving_import_bookmarks(preserved);
-            let observed =
-                crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store, || async {
-                    crate::jj::fetch_origin_observation(&store, target_branch)
-                })
-                .await;
-            match observed.map(|observed| {
-                observed.map(|observed| {
-                    crate::jj::fast_forward_branch_from_origin(
-                        &jj,
-                        &store,
-                        target_branch,
-                        &observed,
-                    )
-                })
-            }) {
-                Ok(Some(Ok(crate::jj::OriginFastForward::Diverged { local, remote }))) => {
-                    return Err(format!(
-                        "Refusing to merge into `{target_branch}`: origin's copy is at `{remote}`, \
-                         which the store's `{local}` does not contain, and each holds commits the \
-                         other lacks. Merging onto the store's copy would push a commit that does \
-                         not descend from origin's tip. The integration branch's owner has to \
-                         combine them first; its `cairn:~/rebase` page shows both."
-                    ));
-                }
-                Ok(Some(Ok(crate::jj::OriginFastForward::Advanced { from, to }))) => log::info!(
-                    "jj store merge: took origin's advance of {target_branch} ({from} -> {to}) \
-                     before folding {source_branch}"
-                ),
-                // The fold's push replaces origin's copy, leased on it.
-                Ok(Some(Ok(crate::jj::OriginFastForward::Superseded { local, remote }))) => {
-                    log::info!(
-                        "jj store merge: origin's {target_branch} ({remote}) is the store's own \
-                         publication, since rewritten to {local}; folding {source_branch}"
-                    )
-                }
-                Ok(Some(Ok(_))) | Ok(None) => {}
-                Ok(Some(Err(error))) | Err(error) => log::warn!(
-                    "jj store merge: could not check origin's {target_branch} before folding \
-                     (continuing; the push fails closed if origin moved): {error}"
-                ),
-            }
-        }
-
-        let pre_repair_op = crate::jj::operation_id(&jj, &store)?;
-
-        // Target preflight (the load-bearing fix). Every other conflict probe on
-        // the merge path scopes to the SOURCE range and is blind to conflicted
-        // commits in the TARGET integration branch's own ancestry. A `main` advance
-        // can bake conflicts into the hub's INTERMEDIATE commits; the coordinator
-        // resolves at the tip and re-seals (clean tip, conflicted ancestors), so
-        // every source-scoped probe passes and the fold succeeds locally — then
-        // pushing the source fails, because its ancestry now includes the target's
-        // conflicted intermediates and jj refuses to push a conflicted commit, and
-        // nothing ever flattened the target. Flatten the target FIRST so the merge
-        // builds on a pushable integration branch (CAIRN-2288).
-        //
-        // The target flatten is a STANDALONE, content-preserving repair of the
-        // integration branch, independent of this child's merge, so it is committed
-        // (pushed to origin) FAIL-CLOSED here — before the merge transaction begins
-        // — and the merge's own rollback baseline (`op_id`, snapshot below) already
-        // includes the durable repair. That separation is what lets the
-        // source-conflict refusal keep the source markers without any risk of
-        // leaving origin behind a locally-clean target: by the time the source is
-        // rebased, the repair is already durable everywhere or the whole merge has
-        // rewound to the pre-repair state.
-        if let Some(dest_commit) = resolve_target_base_commit(
-            &orch.db.local,
-            &jj,
-            &store,
-            project_id,
-            target_branch,
-            default_branch,
-        )
-        .await
-        {
-            match crate::jj::flatten_state(&jj, &store, &dest_commit, target_branch) {
-                Ok(crate::jj::FlattenState::Clean) => {}
-                Ok(crate::jj::FlattenState::TipConflicted) => {
-                    return Err(format!(
-                        "Refusing to merge into `{target_branch}`: the integration branch's own tip carries a recorded conflict. Its coordinator must resolve the conflict markers in that workspace and re-seal before any child PR can merge into it."
-                    ));
-                }
-                Ok(crate::jj::FlattenState::IntermediateOnly) => {
-                    // Healed in place, never collapsed: the integration branch's
-                    // history is published and carries every child PR folded
-                    // into it so far.
-                    if let Err(e) = crate::jj::heal_conflicted_ancestry_preserving(
-                        &jj,
-                        &store,
-                        target_branch,
-                        &dest_commit,
-                        &preserve_bookmarks,
-                    ) {
-                        return Err(rollback_merge(
-                            orch,
-                            project_id,
-                            &jj,
-                            &store,
-                            &pre_repair_op,
-                            source_branch,
-                            Some(target_branch),
-                            format!(
-                                "Refusing to merge into `{target_branch}`: its history has a clean tip over conflicted intermediate commit(s) that could not be healed in place ({e}). The integration branch's coordinator can resolve it from its `cairn:~/rebase` page."
-                            ),
-                        )
-                        .await);
-                    }
-                    // Publish the repair to origin FAIL-CLOSED. If it cannot land,
-                    // roll the heal (and worktree re-parent) back to the
-                    // pre-repair state so local and origin stay identical (both
-                    // wedged) rather than leaving origin behind a locally-clean
-                    // target; a retry re-attempts the repair. Nothing source-side
-                    // has run yet, so this rollback strands no conflict markers.
-                    if has_remote {
-                        if let Err(e) = reflect_child_merge_on_github(&jj, &store, target_branch) {
-                            return Err(rollback_merge(
-                                orch,
-                                project_id,
-                                &jj,
-                                &store,
-                                &pre_repair_op,
-                                source_branch,
-                                Some(target_branch),
-                                format!(
-                                    "Refusing to merge: the integration branch `{target_branch}` had a clean tip over conflicted intermediate commit(s), but the heal that repairs it could not be published to origin ({e})."
-                                ),
-                            )
-                            .await);
-                        }
-                    }
-                }
-                Err(e) => log::warn!(
-                    "jj store merge: target preflight flatten_state for {target_branch} failed: {e}; proceeding without target flatten"
-                ),
-            }
-        }
-
-        // Snapshot the MERGE rollback baseline AFTER the (now durable) target
-        // repair, so a later source-side failure rewinds only the merge and never
-        // un-does the published repair.
-        let op_id = crate::jj::operation_id(&jj, &store)?;
-
-        // A conflicting rebase is rolled back inside `rebase_branch_onto`, so the
-        // source is bit-identical to its pre-merge tip and the integration
-        // bookmark never moved. The target repair above is already durable on
-        // origin, so this is a pure refusal: nothing to roll back, and origin is
-        // not left behind.
-        if merge_mode {
-            require_merged_with(&jj, &store, target_branch, source_branch, target_branch)?;
-        } else {
-            match replay(target_branch)? {
-                crate::jj::RebaseOutcome::Conflicted { diagnostic } => {
-                    return Err(crate::jj::base_conflict_refusal(
-                        target_branch,
-                        source_branch,
-                        &diagnostic.conflicting_paths(),
-                    ))
-                }
-                // Handled below: the child's conflicted ancestry is healed in place
-                // before the fold, so no conflict-flagged commit is folded into the
-                // integration branch.
-                crate::jj::RebaseOutcome::RebasedOverConflictedAncestry {
-                    held_descendants: held,
-                    ..
-                }
-                | crate::jj::RebaseOutcome::Rebased {
-                    held_descendants: held,
-                } => held_descendants.extend(held),
-            }
-        }
-
-        // Clean tip: if a base advance baked conflicts into INTERMEDIATE commits
-        // (clean net tip, conflicted ancestors), heal the child in place before
-        // folding — otherwise `merge_into_bookmark` preserves the child's lineage
-        // and poisons the integration branch with conflicted ancestors (exactly the
-        // CAIRN-2269 failure). The fold preserves the child's commits, so the heal
-        // does too, rather than collapsing them under the tip's message. On guard
-        // failure, keep the existing refuse + materialize path.
-        match crate::jj::flatten_state(&jj, &store, target_branch, source_branch) {
-            Ok(crate::jj::FlattenState::IntermediateOnly) => {
-                let dest_commit = crate::jj::bookmark_commit(&jj, &store, target_branch)
-                    .ok_or_else(|| {
-                        format!("integration bookmark `{target_branch}` did not resolve for the heal")
-                    })?;
-                if let Err(e) =
-                    crate::jj::heal_conflicted_ancestry_preserving(&jj, &store, source_branch, &dest_commit, &preserve_bookmarks)
-                {
-                    let base_err = format!(
-                        "Refusing to merge: could not heal `{source_branch}`'s conflict-flagged history on the integration branch `{target_branch}` ({e}).{detail}",
-                        detail = conflicted_history_detail(
-                            &jj,
-                            &store,
-                            &format!(
-                                "bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})"
-                            ),
-                            source_branch,
-                            Some(target_branch),
-                        )
-                    );
-                    return Err(rollback_merge(
-                        orch,
-                        project_id,
-                        &jj,
-                        &store,
-                        &op_id,
-                        source_branch,
-                        Some(target_branch),
-                        base_err,
-                    )
-                    .await);
-                }
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!(
-                "child->integration: flatten_state check for {source_branch} failed: {e}; proceeding with a plain fold"
-            ),
-        }
-
-        // Fold the source's (now-descendant) real commit into the integration
-        // bookmark (forward-only).
-        if let Err(e) = crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch) {
-            return Err(rollback_merge(
-                orch,
-                project_id,
-                &jj,
-                &store,
-                &op_id,
-                source_branch,
-                Some(target_branch),
-                e,
-            )
-            .await);
-        }
-
-        if has_remote {
-            // The rebase may have rewritten the source's commit id, so origin's PR
-            // head must move to the rebased commit BEFORE the integration ref
-            // advances — otherwise the child PR's old head SHA is unreachable from
-            // the advanced integration branch and GitHub never marks it Merged.
-            // Push the source first and fail closed (do NOT advance the target on
-            // origin while the PR head is stale), then advance the target.
-            // Defensively track each bookmark, since its `@origin` ref may have been
-            // created outside this store's jj (best-effort).
-            if let Err(e) = prepare_source_for_publication(
-                &jj,
-                &store,
-                target_branch,
-                source_branch,
-                merge_mode,
-            ) {
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    None,
-                    e,
-                )
-                .await);
-            }
-            if let Err(e) = crate::jj::track_bookmark(&jj, &store, source_branch) {
-                log::debug!("jj store merge: track {source_branch} (continuing): {e}");
-            }
-            if let Err(e) = crate::jj::push_store_bookmark(&jj, &store, source_branch) {
-                let recovery = if e.contains("conflict") {
-                    format!(
-                        "\n{}",
-                        conflict_recovery_hint(source_branch, Some(target_branch))
-                    )
-                } else {
-                    String::new()
-                };
-                let base_err = format!(
-                    "Refusing to complete the merge: could not advance the rebased source `{source_branch}` on origin ({e}). The integration branch was not advanced on origin; retry the merge.{recovery}"
-                );
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    Some(target_branch),
-                    base_err,
-                )
-                .await);
-            }
-            if let Err(e) = crate::jj::track_bookmark(&jj, &store, target_branch) {
-                log::debug!("jj store merge: track {target_branch} (continuing): {e}");
-            }
-            if let Err(e) = reflect_child_merge_on_github(&jj, &store, target_branch) {
-                return Err(rollback_merge(
-                    orch,
-                    project_id,
-                    &jj,
-                    &store,
-                    &op_id,
-                    source_branch,
-                    Some(target_branch),
-                    e,
-                )
-                .await);
-            }
-        }
-    }
-
-    let commit = crate::jj::bookmark_commit(&jj, &store, target_branch).ok_or_else(|| {
-        format!("target bookmark `{target_branch}` did not resolve after the fold")
-    })?;
-    Ok(StoreFold {
-        commit,
-        held_source,
-        held_db,
-        held_descendants,
-    })
-}
-
-/// The store route's guard for a branch that catches up by merge: it is never
-/// rebased onto the target, so it must already contain it (the landing merged
-/// the live target into it before judging the result).
-fn require_merged_with(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    target_branch: &str,
-    source_branch: &str,
-    dest: &str,
-) -> Result<(), String> {
-    if crate::jj::revset_descends_from(
-        jj,
-        store,
-        &format!("bookmarks(exact:{source_branch:?})"),
-        dest,
-    ) {
-        return Ok(());
-    }
-    Err(format!(
-        "Refusing to merge `{source_branch}` into `{target_branch}`: `{source_branch}` catches up \
-         by merge and is never replayed, and it does not contain the live `{target_branch}` \
-         ({dest}). `{target_branch}` was not advanced; merge again, and the landing merges \
-         `{target_branch}` into it first."
-    ))
-}
-
-/// What preparing a source branch for publication left it as.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SourcePublication {
-    /// The source tip that is published. It holds the tree the source held
-    /// before; it is a different commit when an empty tip was dropped.
-    pub head: String,
-    /// The empty commits dropped from the source, as `<short id> "<subject>"`.
-    pub dropped: Vec<String>,
-}
-
-/// Make the source's stack above `target_branch` fit to publish, or say why it
-/// is not.
-///
-/// An empty commit is dropped ([`crate::jj::drop_empty_commits`]): it has no
-/// content to lose, and the commits Cairn writes on a branch (a write check's
-/// fix, a structural merge, a bind commit) are exactly the ones a later base
-/// advance can empty. A commit with changes and a blank description is
-/// refused. Every commit Cairn writes carries a message, so that commit was
-/// made outside Cairn, and only the person who made it can say what it is.
-/// The caller holds the store lock.
-///
-/// A branch that catches up by merge (`merge_mode`) drops nothing: abandoning
-/// a commit inside its stack rebases every descendant, which is the replay the
-/// mode exists to avoid, and a squash landing ignores empty commits anyway.
-fn prepare_source_for_publication(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    target_branch: &str,
-    source_branch: &str,
-    merge_mode: bool,
-) -> Result<SourcePublication, String> {
-    let dropped = if merge_mode {
-        crate::jj::DroppedEmpty {
-            tip: crate::jj::bookmark_commit(jj, store, source_branch).ok_or_else(|| {
+        // `merge` (workspace pull requests) exists to PRESERVE every commit, so
+        // it cannot flatten a conflict-flagged commit away: it refuses ANY
+        // recorded conflict in the history it would carry onto the default
+        // branch, tip or intermediate, including one older than `dest`.
+        let clean = matches!(
+            crate::jj::flatten_state(&jj, &store, dest, source_branch).map_err(|error| {
                 format!(
-                    "Refusing to publish source `{source_branch}`: its bookmark did not resolve"
+                    "Refusing to preserve `{source_branch}`'s history: its conflict state could \
+                     not be established ({error}); no fold was installed"
                 )
             })?,
-            dropped: Vec::new(),
+            crate::jj::FlattenState::Clean
+        );
+        if !clean {
+            return Err(format!(
+                "Refusing to merge: `{source_branch}`'s own history contains conflict-flagged \
+                 commit(s), and this PR preserves every commit, so they cannot be flattened away. \
+                 `{target_branch}` was not advanced. Rebuild `{source_branch}` on clean content \
+                 before merging again.{detail}",
+                detail = conflicted_history_detail(
+                    &jj,
+                    &store,
+                    &format!(
+                        "bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})"
+                    ),
+                    source_branch,
+                    Some(target_branch),
+                ),
+            ));
         }
-    } else {
-        crate::jj::drop_empty_commits(jj, store, source_branch, target_branch)
-            .map_err(|error| format!("Refusing to publish source `{source_branch}`: {error}"))?
-    };
-    let revset = format!("bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})");
-    let template = "commit_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"";
-    let output = jj.run(
-        store,
-        &[
-            "log",
-            "--ignore-working-copy",
-            "-r",
-            &revset,
-            "--no-graph",
-            "-T",
-            template,
-        ],
-        "jj log source publishability",
-    )?;
-    let undescribed: Vec<&str> = output
-        .lines()
-        .filter_map(|line| line.split_once('\u{1f}'))
-        .filter(|(commit, subject)| !commit.trim().is_empty() && subject.trim().is_empty())
-        .map(|(commit, _)| commit.trim())
-        .collect();
-    if !undescribed.is_empty() {
-        return Err(format!(
-            "Refusing to publish source `{source_branch}`: commit(s) {} carry changes but no \
-             description. Every commit Cairn writes has one (an agent's commit message, a write \
-             check's fix, a heal or bind commit), so these were made outside Cairn, and Cairn \
-             will not guess what they are. Describe or abandon them on `{source_branch}`, then \
-             merge again.",
-            undescribed.join(", ")
-        ));
-    }
-    Ok(SourcePublication {
-        head: dropped.tip,
-        dropped: dropped.dropped,
-    })
-}
-
-/// The base branch the integration `target_branch` was itself cut from: the
-/// `base_branch` of the newest job whose `branch` IS `target_branch` in this
-/// project. A Coordinator integration branch's base is the project default, but a
-/// nested integration branch's base is its parent integration branch — read it
-/// from the job row rather than assuming the default. `None` when no such job
-/// recorded a base (the caller falls back to the project default).
-async fn load_target_base_branch(
-    db: &LocalDb,
-    project_id: &str,
-    branch: &str,
-) -> Result<Option<String>, String> {
-    let project_id = project_id.to_string();
-    let branch = branch.to_string();
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        let branch = branch.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT base_branch
-                     FROM jobs
-                     WHERE project_id = ?1
-                       AND branch = ?2
-                       AND base_branch IS NOT NULL
-                     ORDER BY created_at DESC
-                     LIMIT 1",
-                    params![project_id.as_str(), branch.as_str()],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => Ok(Some(row.text(0)?)),
-                None => Ok(None),
-            }
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
-}
-
-/// Resolve the concrete commit the integration `target_branch` is flattened onto
-/// during the merge-time target preflight: its own recorded base
-/// ([`load_target_base_branch`]), falling back to the project default, resolved to
-/// a bookmark commit. `None` — skip the preflight (liveness over strictness, the
-/// same convention as `classify_reconciled_sibling`'s unresolvable-dest arm) —
-/// when neither base resolves to a commit.
-async fn resolve_target_base_commit(
-    db: &LocalDb,
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    project_id: &str,
-    target_branch: &str,
-    default_branch: &str,
-) -> Option<String> {
-    let base_branch = match load_target_base_branch(db, project_id, target_branch).await {
-        Ok(Some(base)) => base,
-        Ok(None) => default_branch.to_string(),
-        Err(e) => {
-            log::warn!(
-                "jj store merge: could not load base branch for `{target_branch}` ({e}); using the default `{default_branch}`"
-            );
-            default_branch.to_string()
-        }
-    };
-    match crate::jj::bookmark_commit(jj, store, &base_branch) {
-        Some(commit) => Some(commit),
-        None => {
-            log::warn!(
-                "jj store merge: target base `{base_branch}` for `{target_branch}` did not resolve; skipping target preflight"
-            );
-            None
+        // The source descends from `dest`, so this fast-forward never goes
+        // backwards.
+        if let Err(e) = fold_onto_default(&jj, &store, target_branch, source_branch) {
+            return Err(rollback_merge(guard, &jj, &op_id, e));
         }
     }
+
+    crate::jj::bookmark_commit(&jj, &store, target_branch)
+        .ok_or_else(|| format!("target bookmark `{target_branch}` did not resolve after the fold"))
 }
 
-/// Roll a partially-applied merge back to its pre-merge snapshot and extend the
-/// error so the agent knows a clean retry is safe. Called from every
-/// mutation-phase failure that is NOT a designed resolve-and-reseal refusal (a
-/// flatten guard failure, a failed fold, or a failed origin push): restore the
-/// whole store to `op_id` — exact under the per-store lock the merge holds, since
-/// every op since the snapshot is the merge's own — then refresh the
-/// source-branch worktrees onto the restored state. This completes the CAIRN-2287
-/// principle: never PERSIST a merge the remote never saw, so a push half-failure
-/// no longer leaves local bookmarks diverged from origin (the occurrence-1–3
-/// state corruption).
-// The store identity (orch, project_id, jj, store, op_id) plus the two branches
-// and the error message are each load-bearing and distinct; a wrapper struct
-// would not clarify the call sites.
-#[allow(clippy::too_many_arguments)]
-async fn rollback_merge(
-    _orch: &Orchestrator,
-    _project_id: &str,
+/// Roll a partially applied fold back to its snapshot `op_id`, captured under
+/// this same hold (so every operation since it is the fold's own), and say so,
+/// so the caller knows a clean retry is safe.
+fn rollback_merge(
+    guard: &JjStoreGuard,
     jj: &crate::jj::JjEnv,
-    store: &Path,
-    op_id: &str,
-    _source_branch: &str,
-    _target_branch: Option<&str>,
+    op_id: &crate::orchestrator::GuardOperation,
     base_err: String,
 ) -> String {
-    if let Err(e) = crate::jj::restore_operation(jj, store, op_id) {
+    if let Err(e) = guard.undo_own_operations(jj, op_id) {
         log::warn!("jj store merge: op restore during rollback failed: {e}");
     }
     format!(
         "{base_err} All local bookmarks were restored to their pre-merge state; the merge is safe to retry."
     )
-}
-
-/// Reflect a folded child merge as Merged on GitHub by pushing the advanced
-/// integration bookmark to origin. This is the single swappable seam for the
-/// GitHub-state hypothesis: if live testing ever shows GitHub marks the PR Closed
-/// (or is unreliable), a state-only merge-API call belongs here and nowhere else
-/// — the store already owns the content by this point.
-fn reflect_child_merge_on_github(
-    jj: &crate::jj::JjEnv,
-    store: &Path,
-    integration_branch: &str,
-) -> Result<(), String> {
-    crate::jj::push_store_bookmark(jj, store, integration_branch)
 }

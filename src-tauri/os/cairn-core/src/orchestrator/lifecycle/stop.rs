@@ -43,8 +43,13 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
                 }).await.map_err(|e| e.to_string())
             }
         });
-        if let Err(error) = cancel_result {
-            log::warn!("Failed to cancel owned wait for run {run_id}: {error}");
+        match cancel_result {
+            // A cancelled run-batch wait no longer holds its branch: serve the
+            // explicit replay request it deferred, if nothing else holds it.
+            Ok(()) => {
+                crate::orchestrator::base_advance::on_branch_hold_released_for_run(orch, run_id)
+            }
+            Err(error) => log::warn!("Failed to cancel owned wait for run {run_id}: {error}"),
         }
     } else {
         // A durable self-suspend already yielded its turn with the actual cause.

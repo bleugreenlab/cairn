@@ -25,10 +25,12 @@
 //! one first makes the held commit resolve as already landed.
 
 use super::{
-    climb_landing_rungs, publish_available_delta, straddle_inspection_commands, DeltaPublication,
-    LandingRungs, PublishFailure, RoutedLanding, SlotPublicationOutcome,
+    climb_landing_rungs, prepared_barrier, publish_available_delta, straddle_inspection_commands,
+    DeltaPublication, LandingRungs, PreparationKey, PublishFailure, RoutedLanding,
+    SlotPublicationOutcome,
 };
-use crate::orchestrator::{JjStoreOperationTrace, Orchestrator};
+use crate::orchestrator::base_advance::preparation::{PreparationRefusal, PreparedBranch};
+use crate::orchestrator::{BranchReservation, JjStoreGuard, JjStoreOperationTrace, Orchestrator};
 use crate::storage::{LocalDb, RowExt};
 use cairn_vcs::PublicationIdentity;
 use std::path::{Path, PathBuf};
@@ -445,31 +447,93 @@ async fn record_landed_here(db: &LocalDb, attempt_id: &str, head: &str) {
     }
 }
 
-/// Republish the branch's held deltas, oldest first.
+/// What a drain landed, and the exact head it left the branch at.
+#[derive(Debug)]
+pub(crate) struct HeldDrain {
+    pub(crate) drained: Vec<Drained>,
+    /// `expected_head` when nothing landed; otherwise the head the last landed
+    /// delta became. The caller's own landing under the same guard is
+    /// revalidated against exactly this head.
+    pub(crate) head: String,
+}
+
+/// Republish the branch's held deltas, oldest first, onto its prepared
+/// coordinate.
 ///
-/// Caller holds the store lock. Stops at the first delta that still cannot be
-/// published, so held commits land in the order they were made. Never fails
-/// the barrier that called it: everything it could not do is a note.
+/// The caller prepared the branch, then took `reservation` on it and `guard`,
+/// the store's writer lock, keeps both through the landing of its own that
+/// follows (each landing refuses unless the reservation covers the branch), and has
+/// already established under it that the branch is at `expected_head`: the
+/// prepared head, or an own descendant of it that caller adopted. With nothing
+/// held that head is returned as is. Otherwise the coordinate is revalidated
+/// against it before anything moves, so an `Err` means nothing was drained and
+/// the caller may release the guard and prepare again. Each held delta then
+/// lands against the exact head the one before it left, under the capture's
+/// base and relationship; the capture itself never moves to follow the branch
+/// name.
+///
+/// Stops at the first delta that still cannot be published, so held commits
+/// land in the order they were made. Everything else it could not do is a note.
 pub(crate) async fn drain_held_publications(
     orch: &Orchestrator,
-    project_id: &str,
-    branch: &str,
-    trace: Option<&JjStoreOperationTrace>,
-) -> Vec<Drained> {
-    let rows = match held_rows(&orch.db.local, project_id, branch).await {
+    prepared: &PreparedBranch,
+    db: &LocalDb,
+    reservation: &BranchReservation,
+    guard: &JjStoreGuard,
+    expected_head: &str,
+    admission: crate::orchestrator::BatchAdmission<'_>,
+) -> Result<HeldDrain, PreparationRefusal> {
+    let mut head = expected_head.to_string();
+    let rows = match held_rows(&orch.db.local, &prepared.project_id, &prepared.branch).await {
         Ok(rows) => rows,
         Err(error) => {
-            return vec![Drained::Note(format!(
+            return Ok(HeldDrain {
+                drained: vec![Drained::Note(format!(
                 "⚠️ Could not check this branch for held commits, so none were published: {error}."
-            ))]
+            ))],
+                head,
+            })
         }
     };
+    if rows.is_empty() {
+        return Ok(HeldDrain {
+            drained: Vec::new(),
+            head,
+        });
+    }
+    let _admission = guard
+        .branch_write_permit(
+            db,
+            reservation,
+            &prepared.project_id,
+            &prepared.branch,
+            admission,
+        )
+        .await
+        .map_err(PreparationRefusal::from)?;
+    prepared
+        .revalidate_for_publication(db, guard, expected_head)
+        .await?;
+    let trace = guard.trace();
     let mut drained = Vec::new();
     for row in rows {
-        match republish(orch, &row, trace).await {
+        match republish(
+            orch,
+            &row,
+            prepared,
+            db,
+            reservation,
+            guard,
+            &head,
+            &trace,
+            admission,
+        )
+        .await
+        {
             Ok(SlotPublicationOutcome::Published { landed, export, .. }) => {
                 record_landed_here(&orch.db.local, &row.attempt_id, &landed.head).await;
                 release_ref(&row).await;
+                head = landed.head.clone();
                 drained.push(Drained::Landed(Box::new(LandedHeld {
                     row,
                     head: landed.head,
@@ -491,31 +555,23 @@ pub(crate) async fn drain_held_publications(
             // Already on the branch here, perhaps landed by a drain that never
             // settled. Whether the remote has it is still unknown, so it owes
             // the same rungs a fresh landing does.
-            Ok(SlotPublicationOutcome::AlreadyLanded { head }) => {
-                record_landed_here(&orch.db.local, &row.attempt_id, &head).await;
+            Ok(SlotPublicationOutcome::AlreadyLanded { head: carried }) => {
+                record_landed_here(&orch.db.local, &row.attempt_id, &carried).await;
                 release_ref(&row).await;
                 drained.push(Drained::Landed(Box::new(LandedHeld {
                     row,
-                    head,
+                    head: carried,
                     export: Ok(()),
                     already: true,
                 })));
             }
-            Err(PublishFailure::Conflicted { head, paths }) => {
+            Err(PublishFailure::Conflicted { head: at, paths }) => {
                 // The ref stays: it is the agent's route back to the work.
                 settle_row(&orch.db.local, &row.attempt_id, "stranded", None).await;
-                drained.push(Drained::Note(stranded_held_message(&row, &head, &paths)));
+                drained.push(Drained::Note(stranded_held_message(&row, &at, &paths)));
             }
-            // Retrying a retired branch only replays the refusal, so the row
-            // stops waiting. Its ref stays, exactly as a stranded one does: it
-            // is the route back to the work.
             Err(PublishFailure::Retired(retired)) => {
-                settle_row(&orch.db.local, &row.attempt_id, "stranded", None).await;
-                drained.push(Drained::Note(format!(
-                    "⚠️ Held commit {} ({}) was not published. {retired}",
-                    row.delta_commit,
-                    row.origin()
-                )));
+                drained.push(strand_retired(&orch.db.local, &row, &retired).await);
             }
             Err(PublishFailure::Failed(error)) => {
                 record_retry(&orch.db.local, &row.attempt_id, &error).await;
@@ -528,37 +584,125 @@ pub(crate) async fn drain_held_publications(
             }
         }
     }
-    drained
+    Ok(HeldDrain { drained, head })
 }
 
+/// Whether `row` was held for exactly the branch this drain prepared, checked
+/// before anything of it is pinned or published.
+///
+/// The held-row query selects by project and branch alone, so the row's own
+/// store and object repository are checked here: its store must be the
+/// prepared store (by canonical path, so an alias of it matches), and its
+/// repository's Git common directory must be the one that store's backend
+/// writes to. The delta must then be present there and descend from its
+/// recorded base, the check a fresh installation passes. Commit ids are
+/// content addresses, so a present delta commit is the exact tree and parents
+/// that were sealed; no separate digest is kept or needed.
+fn verify_row_for_drain(row: &HeldRow, prepared: &PreparedBranch) -> Result<(), String> {
+    if row.project_id != prepared.project_id || row.branch != prepared.branch {
+        return Err(format!(
+            "it was held for `{}` of project {}, not this branch",
+            row.branch, row.project_id
+        ));
+    }
+    let resolve = |path: &Path, what: &str| {
+        std::fs::canonicalize(path)
+            .map_err(|error| format!("{what} {} cannot be resolved: {error}", path.display()))
+    };
+    if resolve(&row.store_path, "its store")? != resolve(&prepared.store, "this branch's store")? {
+        return Err(format!(
+            "it was held in the store at {}, not this branch's store",
+            row.store_path.display()
+        ));
+    }
+    let backend = crate::jj::store_git_dir(&prepared.store)
+        .ok_or_else(|| "this branch's store has no Git backend".to_string())?;
+    let common = PathBuf::from(super::git_output(
+        &row.repository_path,
+        &["rev-parse", "--git-common-dir"],
+        "resolve the held delta's object repository",
+    )?);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        row.repository_path.join(common)
+    };
+    if resolve(&common, "its object repository")?
+        != resolve(&backend, "this branch's object repository")?
+    {
+        return Err(format!(
+            "its objects are in {}, not the repository behind this branch's store",
+            row.repository_path.display()
+        ));
+    }
+    super::verify_available_delta(
+        &row.repository_path,
+        &crate::fleet::MutationDelta {
+            base_commit: row.base_commit.clone(),
+            delta_commit: row.delta_commit.clone(),
+            upload_receipt: None,
+        },
+    )
+}
+
+/// Retrying a retired branch only replays the refusal, so the row stops
+/// waiting. Its ref stays, exactly as a stranded one does: it is the route
+/// back to the work.
+async fn strand_retired(
+    db: &LocalDb,
+    row: &HeldRow,
+    retired: &crate::mcp::handlers::branch::BranchRetired,
+) -> Drained {
+    settle_row(db, &row.attempt_id, "stranded", None).await;
+    Drained::Note(format!(
+        "⚠️ Held commit {} ({}) was not published. {retired}",
+        row.delta_commit,
+        row.origin()
+    ))
+}
+
+/// A row from before held rows named their run cannot have its session
+/// checked by the publication authority, so it is refused once any resolution
+/// has stopped its job's work. Rows that name their run pass here; their
+/// authority is asked by the publication funnel itself.
+async fn unattributed_row_authority(
+    orch: &Orchestrator,
+    row: &HeldRow,
+) -> Result<(), PublishFailure> {
+    let (None, Some(job_id)) = (row.run_id.as_deref(), row.job_id.as_deref()) else {
+        return Ok(());
+    };
+    match crate::mcp::handlers::branch::unattributed_held_authority(&orch.db, job_id, &row.branch)
+        .await
+    {
+        crate::mcp::handlers::branch::PublicationAuthority::Authorized => Ok(()),
+        crate::mcp::handlers::branch::PublicationAuthority::Retired(retired) => {
+            Err(PublishFailure::Retired(retired))
+        }
+        crate::mcp::handlers::branch::PublicationAuthority::Unknown(error) => {
+            Err(PublishFailure::Failed(format!(
+                "could not confirm this held commit may still publish: {error}"
+            )))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn republish(
     orch: &Orchestrator,
     row: &HeldRow,
-    trace: Option<&JjStoreOperationTrace>,
+    prepared: &PreparedBranch,
+    db: &LocalDb,
+    reservation: &BranchReservation,
+    guard: &JjStoreGuard,
+    expected_head: &str,
+    trace: &JjStoreOperationTrace,
+    admission: crate::orchestrator::BatchAdmission<'_>,
 ) -> Result<SlotPublicationOutcome, PublishFailure> {
-    // A row from before held rows named their run cannot have its session
-    // checked by the publication authority, so it is refused once any
-    // resolution has stopped its job's work. Asked first, under the same
-    // store-lock hold as the rest of the drain, before anything is pinned.
-    if let (None, Some(job_id)) = (row.run_id.as_deref(), row.job_id.as_deref()) {
-        match crate::mcp::handlers::branch::unattributed_held_authority(
-            &orch.db,
-            job_id,
-            &row.branch,
-        )
-        .await
-        {
-            crate::mcp::handlers::branch::PublicationAuthority::Authorized => {}
-            crate::mcp::handlers::branch::PublicationAuthority::Retired(retired) => {
-                return Err(PublishFailure::Retired(retired))
-            }
-            crate::mcp::handlers::branch::PublicationAuthority::Unknown(error) => {
-                return Err(PublishFailure::Failed(format!(
-                    "could not confirm this held commit may still publish: {error}"
-                )))
-            }
-        }
-    }
+    // Asked first, under the same store-lock hold as the rest of the drain,
+    // before anything is pinned.
+    unattributed_row_authority(orch, row).await?;
+    verify_row_for_drain(row, prepared).map_err(PublishFailure::Failed)?;
     // The objects were installed when the delta was held; this re-pins them
     // for the transaction the way a fresh install is pinned.
     let _pin = crate::jj::pin_validated_delta(
@@ -580,11 +724,17 @@ async fn republish(
             message: &row.commit_message,
             author: author.as_ref(),
             job_id: row.job_id.as_deref(),
+            trace: Some(trace),
+            admission,
             run_id: row.run_id.as_deref(),
-            trace,
             key: None,
             prior_since_ms: None,
         },
+        prepared,
+        db,
+        reservation,
+        guard,
+        expected_head,
         None,
     )
     .await
@@ -802,12 +952,21 @@ pub(crate) fn describe_held(rows: &[HeldRow]) -> String {
 }
 
 /// A commit barrier for a PR artifact action on `branch`: drain its held
-/// deltas under the store lock, climb their remaining rungs, and report what is
-/// still held.
+/// deltas through the prepared barrier, climb their remaining rungs, and
+/// report what is still held. The branch is prepared for its live owner.
 pub(crate) async fn pr_commit_barrier(
     orch: &Orchestrator,
     project_id: &str,
     branch: &str,
+) -> PrBarrier {
+    commit_barrier(orch, project_id, branch, None).await
+}
+
+async fn commit_barrier(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    owner_job_id: Option<&str>,
 ) -> PrBarrier {
     let pending = match blocking_rows(&orch.db.local, project_id, branch).await {
         Ok(rows) => rows,
@@ -861,24 +1020,22 @@ pub(crate) async fn pr_commit_barrier(
         }
     }
     if pending.iter().any(|row| row.status == "held") {
-        let drained = match crate::mcp::vcs::acquire_store_lock(
+        // Prepared before the lock, like every other landing on the branch.
+        let barrier = prepared_barrier(
             orch,
             Some(&store),
-            crate::orchestrator::StoreLockClass::Foreground,
             "held publication drain",
-            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+            true,
+            PreparationKey {
+                project_id,
+                branch,
+                owner_job_id,
+                sealed: None,
+            },
+            None,
         )
-        .await
-        {
-            Ok(guard) => {
-                let trace = guard.as_ref().map(|guard| guard.trace());
-                drain_held_publications(orch, project_id, branch, trace.as_ref()).await
-            }
-            Err(error) => vec![Drained::Note(format!(
-                "⚠️ Held commits on this branch could not be published: {error}"
-            ))],
-        };
-        notes.extend(settle_drained(orch, drained).await);
+        .await;
+        notes.extend(settle_drained(orch, barrier.drained).await);
     }
     PrBarrier {
         notes,
@@ -902,7 +1059,9 @@ pub(crate) async fn job_commit_barrier(orch: &Orchestrator, job_id: &str) -> PrB
     }
     .await;
     match located {
-        Ok(Some((project_id, Some(branch)))) => pr_commit_barrier(orch, &project_id, &branch).await,
+        Ok(Some((project_id, Some(branch)))) => {
+            commit_barrier(orch, &project_id, &branch, Some(job_id)).await
+        }
         // A job with no branch of its own commits nothing that could be held.
         Ok(_) => PrBarrier {
             notes: Vec::new(),
@@ -1001,9 +1160,10 @@ mod tests {
     /// resolution makes the row publishable: one held before the session closed
     /// (100, closed at 200), and one a stale batch recorded only after it
     /// closed (300), the delayed completion a hold timestamp cannot tell apart
-    /// from the successor's work. Each stops waiting and keeps its recovery
-    /// ref, and nothing reaches the repository (the paths here do not exist, so
-    /// any pin or publish would fail instead).
+    /// from the successor's work. Each is refused by the authority the drain
+    /// asks before pinning anything, and the drain's settlement of that refusal
+    /// stops it waiting and keeps its recovery ref. (The drain itself needs a
+    /// prepared store; these are the two steps it takes for this row.)
     #[tokio::test]
     async fn an_unattributed_held_delta_stays_refused_across_resolution_and_reopen() {
         for (attempt, held_at) in [("attempt-before", 100), ("attempt-after", 300)] {
@@ -1047,9 +1207,20 @@ mod tests {
         )
         .build();
 
-        let drained = drain_held_publications(&orch, "project", "feature", None).await;
-        let [Drained::Note(note)] = drained.as_slice() else {
-            panic!("{attempt}: expected one refusal note, got {drained:?}");
+        let rows = held_rows(&orch.db.local, "project", "feature")
+            .await
+            .unwrap();
+        let [row] = rows.as_slice() else {
+            panic!("{attempt}: expected the one held row");
+        };
+        let retired = match unattributed_row_authority(&orch, row).await {
+            Err(PublishFailure::Retired(retired)) => retired,
+            Err(PublishFailure::Failed(error)) => panic!("{attempt}: not retired: {error}"),
+            Err(PublishFailure::Conflicted { .. }) => panic!("{attempt}: not retired: conflicted"),
+            Ok(()) => panic!("{attempt}: an unattributed row was authorized"),
+        };
+        let Drained::Note(note) = strand_retired(&orch.db.local, row, &retired).await else {
+            panic!("{attempt}: expected a refusal note");
         };
         assert!(
             note.contains("branch_retired (session_closed)"),

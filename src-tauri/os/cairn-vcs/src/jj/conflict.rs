@@ -84,12 +84,22 @@ pub struct ConflictedCommit {
 /// record-separated (`\x1e`) so the parse stays robust against arbitrary
 /// descriptions and paths.
 pub fn conflicted_commits(jj: &JjEnv, store: &Path, range_revset: &str) -> Vec<ConflictedCommit> {
+    conflicted_commits_checked(jj, store, range_revset).unwrap_or_default()
+}
+
+/// [`conflicted_commits`] keeping "none recorded" distinct from "could not
+/// tell", for a report that must not render an unreadable store as clean.
+pub fn conflicted_commits_checked(
+    jj: &JjEnv,
+    store: &Path,
+    range_revset: &str,
+) -> Result<Vec<ConflictedCommit>, String> {
     // jj template, verified against jj 0.42: `\x1f`/`\x1e` are jj string escapes
     // that emit the literal control bytes we split on; `conflicts()` is the
     // revset and `self.conflicted_files()` yields store-side paths (no workspace).
     const TEMPLATE: &str = "commit_id.short() ++ \"\\x1f\" ++ change_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\x1f\" ++ self.conflicted_files().map(|f| f.path()).join(\"\\x1e\") ++ \"\\n\"";
     let revset = format!("({range_revset}) & conflicts()");
-    let Ok(out) = jj.run(
+    let out = jj.run(
         store,
         &[
             "log",
@@ -101,10 +111,9 @@ pub fn conflicted_commits(jj: &JjEnv, store: &Path, range_revset: &str) -> Vec<C
             "--ignore-working-copy",
         ],
         "jj conflicted commits",
-    ) else {
-        return Vec::new();
-    };
-    out.lines()
+    )?;
+    Ok(out
+        .lines()
         .filter_map(|line| {
             let mut parts = line.split('\u{1f}');
             let commit_id = parts.next()?.trim().to_string();
@@ -131,7 +140,7 @@ pub fn conflicted_commits(jj: &JjEnv, store: &Path, range_revset: &str) -> Vec<C
                 files,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// The conflicted file paths recorded on `branch`'s own tip, store-side and

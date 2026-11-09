@@ -347,6 +347,7 @@ mod tests {
         let notice = "needs a newer Cairn, or the key is misspelled: `fromAFutureCairn` is not \
                       a check key this build understands";
         let plan = crate::execution::checks_turn_end::WavePlan {
+            capture: None,
             head: "head-h2".to_string(),
             base: "base".to_string(),
             tree_hash: "tree-h2".to_string(),

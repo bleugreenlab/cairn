@@ -356,7 +356,22 @@ pub(crate) const REBASE_EXPECTED_TIP: KeySpec = KeySpec::new(
 pub(crate) const REBASE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "replay — replay onto the base (a branch in merge catch-up mode merges the base in instead); fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward; rebuild — rebuild a flagged branch onto its current base using explicit source_commit, owner-attested source_base, source_base_reason and expected_tip, pinning the flagged tip in a recovery ref and refusing unprovable later edits; repair — retry now the targeted repair of a recovery fence on this branch (only the recorded bookmarks and Git heads move); catch-up-mode — set (mode:\"merge\") or end (mode:\"replay\") this branch's merge catch-up mode, on the operator's approval; mark-reviewed — record that the owner reviewed the base's incoming changes through `through`",
+    "replay — replay onto the base (a branch in merge catch-up mode merges the base in instead); fast-forward-from-origin — take origin's copy of the branch (or of its base, with branch:\"base\") now, only when it is a pure fast-forward; rebuild — rebuild a flagged branch onto its current base using explicit source_commit, owner-attested source_base, source_base_reason and expected_tip, pinning the flagged tip in a recovery ref and refusing unprovable later edits; refused while a run batch can still publish to the branch or while its parent's conflict session is open; repair — retry now the targeted repair of a recovery fence on this branch (only the recorded bookmarks and Git heads move); catch-up-mode — set (mode:\"merge\") or end (mode:\"replay\") this branch's merge catch-up mode, on the operator's approval; mark-reviewed — record that the owner reviewed the base's incoming changes through `through`; dismiss-acceptance — the owning node's repair for an `unknown` acceptance this page lists (needs acceptance_id, expected_head and reason, and nothing else): retires the row as dismissed and moves, exports and publishes nothing",
+);
+pub(crate) const REBASE_ACCEPTANCE_ID: KeySpec = KeySpec::new(
+    "acceptance_id",
+    KeyType::Str,
+    "dismiss-acceptance only: the id of an `unknown` acceptance of this node's branch, as this page lists it; a pending row (it settles at the next write), an accepted row, or another branch's row is refused",
+);
+pub(crate) const REBASE_EXPECTED_HEAD: KeySpec = KeySpec::new(
+    "expected_head",
+    KeyType::Str,
+    "dismiss-acceptance only: the branch's full current commit id as this page shows it; refused unless it is exactly the head read under the branch's reservation and the store lock (a prefix or a name is refused)",
+);
+pub(crate) const REBASE_DISMISS_REASON: KeySpec = KeySpec::new(
+    "reason",
+    KeyType::Str,
+    "dismiss-acceptance only: why retiring the row is correct, recorded with it. The row's drop claims were never proven and are discarded, not accepted; a later publication must still account for every commit only origin holds, and may still refuse",
 );
 pub(crate) const REBASE_CATCH_UP_MODE: KeySpec = KeySpec::new(
     "mode",

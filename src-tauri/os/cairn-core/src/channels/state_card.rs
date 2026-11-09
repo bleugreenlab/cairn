@@ -62,7 +62,7 @@ pub async fn derive_agent_state(
             _ if waiting => AgentPhase::WaitingForUser,
             _ => AgentPhase::Running,
         };
-        let pull_request = conn.query("SELECT github_pr_number, COALESCE(github_state,status), COALESCE(additions,0), COALESCE(deletions,0), github_review FROM merge_requests WHERE job_id=?1 ORDER BY updated_at DESC LIMIT 1", params![job_id.as_str()]).await?.next().await?.map(|r| -> DbResult<_> { Ok(PullRequestState { number:r.opt_i64(0)?.unwrap_or(0), status:r.text(1)?, additions:r.i64(2)?, deletions:r.i64(3)?, review_status:r.opt_text(4)? }) }).transpose()?;
+        let pull_request = conn.query("SELECT github_pr_number, CASE WHEN status='merged' THEN 'MERGED' ELSE COALESCE(github_state,status) END, COALESCE(additions,0), COALESCE(deletions,0), github_review FROM merge_requests WHERE job_id=?1 ORDER BY updated_at DESC LIMIT 1", params![job_id.as_str()]).await?.next().await?.map(|r| -> DbResult<_> { Ok(PullRequestState { number:r.opt_i64(0)?.unwrap_or(0), status:r.text(1)?, additions:r.i64(2)?, deletions:r.i64(3)?, review_status:r.opt_text(4)? }) }).transpose()?;
         let mut rows = conn.query(&checks_sql, params![job_id.as_str()]).await?;
         let mut checks = Vec::new();
         while let Some(row) = rows.next().await? {

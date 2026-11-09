@@ -34,6 +34,42 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Instant;
+
+/// A cooperative deadline for the in-process merge work in this module.
+///
+/// A jj subprocess is bounded by its environment's operation budget, but the
+/// line merges and block counts here run in this process, where no subprocess
+/// kill reaches them. Deadline-aware entry points check this between files and
+/// between a merge's stages, so an expired budget stops the CPU work at the
+/// next stage boundary instead of carrying every remaining file to the end.
+/// One `diffy` diff or merge of one file is the indivisible unit.
+///
+/// Expiry is reported with the same phrase an exhausted subprocess budget
+/// uses, so [`is_jj_timeout_error`] and the reconcile failure classifier treat
+/// both alike: as a timeout, never as an answer about the file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergeDeadline(Option<Instant>);
+
+impl MergeDeadline {
+    /// No deadline: what the pure entry points run under.
+    pub const NONE: Self = Self(None);
+
+    pub fn at(deadline: Instant) -> Self {
+        Self(Some(deadline))
+    }
+
+    pub fn expired(&self) -> bool {
+        self.0.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn check(&self, ctx: &str) -> Result<(), String> {
+        if self.expired() {
+            return Err(format!("{ctx} timed out: operation budget exhausted"));
+        }
+        Ok(())
+    }
+}
 
 /// The conflict-marker run length `diffy::merge` writes with its default
 /// options. Asserted by a unit test rather than assumed, because the collapse
@@ -232,11 +268,22 @@ pub fn merge_preview(base: &str, ours: &str, theirs: &str) -> MergePreview {
 /// [`resolve_conflict_regions`] for how each region is resolved, and
 /// [`without_reinsertions`] for the incoming blocks it declines to add twice.
 pub fn completion_candidate(base: &str, ours: &str, theirs: &str) -> String {
+    completion_candidate_within(base, ours, theirs, MergeDeadline::NONE)
+        .expect("a merge without a deadline cannot expire")
+}
+
+fn completion_candidate_within(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    deadline: MergeDeadline,
+) -> Result<String, String> {
     let merged = match merge_preview(base, ours, theirs) {
         MergePreview::Clean(text) => text,
         MergePreview::Conflicted { text, .. } => resolve_conflict_regions(&text),
     };
-    without_reinsertions(base, ours, theirs, merged)
+    deadline.check("three-way merge")?;
+    without_reinsertions(base, ours, theirs, merged, deadline)
 }
 
 /// The candidate minus every block it would add that the committed tip
@@ -261,9 +308,15 @@ pub fn completion_candidate(base: &str, ours: &str, theirs: &str) -> String {
 ///
 /// Only pure insertions are considered. A change that also removes lines from
 /// the tip is a modification, and is kept as the merge made it.
-fn without_reinsertions(base: &str, ours: &str, theirs: &str, candidate: String) -> String {
+fn without_reinsertions(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    candidate: String,
+    deadline: MergeDeadline,
+) -> Result<String, String> {
     if candidate == ours {
-        return candidate;
+        return Ok(candidate);
     }
     // As in `union_of_insertions`, a context at least as long as both inputs
     // folds the diff into one hunk spanning every line of each side.
@@ -299,6 +352,8 @@ fn without_reinsertions(base: &str, ours: &str, theirs: &str, candidate: String)
                 index += 1;
                 continue;
             }
+            // Each group's block count scans the whole tip and incoming side.
+            deadline.check("three-way merge (reinsertion check)")?;
             let start = index;
             while index < lines.len() && !matches!(lines[index], diffy::Line::Context(_)) {
                 index += 1;
@@ -322,11 +377,7 @@ fn without_reinsertions(base: &str, ours: &str, theirs: &str, candidate: String)
             }
         }
     }
-    if dropped_any {
-        out
-    } else {
-        candidate
-    }
+    Ok(if dropped_any { out } else { candidate })
 }
 
 /// How many times `block` occurs in `lines` as a contiguous run.
@@ -589,27 +640,40 @@ fn region_holds_incoming(region: &ConflictRegion<'_>) -> bool {
 /// recorded, where jj's line merge could not see it), or is it just the
 /// branch's own side?
 pub fn holds_incoming_side(sides: &MergeSides) -> bool {
-    if assess_whole_file_restore(sides) != RestoreVerdict::Lossless {
-        return false;
+    holds_incoming_side_within(sides, MergeDeadline::NONE)
+        .expect("a merge without a deadline cannot expire")
+}
+
+fn holds_incoming_side_within(sides: &MergeSides, deadline: MergeDeadline) -> Result<bool, String> {
+    if assess_whole_file_restore_within(sides, deadline)? != RestoreVerdict::Lossless {
+        return Ok(false);
     }
     let (Some(base), Some(ours), Some(theirs)) = (
         sides.base.mergeable(),
         sides.ours.mergeable(),
         sides.theirs.mergeable(),
     ) else {
-        return false;
+        return Ok(false);
     };
-    match merge_preview(base, ours, theirs) {
+    let preview = merge_preview(base, ours, theirs);
+    deadline.check("three-way merge (incoming side)")?;
+    Ok(match preview {
         MergePreview::Clean(_) => true,
         MergePreview::Conflicted { text, .. } => {
             conflict_regions(&text).iter().all(region_holds_incoming)
         }
-    }
+    })
 }
 
 /// Which of `paths` already hold both sides of the `base_rev`/`theirs_rev`
 /// merge at `ours_rev`; see [`holds_incoming_side`]. A path whose sides cannot
 /// be read is not among them: absent evidence of a resolution is not one.
+///
+/// A timeout is different in kind and is an error, never an absent path. Under
+/// a budgeted environment ([`JjEnv::with_operation_budget`]) the in-process
+/// merge observes the same deadline cooperatively, and a read killed or
+/// refused for the budget says nothing about the file: reading it as "not
+/// resolved" would quietly hand the caller a different basis.
 pub fn paths_holding_incoming_side(
     jj: &JjEnv,
     store: &Path,
@@ -617,15 +681,25 @@ pub fn paths_holding_incoming_side(
     ours_rev: &str,
     theirs_rev: &str,
     paths: &[String],
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>, String> {
     if paths.is_empty() {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     }
-    read_sides_for_paths(jj, store, base_rev, ours_rev, theirs_rev, paths)
-        .into_iter()
-        .filter(|(_, sides)| sides.as_ref().is_ok_and(holds_incoming_side))
-        .map(|(path, _)| path)
-        .collect()
+    let deadline = jj.merge_deadline();
+    let mut held = BTreeSet::new();
+    for (path, sides) in read_sides_for_paths(jj, store, base_rev, ours_rev, theirs_rev, paths) {
+        deadline.check("resolution assessment")?;
+        match sides {
+            Ok(sides) => {
+                if holds_incoming_side_within(&sides, deadline)? {
+                    held.insert(path);
+                }
+            }
+            Err(error) if is_jj_timeout_error(&error) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    Ok(held)
 }
 
 fn count_conflict_regions(merged: &str) -> usize {
@@ -675,34 +749,44 @@ pub enum RestoreVerdict {
 
 /// Apply the loss invariant to one path's three sides.
 pub fn assess_whole_file_restore(sides: &MergeSides) -> RestoreVerdict {
+    assess_whole_file_restore_within(sides, MergeDeadline::NONE)
+        .expect("a merge without a deadline cannot expire")
+}
+
+fn assess_whole_file_restore_within(
+    sides: &MergeSides,
+    deadline: MergeDeadline,
+) -> Result<RestoreVerdict, String> {
+    deadline.check("three-way merge")?;
     if let FileContent::Absent = sides.theirs {
-        return RestoreVerdict::NotAssessed(
+        return Ok(RestoreVerdict::NotAssessed(
             "the incoming change deletes this path; keeping your committed version is a decision \
              no line-wise merge can make for you"
                 .to_string(),
-        );
+        ));
     }
     if let FileContent::Absent = sides.ours {
-        return RestoreVerdict::NotAssessed(
+        return Ok(RestoreVerdict::NotAssessed(
             "your branch deletes this path while the incoming change still edits it; the replay \
              would restore your deletion whole"
                 .to_string(),
-        );
+        ));
     }
     let (Some(base), Some(ours), Some(theirs)) = (
         sides.base.mergeable(),
         sides.ours.mergeable(),
         sides.theirs.mergeable(),
     ) else {
-        return RestoreVerdict::NotAssessed(
+        return Ok(RestoreVerdict::NotAssessed(
             "one side of this path is not UTF-8 text, so it cannot be merged line-wise".to_string(),
-        );
+        ));
     };
-    let candidate = completion_candidate(base, ours, theirs);
+    let candidate = completion_candidate_within(base, ours, theirs, deadline)?;
     if same_ignoring_one_trailing_newline(&candidate, ours) {
-        return RestoreVerdict::Lossless;
+        return Ok(RestoreVerdict::Lossless);
     }
-    RestoreVerdict::Lossy(describe_drop(ours, &candidate))
+    deadline.check("three-way merge (dropped work)")?;
+    Ok(RestoreVerdict::Lossy(describe_drop(ours, &candidate)))
 }
 
 /// diffy's marker writer inserts a newline before a marker when the side above
@@ -844,12 +928,18 @@ pub fn assess_paths(
     theirs_rev: &str,
     paths: &[String],
 ) -> Vec<PathAssessment> {
+    // An expired budget leaves the remaining paths NotAssessed, which is never
+    // a refusal or a certification; a deadline-aware caller checks expiry
+    // itself rather than reading the narrower answer as the real one.
+    let deadline = jj.merge_deadline();
     read_sides_for_paths(jj, store, base_rev, ours_rev, theirs_rev, paths)
         .into_iter()
         .map(|(path, sides)| PathAssessment {
             path,
-            verdict: match sides {
-                Ok(sides) => assess_whole_file_restore(&sides),
+            verdict: match sides
+                .and_then(|sides| assess_whole_file_restore_within(&sides, deadline))
+            {
+                Ok(verdict) => verdict,
                 Err(error) => RestoreVerdict::NotAssessed(error),
             },
         })
@@ -960,10 +1050,12 @@ pub fn carry_paths(
     } else {
         paths_mentioned_in_diff(jj, store, resolved_against, destination, &needs_probe)
     };
+    let deadline = jj.merge_deadline();
     sides
         .into_iter()
         .map(|(path, sides)| {
             let carried = sides.and_then(|sides| {
+                deadline.check("resolution carry")?;
                 if needs_probe.contains(&path) {
                     let changed = binary_changed.as_ref().map_err(Clone::clone)?;
                     if !changed.contains(&path) {
@@ -1692,6 +1784,31 @@ mod tests {
             "head\nA\nX\nbody\nfooter\n",
             theirs
         )));
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_the_in_process_merge_as_a_timeout() {
+        // A tip that holds both sides, so an unbounded run reaches every stage.
+        let resolved = sides(
+            "fn a() {}\n",
+            "fn a() {}\nfn ours() {}\nfn theirs() {}\n",
+            "fn a() {}\nfn theirs() {}\n",
+        );
+        assert_eq!(
+            holds_incoming_side_within(&resolved, MergeDeadline::NONE),
+            Ok(true)
+        );
+        let expired = MergeDeadline::at(Instant::now());
+        for error in [
+            holds_incoming_side_within(&resolved, expired).unwrap_err(),
+            assess_whole_file_restore_within(&resolved, expired).unwrap_err(),
+            completion_candidate_within("a\n", "a\nb\n", "a\nc\n", expired).unwrap_err(),
+        ] {
+            assert!(is_jj_timeout_error(&error), "{error}");
+            assert_eq!(reconcile_failure_kind(&error), RECONCILE_TIMEOUT, "{error}");
+        }
+        let later = MergeDeadline::at(Instant::now() + std::time::Duration::from_secs(60));
+        assert_eq!(holds_incoming_side_within(&resolved, later), Ok(true));
     }
 
     #[test]

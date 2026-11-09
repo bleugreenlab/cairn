@@ -295,12 +295,16 @@ fn query_json() -> VcsQuery {
 }
 
 /// The production path of this family may not take the store lock, spawn a
-/// subprocess, or drive the jj CLI. The one inherited exception, a conflicted
-/// name repair, lives in the shared resolver (`branch.rs`), not here.
+/// subprocess, drive the jj CLI, or prepare a branch. Coordinate reads do not
+/// initialize stores or repair conflicted names.
 #[test]
 fn production_vcs_path_has_no_lock_or_subprocess_edge() {
     let sources = [
         include_str!("../vcs.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap(),
+        include_str!("summaries.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap(),
@@ -317,6 +321,11 @@ fn production_vcs_path_has_no_lock_or_subprocess_edge() {
         "std::process::Command",
         "JjEnv",
         "materialize_",
+        "coordinate_repository(",
+        "ensure_project_store(",
+        "resolve_coordinate_repairing_conflicts(",
+        "prepare_branch(",
+        "reconcile_siblings",
     ] {
         assert!(
             !sources.contains(forbidden),
@@ -325,5 +334,5 @@ fn production_vcs_path_has_no_lock_or_subprocess_edge() {
     }
     assert!(sources.contains("resolve_for_project_read"));
     assert!(sources.contains("ObjectStore::new"));
-    assert!(sources.contains("load_repo_at_head"));
+    assert!(sources.contains("load_repo_for_history"));
 }

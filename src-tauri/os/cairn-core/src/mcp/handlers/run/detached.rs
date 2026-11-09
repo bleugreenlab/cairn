@@ -11,7 +11,9 @@
 //!   notice for the job ([`settle_and_deliver`]), never a message from anyone;
 //! - the node reads it at `cairn:~/batches/<request_id>`;
 //! - an identical reissue is refused while it runs;
-//! - the replay mutation boundary holds the branch while it runs unsettled.
+//! - the replay mutation boundary holds the branch while it runs unsettled, and
+//!   its ending releases that hold through [`end`], the one place a detached
+//!   batch reaches `base_advance::on_branch_hold_released`.
 //!
 //! A batch no machine has been handed yet is `parked`: its row names what it
 //! waits for and holds no branch, and it becomes `running` when it is
@@ -582,6 +584,7 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                 // task that would have placed it is gone nothing ever will.
                 let finished = if batch.state == DetachedState::Parked {
                     mark_lost(
+                        orch,
                         &db,
                         id,
                         &format!(
@@ -592,6 +595,7 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                     .await
                 } else if placed_here(id) {
                     mark_lost(
+                        orch,
                         &db,
                         id,
                         "its batch ended in this runner without its result reaching Cairn",
@@ -599,6 +603,7 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                     .await
                 } else if placed_on.is_some_and(super::PlacedOn::colocated) {
                     mark_lost(
+                        orch,
                         &db,
                         id,
                         "it ran on `local`, this machine's own executor, which stops with Cairn when Cairn restarts",
@@ -609,7 +614,8 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                         RequestReport::Unknown | RequestReport::Held { .. } => continue,
                         RequestReport::Completed(completion) => {
                             let (verdict, output) = completion_result(&completion, batch.commits);
-                            finish(
+                            end(
+                                orch,
                                 &db,
                                 id,
                                 Finish::Settled {
@@ -622,6 +628,7 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                             .await
                         }
                         RequestReport::Gone => mark_lost(
+                            orch,
                             &db,
                             id,
                             "every machine has reported its work since Cairn restarted, and none holds or finished it",
@@ -896,14 +903,37 @@ async fn finish(
     .map_err(|error| format!("finish detached run batch: {error}"))
 }
 
+/// [`finish`] a running batch, then release the branch hold it made. Every
+/// way a detached batch ends (its answer settling it with a notice or inline,
+/// a completion its machine lists, or evidence that it was lost) comes through
+/// here, so its hold is released exactly once: only the call whose write
+/// actually moved the row off `parked` or `running` releases it, and a batch that never
+/// held the branch releases nothing. The release is spawned, so it never runs
+/// under whatever guard, reservation or permit the caller holds; it does
+/// nothing while anything else still holds the branch.
+async fn end(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    request_id: &str,
+    how: Finish<'_>,
+    notify: bool,
+) -> Result<Option<DetachedBatch>, String> {
+    let ended = finish(db, request_id, how, notify).await?;
+    if let Some(batch) = ended.as_ref().filter(|batch| batch.holds_branch) {
+        crate::orchestrator::base_advance::on_branch_hold_released(orch, &batch.job_id);
+    }
+    Ok(ended)
+}
+
 /// Settle a running batch as lost, naming the evidence that it can no longer
 /// report, and queue the notice that says so. `None` when it was not running.
 pub(crate) async fn mark_lost(
+    orch: &Orchestrator,
     db: &LocalDb,
     request_id: &str,
     evidence: &str,
 ) -> Result<Option<DetachedBatch>, String> {
-    finish(db, request_id, Finish::Lost { evidence }, true).await
+    end(orch, db, request_id, Finish::Lost { evidence }, true).await
 }
 
 /// Wake a job whose batch result notice is queued, if it is idle. A job busy
@@ -948,7 +978,7 @@ pub(crate) async fn settle_and_deliver(
         output,
         commit_id: commit.as_deref(),
     };
-    match finish(db, request_id, settled, true).await {
+    match end(orch, db, request_id, settled, true).await {
         Ok(Some(batch)) => {
             wake_job(orch, &batch.job_id, &batch.request_id).await;
             true
@@ -965,6 +995,7 @@ pub(crate) async fn settle_and_deliver(
 /// is owed. Used when the row was written ahead of need, or when a wait
 /// converted at abandonment was answered on its socket after all.
 pub(crate) async fn settle_answered_inline(
+    orch: &Orchestrator,
     db: &LocalDb,
     request_id: &str,
     verdict: &str,
@@ -976,7 +1007,7 @@ pub(crate) async fn settle_answered_inline(
         output,
         commit_id: commit.as_deref(),
     };
-    if let Err(error) = finish(db, request_id, settled, false).await {
+    if let Err(error) = end(orch, db, request_id, settled, false).await {
         log::warn!("detached run batch {request_id} could not be settled: {error}");
     }
 }
@@ -1006,6 +1037,24 @@ mod tests {
             settlement: None,
             waiting_on: None,
         }
+    }
+
+    /// An orchestrator over [`db_with_job`], for the ending paths that release
+    /// a branch hold.
+    async fn orch_with_job() -> Orchestrator {
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
+        );
+        crate::orchestrator::OrchestratorBuilder::new(
+            std::sync::Arc::new(crate::db::DbState::new(
+                std::sync::Arc::new(db_with_job().await),
+                search,
+            )),
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build()
     }
 
     async fn db_with_job() -> LocalDb {
@@ -1045,10 +1094,11 @@ mod tests {
     /// finds nothing to finish and queues nothing; an inline answer owes none.
     #[tokio::test(flavor = "current_thread")]
     async fn finishing_a_batch_queues_its_notice_in_the_same_write() {
-        let db = db_with_job().await;
-        insert(&db, &running("req-1")).await.unwrap();
+        let orch = orch_with_job().await;
+        let db: &LocalDb = &orch.db.local;
+        insert(db, &running("req-1")).await.unwrap();
         let settled = finish(
-            &db,
+            db,
             "req-1",
             Finish::Settled {
                 verdict: "succeeded",
@@ -1061,32 +1111,32 @@ mod tests {
         .unwrap()
         .expect("it was running");
         assert!(settled.notified_ms.is_some());
-        assert_eq!(notices(&db).await, vec![notice_sentence(&settled)]);
+        assert_eq!(notices(db).await, vec![notice_sentence(&settled)]);
 
-        assert!(finish(&db, "req-1", Finish::Lost { evidence: "x" }, true)
+        assert!(finish(db, "req-1", Finish::Lost { evidence: "x" }, true)
             .await
             .unwrap()
             .is_none());
-        assert_eq!(notices(&db).await.len(), 1);
+        assert_eq!(notices(db).await.len(), 1);
 
-        insert(&db, &running("req-2")).await.unwrap();
-        settle_answered_inline(&db, "req-2", "succeeded", "inline").await;
+        insert(db, &running("req-2")).await.unwrap();
+        settle_answered_inline(&orch, db, "req-2", "succeeded", "inline").await;
         assert_eq!(
-            load(&db, "req-2").await.unwrap().unwrap().state,
+            load(db, "req-2").await.unwrap().unwrap().state,
             DetachedState::Settled
         );
         assert_eq!(
-            notices(&db).await.len(),
+            notices(db).await.len(),
             1,
             "an inline answer owes no notice"
         );
 
-        insert(&db, &running("req-3")).await.unwrap();
-        let lost = mark_lost(&db, "req-3", "its machine's enrolment is gone")
+        insert(db, &running("req-3")).await.unwrap();
+        let lost = mark_lost(&orch, db, "req-3", "its machine's enrolment is gone")
             .await
             .unwrap()
             .unwrap();
-        assert!(notices(&db).await.contains(&notice_sentence(&lost)));
+        assert!(notices(db).await.contains(&notice_sentence(&lost)));
     }
 
     /// A batch a machine finished while Cairn was down settles from the
@@ -1203,5 +1253,90 @@ mod tests {
         assert!(!crate::mcp::handlers::run::envelope_reports_run_failure(
             &detach_answer_text("req-1", "x")
         ));
+    }
+
+    /// The ending functions, enumerated from the source: a detached row leaves
+    /// `parked` or `running` in exactly one production statement, inside
+    /// [`finish`]; the only other state write is [`mark_admitted`] moving a
+    /// parked row to `running`, which ends nothing;
+    /// `finish` is called only by [`end`]; `end` is the only caller of the
+    /// branch-hold release; and every way a batch ends reaches `end`. No other
+    /// production module of the run path, or the durable-suspend resolution
+    /// that converts waits into these rows, writes a row's state. A new ending
+    /// that bypassed `end` would leave the branch held until some unrelated
+    /// release, so it fails here.
+    #[test]
+    fn every_detached_ending_releases_its_branch_hold_through_end() {
+        // A source with its top-level `#[cfg(test)]` modules removed. Their
+        // bodies are indented, so each ends at the first column-0 brace.
+        fn production(source: &str) -> String {
+            let mut kept = String::new();
+            let mut rest = source;
+            while let Some(start) = rest.find("#[cfg(test)]\nmod ") {
+                kept.push_str(&rest[..start]);
+                let module = &rest[start..];
+                let close = module.find("\n}\n").map_or(module.len(), |at| at + 3);
+                rest = &module[close..];
+            }
+            kept.push_str(rest);
+            kept
+        }
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` is not in detached.rs"));
+            let rest = &source[start + signature.len()..];
+            let close = rest.find("\n}\n").expect("a top-level body ends");
+            &rest[..close]
+        }
+        let own = production(include_str!("detached.rs"));
+        let state_write = "UPDATE run_batch_detached SET state";
+        assert_eq!(own.matches(state_write).count(), 2);
+        assert!(body(&own, "async fn finish(").contains(state_write));
+        let admission = body(&own, "pub(crate) async fn mark_admitted(");
+        assert!(
+            admission.contains("SET state='running',") && admission.contains("AND state='parked'"),
+            "the one state write outside `finish` only admits a parked row"
+        );
+        let release = "base_advance::on_branch_hold_released";
+        assert!(body(&own, "async fn end(").contains(release));
+        assert_eq!(
+            own.matches(&format!("{release}(")).count(),
+            1,
+            "only `end` releases a detached batch's hold"
+        );
+        // The definition and the one call, in `end`.
+        assert_eq!(
+            own.matches("finish(").count(),
+            2,
+            "`finish` is called only by `end`"
+        );
+        assert!(body(&own, "async fn end(").contains("finish(db,"));
+        for ending in [
+            "pub(crate) async fn mark_lost(",
+            "pub(crate) async fn settle_and_deliver(",
+            "pub(crate) async fn settle_answered_inline(",
+            "pub(crate) async fn sweep_unreported(",
+        ] {
+            let ending_body = body(&own, ending);
+            assert!(
+                ending_body.contains(" end(") || ending_body.contains("mark_lost("),
+                "{ending} must end through `end`"
+            );
+            assert!(!ending_body.contains("finish("), "{ending} bypasses `end`");
+        }
+        for (name, other) in [
+            ("run/mod.rs", production(include_str!("mod.rs"))),
+            (
+                "durable_suspend.rs",
+                production(include_str!("../durable_suspend.rs")),
+            ),
+            ("run/adopted.rs", production(include_str!("adopted.rs"))),
+        ] {
+            assert!(
+                !other.contains("UPDATE run_batch_detached"),
+                "{name} writes a detached row's state outside `finish`"
+            );
+        }
     }
 }

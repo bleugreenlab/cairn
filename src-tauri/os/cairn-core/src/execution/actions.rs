@@ -624,70 +624,122 @@ async fn commit_triage_ledger_if_needed(
         .map_err(|error| error.to_string())?
         .ok_or("Memory triage parent job has no logical branch")?
     };
+    use crate::orchestrator::base_advance::preparation::{
+        prepare_branch, PreparationPurpose, PreparationRefusal, PreparationRequest,
+        PREPARATION_ATTEMPTS,
+    };
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    let _store_guard = orch
-        .acquire_jj_store_lock(
+    let reservation = std::sync::Arc::new(
+        orch.reserve_branches(
             &store,
-            crate::orchestrator::StoreLockClass::Foreground,
+            &[branch.as_str()],
             "memory triage logical publication",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
         )
-        .await;
-    match crate::mcp::handlers::branch::publication_authority_in(
-        &db,
-        parent_job_id,
-        None,
-        Some(&branch),
-    )
-    .await
-    {
-        crate::mcp::handlers::branch::PublicationAuthority::Authorized => {}
-        crate::mcp::handlers::branch::PublicationAuthority::Retired(retired) => {
-            return Err(retired.to_string())
-        }
-        crate::mcp::handlers::branch::PublicationAuthority::Unknown(error) => {
-            return Err(format!(
-            "could not confirm the memory triage branch `{branch}` still accepts commits: {error}"
-        ))
-        }
-    }
+        .await?,
+    );
+    // A PR-node retry whose ledger already exists is a read, not another
+    // committing boundary. It owes no replay merely to inspect the ledger.
     let expected = cairn_vcs::resolve_coordinate(&store, &branch)
         .await
         .map_err(|error| error.to_string())?;
     let current = crate::mcp::handlers::read::file_at_commit(
         PathBuf::from(repo_path),
-        expected.clone(),
+        expected,
         &relative_path,
     )?;
     if current.as_deref() == Some(rendered.as_bytes()) {
         return Ok(());
     }
-    let commit_msg = format!("memory triage ledger: {scope}={scope_value}");
-    let published = crate::jj::publish_logical_head_exported(
-        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
-        &store,
-        &branch,
-        &expected,
-        crate::jj::ProposedPublication::Mutations(vec![cairn_vcs::LogicalTreeMutation {
-            path: relative_path,
-            content: Some(rendered.into_bytes()),
-        }]),
-        // A triage ledger belongs to Cairn itself, not to any one user, so it is
-        // signed with the managed identity.
-        None,
-        cairn_vcs::PublicationMode::Child {
-            description: commit_msg,
-        },
-    )
-    .await
-    .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))?;
-    // The ledger's whole purpose is to be read from the branch by whatever opens
-    // the triage PR, so a commit that never reached the branch ref is a failure,
-    // not a warning.
-    published
-        .export
+    for _ in 0..PREPARATION_ATTEMPTS {
+        let mut request = PreparationRequest::new(
+            action_run.project_id.clone(),
+            branch.clone(),
+            Some(parent_job_id.to_string()),
+            PreparationPurpose::OwnerCommit,
+        );
+        request.reservation = Some(reservation.clone());
+        let prepared = prepare_branch(orch, request)
+            .await
+            .map_err(|error| format!("Could not prepare memory triage ledger: {error}"))?;
+        let guard = crate::mcp::vcs::acquire_store_lock(
+            orch,
+            Some(&store),
+            crate::orchestrator::StoreLockClass::Foreground,
+            "memory triage logical publication",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await?
+        .ok_or("A memory triage publication requires its store writer guard")?;
+        let _admission = guard
+            .branch_write_permit(
+                &db,
+                &reservation,
+                &action_run.project_id,
+                &branch,
+                crate::orchestrator::BatchAdmission::None,
+            )
+            .await?;
+        // Asked under the store guard, right before the seal, so a terminal
+        // resolution recorded under the same guard orders against it.
+        match crate::mcp::handlers::branch::publication_authority_in(
+            &db,
+            parent_job_id,
+            None,
+            Some(&branch),
+        )
+        .await
+        {
+            crate::mcp::handlers::branch::PublicationAuthority::Authorized => {}
+            crate::mcp::handlers::branch::PublicationAuthority::Retired(retired) => {
+                return Err(retired.to_string())
+            }
+            crate::mcp::handlers::branch::PublicationAuthority::Unknown(error) => {
+                return Err(format!(
+                    "could not confirm the memory triage branch `{branch}` still accepts commits: {error}"
+                ))
+            }
+        }
+        match prepared.revalidate(&db, &guard).await {
+            Ok(()) => {}
+            Err(PreparationRefusal::Moved { .. }) => continue,
+            Err(error) => return Err(format!("Could not publish memory triage ledger: {error}")),
+        }
+        let current = crate::mcp::handlers::read::file_at_commit(
+            PathBuf::from(repo_path),
+            prepared.head_after.clone(),
+            &relative_path,
+        )?;
+        if current.as_deref() == Some(rendered.as_bytes()) {
+            return Ok(());
+        }
+        let published = crate::jj::publish_logical_head_exported(
+            &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+            &store,
+            &branch,
+            &prepared.head_after,
+            crate::jj::ProposedPublication::Mutations(vec![cairn_vcs::LogicalTreeMutation {
+                path: relative_path.clone(),
+                content: Some(rendered.as_bytes().to_vec()),
+            }]),
+            // A triage ledger belongs to Cairn itself, not to any one user.
+            None,
+            cairn_vcs::PublicationMode::Child {
+                description: format!("memory triage ledger: {scope}={scope_value}"),
+            },
+        )
+        .await
         .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))?;
-    orch.invalidate_node_check_status(parent_job_id, "logical-head-tree-or-contract-change");
-    Ok(())
+        // A ledger that never reached its branch ref cannot open a triage PR.
+        published
+            .export
+            .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))?;
+        orch.invalidate_node_check_status(parent_job_id, "logical-head-tree-or-contract-change");
+        return Ok(());
+    }
+    Err(format!(
+        "Memory triage ledger was not published: the prepared base moved during all {PREPARATION_ATTEMPTS} publication attempts; retry against its current target"
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -698,26 +750,9 @@ struct EffectivePrBase {
 }
 
 async fn project_default_branch(db: &LocalDb, project_id: &str) -> Result<String, String> {
-    let project_id = project_id.to_string();
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT default_branch FROM projects WHERE id = ?1",
-                    (project_id.as_str(),),
-                )
-                .await?;
-            Ok(rows
-                .next()
-                .await?
-                .and_then(|row| row.opt_text(0).ok().flatten())
-                .filter(|branch| !branch.trim().is_empty())
-                .unwrap_or_else(|| "main".to_string()))
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to load project default_branch: {e}"))
+    crate::orchestrator::base_advance::load_project_default_branch(db, project_id)
+        .await?
+        .ok_or_else(|| format!("Project {project_id} has no integration default"))
 }
 
 async fn resolve_effective_pr_base(
@@ -755,13 +790,28 @@ async fn resolve_effective_pr_base(
     // rewrite the base to the project default branch, collapsing the child onto
     // `main`. The origin probe below still handles a base that no longer resolves
     // in the store (the parent coordinator was reclaimed).
+    // Read at the store's one settled operation, so the answer settles
+    // nothing. A store that cannot answer leaves the base unknown, which is
+    // never a reason to substitute the default branch.
     let store = crate::jj::project_store_dir(&vcs.config_dir, vcs.gh_cwd.as_path());
-    if crate::jj::bookmark_commit(&vcs.jj, &store, recorded_base).is_some() {
-        return Ok(EffectivePrBase {
-            branch: recorded_base.to_string(),
-            original: Some(recorded_base.to_string()),
-            substituted: false,
-        });
+    if crate::jj::is_jj_dir(&store) {
+        let unknown = |error: String| {
+            format!(
+                "whether PR base branch `{recorded_base}` still exists is unknown ({error}); the \
+                 pull request was not opened against a substitute base"
+            )
+        };
+        let pinned = vcs.jj.pin_settled_read(&store).map_err(unknown)?;
+        if crate::jj::bookmark_commit_checked(&pinned, &store, recorded_base)
+            .map_err(unknown)?
+            .is_some()
+        {
+            return Ok(EffectivePrBase {
+                branch: recorded_base.to_string(),
+                original: Some(recorded_base.to_string()),
+                substituted: false,
+            });
+        }
     }
 
     match crate::pr_data::publication::live_origin_branch_exists(
@@ -928,21 +978,20 @@ pub(crate) async fn open_pr_for_job(
     .await?;
     let body = pr_body_with_effective_base_note(body, &effective_base);
     let now = chrono::Utc::now().timestamp() as i32;
-
-    upsert_merge_request_for_pr(
-        db,
+    let store = crate::jj::project_store_dir(&orch.config_dir, &repository.local_repo_path);
+    let record = MergeRequestRecord {
         producing_job_id,
         project_id,
         issue_id,
         title,
-        body.as_deref(),
-        branch_name,
-        Some(effective_base.branch.as_str()),
-        None,
-        !has_remote,
-        now,
-    )
-    .await?;
+        body: body.as_deref(),
+        source_branch: branch_name,
+        declared_base: base_branch,
+        target_branch: effective_base.branch.as_str(),
+        is_local: !has_remote,
+    };
+
+    let seeded = record_merge_request(orch, db, &store, &record, None, None, now).await?;
     orch.invalidate_pr_refresh(producing_job_id, "pull-request-seeded");
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -975,20 +1024,29 @@ pub(crate) async fn open_pr_for_job(
         None
     };
 
-    upsert_merge_request_for_pr(
+    record_merge_request(
+        orch,
         db,
-        producing_job_id,
-        project_id,
-        issue_id,
-        title,
-        body.as_deref(),
-        branch_name,
-        Some(effective_base.branch.as_str()),
+        &store,
+        &record,
+        Some(&seeded),
         github.as_ref().map(|(url, number)| (url.as_str(), *number)),
-        !has_remote,
         chrono::Utc::now().timestamp() as i32,
     )
     .await?;
+    if let Some(pr_number) = github.as_ref().map(|(_, number)| *number) {
+        let reconciled = reconcile_github_pr_base(
+            || merge_request_target(db, &seeded),
+            |base| edit_github_pr_base(orch, vcs.clone(), pr_number, base),
+            &effective_base.branch,
+        )
+        .await;
+        if let Err(error) = reconciled {
+            log::warn!(
+                "pull request #{pr_number} for `{branch_name}` may present a stale base: {error}"
+            );
+        }
+    }
     fire_pr_open_review(orch, db, &vcs, producing_job_id, issue_id, branch_name).await;
     orch.invalidate_pr_refresh(producing_job_id, "pull-request-opened");
     let _ = orch.services.emitter.emit(
@@ -1038,16 +1096,15 @@ async fn open_or_update_github_pr(
 ) -> Result<String, String> {
     log::info!("Creating PR for branch {}", branch_name);
     vcs.publish(orch).await?;
+    if let Some(base) = base_branch {
+        ensure_base_branch_on_origin(orch, vcs, base).await?;
+    }
     let vcs = vcs.clone();
     let branch_name = branch_name.to_string();
     let base_branch = base_branch.map(ToString::to_string);
     let title = title.to_string();
     let body = body.map(ToString::to_string);
     tokio::task::spawn_blocking(move || {
-        if let Some(base) = base_branch.as_deref() {
-            ensure_base_branch_on_origin(&vcs, base)?;
-        }
-
         let body_str = body.as_deref().unwrap_or("");
         let mut args = vec!["pr", "create", "--title", &title, "--body", body_str];
         if let Some(base) = base_branch.as_deref() {
@@ -1132,10 +1189,130 @@ async fn open_or_update_github_pr(
 /// `agent/CAIRN-<n>-coordinator-<k>`) lives only as a bookmark in the shared
 /// store — the project checkout has no local ref for it — so it is published
 /// from the store instead.
-fn ensure_base_branch_on_origin(vcs: &PrVcs, base_branch: &str) -> Result<(), String> {
+/// How many times [`reconcile_github_pr_base`] follows a target that moves
+/// while it is retargeting the remote.
+const PR_BASE_RECONCILE_ATTEMPTS: usize = 3;
+
+/// Bring the remote pull request's base to the target its merge-request row
+/// records. The open asked the remote for `requested`, resolved before the
+/// network I/O; a repoint that landed meanwhile kept the row's target, so the
+/// remote can lag it. Runs with no store guard or reservation held. The row is
+/// re-read after every edit and the newest target wins, so a stale target never
+/// overrides one recorded during the retarget; the follow is bounded.
+async fn reconcile_github_pr_base<R, RF, E, EF>(
+    mut read_target: R,
+    mut edit_base: E,
+    requested: &str,
+) -> Result<(), String>
+where
+    R: FnMut() -> RF,
+    RF: std::future::Future<Output = Result<String, String>>,
+    E: FnMut(String) -> EF,
+    EF: std::future::Future<Output = Result<(), String>>,
+{
+    let mut asked = requested.to_string();
+    for _ in 0..PR_BASE_RECONCILE_ATTEMPTS {
+        let target = read_target().await?;
+        if target == asked {
+            return Ok(());
+        }
+        edit_base(target.clone()).await?;
+        asked = target;
+    }
+    let target = read_target().await?;
+    if target == asked {
+        Ok(())
+    } else {
+        Err(format!(
+            "the recorded target kept moving while the remote was retargeted (now `{target}`, \
+             remote asked for `{asked}`)"
+        ))
+    }
+}
+
+async fn merge_request_target(db: &LocalDb, mr_id: &str) -> Result<String, String> {
+    db.query_text(
+        "SELECT target_branch FROM merge_requests WHERE id = ?1",
+        (mr_id.to_string(),),
+    )
+    .await
+    .map_err(|error| format!("could not read merge request {mr_id}'s target: {error}"))?
+    .ok_or_else(|| format!("merge request {mr_id} has no target"))
+}
+
+async fn edit_github_pr_base(
+    orch: &Orchestrator,
+    vcs: PrVcs,
+    pr_number: i32,
+    base: String,
+) -> Result<(), String> {
+    ensure_base_branch_on_origin(orch, &vcs, &base).await?;
+    tokio::task::spawn_blocking(move || {
+        let number = pr_number.to_string();
+        let output = crate::env::gh()
+            .args(["pr", "edit", number.as_str(), "--base", base.as_str()])
+            .current_dir(&vcs.gh_cwd)
+            .output()
+            .map_err(|e| format!("Failed to run gh pr edit: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "gh pr edit --base `{base}` failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    })
+    .await
+    .map_err(|error| format!("pull request retarget task failed: {error}"))?
+}
+
+/// Publish a pull request's base branch to origin when the remote cannot
+/// already hold it, so the pull request can target it.
+///
+/// The push goes through the one managed-branch publication funnel, which
+/// admits the branch's writer and keeps the store's operation log serialized;
+/// a raw `jj git push` records an operation and tracking state, so it is never
+/// run beside it.
+async fn ensure_base_branch_on_origin(
+    orch: &Orchestrator,
+    vcs: &PrVcs,
+    base_branch: &str,
+) -> Result<(), String> {
+    let (probe, base) = (vcs.clone(), base_branch.to_string());
+    let needed = tokio::task::spawn_blocking(move || base_needs_publication(&probe, &base))
+        .await
+        .map_err(|error| format!("pull request base check failed: {error}"))?;
+    if !needed {
+        return Ok(());
+    }
+    // The base bookmark lives in the shared store, not the project checkout.
+    // A base the store does not hold is one origin already carries (the
+    // effective base keeps only a base the store or origin holds), so there is
+    // nothing to publish; a store that cannot answer is not that case.
+    let store = crate::jj::project_store_dir(&vcs.config_dir, &vcs.gh_cwd);
+    if !crate::jj::is_jj_dir(&store) {
+        return Ok(());
+    }
+    let unknown = |error: String| {
+        format!("could not tell whether PR base `{base_branch}` needs publishing: {error}")
+    };
+    let pinned = vcs.jj.pin_settled_read(&store).map_err(unknown)?;
+    if crate::jj::bookmark_commit_checked(&pinned, &store, base_branch)
+        .map_err(unknown)?
+        .is_none()
+    {
+        return Ok(());
+    }
+    crate::orchestrator::base_advance::publish_managed_branch(orch, &store, base_branch).await
+}
+
+/// Whether `base_branch` must be pushed for a pull request to target it: not
+/// `HEAD`, not a remote ref, and not origin's own default branch.
+fn base_needs_publication(vcs: &PrVcs, base_branch: &str) -> bool {
     let gh_cwd = vcs.gh_cwd.as_path();
     if base_branch == "HEAD" || base_branch.starts_with("origin/") {
-        return Ok(());
+        return false;
     }
 
     let default_branch = crate::env::git()
@@ -1154,13 +1331,7 @@ fn ensure_base_branch_on_origin(vcs: &PrVcs, base_branch: &str) -> Result<(), St
         })
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "main".to_string());
-    if base_branch == default_branch {
-        return Ok(());
-    }
-
-    // The base bookmark lives in the shared store, not the project checkout.
-    let store = crate::jj::project_store_dir(&vcs.config_dir, gh_cwd);
-    crate::jj::ensure_bookmark_on_origin(&vcs.jj, &store, base_branch)
+    base_branch != default_branch
 }
 
 /// Refuse a recipe-driven terminal resolution while the resolved issue still has
@@ -1201,40 +1372,14 @@ async fn handle_merge_pr(
         ensure_resolution_not_blocked(orch, issue_id, "merged").await?;
     }
 
-    let branch_name = find_implementation_context(orch, action_run).await?.branch;
-    let repository = crate::projects::crud::resolve_project_repository(
-        &orch.db,
-        &action_run.project_id,
-        &orch.config_dir,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let repo_path = repository.local_repo_path.to_string_lossy().into_owned();
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
 
-    // Merge boundary: refuse a jj-conflicted source bookmark before merging.
-    // Trusts jj's recorded conflict state, not the GitHub mergeable bit (which is
-    // false for a jj-conflicted commit).
-    if let Some(report) = crate::pr_data::actions::source_conflict_report(
-        &orch.jj_binary_path,
-        &orch.config_dir,
-        &repo_path,
-        &branch_name,
-        None,
-    ) {
-        return Err(format!(
-            "Refusing to merge: the jj source bookmark `{branch_name}` carries a recorded conflict — a conflicted history cannot merge.\n{commits}\n{recovery}",
-            commits = crate::pr_data::actions::format_conflicted_commits(&report.commits),
-            recovery = crate::pr_data::actions::conflict_recovery_hint(&branch_name, None),
-        ));
-    }
-
-    // Route through the same in-app merge path, so recipe and in-app merges are
-    // identical. That path lands a remote PR into the default branch through
-    // GitHub's merge API, and folds every other PR (local-only projects, child
-    // into integration branch, workspace PRs) in the shared jj store; either way
-    // it then resolves the PR node, reconciles siblings, and wakes watchers.
-    // Passing `None` selects the default `squash` shape, one commit per PR.
+    // The recipe merge is the in-app merge: one call into the canonical merge
+    // boundary and nothing decided ahead of it. Its preparation owns conflict
+    // policy, reporting a typed conflict before anything is bound or validated,
+    // so a conflicted intermediate commit the merge can heal is not refused
+    // here on a policy the in-app merge does not share. Passing `None` selects
+    // the default `squash` shape, one commit per PR.
     crate::pr_data::actions::merge_pr_for_job(
         orch,
         &mr_job_id,
@@ -1823,75 +1968,204 @@ async fn latest_complete_implementation_job(
     .map_err(|e| format!("Failed to query job: {}", e))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn upsert_merge_request_for_pr(
-    db: &LocalDb,
-    producing_job_id: &str,
-    project_id: &str,
-    issue_id: Option<&str>,
-    title: &str,
-    body: Option<&str>,
-    source_branch: &str,
-    base_branch: Option<&str>,
-    github: Option<(&str, i32)>,
+/// What a pull-request open records on its merge-request row.
+struct MergeRequestRecord<'a> {
+    producing_job_id: &'a str,
+    project_id: &'a str,
+    issue_id: Option<&'a str>,
+    title: &'a str,
+    body: Option<&'a str>,
+    source_branch: &'a str,
+    /// The job's declared base as this open read it, before it resolved
+    /// `target_branch` from it.
+    declared_base: Option<&'a str>,
+    /// The target the open resolved and asked the remote for.
+    target_branch: &'a str,
     is_local: bool,
+}
+
+fn declared(base: Option<&str>) -> Option<&str> {
+    base.map(str::trim).filter(|base| !base.is_empty())
+}
+
+/// Record a pull-request open on its merge-request row, serialized with the
+/// declared-base relationship: the source branch's reservation (so a landing
+/// that holds it across its push cannot be overtaken), then the store guard
+/// (so a repoint cannot land between the re-read and the write), then a short
+/// SQL-only transaction. Neither is held across the open's network I/O; each of
+/// the open's two writes takes them afresh. `seeded` is the row an earlier
+/// write of this same open created. Returns the row's id.
+async fn record_merge_request(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    store: &Path,
+    record: &MergeRequestRecord<'_>,
+    seeded: Option<&str>,
+    github: Option<(&str, i32)>,
     now: i32,
-) -> Result<(), String> {
-    let producing_job_id = producing_job_id.to_string();
-    let project_id = project_id.to_string();
-    let issue_id = issue_id.map(ToOwned::to_owned);
-    let title = title.to_string();
-    let body = body.map(ToOwned::to_owned);
-    let source_branch = source_branch.to_string();
-    let base_branch = base_branch.map(ToOwned::to_owned);
-    let github = github.map(|(url, number)| (url.to_string(), number));
+) -> Result<String, String> {
+    let purpose = "pull-request target record";
+    let reservation = orch
+        .reserve_branches(
+            store,
+            &[record.source_branch],
+            purpose,
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await?;
+    let guard = crate::mcp::vcs::acquire_store_lock(
+        orch,
+        Some(store),
+        crate::orchestrator::StoreLockClass::Foreground,
+        purpose,
+        crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+    )
+    .await?
+    .expect("a named store always yields a guard");
+    write_merge_request_row(db, store, &guard, &reservation, record, seeded, github, now).await
+}
+
+/// The merge-request write itself, under the witnesses
+/// [`record_merge_request`] takes. SQL only: `LocalDb::write` may rerun it.
+///
+/// The target is re-derived from the job's declared base as it stands now. When
+/// that base moved after the open read it, a repoint has already re-targeted the
+/// row, so the row keeps its target (or, new, takes the current declared base or
+/// project default) rather than the stale one the open resolved. A merged row is
+/// a landing record: it is never reopened or re-targeted, only given the
+/// remote's facts, and a fresh open after it gets a row of its own.
+#[allow(clippy::too_many_arguments)]
+async fn write_merge_request_row(
+    db: &LocalDb,
+    store: &Path,
+    guard: &crate::orchestrator::JjStoreGuard,
+    reservation: &crate::orchestrator::BranchReservation,
+    record: &MergeRequestRecord<'_>,
+    seeded: Option<&str>,
+    github: Option<(&str, i32)>,
+    now: i32,
+) -> Result<String, String> {
+    if !guard.covers(store) || !reservation.covers(store, record.source_branch) {
+        return Err(format!(
+            "merge_request for `{}` must be written under its store guard and source reservation",
+            record.source_branch
+        ));
+    }
+    let producing_job_id = record.producing_job_id.to_string();
+    let project_id = record.project_id.to_string();
+    let issue_id = record.issue_id.map(ToOwned::to_owned);
+    let title = record.title.to_string();
+    let body = record.body.map(ToOwned::to_owned);
+    let source_branch = record.source_branch.to_string();
+    let declared_seen = declared(record.declared_base).map(ToOwned::to_owned);
+    let resolved_target = record.target_branch.to_string();
+    let is_local = i64::from(record.is_local);
+    let seeded = seeded.map(ToOwned::to_owned);
+    let (github_pr_url, github_pr_number) = github
+        .map(|(url, number)| (Some(url.to_string()), Some(number)))
+        .unwrap_or((None, None));
+    let github_state = github.map(|_| "OPEN".to_string());
 
     db.write(|conn| {
-        let producing_job_id = producing_job_id.clone();
-        let project_id = project_id.clone();
-        let issue_id = issue_id.clone();
-        let title = title.clone();
-        let body = body.clone();
-        let source_branch = source_branch.clone();
-        let base_branch = base_branch.clone();
-        let github = github.clone();
+        let (producing_job_id, project_id, issue_id, title, body, source_branch) = (
+            producing_job_id.clone(),
+            project_id.clone(),
+            issue_id.clone(),
+            title.clone(),
+            body.clone(),
+            source_branch.clone(),
+        );
+        let (declared_seen, resolved_target, seeded) = (
+            declared_seen.clone(),
+            resolved_target.clone(),
+            seeded.clone(),
+        );
+        let (github_pr_url, github_state) = (github_pr_url.clone(), github_state.clone());
         Box::pin(async move {
             validate_merge_request_job(conn, &producing_job_id, &project_id, &source_branch)
                 .await?;
-            let mut existing = conn
+            let mut rows = conn
                 .query(
-                    "SELECT id, target_branch
-                     FROM merge_requests
-                     WHERE job_id = ?1
-                        OR job_id IN (
-                            SELECT ar.id
-                            FROM action_runs ar
-                            WHERE ar.parent_job_id = ?1
-                        )
-                     ORDER BY CASE WHEN job_id = ?1 THEN 0 ELSE 1 END, updated_at DESC
-                     LIMIT 1",
+                    "SELECT base_branch FROM jobs WHERE id = ?1",
                     params![producing_job_id.as_str()],
                 )
                 .await?;
+            let current_declared = match rows.next().await? {
+                Some(row) => row.opt_text(0)?,
+                None => None,
+            };
+            let current_declared = declared(current_declared.as_deref()).map(ToOwned::to_owned);
+            let moved = current_declared != declared_seen;
+            if moved {
+                log::warn!(
+                    "job {producing_job_id}'s declared base moved from {declared_seen:?} to \
+                     {current_declared:?} while its pull request was being opened against \
+                     `{resolved_target}`; keeping the re-pointed target"
+                );
+            }
+
+            let mut existing = match seeded.as_deref() {
+                Some(id) => {
+                    conn.query(
+                        "SELECT id, target_branch, status FROM merge_requests WHERE id = ?1",
+                        params![id],
+                    )
+                    .await?
+                }
+                None => {
+                    conn.query(
+                        "SELECT id, target_branch, status
+                         FROM merge_requests
+                         WHERE (job_id = ?1
+                            OR job_id IN (
+                                SELECT ar.id
+                                FROM action_runs ar
+                                WHERE ar.parent_job_id = ?1
+                            ))
+                         ORDER BY CASE WHEN job_id = ?1 THEN 0 ELSE 1 END, updated_at DESC
+                         LIMIT 1",
+                        params![producing_job_id.as_str()],
+                    )
+                    .await?
+                }
+            };
             if let Some(row) = existing.next().await? {
                 let existing_id = row.text(0)?;
-                let existing_target = row.text(1).unwrap_or_else(|_| "main".to_string());
-                let target_branch = base_branch.as_deref().unwrap_or(&existing_target);
-                log::info!(
-                    "Updating existing merge_request for job {}",
-                    producing_job_id
-                );
-                let (github_pr_url, github_pr_number, github_state): (
-                    Option<String>,
-                    Option<i32>,
-                    Option<String>,
-                ) = github
-                    .as_ref()
-                    .map(|(url, number)| {
-                        (Some(url.clone()), Some(*number), Some("OPEN".to_string()))
-                    })
-                    .unwrap_or((None, None, None));
-                // COALESCE, not assignment: this upsert runs twice per open —
+                let existing_target = row.opt_text(1)?.unwrap_or_else(|| "main".to_string());
+                let status = row.text(2)?;
+                // A job has one merge-request row, and a merged one is its
+                // landing record. A fresh open must neither reopen it nor add a
+                // second row, so it is refused here, before any network I/O.
+                if status == "merged" && seeded.is_none() {
+                    return Err(DbError::internal(format!(
+                        "job {producing_job_id}'s pull request already landed (merge request \
+                         {existing_id} is merged); a landed record is never reopened, so no new \
+                         pull request was opened"
+                    )));
+                }
+                if status == "merged" {
+                    conn.execute(
+                        "UPDATE merge_requests
+                         SET github_pr_number = COALESCE(github_pr_number, ?1),
+                             github_pr_url = COALESCE(github_pr_url, ?2),
+                             updated_at = ?3
+                         WHERE id = ?4",
+                        params![
+                            github_pr_number,
+                            github_pr_url.as_deref(),
+                            now,
+                            existing_id.as_str()
+                        ],
+                    )
+                    .await?;
+                    return Ok(existing_id);
+                }
+                let target_branch = if moved {
+                    existing_target
+                } else {
+                    resolved_target
+                };
+                // COALESCE, not assignment: this write runs twice per open —
                 // once to seed the row before the slow push, once to record the
                 // result. A plain assignment lets the seeding call erase a
                 // binding an earlier open established, so a retry whose open then
@@ -1916,42 +2190,39 @@ async fn upsert_merge_request_for_pr(
                         title.as_str(),
                         body.as_deref(),
                         source_branch.as_str(),
-                        target_branch,
+                        target_branch.as_str(),
                         github_pr_number,
                         github_pr_url.as_deref(),
                         github_state.as_deref(),
-                        i64::from(is_local),
+                        is_local,
                         now,
                         existing_id.as_str()
                     ],
                 )
                 .await?;
-                return Ok(());
+                return Ok(existing_id);
             }
 
-            log::info!("Creating new merge_request for job {}", producing_job_id);
-            let mut default_branch_rows = conn
-                .query(
-                    "SELECT default_branch FROM projects WHERE id = ?1",
-                    (project_id.as_str(),),
-                )
-                .await?;
-            let default_branch = default_branch_rows
-                .next()
-                .await?
-                .and_then(|row| row.opt_text(0).ok().flatten())
-                .unwrap_or_else(|| "main".to_string());
-            let target_branch = base_branch.as_deref().unwrap_or(&default_branch);
+            let target_branch = if moved {
+                match current_declared {
+                    Some(base) => base,
+                    None => {
+                        let mut rows = conn
+                            .query(
+                                "SELECT default_branch FROM projects WHERE id = ?1",
+                                (project_id.as_str(),),
+                            )
+                            .await?;
+                        rows.next()
+                            .await?
+                            .and_then(|row| row.opt_text(0).ok().flatten())
+                            .unwrap_or_else(|| "main".to_string())
+                    }
+                }
+            } else {
+                resolved_target
+            };
             let mr_id = ids::mint_child(project_id.as_str());
-            let (github_pr_url, github_pr_number, github_state): (
-                Option<String>,
-                Option<i32>,
-                Option<String>,
-            ) = github
-                .as_ref()
-                .map(|(url, number)| (Some(url.clone()), Some(*number), Some("OPEN".to_string())))
-                .unwrap_or((None, None, None));
-
             conn.execute(
                 "INSERT INTO merge_requests(
                     id, job_id, project_id, issue_id, title, body,
@@ -1968,21 +2239,21 @@ async fn upsert_merge_request_for_pr(
                     title.as_str(),
                     body.as_deref(),
                     source_branch.as_str(),
-                    target_branch,
+                    target_branch.as_str(),
                     now,
                     now,
                     github_pr_number,
                     github_pr_url.as_deref(),
                     github_state.as_deref(),
-                    i64::from(is_local),
+                    is_local,
                 ],
             )
             .await?;
-            Ok(())
+            Ok(mr_id)
         })
     })
     .await
-    .map_err(|e| format!("Failed to upsert merge_request: {}", e))
+    .map_err(|e| format!("Failed to record merge_request: {}", e))
 }
 
 async fn validate_merge_request_job(
@@ -2107,6 +2378,466 @@ mod tests {
         // Leak the tempdir so the file outlives the test body.
         std::mem::forget(temp);
         db
+    }
+
+    const PR_STORE: &str = "/fixture/pr-store";
+
+    /// An orchestrator used only for its lock registries; the rows live in the
+    /// test's own database.
+    async fn lock_orchestrator() -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.join("search")).unwrap(),
+        );
+        Orchestrator::builder(
+            std::sync::Arc::new(crate::db::DbState::new(
+                std::sync::Arc::new(test_db().await),
+                search,
+            )),
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root,
+        )
+        .build()
+    }
+
+    fn mr_record<'a>(
+        job: &'a str,
+        project: &'a str,
+        issue: Option<&'a str>,
+        declared_base: Option<&'a str>,
+        target: &'a str,
+    ) -> MergeRequestRecord<'a> {
+        MergeRequestRecord {
+            producing_job_id: job,
+            project_id: project,
+            issue_id: issue,
+            title: "Title",
+            body: Some("Body"),
+            source_branch: "agent/p-1-builder",
+            declared_base,
+            target_branch: target,
+            is_local: true,
+        }
+    }
+
+    /// Write a merge-request row under a real source reservation and store
+    /// guard, the witnesses production takes in `record_merge_request`.
+    async fn write_row(
+        db: &LocalDb,
+        record: &MergeRequestRecord<'_>,
+        seeded: Option<&str>,
+        github: Option<(&str, i32)>,
+    ) -> Result<String, String> {
+        let orch = lock_orchestrator().await;
+        let store = Path::new(PR_STORE);
+        let reservation = orch
+            .reserve_branches(
+                store,
+                &[record.source_branch],
+                "test pull-request open",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let guard = orch
+            .acquire_jj_store_lock(
+                store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "test pull-request open",
+            )
+            .await;
+        write_merge_request_row(db, store, &guard, &reservation, record, seeded, github, 10).await
+    }
+
+    /// A project `p-race` with a child job on `agent/p-1-builder` whose
+    /// declared base is `agent/parent`.
+    async fn seed_child_job(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-race','default','P','p','/tmp/p','main',1,1);
+             INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-race','p-race',1,'T','active','none',1,1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-race','recipe','i-race','p-race','running',1,1,'{}');
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, base_branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-race','e-race','builder','i-race','p-race','agent/p-1-builder','agent/parent','complete','builder','Builder',1,1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The parent merged while the child's open was on the network: the
+    /// repoint moved the job and its row to `main` together.
+    async fn repoint_child_to_main(db: &LocalDb) {
+        db.execute_script(
+            "UPDATE jobs SET base_branch = 'main' WHERE id = 'job-race';
+             UPDATE merge_requests SET target_branch = 'main' WHERE job_id = 'job-race';",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn row_text(db: &LocalDb, id: &str, column: &str) -> Option<String> {
+        db.query_opt(
+            format!("SELECT {column} FROM merge_requests WHERE id = ?1"),
+            params![id],
+            |row| row.opt_text(0),
+        )
+        .await
+        .unwrap()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn post_network_write_keeps_a_target_repointed_during_the_open() {
+        let db = test_db().await;
+        seed_child_job(&db).await;
+        let stale = mr_record(
+            "job-race",
+            "p-race",
+            Some("i-race"),
+            Some("agent/parent"),
+            "agent/parent",
+        );
+        let seeded = write_row(&db, &stale, None, None).await.unwrap();
+        assert_eq!(
+            row_text(&db, &seeded, "target_branch").await.as_deref(),
+            Some("agent/parent")
+        );
+
+        repoint_child_to_main(&db).await;
+        let recorded = write_row(&db, &stale, Some(&seeded), Some(("https://g/pr/7", 7)))
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, seeded);
+        assert_eq!(
+            row_text(&db, &seeded, "target_branch").await.as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            row_text(&db, &seeded, "github_pr_url").await.as_deref(),
+            Some("https://g/pr/7")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_after_a_repoint_targets_the_current_declared_base() {
+        let db = test_db().await;
+        seed_child_job(&db).await;
+        db.execute_script(
+            "UPDATE jobs SET base_branch = 'agent/grandparent' WHERE id = 'job-race';",
+        )
+        .await
+        .unwrap();
+        let stale = mr_record(
+            "job-race",
+            "p-race",
+            Some("i-race"),
+            Some("agent/parent"),
+            "agent/parent",
+        );
+
+        let seeded = write_row(&db, &stale, None, None).await.unwrap();
+        assert_eq!(
+            row_text(&db, &seeded, "target_branch").await.as_deref(),
+            Some("agent/grandparent")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_landed_row_is_never_reopened_or_retargeted() {
+        let db = test_db().await;
+        seed_child_job(&db).await;
+        let open = mr_record(
+            "job-race",
+            "p-race",
+            Some("i-race"),
+            Some("agent/parent"),
+            "agent/parent",
+        );
+        let seeded = write_row(&db, &open, None, None).await.unwrap();
+        db.execute_script("UPDATE merge_requests SET status = 'merged', github_state = 'MERGED';")
+            .await
+            .unwrap();
+
+        let changed_target = MergeRequestRecord {
+            target_branch: "main",
+            ..mr_record(
+                "job-race",
+                "p-race",
+                Some("i-race"),
+                Some("agent/parent"),
+                "main",
+            )
+        };
+        write_row(
+            &db,
+            &changed_target,
+            Some(&seeded),
+            Some(("https://g/pr/8", 8)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            row_text(&db, &seeded, "status").await.as_deref(),
+            Some("merged")
+        );
+        assert_eq!(
+            row_text(&db, &seeded, "github_state").await.as_deref(),
+            Some("MERGED")
+        );
+        assert_eq!(
+            row_text(&db, &seeded, "target_branch").await.as_deref(),
+            Some("agent/parent")
+        );
+        assert_eq!(
+            row_text(&db, &seeded, "github_pr_url").await.as_deref(),
+            Some("https://g/pr/8")
+        );
+
+        // A job has one merge-request row: a fresh open after the landing is
+        // refused, and the landing record is left exactly as it was.
+        let refused = write_row(&db, &open, None, None).await.unwrap_err();
+        assert!(refused.contains("already landed"), "{refused}");
+        assert_eq!(
+            row_text(&db, &seeded, "status").await.as_deref(),
+            Some("merged")
+        );
+        assert_eq!(
+            row_text(&db, &seeded, "target_branch").await.as_deref(),
+            Some("agent/parent")
+        );
+        assert_eq!(
+            db.query_opt("SELECT COUNT(*) FROM merge_requests", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_row_write_refuses_witnesses_for_another_branch() {
+        let db = test_db().await;
+        seed_child_job(&db).await;
+        let orch = lock_orchestrator().await;
+        let store = Path::new(PR_STORE);
+        let reservation = orch
+            .reserve_branches(
+                store,
+                &["agent/other"],
+                "test",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let guard = orch
+            .acquire_jj_store_lock(
+                store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "test",
+            )
+            .await;
+        let record = mr_record(
+            "job-race",
+            "p-race",
+            None,
+            Some("agent/parent"),
+            "agent/parent",
+        );
+
+        let error =
+            write_merge_request_row(&db, store, &guard, &reservation, &record, None, None, 10)
+                .await
+                .unwrap_err();
+        assert!(error.contains("source reservation"), "{error}");
+        assert_eq!(
+            db.query_opt("SELECT COUNT(*) FROM merge_requests", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    /// A landing that reserves the source across its push holds the row still:
+    /// the open's write waits for the reservation and lands only after release.
+    #[tokio::test]
+    async fn the_record_waits_for_a_landing_that_holds_the_source_reservation() {
+        let db = std::sync::Arc::new(test_db().await);
+        seed_child_job(&db).await;
+        let orch = std::sync::Arc::new(lock_orchestrator().await);
+        let store = Path::new(PR_STORE);
+        let landing = orch
+            .reserve_branches(
+                store,
+                &["agent/p-1-builder", "agent/parent"],
+                "test landing",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        let open = {
+            let (db, orch) = (db.clone(), orch.clone());
+            tokio::spawn(async move {
+                let record = mr_record(
+                    "job-race",
+                    "p-race",
+                    Some("i-race"),
+                    Some("agent/parent"),
+                    "agent/parent",
+                );
+                record_merge_request(&orch, &db, Path::new(PR_STORE), &record, None, None, 10).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !open.is_finished(),
+            "the open must wait for the landing's reservation"
+        );
+        assert_eq!(
+            db.query_opt("SELECT COUNT(*) FROM merge_requests", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        drop(landing);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), open)
+            .await
+            .expect("the open proceeds once the landing releases")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Drive [`reconcile_github_pr_base`] over a scripted sequence of recorded
+    /// targets (one per read; the last repeats) and return the edits it made.
+    async fn reconcile_over(
+        targets: &[&str],
+        requested: &str,
+    ) -> (Result<(), String>, Vec<String>) {
+        let reads = std::sync::Mutex::new(
+            targets
+                .iter()
+                .map(|target| target.to_string())
+                .collect::<Vec<_>>(),
+        );
+        let edits = std::sync::Mutex::new(Vec::new());
+        let result = reconcile_github_pr_base(
+            || {
+                let mut reads = reads.lock().unwrap();
+                let next = if reads.len() > 1 {
+                    reads.remove(0)
+                } else {
+                    reads[0].clone()
+                };
+                async move { Ok(next) }
+            },
+            |base| {
+                edits.lock().unwrap().push(base);
+                async { Ok(()) }
+            },
+            requested,
+        )
+        .await;
+        (result, edits.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn remote_base_untouched_when_the_record_matches_the_request() {
+        let (result, edits) = reconcile_over(&["agent/parent"], "agent/parent").await;
+        assert!(result.is_ok());
+        assert!(edits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_base_follows_a_target_repointed_during_the_open() {
+        let (result, edits) = reconcile_over(&["main"], "agent/parent").await;
+        assert!(result.is_ok());
+        assert_eq!(edits, ["main"]);
+    }
+
+    /// A repoint that lands while the remote is being retargeted wins: the
+    /// row is re-read after the edit and the newer target replaces the older.
+    #[tokio::test]
+    async fn a_newer_target_is_never_overridden_by_the_stale_one() {
+        let (result, edits) = reconcile_over(&["main", "release"], "agent/parent").await;
+        assert!(result.is_ok());
+        assert_eq!(edits, ["main", "release"]);
+    }
+
+    #[tokio::test]
+    async fn a_target_that_keeps_moving_is_followed_a_bounded_number_of_times() {
+        let (result, edits) = reconcile_over(&["a", "b", "c", "d", "e"], "agent/parent").await;
+        assert_eq!(edits.len(), PR_BASE_RECONCILE_ATTEMPTS);
+        assert!(result.unwrap_err().contains("kept moving"));
+    }
+
+    /// The recipe merge decides nothing ahead of the canonical merge boundary:
+    /// no conflict probe of its own, exactly one call into `merge_pr_for_job`.
+    #[test]
+    fn the_recipe_merge_routes_once_through_the_canonical_boundary() {
+        let source = include_str!("actions.rs");
+        let start = source
+            .find("async fn handle_merge_pr(")
+            .expect("handle_merge_pr exists");
+        let end = start
+            + source[start..]
+                .find("\n}\n")
+                .expect("handle_merge_pr has a closing brace");
+        let body = &source[start..end];
+        assert_eq!(body.matches("merge_pr_for_job(").count(), 1, "{body}");
+        for probe in [
+            "source_conflict_report",
+            "conflict_recovery_hint",
+            "Refusing to merge",
+        ] {
+            assert!(
+                !body.contains(probe),
+                "handle_merge_pr must not decide `{probe}` itself"
+            );
+        }
+    }
+
+    /// The body of production function `name` in this file.
+    fn production_fn<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} exists"));
+        let end = start + source[start..].find("\n}\n").expect("a closing brace");
+        &source[start..end]
+    }
+
+    /// A pull request's base reaches origin only through the managed-branch
+    /// publication funnel, never through a raw `jj git push` of its own.
+    #[test]
+    fn the_pull_request_base_is_published_through_the_managed_funnel() {
+        let source = include_str!("actions.rs");
+        let body = production_fn(source, "ensure_base_branch_on_origin");
+        assert!(body.contains("publish_managed_branch("), "{body}");
+        assert!(!body.contains("ensure_bookmark_on_origin("), "{body}");
+        // An absent base is decided from a pinned read before the funnel,
+        // which refuses a branch the store does not hold.
+        assert!(body.contains(".pin_settled_read(&store)"), "{body}");
+        assert!(
+            body.find("bookmark_commit_checked(&pinned") < body.find("publish_managed_branch("),
+            "{body}"
+        );
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests")];
+        assert!(
+            !production.contains("crate::jj::ensure_bookmark_on_origin("),
+            "no raw base push remains in production"
+        );
+    }
+
+    /// The effective base's store read is pinned to the settled operation and
+    /// an unknown answer is an error, not a fallback to the default.
+    #[test]
+    fn the_effective_base_reads_a_pinned_view_and_never_guesses() {
+        let source = include_str!("actions.rs");
+        let body = production_fn(source, "resolve_effective_pr_base");
+        assert!(body.contains(".pin_settled_read(&store)"), "{body}");
+        assert!(body.contains("bookmark_commit_checked(&pinned"), "{body}");
+        assert!(
+            !body.contains("crate::jj::bookmark_commit(&vcs.jj"),
+            "{body}"
+        );
     }
 
     async fn seed_project_with_default_branch(
@@ -2441,18 +3172,17 @@ mod tests {
             substituted: true,
         };
 
-        upsert_merge_request_for_pr(
+        write_row(
             &db,
-            "job-effective",
-            "p-effective",
-            Some("i-effective"),
-            "Title",
-            Some("Body"),
-            "agent/p-1-builder",
-            Some(effective.branch.as_str()),
+            &mr_record(
+                "job-effective",
+                "p-effective",
+                Some("i-effective"),
+                None,
+                effective.branch.as_str(),
+            ),
             None,
-            true,
-            10,
+            None,
         )
         .await
         .unwrap();
@@ -2567,18 +3297,11 @@ mod tests {
             })
         }).await.unwrap();
 
-        upsert_merge_request_for_pr(
+        write_row(
             &db,
-            "job-mr",
-            "p-mr",
-            Some("i-mr"),
-            "Title",
-            Some("Body"),
-            "agent/p-1-builder",
-            Some("main"),
+            &mr_record("job-mr", "p-mr", Some("i-mr"), None, "main"),
             None,
-            true,
-            10,
+            None,
         )
         .await
         .unwrap();
@@ -2612,18 +3335,17 @@ mod tests {
             })
         }).await.unwrap();
 
-        upsert_merge_request_for_pr(
+        write_row(
             &db,
-            "job-int",
-            "p-int",
-            Some("i-int"),
-            "Title",
-            Some("Body"),
-            "agent/p-1-builder",
-            Some("agent/coord-integration"),
+            &mr_record(
+                "job-int",
+                "p-int",
+                Some("i-int"),
+                None,
+                "agent/coord-integration",
+            ),
             None,
-            true,
-            10,
+            None,
         )
         .await
         .unwrap();
@@ -2648,18 +3370,11 @@ mod tests {
         .await
         .unwrap();
 
-        let err = upsert_merge_request_for_pr(
+        let err = write_row(
             &db,
-            "not-a-job",
-            "p-missing",
+            &mr_record("not-a-job", "p-missing", None, None, "main"),
             None,
-            "Title",
             None,
-            "agent/p-1-builder",
-            Some("main"),
-            None,
-            true,
-            10,
         )
         .await
         .expect_err("dangling merge_request job_id must fail closed");
@@ -2684,18 +3399,15 @@ mod tests {
             })
         }).await.unwrap();
 
-        upsert_merge_request_for_pr(
+        write_row(
             &db,
-            "job-relink",
-            "p-relink",
-            Some("i-relink"),
-            "New",
+            &MergeRequestRecord {
+                title: "New",
+                body: None,
+                ..mr_record("job-relink", "p-relink", Some("i-relink"), None, "main")
+            },
             None,
-            "agent/p-1-builder",
-            Some("main"),
             None,
-            true,
-            10,
         )
         .await
         .unwrap();
@@ -2975,9 +3687,92 @@ mod tests {
             uri_segment: Some("pr".to_string()),
         };
 
+        let branch = "agent/cairn-7-integrator-0";
+        let before = cairn_vcs::resolve_coordinate(&store_dir, branch)
+            .await
+            .unwrap();
+        // A ledger is a committing demand even when its producing job finished.
+        std::fs::write(project_repo.join("README.md"), "advanced base\n").unwrap();
+        git(&project_repo, &["add", "README.md"]);
+        git(
+            &project_repo,
+            &["commit", "-qm", "advance integration target"],
+        );
+        crate::jj::ensure_project_store(&jj, &store_dir, &project_repo).unwrap();
+        let target = cairn_vcs::resolve_coordinate(&store_dir, "main")
+            .await
+            .unwrap();
+        assert_ne!(before, target);
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&store_dir, branch)
+                .await
+                .unwrap(),
+            before
+        );
+        let key =
+            crate::orchestrator::base_advance::preparation::journal_store_key(&store_dir).unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO branch_advance_acceptances
+               (id, project_id, store_path, branch, head_before, head_after, base_branch,
+                base_commit, captured_operation, dropped_commits_json, inherited_drops_json,
+                status, created_at)
+             VALUES ('triage-injected-unknown', 'p-1', ?1, ?2, ?3, ?4, 'main', ?4,
+                     'captured-op', '[]', '[]', 'unknown', 1)",
+                params![key.as_str(), branch, before.as_str(), target.as_str()],
+            )
+            .await
+            .unwrap();
+        let refusal = commit_triage_ledger_if_needed(&orch, &action_run, &repo_path)
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("triage-injected-unknown"), "{refusal}");
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&store_dir, branch)
+                .await
+                .unwrap(),
+            before
+        );
+        // Remove only the injected fault fixture; this is not an acceptance
+        // repair path and supplies no proof for a publication.
+        orch.db
+            .local
+            .execute(
+                "DELETE FROM branch_advance_acceptances WHERE id = 'triage-injected-unknown'",
+                (),
+            )
+            .await
+            .unwrap();
+
         commit_triage_ledger_if_needed(&orch, &action_run, &repo_path)
             .await
-            .expect("no-promotion ledger seals cleanly");
+            .expect("no-promotion ledger seals cleanly on the prepared base");
+        let sealed = cairn_vcs::resolve_coordinate(&store_dir, branch)
+            .await
+            .unwrap();
+        git(
+            &project_repo,
+            &["merge-base", "--is-ancestor", &target, &sealed],
+        );
+        let inherited = crate::jj::file_show(&jj, &store_dir, &sealed, "README.md").unwrap();
+        assert_eq!(inherited.as_slice(), b"advanced base\n");
+
+        // An idempotent PR-node retry reads its existing ledger. It is not
+        // another commit and must not replay just because main moved again.
+        std::fs::write(project_repo.join("README.md"), "later base\n").unwrap();
+        git(&project_repo, &["add", "README.md"]);
+        git(&project_repo, &["commit", "-qm", "advance after ledger"]);
+        crate::jj::ensure_project_store(&jj, &store_dir, &project_repo).unwrap();
+        commit_triage_ledger_if_needed(&orch, &action_run, &repo_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&store_dir, branch)
+                .await
+                .unwrap(),
+            sealed
+        );
 
         // The branch now carries a ledger commit ahead of `main` — the diff the
         // PR opens on. Without it the branch is empty and gh pr create fails with

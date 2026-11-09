@@ -349,6 +349,13 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     .budget(32),
     // Undecided, each with an owner (the tables cairn/5585's census named).
     undecided(
+        "branch_advance_acceptances",
+        "cairn/5387",
+        "keep until the branch is deleted AND no remote history can still need a dropped-commit \
+         claim; pruning when origin first passes head_after is unsound, since origin can be \
+         rewritten later",
+    ),
+    undecided(
         "cas_cache",
         "cairn/4648",
         "not a cache on a private database: 99% of rows (944 of 949 MB on 10-30) are the \

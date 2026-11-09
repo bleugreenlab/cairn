@@ -28,10 +28,29 @@ const AGENT_COMMIT_VERBS: &[(&str, &[&str])] = &[
 /// explicit publication barrier (opening or re-saving a pull request). Each must
 /// ask the same publication rule the commit verbs ask, or it becomes a second
 /// definition of when a branch belongs on origin.
-const AUTOMATIC_PUBLISHERS: &[(&str, &str)] = &[(
-    "base-advance reconciler",
-    include_str!("../orchestrator/base_advance.rs"),
-)];
+///
+/// There are none today. Base advance is lazy: the preparer and explicit
+/// replays rewrite the store and publish nothing, leaving origin to the branch's
+/// next commit verb or PR barrier, and `base_advance_publishes_nothing` holds
+/// them to that. A path that starts publishing on its own belongs here.
+const AUTOMATIC_PUBLISHERS: &[(&str, &str)] = &[];
+
+/// The base-advance modules whose whole source is production code (their tests
+/// live in sibling files), none of which may push.
+const NON_PUBLISHING_ADVANCERS: &[(&str, &str)] = &[
+    (
+        "base-advance preparer",
+        include_str!("../orchestrator/base_advance/preparation.rs"),
+    ),
+    (
+        "explicit base replay",
+        include_str!("../orchestrator/base_advance/replay_requests.rs"),
+    ),
+    (
+        "base-advance retirement",
+        include_str!("../orchestrator/base_advance/retirement.rs"),
+    ),
+];
 
 const MANAGED_PUSH_TRIGGERS: &[(&str, &str)] = &[
     ("run", include_str!("../mcp/handlers/run/mod.rs")),
@@ -42,7 +61,7 @@ const MANAGED_PUSH_TRIGGERS: &[(&str, &str)] = &[
     ),
     ("create-pr open", include_str!("../execution/actions.rs")),
     (
-        "reconciler",
+        "managed publication wrapper",
         include_str!("../orchestrator/base_advance.rs"),
     ),
 ];
@@ -93,6 +112,38 @@ fn automatic_publishers_consult_the_commit_verbs_rule() {
              `publication_requirement_for_managed_branch`, so it would push branches the \
              commit verbs deliberately keep local."
         );
+    }
+}
+
+/// Lazy base advance never reaches origin itself. `base_advance.rs` holds the
+/// managed publication wrapper, so its production code names the wrapper once,
+/// at its definition; the modules beside it name no push at all. A base-advance
+/// path that publishes must move into `AUTOMATIC_PUBLISHERS` and ask the rule.
+#[test]
+fn base_advance_publishes_nothing() {
+    let wrapper_home = include_str!("../orchestrator/base_advance.rs")
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .unwrap();
+    assert_eq!(
+        wrapper_home.matches("publish_managed_branch(").count(),
+        1,
+        "base_advance.rs calls `publish_managed_branch` on its own initiative; register it \
+         in AUTOMATIC_PUBLISHERS and ask `publication_requirement_for_managed_branch`"
+    );
+    for (name, source) in NON_PUBLISHING_ADVANCERS {
+        for push in [
+            "publish_managed_branch(",
+            "push_managed_branch",
+            "publish_branch_to_origin(",
+            "push_to_origin(",
+        ] {
+            assert!(
+                !source.contains(push),
+                "{name} reaches `{push}`; base advance publishes nothing on its own. Register \
+                 it in AUTOMATIC_PUBLISHERS and ask `publication_requirement_for_managed_branch`"
+            );
+        }
     }
 }
 

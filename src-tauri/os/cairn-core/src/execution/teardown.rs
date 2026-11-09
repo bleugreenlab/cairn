@@ -152,97 +152,403 @@ pub(crate) async fn cleanup_issue_jobs(
         archive_issue_executions(orch, &db, &issue_id).await;
     }
 
-    let mut branches_by_repo: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for target in targets {
-        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&target.repo_path));
-        let _guard = orch
-            .acquire_jj_store_lock(
-                &store,
-                crate::orchestrator::StoreLockClass::Background,
-                format!("retire issue branch {}", target.branch),
-            )
-            .await;
-        // The same guard serializes recording a recovery and deleting its head.
-        // Preserve fenced heads rather than changing a repair's coordinates.
-        let mut admitted = true;
-        for owner_db in orch.db.all_dbs().await {
-            if let Err(error) = crate::orchestrator::branch_recovery::refuse_if_fenced(
-                &owner_db,
-                &store,
-                &[target.branch.as_str()],
-                "Retiring this branch",
-            )
-            .await
-            {
-                log::warn!("Teardown: preserving branch {}: {error}", target.branch);
-                admitted = false;
-                break;
-            }
-        }
-        if !admitted {
-            continue;
-        }
-        let delete_branch = match reason {
-            TeardownReason::Discarded => true,
-            TeardownReason::Merged => {
-                match resolve_merge_target_for_source(
-                    &db,
-                    &issue_id,
-                    &target.branch,
-                    &target.job_ids,
-                )
-                .await
-                {
-                    Some(merge_target) if merge_target == target.branch => true,
-                    Some(merge_target) => {
-                        match branch_landed(orch, &target.repo_path, &target.branch, &merge_target)
-                        {
-                            Ok(true) => true,
-                            Ok(false) => {
-                                log::warn!(
-                                    "Teardown: preserving unlanded branch `{}` for merged issue {}",
-                                    target.branch,
-                                    issue_id
-                                );
-                                false
-                            }
-                            Err(error) => {
-                                log::warn!("Teardown: preserving branch `{}` because landed-state resolution failed: {}", target.branch, error);
-                                false
-                            }
-                        }
-                    }
-                    None => {
-                        log::warn!("Teardown: preserving branch `{}` because its merge target is unresolved", target.branch);
-                        false
-                    }
-                }
-            }
-        };
-        if delete_branch {
-            if let Err(error) = crate::git::branch::delete_with_services(
-                &*orch.services.git,
-                Path::new(&target.repo_path),
-                &target.branch,
-            ) {
-                log::warn!(
-                    "Teardown: failed to delete local branch {}: {}",
-                    target.branch,
-                    error
-                );
-            }
-            branches_by_repo
-                .entry(target.repo_path)
-                .or_default()
-                .push(target.branch);
-        }
-    }
-    for (repo_path, mut branches) in branches_by_repo {
-        branches.sort();
-        branches.dedup();
-        delete_remote_branches_for_repo(orch, &repo_path, &branches).await;
+    for target in &targets {
+        retire_branch(orch, &db, &issue_id, target, reason).await;
     }
     Ok(())
+}
+
+/// Retire one of a resolved issue's branches, or keep it and say why.
+///
+/// Retirement is a compare-and-swap of what the decision saw. The branch is
+/// reserved before the decision and until the end, so no owner commit or
+/// landing can move it in between unseen; the decision and the local delete run
+/// under the store lock, off the runtime, in one worker that owns the lock; and
+/// the decision's metadata reads hold the store's object lease. Anything
+/// uncertain keeps the branch: a kept branch costs a stale ref, a wrong delete
+/// costs commits. The origin copy goes only after both local copies are gone,
+/// by a delete leased on the store's tracked origin value
+/// ([`retire_remote_copy`]), never an unleased one.
+async fn retire_branch(
+    orch: &Orchestrator,
+    db: &std::sync::Arc<LocalDb>,
+    issue_id: &str,
+    target: &BranchTarget,
+    reason: TeardownReason,
+) {
+    let branch = target.branch.as_str();
+    let keep = |why: String| log::info!("Teardown: keeping branch `{branch}`: {why}");
+    let merge_target = match reason {
+        TeardownReason::Discarded => None,
+        TeardownReason::Merged => {
+            match resolve_merge_target_for_source(db, issue_id, branch, &target.job_ids).await {
+                Some(merge_target) => Some(merge_target),
+                None => return keep("its merge target is unresolved".into()),
+            }
+        }
+    };
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&target.repo_path));
+    if !crate::jj::is_jj_dir(&store) {
+        return keep(
+            "the project has no branch store to retire it from by compare-and-swap".into(),
+        );
+    }
+    let reservation = match orch
+        .reserve_branches(
+            &store,
+            &[branch],
+            "retire a resolved issue's branch",
+            crate::mcp::vcs::STORE_LOCK_TIMEOUT,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => return keep(format!("it could not be reserved ({error})")),
+    };
+    let guard = match orch
+        .acquire_jj_store_lock_with_timeout(
+            &store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            format!("retire branch {branch}"),
+            Some(crate::mcp::vcs::STORE_LOCK_TIMEOUT),
+        )
+        .await
+    {
+        Ok(guard) => guard,
+        Err(()) => return keep("the store is busy".into()),
+    };
+    // Recording a recovery takes this same lock, so a fence recorded just
+    // before is seen here. A head a fence holds is kept: its coordinates are
+    // the repair's, not this retirement's to change.
+    if let Err(refusal) = crate::orchestrator::branch_recovery::refuse_coordinate_if_fenced(
+        orch,
+        &store,
+        &[branch],
+        "Retiring this branch",
+    )
+    .await
+    {
+        return keep(refusal);
+    }
+    // Read under the reservation and the lock: work cut from the branch, or a
+    // new owner, may have appeared while this waited for them.
+    match protection(db, &target.project_id, branch, merge_target.as_deref()).await {
+        Ok(None) => {}
+        Ok(Some(why)) => return keep(why),
+        Err(error) => return keep(format!("whether it is still in use is unknown ({error})")),
+    }
+    let recorded = match merge_target {
+        Some(_) => match recorded_source_commit(db, issue_id, branch).await {
+            Ok(recorded) => recorded,
+            Err(error) => return keep(error),
+        },
+        None => None,
+    };
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let outcome = {
+        // Admission immediately before the decision and the delete: the
+        // branch is reserved by this caller and owes no acceptance (a write
+        // whose acceptance is unsettled may or may not be in its bookmark, so
+        // its content is not known). Refused means kept, locally and on origin.
+        let permit = match guard
+            .branch_write_permit(
+                db,
+                &reservation,
+                &target.project_id,
+                branch,
+                crate::orchestrator::BatchAdmission::None,
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => return keep(refusal.to_string()),
+        };
+        // The judgement and the delete are blocking jj and git work; the
+        // permit borrows the guard, so they run in place on this worker
+        // thread, handed off from the runtime, rather than on a pooled task.
+        crate::jj::in_place_blocking(|| {
+            retire_locally(
+                &jj,
+                &store,
+                branch,
+                merge_target.as_deref(),
+                recorded.as_deref(),
+                &permit,
+                &guard,
+            )
+        })
+    };
+    // The lock ends with the local half; the reservation outlives it, through
+    // the remote delete and its record.
+    drop(guard);
+    match outcome {
+        Ok(LocalRetirement::Retired {
+            tracked_origin: Some(origin),
+        }) => {
+            retire_remote_copy(
+                orch,
+                db,
+                &target.project_id,
+                &store,
+                branch,
+                &origin,
+                &reservation,
+            )
+            .await
+        }
+        Ok(LocalRetirement::Retired {
+            tracked_origin: None,
+        }) => log::info!("Teardown: retired `{branch}`; origin has no tracked copy to retire"),
+        Ok(LocalRetirement::Kept(why)) => keep(why),
+        Ok(LocalRetirement::Partial(why)) => {
+            log::warn!("Teardown: {why}; its origin copy is kept")
+        }
+        Err(error) => keep(error),
+    }
+}
+
+/// Delete `branch` on origin, leased on the copy the store last recorded
+/// there (`origin`), after its local copies were retired.
+///
+/// The push and the read-back are network I/O, so they run off the store lock
+/// while `reservation` still holds the branch. Recording the result re-takes
+/// the lock, re-admits the branch, and retires only this branch's tracking
+/// copy, by compare-and-swap on `origin`. Every failure keeps the remote copy: origin moving
+/// off `origin` means someone pushed since, and their commits are not this
+/// retirement's to drop.
+async fn retire_remote_copy(
+    orch: &Orchestrator,
+    db: &std::sync::Arc<LocalDb>,
+    project_id: &str,
+    store: &Path,
+    branch: &str,
+    origin: &str,
+    reservation: &crate::orchestrator::BranchReservation,
+) {
+    let (jj, path, name, expected) = (
+        crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        store.to_path_buf(),
+        branch.to_string(),
+        origin.to_string(),
+    );
+    let pushed = tokio::task::spawn_blocking(move || {
+        let heads = crate::jj::retire_remote_branch_unrecorded(&jj, &path, &name, &expected)
+            .map_err(|error| error.to_string())?;
+        let readback = crate::jj::readback_leased_push(&jj, &path, &heads).err();
+        Ok::<_, String>((heads, readback))
+    })
+    .await;
+    let (heads, readback) = match pushed {
+        Ok(Ok(pushed)) => pushed,
+        Ok(Err(error)) => {
+            return log::warn!("Teardown: kept origin's copy of `{branch}`: {error}");
+        }
+        Err(error) => {
+            return log::warn!(
+                "Teardown: kept origin's copy of `{branch}`: worker failed ({error})"
+            );
+        }
+    };
+    if let Some(error) = readback {
+        log::warn!("Teardown: deleted origin's `{branch}` but could not read it back: {error}");
+    }
+    let guard = match orch
+        .acquire_jj_store_lock_with_timeout(
+            store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            format!("record retirement of {branch} on origin"),
+            Some(crate::mcp::vcs::STORE_LOCK_TIMEOUT),
+        )
+        .await
+    {
+        Ok(guard) => guard,
+        Err(()) => {
+            return log::warn!(
+                "Teardown: deleted origin's `{branch}`; the store is busy, so its tracking copy is \
+                 recorded by the next import"
+            );
+        }
+    };
+    // The lock was released for the network, so the branch is admitted again
+    // under this one before the store records anything about it. The record
+    // touches only this branch's tracking ref and its view entry, by
+    // compare-and-swap, so the branch's own admission is the whole gate.
+    // The permit borrows the guard, so it lives in this block and ends before
+    // the guard is released.
+    let recorded = {
+        let permit = match guard
+            .branch_write_permit(
+                db,
+                reservation,
+                project_id,
+                branch,
+                crate::orchestrator::BatchAdmission::None,
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                return log::warn!(
+                    "Teardown: deleted origin's `{branch}`; recording it waits (next fetch): \
+                     {refusal}"
+                );
+            }
+        };
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        crate::jj::in_place_blocking(|| {
+            let _admitted = &permit;
+            crate::jj::record_leased_push(&jj, store, &heads)
+        })
+    };
+    drop(guard);
+    match recorded {
+        Ok(()) => log::info!("Teardown: retired `{branch}` locally and on origin"),
+        Err(error) => {
+            log::warn!("Teardown: deleted origin's `{branch}`, but recording it refused: {error}")
+        }
+    }
+}
+
+/// What keeps a branch from retirement, first match wins. Every lookup binds
+/// the project and the branch; the owner lookup is pinned to
+/// `idx_jobs_project_branch` by `protection_seeks_jobs_on_project_and_branch`.
+const PROTECTION_SQL: &str = "SELECT CASE
+     WHEN EXISTS (SELECT 1 FROM projects p WHERE p.id = ?1 AND p.default_branch = ?2)
+       THEN 'it is the project default branch'
+     WHEN EXISTS (SELECT 1 FROM jobs j WHERE j.project_id = ?1 AND j.base_branch = ?2
+                     AND j.status NOT IN ('complete', 'failed', 'cancelled'))
+       THEN 'live work is cut from it'
+     WHEN EXISTS (SELECT 1 FROM merge_requests m WHERE m.project_id = ?1
+                     AND m.target_branch = ?2 AND m.status = 'open')
+       THEN 'an open pull request targets it'
+     WHEN EXISTS (SELECT 1 FROM merge_requests m WHERE m.project_id = ?1
+                     AND m.source_branch = ?2 AND m.status = 'open')
+       THEN 'an open pull request is published from it'
+     WHEN EXISTS (SELECT 1 FROM jobs j WHERE j.project_id = ?1 AND j.branch = ?2
+                     AND j.status NOT IN ('complete', 'failed', 'cancelled'))
+       THEN 'live work still owns it'
+   END";
+
+/// Why `branch` must not be retired, if anything says so: it is the project's
+/// default, it is the branch its own work merged into, or live work still uses
+/// it as a base, a pull request target, or its own branch.
+async fn protection(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+    merge_target: Option<&str>,
+) -> Result<Option<String>, String> {
+    if merge_target == Some(branch) {
+        return Ok(Some("it is the branch its work merged into".into()));
+    }
+    let reason = db
+        .query_opt_text(
+            PROTECTION_SQL,
+            params![project_id.to_string(), branch.to_string()],
+        )
+        .await
+        .map_err(|error| format!("read what uses `{branch}`: {error}"))?;
+    Ok(reason)
+}
+
+/// The source commit the issue's merged pull request for `branch` recorded.
+async fn recorded_source_commit(
+    db: &LocalDb,
+    issue_id: &str,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    db.query_opt_text(
+        "SELECT merged_source_commit FROM merge_requests
+          WHERE issue_id = ?1 AND source_branch = ?2 AND status = 'merged'
+            AND merged_source_commit IS NOT NULL
+          ORDER BY merged_at DESC LIMIT 1",
+        params![issue_id.to_string(), branch.to_string()],
+    )
+    .await
+    .map_err(|error| format!("the landing record is unreadable: {error}"))
+}
+
+/// What the local half of a retirement did.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalRetirement {
+    Retired { tracked_origin: Option<String> },
+    Kept(String),
+    Partial(String),
+}
+
+/// Judge and retire `branch`'s local copies. Runs on a blocking worker that
+/// holds the store lock; the judgement's reads also hold the object lease,
+/// which is released before anything is deleted and never upgraded.
+///
+/// `merge_target` is `None` for a discarded issue, whose branch needs no
+/// landing proof. For a merged one, the branch landed exactly while its
+/// bookmark holds the source commit the landing recorded; a row that names none
+/// falls back to the ancestry proof alone.
+fn retire_locally(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    merge_target: Option<&str>,
+    recorded: Option<&str>,
+    _admitted: &crate::orchestrator::BranchWritePermit<'_>,
+    guard: &crate::orchestrator::JjStoreGuard,
+) -> Result<LocalRetirement, String> {
+    if !guard.covers(store) {
+        return Err(format!(
+            "retiring `{branch}` needs the lock of {}, which this caller does not hold",
+            store.display()
+        ));
+    }
+    let state = {
+        let _lease = crate::jj::StoreObjectLease::for_store(store)?;
+        let state = crate::jj::read_local_branch_state(store, branch)?;
+        let landed = || match recorded {
+            Some(recorded) => state.bookmark.as_deref() == Some(recorded),
+            None => merge_target
+                .is_some_and(|target| crate::jj::bookmark_landed_in(jj, store, branch, target)),
+        };
+        if let Some(why) = retirement_refusal(&state, merge_target.is_some(), landed) {
+            return Ok(LocalRetirement::Kept(why));
+        }
+        state
+    };
+    Ok(
+        match crate::jj::retire_bookmark_expecting(store, branch, &state)? {
+            crate::jj::Retirement::Retired => LocalRetirement::Retired {
+                tracked_origin: state.tracked_origin,
+            },
+            crate::jj::Retirement::Refused(why) => LocalRetirement::Kept(why),
+            crate::jj::Retirement::Partial(why) => LocalRetirement::Partial(why),
+        },
+    )
+}
+
+/// Why the local copies in `state` must be kept, if anything says so.
+fn retirement_refusal(
+    state: &crate::jj::LocalBranchState,
+    merged: bool,
+    landed: impl FnOnce() -> bool,
+) -> Option<String> {
+    let Some(bookmark) = state.bookmark.as_deref() else {
+        return Some(match state.git_ref {
+            Some(_) => "its git ref has no bookmark to account for it".into(),
+            None => "it has no local copy left".into(),
+        });
+    };
+    if state
+        .git_ref
+        .as_deref()
+        .is_some_and(|git_ref| git_ref != bookmark)
+    {
+        return Some(format!(
+            "its git ref ({}) differs from its bookmark ({bookmark}), and nothing accounts for it",
+            state.git_ref.as_deref().unwrap_or_default()
+        ));
+    }
+    if merged && !landed() {
+        return Some("it holds commits its landing did not include".into());
+    }
+    None
 }
 
 /// One issue job's archival coordinates.
@@ -469,28 +775,6 @@ pub async fn cleanup_project_jobs(orch: &Orchestrator, project_id: &str) -> Resu
     }
     crate::node_scratch::lifecycle::close_for_project(orch, project_id).await;
     Ok(())
-}
-
-fn branch_landed(
-    orch: &Orchestrator,
-    repo_path: &str,
-    source_branch: &str,
-    target_branch: &str,
-) -> Result<bool, String> {
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    if crate::jj::is_jj_dir(&store) {
-        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-        Ok(crate::jj::bookmark_landed_in(
-            &jj,
-            &store,
-            source_branch,
-            target_branch,
-        ))
-    } else {
-        orch.services
-            .git
-            .is_ancestor(Path::new(repo_path), source_branch, target_branch)
-    }
 }
 
 /// Resolve the merge target branch a torn-down `source_branch` should have landed
@@ -742,48 +1026,6 @@ async fn delete_all_terminal_rows_for_jobs(db: &LocalDb, job_ids: &[String]) -> 
     .map_err(|e| format!("Failed to delete job terminals during teardown: {e}"))
 }
 
-/// Delete remote branches for a repo (best-effort). No-ops when the repo is not
-/// a GitHub remote or no GitHub App credentials are available.
-async fn delete_remote_branches_for_repo(
-    orch: &Orchestrator,
-    repo_path: &str,
-    branches: &[String],
-) {
-    if branches.is_empty() {
-        return;
-    }
-    let (owner, repo) = match crate::github::credentials::get_owner_repo(repo_path) {
-        Ok(owner_repo) => owner_repo,
-        Err(e) => {
-            log::debug!(
-                "Teardown: skipping remote branch cleanup (not a GitHub repo): {}",
-                e
-            );
-            return;
-        }
-    };
-    let auth = match crate::security::broker::github::installation_authority(&orch.db.local, &owner)
-        .await
-    {
-        Ok(auth) => auth,
-        Err(e) => {
-            log::warn!(
-                "Teardown: skipping remote branch cleanup (no GitHub credentials): {}",
-                e
-            );
-            return;
-        }
-    };
-    crate::github::api::delete_remote_branches(
-        &*orch.services.http,
-        &auth,
-        &owner,
-        &repo,
-        branches,
-    )
-    .await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,6 +1194,222 @@ mod tests {
         assert_eq!(tip, sealed);
     }
 
+    /// A resolved issue's branch is retired only as its landing recorded it,
+    /// under the store's own exclusions, and only when nothing still uses it:
+    /// busy maintenance, a git ref the bookmark does not account for, an owner
+    /// commit after the landing, a row naming no commit with ancestry saying no,
+    /// live work cut from the branch, and the project default all keep it. A
+    /// retirement removes the bookmark and the git ref together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(jj)]
+    async fn a_resolved_branch_is_retired_only_as_its_landing_recorded_it() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            eprintln!("skipping: jj not resolvable");
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let workspaces = tempfile::tempdir().unwrap();
+        crate::jj::tests::init_project(project.path());
+        let jj = crate::jj::environment(&bin, home.path());
+        let store = crate::jj::project_store_dir(home.path(), project.path());
+        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
+        let sealed = |branch: &str, file: &str| {
+            let node = workspaces.path().join(branch.replace('/', "-"));
+            if !node.exists() {
+                crate::jj::add_workspace(&jj, &store, &node, branch, "main", None).unwrap();
+            }
+            std::fs::write(node.join(file), format!("{file}\n")).unwrap();
+            crate::jj::seal(&jj, &node, file, None).unwrap();
+            crate::jj::head_commit(&jj, &node).unwrap()
+        };
+        let (landed, moved, unrecorded) = ("agent/landed", "agent/moved", "agent/unrecorded");
+        let landed_at = sealed(landed, "landed.rs");
+        let moved_at = sealed(moved, "moved.rs");
+        sealed(moved, "after-the-landing.rs");
+        sealed(unrecorded, "unrecorded.rs");
+        jj.run(&store, &["git", "export"], "export the fixture")
+            .unwrap();
+        let git_dir = crate::jj::store_git_dir(&store).unwrap();
+        let update_ref = |branch: &str, to: &str| {
+            let status = std::process::Command::new("git")
+                .arg(format!("--git-dir={}", git_dir.display()))
+                .args(["update-ref", &format!("refs/heads/{branch}"), to])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        let db = crate::storage::migrated_test_db("teardown-retire.db").await;
+        db.execute_script(format!(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj','ws','P','p','{repo}','main',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue','proj',1,'T','merged',1,1), ('other','proj',2,'O','active',1,1);
+             INSERT INTO executions(id, recipe_id, status, started_at) VALUES ('exec','r','running',1);
+             INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch,
+                                        status, opened_at, updated_at, merged_at, merged_commit, merged_source_commit)
+               VALUES ('mr-l','job-l','proj','issue','PR','{landed}','main','merged',1,1,2,'x','{landed_at}'),
+                      ('mr-m','job-m','proj','issue','PR','{moved}','main','merged',1,1,2,'x','{moved_at}'),
+                      ('mr-u','job-u','proj','issue','PR','{unrecorded}','main','merged',1,1,2,'x',NULL);
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, branch, base_branch, status, created_at, updated_at)
+               VALUES ('cut','exec','proj','other','agent/cut','{unrecorded}','running',1,1);",
+            repo = project.path().display(),
+        ))
+        .await
+        .unwrap();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(home.path().join("search")).unwrap(),
+        );
+        let db_state =
+            std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(db), search));
+        let orch = crate::orchestrator::OrchestratorBuilder::new(
+            db_state,
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            home.path().to_path_buf(),
+        )
+        .jj_binary_path(bin.clone())
+        .build();
+        let repo = project.path().to_str().unwrap().to_string();
+        let retire = |branch: &str, reason: TeardownReason| {
+            let target = BranchTarget {
+                project_id: "proj".into(),
+                branch: branch.into(),
+                repo_path: repo.clone(),
+                job_ids: Vec::new(),
+            };
+            let orch = &orch;
+            async move { retire_branch(orch, &orch.db.local, "issue", &target, reason).await }
+        };
+        let state = |branch: &str| crate::jj::read_local_branch_state(&store, branch).unwrap();
+
+        {
+            let _maintenance = crate::jj::testing::hold_store_reclamation(&store).unwrap();
+            retire(landed, TeardownReason::Merged).await;
+        }
+        assert!(
+            state(landed).bookmark.is_some(),
+            "busy maintenance keeps it"
+        );
+
+        let main = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
+        update_ref(landed, &main);
+        retire(landed, TeardownReason::Merged).await;
+        assert!(
+            state(landed).bookmark.is_some(),
+            "a git ref its bookmark does not account for keeps it"
+        );
+        update_ref(landed, &landed_at);
+
+        retire(landed, TeardownReason::Merged).await;
+        let gone = state(landed);
+        assert_eq!(
+            (gone.bookmark, gone.git_ref),
+            (None, None),
+            "retired as its landing recorded it"
+        );
+
+        retire(moved, TeardownReason::Merged).await;
+        assert!(
+            state(moved).bookmark.is_some(),
+            "an owner commit after the landing keeps it"
+        );
+
+        retire(unrecorded, TeardownReason::Discarded).await;
+        assert!(
+            state(unrecorded).bookmark.is_some(),
+            "live work cut from it keeps it, even discarded"
+        );
+        orch.db
+            .local
+            .execute("UPDATE jobs SET status = 'complete' WHERE id = 'cut'", ())
+            .await
+            .unwrap();
+        retire(unrecorded, TeardownReason::Merged).await;
+        assert!(
+            state(unrecorded).bookmark.is_some(),
+            "no recorded commit, and ancestry says it has not landed"
+        );
+        retire(unrecorded, TeardownReason::Discarded).await;
+        assert!(
+            state(unrecorded).bookmark.is_none(),
+            "discarded work needs no landing proof"
+        );
+
+        retire("main", TeardownReason::Discarded).await;
+        assert!(
+            state("main").bookmark.is_some(),
+            "the project default is never retired"
+        );
+
+        // A write to the branch whose acceptance is unsettled: its content is
+        // not known, so the branch owes a repair and is not retired.
+        let owed = sealed("agent/owed", "owed.rs");
+        jj.run(&store, &["git", "export"], "export the owed branch")
+            .unwrap();
+        let key =
+            crate::orchestrator::base_advance::preparation::journal_store_key(&store).unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO branch_advance_acceptances
+                   (id, project_id, store_path, branch, head_before, head_after, base_branch,
+                    base_commit, captured_operation, dropped_commits_json, inherited_drops_json,
+                    status, created_at)
+                 VALUES ('owed', 'proj', ?1, 'agent/owed', 'b', 'a', 'main', 'm', 'op', '[]', '[]',
+                         'unknown', 1)",
+                params![key],
+            )
+            .await
+            .unwrap();
+        retire("agent/owed", TeardownReason::Discarded).await;
+        assert_eq!(
+            state("agent/owed").bookmark.as_deref(),
+            Some(owed.as_str()),
+            "an unsettled write keeps the branch, even discarded"
+        );
+
+        // A recovery fence on the branch keeps it: recording a recovery takes
+        // the store lock retirement holds, and the fenced head is the repair's.
+        let fenced = sealed("agent/fenced", "fenced.rs");
+        jj.run(&store, &["git", "export"], "export the fenced branch")
+            .unwrap();
+        let fenced_state = cairn_vcs::BookmarkState::normal(&fenced);
+        crate::orchestrator::branch_recovery::record_recoveries(
+            &orch.db.local,
+            "proj",
+            &store,
+            Some("agent/fenced"),
+            crate::orchestrator::branch_recovery::BUDGET_AUTOMATIC,
+            "fixture",
+            vec![crate::jj::RecoveryCoordinates {
+                scope: crate::jj::RecoveryScope::Branch,
+                phase: crate::jj::RollbackFailurePhase::ExportUnverified,
+                pre_op: None,
+                pre_view: None,
+                pre_git: None,
+                failed_view: None,
+                bookmarks: vec![crate::jj::BookmarkRecovery {
+                    bookmark: "agent/fenced".into(),
+                    pre: fenced_state.clone(),
+                    pre_git: Some(fenced.clone()),
+                    failed: fenced_state,
+                }],
+                survivors: vec![],
+                evidence: vec!["fixture".into()],
+            }],
+        )
+        .await
+        .unwrap();
+        retire("agent/fenced", TeardownReason::Discarded).await;
+        assert_eq!(
+            state("agent/fenced").bookmark.as_deref(),
+            Some(fenced.as_str()),
+            "a head a recovery fence holds is kept, even discarded"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn teardown_preserves_a_head_held_by_a_recovery_fence() {
         use crate::orchestrator::branch_recovery;
@@ -1024,6 +1482,22 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// The owner lookup binds project and branch. Without an index leading
+    /// with both it reads every job in the project; results are the same
+    /// either way, so only the plan witnesses the regression.
+    #[tokio::test]
+    async fn protection_seeks_jobs_on_project_and_branch() {
+        let db = crate::storage::migrated_test_db("teardown-protection-plan.db").await;
+        let plan =
+            crate::storage::query_plan(&db, PROTECTION_SQL, vec!["p".into(), "agent/x".into()])
+                .await;
+        assert!(
+            plan.lines().any(|step| step
+                == "SEARCH j USING INDEX idx_jobs_project_branch (project_id=? AND branch=?)"),
+            "the owner lookup must seek jobs on project and branch, got\n{plan}"
         );
     }
 

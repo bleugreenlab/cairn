@@ -245,7 +245,7 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeRebase,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/rebase",
     name: "Node rebase",
-    description: "The active conflict resolution session for this node's branch: what advanced the base, the immutable three-way coordinates, the incoming change's complete file list flagged conflicting or clean-on-retry, whether conflict markers are present in the checkout, and the sanctioned next action. Both sides of the merge are recomputed from immutable commits and paged independently — view=base-ours is what your branch did, view=base-theirs is what arrived. A patch with action:rebuild recovers a flagged branch from explicit source_commit, owner-attested source_base with source_base_reason, and expected_tip coordinates, preserving the flagged tip in a recovery ref and refusing unprovable later edits. A patch with action:replay asks the store to replay the branch onto the base; slot refs are exports of the runner's jj store, so this is the only way ancestry moves.",
+    description: "The active conflict resolution session for this node's branch: what advanced the base, the immutable three-way coordinates, the incoming change's complete file list flagged conflicting or clean-on-retry, whether conflict markers are present in the checkout, and the sanctioned next action. Both sides of the merge are recomputed from immutable commits and paged independently — view=base-ours is what your branch did, view=base-theirs is what arrived. A patch with action:replay carries the branch onto the base for this branch only, under one shared time budget: synchronously with the terminal outcome when nothing holds the branch, or, when a run batch holds it, recorded and served once that batch completes (or at the next start), with the outcome delivered as a note; slot refs are exports of the runner's jj store, so this is the only way ancestry moves. A branch is otherwise carried only at its next commit, a check or run that names it, or a merge, and a check's conflict opens no session here. A patch with action:rebuild recovers a flagged branch from explicit source_commit, owner-attested source_base with source_base_reason, and expected_tip coordinates, preserving the flagged tip in a recovery ref and refusing unprovable later edits; it is refused while a run batch can still publish to the branch or while the branch's parent has an open conflict session. The page also lists any acceptance this branch still owes from an earlier install, with or without a session: a pending one settles at the branch's next write, and an `unknown` one refuses every writer until the owning node dismisses it with action:dismiss-acceptance, naming the acceptance, the branch's exact current head and a reason. Dismissal retires the row without accepting its drop claims and moves, exports and publishes nothing.",
     read_projections: &[
         ProjectionSpec {
             key: "view",
@@ -278,13 +278,16 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
             REBASE_REVIEW_PATHS,
             REBASE_REVIEWED_THROUGH,
             REBASE_THROUGH,
+            REBASE_ACCEPTANCE_ID,
+            REBASE_EXPECTED_HEAD,
+            REBASE_DISMISS_REASON,
             REBASE_SOURCE_COMMIT,
             REBASE_SOURCE_BASE,
             REBASE_SOURCE_BASE_REASON,
             REBASE_EXPECTED_TIP,
         ],
-        label: "replay this branch, take origin's fast-forward of it or its base, set its catch-up mode, or mark its review",
-        example: "write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]})",
+        label: "replay this branch, take origin's fast-forward of it or its base, retry its recovery repair, rebuild it from attested coordinates, set its catch-up mode, mark its review, or dismiss an unknown acceptance",
+        example: "replay: write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"replay\",resolution:\"take-committed-tip\"}}]}) | dismiss an unknown acceptance: write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"dismiss-acceptance\",acceptance_id:\"ID\",expected_head:\"FULL_HEAD\",reason:\"...\"}}]}) | rebuild a flagged branch: write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"rebuild\",source_commit:\"FULL_SOURCE\",source_base:\"FULL_CUT\",source_base_reason:\"...\",expected_tip:\"FULL_FLAGGED_TIP\"}}]})",
     }],
 };
 

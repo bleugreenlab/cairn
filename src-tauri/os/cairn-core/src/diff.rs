@@ -235,22 +235,26 @@ pub struct BranchRange {
 ///
 /// `integration_target` is what `jobs.base_branch` records. An unresolvable
 /// endpoint is an error, never a silent fall back to a recorded coordinate.
+///
+/// A pure read: resolution runs in process over one settled operation (a
+/// split operation log is refused, not merged), and a project with no branch
+/// store yet is reported as having no live range rather than given one. That
+/// is why `_jj_binary_path` goes unused: no jj command runs here.
 pub async fn live_branch_range(
-    jj_binary_path: &str,
+    _jj_binary_path: &str,
     config_dir: &Path,
     repo_path: &Path,
     branch: &str,
     integration_target: &str,
 ) -> Result<BranchRange, String> {
-    let jj_binary_path = jj_binary_path.to_string();
-    let config_dir = config_dir.to_path_buf();
-    let project_repo = repo_path.to_path_buf();
-    let repository = tokio::task::spawn_blocking(move || {
-        let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-        crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-    })
-    .await
-    .map_err(|error| format!("coordinate repository task failed: {error}"))??;
+    let repository = crate::jj::project_store_dir(config_dir, repo_path);
+    if !crate::jj::is_jj_dir(&repository) {
+        return Err(format!(
+            "no branch store exists for {} yet, so `{branch}` has no live range; reading does \
+             not create one",
+            repo_path.display()
+        ));
+    }
     let resolved = cairn_vcs::merge_base(&repository, branch, integration_target)
         .await
         .map_err(|error| format!("resolving '{branch}' against '{integration_target}': {error}"))?;
@@ -512,11 +516,9 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(jj)]
-        async fn thread_style_job_creates_coordinate_store_on_demand() {
+        async fn a_live_range_read_never_creates_the_store() {
             let Some(bin) = crate::jj::tests::jj_bin() else {
-                eprintln!(
-                    "skipping thread_style_job_creates_coordinate_store_on_demand: jj not resolvable"
-                );
+                eprintln!("skipping a_live_range_read_never_creates_the_store: jj not resolvable");
                 return;
             };
             let home = tempfile::tempdir().unwrap();
@@ -538,15 +540,13 @@ mod tests {
                 "the fixture must start without a managed store"
             );
 
-            let range = live_job_branch_range(&db, "owner", &bin, home.path())
+            let error = live_job_branch_range(&db, "owner", &bin, home.path())
                 .await
-                .unwrap()
-                .expect("the thread-style job has a branch coordinate");
-
-            assert_eq!(range.base, range.tip);
+                .expect_err("a project with no store has no live range");
+            assert!(error.contains("no branch store"), "{error}");
             assert!(
-                crate::jj::is_jj_dir(&store),
-                "coordinate resolution must create the managed store on first use"
+                !store.exists(),
+                "a read must not create or import the managed store"
             );
         }
 
@@ -832,6 +832,42 @@ mod tests {
                 from_row.iter().any(|file| file.path == "unrelated.rs"),
                 "the recorded coordinate must still pull the base's landed work into the gate"
             );
+
+            // Two writers forked from one operation: the live range is refused
+            // by name, and the read leaves both operation heads in place.
+            let cairn_vcs::SettledOperation::Single(operation) =
+                cairn_vcs::settled_operation(&store).unwrap()
+            else {
+                panic!("the fixture store is settled before the fork");
+            };
+            for name in ["split-a", "split-b"] {
+                jj.run(
+                    &store,
+                    &[
+                        "--at-op",
+                        operation.as_str(),
+                        "bookmark",
+                        "create",
+                        "-r",
+                        "main",
+                        name,
+                        "--ignore-working-copy",
+                    ],
+                    "fork the operation log",
+                )
+                .unwrap();
+            }
+            let heads = || {
+                std::fs::read_dir(store.join(".jj/repo/op_heads/heads"))
+                    .unwrap()
+                    .count()
+            };
+            assert_eq!(heads(), 2, "fixture must fork the op log");
+            let error = live_job_branch_range(&db, "owner", &bin, home.path())
+                .await
+                .expect_err("a split log has no single live range");
+            assert!(error.contains("2 operation heads"), "{error}");
+            assert_eq!(heads(), 2, "the read settled nothing");
         }
     }
 }

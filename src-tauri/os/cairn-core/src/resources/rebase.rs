@@ -40,12 +40,13 @@ use crate::orchestrator::base_advance::{
 };
 use crate::orchestrator::conflict_session::{
     assess_session_tip, load_active_session, load_latest_session, load_reconcile_pass,
-    ConflictSession, MarkerState, ReplayPass, ReplayState, SessionFile, TipAssessment, Unproven,
+    ConflictSession, MarkerState, ReplayPass, SessionFile, TipAssessment, Unproven,
 };
 use crate::orchestrator::replay_base::{
     load_base_candidates, resolve_base, BaseCandidates, BaseSource,
 };
 use crate::orchestrator::Orchestrator;
+use crate::pr_data::actions::{immutable_store_read, StoreView};
 use crate::storage::RowExt;
 
 use super::paging::RecordPage;
@@ -181,7 +182,7 @@ pub(super) async fn read_node_rebase_page(
     }))
 }
 
-pub(super) async fn read_node_rebase(
+pub(crate) async fn read_node_rebase(
     orch: &Orchestrator,
     project: &str,
     number: i32,
@@ -201,22 +202,29 @@ pub(super) async fn read_node_rebase(
     let Some(branch) = rows.branch.clone() else {
         return "This node has no branch, so it cannot have a rebase session.".to_string();
     };
+    // One pinned view of the store for the whole page, so every section
+    // describes the same operation and none can settle a split log.
+    let view = rebase_store_view(orch, &rows).await;
     // Read before anything else on the page: while the name is conflicted, no
     // replay can run, so everything below it describes a branch that cannot
     // move until this is settled.
     let name_section = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         recovery_fence_section(orch, &db, &rows, &branch).await,
-        catch_up_section(orch, &db, &rows, &branch).await,
+        catch_up_section(orch, &db, &rows, &view, &branch).await,
         own_origin_section(orch, &rows, &branch).await,
-        conflicted_name_section(orch, &rows, &branch).await
+        conflicted_name_section(&rows, &view, &branch).await,
+        acceptance_debt(orch, &db, &rows, &view, &branch).await
     );
+    // The owner's own request, whatever any session says: a held plain
+    // request has no session at all, and a closed request's reason outlives one.
+    let request_section = explicit_request_section(&db, &rows.job_id, &branch).await;
     let session = match load_active_session(&db, &branch).await {
         Ok(Some(session)) => session,
         Ok(None) => {
             return format!(
-                "{name_section}{}",
-                render_closed_session(orch, &db, &rows, &branch).await
+                "{name_section}{request_section}{}",
+                render_closed_session(orch, &db, &rows, &view, &branch).await
             )
         }
         Err(error) => return error,
@@ -224,15 +232,22 @@ pub(super) async fn read_node_rebase(
 
     let rendered = match request.view {
         RebaseView::Summary => {
-            let standing = load_live_standing(orch, &rows, &branch, &session).await;
-            let hold = inflight_run_batch_on_branch(&db, &rows.job_id, &branch).await;
+            let standing = load_live_standing(orch, &rows, &view, &branch, &session).await;
             render_summary(
-                orch, project, number, exec_seq, node_id, &session, &standing, &hold,
+                orch,
+                project,
+                number,
+                exec_seq,
+                node_id,
+                &session,
+                &standing,
+                &request_section,
+                &view,
             )
         }
-        RebaseView::Merged => {
-            render_merged(orch, project, number, exec_seq, node_id, &session, &request)
-        }
+        RebaseView::Merged => render_merged(
+            &view, project, number, exec_seq, node_id, &session, &request,
+        ),
         RebaseView::BaseOurs | RebaseView::BaseTheirs => {
             render_side(orch, project, number, exec_seq, node_id, &session, &request)
         }
@@ -241,6 +256,26 @@ pub(super) async fn read_node_rebase(
         return rendered;
     }
     format!("{name_section}{rendered}")
+}
+
+/// The branch's newest explicit replay request with the hold it is waiting
+/// on, or nothing when it has none.
+async fn explicit_request_section(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    branch: &str,
+) -> String {
+    match crate::orchestrator::conflict_session::latest_replay_request(db, job_id, branch).await {
+        Ok(Some(request)) => {
+            let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
+            render_request_section(&request, &hold)
+        }
+        Ok(None) => String::new(),
+        Err(error) => format!(
+            "\n## Your replay request\n\nYour latest replay request could not be read \
+             ({error}).\n\n"
+        ),
+    }
 }
 
 /// A durable recovery fence on this branch, first on the page: while it
@@ -275,6 +310,111 @@ async fn recovery_fence_section(
     }
 }
 
+/// Pure, so each state's wording is provable without a store.
+fn render_request_section(
+    request: &crate::orchestrator::conflict_session::LatestReplayRequest,
+    hold: &Result<Option<InflightRunBatch>, String>,
+) -> String {
+    use crate::orchestrator::conflict_session::ReplayRequestState;
+    let at = crate::clock::stamp(request.requested_at)
+        .map(|stamp| format!(", recorded {stamp}"))
+        .unwrap_or_default();
+    let accepted = format!(
+        "Request `{}`{at}, accepted at `{}` onto `{}` at `{}`,",
+        request.id,
+        request
+            .requested_tip
+            .as_deref()
+            .unwrap_or("an unrecorded tip"),
+        request.target_branch,
+        request.destination_commit
+    );
+    let again = "Request it again with `write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",\
+         payload:{action:\"replay\"}}]})` (add `resolution:\"take-committed-tip\"` if a session \
+         below names conflicting files).";
+    let body = match &request.state {
+        ReplayRequestState::Pending => match hold {
+            Ok(Some(batch)) => format!(
+                "{accepted} is **pending**: {} holds this branch, and the request is served on its \
+                 own when that batch completes, or at the orchestrator's next start. You do not \
+                 need to request it again.",
+                batch.describe()
+            ),
+            Ok(None) => format!(
+                "{accepted} is **pending**, and nothing holds this branch now. It is served at the \
+                 orchestrator's next start. {again}"
+            ),
+            Err(error) => format!(
+                "{accepted} is **pending**; whether a run batch still holds this branch could not \
+                 be read ({error})."
+            ),
+        },
+        ReplayRequestState::Superseded => format!(
+            "{accepted} was **superseded** by a newer request; nothing was replayed for it."
+        ),
+        ReplayRequestState::Served { pass, destination } => {
+            let (verdict, retry) =
+                match (pass.outcome_kind.as_deref(), pass.failure_kind.as_deref()) {
+                    (Some("rebased_clean"), _) => (format!("**landed** on `{destination}`"), false),
+                    (Some("silent"), _) => (
+                        format!("found the branch already carrying `{destination}`"),
+                        false,
+                    ),
+                    (Some("conflicted"), _) => (
+                        format!(
+                            "**still conflicts** with `{destination}`; the session below holds it"
+                        ),
+                        false,
+                    ),
+                    (_, Some(crate::jj::ROLLBACK_FAILED)) => (
+                        format!(
+                            "**failed** onto `{destination}`, and its rollback did NOT complete, \
+                             so the store may not be where the attempt found it. Do not publish \
+                             or force-push this branch; report the diagnostic below"
+                        ),
+                        false,
+                    ),
+                    (_, Some(crate::jj::RECONCILE_TIMEOUT)) => (
+                        format!(
+                            "**timed out** onto `{destination}`. Nothing retries an explicit \
+                             attempt on its own; inspect the phase and rollback diagnostic below \
+                             before requesting it again"
+                        ),
+                        true,
+                    ),
+                    (_, Some("not_attempted")) => {
+                        ("was **closed without replaying**".to_string(), true)
+                    }
+                    (_, Some("superseded")) => (
+                        "was **closed**: the branch moved past the tip it was accepted at"
+                            .to_string(),
+                        true,
+                    ),
+                    (_, Some(kind)) => (format!("ended **{kind}**"), true),
+                    (Some(kind), None) => (format!("ended **{kind}**"), true),
+                    (None, None) => ("ended without a recorded verdict".to_string(), true),
+                };
+            let diagnostic = pass
+                .diagnostic
+                .as_deref()
+                .map(|text| {
+                    format!(
+                        "\n\n> {}",
+                        text.trim().lines().collect::<Vec<_>>().join("\n> ")
+                    )
+                })
+                .unwrap_or_default();
+            let retry = if retry {
+                format!("\n\n{again}")
+            } else {
+                String::new()
+            };
+            format!("{accepted} {verdict}.{diagnostic}{retry}")
+        }
+    };
+    format!("\n## Your replay request\n\n{body}\n\n")
+}
+
 /// The page for a branch with no OPEN session.
 ///
 /// A bare "nothing to do here" is the right answer for a branch that never
@@ -294,6 +434,7 @@ async fn render_closed_session(
     orch: &Orchestrator,
     db: &crate::storage::LocalDb,
     rows: &NodeRebaseRows,
+    view: &StoreView,
     branch: &str,
 ) -> String {
     let job_id = rows.job_id.as_str();
@@ -302,7 +443,7 @@ async fn render_closed_session(
         Err(error) => return error,
     };
     let Some(session) = latest.filter(|session| !session.is_open()) else {
-        return render_no_session(orch, db, rows, branch).await;
+        return render_no_session(orch, db, rows, view, branch).await;
     };
 
     let closed_at = crate::clock::stamp(session.updated_at)
@@ -329,7 +470,7 @@ async fn render_closed_session(
     // this page gives a branch that never conflicted at all, so it is answered
     // the same way: from the store, and from what the reconcile record says
     // happened to that advance.
-    let standing = load_base_standing(orch, rows, branch).await;
+    let standing = load_base_standing(orch, rows, view, branch).await;
     let now = match &standing {
         Ok(standing) if !standing.carries_base => format!(
             "\n⚠️ **Since then, the base has moved again.** `{}` is now at `{}`, which this \
@@ -443,23 +584,23 @@ impl BaseStanding {
 async fn load_base_standing(
     orch: &Orchestrator,
     rows: &NodeRebaseRows,
+    view: &StoreView,
     branch: &str,
 ) -> Result<BaseStanding, String> {
-    let store = rows.store_path(orch).await?;
     let candidates = rows
         .candidates
         .as_ref()
         .map_err(|error| format!("This node's base branch could not be read: {error}"))?;
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let (jj, store) = view.pinned()?;
     let resolved =
-        resolve_base(&jj, &store, branch, candidates).map_err(|error| error.to_string())?;
-    let carries_base = crate::jj::branch_carries_commit(&jj, &store, branch, &resolved.commit);
+        resolve_base(jj, store, branch, candidates).map_err(|error| error.to_string())?;
+    let carries_base = crate::jj::branch_carries_commit(jj, store, branch, &resolved.commit);
     let origin_drift = match rows.project_id.as_deref() {
         Some(project_id) => {
             crate::orchestrator::base_branch_sync::known_drift(
                 orch,
                 project_id,
-                &store,
+                store,
                 &resolved.branch,
             )
             .await
@@ -484,9 +625,50 @@ pub(crate) async fn node_base_branch(
     rows: &NodeRebaseRows,
     branch: &str,
 ) -> Result<String, String> {
-    load_base_standing(orch, rows, branch)
+    let view = rebase_store_view(orch, rows).await;
+    load_base_standing(orch, rows, &view, branch)
         .await
         .map(|standing| standing.base_branch)
+}
+
+/// The branch's owed acceptance rows, rendered against the head the page's
+/// pinned view reads. The journal is a database read keyed by the store, so it
+/// still answers when the view cannot; only the head is then left unstated.
+async fn acceptance_debt(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    rows: &NodeRebaseRows,
+    view: &StoreView,
+    branch: &str,
+) -> String {
+    if matches!(view, StoreView::Absent) {
+        return String::new();
+    }
+    let store = match view.pinned() {
+        Ok((_, store)) => Ok(store.to_path_buf()),
+        Err(_) => rows.store_path(orch).await,
+    };
+    let debt = match (rows.project_id.as_deref(), store) {
+        (Some(project_id), Ok(store)) => {
+            crate::orchestrator::base_advance::preparation::outstanding_acceptances(
+                db, project_id, &store, branch,
+            )
+            .await
+        }
+        (None, _) => Err("this node's project could not be read".to_string()),
+        (_, Err(error)) => Err(error),
+    };
+    super::mutations::acceptance_debt_section(&debt, view.bookmark_commit(branch).as_deref())
+}
+
+/// The one pinned view of the branch store a `cairn:~/rebase` read describes.
+/// A split operation log, or a store that would not load, makes every live
+/// answer on the page unknown; nothing falls back to an unpinned read.
+async fn rebase_store_view(orch: &Orchestrator, rows: &NodeRebaseRows) -> StoreView {
+    match rows.local_repo_path(orch).await {
+        Ok(repo_path) => StoreView::capture(&orch.jj_binary_path, &orch.config_dir, &repo_path),
+        Err(error) => StoreView::Unknown(error),
+    }
 }
 
 /// Every row the rebase page and the `cairn:~/rebase` actions read about a
@@ -508,12 +690,10 @@ impl NodeRebaseRows {
         self.project_id.as_deref()
     }
 
-    /// Resolve after the row read releases its connection. Team repositories
-    /// belong to this machine's private overlay, not the synced creator path.
-    pub(crate) async fn store_path(
-        &self,
-        orch: &Orchestrator,
-    ) -> Result<std::path::PathBuf, String> {
+    /// The project's repository on this machine. Resolve after the row read
+    /// releases its connection. Team repositories belong to this machine's
+    /// private overlay, not the synced creator path.
+    async fn local_repo_path(&self, orch: &Orchestrator) -> Result<String, String> {
         let project_id = self
             .project_id
             .as_deref()
@@ -524,9 +704,17 @@ impl NodeRebaseRows {
                 .map_err(|error| {
                     format!("This node's local repository path could not be read: {error}")
                 })?;
-        let repo_path = repo_path.filter(|path| !path.trim().is_empty()).ok_or_else(|| {
+        repo_path.filter(|path| !path.trim().is_empty()).ok_or_else(|| {
             format!("Project `{key}` has no local repository path on this machine, so its branch store cannot be accessed. Register its local repository before requesting a replay or rebuild.")
-        })?;
+        })
+    }
+
+    /// The project's branch store, where this node's bookmark lives.
+    pub(crate) async fn store_path(
+        &self,
+        orch: &Orchestrator,
+    ) -> Result<std::path::PathBuf, String> {
+        let repo_path = self.local_repo_path(orch).await?;
         Ok(crate::jj::project_store_dir(
             &orch.config_dir,
             std::path::Path::new(&repo_path),
@@ -592,6 +780,7 @@ async fn catch_up_section(
     orch: &Orchestrator,
     db: &crate::storage::LocalDb,
     rows: &NodeRebaseRows,
+    view: &StoreView,
     branch: &str,
 ) -> String {
     let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch).await) else {
@@ -612,23 +801,13 @@ async fn catch_up_section(
         .ok()
         .flatten();
     let pending = match default_branch {
-        Some(default_branch) => {
-            let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-            let (read_store, read_mode) = (store.clone(), mode.clone());
-            tokio::task::spawn_blocking(move || {
-                let tip = crate::jj::bookmark_commit(&jj, &read_store, &default_branch)
-                    .ok_or_else(|| format!("`{default_branch}` does not resolve"))?;
-                crate::orchestrator::catch_up::unreviewed_base_paths(
-                    &jj,
-                    &read_store,
-                    &read_mode,
-                    &tip,
-                )
+        Some(default_branch) => view.pinned().and_then(|(jj, pinned_store)| {
+            let tip = view
+                .bookmark_commit(&default_branch)
+                .ok_or_else(|| format!("`{default_branch}` does not resolve"))?;
+            crate::orchestrator::catch_up::unreviewed_base_paths(jj, pinned_store, &mode, &tip)
                 .map(|paths| (tip, paths))
-            })
-            .await
-            .unwrap_or_else(|error| Err(error.to_string()))
-        }
+        }),
         None => Err("the default branch could not be read".to_string()),
     };
     let mut out = format!(
@@ -738,12 +917,17 @@ async fn load_advance_state(
     advance_state(&standing.destination, &pass, &hold)
 }
 
+/// How this branch is carried onto its base from here. Base advance is lazy:
+/// nothing replays a branch on a timer or when the base moves.
+const LAZY_ADVANCE: &str = "Base advance is lazy: nothing replays this branch until it needs its \
+     base, at its next commit, a requested check or `run branch:` capture, a merge, or an explicit \
+     replay request on this page.";
+
 /// The advance's state in words, from the reconcile record and the live hold.
 ///
-/// "Deferred or never ran" was two incompatible readings offered as one, while
-/// the record knew which: a deferral writes its row, names the batch that held
-/// it, and stays queued for the sweep. So each state the record can be in is
-/// said as itself, and one it cannot vouch for is said to be unknown.
+/// Each state the record can be in is said as itself, and one it cannot vouch
+/// for is said to be unknown. A record written by the retired base-advance
+/// queue is history: nothing retries or resumes it.
 fn advance_state(
     destination: &str,
     pass: &Result<Option<ReplayPass>, String>,
@@ -751,8 +935,8 @@ fn advance_state(
 ) -> String {
     let held_now = match hold {
         Ok(Some(batch)) => format!(
-            " A {} is in flight on this branch now, so an automatic pass that reaches the branch \
-             before it ends will defer at the mutation boundary.",
+            " A {} is in flight on this branch now, and nothing moves the branch under it until \
+             that batch ends.",
             batch.describe()
         ),
         Ok(None) => String::new(),
@@ -770,7 +954,7 @@ fn advance_state(
         Ok(None) => {
             return format!(
                 "**Never ran.** No base-advance pass has reached this branch at `{destination}`: \
-                 none deferred it and none attempted it.{held_now}"
+                 none deferred it and none attempted it. {LAZY_ADVANCE}{held_now}"
             )
         }
         Ok(Some(pass)) => pass,
@@ -790,13 +974,13 @@ fn advance_state(
         .is_some_and(crate::jj::reconcile_failure_is_ref_lock);
     match (intent, pass.outcome_kind.as_deref()) {
         (Some("running"), _) => format!(
-            "**Running.** A base-advance pass onto `{destination}` is running now, under the store \
-             lock.{held_now}"
+            "**Unfinished.** A pass onto `{destination}` was recorded running by the retired \
+             base-advance queue and never finished; nothing resumes it. {LAZY_ADVANCE}{held_now}"
         ),
         (Some("pending"), _) if ref_lock => format!(
-            "**Retrying.** The last pass onto `{destination}`{at} could not take the ref store's \
-             lock. That is the machine's shared Git ref store, not your branch; the reconcile \
-             worker retries it automatically.{quoted}"
+            "**Did not complete.** The last pass onto `{destination}`{at} could not take the ref \
+             store's lock. That is the machine's shared Git ref store, not your branch, and \
+             nothing retries that pass.{quoted}{LAZY_ADVANCE}"
         ),
         (Some("pending"), Some("deferred")) => format!(
             "**Deferred.** A base-advance pass onto `{destination}` reached this branch{at} and \
@@ -806,13 +990,12 @@ fn advance_state(
         ),
         (_, Some("failed")) => format!(
             "**Attempted and failed** ({}){at}. The diagnostic says what the pass changed.\
-             {quoted}A transient failure is retried automatically; one that needs you also \
-             arrives as a message.",
+             {quoted}Nothing retries it. {LAZY_ADVANCE}",
             pass.failure_kind.as_deref().unwrap_or("unknown")
         ),
         (Some("pending"), None) => format!(
-            "**Queued.** A pass onto `{destination}` is queued for the durable reconcile worker \
-             and has not reached this branch yet.{held_now}"
+            "**Never reached.** A pass onto `{destination}` was queued by the retired base-advance \
+             queue and never reached this branch; nothing will run it. {LAZY_ADVANCE}{held_now}"
         ),
         (intent, outcome) => format!(
             "**Unknown.** The last pass onto `{destination}` recorded `{}`{at}, and its reconcile \
@@ -828,22 +1011,14 @@ fn advance_state(
 /// nothing when it is not. Reads only: the page never settles the name, it
 /// says whether the next replay or branch read will, and when not, why and
 /// with which commands a maintainer can.
-async fn conflicted_name_section(
-    orch: &Orchestrator,
-    rows: &NodeRebaseRows,
-    branch: &str,
-) -> String {
-    let Ok(store) = rows.store_path(orch).await else {
+async fn conflicted_name_section(rows: &NodeRebaseRows, view: &StoreView, branch: &str) -> String {
+    let Ok((jj, store)) = view.pinned() else {
         return String::new();
     };
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    if !crate::jj::is_jj_dir(&store) {
-        return String::new();
-    }
     // The base names the column that says which version sits on the newer
     // base; without it the table still renders, just without that column.
     let base_branch = match rows.candidates.as_ref() {
-        Ok(candidates) => match resolve_base(&jj, &store, branch, candidates) {
+        Ok(candidates) => match resolve_base(jj, store, branch, candidates) {
             Ok(resolved) => Some(resolved.branch),
             Err(_) => candidates
                 .recorded
@@ -852,7 +1027,7 @@ async fn conflicted_name_section(
         },
         Err(_) => None,
     };
-    match crate::jj::assess_conflicted_bookmark_name(&jj, &store, branch, base_branch.as_deref()) {
+    match crate::jj::assess_conflicted_bookmark_name(jj, store, branch, base_branch.as_deref()) {
         Ok(Some(assessment)) => render_conflicted_name(&assessment),
         Ok(None) => String::new(),
         Err(error) => {
@@ -959,27 +1134,27 @@ struct LiveStanding {
 async fn load_live_standing(
     orch: &Orchestrator,
     rows: &NodeRebaseRows,
+    view: &StoreView,
     branch: &str,
     session: &ConflictSession,
 ) -> Result<LiveStanding, String> {
-    let base = load_base_standing(orch, rows, branch).await?;
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = std::path::PathBuf::from(&session.store_path);
-    let tip = crate::jj::bookmark_commit(&jj, &store, branch);
+    let base = load_base_standing(orch, rows, view, branch).await?;
+    let (jj, store) = view.pinned()?;
+    let tip = view.bookmark_commit(branch);
     let fork_point = tip.as_deref().and_then(|tip| {
         crate::jj::revset_commit(
-            &jj,
-            &store,
+            jj,
+            store,
             &format!("heads(::{tip} & ::{})", base.destination),
         )
     });
     let ours_in_ancestry = session
         .ours
         .as_deref()
-        .map(|ours| crate::jj::branch_carries_commit(&jj, &store, branch, ours));
+        .map(|ours| crate::jj::branch_carries_commit(jj, store, branch, ours));
     let basis = tip
         .as_deref()
-        .and_then(|tip| session.resolution_basis_at(&jj, &store, tip).ok())
+        .and_then(|tip| session.resolution_basis_at(jj, store, tip).ok())
         .unwrap_or_else(|| session.resolution_basis.clone());
     let mut resolved_against: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut attested = Vec::new();
@@ -1075,10 +1250,11 @@ async fn render_no_session(
     orch: &Orchestrator,
     db: &crate::storage::LocalDb,
     rows: &NodeRebaseRows,
+    view: &StoreView,
     branch: &str,
 ) -> String {
     let job_id = rows.job_id.as_str();
-    let standing = match load_base_standing(orch, rows, branch).await {
+    let standing = match load_base_standing(orch, rows, view, branch).await {
         Ok(standing) => standing,
         Err(why) => {
             return format!(
@@ -1232,7 +1408,8 @@ fn render_summary(
     node_id: &str,
     session: &ConflictSession,
     standing: &Result<LiveStanding, String>,
-    hold: &Result<Option<InflightRunBatch>, String>,
+    request_section: &str,
+    view: &StoreView,
 ) -> String {
     let base = format!("cairn://p/{project}/{number}/{exec_seq}/{node_id}/rebase");
     let conflicting: Vec<&SessionFile> = session.conflicting().collect();
@@ -1252,8 +1429,24 @@ fn render_summary(
         )
     };
 
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = std::path::PathBuf::from(&session.store_path);
+    // The session's three coordinates are exact commits, read through a pin
+    // that indexes them; what depends on the live tip comes from the page's one
+    // view, and says so when that view cannot answer.
+    let session_store = std::path::PathBuf::from(&session.store_path);
+    let coordinates: Vec<&str> = [
+        session.base.as_deref(),
+        session.ours.as_deref(),
+        session.theirs.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let exact = immutable_store_read(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+        &session_store,
+        &coordinates,
+    );
 
     let (condition, replay_payload) = if session.is_base_drift() {
         (
@@ -1274,7 +1467,13 @@ fn render_summary(
                  sides of each file, write it so it holds both sides' changes and parses (after two \
                  appends to one list, usually: one closing bracket, every entry inside it), commit \
                  it on your branch, then request the replay below.",
-                unparseable_failures(&jj, &store, session)
+                match &exact {
+                    Ok(jj) => unparseable_failures(jj, &session_store, session),
+                    Err(error) => format!(
+                        " The parser's errors could not be recomputed ({error}); read the merged \
+                         view of each conflicting file."
+                    ),
+                }
             ),
             "action:\"replay\",resolution:\"take-committed-tip\"",
         )
@@ -1299,11 +1498,24 @@ fn render_summary(
     // since, does that commit already contain both sides, and would the
     // whole-file restore drop anything. Computed once so the sections below can
     // never disagree with each other or with the guard on the replay itself.
-    let assessment = assess_session_tip(&jj, &store, session);
+    let (assessment, assessment_unknown) = match view.pinned() {
+        Ok((jj, store)) => (assess_session_tip(jj, store, session), String::new()),
+        Err(reason) => (
+            None,
+            format!(
+                "\n## Resolution assessment\n\nUnavailable: {reason}. Whether your committed tip \
+                 resolves this conflict is unknown, not settled; read this page again shortly.\n"
+            ),
+        ),
+    };
+    let resolution = format!(
+        "{assessment_unknown}{}",
+        resolution_section(assessment.as_ref(), &base)
+    );
 
     format!(
-        "# Rebase session for `{branch}`\n{version_note}\n{incoming}, and the automatic replay of your branch \
-         onto it recorded a conflict and did not land the new base. Your branch remains on its \
+        "# Rebase session for `{branch}`\n{version_note}\n{incoming}, and preparing your branch onto it \
+         recorded a conflict and did not land the new base. Your branch remains on its \
          pre-advance content, but replay machinery may rewrite its store commit identity; the \
          coordinates below are current.\n\n{condition}\n{status}\n{markers}\n{standing}\n## Three-way \
          coordinates\n\n{coords}\nThese are immutable commits. Read any file as of either side \
@@ -1320,12 +1532,15 @@ fn render_summary(
         branch = session.bookmark,
         incoming = incoming_line(session),
         markers = marker_line(session),
-        status = status_line(session, hold),
+        status = request_section,
         standing = standing_section(session, standing),
         coords = coordinates_block(session),
-        resolution_section = resolution_section(assessment.as_ref(), &base),
+        resolution_section = resolution,
         dropped_section = dropped_work_section(assessment.as_ref(), &base),
-        collision_section = collision_section(&jj, &store, session),
+        collision_section = exact
+            .as_ref()
+            .map(|jj| collision_section(jj, &session_store, session))
+            .unwrap_or_default(),
         conflicting_table = file_table("Conflicting files, yours to merge", &conflicting),
         clean_table = file_table(
             "Also arriving with this change, cleanly on replay",
@@ -1414,7 +1629,7 @@ const MERGED_MARKER_WARNING: &str = "⚠️ The text below contains literal conf
 /// committed tip) plus the diff from the tip to it answers the more useful
 /// question: what does my resolution still not include.
 fn render_merged(
-    orch: &Orchestrator,
+    store_view: &StoreView,
     project: &str,
     number: i32,
     exec_seq: i32,
@@ -1440,20 +1655,31 @@ fn render_merged(
         );
     }
 
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = std::path::PathBuf::from(&session.store_path);
     // The LIVE tip, not the session's frozen `ours`: a resolution the agent has
-    // already committed is exactly what this view needs to account for.
-    let ours_rev = crate::jj::bookmark_commit(&jj, &store, &session.bookmark)
+    // already committed is exactly what this view needs to account for. A store
+    // the page could not pin has no live tip to offer, and nothing is
+    // substituted for it.
+    let (jj, store) = match store_view.pinned() {
+        Ok(pinned) => pinned,
+        Err(reason) => {
+            return format!(
+                "# Merged view\n\nUnavailable: {reason}. This view merges against your branch's \
+                 live tip, which cannot be read right now without changing the store; nothing \
+                 has been substituted for it. Read `{uri}?view=merged` again shortly."
+            )
+        }
+    };
+    let ours_rev = store_view
+        .bookmark_commit(&session.bookmark)
         .unwrap_or_else(|| session.ours.clone().unwrap_or_default());
     let tip_moved = session.ours.as_deref() != Some(ours_rev.as_str());
 
     let view = match request.file {
         Some(file) => render_merged_file(
-            &jj, &store, base_rev, &ours_rev, theirs_rev, file, tip_moved, request, &uri,
+            jj, store, base_rev, &ours_rev, theirs_rev, file, tip_moved, request, &uri,
         ),
         None => render_merged_overview(
-            &jj, &store, base_rev, &ours_rev, theirs_rev, session, tip_moved, &uri,
+            jj, store, base_rev, &ours_rev, theirs_rev, session, tip_moved, &uri,
         ),
     };
     if session.is_unparseable() {
@@ -1926,116 +2152,6 @@ fn render_collisions(collisions: &[NumberCollision], bound: &BTreeSet<String>) -
     out
 }
 
-/// Whether a replay is outstanding, and how far it has got.
-///
-/// Omitted when nothing has been requested: the Next action block below already
-/// says what to do, and a line saying "no replay requested" would be noise on
-/// every read of the ordinary case.
-fn status_line(
-    session: &ConflictSession,
-    hold: &Result<Option<InflightRunBatch>, String>,
-) -> String {
-    let Some(progress) = session.replay_progress() else {
-        return String::new();
-    };
-    let requested = crate::clock::stamp(progress.requested_at)
-        .map(|stamp| format!(", requested {stamp}"))
-        .unwrap_or_default();
-    let destination = progress.destination.as_str();
-    let when = |at: i64| {
-        crate::clock::stamp(at)
-            .map(|stamp| format!(" at {stamp}"))
-            .unwrap_or_default()
-    };
-    match progress.state {
-        ReplayState::Retrying { diagnosis, at } => format!(
-            "\n**Status:** replay onto `{destination}`{requested} is RETRYING. Its last \
-             attempt{} could not take the ref store's lock: {diagnosis}. That is the machine's \
-             shared Git ref store, not your branch — nothing needs repair, and the reconcile \
-             worker retries it automatically. Re-requesting does not make it sooner.\n",
-            when(at)
-        ),
-        // A failure says nothing about where the branch now stands: a clean
-        // rebase may have landed before its publication failed. Only the
-        // diagnostic does, so it is quoted rather than summarized.
-        ReplayState::Failed {
-            kind,
-            diagnostic,
-            at,
-        } => {
-            let quoted = diagnostic
-                .as_deref()
-                .map(|text| format!("\n\n```\n{}\n```\n", text.trim()))
-                .unwrap_or_default();
-            if kind == crate::jj::ROLLBACK_FAILED {
-                format!(
-                    "\n**Status:** replay onto `{destination}`{requested} FAILED{} and its \
-                     rollback did NOT complete, so the store may not be where the pass found it. \
-                     Do not publish or force-push this branch; report the diagnostic below.{quoted}",
-                    when(at)
-                )
-            } else if diagnostic
-                .as_deref()
-                .is_some_and(|text| text.contains("No automatic cooldown was recorded."))
-            {
-                format!(
-                    "\n**Status:** explicit replay onto `{destination}`{requested} TIMED OUT{}. \
-                     No automatic cooldown was recorded. Inspect the phase and rollback diagnostic \
-                     below before requesting it again; the explicit attempt is not retried automatically.{quoted}",
-                    when(at)
-                )
-            } else {
-                format!(
-                    "\n**Status:** replay onto `{destination}`{requested} was attempted{} and \
-                     FAILED ({kind}); the diagnostic below says what the pass changed.{quoted} A \
-                     transient failure is retried automatically; one that needs you also arrives \
-                     as a message.\n",
-                    when(at)
-                )
-            }
-        }
-        ReplayState::Deferred { diagnostic, at } => {
-            let recorded = diagnostic
-                .as_deref()
-                .map(|text| format!(" It recorded:\n\n> {}\n\n", text.trim()))
-                .unwrap_or_else(|| " ".to_string());
-            format!(
-                "\n**Status:** replay onto `{destination}`{requested} is DEFERRED. Its last pass{} \
-                 stopped at the mutation boundary and attempted nothing.{recorded}{}\n",
-                when(at),
-                mutation_boundary_hold(hold)
-            )
-        }
-        ReplayState::Processed { outcome, at } => format!(
-            "\n**Status:** replay onto `{destination}`{requested} was processed: {} {}. If this \
-             page has not caught up with that pass, re-read it.\n",
-            outcome.replace('_', " "),
-            when(at).trim_start()
-        ),
-        ReplayState::NotProcessed { intent_status } => format!(
-            "\n**Status:** a replay was requested onto `{destination}`{requested}, but no pass \
-             has processed it and none is queued to (its reconcile work is {intent_status}). \
-             Request the replay again.\n"
-        ),
-        ReplayState::Running => format!(
-            "\n**Status:** replay IN PROGRESS onto `{destination}`{requested}. It runs under the \
-             store lock; nothing runs in your slot.\n"
-        ),
-        ReplayState::Queued => format!(
-            "\n**Status:** replay QUEUED onto `{destination}`{requested}. The durable reconcile \
-             worker picks it up; nothing runs in your slot, and re-requesting does not make it \
-             sooner.\n"
-        ),
-        ReplayState::Superseded => format!(
-            "\n**Status:** a replay was requested onto `{destination}`{requested}, but the \
-             reconcile work this session was recorded under has since been SUPERSEDED by a newer \
-             base, so this line no longer tracks that request. Its outcome is either a fresh \
-             session on this page or a published branch; if neither has appeared, request the \
-             replay again.\n"
-        ),
-    }
-}
-
 /// Whether the branch's committed tip has already absorbed both sides.
 ///
 /// The reviewer's case: a file that already contains both changes, a node diff
@@ -2194,19 +2310,22 @@ fn render_side(
         );
     };
 
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    // Both ends are exact commits: read through a pin that indexes them.
     let store = std::path::PathBuf::from(&session.store_path);
-    let patch = match crate::jj::merge_side_patch(&jj, &store, from, to, request.file) {
-        Ok(patch) => patch,
-        Err(error) => {
-            return format!(
+    let patch =
+        match immutable_store_read(&orch.jj_binary_path, &orch.config_dir, &store, &[from, to])
+            .and_then(|jj| crate::jj::merge_side_patch(&jj, &store, from, to, request.file))
+        {
+            Ok(patch) => patch,
+            Err(error) => {
+                return format!(
                 "# {label}\n\nThis side is unavailable: {error}\n\nThe conflict's identity and \
                  complete file inventory are still recorded — read `{uri}` for them. This read \
                  deliberately does NOT fall back to your current tree: that describes a different \
                  range and would answer a question you did not ask."
             );
-        }
-    };
+            }
+        };
 
     let lines: Vec<&str> = patch.lines().collect();
     let total = lines.len();
@@ -2401,13 +2520,10 @@ mod tests {
             resolution_state: Some("open".to_string()),
             updated_at: 0,
             replay_requested_at: None,
-            item_status: None,
-            intent_status: None,
             files: Vec::new(),
             resolution_basis: Default::default(),
             replay_requested_tip: None,
             replay_requested_destination: None,
-            replay_pass: None,
         }
     }
 
@@ -2474,152 +2590,6 @@ mod tests {
         );
     }
 
-    /// A replay whose last pass lost the ref-store lock says so, names the
-    /// lock's state, and tells the agent there is nothing to repair; one no
-    /// pass will process says to ask again instead of claiming to be queued.
-    #[test]
-    fn the_status_line_reports_the_last_pass_instead_of_queued() {
-        let mut session = recorded_session();
-        session.replay_requested_at = Some(100);
-        session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
-            item_status: Some("pending".to_string()),
-            intent_status: Some("pending".to_string()),
-            outcome_kind: Some("failed".to_string()),
-            failure_kind: Some(crate::jj::REF_LOCK_CONTENTION.to_string()),
-            diagnostic: Some(
-                "jj rebase failed: The lock for the packed-ref file could not be obtained\n\
-                 packed-refs lock: contention — held by live process 77 (git) after 30s"
-                    .to_string(),
-            ),
-            updated_at: 130,
-        });
-        let line = status_line(&session, &Ok(None));
-        assert!(line.contains("RETRYING"), "{line}");
-        assert!(
-            line.contains("held by live process 77 (git)"),
-            "names the lock's state: {line}"
-        );
-        assert!(line.contains("nothing needs repair"), "{line}");
-        assert!(!line.contains("QUEUED"), "{line}");
-
-        session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
-            intent_status: Some("completed".to_string()),
-            updated_at: 50,
-            ..Default::default()
-        });
-        let line = status_line(&session, &Ok(None));
-        assert!(line.contains("no pass has processed it"), "{line}");
-        assert!(line.contains("Request the replay again"), "{line}");
-        assert!(!line.contains("QUEUED"), "{line}");
-    }
-
-    /// A failure never promises an unchanged branch: a publication can fail
-    /// after its rebase landed. And a failure whose rollback did not complete
-    /// — even one caused by a lost lock — is a warning, never a quiet retry.
-    #[test]
-    fn a_failed_pass_claims_nothing_about_the_branch_and_an_incomplete_rollback_warns() {
-        let failed = |kind: &str, diagnostic: &str| {
-            let mut session = recorded_session();
-            session.replay_requested_at = Some(100);
-            session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
-                item_status: Some("pending".to_string()),
-                intent_status: Some("pending".to_string()),
-                outcome_kind: Some("failed".to_string()),
-                failure_kind: Some(kind.to_string()),
-                diagnostic: Some(diagnostic.to_string()),
-                updated_at: 130,
-            });
-            status_line(&session, &Ok(None))
-        };
-        let push = failed(
-            "transient_process",
-            "origin push failed: connection reset. GitHub still holds the previous branch head",
-        );
-        assert!(push.contains("FAILED (transient_process)"), "{push}");
-        assert!(
-            !push.contains("unchanged"),
-            "a published rebase may have landed: {push}"
-        );
-        assert!(
-            push.contains("origin push failed"),
-            "the diagnostic is quoted: {push}"
-        );
-
-        let unsafe_rollback = failed(
-            crate::jj::ROLLBACK_FAILED,
-            "jj rebase moved the bookmark, and exporting it failed: The lock for the packed-ref \
-             file could not be obtained\nrollback incomplete: rolling the rebase back also failed",
-        );
-        assert!(
-            unsafe_rollback.contains("rollback did NOT complete"),
-            "{unsafe_rollback}"
-        );
-        assert!(
-            unsafe_rollback.contains("Do not publish"),
-            "{unsafe_rollback}"
-        );
-        assert!(!unsafe_rollback.contains("RETRYING"), "{unsafe_rollback}");
-        assert!(
-            !unsafe_rollback.contains("nothing needs repair"),
-            "{unsafe_rollback}"
-        );
-    }
-
-    #[test]
-    fn explicit_replay_timeout_shows_phases_without_promising_an_automatic_retry() {
-        let mut session = recorded_session();
-        session.replay_requested_at = Some(100);
-        session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
-            item_status: Some("pending".into()),
-            intent_status: Some("completed".into()),
-            outcome_kind: Some("failed".into()),
-            failure_kind: Some("reconcile_timeout".into()),
-            diagnostic: Some(
-                "jj restore (ancestry heal) timed out: operation budget exhausted before spawning; remaining 18ms, minimum 100ms. \
-                 The rebase was rolled back, so the branch is unchanged.\n\
-                 Explicit replay timed out under its cumulative forward budget. No automatic cooldown was recorded. \
-                 A new explicit request may run immediately.\n\
-                 Store-lock phases: plan resolution carry 1.4s, rebase and export 9.9s; jj op restore [cleanup] 100ms"
-                    .into(),
-            ),
-            updated_at: 130,
-        });
-        let line = status_line(&session, &Ok(None));
-        for expected in [
-            "explicit replay",
-            "TIMED OUT",
-            "No automatic cooldown",
-            "not retried automatically",
-            "ancestry heal",
-            "remaining 18ms",
-            "plan resolution carry 1.4s",
-            "jj op restore [cleanup]",
-            "rebase was rolled back",
-            "may run immediately",
-        ] {
-            assert!(line.contains(expected), "{expected}: {line}");
-        }
-        assert!(
-            !line.contains("A transient failure is retried automatically"),
-            "{line}"
-        );
-
-        let pass = session.replay_pass.as_mut().unwrap();
-        pass.failure_kind = Some(crate::jj::ROLLBACK_FAILED.into());
-        pass.diagnostic = Some("jj restore timed out: operation budget exhausted; rollback incomplete. \
-            No automatic cooldown was recorded. Do not publish this branch; recover the store before retrying.".into());
-        let unsafe_line = status_line(&session, &Ok(None));
-        assert!(
-            unsafe_line.contains("rollback did NOT complete"),
-            "{unsafe_line}"
-        );
-        assert!(unsafe_line.contains("Do not publish"), "{unsafe_line}");
-        assert!(
-            !unsafe_line.contains("may run immediately"),
-            "{unsafe_line}"
-        );
-    }
-
     fn deferred_pass() -> crate::orchestrator::conflict_session::ReplayPass {
         crate::orchestrator::conflict_session::ReplayPass {
             item_status: Some("pending".to_string()),
@@ -2656,7 +2626,7 @@ mod tests {
             deferred.contains("run batch `ba0e0085` (\"rust-tests on main\")")
                 && deferred.contains("on cairn://p/cairn/5069/1/builder")
                 && deferred.contains("finishes or is stopped")
-                && deferred.contains("durable sweep"),
+                && deferred.contains("next commit, requested check or run, or merge"),
             "names the holding batch and what ends the hold: {deferred}"
         );
         assert!(!deferred.contains("never ran"), "{deferred}");
@@ -2665,7 +2635,7 @@ mod tests {
         assert!(
             released.contains("**Deferred.**")
                 && released.contains("nothing holds the boundary any more"),
-            "a hold whose batch has ended says the sweep takes it from here: {released}"
+            "a hold whose batch has ended says what carries the branch from here: {released}"
         );
 
         let never = advance_state("279ddbcf", &Ok(None), &Ok(None));
@@ -2689,20 +2659,189 @@ mod tests {
         assert!(contradictory.contains("**Unknown.**"), "{contradictory}");
     }
 
-    /// A replay request whose pass deferred reads DEFERRED with the batch, not
-    /// QUEUED, which read as imminent while the branch could not move.
+    fn latest(
+        state: crate::orchestrator::conflict_session::ReplayRequestState,
+    ) -> crate::orchestrator::conflict_session::LatestReplayRequest {
+        crate::orchestrator::conflict_session::LatestReplayRequest {
+            id: "req-1".into(),
+            requested_at: 100,
+            requested_tip: Some("c9bcf33c".into()),
+            target_branch: "main".into(),
+            destination_commit: "a337fa4d".into(),
+            state,
+        }
+    }
+
+    /// A plain request a run batch held has no session at all, so the request
+    /// section alone shows it: its id, the tip and base it was accepted at, the
+    /// batch that holds it, and that it is served when that batch completes.
     #[test]
-    fn a_deferred_replay_request_names_the_batch_instead_of_reading_queued() {
-        let mut session = recorded_session();
-        session.replay_requested_at = Some(100);
-        session.replay_pass = Some(deferred_pass());
-        let line = status_line(&session, &held());
-        assert!(line.contains("DEFERRED"), "{line}");
-        assert!(!line.contains("QUEUED"), "{line}");
+    fn a_held_request_names_its_coordinate_and_the_batch_that_serves_it() {
+        use crate::orchestrator::conflict_session::ReplayRequestState;
+        let held_now = render_request_section(&latest(ReplayRequestState::Pending), &held());
         assert!(
-            line.contains("run batch `ba0e0085`") && line.contains("finishes or is stopped"),
-            "{line}"
+            held_now.contains("`req-1`")
+                && held_now.contains("accepted at `c9bcf33c` onto `main` at `a337fa4d`")
+                && held_now.contains("**pending**")
+                && held_now.contains("run batch `ba0e0085`")
+                && held_now.contains("when that batch completes")
+                && held_now.contains("do not need to request it again"),
+            "{held_now}"
         );
+        assert!(!held_now.contains("automatic"), "{held_now}");
+
+        let released = render_request_section(&latest(ReplayRequestState::Pending), &Ok(None));
+        assert!(
+            released.contains("nothing holds this branch now")
+                && released.contains("Request it again"),
+            "{released}"
+        );
+    }
+
+    /// A request served after its hold released shows the frozen verdict onto
+    /// the base it ran against, which may be newer than the one it was
+    /// accepted at; a closed one shows its reason and how to ask again.
+    #[test]
+    fn a_served_or_closed_request_shows_its_frozen_verdict_and_reason() {
+        use crate::orchestrator::conflict_session::{ReplayPass, ReplayRequestState};
+        let landed = render_request_section(
+            &latest(ReplayRequestState::Served {
+                pass: ReplayPass {
+                    outcome_kind: Some("rebased_clean".into()),
+                    ..ReplayPass::default()
+                },
+                destination: "b5461a3b".into(),
+            }),
+            &Ok(None),
+        );
+        assert!(
+            landed.contains("**landed** on `b5461a3b`") && !landed.contains("Request it again"),
+            "{landed}"
+        );
+
+        let closed = render_request_section(
+            &latest(ReplayRequestState::Served {
+                pass: ReplayPass {
+                    failure_kind: Some("not_attempted".into()),
+                    diagnostic: Some(
+                        "`agent/test` stayed reserved by a landing\nno cooldown was recorded"
+                            .into(),
+                    ),
+                    ..ReplayPass::default()
+                },
+                destination: "a337fa4d".into(),
+            }),
+            &Ok(None),
+        );
+        assert!(
+            closed.contains("**closed without replaying**")
+                && closed.contains("> `agent/test` stayed reserved by a landing")
+                && closed.contains("> no cooldown was recorded")
+                && closed.contains("Request it again"),
+            "{closed}"
+        );
+
+        let superseded = render_request_section(&latest(ReplayRequestState::Superseded), &Ok(None));
+        assert!(
+            superseded.contains("**superseded** by a newer request"),
+            "{superseded}"
+        );
+    }
+
+    /// An explicit attempt that timed out quotes its phases and promises no
+    /// automatic retry; one whose rollback did not complete says not to publish
+    /// and offers no retry at all.
+    #[test]
+    fn a_timed_out_or_unrolled_back_request_says_what_to_do_before_asking_again() {
+        use crate::orchestrator::conflict_session::{ReplayPass, ReplayRequestState};
+        let served = |failure_kind: &str, diagnostic: &str| {
+            latest(ReplayRequestState::Served {
+                pass: ReplayPass {
+                    item_status: Some("pending".into()),
+                    intent_status: Some("completed".into()),
+                    outcome_kind: Some("failed".into()),
+                    failure_kind: Some(failure_kind.into()),
+                    diagnostic: Some(diagnostic.into()),
+                    updated_at: 130,
+                },
+                destination: "b5461a3b".into(),
+            })
+        };
+        let timed_out = render_request_section(
+            &served(
+                crate::jj::RECONCILE_TIMEOUT,
+                "jj restore (ancestry heal) timed out: operation budget exhausted before spawning; \
+                 remaining 18ms, minimum 100ms. The rebase was rolled back, so the branch is \
+                 unchanged.\nExplicit replay timed out under its cumulative forward budget. No \
+                 automatic cooldown was recorded. A new explicit request may run immediately.\n\
+                 Store-lock phases: plan resolution carry 1.4s, rebase and export 9.9s; jj op \
+                 restore [cleanup] 100ms",
+            ),
+            &Ok(None),
+        );
+        for expected in [
+            "**timed out** onto `b5461a3b`",
+            "Nothing retries an explicit attempt on its own",
+            "> jj restore (ancestry heal) timed out",
+            "remaining 18ms",
+            "> Store-lock phases: plan resolution carry 1.4s",
+            "jj op restore [cleanup]",
+            "rebase was rolled back",
+            "may run immediately",
+            "Request it again",
+        ] {
+            assert!(timed_out.contains(expected), "{expected}: {timed_out}");
+        }
+        assert!(!timed_out.contains("retried automatically"), "{timed_out}");
+
+        let unsafe_line = render_request_section(
+            &served(
+                crate::jj::ROLLBACK_FAILED,
+                "jj restore timed out: operation budget exhausted; rollback incomplete. No \
+                 automatic cooldown was recorded. Do not publish this branch; recover the store \
+                 before retrying.",
+            ),
+            &Ok(None),
+        );
+        assert!(
+            unsafe_line.contains("rollback did NOT complete")
+                && unsafe_line.contains("Do not publish or force-push this branch"),
+            "{unsafe_line}"
+        );
+        assert!(!unsafe_line.contains("Request it again"), "{unsafe_line}");
+        assert!(
+            !unsafe_line.contains("may run immediately"),
+            "{unsafe_line}"
+        );
+    }
+
+    /// A record left by the retired base-advance queue never promises a pass
+    /// that will retry or pick it up; it names the lazy boundaries instead.
+    #[test]
+    fn a_legacy_pass_record_promises_no_automatic_retry() {
+        let mut queued = deferred_pass();
+        queued.outcome_kind = None;
+        for pass in [
+            queued,
+            crate::orchestrator::conflict_session::ReplayPass {
+                intent_status: Some("pending".into()),
+                outcome_kind: Some("failed".into()),
+                failure_kind: Some("transient_process".into()),
+                ..Default::default()
+            },
+            crate::orchestrator::conflict_session::ReplayPass {
+                intent_status: Some("running".into()),
+                ..Default::default()
+            },
+        ] {
+            let said = advance_state("279ddbcf", &Ok(Some(pass)), &Ok(None));
+            assert!(
+                !said.contains("automatically")
+                    && !said.contains("reconcile worker")
+                    && said.contains("next commit"),
+                "{said}"
+            );
+        }
     }
 
     fn params(pairs: &[(&str, &str)]) -> Vec<QueryParam> {

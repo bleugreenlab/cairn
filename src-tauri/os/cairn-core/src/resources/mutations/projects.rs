@@ -18,7 +18,8 @@ use crate::config::project_settings::{
 use crate::credentials::AccountOverrides;
 use crate::mcp::types::{ChangeItem, ChangeMode};
 use crate::models::{CreateProject, TerminalCommand};
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{JjStoreGuard, Orchestrator};
+use crate::projects::default_branch::{write_project_settings, ConfigDefault, DefaultBranchChange};
 use crate::projects::{crud, remote};
 use crate::references::ProjectReference;
 use crate::services::RealClock;
@@ -199,6 +200,23 @@ fn project_create_team_id(payload: &Value) -> Option<String> {
     opt_trimmed(payload, &["teamId", "team_id"])
 }
 
+/// A create's explicit default must agree with the repository's declared one:
+/// the config's `defaultBranch` is the effective default, and the row mirrors it
+/// from creation. Refused before the route, the row, or any file is written.
+fn refuse_default_contradicting_config(repo_path: &Path, requested: &str) -> Result<(), String> {
+    let effective =
+        crate::config::project_settings::effective_default_branch(Some(repo_path), Some(requested));
+    if effective == requested {
+        return Ok(());
+    }
+    Err(format!(
+        "{} declares defaultBranch `{effective}`, which wins over the requested `{requested}`; \
+         omit defaultBranch, pass `{effective}`, or change the declaration in the config file \
+         first. No project was created.",
+        crate::config::project_settings::get_project_config_path(repo_path).display()
+    ))
+}
+
 pub(super) async fn apply_projects_create(
     orch: &Orchestrator,
     payload: &Value,
@@ -222,6 +240,9 @@ pub(super) async fn apply_projects_create(
     // Route to a team's shared database when the payload carries a team id;
     // absent, the row lands in the private database exactly as before.
     let team_id = project_create_team_id(payload);
+    if let Some(requested) = default_branch.as_deref() {
+        refuse_default_contradicting_config(Path::new(&repo_path), requested)?;
+    }
 
     if dry_run {
         return Ok(format!("Would create project {key} at {repo_path}"));
@@ -247,8 +268,10 @@ pub(super) async fn apply_projects_create(
     .await
     .map_err(|error| error.to_string())?;
 
+    // The project was created by this call, so no job can reference its
+    // default yet and no installer can be reading it.
     if let Some(branch) = default_branch {
-        crud::set_default_branch_db(&target_db, &project.id, &branch)
+        crud::seed_default_branch_db(&target_db, &project.id, &branch)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -741,11 +764,15 @@ fn apply_references(
     })
 }
 
+/// `held_store` is the store guard the calling write batch already holds. A
+/// `defaultBranch` change on that store runs under it; the guard is not
+/// reentrant, so acquiring it again would wait on the batch itself.
 pub(super) async fn apply_project_settings_patch(
     orch: &Orchestrator,
     project_key: &str,
     payload: &Value,
     dry_run: bool,
+    held_store: Option<&JjStoreGuard>,
 ) -> Result<String, String> {
     let (db, id, repo_path, _db_default_branch) = resolve_project(orch, project_key).await?;
     let repo = Path::new(&repo_path);
@@ -828,9 +855,6 @@ pub(super) async fn apply_project_settings_patch(
                 .get_or_insert_with(Default::default)
                 .populate = populate.clone();
         }
-        if let Some(branch) = &default_branch {
-            config.default_branch = Some(branch.clone());
-        }
         match references {
             Some(refs) => apply_references(config, refs),
             None => Ok(ReferenceOps {
@@ -851,7 +875,11 @@ pub(super) async fn apply_project_settings_patch(
             let mut config = load_project_settings_read_only(repo);
             mutate_file(&mut config)?
         } else {
-            mutate_project_settings(repo, mutate_file).map_err(|error| error.to_string())?
+            let change = default_branch.as_deref().map(|branch| DefaultBranchChange {
+                branch,
+                config: ConfigDefault::Declare,
+            });
+            write_project_settings(orch, &db, &id, repo, change, held_store, mutate_file).await?
         }
     } else {
         ReferenceOps {
@@ -871,11 +899,6 @@ pub(super) async fn apply_project_settings_patch(
     }
 
     if !dry_run {
-        if let Some(branch) = &default_branch {
-            crud::set_default_branch_db(&db, &id, branch)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
         if let Some(overrides) = account_overrides {
             orch.set_project_overrides(&id, overrides)?;
         }

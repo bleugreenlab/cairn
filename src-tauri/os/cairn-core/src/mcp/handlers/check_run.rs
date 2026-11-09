@@ -97,6 +97,13 @@ enum ManualCheckObservation {
     Complete {
         result: Box<crate::execution::checks::ManualConfiguredCheckResult>,
     },
+    ConflictsWithBase {
+        branch: String,
+        head: String,
+        base_branch: String,
+        base_commit: String,
+        paths: Vec<String>,
+    },
     Failed {
         error: String,
     },
@@ -115,7 +122,9 @@ static MANUAL_CHECKS: LazyLock<Arc<Mutex<HashMap<String, RetainedObservation>>>>
 fn is_settled(observation: &ManualCheckObservation) -> bool {
     matches!(
         observation,
-        ManualCheckObservation::Complete { .. } | ManualCheckObservation::Failed { .. }
+        ManualCheckObservation::Complete { .. }
+            | ManualCheckObservation::Failed { .. }
+            | ManualCheckObservation::ConflictsWithBase { .. }
     )
 }
 
@@ -290,6 +299,28 @@ fn observation_from_progress(
     }
 }
 
+fn observation_from_error(
+    error: crate::execution::checks::ManualCheckError,
+) -> ManualCheckObservation {
+    use crate::execution::checks::ManualCheckError;
+    use crate::mcp::handlers::branch::RevisionCaptureError;
+    use crate::orchestrator::base_advance::preparation::PreparationRefusal;
+    if let ManualCheckError::Capture(RevisionCaptureError::Preparation { refusal, .. }) = &error {
+        if let PreparationRefusal::Conflict(conflict) = &**refusal {
+            return ManualCheckObservation::ConflictsWithBase {
+                branch: conflict.branch.clone(),
+                head: conflict.head.clone(),
+                base_branch: conflict.base_branch.clone(),
+                base_commit: conflict.base_commit.clone(),
+                paths: conflict.paths.clone(),
+            };
+        }
+    }
+    ManualCheckObservation::Failed {
+        error: error.to_string(),
+    }
+}
+
 type ManualProgressSink =
     Arc<dyn Fn(crate::execution::checks::ManualCheckProgressUpdate) + Send + Sync>;
 
@@ -307,7 +338,10 @@ fn spawn_manual_observation<F>(
     run: impl FnOnce(ManualProgressSink) -> F,
 ) where
     F: std::future::Future<
-            Output = Result<crate::execution::checks::ManualConfiguredCheckResult, String>,
+            Output = Result<
+                crate::execution::checks::ManualConfiguredCheckResult,
+                crate::execution::checks::ManualCheckError,
+            >,
         > + Send
         + 'static,
 {
@@ -325,7 +359,7 @@ fn spawn_manual_observation<F>(
             Ok(result) => ManualCheckObservation::Complete {
                 result: Box::new(result),
             },
-            Err(error) => ManualCheckObservation::Failed { error },
+            Err(error) => observation_from_error(error),
         };
         if let Err(error) =
             persist_terminal_observation(&db, &project_id, &handle, &final_state).await
@@ -381,16 +415,17 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
             .filter(|suite| !suite.trim().is_empty())
             .ok_or_else(|| "configured suite name must not be empty".to_string())?;
         let placement = payload.placement()?;
-        // Resolved, and refused, before a handle exists: a caller told its check
-        // was queued must not then learn the revision never named anything. The
-        // commit, not the name, is what the run evaluates, so a branch that moves
-        // after this point does not change which revision the answer is about.
-        let commit = match payload.branch.as_deref() {
-            Some(branch) => Some(
-                crate::execution::checks::resolve_manual_check_revision(orch, run_id, branch)
-                    .await?,
-            ),
-            None => None,
+        // Classified, and refused, before a handle exists: a caller told its
+        // check was queued must not then learn the revision never named
+        // anything. An exact revision is captured here at its commit; a managed
+        // branch is prepared exactly once by the run itself. Either way the
+        // captured commit, never the name, is what the run evaluates.
+        let revision = match payload.branch.as_deref() {
+            Some(branch) => {
+                crate::execution::checks::classify_manual_check_revision(orch, run_id, branch)
+                    .await?
+            }
+            None => crate::execution::checks::ManualCheckRevision::OwnHead,
         };
         let handle = uuid::Uuid::new_v4().to_string();
         db.execute(
@@ -415,7 +450,6 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
         let task_orch = orch.clone();
         let task_run_id = run_id.to_string();
         let task_suite = suite.to_string();
-        let task_branch = commit;
         let task_retry = payload.retry;
         let task_handle = handle.clone();
         spawn_manual_observation(db, project_id, handle.clone(), move |progress| async move {
@@ -424,7 +458,7 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
                 &task_run_id,
                 crate::execution::checks::ManualCheckRequest {
                     check_name: &task_suite,
-                    branch: task_branch.as_deref(),
+                    revision,
                     placement,
                     retry: task_retry,
                     manual_handle: Some(task_handle.as_str()),
@@ -600,7 +634,7 @@ mod tests {
                     since_unix_ms: Some(1_792_403_289_000),
                 });
                 let _ = finished.await;
-                Err("settled with nobody polling".to_string())
+                Err("settled with nobody polling".to_string().into())
             },
         );
         let observed = |handle: &str| {
@@ -639,22 +673,50 @@ mod tests {
     struct BranchFixture {
         _root: tempfile::TempDir,
         orch: Orchestrator,
+        repo: std::path::PathBuf,
+        store: std::path::PathBuf,
         main: String,
         agent: String,
     }
 
+    impl BranchFixture {
+        /// Where each branch points in the managed store right now.
+        async fn tips(&self) -> Vec<String> {
+            let mut tips = Vec::new();
+            for branch in ["main", AGENT_BRANCH] {
+                tips.push(
+                    cairn_vcs::resolve_coordinate(&self.store, branch)
+                        .await
+                        .unwrap(),
+                );
+            }
+            tips
+        }
+    }
+
     async fn branch_fixture(bin: &str) -> BranchFixture {
+        branch_fixture_with(bin, |_| {}, "").await
+    }
+
+    /// [`branch_fixture`], with `setup` run on the checkout (on `main`) before
+    /// the managed store imports it, and `extra_sql` run after the base rows.
+    async fn branch_fixture_with(
+        bin: &str,
+        setup: impl FnOnce(&std::path::Path),
+        extra_sql: &str,
+    ) -> BranchFixture {
         use crate::jj::testing::{git, git_stdout, init_project};
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_project(&repo);
-        let main = git_stdout(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["checkout", "-q", "-b", AGENT_BRANCH]);
         std::fs::write(repo.join("shared.rs"), "agent\n").unwrap();
         git(&repo, &["commit", "-q", "-am", "agent work"]);
         let agent = git_stdout(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["checkout", "-q", "main"]);
+        setup(&repo);
+        let main = git_stdout(&repo, &["rev-parse", "main"]);
 
         let db = crate::storage::migrated_test_db("check-run-branch.db").await;
         let repo_path = repo.to_string_lossy();
@@ -677,7 +739,8 @@ mod tests {
              INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
                VALUES('m','q','k','f','running','builder','builder','{AGENT_BRANCH}','main',1,1);
              INSERT INTO runs(id,issue_id,project_id,job_id,status,created_at,updated_at)
-               VALUES('run-1','i','p','j','running',1,1);"
+               VALUES('run-1','i','p','j','running',1,1);
+             {extra_sql}"
         ))
         .await
         .unwrap();
@@ -700,6 +763,8 @@ mod tests {
         BranchFixture {
             _root: root,
             orch,
+            repo,
+            store,
             main,
             agent,
         }
@@ -718,6 +783,32 @@ mod tests {
         }
     }
 
+    /// Classify `requested` as the handler does, then capture it as the run
+    /// does: an exact revision is already captured, a managed one is prepared.
+    async fn captured(
+        orch: &Orchestrator,
+        requested: &str,
+    ) -> Result<crate::mcp::handlers::branch::CapturedRevision, String> {
+        use crate::execution::checks::ManualCheckRevision;
+        match crate::execution::checks::classify_manual_check_revision(orch, "run-1", requested)
+            .await?
+        {
+            ManualCheckRevision::Captured(captured) => Ok(*captured),
+            ManualCheckRevision::Managed(revision) => {
+                let store = crate::jj::project_store_dir(&orch.config_dir, &revision.project_path);
+                crate::mcp::handlers::branch::capture_revision(
+                    orch,
+                    *revision,
+                    store,
+                    crate::mcp::handlers::branch::CapturePurpose::Check,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+            other => panic!("--branch {requested:?} classified as {other:?}"),
+        }
+    }
+
     /// `--branch` takes every form `read ?branch=` and `run branch:` take, and
     /// each lands on the commit that form names.
     #[tokio::test]
@@ -733,14 +824,73 @@ mod tests {
             (&fixture.agent[..12], &fixture.agent),
             (NODE_URI, &fixture.agent),
         ] {
-            let resolved = crate::execution::checks::resolve_manual_check_revision(
-                &fixture.orch,
-                "run-1",
-                requested,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{requested:?} did not resolve: {error}"));
-            assert_eq!(&resolved, expected, "{requested:?}");
+            let resolved = captured(&fixture.orch, requested)
+                .await
+                .unwrap_or_else(|error| panic!("{requested:?} did not resolve: {error}"));
+            assert_eq!(&resolved.commit_id, expected, "{requested:?}");
+        }
+    }
+
+    /// The form decides authority, never where a commit sits: the managed
+    /// branch's name and its node prepare, while its head's commit id, the
+    /// default branch, and a name no live job owns are exact snapshots. None
+    /// of the exact forms touches the store's branches.
+    #[tokio::test]
+    async fn only_a_managed_name_or_node_authorizes_preparation() {
+        use crate::mcp::handlers::branch::{ExactRevisionKind, RevisionAuthority};
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture(&bin).await;
+        let before = fixture.tips().await;
+        for (requested, kind) in [
+            ("main", ExactRevisionKind::IntegrationBaseline),
+            (fixture.agent.as_str(), ExactRevisionKind::Commit),
+        ] {
+            let resolved = captured(&fixture.orch, requested).await.unwrap();
+            assert!(resolved.prepared.is_none(), "{requested:?} was prepared");
+            assert!(
+                matches!(resolved.revision.authority, RevisionAuthority::Exact { kind: k, .. } if k == kind),
+                "{requested:?}: {:?}",
+                resolved.revision.authority
+            );
+            assert!(
+                resolved.provenance().contains("exact snapshot"),
+                "{}",
+                resolved.provenance()
+            );
+        }
+        assert_eq!(
+            fixture.tips().await,
+            before,
+            "an exact capture moved a branch"
+        );
+        for (requested, owner) in [(AGENT_BRANCH, None), (NODE_URI, Some("j"))] {
+            let resolved = captured(&fixture.orch, requested).await.unwrap();
+            assert_eq!(
+                resolved.revision.authority,
+                RevisionAuthority::Managed {
+                    branch: AGENT_BRANCH.into(),
+                    owner_job_id: owner.map(str::to_string),
+                },
+                "{requested:?}"
+            );
+            let prepared = resolved
+                .prepared
+                .as_ref()
+                .expect("a managed capture is prepared");
+            assert_eq!(prepared.base_branch, "main");
+            assert_eq!(prepared.base_commit, fixture.main);
+            assert_eq!(
+                prepared.head_after, fixture.agent,
+                "main is already its ancestor"
+            );
+            assert!(!prepared.advanced);
+            assert_eq!(
+                resolved.attribution(),
+                ("main".to_string(), Some(fixture.main.clone())),
+                "a managed revision is measured from its declared base's exact commit"
+            );
         }
     }
 
@@ -774,6 +924,569 @@ mod tests {
         }
     }
 
+    const FOREIGN_BRANCH: &str = "agent/proj-9-builder-0";
+
+    /// A second live job in the same project, stacked on the requester's
+    /// branch: its declared base is `AGENT_BRANCH`, not the project default.
+    const FOREIGN_STACKED_SQL: &str = "
+        INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+          VALUES('i9','p',9,'F','active','active','none',1,1);
+        INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+          VALUES('g','r','i9','p','running',1,1);
+        INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+          VALUES('n','p','i9','g','running','builder','builder','agent/proj-9-builder-0','agent/proj-7-builder-0',1,1);";
+
+    /// Naming another owner's managed branch prepares THAT branch against ITS
+    /// declared base (here a stacked parent, not the requester's default), and
+    /// the capture judges exactly the head the branch then holds. Neither base
+    /// moves, and a second capture of the prepared branch replays nothing.
+    #[tokio::test]
+    async fn a_foreign_branch_is_prepared_onto_its_own_declared_base() {
+        use crate::jj::testing::git;
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture_with(
+            &bin,
+            |repo| {
+                git(repo, &["checkout", "-q", "-b", FOREIGN_BRANCH]);
+                std::fs::write(repo.join("foreign.rs"), "foreign\n").unwrap();
+                git(repo, &["add", "-A"]);
+                git(repo, &["commit", "-q", "-m", "foreign work"]);
+                git(repo, &["checkout", "-q", "main"]);
+            },
+            FOREIGN_STACKED_SQL,
+        )
+        .await;
+        let foreign_tip = || cairn_vcs::resolve_coordinate(&fixture.store, FOREIGN_BRANCH);
+        let before = foreign_tip().await.unwrap();
+
+        let resolved = captured(&fixture.orch, FOREIGN_BRANCH).await.unwrap();
+        let prepared = resolved
+            .prepared
+            .clone()
+            .expect("a managed capture is prepared");
+        assert_eq!(
+            prepared.base_branch, AGENT_BRANCH,
+            "the branch's own declared target, not the requester's default"
+        );
+        assert_eq!(prepared.base_commit, fixture.agent);
+        assert!(prepared.advanced);
+        assert_eq!(prepared.head_before, before);
+        assert_ne!(prepared.head_after, before);
+        assert_eq!(resolved.commit_id, prepared.head_after);
+        assert_eq!(
+            foreign_tip().await.unwrap(),
+            prepared.head_after,
+            "the captured head is what the branch now holds"
+        );
+        assert_eq!(
+            fixture.tips().await,
+            vec![fixture.main.clone(), fixture.agent.clone()],
+            "preparing a branch moved one of its bases"
+        );
+        assert_eq!(
+            resolved.attribution(),
+            (AGENT_BRANCH.to_string(), Some(fixture.agent.clone()))
+        );
+        assert!(
+            resolved.provenance().contains(&prepared.head_before[..12])
+                && resolved.provenance().contains(&prepared.head_after[..12]),
+            "{}",
+            resolved.provenance()
+        );
+
+        let again = captured(&fixture.orch, FOREIGN_BRANCH).await.unwrap();
+        assert_eq!(again.commit_id, prepared.head_after);
+        assert!(!again.prepared.unwrap().advanced);
+    }
+
+    /// An install the store accepts but Git cannot take (its ref is locked) is
+    /// still the captured coordinate: no refusal, and no fallback to the stale
+    /// Git ref. The capture names the failed export and the record the next
+    /// preparation recovers it from, in the provenance a run label shows and in
+    /// the `CheckCapture` a manual result and a review wave's plan carry. A
+    /// repeat check capture stays accepted at that head and keeps reporting the
+    /// owed export, which only the owner's own preparation performs.
+    #[tokio::test]
+    async fn an_accepted_install_whose_export_fails_is_captured_with_its_warning() {
+        use crate::jj::testing::{git, git_stdout};
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture_with(
+            &bin,
+            |repo| {
+                git(repo, &["checkout", "-q", "-b", FOREIGN_BRANCH]);
+                std::fs::write(repo.join("foreign.rs"), "foreign\n").unwrap();
+                git(repo, &["add", "-A"]);
+                git(repo, &["commit", "-q", "-m", "foreign work"]);
+                git(repo, &["checkout", "-q", "main"]);
+            },
+            FOREIGN_STACKED_SQL,
+        )
+        .await;
+        let git_ref = || git_stdout(&fixture.repo, &["rev-parse", FOREIGN_BRANCH]);
+        let before = git_ref();
+        let lock = fixture
+            .repo
+            .join(".git/refs/heads")
+            .join(format!("{FOREIGN_BRANCH}.lock"));
+        std::fs::write(&lock, "held by another writer\n").unwrap();
+
+        let resolved = captured(&fixture.orch, FOREIGN_BRANCH)
+            .await
+            .expect("a failed export is not a refusal");
+        let prepared = resolved.prepared.clone().unwrap();
+        assert!(prepared.advanced);
+        assert_eq!(resolved.commit_id, prepared.head_after);
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&fixture.store, FOREIGN_BRANCH)
+                .await
+                .unwrap(),
+            prepared.head_after,
+            "the store holds the accepted install"
+        );
+        assert_eq!(git_ref(), before, "Git could not take the head");
+        assert_ne!(
+            resolved.commit_id, before,
+            "no fallback to the stale Git ref"
+        );
+        let warning = prepared
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("Git export failed"))
+            .unwrap_or_else(|| panic!("no export warning in {:?}", prepared.warnings));
+        assert!(
+            warning.contains("recovers it from record"),
+            "the warning names its durable recovery record: {warning}"
+        );
+        assert!(
+            resolved.provenance().contains("warning:"),
+            "{}",
+            resolved.provenance()
+        );
+        let capture = crate::execution::checks::CheckCapture::of(&resolved);
+        assert_eq!(capture.head_before.as_deref(), Some(before.as_str()));
+        assert_eq!(capture.head_after, prepared.head_after);
+        assert_eq!(
+            capture.git_tree.as_deref(),
+            Some(prepared.git_tree.as_str())
+        );
+        assert_eq!(capture.base_commit.as_deref(), Some(fixture.agent.as_str()));
+        assert_eq!(capture.warnings, prepared.warnings);
+
+        // A check does not hold the branch's reservation, so it never performs
+        // the owed export itself; the owner's next preparation does. Until
+        // then a repeat capture is still accepted at the installed head and
+        // keeps naming the same owed export, rather than refusing or falling
+        // back to the stale Git ref.
+        std::fs::remove_file(&lock).unwrap();
+        let repeat = captured(&fixture.orch, FOREIGN_BRANCH)
+            .await
+            .expect("an owed export is not a refusal");
+        assert_eq!(repeat.commit_id, prepared.head_after);
+        let again = repeat.prepared.unwrap();
+        assert!(!again.advanced, "a repeat capture replays nothing");
+        let record = warning
+            .rsplit("record ")
+            .next()
+            .expect("the warning names its record");
+        assert!(
+            again
+                .warnings
+                .iter()
+                .any(|owed| owed.contains("Git export failed") && owed.contains(record)),
+            "the owed export stays reported against the same record: {:?}",
+            again.warnings
+        );
+        assert_eq!(git_ref(), before, "a check never performs the owed export");
+    }
+
+    const UNIT_CHECK_CONFIG: &str = "checks:\n  unit:\n    command: echo ok\n    when: review\n";
+    const UNOWNED_REF: &str = "scratch/unowned";
+
+    /// A one-row count from the fixture's database.
+    async fn count(orch: &Orchestrator, sql: &'static str) -> i64 {
+        use crate::storage::RowExt;
+        orch.db
+            .local
+            .read(move |conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(sql, ()).await?;
+                    let row = rows.next().await?.expect("a count row");
+                    row.i64(0)
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// No conflict session was opened, no verdict was recorded, and nobody was
+    /// steered or interrupted. A clean preparation's one passive owner note is
+    /// allowed; anything that resumes a session is not.
+    async fn assert_nobody_resumed(orch: &Orchestrator, branch: &str, context: &str) {
+        assert_eq!(
+            count(
+                orch,
+                "SELECT COUNT(*) FROM attention_pushes WHERE wake IN ('wake', 'interrupt')"
+            )
+            .await,
+            0,
+            "{context}: a resuming wake"
+        );
+        assert_eq!(
+            count(orch, "SELECT COUNT(*) FROM check_result_cache").await,
+            0,
+            "{context}: a verdict"
+        );
+        assert!(
+            crate::orchestrator::conflict_session::load_active_session(&orch.db.local, branch)
+                .await
+                .unwrap()
+                .is_none(),
+            "{context}: a conflict session"
+        );
+    }
+
+    /// [`assert_nobody_resumed`], and nothing was delivered at all: a refused
+    /// capture is nobody's to hear about.
+    async fn assert_nothing_reached_anyone(orch: &Orchestrator, branch: &str, context: &str) {
+        assert_nobody_resumed(orch, branch, context).await;
+        assert_eq!(
+            count(orch, "SELECT COUNT(*) FROM attention_pushes").await,
+            0,
+            "{context}: a push"
+        );
+        assert_eq!(
+            count(orch, "SELECT COUNT(*) FROM messages").await,
+            0,
+            "{context}: a message"
+        );
+    }
+
+    fn run_request() -> McpCallbackRequest {
+        McpCallbackRequest {
+            tool: "run".into(),
+            payload: serde_json::json!({}),
+            ..check_run_request("main")
+        }
+    }
+
+    /// A foreign managed branch carrying its own check definition, stacked on
+    /// `AGENT_BRANCH`, beside a ref no live job owns.
+    async fn foreign_fixture(
+        bin: &str,
+        foreign_file: (&'static str, &'static str),
+    ) -> BranchFixture {
+        use crate::jj::testing::git;
+        branch_fixture_with(
+            bin,
+            move |repo| {
+                git(repo, &["branch", UNOWNED_REF]);
+                git(repo, &["checkout", "-q", "-b", FOREIGN_BRANCH]);
+                std::fs::create_dir_all(repo.join(".cairn")).unwrap();
+                std::fs::write(repo.join(".cairn/config.yaml"), UNIT_CHECK_CONFIG).unwrap();
+                std::fs::write(repo.join(foreign_file.0), foreign_file.1).unwrap();
+                git(repo, &["add", "-A"]);
+                git(repo, &["commit", "-q", "-m", "foreign work"]);
+                git(repo, &["checkout", "-q", "main"]);
+            },
+            FOREIGN_STACKED_SQL,
+        )
+        .await
+    }
+
+    /// A manual check of another owner's managed branch prepares it once and
+    /// then every stage reads that one coordinate: the contract is the one the
+    /// prepared head declares, the tree and key are that head's, and the change
+    /// is measured from the exact base commit of the branch's own declared
+    /// target, so the base's own work (`shared.rs`) is not attributed to it.
+    #[tokio::test]
+    async fn a_manual_check_carries_one_capture_through_contract_change_and_key() {
+        use crate::execution::checks::{manual_capture_evidence, ManualCheckRevision};
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = foreign_fixture(&bin, ("foreign.rs", "foreign\n")).await;
+        let revision = crate::execution::checks::classify_manual_check_revision(
+            &fixture.orch,
+            "run-1",
+            FOREIGN_BRANCH,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(revision, ManualCheckRevision::Managed(_)),
+            "{revision:?}"
+        );
+        assert_eq!(
+            count(&fixture.orch, "SELECT COUNT(*) FROM jj_reconcile_items").await,
+            0,
+            "classification prepares nothing"
+        );
+
+        let evidence = manual_capture_evidence(&fixture.orch, "run-1", "unit", revision)
+            .await
+            .unwrap();
+        let tip = cairn_vcs::resolve_coordinate(&fixture.store, FOREIGN_BRANCH)
+            .await
+            .unwrap();
+        let capture = evidence
+            .capture
+            .clone()
+            .expect("a managed capture is reported");
+        assert!(capture.advanced);
+        assert_eq!(
+            evidence.commit, tip,
+            "the judged commit is the prepared head"
+        );
+        assert_eq!(capture.head_after, evidence.commit);
+        assert_eq!(
+            evidence.defined_by, evidence.commit,
+            "the contract is the prepared head's"
+        );
+        assert_eq!(evidence.change_head, evidence.commit);
+        assert_eq!(
+            evidence.change_base, fixture.agent,
+            "measured from the exact declared base"
+        );
+        assert_eq!(capture.base_branch.as_deref(), Some(AGENT_BRANCH));
+        assert_eq!(capture.base_commit.as_deref(), Some(fixture.agent.as_str()));
+        let mut changed = evidence.changed.clone();
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![".cairn/config.yaml".to_string(), "foreign.rs".to_string()]
+        );
+        let jj = crate::jj::environment(&fixture.orch.jj_binary_path, &fixture.orch.config_dir);
+        assert_eq!(
+            evidence.tree_hash,
+            crate::jj::logical_tree_hash(&jj, &fixture.repo, &evidence.commit).unwrap(),
+            "the key's tree is the judged commit's"
+        );
+        assert!(!evidence.input_hash.is_empty());
+        assert_nobody_resumed(&fixture.orch, FOREIGN_BRANCH, "a clean check").await;
+    }
+
+    /// `run branch:` prepares an own or foreign managed branch exactly once,
+    /// and captures a commit id (even the managed head's), the default branch,
+    /// and an unowned ref literally: no operation is recorded and no branch
+    /// moves for any exact form.
+    #[tokio::test]
+    async fn run_branch_prepares_managed_forms_once_and_takes_exact_forms_literally() {
+        use crate::mcp::handlers::branch::capture_for_run;
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = foreign_fixture(&bin, ("foreign.rs", "foreign\n")).await;
+        let request = run_request();
+        let operation = || cairn_vcs::settled_operation(&fixture.store).unwrap();
+        let unowned = cairn_vcs::resolve_coordinate(&fixture.store, UNOWNED_REF)
+            .await
+            .unwrap();
+
+        for (requested, expected) in [
+            (fixture.agent.as_str(), fixture.agent.as_str()),
+            ("main", fixture.main.as_str()),
+            (UNOWNED_REF, unowned.as_str()),
+        ] {
+            let (before_op, before_tips) = (operation(), fixture.tips().await);
+            let captured = capture_for_run(&fixture.orch, &request, requested)
+                .await
+                .unwrap_or_else(|error| panic!("{requested}: {error}"));
+            assert_eq!(captured.commit_id, expected, "{requested}");
+            assert!(captured.prepared.is_none(), "{requested} was prepared");
+            assert_eq!(operation(), before_op, "{requested} recorded an operation");
+            assert_eq!(
+                fixture.tips().await,
+                before_tips,
+                "{requested} moved a branch"
+            );
+        }
+
+        for own in [AGENT_BRANCH, NODE_URI] {
+            let captured = capture_for_run(&fixture.orch, &request, own).await.unwrap();
+            let prepared = captured.prepared.clone().expect("own branch is prepared");
+            assert_eq!(captured.commit_id, fixture.agent, "{own}");
+            assert!(!prepared.advanced, "{own}: it already contains main");
+        }
+
+        let first = capture_for_run(&fixture.orch, &request, FOREIGN_BRANCH)
+            .await
+            .unwrap();
+        let prepared = first.prepared.clone().unwrap();
+        assert!(prepared.advanced);
+        assert_eq!(prepared.base_branch, AGENT_BRANCH);
+        assert!(first.provenance().contains(&prepared.head_after[..12]));
+        let settled = operation();
+        let second = capture_for_run(&fixture.orch, &request, FOREIGN_BRANCH)
+            .await
+            .unwrap();
+        assert_eq!(second.commit_id, prepared.head_after);
+        assert!(!second.prepared.unwrap().advanced, "prepared exactly once");
+        assert_eq!(
+            operation(),
+            settled,
+            "a prepared branch is captured again without a mutation"
+        );
+        assert_nobody_resumed(&fixture.orch, FOREIGN_BRANCH, "clean captures").await;
+    }
+
+    /// A foreign branch that conflicts with its declared base, captured again
+    /// and again by both a manual check and `run branch:`, is refused every
+    /// time as "conflicts with base" with the exact paths and base, moves
+    /// nothing, records no verdict, opens no session, and wakes nobody.
+    #[tokio::test]
+    async fn a_foreign_conflict_repeated_by_checks_and_runs_reaches_nobody() {
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = foreign_fixture(&bin, ("shared.rs", "foreign\n")).await;
+        let before = cairn_vcs::resolve_coordinate(&fixture.store, FOREIGN_BRANCH)
+            .await
+            .unwrap();
+        // Exercise the durable handler, not just capture's displayed error.
+        let mut check_request = check_run_request(FOREIGN_BRANCH);
+        check_request.payload["suite"] = "unit".into();
+        let queued: serde_json::Value =
+            serde_json::from_str(&handle_check_run(&fixture.orch, &check_request).await).unwrap();
+        assert_eq!(queued["ok"], true, "{queued}");
+        let handle = queued["observationHandle"].as_str().unwrap();
+        let durable: String = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let response: Option<String> = fixture.orch.db.local.query_opt(
+                    "SELECT response_json FROM manual_check_handles WHERE project_id='p' AND handle=?1 AND response_json IS NOT NULL",
+                    cairn_db::turso::params![handle],
+                    |row| row.text(0),
+                ).await.unwrap();
+                if let Some(response) = response { break response; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("conflicting capture must settle durably");
+        let stored: serde_json::Value = serde_json::from_str(&durable).unwrap();
+        assert_eq!(stored["state"], "conflictsWithBase", "{stored}");
+        assert_eq!(stored["branch"], FOREIGN_BRANCH);
+        assert_eq!(stored["head"], before);
+        assert_eq!(stored["baseBranch"], AGENT_BRANCH);
+        assert_eq!(stored["baseCommit"], fixture.agent);
+        assert_eq!(stored["paths"], serde_json::json!(["shared.rs"]));
+        MANUAL_CHECKS
+            .lock()
+            .unwrap()
+            .remove(&registry_key("p", handle));
+        assert_eq!(
+            poll_handle(&fixture.orch, handle, "run-1").await["observation"],
+            stored
+        );
+        assert_eq!(
+            count(
+                &fixture.orch,
+                "SELECT COUNT(*) FROM check_result_observations"
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            count(&fixture.orch, "SELECT COUNT(*) FROM check_result_cache").await,
+            0
+        );
+
+        let request = run_request();
+        for attempt in 0..2 {
+            let check = captured(&fixture.orch, FOREIGN_BRANCH).await.unwrap_err();
+            let run = crate::mcp::handlers::branch::capture_for_run(
+                &fixture.orch,
+                &request,
+                FOREIGN_BRANCH,
+            )
+            .await
+            .unwrap_err();
+            assert!(run.conflicts_with_base(), "{attempt}: {run}");
+            for error in [check, run.to_string()] {
+                assert!(
+                    error.starts_with("Conflicts with base:"),
+                    "{attempt}: {error}"
+                );
+                assert!(error.contains("shared.rs"), "{attempt}: {error}");
+                assert!(error.contains(AGENT_BRANCH), "{attempt}: {error}");
+                assert!(error.contains(&fixture.agent[..12]), "{attempt}: {error}");
+            }
+            assert_eq!(
+                cairn_vcs::resolve_coordinate(&fixture.store, FOREIGN_BRANCH)
+                    .await
+                    .unwrap(),
+                before,
+                "{attempt}: a refused preparation installed something"
+            );
+            assert_nothing_reached_anyone(&fixture.orch, FOREIGN_BRANCH, "a conflict").await;
+        }
+    }
+
+    /// A managed branch whose declared base names nothing is refused as a
+    /// preparation outcome, not a verdict, and steers or interrupts nobody.
+    #[tokio::test]
+    async fn an_unresolvable_declared_base_is_refused_and_steers_nobody() {
+        use crate::jj::testing::git;
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture_with(
+            &bin,
+            |repo| git(repo, &["branch", FOREIGN_BRANCH]),
+            &FOREIGN_STACKED_SQL.replace("'agent/proj-7-builder-0',1,1)", "'agent/gone',1,1)"),
+        )
+        .await;
+        let before = fixture.tips().await;
+        for attempt in 0..2 {
+            let error = captured(&fixture.orch, FOREIGN_BRANCH).await.unwrap_err();
+            assert!(
+                error.contains("could not be prepared"),
+                "{attempt}: {error}"
+            );
+            assert!(error.contains("no verdict"), "{attempt}: {error}");
+            assert_eq!(fixture.tips().await, before);
+            assert_nothing_reached_anyone(&fixture.orch, FOREIGN_BRANCH, "an unresolved base")
+                .await;
+        }
+    }
+
+    /// A branch that cannot take its base cleanly is refused as "conflicts with
+    /// base", naming the paths and the exact base, and nothing is installed:
+    /// every tip is where it was, however often the capture is asked.
+    #[tokio::test]
+    async fn a_conflicting_branch_is_refused_and_nothing_moves() {
+        use crate::jj::testing::git;
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture_with(
+            &bin,
+            |repo| {
+                std::fs::write(repo.join("shared.rs"), "main moved\n").unwrap();
+                git(repo, &["commit", "-q", "-am", "main edits the same line"]);
+            },
+            "",
+        )
+        .await;
+        let before = fixture.tips().await;
+        for attempt in 0..2 {
+            let error = captured(&fixture.orch, AGENT_BRANCH).await.unwrap_err();
+            assert!(
+                error.starts_with("Conflicts with base:"),
+                "{attempt}: {error}"
+            );
+            assert!(error.contains("shared.rs"), "{attempt}: {error}");
+            assert!(error.contains(&fixture.main[..12]), "{attempt}: {error}");
+            assert!(error.contains("not a test result"), "{attempt}: {error}");
+            assert_eq!(
+                fixture.tips().await,
+                before,
+                "{attempt}: a refused preparation installed something"
+            );
+        }
+    }
+
     /// A node of another project is refused rather than resolved, even when
     /// its branch name happens to exist here.
     #[tokio::test]
@@ -782,7 +1495,7 @@ mod tests {
             return;
         };
         let fixture = branch_fixture(&bin).await;
-        let error = crate::execution::checks::resolve_manual_check_revision(
+        let error = crate::execution::checks::classify_manual_check_revision(
             &fixture.orch,
             "run-1",
             FOREIGN_NODE_URI,

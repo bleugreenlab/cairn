@@ -2496,6 +2496,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("jj_reconcile_intents", TableScope::ProjectScoped),
     ("jj_reconcile_items", TableScope::ProjectScoped),
     ("jj_reconcile_quarantines", TableScope::ProjectScoped),
+    // cairn/5387: branch preparation's acceptance journal, beside the reconcile
+    // tables it supersedes; rows describe this store's installs.
+    ("branch_advance_acceptances", TableScope::ProjectScoped),
     // cairn/6173: this runner's durable fences on its own store's bookmarks.
     ("jj_branch_recoveries", TableScope::ProjectScoped),
     // cairn/6080: the operator-set merge catch-up mode of one store bookmark,
@@ -3387,6 +3390,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "jj_reconcile_quarantines",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "branch_advance_acceptances",
         id_columns: &["project_id"],
     },
     RekeyTableManifest {

@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -24,11 +23,11 @@ use jj_lib::backend::{CommitId, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::fileset::FilesetExpression;
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::repo::{ReadonlyRepo, Repo as _};
+use jj_lib::repo::Repo;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::ResolvedRevsetExpression;
 
-use crate::{best_common_ancestor, load_repo_at_head};
+use crate::{best_common_ancestor, load_repo_for_history};
 
 /// Why a history query produced no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,7 +194,7 @@ pub struct Annotation {
 async fn with_repo<T, F, Fut>(repository_path: &Path, query: F) -> Result<T, HistoryError>
 where
     T: Send + 'static,
-    F: FnOnce(Arc<ReadonlyRepo>) -> Fut + Send + 'static,
+    F: FnOnce(Box<dyn Repo>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<T, HistoryError>>,
 {
     let repository_path: PathBuf = repository_path.to_path_buf();
@@ -205,7 +204,7 @@ where
             .build()
             .map_err(repository_error)?
             .block_on(async move {
-                let repo = load_repo_at_head(&repository_path)
+                let repo = load_repo_for_history(&repository_path)
                     .await
                     .map_err(|error| HistoryError::Repository(format!("{error:?}")))?;
                 query(repo).await
@@ -218,7 +217,7 @@ where
 /// Parse `hex` and confirm the index holds it. `DefaultIndex::is_ancestor`
 /// unwraps its position lookup, so an id that skipped this guard would panic
 /// rather than fail.
-fn indexed_commit(repo: &ReadonlyRepo, hex: &str) -> Result<CommitId, HistoryError> {
+fn indexed_commit(repo: &dyn Repo, hex: &str) -> Result<CommitId, HistoryError> {
     let hex = hex.trim();
     let id =
         CommitId::try_from_hex(hex).ok_or_else(|| HistoryError::UnknownCommit(hex.to_string()))?;
@@ -260,8 +259,8 @@ pub async fn ancestry(
     let to = to.to_string();
     with_repo(repository_path, move |repo| async move {
         let started = Instant::now();
-        let from_id = indexed_commit(&repo, &from)?;
-        let to_id = indexed_commit(&repo, &to)?;
+        let from_id = indexed_commit(repo.as_ref(), &from)?;
+        let to_id = indexed_commit(repo.as_ref(), &to)?;
         let index = repo.index();
         let from_in_to = index
             .is_ancestor(&from_id, &to_id)
@@ -269,10 +268,12 @@ pub async fn ancestry(
         let to_in_from = index
             .is_ancestor(&to_id, &from_id)
             .map_err(repository_error)?;
-        let merge_base =
-            best_common_ancestor(&repo, &from_id, &to_id).map_err(HistoryError::Repository)?;
-        let ahead = count_exclusive(&repo, &to_id, &from_id, count_cap, started, limit).await?;
-        let behind = count_exclusive(&repo, &from_id, &to_id, count_cap, started, limit).await?;
+        let merge_base = best_common_ancestor(repo.as_ref(), &from_id, &to_id)
+            .map_err(HistoryError::Repository)?;
+        let ahead =
+            count_exclusive(repo.as_ref(), &to_id, &from_id, count_cap, started, limit).await?;
+        let behind =
+            count_exclusive(repo.as_ref(), &from_id, &to_id, count_cap, started, limit).await?;
         Ok(Ancestry {
             from: from_id.hex(),
             to: to_id.hex(),
@@ -289,6 +290,12 @@ pub async fn ancestry(
 /// Whether `descendant` contains `ancestor`: it is that commit or one of its
 /// descendants. The same answer [`ancestry`] reports as `from_in_to`, without
 /// the fork-point and ahead/behind walks a yes/no question has no use for.
+/// Unknown coordinates are errors, never "false", and the repository view is
+/// not merged or published.
+///
+/// This is the one indexed ancestry query (it absorbed `is_ancestor`). It
+/// passes `repo.as_ref()` because [`with_repo`] hands the closure a
+/// `Box<dyn Repo>`, and `&Box<dyn Repo>` does not coerce to `&dyn Repo`.
 pub async fn contains(
     repository_path: &Path,
     ancestor: &str,
@@ -297,8 +304,8 @@ pub async fn contains(
     let ancestor = ancestor.to_string();
     let descendant = descendant.to_string();
     with_repo(repository_path, move |repo| async move {
-        let ancestor = indexed_commit(&repo, &ancestor)?;
-        let descendant = indexed_commit(&repo, &descendant)?;
+        let ancestor = indexed_commit(repo.as_ref(), &ancestor)?;
+        let descendant = indexed_commit(repo.as_ref(), &descendant)?;
         repo.index()
             .is_ancestor(&ancestor, &descendant)
             .map_err(repository_error)
@@ -308,7 +315,7 @@ pub async fn contains(
 
 /// Count `::include ~ ::exclude`, stopping at `cap`.
 async fn count_exclusive(
-    repo: &ReadonlyRepo,
+    repo: &dyn Repo,
     include: &CommitId,
     exclude: &CommitId,
     cap: usize,
@@ -349,10 +356,10 @@ pub async fn log(
 ) -> Result<LogPage, HistoryError> {
     with_repo(repository_path, move |repo| async move {
         let started = Instant::now();
-        let to = indexed_commit(&repo, &query.to)?;
+        let to = indexed_commit(repo.as_ref(), &query.to)?;
         let mut expression = ResolvedRevsetExpression::commit(to).ancestors();
         if let Some(from) = query.from.as_deref() {
-            let from = indexed_commit(&repo, from)?;
+            let from = indexed_commit(repo.as_ref(), from)?;
             expression = expression.minus(&ResolvedRevsetExpression::commit(from).ancestors());
         }
         // jj's virtual root is an ancestor of everything and is not a commit
@@ -430,7 +437,7 @@ pub async fn annotate(
     let path = path.to_string();
     with_repo(repository_path, move |repo| async move {
         let started = Instant::now();
-        let id = indexed_commit(&repo, &commit)?;
+        let id = indexed_commit(repo.as_ref(), &commit)?;
         let file_path = repo_path(&path)?.ok_or_else(|| HistoryError::InvalidPath(path.clone()))?;
         let starting = repo.store().get_commit(&id).map_err(repository_error)?;
         let value = starting

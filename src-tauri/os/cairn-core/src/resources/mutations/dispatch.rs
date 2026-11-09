@@ -42,7 +42,7 @@ mod prompts;
 mod queue;
 pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
 mod rebase;
-pub(crate) use rebase::rebase_authority;
+pub(crate) use rebase::{acceptance_debt_section, rebase_authority};
 mod camps;
 mod recipes;
 mod repls;
@@ -363,6 +363,21 @@ pub(crate) async fn dispatch_resource_change(
     item: &ChangeItem,
     dry_run: bool,
 ) -> ResourceMutationResult<ResourceAppliedChange> {
+    dispatch_resource_change_under_store(orch, request, index, item, dry_run, None).await
+}
+
+/// [`dispatch_resource_change`] for a caller that holds the store guard of the
+/// project it is writing, as a write batch with file targets does. A resource
+/// that writes a declared-base relationship on that store runs under `held_store`
+/// rather than re-acquiring the non-reentrant lock.
+pub(crate) async fn dispatch_resource_change_under_store(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    index: usize,
+    item: &ChangeItem,
+    dry_run: bool,
+    held_store: Option<&crate::orchestrator::JjStoreGuard>,
+) -> ResourceMutationResult<ResourceAppliedChange> {
     let resource = target_resource_for_request(orch, request, item)
         .await
         .map_err(|e| build_failure(index, item, e))?;
@@ -381,6 +396,7 @@ pub(crate) async fn dispatch_resource_change(
     // transcript finds the proposal without parsing the summary.
     let mut applied_data: Option<serde_json::Value> = None;
     let mut promoted_memory = None;
+    let mut deferred_pr_sync = None;
 
     let summary = if let Some(summary) =
         off_frame(|| posts::dispatch(orch, request, index, item, dry_run, &resource)).await?
@@ -470,7 +486,8 @@ pub(crate) async fn dispatch_resource_change(
     {
         summary
     } else if let Some(summary) =
-        off_frame(|| projects::dispatch(orch, request, index, item, dry_run, &resource)).await?
+        off_frame(|| projects::dispatch(orch, request, index, item, dry_run, &resource, held_store))
+            .await?
     {
         summary
     } else if let Some(summary) = {
@@ -558,8 +575,22 @@ pub(crate) async fn dispatch_resource_change(
         off_frame(|| pages::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
-    } else if let Some(summary) =
-        off_frame(|| artifacts::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    } else if let Some(summary) = {
+        let (resource, deferred_pr_sync) = (&resource, &mut deferred_pr_sync);
+        off_frame(move || {
+            artifacts::dispatch(
+                orch,
+                request,
+                index,
+                item,
+                dry_run,
+                resource,
+                held_store,
+                deferred_pr_sync,
+            )
+        })
+    }
+    .await?
     {
         summary
     } else if let Some(summary) =
@@ -676,6 +707,7 @@ pub(crate) async fn dispatch_resource_change(
         summary,
         data: applied_data,
         promoted_memory,
+        deferred_pr_sync,
     })
 }
 

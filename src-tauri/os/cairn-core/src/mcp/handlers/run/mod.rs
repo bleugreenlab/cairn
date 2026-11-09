@@ -45,7 +45,11 @@ pub use types::{
 
 use crate::mcp::answer_timeline::{self, AnswerOutcome};
 use crate::mcp::vcs::{acquire_store_lock, STORE_LOCK_TIMEOUT};
-use crate::orchestrator::JjStoreOperationTrace;
+use crate::orchestrator::base_advance::preparation::{
+    prepare_branch, PreparationPurpose, PreparationRefusal, PreparationRequest, PreparedBranch,
+    PREPARATION_ATTEMPTS,
+};
+use crate::orchestrator::{BranchReservation, JjStoreGuard, JjStoreOperationTrace};
 use crate::storage::RowExt;
 use cairn_platform::stack::off_frame;
 use commit_barrier::{run_commit_barrier, CommitBarrierOutcome};
@@ -656,41 +660,41 @@ pub(crate) async fn publish_and_seal_slot_delta(
         store_dir: store_dir.to_path_buf(),
         branch: branch.to_string(),
     };
-    // Prepared before the lock: installation, pinning, and the integration
-    // against the head read now need no exclusion (I3, I4).
+    // Installed, pinned, its branch prepared, and integrated onto the prepared
+    // head before the lock (I3, I4). The barrier releases the lock before it
+    // returns: receipt finalization talks to the object plane and the patch
+    // capture reads immutable commits, so neither needs the store.
     let prepared = prepare_slot_publication(orch, &target, request, delta, message, author)
         .await
         .map_err(|error| error.to_string())?;
-    let guard = acquire_store_lock(
+    // Taken before the barrier consumes the slot: the upload is installed by
+    // now, so it is finalized whether the fix lands, is superseded, or fails.
+    let consume_receipt = prepared.available.consume_receipt;
+    let (_, landed) = delta_barrier(
         orch,
         Some(store_dir),
-        crate::orchestrator::StoreLockClass::Foreground,
         "build-slot delta publication and seal",
-        STORE_LOCK_TIMEOUT,
-    )
-    .await?;
-    let trace = guard.as_ref().map(|guard| guard.trace());
-    let consume_receipt = prepared.available.consume_receipt;
-    let landed = land_prepared_check_delta(
-        orch,
-        &target,
-        request,
-        delta,
-        message,
-        author,
-        trace.as_ref(),
-        prepared,
+        false,
+        OwnDelta {
+            target: &target,
+            request,
+            delta,
+            message,
+            author,
+            slot: prepared,
+            fold: DeltaFold::Exact,
+        },
     )
     .await;
-    // Neither receipt finalization nor immutable patch capture needs the store.
-    drop(guard);
     if consume_receipt {
         if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
             log::warn!("check delta upload was not finalized: {error}");
         }
     }
-    let Some(mut outcome) = landed? else {
-        return Ok(None);
+    let mut outcome = match landed {
+        Ok(publication) => publication.outcome,
+        Err(SlotPublicationError::Superseded) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
     };
     outcome.capture_patch(&target.repository);
     let (commit, patch, landed_on_tested_base) = match outcome {
@@ -737,57 +741,100 @@ pub(crate) async fn publish_and_seal_slot_delta(
     }))
 }
 
-/// Caller holds the store lock through both input validation and publication.
-#[allow(clippy::too_many_arguments)]
+/// Land check output under the barrier's reservation and store guard, and
+/// only on the exact head it was tested on.
+///
+/// Check output is valid only for the tree it ran on. Unlike an agent's edits,
+/// a formatter delta must never be integrated onto a newer head, so it is
+/// compared with `expected_head`, the head the barrier revalidated under this
+/// guard, rather than at preparation time: a commit arriving while the fold
+/// waits for the lock, or a base advance its own preparation made, supersedes
+/// it too. A landing that fails is discarded, never held, so no later drain
+/// can replay stale output onto a newer head.
 async fn land_prepared_check_delta(
     orch: &Orchestrator,
-    target: &RunnerPublicationTarget,
-    request: &CellRequest,
-    delta: &crate::fleet::MutationDelta,
-    message: &str,
-    author: Option<&PublicationIdentity>,
-    trace: Option<&JjStoreOperationTrace>,
-    prepared: PreparedSlot,
-) -> Result<Option<SlotPublicationOutcome>, String> {
-    // Check output is valid only for the tree it ran on. Unlike an agent's
-    // edits, a formatter delta must never be integrated onto a newer head.
-    // Compare under the publication lock, not at preparation time, so a commit
-    // arriving while this wave waits for the lock also supersedes the fold.
-    let head = cairn_vcs::resolve_coordinate(&target.store_dir, &target.branch)
-        .await
-        .map_err(|error| format!("resolve `{}` for check fold: {error}", target.branch))?;
+    own: OwnDelta<'_>,
+    reservation: &BranchReservation,
+    guard: &JjStoreGuard,
+    expected_head: &str,
+) -> Result<SlotPublication, SlotPublicationError> {
+    let OwnDelta {
+        target,
+        request,
+        delta,
+        message,
+        author,
+        slot,
+        ..
+    } = own;
+    // `available` is kept until the landing transaction has committed: its
+    // pin protects the delta's objects through the publication attempt.
+    let PreparedSlot {
+        available,
+        plan,
+        coordinate,
+        sealed,
+        run_id,
+        prior_since_ms,
+    } = slot;
+    let discarded =
+        |error: String| SlotPublicationError::Discarded(format!("check output discarded: {error}"));
     let parent = git_output(
         &target.repository,
         &["rev-parse", &format!("{}^1", delta.delta_commit)],
         "read check fold input commit",
-    )?;
-    if head != request.base_commit || head != delta.base_commit || parent != head {
-        return Ok(None);
+    )
+    .map_err(discarded)?;
+    if expected_head != request.base_commit
+        || expected_head != delta.base_commit
+        || parent != expected_head
+    {
+        return Err(SlotPublicationError::Superseded);
     }
+    let coordinate = coordinate
+        .as_ref()
+        .map_err(|reason| discarded(unprepared(reason)))?;
+    let trace = guard.trace();
+    let admission = sealed.as_ref().map_or(
+        crate::orchestrator::BatchAdmission::None,
+        crate::orchestrator::BatchAdmission::Sealed,
+    );
     let publication = slot_delta_publication(
         target,
         request,
         delta,
         message,
         author,
-        trace,
-        prepared.run_id.as_deref(),
-        prepared.prior_since_ms,
+        Some(&trace),
+        admission,
+        run_id.as_deref(),
+        prior_since_ms,
     );
-    // Do not use the agent-delta hold path: a failed formatter publication must
-    // not become a held delta that a later drain can replay onto a newer head.
-    // The available delta's pin stays alive through the publication attempt.
-    publish_available_delta(orch, &publication, prepared.plan)
-        .await
-        .map(Some)
-        .map_err(|error| match error {
-            PublishFailure::Failed(error) => error,
-            PublishFailure::Retired(retired) => retired.to_string(),
-            PublishFailure::Conflicted { head, paths } => format!(
-                "check output discarded: branch moved to {head}; conflicting paths: {}",
-                paths.join(", ")
-            ),
-        })
+    let landed = publish_available_delta(
+        orch,
+        &publication,
+        &coordinate.prepared,
+        &coordinate.db,
+        reservation,
+        guard,
+        expected_head,
+        plan,
+    )
+    .await;
+    let consume_receipt = available.consume_receipt;
+    drop(available);
+    match landed {
+        Ok(outcome) => Ok(SlotPublication {
+            consume_receipt,
+            outcome,
+        }),
+        Err(PublishFailure::Failed(error)) => Err(discarded(error)),
+        Err(PublishFailure::Retired(retired)) => Err(discarded(retired.to_string())),
+        Err(PublishFailure::Conflicted { head, paths }) => Err(discarded(format!(
+            "branch moved to {head}; conflicting paths: {}",
+            paths.join(", ")
+        ))),
+    }
 }
 
 fn validate_publication_identity(
@@ -1011,6 +1058,12 @@ pub(crate) enum SlotPublicationError {
     /// or the job publishing it was archived. Nothing was sealed onto the
     /// branch; the delta is kept under a stranded ref so the work is not lost.
     Retired(String),
+    /// Check output whose tested head is no longer the branch head. Nothing
+    /// landed, and nothing is held or stranded.
+    Superseded,
+    /// Check output that could not land on its tested head. It is discarded
+    /// rather than held: see [`DeltaFold::Exact`].
+    Discarded(String),
 }
 
 impl std::fmt::Display for SlotPublicationError {
@@ -1020,7 +1073,12 @@ impl std::fmt::Display for SlotPublicationError {
                 f.write_str(&held::not_in_store_message(delta, error))
             }
             Self::Held { held, .. } => f.write_str(&held.message()),
-            Self::Straddled(text) | Self::Retired(text) => f.write_str(text),
+            Self::Superseded => f.write_str(
+                "check output superseded: the branch moved past the commit it was tested on",
+            ),
+            Self::Straddled(text) | Self::Retired(text) | Self::Discarded(text) => {
+                f.write_str(text)
+            }
         }
     }
 }
@@ -1053,6 +1111,102 @@ struct AvailableDelta {
     _pin: crate::jj::DeltaObjectPin,
 }
 
+/// The invoking run batch's own sealed result: the one in-flight batch a
+/// commit barrier may land under. Minted only from proof that the batch can
+/// publish nothing more (its delta installed and verified in the store, or its
+/// outcomes read back with no delta after it won its settle gate), naming the
+/// job that parked the batch and the project, store and branch it was sealed
+/// for. A child task sharing its parent's branch is named itself, never the
+/// branch's owner. The fields are private so nothing outside this module can
+/// assert one.
+#[derive(Debug, Clone)]
+pub(crate) struct SealedPublication {
+    job_id: String,
+    request_id: String,
+    project_id: String,
+    /// The store's canonical key, resolved strictly when minted.
+    store_key: String,
+    branch: String,
+}
+
+impl SealedPublication {
+    /// A routed delta now installed and verified in the store. `None` for a
+    /// request no job parked (a system check's fix): nothing of its own waits.
+    fn delivered(
+        _available: &AvailableDelta,
+        target: &RunnerPublicationTarget,
+        request: &CellRequest,
+    ) -> Option<Self> {
+        Some(Self {
+            job_id: request.requesting_job_id.clone()?,
+            request_id: request.request_id.clone(),
+            project_id: target.project_id.clone(),
+            store_key: strict_store_key(&target.store_dir)?,
+            branch: target.branch.clone(),
+        })
+    }
+
+    /// A batch whose settlement, run only after it won its settle gate, read
+    /// its outcomes back with no delta among them.
+    fn verified_empty(
+        s: &RunBatchSettlement,
+        resolution: &super::branch::BranchResolution,
+        request: &CellRequest,
+    ) -> Option<Self> {
+        Some(Self {
+            job_id: s.run_context.as_ref()?.job_id.clone(),
+            request_id: request.request_id.clone(),
+            project_id: resolution.project_id.clone(),
+            store_key: strict_store_key(&resolution.repository_path)?,
+            branch: resolution.rev.clone(),
+        })
+    }
+
+    pub(crate) fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Whether this was sealed for exactly this target: the project by id, the
+    /// store by its strictly resolved canonical path, the branch by name. A
+    /// store that cannot be resolved now (deleted since minting, say) matches
+    /// nothing, even under the spelling it was minted with.
+    pub(crate) fn is_for(&self, project_id: &str, store: &Path, branch: &str) -> bool {
+        self.project_id == project_id
+            && self.branch == branch
+            && strict_store_key(store).is_some_and(|key| key == self.store_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        job: &str,
+        request: &str,
+        project: &str,
+        store: &Path,
+        branch: &str,
+    ) -> Self {
+        Self {
+            job_id: job.into(),
+            request_id: request.into(),
+            project_id: project.into(),
+            store_key: strict_store_key(store).expect("a test capability's store exists"),
+            branch: branch.into(),
+        }
+    }
+}
+
+/// The canonical key of a store a capability is minted for, with no fallback to
+/// its spelling: an unresolvable store mints no capability, so its publication
+/// is admitted only as an ordinary writer.
+fn strict_store_key(store: &Path) -> Option<String> {
+    std::fs::canonicalize(store)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Everything needed to publish a delta the store already holds. Deliberately
 /// free of the routed request, so a held delta can be republished long after
 /// the batch that sealed it returned.
@@ -1073,6 +1227,8 @@ struct DeltaPublication<'a> {
     run_id: Option<&'a str>,
     /// The enclosing store-lock hold, whose phases this publication reports.
     trace: Option<&'a JjStoreOperationTrace>,
+    /// The in-flight batch this publication is the sealed result of, if any.
+    admission: crate::orchestrator::BatchAdmission<'a>,
     /// The key this landing is recorded under in the store's operation log.
     /// `None` for a republished held delta, which has no batch of its own.
     key: Option<String>,
@@ -1151,16 +1307,110 @@ fn make_delta_available(
     })
 }
 
-/// A routed delta made ready to land: installed, pinned, and — when it could
-/// be — integrated against the head the branch held at preparation.
+/// A branch prepared for publication: its immutable coordinate, and the
+/// database its base relationship is revalidated against under the store lock.
+pub(crate) struct PublicationCoordinate {
+    pub(crate) prepared: PreparedBranch,
+    pub(crate) db: std::sync::Arc<crate::storage::LocalDb>,
+}
+
+/// Prepare `branch` onto its base for an owner's publication, outside the
+/// store lock.
+///
+/// `sealed` is the invoking run batch's own [`SealedPublication`], minted only
+/// from its proofs, so that batch does not hold up its own preparation. Every
+/// other in-flight batch on the branch still does.
+pub(crate) async fn prepare_publication(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    owner_job_id: Option<&str>,
+    sealed: Option<&SealedPublication>,
+) -> Result<PublicationCoordinate, PreparationRefusal> {
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| PreparationRefusal::Repository(error.to_string()))?;
+    let mut request = PreparationRequest::new(
+        project_id,
+        branch,
+        owner_job_id.map(str::to_string),
+        PreparationPurpose::OwnerCommit,
+    );
+    request.sealed = sealed.cloned();
+    let prepared = prepare_branch(orch, request).await?;
+    Ok(PublicationCoordinate { prepared, db })
+}
+
+/// Whose publication a commit barrier prepares its branch for.
+#[derive(Clone, Copy)]
+struct PreparationKey<'a> {
+    project_id: &'a str,
+    branch: &'a str,
+    owner_job_id: Option<&'a str>,
+    /// See [`prepare_publication`].
+    sealed: Option<&'a SealedPublication>,
+}
+
+impl<'a> PreparationKey<'a> {
+    /// A routed delta's branch, prepared for its owner, with the sealed result
+    /// its installation proved.
+    fn for_slot(
+        target: &'a RunnerPublicationTarget,
+        request: &'a CellRequest,
+        sealed: Option<&'a SealedPublication>,
+    ) -> Self {
+        Self {
+            project_id: &target.project_id,
+            branch: &target.branch,
+            owner_job_id: request
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.job_id.as_deref()),
+            sealed,
+        }
+    }
+
+    fn admission(self) -> crate::orchestrator::BatchAdmission<'a> {
+        self.sealed.map_or(
+            crate::orchestrator::BatchAdmission::None,
+            crate::orchestrator::BatchAdmission::Sealed,
+        )
+    }
+
+    async fn prepare(self, orch: &Orchestrator) -> Result<PublicationCoordinate, String> {
+        prepare_publication(
+            orch,
+            self.project_id,
+            self.branch,
+            self.owner_job_id,
+            self.sealed,
+        )
+        .await
+        .map_err(|refusal| refusal.to_string())
+    }
+}
+
+fn unprepared(reason: &str) -> String {
+    format!("its branch could not be prepared for publication ({reason})")
+}
+
+/// A routed delta made ready to land: installed, pinned, its branch prepared,
+/// and — when it could be — integrated against the head that preparation
+/// captured.
 ///
 /// Everything here is computed without the store lock. The objects are pinned
-/// from installation until the landing transaction commits (I4), so nothing
-/// ref-less is ever unprotected, and the plan is only used under the lock if
-/// the bookmark still holds the head it was computed against (I3).
+/// from installation until the landing transaction commits or a held ref takes
+/// over (I4), and the plan is only used under the lock if the branch is still
+/// at the head it was computed against (I3). A branch that could not be
+/// prepared is kept as the reason, so the installed delta is held with it and
+/// never reported as having missed the store.
 struct PreparedSlot {
     available: AvailableDelta,
+    /// Planned on the prepared head, never on the branch name.
     plan: Option<IntegrationPlan>,
+    coordinate: Result<PublicationCoordinate, String>,
+    /// The batch's own sealed result, proven by the installation.
+    sealed: Option<SealedPublication>,
     /// The agent run publishing it, set by the run barrier. Carried to the
     /// locked publication authority and into a hold, so the run's session is
     /// judged however late the delta lands.
@@ -1177,6 +1427,7 @@ fn slot_delta_publication<'a>(
     message: &'a str,
     author: Option<&'a PublicationIdentity>,
     trace: Option<&'a JjStoreOperationTrace>,
+    admission: crate::orchestrator::BatchAdmission<'a>,
     run_id: Option<&'a str>,
     prior_since_ms: Option<i64>,
 ) -> DeltaPublication<'a> {
@@ -1195,17 +1446,19 @@ fn slot_delta_publication<'a>(
             .and_then(|owner| owner.job_id.as_deref()),
         run_id,
         trace,
+        admission,
         key: Some(publication_key(&request.request_id)),
         prior_since_ms,
     }
 }
 
-/// Install, pin, and integrate a routed delta without holding the store lock.
+/// Install, pin, prepare, and integrate a routed delta without holding the
+/// store lock.
 ///
-/// Only installation can fail the publication here, and it fails exactly as it
-/// would under the lock: nothing is in the store, nothing is held. An
-/// integration that cannot be planned is simply not planned; the locked path
-/// meets the same condition and reports it.
+/// Only installation can fail the publication here, and then nothing is in
+/// the store and nothing is held. A branch that cannot be prepared, or an
+/// integration that cannot be planned, is carried to the barrier, which holds
+/// the delta or plans again under the lock.
 async fn prepare_slot_publication(
     orch: &Orchestrator,
     target: &RunnerPublicationTarget,
@@ -1224,23 +1477,64 @@ async fn prepare_slot_publication(
                 error,
             }
         })?;
-    let publication =
-        slot_delta_publication(target, request, delta, message, author, None, None, None);
-    let plan = match cairn_vcs::resolve_coordinate(&target.store_dir, &target.branch).await {
-        Ok(head) => plan_integration(orch, &publication, head).await.ok(),
-        Err(_) => None,
-    };
-    Ok(PreparedSlot {
+    let sealed = SealedPublication::delivered(&available, target, request);
+    let mut prepared = PreparedSlot {
         available,
-        plan,
+        plan: None,
+        coordinate: Err(String::new()),
+        sealed,
         run_id: None,
         prior_since_ms: None,
-    })
+    };
+    prepare_slot_branch(orch, target, request, delta, message, author, &mut prepared).await;
+    Ok(prepared)
 }
 
-/// Land a prepared delta. Caller holds the store lock; on a failure that
-/// leaves the delta in the store it is held or stranded here, under the same
-/// hold, as before.
+/// Prepare (again) the branch an installed delta lands on, and plan the delta
+/// onto the head that preparation captured.
+async fn prepare_slot_branch(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    prepared: &mut PreparedSlot,
+) {
+    prepared.plan = None;
+    let coordinate = PreparationKey::for_slot(target, request, prepared.sealed.as_ref())
+        .prepare(orch)
+        .await;
+    prepared.coordinate = coordinate;
+    if let Ok(coordinate) = &prepared.coordinate {
+        // Planning only: nothing is admitted or moved here.
+        let publication = slot_delta_publication(
+            target,
+            request,
+            delta,
+            message,
+            author,
+            None,
+            crate::orchestrator::BatchAdmission::None,
+            None,
+            None,
+        );
+        prepared.plan =
+            plan_integration(orch, &publication, coordinate.prepared.head_after.clone())
+                .await
+                .ok();
+    }
+}
+
+/// Land a prepared delta onto `expected_head` under the caller's branch
+/// reservation and store guard.
+///
+/// The caller revalidated the prepared coordinate under `guard` before its
+/// first landing, and `expected_head` is the exact head the branch holds now:
+/// the prepared head, or the one the held deltas drained ahead of this delta
+/// left under the same guard. A delta whose branch could not be prepared, or
+/// whose landing fails after installation, is held here; one that conflicts
+/// with the head is stranded.
 #[allow(clippy::too_many_arguments)]
 async fn land_prepared_slot_delta(
     orch: &Orchestrator,
@@ -1249,34 +1543,60 @@ async fn land_prepared_slot_delta(
     delta: &crate::fleet::MutationDelta,
     message: &str,
     author: Option<&PublicationIdentity>,
-    trace: Option<&JjStoreOperationTrace>,
+    reservation: &BranchReservation,
+    guard: &JjStoreGuard,
+    expected_head: &str,
     prepared: PreparedSlot,
 ) -> Result<SlotPublication, SlotPublicationError> {
-    // Kept to the end of this function: its pin protects the delta's objects
+    // `available` is kept to the end: its pin protects the delta's objects
     // until the landing transaction has committed or a held ref has taken over.
     let PreparedSlot {
         available,
         plan,
+        coordinate,
+        sealed,
         run_id,
         prior_since_ms,
     } = prepared;
+    let trace = guard.trace();
+    let admission = sealed.as_ref().map_or(
+        crate::orchestrator::BatchAdmission::None,
+        crate::orchestrator::BatchAdmission::Sealed,
+    );
     let publication = slot_delta_publication(
         target,
         request,
         delta,
         message,
         author,
-        trace,
+        Some(&trace),
+        admission,
         run_id.as_deref(),
         prior_since_ms,
     );
-    match publish_available_delta(orch, &publication, plan).await {
+    let landed = match &coordinate {
+        Ok(coordinate) => {
+            publish_available_delta(
+                orch,
+                &publication,
+                &coordinate.prepared,
+                &coordinate.db,
+                reservation,
+                guard,
+                expected_head,
+                plan,
+            )
+            .await
+        }
+        Err(reason) => Err(PublishFailure::Failed(unprepared(reason))),
+    };
+    match landed {
         Ok(outcome) => Ok(SlotPublication {
             consume_receipt: available.consume_receipt,
             outcome,
         }),
         Err(PublishFailure::Conflicted { head, paths }) => {
-            let _phase = trace.map(|trace| trace.phase("strand conflicted delta"));
+            let _phase = trace.phase("strand conflicted delta");
             Err(SlotPublicationError::Straddled(strand_conflicted_delta(
                 &target.repository,
                 request,
@@ -1286,47 +1606,462 @@ async fn land_prepared_slot_delta(
             )))
         }
         Err(PublishFailure::Retired(retired)) => {
-            let _phase = trace.map(|trace| trace.phase("strand retired delta"));
+            let _phase = trace.phase("strand retired delta");
             let reference = stranded_ref_name(publication.job_id, &request.attempt_id);
             Err(SlotPublicationError::Retired(format!(
                 "{retired} {}",
                 keep_stranded_delta(&target.repository, &reference, &delta.delta_commit)
             )))
         }
-        Err(PublishFailure::Failed(error)) => {
-            let _phase = trace.map(|trace| trace.phase("hold delta"));
-            // Written while `available` still pins the objects, so the ref
-            // takes over protecting them before the pin is released.
-            let held = held::hold_delta(
+        Err(PublishFailure::Failed(error)) => Err(hold_slot_delta(
+            orch,
+            target,
+            request,
+            delta,
+            message,
+            author,
+            run_id.as_deref(),
+            available,
+            Some(&trace),
+            &error,
+        )
+        .await),
+    }
+}
+
+/// Hold an installed delta that could not land. Written while `available`
+/// still pins the objects, so the ref takes over protecting them before the
+/// pin is released.
+#[allow(clippy::too_many_arguments)]
+async fn hold_slot_delta(
+    orch: &Orchestrator,
+    target: &RunnerPublicationTarget,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    run_id: Option<&str>,
+    available: AvailableDelta,
+    trace: Option<&JjStoreOperationTrace>,
+    error: &str,
+) -> SlotPublicationError {
+    let _phase = trace.map(|trace| trace.phase("hold delta"));
+    let held = held::hold_delta(
+        orch,
+        held::Hold {
+            project_id: &target.project_id,
+            store_dir: &target.store_dir,
+            repository: &target.repository,
+            branch: &target.branch,
+            job_id: request
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.job_id.as_deref()),
+            run_id,
+            attempt_id: &request.attempt_id,
+            base_commit: &delta.base_commit,
+            delta_commit: &delta.delta_commit,
+            message,
+            author,
+            error,
+        },
+    )
+    .await;
+    let consume_receipt = available.consume_receipt;
+    drop(available);
+    SlotPublicationError::Held {
+        consume_receipt,
+        held,
+    }
+}
+
+/// A routed delta a commit barrier lands after whatever held work it drains.
+struct OwnDelta<'a> {
+    target: &'a RunnerPublicationTarget,
+    request: &'a CellRequest,
+    delta: &'a crate::fleet::MutationDelta,
+    message: &'a str,
+    author: Option<&'a PublicationIdentity>,
+    slot: PreparedSlot,
+    fold: DeltaFold,
+}
+
+/// How a barrier lands its own delta once the branch is prepared and guarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeltaFold {
+    /// An agent's edits: merged onto whatever head the branch holds, and held
+    /// when they cannot land.
+    Integrate,
+    /// A check's output, valid only for the tree it ran on: it lands only on
+    /// that exact head, and is otherwise discarded, never held, so no later
+    /// drain can replay stale output onto a newer head.
+    Exact,
+}
+
+/// What a prepared barrier did. Its store lock is already released.
+struct PreparedBarrier {
+    drained: Vec<held::Drained>,
+    /// The own delta's landing, hold, or strand, when it was given one.
+    own: Option<Result<SlotPublication, SlotPublicationError>>,
+}
+
+/// The one commit barrier every managed landing on a branch goes through: a
+/// run batch's own delta, the held deltas a commit_msg or a PR action drains
+/// ahead of it, and a system check's fix.
+///
+/// The branch is prepared with nothing held. Then the branch is reserved, and
+/// only then the store guard taken, so a reservation is never awaited under
+/// the guard. Under both the original capture is revalidated before anything
+/// moves; if the branch, its base, or its relationship moved in between, both
+/// are released and the branch is prepared again, at most
+/// [`PREPARATION_ATTEMPTS`] times, so preparation never runs under this
+/// barrier's own reservation. Once it holds, held deltas land oldest first and
+/// then the own delta, each revalidated against the exact head the one before
+/// it left under this same guard. The guard is released after the landings and
+/// the reservation after any hold or strand is written, so the settlement that
+/// follows (origin push, receipt) holds neither. Nothing lands on a head that
+/// was not prepared, and an installed delta that cannot land is held, never
+/// dropped.
+async fn prepared_barrier(
+    orch: &Orchestrator,
+    store: Option<&Path>,
+    operation: &str,
+    drain: bool,
+    key: PreparationKey<'_>,
+    mut own: Option<OwnDelta<'_>>,
+) -> PreparedBarrier {
+    // A delta carries the coordinate prepared with its installation.
+    let mut standalone = match own {
+        Some(_) => Err(String::new()),
+        None => key.prepare(orch).await,
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let coordinate = match own.as_ref().map_or(&standalone, |own| &own.slot.coordinate) {
+            Ok(coordinate) => coordinate,
+            Err(reason) => {
+                let reason = unprepared(reason);
+                return refuse_barrier(orch, key, drain, own, &reason).await;
+            }
+        };
+        let Some(store_path) = store else {
+            let reason = "the branch's store has no lock to publish under";
+            return refuse_barrier(orch, key, drain, own, reason).await;
+        };
+        // Held until this function returns: through the landings and any
+        // hold or strand they leave.
+        let reservation = match orch
+            .reserve_branches(store_path, &[key.branch], operation, STORE_LOCK_TIMEOUT)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(error) => return refuse_barrier(orch, key, drain, own, &error).await,
+        };
+        let guard = match acquire_store_lock(
+            orch,
+            store,
+            crate::orchestrator::StoreLockClass::Foreground,
+            operation,
+            STORE_LOCK_TIMEOUT,
+        )
+        .await
+        {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                let reason = "the branch's store has no lock to publish under";
+                return refuse_barrier(orch, key, drain, own, reason).await;
+            }
+            Err(error) => return refuse_barrier(orch, key, drain, own, &error).await,
+        };
+        match coordinate.prepared.revalidate(&coordinate.db, &guard).await {
+            Ok(()) => {}
+            Err(PreparationRefusal::Moved { what }) if attempt < PREPARATION_ATTEMPTS => {
+                drop(guard);
+                drop(reservation);
+                log::info!(
+                    "{operation} on `{}`: {what} after preparation; preparing it again",
+                    key.branch
+                );
+                match own.as_mut() {
+                    Some(own) => {
+                        prepare_slot_branch(
+                            orch,
+                            own.target,
+                            own.request,
+                            own.delta,
+                            own.message,
+                            own.author,
+                            &mut own.slot,
+                        )
+                        .await
+                    }
+                    None => standalone = key.prepare(orch).await,
+                }
+                continue;
+            }
+            Err(refusal) => {
+                drop(guard);
+                let reason = unprepared(&refusal.to_string());
+                return refuse_barrier(orch, key, drain, own, &reason).await;
+            }
+        }
+        // Every landing below moves the branch and mints its write permit
+        // under this guard, which refuses any in-flight run batch on the
+        // branch but this barrier's own sealed one: a batch that parked after
+        // preparation is seen there.
+        let mut drained = Vec::new();
+        let mut head = coordinate.prepared.head_after.clone();
+        if drain {
+            match held::drain_held_publications(
                 orch,
-                held::Hold {
-                    project_id: &target.project_id,
-                    store_dir: &target.store_dir,
-                    repository: &target.repository,
-                    branch: &target.branch,
-                    job_id: publication.job_id,
-                    run_id: publication.run_id,
-                    attempt_id: &request.attempt_id,
-                    base_commit: &delta.base_commit,
-                    delta_commit: &delta.delta_commit,
+                &coordinate.prepared,
+                &coordinate.db,
+                &reservation,
+                &guard,
+                &head,
+                key.admission(),
+            )
+            .await
+            {
+                Ok(drain) => {
+                    drained = drain.drained;
+                    head = drain.head;
+                }
+                // Revalidated just above under this guard, so nothing moved
+                // and nothing was drained: a store or database failure.
+                Err(refusal) => {
+                    drop(guard);
+                    let reason = unprepared(&refusal.to_string());
+                    return refuse_barrier(orch, key, drain, own, &reason).await;
+                }
+            }
+        }
+        let landed = match own {
+            Some(own) if own.fold == DeltaFold::Exact => {
+                Some(land_prepared_check_delta(orch, own, &reservation, &guard, &head).await)
+            }
+            Some(own) => Some(
+                land_prepared_slot_delta(
+                    orch,
+                    own.target,
+                    own.request,
+                    own.delta,
+                    own.message,
+                    own.author,
+                    &reservation,
+                    &guard,
+                    &head,
+                    own.slot,
+                )
+                .await,
+            ),
+            None => None,
+        };
+        drop(guard);
+        drop(reservation);
+        return PreparedBarrier {
+            drained,
+            own: landed,
+        };
+    }
+}
+
+/// A barrier that could land nothing: its branch could not be prepared, its
+/// lock not taken, or its capture kept moving. An installed own delta is held
+/// with the reason — never dropped, never reported as missing the store — and
+/// held work on the branch stays held, and says so.
+async fn refuse_barrier(
+    orch: &Orchestrator,
+    key: PreparationKey<'_>,
+    drain: bool,
+    own: Option<OwnDelta<'_>>,
+    reason: &str,
+) -> PreparedBarrier {
+    let mut drained = Vec::new();
+    if drain {
+        match held::held_rows(&orch.db.local, key.project_id, key.branch).await {
+            Ok(rows) if rows.is_empty() => {}
+            Ok(_) => drained.push(held::Drained::Note(format!(
+                "⚠️ Held commits on this branch could not be published: {reason}. They stay held."
+            ))),
+            Err(error) => drained.push(held::Drained::Note(format!(
+                "⚠️ Could not check this branch for held commits, so none were published: {error}."
+            ))),
+        }
+    }
+    let own = match own {
+        // Dropping the slot releases the pin: check output is discarded.
+        Some(own) if own.fold == DeltaFold::Exact => Some(Err(SlotPublicationError::Discarded(
+            format!("check output discarded: {reason}"),
+        ))),
+        Some(own) => Some(Err(hold_slot_delta(
+            orch,
+            own.target,
+            own.request,
+            own.delta,
+            own.message,
+            own.author,
+            own.slot.run_id.as_deref(),
+            own.slot.available,
+            None,
+            reason,
+        )
+        .await)),
+        None => None,
+    };
+    PreparedBarrier { drained, own }
+}
+
+/// [`prepared_barrier`] for a routed delta: what it drained, and the delta's
+/// landing, hold, or strand.
+async fn delta_barrier(
+    orch: &Orchestrator,
+    store: Option<&Path>,
+    operation: &str,
+    drain: bool,
+    own: OwnDelta<'_>,
+) -> (
+    Vec<held::Drained>,
+    Result<SlotPublication, SlotPublicationError>,
+) {
+    let sealed = own.slot.sealed.clone();
+    let key = PreparationKey::for_slot(own.target, own.request, sealed.as_ref());
+    let barrier = prepared_barrier(orch, store, operation, drain, key, Some(own)).await;
+    let landed = barrier
+        .own
+        .expect("a prepared barrier answers for the delta it was given");
+    (barrier.drained, landed)
+}
+
+/// A routed publication's outcome and the target it went to, which the
+/// settlement arms finalize and push.
+type RoutedPublication = Result<
+    (SlotPublication, RunnerPublicationTarget),
+    (SlotPublicationError, Option<RunnerPublicationTarget>),
+>;
+
+fn not_in_store(delta: &crate::fleet::MutationDelta, error: String) -> SlotPublicationError {
+    SlotPublicationError::NotInStore {
+        delta: delta.delta_commit.clone(),
+        error,
+    }
+}
+
+/// A managed batch's commit barrier: drain the branch's held deltas, then land
+/// this batch's own, all through the prepared barrier.
+///
+/// A commit_msg drains held work whether or not this batch changed anything: a
+/// trivial batch with a commit_msg is the lever an agent is given for
+/// publishing a held commit now.
+async fn logical_commit_barrier(
+    orch: &Orchestrator,
+    s: &RunBatchSettlement,
+    resolution: &super::branch::BranchResolution,
+    message: &str,
+    delta: Option<&crate::fleet::MutationDelta>,
+    request: Option<&CellRequest>,
+    author: Option<&PublicationIdentity>,
+) -> (Option<RoutedPublication>, Vec<held::Drained>) {
+    const OPERATION: &str = "run commit barrier publication";
+    let store = s.store_lock.as_deref();
+    let owner_job_id = s
+        .run_context
+        .as_ref()
+        .map(|context| context.job_id.as_str());
+    let Some(delta) = delta else {
+        // Settlement runs only after this batch won its settle gate, and it
+        // read the batch's outcomes back with no delta among them: its sealed
+        // result is verified empty, so it can publish nothing more and is
+        // named as sealed rather than holding up its own drain. Any other
+        // batch on the branch still does.
+        let sealed =
+            request.and_then(|request| SealedPublication::verified_empty(s, resolution, request));
+        let key = PreparationKey {
+            project_id: &resolution.project_id,
+            branch: &resolution.rev,
+            owner_job_id,
+            sealed: sealed.as_ref(),
+        };
+        let barrier = prepared_barrier(orch, store, OPERATION, true, key, None).await;
+        return (None, barrier.drained);
+    };
+    let prepared = match (store, request) {
+        (Some(_), Some(request)) => match resolve_runner_publication_target(resolution, request) {
+            Ok(target) => {
+                match prepare_slot_publication(orch, &target, request, delta, message, author).await
+                {
+                    // The run publishing it, judged by the locked publication
+                    // authority and recorded with any hold.
+                    Ok(mut slot) => {
+                        slot.run_id = s.request.run_id.clone();
+                        // Set on a settlement a later runner process rebuilt:
+                        // the landing first looks for its earlier one.
+                        slot.prior_since_ms = s.prior_publication_since_ms;
+                        Ok((target, slot, request))
+                    }
+                    Err(error) => Err((error, Some(target))),
+                }
+            }
+            Err(error) => Err((not_in_store(delta, error), None)),
+        },
+        (None, _) => Err((
+            not_in_store(
+                delta,
+                "build-slot publication has no resolved shared-store lock path".to_string(),
+            ),
+            None,
+        )),
+        (Some(_), None) => Err((
+            not_in_store(
+                delta,
+                "the routed request that sealed this delta is missing".to_string(),
+            ),
+            None,
+        )),
+    };
+    match prepared {
+        Ok((target, slot, request)) => {
+            let (drained, landed) = delta_barrier(
+                orch,
+                store,
+                OPERATION,
+                true,
+                OwnDelta {
+                    target: &target,
+                    request,
+                    delta,
                     message,
                     author,
-                    error: &error,
+                    slot,
+                    fold: DeltaFold::Integrate,
                 },
             )
             .await;
-            Err(SlotPublicationError::Held {
-                consume_receipt: available.consume_receipt,
-                held,
-            })
+            let routed = match landed {
+                Ok(publication) => Ok((publication, target)),
+                Err(error) => Err((error, Some(target))),
+            };
+            (Some(routed), drained)
+        }
+        Err(failed) => {
+            // This batch's delta never reached the store, so its sealed result
+            // was not captured here and it is not named: the drain prepares as
+            // any other writer on the branch would.
+            let key = PreparationKey {
+                project_id: &resolution.project_id,
+                branch: &resolution.rev,
+                owner_job_id,
+                sealed: None,
+            };
+            let barrier = prepared_barrier(orch, store, OPERATION, true, key, None).await;
+            (Some(Err(failed)), barrier.drained)
         }
     }
 }
 
-/// Prepare, land, and capture the patch of a routed delta in one call, for a
-/// caller that holds the store lock across all three. Production callers
-/// prepare before acquiring the lock instead; the straddle tests drive the same
-/// prepare-then-land sequence through this.
+/// Prepare, land, and capture the patch of a routed delta in one call, through
+/// the same prepared barrier production publishes through.
 #[cfg(test)]
 async fn publish_visible_slot_delta(
     orch: &Orchestrator,
@@ -1335,13 +2070,26 @@ async fn publish_visible_slot_delta(
     delta: &crate::fleet::MutationDelta,
     message: &str,
     author: Option<&PublicationIdentity>,
-    trace: Option<&JjStoreOperationTrace>,
+    _trace: Option<&JjStoreOperationTrace>,
 ) -> Result<SlotPublication, SlotPublicationError> {
     let prepared = prepare_slot_publication(orch, target, request, delta, message, author).await?;
-    let mut publication = land_prepared_slot_delta(
-        orch, target, request, delta, message, author, trace, prepared,
+    let (_, landed) = delta_barrier(
+        orch,
+        Some(&target.store_dir),
+        "slot delta publication",
+        false,
+        OwnDelta {
+            target,
+            request,
+            delta,
+            message,
+            author,
+            slot: prepared,
+            fold: DeltaFold::Integrate,
+        },
     )
-    .await?;
+    .await;
+    let mut publication = landed?;
     publication.outcome.capture_patch(&target.repository);
     Ok(publication)
 }
@@ -1500,22 +2248,34 @@ async fn plan_integration(
     }))
 }
 
-/// Land a delta the project store already holds onto its branch.
+/// Land a delta the project store already holds onto its prepared branch.
 ///
-/// Caller holds the canonical per-store lock and keeps the delta's objects
-/// pinned for the duration. Shared by a batch's own publication and by the
-/// republication of a held delta, so both land through one funnel.
+/// Caller holds `reservation` on the branch and then `guard`, the canonical
+/// per-store lock, and keeps the delta's objects pinned for the duration. Shared by a batch's own publication and by
+/// the republication of a held delta, so both land through one funnel.
 ///
-/// `prepared` is an integration planned before the lock. It is used only when
-/// the bookmark, read here under the lock, still holds the head it was planned
-/// against; otherwise the integration is computed again here, which is exactly
-/// the fully locked path, so the outcome is the same either way (I3). The
+/// The branch name is never re-read to find a head to land on. `expected_head`
+/// is the head the caller established under this guard: the prepared head, or
+/// the exact head its own earlier landings left. Immediately before the
+/// transaction the prepared coordinate is revalidated against it — base,
+/// relationship, bound conflict session, and head — so a delta lands only on a
+/// head prepared onto the base it was prepared against.
+///
+/// `prepared` is an integration planned before the lock, used only when it was
+/// planned on `expected_head`; otherwise the integration is computed again here
+/// against that head, so the outcome is the same either way (I3). The
 /// transaction itself still refuses a bookmark that is no longer that head.
 /// The patch is not captured here: it is a read of two immutable commits, left
 /// to [`SlotPublicationOutcome::capture_patch`] once the lock is released.
+#[allow(clippy::too_many_arguments)]
 async fn publish_available_delta(
     orch: &Orchestrator,
     publication: &DeltaPublication<'_>,
+    coordinate: &PreparedBranch,
+    db: &crate::storage::LocalDb,
+    reservation: &BranchReservation,
+    guard: &JjStoreGuard,
+    expected_head: &str,
     prepared: Option<IntegrationPlan>,
 ) -> Result<SlotPublicationOutcome, PublishFailure> {
     let DeltaPublication {
@@ -1525,14 +2285,29 @@ async fn publish_available_delta(
         job_id,
         run_id,
         trace,
+        admission,
         ..
     } = *publication;
+    if coordinate.branch != branch {
+        return Err(PublishFailure::Failed(format!(
+            "the branch was prepared as `{}`, not `{branch}`",
+            coordinate.branch
+        )));
+    }
+    if !reservation.covers(&coordinate.store, branch) {
+        return Err(PublishFailure::Failed(format!(
+            "publishing to `{branch}` requires its branch reservation, which this writer does \
+             not hold"
+        )));
+    }
     let key = publication.key.clone();
 
     // The authority check belongs here, inside the caller's store-lock hold and
-    // before the head is even read: a batch prepared while its issue was open
-    // may reach this lock after the issue resolved, and a batch whose process
-    // outlived its own cancellation still arrives here with a sealed delta.
+    // before anything is read or moved: a batch prepared while its issue was
+    // open may reach this lock after the issue resolved, and a batch whose
+    // process outlived its own cancellation still arrives here with a sealed
+    // delta. It is asked before the write permit, so a retired job's delta is
+    // stranded as retired rather than held behind another batch.
     if let Some(job_id) = job_id {
         let _checking = trace.map(|trace| trace.phase("publication authority"));
         match super::branch::publication_authority(&orch.db, job_id, run_id, Some(branch)).await {
@@ -1580,26 +2355,24 @@ async fn publish_available_delta(
         }
     }
 
-    // A delta declares as its parent the commit the batch was routed against,
-    // and the logical-head transaction refuses a parent the bookmark no longer
-    // holds. Read the bookmark here — under the same store lock the transaction
-    // will re-check it under, through the same jj view, so the two cannot
-    // disagree — and merge the batch's changes onto it when it moved. The
-    // executor cannot do this: it cannot tell its own head having been refreshed
-    // to a new tip from its head being a descendant carrying work the runner has
-    // not published back yet.
-    let resolving = trace.map(|trace| trace.phase("resolve head"));
-    let head = cairn_vcs::resolve_coordinate(store_dir, branch)
+    let _admission = guard
+        .branch_write_permit(db, reservation, &coordinate.project_id, branch, admission)
         .await
-        .map_err(|error| format!("resolve `{branch}` for delta publication: {error}"))?;
-    drop(resolving);
+        .map_err(|refusal| PublishFailure::Failed(refusal.to_string()))?;
+    let revalidating = trace.map(|trace| trace.phase("revalidate prepared coordinate"));
+    coordinate
+        .revalidate_for_publication(db, guard, expected_head)
+        .await
+        .map_err(|refusal| PublishFailure::Failed(refusal.to_string()))?;
+    drop(revalidating);
+    let head = expected_head.to_string();
     let plan = match prepared {
         Some(plan) if plan.reusable && plan.head == head => plan,
         prepared => {
             if let Some(stale) = prepared.filter(|plan| plan.head != head) {
                 log::info!(
-                    "delta publication on `{branch}`: the head moved from {} to {head} after \
-                     preparation; integrating again under the store lock",
+                    "delta publication on `{branch}`: planned on {} but landing on {head}, which \
+                     held deltas reached first; integrating again under the store lock",
                     stale.head
                 );
             }
@@ -1970,12 +2743,16 @@ pub(crate) mod slot_publication_tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    /// A colocated repository holding a `feature` bookmark, plus everything the
-    /// runner has in hand at publication time: the routed request, the sealed
-    /// delta, and the publication target.
+    /// A project Git repository with its Cairn-managed jj store (the store
+    /// `project_store_dir` derives under `_home`, backed by the repository as
+    /// external Git) holding a `feature` bookmark, plus everything the runner
+    /// has in hand at publication time: the routed request, the sealed delta,
+    /// and the publication target. Git object reads go to `repository`; jj
+    /// bookmark and view operations go to `target.store_dir`.
     pub(crate) struct Straddle {
         _home: tempfile::TempDir,
         _repo: tempfile::TempDir,
+        jj_bin: String,
         jj: JjEnv,
         pub(crate) repository: PathBuf,
         target: RunnerPublicationTarget,
@@ -1988,10 +2765,23 @@ pub(crate) mod slot_publication_tests {
     }
 
     impl Straddle {
+        pub(crate) fn store(&self) -> &std::path::Path {
+            &self.target.store_dir
+        }
+
+        /// The orchestrator config directory the store lives under.
+        pub(crate) fn home(&self) -> &std::path::Path {
+            self._home.path()
+        }
+
+        pub(crate) fn jj_bin(&self) -> &str {
+            &self.jj_bin
+        }
+
         pub(crate) fn bookmark(&self) -> String {
             self.jj
                 .run(
-                    &self.repository,
+                    self.store(),
                     &[
                         "log",
                         "-r",
@@ -2053,12 +2843,28 @@ pub(crate) mod slot_publication_tests {
         let delta_commit = side(batch, "the batch");
         git(path, &["checkout", "-q", "main"]);
 
-        jj.run(path, &["git", "init", "--colocate", "."], "colocate")
-            .unwrap();
+        // The store production resolves for this project: keyed by the same
+        // repository path the project row carries, under the orchestrator's
+        // config directory.
+        let store = crate::jj::project_store_dir(home.path(), &repository);
+        crate::jj::ensure_project_store(&jj, &store, &repository).unwrap();
         jj.run(
-            path,
-            &["bookmark", "create", "feature", "-r", &base],
+            &store,
+            &[
+                "bookmark",
+                "create",
+                "feature",
+                "-r",
+                &base,
+                "--ignore-working-copy",
+            ],
             "create the job bookmark",
+        )
+        .unwrap();
+        jj.run(
+            &store,
+            &["git", "export", "--ignore-working-copy"],
+            "export the job bookmark",
         )
         .unwrap();
         let head = match sibling {
@@ -2069,7 +2875,7 @@ pub(crate) mod slot_publication_tests {
                 // landing would.
                 crate::jj::publish_logical_head_exported(
                     &jj,
-                    &repository,
+                    &store,
                     "feature",
                     &base,
                     crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
@@ -2107,7 +2913,9 @@ pub(crate) mod slot_publication_tests {
             waiting_since_unix_ms: 0,
             timeout_ms: 1_000,
             mutation_policy: cairn_common::executor_protocol::MutationPolicy::AllowDelta,
-            requesting_job_id: None,
+            // The job that routed (and so parked) the batch, which its sealed
+            // result names.
+            requesting_job_id: Some(FEATURE_JOB.into()),
             affinity_key: None,
             executor: None,
             pinned_executor_id: None,
@@ -2125,7 +2933,7 @@ pub(crate) mod slot_publication_tests {
             project_id: "project".into(),
             repository_identity: request.repository.identity(),
             repository: repository.clone(),
-            store_dir: repository.clone(),
+            store_dir: store,
             git_common_dir: repository.join(".git"),
             branch: "feature".into(),
         };
@@ -2137,6 +2945,7 @@ pub(crate) mod slot_publication_tests {
         Some(Straddle {
             _home: home,
             _repo: repo,
+            jj_bin: bin,
             jj,
             repository,
             target,
@@ -2147,34 +2956,232 @@ pub(crate) mod slot_publication_tests {
         })
     }
 
-    async fn orchestrator() -> Orchestrator {
+    /// The live owner of the `feature` branch.
+    const FEATURE_JOB: &str = "job-feature";
+    /// The live owner of the `later` branch the hold tests publish to.
+    const LATER_JOB: &str = "job-later";
+
+    /// An orchestrator over `fx`'s managed store: its config directory is the
+    /// one the store was derived under, the project row carries the real
+    /// repository path (so `project_store_dir` resolves to `fx.target.store_dir`),
+    /// and each branch the tests publish to has a live managed owner job, as
+    /// branch preparation requires.
+    async fn orchestrator(fx: &Straddle) -> Orchestrator {
         let db = crate::storage::migrated_test_db("run-slot-publication-test.db").await;
-        // A managed delta's catalog publication carries the project id, and the
-        // pack catalog holds a foreign key to `projects`. Without the row the
-        // publication fails and the receipt is never finalized — a property of
-        // the fixture, not of the publication path, so seed it here rather than
-        // let it masquerade as behavior.
-        db.write(|conn| {
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('project', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
-                    (),
-                )
-                .await?;
-                Ok(())
-            })
-        })
+        let repo_sql = fx.repository.to_string_lossy().replace('\'', "''");
+        db.execute_script(format!(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('project', 'default', 'Project', 'proj', '{repo_sql}', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1', 'project', 1, 'Issue', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-1', 'recipe-default', 'issue-1', 'project', 'running', 1, 1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+               VALUES ('{FEATURE_JOB}', 'exec-1', 'node', 'issue-1', 'project', 'running', 'feature', NULL, 1, 1),
+                      ('{LATER_JOB}', 'exec-1', 'node', 'issue-1', 'project', 'running', 'later', NULL, 1, 1);
+             INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('run-feature', 'issue-1', 'project', '{FEATURE_JOB}', 'live', 1, 1),
+                      ('run-later', 'issue-1', 'project', '{LATER_JOB}', 'live', 1, 1);"
+        ))
         .await
         .unwrap();
-        let config_dir = tempfile::tempdir().unwrap().keep();
-        let index_path = config_dir.join("search-index.db");
+        let config_dir = fx._home.path().to_path_buf();
         let db_state = Arc::new(DbState::new(
             Arc::new(db),
-            Arc::new(SearchIndex::open_or_create(index_path).unwrap()),
+            Arc::new(SearchIndex::open_or_create(config_dir.join("search-index.db")).unwrap()),
         ));
         let services = Arc::new(TestServicesBuilder::new().build());
-        Orchestrator::builder(db_state, services, config_dir).build()
+        Orchestrator::builder(db_state, services, config_dir)
+            .jj_binary_path(&fx.jj_bin)
+            .build()
+    }
+
+    /// A further live job on `branch`, created before the fixture's owners so
+    /// it never becomes the branch's owner: a sibling whose in-flight batch
+    /// the owner must not publish under.
+    async fn add_job(orch: &Orchestrator, job_id: &str, branch: &str) {
+        orch.db
+            .local
+            .execute_script(format!(
+                "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+                   VALUES ('{job_id}', 'exec-1', 'node', 'issue-1', 'project', 'running', '{branch}', NULL, 0, 0);"
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// A pending run-batch suspension of `job_id` under `request_id`: a batch
+    /// that may still commit to the job's branch. The wait hangs off a real
+    /// session, run and turn of that job, as a parked call does.
+    async fn park_run_batch(orch: &Orchestrator, job_id: &str, request_id: &str) {
+        let tag = format!("{job_id}-{request_id}");
+        orch.db
+            .local
+            .execute_script(format!(
+                "INSERT INTO sessions(id, job_id, status, backend_id, created_at, updated_at)
+                   VALUES('session-{tag}', '{job_id}', 'open', 'backend', 1, 1);
+                 INSERT INTO runs(id, project_id, job_id, issue_id, status, session_id, created_at, updated_at)
+                   VALUES('run-{tag}', 'project', '{job_id}', 'issue-1', 'live', 'session-{tag}', 1, 1);
+                 INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                                   yield_reason, created_at, updated_at)
+                   VALUES('turn-{tag}', 'session-{tag}', 'run-{tag}', '{job_id}', 1, 'yielded',
+                          'initial', 'wait', 1, 1);"
+            ))
+            .await
+            .unwrap();
+        let condition = serde_json::to_string(
+            &crate::mcp::handlers::durable_suspend::Condition::RunBatch {
+                request_id: request_id.into(),
+                commits: true,
+                label: None,
+                host: false,
+                identity: None,
+                verdict_only: false,
+                settlement: None,
+            },
+        )
+        .unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO agent_waits(id, job_id, run_id, session_id, predecessor_turn_id,
+                                         tool_use_id, condition_json, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 1)",
+                (
+                    format!("wait-{tag}"),
+                    job_id.to_string(),
+                    format!("run-{tag}"),
+                    format!("session-{tag}"),
+                    format!("turn-{tag}"),
+                    format!("tool-{tag}"),
+                    condition,
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The store's writer lock, as a commit barrier takes it.
+    async fn lock(orch: &Orchestrator, fx: &Straddle) -> JjStoreGuard {
+        acquire_store_lock(
+            orch,
+            Some(fx.store()),
+            crate::orchestrator::StoreLockClass::Foreground,
+            "slot publication test",
+            STORE_LOCK_TIMEOUT,
+        )
+        .await
+        .unwrap()
+        .expect("the managed store has a lock")
+    }
+
+    /// A publication reservation of `branches` in `fx`'s store, as a commit
+    /// barrier takes it: before, and never while holding, the store guard.
+    async fn reserve(orch: &Orchestrator, fx: &Straddle, branches: &[&str]) -> BranchReservation {
+        orch.reserve_branches(
+            fx.store(),
+            branches,
+            "slot publication test",
+            STORE_LOCK_TIMEOUT,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Prepare `branch` for its live owner and drain its held deltas under the
+    /// store lock, exactly as a commit barrier does before its own landing.
+    async fn drain(orch: &Orchestrator, fx: &Straddle, branch: &str) -> Vec<held::Drained> {
+        let coordinate = prepare_publication(orch, "project", branch, None, None)
+            .await
+            .unwrap_or_else(|refusal| panic!("`{branch}` prepares: {refusal}"));
+        let reservation = reserve(orch, fx, &[branch]).await;
+        let guard = lock(orch, fx).await;
+        coordinate
+            .prepared
+            .revalidate(&coordinate.db, &guard)
+            .await
+            .expect("nothing moved between preparation and the drain");
+        held::drain_held_publications(
+            orch,
+            &coordinate.prepared,
+            &coordinate.db,
+            &reservation,
+            &guard,
+            &coordinate.prepared.head_after,
+            crate::orchestrator::BatchAdmission::None,
+        )
+        .await
+        .expect("nothing moved between preparation and the drain")
+        .drained
+    }
+
+    async fn landed_head(orch: &Orchestrator, attempt_id: &str) -> String {
+        orch.db
+            .local
+            .query_opt(
+                "SELECT landed_head FROM held_publications WHERE attempt_id = ?1",
+                (attempt_id.to_string(),),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+            .flatten()
+            .unwrap_or_else(|| panic!("{attempt_id} recorded where it landed"))
+    }
+
+    /// Advance `main` past the routed base the way a base advance reaches the
+    /// store: its Git ref moves and the store imports it. Every branch cut
+    /// from the old base is then behind, so preparing one installs a replay.
+    /// Returns the new base.
+    fn advance_base(fx: &Straddle, file: &str) -> String {
+        let upstream = side_commit(fx, &fx.base, &[(file, "from main\n")]);
+        git(
+            &fx.repository,
+            &["update-ref", "refs/heads/main", &upstream],
+        );
+        fx.jj
+            .run(
+                fx.store(),
+                &["git", "import", "--ignore-working-copy"],
+                "import the advanced base",
+            )
+            .unwrap();
+        upstream
+    }
+
+    fn is_ancestor(fx: &Straddle, ancestor: &str, descendant: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .current_dir(&fx.repository)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn own_delta<'a>(
+        fx: &'a Straddle,
+        request: &'a CellRequest,
+        delta: &'a crate::fleet::MutationDelta,
+        message: &'a str,
+        slot: PreparedSlot,
+    ) -> OwnDelta<'a> {
+        OwnDelta {
+            target: &fx.target,
+            request,
+            delta,
+            message,
+            author: None,
+            slot,
+            fold: DeltaFold::Integrate,
+        }
+    }
+
+    /// `fx`'s own delta landed as check output.
+    fn exact_delta(fx: &Straddle, slot: PreparedSlot) -> OwnDelta<'_> {
+        OwnDelta {
+            fold: DeltaFold::Exact,
+            ..own_delta(fx, &fx.request, &fx.delta, "fix", slot)
+        }
     }
 
     fn published_paths(patch: &str) -> Vec<String> {
@@ -2201,7 +3208,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_straddled_batch_publishes_onto_the_head: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
 
         let publication = publish_visible_slot_delta(
             &orch,
@@ -2279,34 +3286,43 @@ pub(crate) mod slot_publication_tests {
         commit
     }
 
-    /// The compare-and-set behind preparing outside the lock (I3). A batch is
-    /// integrated against the head it finds, then a sibling lands before the
-    /// batch reaches the lock. The prepared plan must be discarded and the
-    /// integration done again under the lock, so the batch lands on the
-    /// sibling exactly as a fully locked publication would have.
+    /// The compare-and-set behind preparing outside the lock. A batch is
+    /// prepared and planned against the head it finds, then a sibling lands
+    /// before the batch reaches the lock. Revalidation under the lock catches
+    /// the move, the branch is prepared again, and the batch lands on the
+    /// sibling's commit, never on a head no preparation captured.
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_head_that_moves_after_preparation_is_integrated_again_under_the_lock() {
+    async fn a_head_that_moves_after_preparation_is_prepared_again_under_the_lock() {
         let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
             eprintln!("skipping a_head_that_moves_after_preparation: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
 
         let prepared =
             prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
                 .await
                 .expect("the delta prepares");
         assert_eq!(
+            prepared
+                .coordinate
+                .as_ref()
+                .map(|coordinate| coordinate.prepared.head_after.as_str())
+                .ok(),
+            Some(fx.base.as_str()),
+            "prepared at the head the bookmark held"
+        );
+        assert_eq!(
             prepared.plan.as_ref().map(|plan| plan.head.as_str()),
             Some(fx.base.as_str()),
-            "planned against the head the bookmark held at preparation"
+            "planned on the prepared head"
         );
 
         let sibling = side_commit(&fx, &fx.base, &[("advanced.rs", "after the advance\n")]);
         let moved = crate::jj::publish_logical_head_exported(
             &fx.jj,
-            &fx.repository,
+            fx.store(),
             "feature",
             &fx.base,
             crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
@@ -2320,18 +3336,16 @@ pub(crate) mod slot_publication_tests {
         .landed
         .head;
 
-        let mut publication = land_prepared_slot_delta(
+        let (drained, landed) = delta_barrier(
             &orch,
-            &fx.target,
-            &fx.request,
-            &fx.delta,
-            "the batch",
-            None,
-            None,
-            prepared,
+            Some(fx.store()),
+            "slot publication test",
+            false,
+            own_delta(&fx, &fx.request, &fx.delta, "the batch", prepared),
         )
-        .await
-        .expect("the batch still publishes onto the moved head");
+        .await;
+        assert!(drained.is_empty(), "{drained:?}");
+        let mut publication = landed.expect("the batch still publishes onto the moved head");
         publication.outcome.capture_patch(&fx.repository);
         let SlotPublicationOutcome::Published {
             landed,
@@ -2368,7 +3382,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping an_unmoved_head_lands_the_prepared_plan: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let prepared =
             prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
                 .await
@@ -2380,6 +3394,19 @@ pub(crate) mod slot_publication_tests {
                 ..
             })
         ));
+        let coordinate = prepared
+            .coordinate
+            .as_ref()
+            .expect("the owned branch prepares");
+        let expected_head = coordinate.prepared.head_after.clone();
+        assert_eq!(expected_head, fx.base);
+        let reservation = reserve(&orch, &fx, &["feature"]).await;
+        let guard = lock(&orch, &fx).await;
+        coordinate
+            .prepared
+            .revalidate(&coordinate.db, &guard)
+            .await
+            .expect("nothing moved since preparation");
         let publication = land_prepared_slot_delta(
             &orch,
             &fx.target,
@@ -2387,11 +3414,14 @@ pub(crate) mod slot_publication_tests {
             &fx.delta,
             "the batch",
             None,
-            None,
+            &reservation,
+            &guard,
+            &expected_head,
             prepared,
         )
         .await
         .unwrap();
+        drop(guard);
         let SlotPublicationOutcome::Published {
             landed,
             integration,
@@ -2407,6 +3437,272 @@ pub(crate) mod slot_publication_tests {
         );
     }
 
+    /// Cancelling a commit barrier mid-publication cannot release its store
+    /// guard early. With the publication held between its land and export
+    /// legs, the caller is aborted from this task: no second writer gets the
+    /// guard until the publication finishes, a preparation queued meanwhile
+    /// captures the head it published, and the store has one operation head.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(jj)]
+    async fn a_cancelled_publication_keeps_the_store_guard_until_it_finishes() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_cancelled_publication_keeps_the_store_guard: jj not resolvable");
+            return;
+        };
+        let fx = Arc::new(fx);
+        let orch = orchestrator(&fx).await;
+        let pause = crate::jj::testing::pause_publication_after_landing(fx.store());
+        let caller = tokio::spawn({
+            let (orch, fx) = (orch.clone(), fx.clone());
+            async move {
+                publish_visible_slot_delta(
+                    &orch,
+                    &fx.target,
+                    &fx.request,
+                    &fx.delta,
+                    "the batch",
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+            }
+        });
+        assert!(
+            crate::jj::in_place_blocking(
+                || pause.wait_until_paused(std::time::Duration::from_secs(60))
+            ),
+            "the publication reached the pause between its legs"
+        );
+        caller.abort();
+
+        let contender = orch
+            .acquire_jj_store_lock_with_timeout(
+                fx.store(),
+                crate::orchestrator::StoreLockClass::Foreground,
+                "contending writer",
+                Some(std::time::Duration::from_millis(500)),
+            )
+            .await;
+        assert!(
+            contender.is_err(),
+            "a second writer took the store guard while the cancelled publication was writing"
+        );
+        assert!(
+            !caller.is_finished(),
+            "the abort cannot end the publishing poll"
+        );
+        let queued = tokio::spawn({
+            let orch = orch.clone();
+            async move {
+                prepare_publication(&orch, "project", "feature", None, None)
+                    .await
+                    .map(|coordinate| coordinate.prepared.head_after)
+                    .map_err(|refusal| refusal.to_string())
+            }
+        });
+
+        pause.release();
+        let _ = caller.await;
+        let published = fx.bookmark();
+        assert_ne!(published, fx.base, "the batch landed");
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", "refs/heads/feature"]),
+            published,
+            "the export leg finished before the guard was released"
+        );
+        assert_eq!(
+            queued.await.unwrap().expect("the queued preparation runs"),
+            published,
+            "the queued preparation captures the published head"
+        );
+        assert!(
+            matches!(
+                cairn_vcs::settled_operation(fx.store()),
+                Ok(cairn_vcs::SettledOperation::Single(_))
+            ),
+            "one operation head"
+        );
+        drop(lock(&orch, &fx).await);
+    }
+
+    /// A landing is only as good as the reservation it runs under. One whose
+    /// reservation does not cover its branch is held, its sealed commit kept
+    /// under its ref, and the branch is never published.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_landing_without_a_covering_reservation_is_held_not_published() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_landing_without_a_covering_reservation: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .unwrap();
+        let coordinate = prepared
+            .coordinate
+            .as_ref()
+            .expect("the owned branch prepares");
+        let expected_head = coordinate.prepared.head_after.clone();
+        let reservation = reserve(&orch, &fx, &["unrelated"]).await;
+        let guard = lock(&orch, &fx).await;
+        coordinate
+            .prepared
+            .revalidate(&coordinate.db, &guard)
+            .await
+            .expect("nothing moved since preparation");
+        let landed = land_prepared_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            &reservation,
+            &guard,
+            &expected_head,
+            prepared,
+        )
+        .await;
+        drop(guard);
+
+        let held = match landed {
+            Err(SlotPublicationError::Held { held, .. }) => held,
+            other => panic!("an unreserved landing is held, got {other:?}"),
+        };
+        assert_eq!(
+            git_stdout(
+                &fx.repository,
+                &["rev-parse", &held.reference.clone().expect("ref-protected")]
+            ),
+            fx.delta.delta_commit
+        );
+        assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
+        assert_eq!(fx.bookmark(), fx.base, "the branch was never published");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn acceptance_debt_is_checked_again_after_preparation_before_a_delta_lands() {
+        for (status, publishes) in [("unknown", false), ("pending", true)] {
+            let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+                eprintln!("skipping acceptance_debt_is_checked_again: jj not resolvable");
+                return;
+            };
+            let orch = orchestrator(&fx).await;
+            let prepared = prepare_slot_publication(
+                &orch,
+                &fx.target,
+                &fx.request,
+                &fx.delta,
+                "the batch",
+                None,
+            )
+            .await
+            .unwrap();
+            let coordinate = prepared.coordinate.as_ref().expect("the branch prepares");
+            let expected_head = coordinate.prepared.head_after.clone();
+            let reservation = reserve(&orch, &fx, &["feature"]).await;
+            let guard = lock(&orch, &fx).await;
+            let store_key =
+                crate::orchestrator::base_advance::preparation::journal_store_key(fx.store())
+                    .unwrap();
+            // Model a row whose terminal SQL write was lost after installation.
+            // It appears after capture, so preparation alone cannot enforce it.
+            coordinate
+                .db
+                .execute(
+                    "INSERT INTO branch_advance_acceptances
+                   (id, project_id, store_path, branch, head_before, head_after, base_branch,
+                    base_commit, captured_operation, dropped_commits_json, inherited_drops_json,
+                    status, created_at)
+                 VALUES ('debt-after-capture', 'project', ?1, 'feature', ?2, ?3, 'main',
+                         ?3, 'captured-op', '[]', '[]', ?4, 1)",
+                    cairn_db::turso::params![
+                        store_key.as_str(),
+                        fx.delta.delta_commit.as_str(),
+                        expected_head.as_str(),
+                        status
+                    ],
+                )
+                .await
+                .unwrap();
+            let landed = land_prepared_slot_delta(
+                &orch,
+                &fx.target,
+                &fx.request,
+                &fx.delta,
+                "the batch",
+                None,
+                &reservation,
+                &guard,
+                &expected_head,
+                prepared,
+            )
+            .await;
+            drop(guard);
+
+            if publishes {
+                assert!(
+                    landed.is_ok(),
+                    "exact pending acceptance settles in the same call: {landed:?}"
+                );
+                let published_head = match landed.unwrap().outcome {
+                    SlotPublicationOutcome::Published { landed, .. } => landed.head,
+                    SlotPublicationOutcome::AlreadyLanded { head } => head,
+                    SlotPublicationOutcome::PublishedEarlier { .. } => {
+                        panic!("a landing that is no re-drive finds no earlier one")
+                    }
+                };
+                assert_eq!(fx.bookmark(), published_head);
+                assert_eq!(fx.blob(&published_head, "mine.rs"), "the batch's work");
+                // Publication stamps the managed identity; its commit id can
+                // differ from the sealed delta while its exact tree is preserved.
+                assert_eq!(
+                    git_stdout(
+                        &fx.repository,
+                        &["show", "-s", "--format=%T", &published_head]
+                    ),
+                    git_stdout(
+                        &fx.repository,
+                        &["show", "-s", "--format=%T", &fx.delta.delta_commit]
+                    ),
+                );
+                let status = orch.db.local.query_one(
+                    "SELECT status FROM branch_advance_acceptances WHERE id = 'debt-after-capture'",
+                    (), |row| row.text(0),
+                ).await.unwrap();
+                assert_eq!(status, "accepted");
+            } else {
+                let held = match landed {
+                    Err(SlotPublicationError::Held { held, .. }) => held,
+                    other => {
+                        panic!("unknown acceptance must hold the immutable delta, got {other:?}")
+                    }
+                };
+                assert_eq!(
+                    git_stdout(
+                        &fx.repository,
+                        &[
+                            "rev-parse",
+                            &held.reference.expect("the delta stays protected")
+                        ]
+                    ),
+                    fx.delta.delta_commit,
+                );
+                assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
+                assert_eq!(
+                    fx.bookmark(),
+                    expected_head,
+                    "no branch move under unknown debt"
+                );
+            }
+        }
+    }
+
     /// Nothing about the ordinary path changes. With the bookmark still at the
     /// commit the batch was routed against, the sealed delta publishes exactly
     /// as it was sealed and nothing is reported as integrated.
@@ -2417,7 +3713,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping an_unmoved_bookmark_publishes_the_sealed_delta: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
 
         let publication = publish_visible_slot_delta(
             &orch,
@@ -2466,7 +3762,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping an_amend_that_straddles: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
 
         let publication =
             publish_visible_slot_delta(&orch, &fx.target, &fx.request, &fx.delta, "^", None, None)
@@ -2579,14 +3875,14 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping an_already_landed_managed_delta: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let staging = tempfile::tempdir().unwrap();
         let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
         assert!(orch.object_plane.staged_delta(&receipt).is_some());
 
         let published = publish_and_seal_slot_delta(
             &orch,
-            &fx.repository,
+            fx.store(),
             &fx.request,
             &fx.delta,
             "feature",
@@ -2624,10 +3920,10 @@ pub(crate) mod slot_publication_tests {
                 eprintln!("skipping a_fix_merged_onto_an_advanced_head: jj not resolvable");
                 return;
             };
-            let orch = orchestrator().await;
+            let orch = orchestrator(&fx).await;
             let published = publish_and_seal_slot_delta(
                 &orch,
-                &fx.repository,
+                fx.store(),
                 &fx.request,
                 &fx.delta,
                 "feature",
@@ -2661,13 +3957,13 @@ pub(crate) mod slot_publication_tests {
         )
         .await
         .expect("jj is required for the check-fold regression");
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         assert_eq!(fx.blob(&fx.base, "mine.rs"), "base");
         assert_eq!(fx.blob(&fx.head, "mine.rs"), "");
 
         let published = publish_and_seal_slot_delta(
             &orch,
-            &fx.repository,
+            fx.store(),
             &fx.request,
             &fx.delta,
             "feature",
@@ -2697,7 +3993,7 @@ pub(crate) mod slot_publication_tests {
         let fx = straddle(None, &[("mine.rs", "base\nformatted\n")])
             .await
             .expect("jj is required for the check-fold regression");
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let prepared =
             prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "fix", None)
                 .await
@@ -2706,7 +4002,7 @@ pub(crate) mod slot_publication_tests {
         let sibling = side_commit(&fx, &fx.base, &[("mine.rs", "")]);
         let moved = crate::jj::publish_logical_head_exported(
             &fx.jj,
-            &fx.repository,
+            fx.store(),
             "feature",
             &fx.base,
             crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
@@ -2719,28 +4015,18 @@ pub(crate) mod slot_publication_tests {
         .unwrap()
         .landed
         .head;
-        let _guard = acquire_store_lock(
+        let (_, outcome) = delta_barrier(
             &orch,
-            Some(&fx.repository),
-            crate::orchestrator::StoreLockClass::Foreground,
+            Some(fx.store()),
             "check-fold regression",
-            STORE_LOCK_TIMEOUT,
+            false,
+            exact_delta(&fx, prepared),
         )
-        .await
-        .unwrap();
-        let outcome = land_prepared_check_delta(
-            &orch,
-            &fx.target,
-            &fx.request,
-            &fx.delta,
-            "fix",
-            None,
-            None,
-            prepared,
-        )
-        .await
-        .unwrap();
-        assert!(outcome.is_none());
+        .await;
+        assert!(
+            matches!(outcome, Err(SlotPublicationError::Superseded)),
+            "{outcome:?}"
+        );
         assert_eq!(fx.bookmark(), moved);
         assert_eq!(fx.blob(&moved, "mine.rs"), "");
     }
@@ -2751,7 +4037,7 @@ pub(crate) mod slot_publication_tests {
         let mut fx = straddle(None, &[("mine.rs", "formatted\n")])
             .await
             .expect("jj is required for the check-fold regression");
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let original_base = fx.base.clone();
         let source = side_commit(&fx, &original_base, &[("mine.rs", "unformatted\n")]);
         // A bookmark target must be indexed by jj, not merely present in Git.
@@ -2760,10 +4046,14 @@ pub(crate) mod slot_publication_tests {
             &["update-ref", "refs/heads/source", &source],
         );
         fx.jj
-            .run(&fx.repository, &["git", "import"], "import source")
+            .run(
+                fx.store(),
+                &["git", "import", "--ignore-working-copy"],
+                "import source",
+            )
             .unwrap();
         cairn_vcs::repoint_bookmark_if_unchanged(
-            &fx.repository,
+            fx.store(),
             "feature",
             std::slice::from_ref(&original_base),
             &source,
@@ -2771,7 +4061,11 @@ pub(crate) mod slot_publication_tests {
         )
         .unwrap();
         fx.jj
-            .run(&fx.repository, &["git", "export"], "export source")
+            .run(
+                fx.store(),
+                &["git", "export", "--ignore-working-copy"],
+                "export source",
+            )
             .unwrap();
         fx.base = source.clone();
         fx.head = source.clone();
@@ -2796,10 +4090,14 @@ pub(crate) mod slot_publication_tests {
             &["update-ref", "refs/heads/replayed", &replayed],
         );
         fx.jj
-            .run(&fx.repository, &["git", "import"], "import replay")
+            .run(
+                fx.store(),
+                &["git", "import", "--ignore-working-copy"],
+                "import replay",
+            )
             .unwrap();
         cairn_vcs::repoint_bookmark_if_unchanged(
-            &fx.repository,
+            fx.store(),
             "feature",
             std::slice::from_ref(&source),
             &replayed,
@@ -2807,32 +4105,26 @@ pub(crate) mod slot_publication_tests {
         )
         .unwrap();
         fx.jj
-            .run(&fx.repository, &["git", "export"], "export replay")
+            .run(
+                fx.store(),
+                &["git", "export", "--ignore-working-copy"],
+                "export replay",
+            )
             .unwrap();
         assert!(!git_is_ancestor(&fx.repository, &source, &replayed));
 
-        let _guard = acquire_store_lock(
+        let (_, outcome) = delta_barrier(
             &orch,
-            Some(&fx.repository),
-            crate::orchestrator::StoreLockClass::Foreground,
+            Some(fx.store()),
             "check-fold replay regression",
-            STORE_LOCK_TIMEOUT,
+            false,
+            exact_delta(&fx, prepared),
         )
-        .await
-        .unwrap();
-        let outcome = land_prepared_check_delta(
-            &orch,
-            &fx.target,
-            &fx.request,
-            &fx.delta,
-            "fix",
-            None,
-            None,
-            prepared,
-        )
-        .await
-        .unwrap();
-        assert!(outcome.is_none());
+        .await;
+        assert!(
+            matches!(outcome, Err(SlotPublicationError::Superseded)),
+            "{outcome:?}"
+        );
         assert_eq!(fx.bookmark(), replayed);
         assert_eq!(fx.blob(&replayed, "advanced.rs"), "new base dependency");
         assert_eq!(fx.blob(&replayed, "mine.rs"), "unformatted");
@@ -2848,13 +4140,13 @@ pub(crate) mod slot_publication_tests {
         let fx = straddle(None, &[("mine.rs", "unpublished\n")])
             .await
             .expect("jj is required for the check-fold regression");
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let (request, delta) = absorbing_delta(&fx, &[("mine.rs", "formatted\n")]);
         assert_eq!(request.base_commit, fx.head);
         assert_eq!(delta.base_commit, fx.head);
         let published = publish_and_seal_slot_delta(
             &orch,
-            &fx.repository,
+            fx.store(),
             &request,
             &delta,
             "feature",
@@ -2874,7 +4166,7 @@ pub(crate) mod slot_publication_tests {
         let fx = straddle(None, &[("mine.rs", "base\nformatted\n")])
             .await
             .expect("jj is required for the check-fold regression");
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         // Simulate a transient fence-read failure after input validation.
         orch.db
             .local
@@ -2892,7 +4184,7 @@ pub(crate) mod slot_publication_tests {
             .unwrap();
         let error = publish_and_seal_slot_delta(
             &orch,
-            &fx.repository,
+            fx.store(),
             &fx.request,
             &fx.delta,
             "feature",
@@ -2928,7 +4220,7 @@ pub(crate) mod slot_publication_tests {
         let sibling = side_commit(&fx, &fx.base, &[("mine.rs", "")]);
         let moved = crate::jj::publish_logical_head_exported(
             &fx.jj,
-            &fx.repository,
+            fx.store(),
             "feature",
             &fx.base,
             crate::jj::ProposedPublication::DeltaCommit(sibling.into()),
@@ -2941,11 +4233,10 @@ pub(crate) mod slot_publication_tests {
         .unwrap()
         .landed
         .head;
-        assert!(
-            held::drain_held_publications(&orch, "project", "feature", None)
-                .await
-                .is_empty()
-        );
+        assert!(held::held_rows(&orch.db.local, "project", "feature")
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(fx.bookmark(), moved);
         assert_eq!(fx.blob(&moved, "mine.rs"), "");
     }
@@ -2966,7 +4257,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_straddle_that_cannot_merge: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
 
         let error = publish_visible_slot_delta(
             &orch,
@@ -3001,9 +4292,9 @@ pub(crate) mod slot_publication_tests {
     }
 
     /// Hold `fx`'s delta the way a failed publication does: the store takes
-    /// its objects, then the branch transaction fails. Publishing to a branch
-    /// that does not exist yet is the deterministic stand-in for lock
-    /// contention that outlasts patience.
+    /// its objects, then the branch cannot take them. A branch that does not
+    /// exist yet cannot be prepared, the deterministic stand-in for anything
+    /// that stops an installed delta from landing.
     async fn hold(orch: &Orchestrator, fx: &mut Straddle, branch: &str) -> held::HeldDelta {
         fx.target.branch = branch.into();
         match publish_visible_slot_delta(
@@ -3025,7 +4316,7 @@ pub(crate) mod slot_publication_tests {
     fn create_bookmark(fx: &Straddle, name: &str, at: &str) {
         fx.jj
             .run(
-                &fx.repository,
+                fx.store(),
                 &[
                     "bookmark",
                     "create",
@@ -3042,7 +4333,7 @@ pub(crate) mod slot_publication_tests {
     fn bookmark_at(fx: &Straddle, name: &str) -> String {
         fx.jj
             .run(
-                &fx.repository,
+                fx.store(),
                 &[
                     "log",
                     "-r",
@@ -3160,7 +4451,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_publication_that_fails_after_install: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
 
         let held = hold(&orch, &mut fx, "later").await;
 
@@ -3192,11 +4483,11 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_drain_lands_a_held_delta: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let held = hold(&orch, &mut fx, "later").await;
         create_bookmark(&fx, "later", &fx.base);
 
-        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
+        let drained = drain(&orch, &fx, "later").await;
 
         assert!(held::any_landed(&drained), "{drained:?}");
         let landed = bookmark_at(&fx, "later");
@@ -3228,9 +4519,7 @@ pub(crate) mod slot_publication_tests {
         );
         assert!(!ref_exists(&fx, &held.reference.unwrap()));
         assert!(
-            held::drain_held_publications(&orch, "project", "later", None)
-                .await
-                .is_empty(),
+            drain(&orch, &fx, "later").await.is_empty(),
             "a landed delta is not drained twice"
         );
     }
@@ -3251,11 +4540,11 @@ pub(crate) mod slot_publication_tests {
                 eprintln!("skipping a_drain_merges_onto_a_moved_head: jj not resolvable");
                 return;
             };
-            let orch = orchestrator().await;
+            let orch = orchestrator(&fx).await;
             let held = hold(&orch, &mut fx, "later").await;
             create_bookmark(&fx, "later", &fx.head);
 
-            let drained = held::drain_held_publications(&orch, "project", "later", None).await;
+            let drained = drain(&orch, &fx, "later").await;
 
             let reference = held.reference.unwrap();
             if conflicts {
@@ -3314,7 +4603,7 @@ pub(crate) mod slot_publication_tests {
                     eprintln!("skipping a_batch_built_on_a_held_commit: jj not resolvable");
                     return;
                 };
-                let orch = orchestrator().await;
+                let orch = orchestrator(&fx).await;
                 hold(&orch, &mut fx, "later").await;
                 create_bookmark(&fx, "later", &fx.base);
                 let (next_request, next_delta) = absorbing_delta(&fx, &[edit]);
@@ -3331,8 +4620,7 @@ pub(crate) mod slot_publication_tests {
                 };
 
                 if drain_first {
-                    let drained =
-                        held::drain_held_publications(&orch, "project", "later", None).await;
+                    let drained = drain(&orch, &fx, "later").await;
                     assert!(held::any_landed(&drained), "{name}: {drained:?}");
                     held::settle_drained(&orch, drained).await;
                     let SlotPublicationOutcome::Published { patch, .. } = publish_next()
@@ -3357,8 +4645,7 @@ pub(crate) mod slot_publication_tests {
                         "{name}: {}",
                         held.error
                     );
-                    let drained =
-                        held::drain_held_publications(&orch, "project", "later", None).await;
+                    let drained = drain(&orch, &fx, "later").await;
                     assert_eq!(
                         drained
                             .iter()
@@ -3400,7 +4687,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_redriven_landing_on_a_moved_base: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let started = chrono::Utc::now().timestamp_millis() - 60_000;
 
         let SlotPublicationOutcome::Published { landed, .. } = publish_visible_slot_delta(
@@ -3429,6 +4716,15 @@ pub(crate) mod slot_publication_tests {
                 .await
                 .expect("the delta prepares again");
         prepared.prior_since_ms = Some(started);
+        let expected_head = prepared
+            .coordinate
+            .as_ref()
+            .expect("the owned branch prepares")
+            .prepared
+            .head_after
+            .clone();
+        let reservation = reserve(&orch, &fx, &["feature"]).await;
+        let guard = lock(&orch, &fx).await;
         let again = land_prepared_slot_delta(
             &orch,
             &fx.target,
@@ -3436,12 +4732,15 @@ pub(crate) mod slot_publication_tests {
             &fx.delta,
             "the batch",
             None,
-            None,
+            &reservation,
+            &guard,
+            &expected_head,
             prepared,
         )
         .await
         .expect("the re-drive settles")
         .outcome;
+        drop(guard);
         match again {
             SlotPublicationOutcome::PublishedEarlier { head, export } => {
                 assert_eq!(head, landed.head);
@@ -3466,7 +4765,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_carried_commit_nothing_holds: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let (next_request, next_delta) = absorbing_delta(&fx, &[("other.rs", "next\n")]);
 
         let SlotPublicationOutcome::Published { landed, .. } = publish_visible_slot_delta(
@@ -3505,7 +4804,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_drain_interrupted_before_its_push: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         hold(&orch, &mut fx, "later").await;
         create_bookmark(&fx, "later", &fx.base);
         let unreachable = fx.repository.join("no-such-origin.git");
@@ -3515,7 +4814,7 @@ pub(crate) mod slot_publication_tests {
         );
 
         // Landed under the lock, and never settled.
-        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
+        let drained = drain(&orch, &fx, "later").await;
         assert!(held::any_landed(&drained), "{drained:?}");
         drop(drained);
         assert_eq!(held_status(&orch, "attempt-3231").await.0, "unpublished");
@@ -3537,7 +4836,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_held_commit_already_on_the_branch: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         hold(&orch, &mut fx, "later").await;
         // The branch already carries the held content: landed through the
         // sanctioned barrier, as a drain that never got to settle its row would
@@ -3545,7 +4844,7 @@ pub(crate) mod slot_publication_tests {
         create_bookmark(&fx, "later", &fx.base);
         crate::jj::publish_logical_head_exported(
             &fx.jj,
-            &fx.repository,
+            fx.store(),
             "later",
             &fx.base,
             crate::jj::ProposedPublication::DeltaCommit(fx.delta.delta_commit.clone().into()),
@@ -3562,7 +4861,7 @@ pub(crate) mod slot_publication_tests {
             &["remote", "add", "origin", &unreachable.to_string_lossy()],
         );
 
-        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
+        let drained = drain(&orch, &fx, "later").await;
         assert!(
             !held::any_landed(&drained),
             "nothing moved the branch: {drained:?}"
@@ -3591,7 +4890,7 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_held_commit_that_lands_but_cannot_be_pushed: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         hold(&orch, &mut fx, "later").await;
         create_bookmark(&fx, "later", &fx.base);
         let unreachable = fx.repository.join("no-such-origin.git");
@@ -3636,17 +4935,18 @@ pub(crate) mod slot_publication_tests {
         assert_eq!(held_status(&orch, "attempt-3231").await.0, "landed");
     }
 
-    /// Held commits land in the order they were made: a drain stops at the
-    /// first one it still cannot publish and leaves the rest for the next
-    /// barrier.
+    /// Held commits land in the order they were made. A barrier that cannot
+    /// prepare the branch publishes none of them and says so, leaving each one
+    /// held and unattempted; once it can, the earlier lands first and the later
+    /// lands on the head the earlier one became.
     #[tokio::test]
     #[serial_test::serial(jj)]
-    async fn a_drain_stops_at_the_first_delta_it_still_cannot_publish() {
+    async fn held_deltas_land_in_the_order_they_were_made() {
         let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
-            eprintln!("skipping a_drain_stops_at_the_first_delta: jj not resolvable");
+            eprintln!("skipping held_deltas_land_in_the_order: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         hold(&orch, &mut fx, "later").await;
         let (next_request, next_delta) = absorbing_delta(&fx, &[("other.rs", "next\n")]);
         let next = publish_visible_slot_delta(
@@ -3664,18 +4964,929 @@ pub(crate) mod slot_publication_tests {
             "{next:?}"
         );
 
-        let drained = held::drain_held_publications(&orch, "project", "later", None).await;
-
-        let [held::Drained::Note(note)] = drained.as_slice() else {
-            panic!("expected one note, got {drained:?}");
-        };
-        assert!(note.contains("still could not be published"), "{note}");
-        assert!(note.contains(&fx.delta.delta_commit), "{note}");
-        assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 2));
+        let refused = held::pr_commit_barrier(&orch, "project", "later").await;
+        assert!(
+            refused
+                .notes
+                .iter()
+                .any(|note| note.contains("could not be published") && note.contains("stay held")),
+            "{:?}",
+            refused.notes
+        );
+        refused.refuse_merge().expect_err("nothing held has landed");
+        assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
         assert_eq!(
             held_status(&orch, "attempt-next").await,
             ("held".into(), 1),
             "the later delta is not attempted ahead of the earlier one"
+        );
+
+        create_bookmark(&fx, "later", &fx.base);
+        let drained = drain(&orch, &fx, "later").await;
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|entry| matches!(entry, held::Drained::Landed(_)))
+                .count(),
+            2,
+            "{drained:?}"
+        );
+        held::settle_drained(&orch, drained).await;
+        let first = landed_head(&orch, "attempt-3231").await;
+        let second = landed_head(&orch, "attempt-next").await;
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{first}^")]),
+            fx.base
+        );
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{second}^")]),
+            first,
+            "the later delta lands on the head the earlier one became"
+        );
+        assert_eq!(bookmark_at(&fx, "later"), second);
+        assert_eq!(fx.blob(&second, "mine.rs"), "the batch's work");
+        assert_eq!(fx.blob(&second, "other.rs"), "next");
+    }
+
+    /// A base that advances between preparation and the lock is caught by
+    /// revalidation: the branch is prepared again onto the new base and the
+    /// sealed delta is planned again onto that preparation, so what lands
+    /// carries the base it was prepared on rather than a head-only integration
+    /// onto a base nothing prepared.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_base_that_advances_after_preparation_is_caught_and_prepared_again() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_base_that_advances_after_preparation: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .expect("the delta prepares");
+        assert_eq!(
+            prepared
+                .coordinate
+                .as_ref()
+                .map(|coordinate| coordinate.prepared.base_commit.as_str())
+                .ok(),
+            Some(fx.base.as_str())
+        );
+
+        let upstream = advance_base(&fx, "upstream.rs");
+
+        let (_, landed) = delta_barrier(
+            &orch,
+            Some(fx.store()),
+            "slot publication test",
+            false,
+            own_delta(&fx, &fx.request, &fx.delta, "the batch", prepared),
+        )
+        .await;
+        let SlotPublicationOutcome::Published {
+            landed,
+            integration,
+            ..
+        } = landed
+            .expect("the delta lands on the new preparation")
+            .outcome
+        else {
+            panic!("expected a publication");
+        };
+        let integration = integration.expect("planned again onto the new prepared head");
+        assert_ne!(integration.head, fx.base);
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{}^", landed.head)]),
+            integration.head
+        );
+        assert!(
+            is_ancestor(&fx, &upstream, &landed.head),
+            "the published head carries the advanced base"
+        );
+        assert_eq!(fx.bookmark(), landed.head);
+        assert_eq!(fx.blob(&landed.head, "upstream.rs"), "from main");
+        assert_eq!(fx.blob(&landed.head, "mine.rs"), "the batch's work");
+    }
+
+    /// A sealed delta whose branch cannot be prepared is already in the store,
+    /// so it is held exactly as sealed, with the refusal as its reason, and is
+    /// never reported as having missed the store. The branch does not move.
+    /// Another batch in flight on the branch refuses it whether the base is
+    /// current (the barrier refuses the landing) or stale (preparation refuses
+    /// the replay).
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_preparation_refusal_holds_the_sealed_delta_exactly_as_sealed() {
+        for (case, stale) in [
+            ("unmanaged", false),
+            ("unmanaged", true),
+            ("busy", false),
+            ("busy", true),
+        ] {
+            eprintln!("case {case}, stale base: {stale}");
+            let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+                eprintln!("skipping a_preparation_refusal_holds: jj not resolvable");
+                return;
+            };
+            let orch = orchestrator(&fx).await;
+            if case == "unmanaged" {
+                orch.db
+                    .local
+                    .execute(
+                        "UPDATE jobs SET status = 'complete' WHERE id = ?1",
+                        (FEATURE_JOB,),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                add_job(&orch, "job-sibling", "feature").await;
+                park_run_batch(&orch, "job-sibling", "request-sibling").await;
+            }
+            if stale {
+                advance_base(&fx, "upstream.rs");
+            }
+
+            let error = publish_visible_slot_delta(
+                &orch,
+                &fx.target,
+                &fx.request,
+                &fx.delta,
+                "the batch",
+                None,
+                None,
+            )
+            .await
+            .expect_err("an unprepared branch takes nothing");
+            let held = match error {
+                SlotPublicationError::Held { held, .. } => held,
+                other => panic!("{case}: an installed delta is held, got {other:?}"),
+            };
+            assert!(
+                held.error.contains("could not be prepared for publication"),
+                "{case}: {}",
+                held.error
+            );
+            if case == "busy" {
+                assert!(
+                    held.error.contains("may still commit to this branch"),
+                    "{}",
+                    held.error
+                );
+            }
+            let reference = held.reference.clone().expect("the delta is ref-protected");
+            assert_eq!(
+                git_stdout(&fx.repository, &["rev-parse", &reference]),
+                fx.delta.delta_commit,
+                "{case}: what is held is the sealed commit itself"
+            );
+            assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
+            assert_eq!(fx.bookmark(), fx.base, "{case}: the branch did not move");
+        }
+    }
+
+    /// The batch being published is exempt from its own pending suspension,
+    /// and only that: its sealed result names the job that parked it (a child
+    /// task sharing the branch names itself, not the branch's owner) and the
+    /// request. Any other batch in flight on the branch still holds it: another
+    /// request of the same job, a sibling job's batch sharing the request id,
+    /// or the owner's batch under a child's publication. Both on a current
+    /// base, where the barrier's permit enforces it, and on a stale one, where
+    /// preparation does.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn only_the_publishing_batch_itself_is_exempt_from_the_inflight_hold() {
+        // (the job that routed the batch, the job with a pending batch, its
+        // request, whether the delta publishes)
+        let cases = [
+            (FEATURE_JOB, FEATURE_JOB, "request", true),
+            ("job-child", "job-child", "request", true),
+            (FEATURE_JOB, FEATURE_JOB, "another-request", false),
+            (FEATURE_JOB, "job-sibling", "request", false),
+            ("job-child", FEATURE_JOB, "request", false),
+        ];
+        for (requester, parker, parked, publishes) in cases {
+            for stale in [false, true] {
+                eprintln!(
+                    "case {requester} publishing under {parker}/{parked}, stale base: {stale}"
+                );
+                let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+                    eprintln!("skipping only_the_publishing_batch_itself: jj not resolvable");
+                    return;
+                };
+                assert_eq!(fx.request.request_id, "request");
+                let orch = orchestrator(&fx).await;
+                add_job(&orch, "job-child", "feature").await;
+                add_job(&orch, "job-sibling", "feature").await;
+                park_run_batch(&orch, parker, parked).await;
+                if stale {
+                    advance_base(&fx, "upstream.rs");
+                }
+                let request = CellRequest {
+                    requesting_job_id: Some(requester.into()),
+                    ..fx.request.clone()
+                };
+
+                let published = publish_visible_slot_delta(
+                    &orch,
+                    &fx.target,
+                    &request,
+                    &fx.delta,
+                    "the batch",
+                    None,
+                    None,
+                )
+                .await;
+                let case = format!("{requester} under {parker}/{parked}, stale {stale}");
+                if publishes {
+                    let Ok(SlotPublication {
+                        outcome: SlotPublicationOutcome::Published { landed, .. },
+                        ..
+                    }) = published
+                    else {
+                        panic!("{case}: its own batch does not block it: {published:?}");
+                    };
+                    assert_eq!(fx.bookmark(), landed.head, "{case}");
+                } else {
+                    let Err(SlotPublicationError::Held { held, .. }) = &published else {
+                        panic!("{case}: another batch holds the branch: {published:?}");
+                    };
+                    assert!(
+                        held.error.contains("may still commit to this branch"),
+                        "{case}: {}",
+                        held.error
+                    );
+                    assert_eq!(fx.bookmark(), fx.base, "{case}");
+                }
+            }
+        }
+    }
+
+    async fn row_count(orch: &Orchestrator, table: &str) -> i64 {
+        orch.db
+            .local
+            .query_one(format!("SELECT COUNT(*) FROM {table}"), (), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Branch advance is lazy: publishing a run's delta onto a branch that
+    /// other live branches were cut from moves that branch alone. Its dormant
+    /// children keep their tips, and nothing is queued, messaged or woken on
+    /// their behalf; each catches up only when its own owner next publishes.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_run_publication_leaves_the_branches_cut_from_it_dormant() {
+        const CHILDREN: usize = 4;
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_run_publication_leaves_the_branches_cut_from_it_dormant: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let children: Vec<String> = (0..CHILDREN).map(|n| format!("child-{n}")).collect();
+        for child in &children {
+            create_bookmark(&fx, child, &fx.base);
+            orch.db
+                .local
+                .execute_script(format!(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+                       VALUES ('job-{child}', 'exec-1', 'node', 'issue-1', 'project', 'running', '{child}', 'feature', 1, 1);"
+                ))
+                .await
+                .unwrap();
+        }
+        let watched = [
+            "messages",
+            "attention_pushes",
+            "jj_reconcile_intents",
+            "jj_reconcile_items",
+        ];
+        let mut before = Vec::new();
+        for table in watched {
+            before.push(row_count(&orch, table).await);
+        }
+
+        let SlotPublicationOutcome::Published { landed, .. } = publish_visible_slot_delta(
+            &orch,
+            &fx.target,
+            &fx.request,
+            &fx.delta,
+            "the batch",
+            None,
+            None,
+        )
+        .await
+        .expect("the batch publishes")
+        .outcome
+        else {
+            panic!("expected a publication");
+        };
+        assert_eq!(fx.bookmark(), landed.head, "the published branch moved");
+
+        for child in &children {
+            assert_eq!(
+                bookmark_at(&fx, child),
+                fx.base,
+                "`{child}` was not replayed onto its base's new head"
+            );
+        }
+        for (table, before) in watched.into_iter().zip(before) {
+            assert_eq!(
+                row_count(&orch, table).await,
+                before,
+                "publishing one branch wrote nothing to `{table}` for its dormant children"
+            );
+        }
+    }
+
+    /// The exclusion is read under the barrier's guard, not only at
+    /// preparation: an unrelated batch that parks after the delta was prepared
+    /// still holds the landing, and the sealed delta is held exactly as sealed.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_batch_that_parks_after_preparation_still_holds_the_landing() {
+        let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_batch_that_parks_after_preparation: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .expect("the delta prepares");
+        assert!(
+            prepared.coordinate.is_ok(),
+            "nothing was in flight at preparation"
+        );
+        add_job(&orch, "job-sibling", "feature").await;
+        park_run_batch(&orch, "job-sibling", "request-sibling").await;
+
+        let (_, landed) = delta_barrier(
+            &orch,
+            Some(fx.store()),
+            "slot publication test",
+            false,
+            own_delta(&fx, &fx.request, &fx.delta, "the batch", prepared),
+        )
+        .await;
+        let held = match landed {
+            Err(SlotPublicationError::Held { held, .. }) => held,
+            other => panic!("a batch in flight at landing holds it, got {other:?}"),
+        };
+        assert!(
+            held.error.contains("may still commit to this branch"),
+            "{}",
+            held.error
+        );
+        assert_eq!(
+            git_stdout(
+                &fx.repository,
+                &["rev-parse", &held.reference.clone().expect("ref-protected")]
+            ),
+            fx.delta.delta_commit
+        );
+        assert_eq!(fx.bookmark(), fx.base, "the branch did not move");
+    }
+
+    /// An installed delta whose barrier cannot take the store lock is held
+    /// under its ref with its upload spent: the store has it, so it is never
+    /// reported as having missed the store.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_barrier_without_its_lock_holds_the_installed_delta_and_spends_its_upload() {
+        let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_barrier_without_its_lock: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        let staging = tempfile::tempdir().unwrap();
+        stage_managed_upload(&orch, &mut fx, staging.path());
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &fx.request, &fx.delta, "the batch", None)
+                .await
+                .expect("the managed delta installs");
+        assert!(prepared.coordinate.is_ok());
+
+        let (_, landed) = delta_barrier(
+            &orch,
+            None,
+            "slot publication test",
+            false,
+            own_delta(&fx, &fx.request, &fx.delta, "the batch", prepared),
+        )
+        .await;
+        let (consume_receipt, held) = match landed {
+            Err(SlotPublicationError::Held {
+                consume_receipt,
+                held,
+            }) => (consume_receipt, held),
+            other => panic!("expected the delta to be held, got {other:?}"),
+        };
+        assert!(
+            consume_receipt,
+            "the upload was installed, so the caller spends it"
+        );
+        assert!(held.error.contains("no lock"), "{}", held.error);
+        assert_eq!(
+            git_stdout(
+                &fx.repository,
+                &["rev-parse", &held.reference.clone().expect("ref-protected")]
+            ),
+            fx.delta.delta_commit
+        );
+        assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
+        assert_eq!(fx.bookmark(), fx.base);
+    }
+
+    /// A commit barrier drains held deltas ahead of the batch's own: both held
+    /// deltas land oldest first, each on the head the one before it left, and
+    /// the own delta, planned on the prepared head, is planned again onto the
+    /// drained head and reported as integrated.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_barrier_lands_held_deltas_in_order_before_its_own() {
+        let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_barrier_lands_held_deltas_in_order: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        hold(&orch, &mut fx, "later").await;
+        let (next_request, next_delta) = absorbing_delta(&fx, &[("other.rs", "next\n")]);
+        let next = publish_visible_slot_delta(
+            &orch,
+            &fx.target,
+            &next_request,
+            &next_delta,
+            "the next batch",
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(next, Err(SlotPublicationError::Held { .. })),
+            "{next:?}"
+        );
+        create_bookmark(&fx, "later", &fx.base);
+
+        let own_commit = side_commit(&fx, &fx.base, &[("third.rs", "own\n")]);
+        let own_request = CellRequest {
+            attempt_id: "attempt-own".into(),
+            request_id: "request-own".into(),
+            ..fx.request.clone()
+        };
+        let own = crate::fleet::MutationDelta {
+            base_commit: fx.base.clone(),
+            delta_commit: own_commit,
+            upload_receipt: None,
+        };
+        let prepared =
+            prepare_slot_publication(&orch, &fx.target, &own_request, &own, "own batch", None)
+                .await
+                .expect("the own delta prepares");
+        assert_eq!(
+            prepared.plan.as_ref().map(|plan| plan.head.as_str()),
+            Some(fx.base.as_str()),
+            "planned on the prepared head, before anything drained"
+        );
+
+        let (drained, landed) = delta_barrier(
+            &orch,
+            Some(fx.store()),
+            "slot publication test",
+            true,
+            own_delta(&fx, &own_request, &own, "own batch", prepared),
+        )
+        .await;
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|entry| matches!(entry, held::Drained::Landed(_)))
+                .count(),
+            2,
+            "{drained:?}"
+        );
+        held::settle_drained(&orch, drained).await;
+        let first = landed_head(&orch, "attempt-3231").await;
+        let second = landed_head(&orch, "attempt-next").await;
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{first}^")]),
+            fx.base
+        );
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{second}^")]),
+            first
+        );
+
+        let SlotPublicationOutcome::Published {
+            landed,
+            integration,
+            ..
+        } = landed.expect("the own delta lands after the drain").outcome
+        else {
+            panic!("expected a publication");
+        };
+        assert_eq!(
+            integration.expect("re-planned onto the drained head").head,
+            second
+        );
+        assert_eq!(
+            git_stdout(&fx.repository, &["rev-parse", &format!("{}^", landed.head)]),
+            second
+        );
+        assert_eq!(bookmark_at(&fx, "later"), landed.head);
+        assert_eq!(fx.blob(&landed.head, "mine.rs"), "the batch's work");
+        assert_eq!(fx.blob(&landed.head, "other.rs"), "next");
+        assert_eq!(fx.blob(&landed.head, "third.rs"), "own");
+    }
+
+    /// A trivial batch with a commit_msg drains older held work while its own
+    /// suspension is still pending: its verified-empty settlement exempts that
+    /// one wait and authorizes no content of its own, while each held delta
+    /// carries its own installed objects. Only the exact capability exempts it:
+    /// the same job and request, minted for this project, store (an alias of
+    /// it included) and branch. Any other batch in flight on the branch, or a
+    /// capability that is missing or minted for another job, request, branch
+    /// or store, refuses the whole drain, and the held delta stays held saying
+    /// why. Both on a current base and on a stale one.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_trivial_commit_barrier_drains_past_its_own_batch_but_not_another() {
+        // (the job with a pending batch, the capability presented as
+        // (job, request, branch, store), whether the drain lands)
+        type Capability = Option<(&'static str, &'static str, &'static str, &'static str)>;
+        let cases: [(&str, Capability, bool); 8] = [
+            (
+                LATER_JOB,
+                Some((LATER_JOB, "request-trivial", "later", "same")),
+                true,
+            ),
+            (
+                LATER_JOB,
+                Some((LATER_JOB, "request-trivial", "later", "alias")),
+                true,
+            ),
+            (
+                "job-sibling",
+                Some((LATER_JOB, "request-trivial", "later", "same")),
+                false,
+            ),
+            (LATER_JOB, None, false),
+            (
+                LATER_JOB,
+                Some(("job-sibling", "request-trivial", "later", "same")),
+                false,
+            ),
+            (
+                LATER_JOB,
+                Some((LATER_JOB, "another-request", "later", "same")),
+                false,
+            ),
+            (
+                LATER_JOB,
+                Some((LATER_JOB, "request-trivial", "feature", "same")),
+                false,
+            ),
+            (
+                LATER_JOB,
+                Some((LATER_JOB, "request-trivial", "later", "foreign")),
+                false,
+            ),
+        ];
+        for (job, capability, drains) in cases {
+            for stale in [false, true] {
+                eprintln!("case {job} under {capability:?}, stale base: {stale}");
+                let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await
+                else {
+                    eprintln!("skipping a_trivial_commit_barrier_drains: jj not resolvable");
+                    return;
+                };
+                let orch = orchestrator(&fx).await;
+                hold(&orch, &mut fx, "later").await;
+                create_bookmark(&fx, "later", &fx.base);
+                if job != LATER_JOB {
+                    add_job(&orch, job, "later").await;
+                }
+                park_run_batch(&orch, job, "request-trivial").await;
+                if stale {
+                    advance_base(&fx, "upstream.rs");
+                }
+
+                let foreign = tempfile::tempdir().unwrap();
+                let trivial = capability.map(|(sealed_job, request, branch, store)| {
+                    let store = match store {
+                        "same" => fx.store().to_path_buf(),
+                        "alias" => fx.store().join("."),
+                        _ => foreign.path().to_path_buf(),
+                    };
+                    SealedPublication::for_test(sealed_job, request, "project", &store, branch)
+                });
+                let barrier = prepared_barrier(
+                    &orch,
+                    Some(fx.store()),
+                    "slot publication test",
+                    true,
+                    PreparationKey {
+                        project_id: "project",
+                        branch: "later",
+                        owner_job_id: Some(LATER_JOB),
+                        sealed: trivial.as_ref(),
+                    },
+                    None,
+                )
+                .await;
+                assert!(barrier.own.is_none());
+                if drains {
+                    assert!(held::any_landed(&barrier.drained), "{:?}", barrier.drained);
+                    held::settle_drained(&orch, barrier.drained).await;
+                    assert_eq!(held_status(&orch, "attempt-3231").await.0, "landed");
+                    assert_eq!(
+                        fx.blob(&bookmark_at(&fx, "later"), "mine.rs"),
+                        "the batch's work"
+                    );
+                } else {
+                    let [held::Drained::Note(note)] = barrier.drained.as_slice() else {
+                        panic!("expected one note, got {:?}", barrier.drained);
+                    };
+                    assert!(note.contains("could not be published"), "{note}");
+                    assert!(note.contains("may still commit to this branch"), "{note}");
+                    assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
+                    assert_eq!(bookmark_at(&fx, "later"), fx.base);
+                }
+            }
+        }
+    }
+
+    async fn set_held_path(orch: &Orchestrator, attempt_id: &str, column: &str, path: &Path) {
+        orch.db
+            .local
+            .execute(
+                format!("UPDATE held_publications SET {column} = ?1 WHERE attempt_id = ?2"),
+                (path.to_string_lossy().into_owned(), attempt_id.to_string()),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A held row is republished only into the store and object repository it
+    /// was held for. The held-row query selects by project and branch, so a row
+    /// recorded against another store, or whose objects live in a repository
+    /// other than the one behind this branch's store, is refused before
+    /// anything is pinned: it stays held and the branch does not move. An alias
+    /// of the same store is the same store.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_held_row_lands_only_in_the_store_and_repository_it_was_held_for() {
+        for case in ["alias", "foreign-store", "foreign-repository"] {
+            let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+                eprintln!("skipping a_held_row_lands_only_in_its_store: jj not resolvable");
+                return;
+            };
+            let orch = orchestrator(&fx).await;
+            hold(&orch, &mut fx, "later").await;
+            create_bookmark(&fx, "later", &fx.base);
+            let elsewhere = tempfile::tempdir().unwrap();
+            match case {
+                "alias" => {
+                    set_held_path(&orch, "attempt-3231", "store_path", &fx.store().join(".")).await
+                }
+                "foreign-store" => {
+                    set_held_path(&orch, "attempt-3231", "store_path", elsewhere.path()).await
+                }
+                _ => {
+                    git(elsewhere.path(), &["init", "-q", "-b", "main"]);
+                    set_held_path(&orch, "attempt-3231", "repository_path", elsewhere.path()).await
+                }
+            }
+
+            let drained = drain(&orch, &fx, "later").await;
+
+            if case == "alias" {
+                assert!(held::any_landed(&drained), "{case}: {drained:?}");
+                assert_eq!(
+                    fx.blob(&bookmark_at(&fx, "later"), "mine.rs"),
+                    "the batch's work"
+                );
+            } else {
+                let [held::Drained::Note(note)] = drained.as_slice() else {
+                    panic!("{case}: expected one note, got {drained:?}");
+                };
+                assert!(
+                    note.contains("still could not be published"),
+                    "{case}: {note}"
+                );
+                assert_eq!(
+                    held_status(&orch, "attempt-3231").await,
+                    ("held".into(), 2),
+                    "{case}"
+                );
+                assert_eq!(bookmark_at(&fx, "later"), fx.base, "{case}: nothing moved");
+                assert!(
+                    ref_exists(&fx, "refs/cairn/stranded/attempt-3231"),
+                    "{case}: the route back stays open"
+                );
+            }
+        }
+    }
+
+    /// Held rows judged by the publication authority, drained after a merge
+    /// that left the branch in place and a reopen that continued its owner in
+    /// a new session (`s-old` closed by the merge at 200, `s-new` open). A row
+    /// from before held rows named their run cannot have its session checked,
+    /// so it is refused whether it was held before the session closed (100) or
+    /// only after (300), the delayed completion no hold timestamp tells apart
+    /// from the successor's work. A row naming a run of the closed session is
+    /// refused by that session; one naming a run of the successor lands. A
+    /// refused row stops waiting, keeps its recovery ref, and moves nothing.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_held_row_publishes_only_while_its_session_may() {
+        for (case, run_id, held_at, lands) in [
+            ("unattributed, held before the close", None, 100, false),
+            ("unattributed, held after the close", None, 300, false),
+            ("its run's session was closed", Some("run-old"), 300, false),
+            ("its run is the successor's", Some("run-new"), 300, true),
+        ] {
+            let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+                eprintln!(
+                    "skipping a_held_row_publishes_only_while_its_session_may: jj not resolvable"
+                );
+                return;
+            };
+            let orch = orchestrator(&fx).await;
+            hold(&orch, &mut fx, "later").await;
+            create_bookmark(&fx, "later", &fx.base);
+            let run_sql = run_id.map_or("NULL".to_string(), |run| format!("'{run}'"));
+            orch.db
+                .local
+                .execute_script(format!(
+                    "INSERT INTO sessions(id, job_id, status, backend_id, terminal_reason, created_at, closed_at, updated_at)
+                       VALUES('s-old', '{LATER_JOB}', 'closed', 'backend', 'issue_merged', 1, 200, 200),
+                             ('s-new', '{LATER_JOB}', 'open', 'backend', NULL, 400, NULL, 400);
+                     INSERT INTO runs(id, project_id, job_id, issue_id, status, session_id, created_at, updated_at)
+                       VALUES('run-old', 'project', '{LATER_JOB}', 'issue-1', 'live', 's-old', 1, 1),
+                             ('run-new', 'project', '{LATER_JOB}', 'issue-1', 'live', 's-new', 400, 400);
+                     UPDATE held_publications SET job_id = '{LATER_JOB}', run_id = {run_sql},
+                            created_at = {held_at}, updated_at = {held_at}
+                      WHERE attempt_id = 'attempt-3231';"
+                ))
+                .await
+                .unwrap();
+
+            let drained = drain(&orch, &fx, "later").await;
+
+            if lands {
+                assert!(held::any_landed(&drained), "{case}: {drained:?}");
+                assert_eq!(
+                    fx.blob(&bookmark_at(&fx, "later"), "mine.rs"),
+                    "the batch's work",
+                    "{case}"
+                );
+                continue;
+            }
+            let [held::Drained::Note(note)] = drained.as_slice() else {
+                panic!("{case}: expected one refusal note, got {drained:?}");
+            };
+            assert!(
+                note.contains("branch_retired (session_closed)"),
+                "{case}: {note}"
+            );
+            assert!(note.contains("proj/1"), "{case}: {note}");
+            assert_eq!(
+                held_status(&orch, "attempt-3231").await.0,
+                "stranded",
+                "{case}: the row stops waiting"
+            );
+            assert!(
+                held::held_rows(&orch.db.local, "project", "later")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{case}"
+            );
+            assert!(
+                ref_exists(&fx, "refs/cairn/stranded/attempt-3231"),
+                "{case}: the recovery ref is kept"
+            );
+            let recorded = orch
+                .db
+                .local
+                .query_opt(
+                    "SELECT reference FROM held_publications WHERE attempt_id = 'attempt-3231'",
+                    (),
+                    |row| row.opt_text(0),
+                )
+                .await
+                .unwrap()
+                .flatten();
+            assert_eq!(
+                recorded.as_deref(),
+                Some("refs/cairn/stranded/attempt-3231"),
+                "{case}: the row still names its recovery ref"
+            );
+            assert_eq!(bookmark_at(&fx, "later"), fx.base, "{case}: nothing moved");
+        }
+    }
+
+    /// A drain stops at the first held delta it still cannot publish, here
+    /// because its objects are not in the store: the ones before it have landed,
+    /// it stays held with its attempt recorded, and every later one stays held
+    /// untouched, in order, for the next barrier.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_drain_stops_at_a_held_delta_whose_objects_are_missing() {
+        let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_drain_stops_at_a_held_delta_whose_objects_are_missing: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        hold(&orch, &mut fx, "later").await;
+        let (next_request, next_delta) = absorbing_delta(&fx, &[("other.rs", "next\n")]);
+        let third_request = CellRequest {
+            attempt_id: "attempt-third".into(),
+            request_id: "request-third".into(),
+            ..fx.request.clone()
+        };
+        let third_delta = crate::fleet::MutationDelta {
+            base_commit: fx.base.clone(),
+            delta_commit: side_commit(&fx, &fx.base, &[("third.rs", "third\n")]),
+            upload_receipt: None,
+        };
+        for (request, delta, message) in [
+            (&next_request, &next_delta, "the next batch"),
+            (&third_request, &third_delta, "the third batch"),
+        ] {
+            let held =
+                publish_visible_slot_delta(&orch, &fx.target, request, delta, message, None, None)
+                    .await;
+            assert!(
+                matches!(held, Err(SlotPublicationError::Held { .. })),
+                "{held:?}"
+            );
+        }
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        orch.db
+            .local
+            .execute_script(format!(
+                "UPDATE held_publications SET created_at = 1 WHERE attempt_id = 'attempt-3231';
+                 UPDATE held_publications SET created_at = 2, delta_commit = '{missing}'
+                  WHERE attempt_id = 'attempt-next';
+                 UPDATE held_publications SET created_at = 3 WHERE attempt_id = 'attempt-third';"
+            ))
+            .await
+            .unwrap();
+        create_bookmark(&fx, "later", &fx.base);
+
+        let drained = drain(&orch, &fx, "later").await;
+
+        let [held::Drained::Landed(_), held::Drained::Note(note)] = drained.as_slice() else {
+            panic!("expected the first to land and the second to stop the drain: {drained:?}");
+        };
+        assert!(note.contains("still could not be published"), "{note}");
+        assert!(note.contains(missing), "{note}");
+        assert_eq!(
+            bookmark_at(&fx, "later"),
+            landed_head(&orch, "attempt-3231").await,
+            "the earlier delta landed"
+        );
+        assert_eq!(held_status(&orch, "attempt-next").await, ("held".into(), 2));
+        assert_eq!(
+            held_status(&orch, "attempt-third").await,
+            ("held".into(), 1),
+            "the later delta is not attempted ahead of the one that failed"
+        );
+    }
+
+    /// A PR action's barrier drains held work through the same preparation
+    /// every landing uses, and leaves nothing held for a merge to refuse on.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_pr_barrier_drains_held_work_through_preparation() {
+        let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
+            eprintln!("skipping a_pr_barrier_drains_held_work: jj not resolvable");
+            return;
+        };
+        let orch = orchestrator(&fx).await;
+        hold(&orch, &mut fx, "later").await;
+        create_bookmark(&fx, "later", &fx.base);
+
+        let barrier = held::pr_commit_barrier(&orch, "project", "later").await;
+
+        assert!(
+            barrier
+                .still_held
+                .as_ref()
+                .is_ok_and(|rows| rows.is_empty()),
+            "{barrier:?}"
+        );
+        barrier
+            .refuse_merge()
+            .expect("nothing is held, so the merge may proceed");
+        assert_eq!(held_status(&orch, "attempt-3231").await.0, "landed");
+        assert_eq!(
+            fx.blob(&bookmark_at(&fx, "later"), "mine.rs"),
+            "the batch's work"
         );
     }
 
@@ -3688,13 +5899,13 @@ pub(crate) mod slot_publication_tests {
             eprintln!("skipping a_held_managed_delta: jj not resolvable");
             return;
         };
-        let orch = orchestrator().await;
+        let orch = orchestrator(&fx).await;
         let staging = tempfile::tempdir().unwrap();
         let receipt = stage_managed_upload(&orch, &mut fx, staging.path());
 
         let error = publish_and_seal_slot_delta(
             &orch,
-            &fx.repository,
+            fx.store(),
             &fx.request,
             &fx.delta,
             "later",
@@ -3704,9 +5915,13 @@ pub(crate) mod slot_publication_tests {
         .await
         .expect_err("a branch that does not exist cannot take the fix");
 
-        assert!(error.contains("for check fold"), "{error}");
+        assert!(error.contains("check output discarded"), "{error}");
         assert!(orch.object_plane.staged_delta(&receipt).is_none());
         assert_eq!(fx.bookmark(), fx.head);
+        assert!(held::held_rows(&orch.db.local, "project", "later")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
 
@@ -4849,8 +7064,13 @@ async fn prepare_and_run_batch(
                 Vec::new(),
             );
         }
-        match crate::mcp::handlers::branch::resolve_for_run(orch, request, branch).await {
-            Ok(resolution) => Some(resolution),
+        // One capture: a managed branch (own or another owner's) is prepared
+        // against its declared base here, before anything is materialized, and
+        // the batch checks out exactly the captured commit. An exact revision
+        // is captured as it stands. A refusal (including "conflicts with
+        // base") runs nothing and wakes nobody.
+        match crate::mcp::handlers::branch::capture_for_run(orch, request, branch).await {
+            Ok(captured) => Some(captured),
             Err(error) => return run_envelope(error.to_string(), Vec::new()),
         }
     } else {
@@ -4860,17 +7080,18 @@ async fn prepare_and_run_batch(
     // `read ?branch=main`, so the result names the tree it ran against with the
     // same label a read header carries.
     let revision_label = match branch_target.as_ref() {
-        Some(target) => Some(
-            crate::orchestrator::base_branch_sync::revision_label(
+        Some(target) => {
+            let label = crate::orchestrator::base_branch_sync::revision_label(
                 orch,
-                &target.project_id,
-                &target.rev,
-                &target.default_branch,
-                &target.revision_store,
+                &target.revision.project_id,
+                target.rev(),
+                &target.revision.default_branch,
+                &target.store,
                 &target.commit_id,
             )
-            .await,
-        ),
+            .await;
+            Some(format!("{label} ({})", target.provenance()))
+        }
         None => None,
     };
 
@@ -5096,16 +7317,17 @@ async fn prepare_and_run_batch(
         })
     } else if let Some(target) = branch_target.as_ref() {
         log::info!(
-            "resolved branch run rev {} to commit {} in project {}",
-            target.rev,
+            "captured branch run rev {} at commit {} in project {}: {}",
+            target.rev(),
             target.commit_id,
-            target.project_id
+            target.revision.project_id,
+            target.provenance()
         );
         Some((
             RepositoryLocator::ColocatedPath {
-                project_id: target.project_id.clone(),
-                repository_id: target.project_id.clone(),
-                absolute_path: target.repository_path.to_string_lossy().into_owned(),
+                project_id: target.revision.project_id.clone(),
+                repository_id: target.revision.project_id.clone(),
+                absolute_path: target.revision.project_path.to_string_lossy().into_owned(),
             },
             target.commit_id.clone(),
             String::new(),
@@ -5248,7 +7470,7 @@ async fn prepare_and_run_batch(
                             _ => None,
                         }
                         .as_deref(),
-                        branch_target.as_ref().map(|target| target.rev.as_str()),
+                        branch_target.as_ref().map(|target| target.rev()),
                         logical_resolution
                             .as_ref()
                             .map(|resolution| resolution.rev.as_str()),
@@ -6237,26 +8459,28 @@ impl PersistedSettlement {
         }
     }
 
-    /// The same settlement, publishing to `repository`'s bookmark `rev`, which
-    /// was at `commit_id` when the batch was routed.
+    /// The same settlement, publishing to bookmark `rev` of `store`, the
+    /// project store backed by `repository`, which was at `commit_id` when
+    /// the batch was routed.
     #[cfg(test)]
     pub(crate) fn publishing_to_for_test(
         mut self,
         project_id: &str,
         repository: &std::path::Path,
+        store: &std::path::Path,
         rev: &str,
         commit_id: &str,
     ) -> Self {
         self.resolution = Some(PersistedResolution {
             project_id: project_id.into(),
-            repository_path: repository.to_path_buf(),
+            repository_path: store.to_path_buf(),
             object_repository_path: repository.to_path_buf(),
             rev: rev.into(),
             commit_id: commit_id.into(),
             default_commit_id: commit_id.into(),
             default_branch: "main".into(),
         });
-        self.store_lock = Some(repository.to_path_buf());
+        self.store_lock = Some(store.to_path_buf());
         self
     }
 
@@ -8448,6 +10672,7 @@ impl CallAnswer {
             .or_else(|| self.held.as_ref().map(|held| held.db.clone()));
         if let Some(db) = detached_db {
             detached::settle_answered_inline(
+                &self.orch,
                 &db,
                 &self.control.request_id,
                 &self.control.verdict_for(&answer.resume_text),
@@ -9566,132 +11791,38 @@ async fn settle_run_batch(
             .map(|(name, email)| PublicationIdentity::new(name, email)),
         None => None,
     };
-    // Serialize the seal/discard inside the barrier on the per-store jj lock that
-    // base-advance reconcile and merge-fold also hold, so a run-path seal never
-    // forks the shared store's operation log against a concurrent reconcile/fold.
-    // The guard scopes ONLY the barrier's store mutation — the pre-batch snapshot
-    // and per-item command execution above stay outside it (per-workspace reads /
-    // FS work, not shared-store rebase/import). `None` for a non-worktree cwd.
-    // `store_lock` is the same handle resolved for the pre-flight reconcile above.
     // Held deltas this barrier republished. Settled once the store lock is
     // released, because their remaining rungs include an origin push.
     let mut drained = Vec::new();
-    // A routed delta is installed, pinned, and integrated against the head it
-    // finds now, before the lock (I3, I4). Under the lock the plan lands only if
-    // the bookmark still holds that head — a held delta the drain below lands
-    // first moves it, and then the integration is simply done again there.
-    let prepared_routed = match (
-        s.commit_msg.as_deref(),
-        routed_delta.as_ref(),
-        publication_request.or(s.routed_request.as_ref()),
-        s.logical_resolution.as_ref(),
-    ) {
-        (Some(message), Some(delta), Some(request), Some(resolution)) => {
-            Some(match s.store_lock.as_deref() {
-                Some(_store) => match resolve_runner_publication_target(resolution, request) {
-                    Ok(target) => match prepare_slot_publication(
+    let barrier = match s.logical_resolution.as_ref() {
+        // A managed publication lands through the prepared barrier, which
+        // releases the store lock before it returns: everything the arms below
+        // do — receipt finalization, the patch capture, the origin push — is
+        // network I/O or a read of immutable commits (I6).
+        Some(resolution) => {
+            let routed = match s.commit_msg.as_deref() {
+                Some(message) => {
+                    let (routed, barrier_drained) = logical_commit_barrier(
                         orch,
-                        &target,
-                        request,
-                        delta,
+                        s,
+                        resolution,
                         message,
+                        routed_delta.as_deref(),
+                        publication_request.or(s.routed_request.as_ref()),
                         author.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(mut prepared) => {
-                            prepared.run_id = s.request.run_id.clone();
-                            prepared.prior_since_ms = s.prior_publication_since_ms;
-                            Ok((prepared, target, message, delta, request))
-                        }
-                        Err(error) => Err((error, Some(target))),
-                    },
-                    Err(error) => Err((
-                        SlotPublicationError::NotInStore {
-                            delta: delta.delta_commit.clone(),
-                            error,
-                        },
-                        None,
-                    )),
-                },
-                None => Err((
-                    SlotPublicationError::NotInStore {
-                        delta: delta.delta_commit.clone(),
-                        error: "build-slot publication has no resolved shared-store lock path"
-                            .to_string(),
-                    },
-                    None,
-                )),
-            })
-        }
-        _ => None,
-    };
-    let barrier = match acquire_store_lock(
-        orch,
-        s.store_lock.as_deref(), crate::orchestrator::StoreLockClass::Foreground,
-        "run commit barrier publication",
-        STORE_LOCK_TIMEOUT,
-    )
-    .await
-    {
-        Ok(_store_guard) => {
-            let barrier_trace = _store_guard.as_ref().map(|guard| guard.trace());
-            // A commit_msg makes this batch a commit barrier on its branch. A
-            // delta an earlier batch sealed but could not publish lands first,
-            // ahead of this batch's own changes, and whether or not this batch
-            // changed anything: a trivial batch with a commit_msg is the lever
-            // an agent is given for publishing a held commit now.
-            if s.commit_msg.is_some() {
-                if let Some(resolution) = s.logical_resolution.as_ref() {
-                    drained = held::drain_held_publications(
-                        orch,
-                        &resolution.project_id,
-                        &resolution.rev,
-                        barrier_trace.as_ref(),
                     )
                     .await;
+                    drained = barrier_drained;
+                    routed
                 }
-            }
-            let routed = match prepared_routed {
-                Some(Ok((prepared, target, message, delta, request))) => {
-                    Some(match land_prepared_slot_delta(
-                        orch,
-                        &target,
-                        request,
-                        delta,
-                        message,
-                        author.as_ref(),
-                        barrier_trace.as_ref(),
-                        prepared,
-                    )
-                    .await
-                    {
-                        Ok(publication) => Ok((publication, target)),
-                        Err(error) => Err((error, Some(target))),
-                    })
-                }
-                Some(Err(error)) => Some(Err(error)),
                 None => None,
             };
-            // A routed publication's store work ends with its landing, or with
-            // the hold or strand that replaced it. Everything its arms do next —
-            // receipt finalization, the patch capture, the origin push — is
-            // network I/O or a read of immutable commits (I6), so the lock is
-            // released here for every routed outcome. Only the ambient barrier
-            // below still needs it.
-            let _store_guard = if routed.is_some() {
-                drop(_store_guard);
-                None
-            } else {
-                _store_guard
-            };
             match routed {
-                None if s.logical_resolution.is_some() => CommitBarrierOutcome {
+                None => CommitBarrierOutcome {
                     // A bound batch reports discarded work as tracked
                     // modifications (it already undid them); an unbound one
                     // reports a sealed delta the runner declines to publish.
-                    message: if (routed_delta.is_some()
-                        || routed_tracked_modifications.is_some())
+                    message: if (routed_delta.is_some() || routed_tracked_modifications.is_some())
                         && s.commit_msg.is_none()
                     {
                         home_discard_message(&modified_paths, &index_restore_failures)
@@ -9701,25 +11832,13 @@ async fn settle_run_batch(
                     worktree_changed: false,
                     committed: false,
                 },
-                None => run_commit_barrier(
-                    s.vcs
-                        .as_ref()
-                        .expect("ambient run resolves a physical VCS")
-                        .as_ref(),
-                    checkout_path,
-                    s.commit_msg.as_deref(),
-                    all_ok,
-                    s.status_before.as_ref(),
-                    author.as_ref(),
-                    s.marker_escape.as_deref(),
-                ),
                 Some(Ok((publication, target))) => {
                     let SlotPublication {
                         consume_receipt,
                         mut outcome,
                     } = publication;
-                    // The lock was released above; the patch capture reads
-                    // immutable commits.
+                    // The lock was released by the barrier; the patch capture
+                    // reads immutable commits.
                     outcome.capture_patch(&target.repository);
                     // The upload was validated and installed before either
                     // outcome was reached, so it is finalized on both.
@@ -9791,10 +11910,6 @@ async fn settle_run_batch(
                             integration,
                             ..
                         } => {
-                            let resolution = s
-                                .logical_resolution
-                                .as_ref()
-                                .expect("a routed publication has a logical resolution");
                             let rungs = climb_landing_rungs(
                                 orch,
                                 &LandingRungs {
@@ -9888,11 +12003,23 @@ async fn settle_run_batch(
                 }
             }
         }
-        Err(error) => CommitBarrierOutcome {
-            message: format!("⚠️ {error} Nothing was committed and the working copy was PRESERVED exactly. Retry with a trivial `run` carrying the same `commit_msg`; the commit barrier will seal any remaining dirty worktree."),
-            worktree_changed: false,
-            committed: false,
-        },
+        // An ambient batch keeps only its physical hygiene gate. It carries no
+        // run identity, so it resolves no store and takes no lock or branch
+        // reservation: a checkout of Cairn's shared store resolved to a backend
+        // that neither seals nor reverts (`CairnResidenceVcs`), and every other
+        // checkout is the user's, whose seal moves no Cairn branch.
+        None => run_commit_barrier(
+            s.vcs
+                .as_ref()
+                .expect("ambient run resolves a physical VCS")
+                .as_ref(),
+            checkout_path,
+            s.commit_msg.as_deref(),
+            all_ok,
+            s.status_before.as_ref(),
+            author.as_ref(),
+            s.marker_escape.as_deref(),
+        ),
     };
     if barrier.worktree_changed {
         let _ = orch.services.emitter.emit(
@@ -11455,34 +13582,45 @@ mod tests {
 
 #[cfg(test)]
 mod barrier_lock_scope_tests {
-    /// The commit barrier releases the store lock as soon as a routed
-    /// publication has landed, been held, or been stranded, and before any arm
-    /// finalizes a receipt or pushes: those are network I/O (I6). Pinned in
-    /// source order because the barrier lives inside the run handler, which has
-    /// no harness of its own.
+    /// The prepared barrier releases the store lock as soon as a routed
+    /// publication has landed, been held, or been stranded, and the settlement
+    /// arms that finalize a receipt or push run only after it returned: those
+    /// are network I/O (I6). Pinned in source order because the barrier lives
+    /// inside the run handler, which has no harness of its own.
     #[test]
     fn the_barrier_releases_the_store_lock_before_any_routed_arm_finalizes() {
         let source = include_str!("mod.rs");
-        let lock = source
-            .find("\"run commit barrier publication\",")
-            .expect("the barrier acquires the store lock");
-        let landing = lock
-            + source[lock..]
-                .find("land_prepared_slot_delta(")
-                .expect("the barrier lands a prepared delta");
+        let start = source
+            .find("async fn prepared_barrier(")
+            .expect("the prepared barrier");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the barrier's body ends")];
+        let landing = body
+            .find("land_prepared_slot_delta(")
+            .expect("the barrier lands a prepared delta under its guard");
         let release = landing
-            + source[landing..]
-                .find("let _store_guard = if routed.is_some()")
-                .expect("the barrier releases the lock for routed outcomes");
-        let arms = release
-            + source[release..]
+            + body[landing..]
+                .find("drop(guard);")
+                .expect("the barrier releases its guard after landing");
+        let returned = release
+            + body[release..]
+                .find("PreparedBarrier {")
+                .expect("and only then returns");
+        assert!(landing < release && release < returned);
+        assert!(!body.contains("finalize_delta_receipt("));
+        assert!(!body.contains("climb_landing_rungs("));
+        let settle = source
+            .find("let (routed, barrier_drained) = logical_commit_barrier(")
+            .expect("settlement publishes through the prepared barrier");
+        let arms = settle
+            + source[settle..]
                 .find("match routed {")
-                .expect("the routed arms follow the release");
-        let finalize = landing
-            + source[landing..]
+                .expect("the routed arms follow the barrier");
+        let finalize = arms
+            + source[arms..]
                 .find("finalize_delta_receipt(")
                 .expect("routed arms finalize receipts");
-        assert!(lock < landing && landing < release && release < arms && arms < finalize);
+        assert!(settle < arms && arms < finalize);
     }
 }
 
@@ -13168,17 +15306,15 @@ pub(crate) mod host_batch_tests {
             verdict_only: false,
         });
         let held = orch
-            .acquire_jj_store_lock_with_timeout(
+            .hold_jj_store_lock_on_another_task(
                 &store,
                 crate::orchestrator::StoreLockClass::Foreground,
                 "test holds the store",
-                None,
             )
-            .await
-            .unwrap();
+            .await;
         tokio::spawn(async move {
             tokio::time::sleep(ms(600)).await;
-            drop(held);
+            held.release().await;
         });
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn({
@@ -13321,14 +15457,12 @@ pub(crate) mod host_batch_tests {
             verdict_only: false,
         });
         let _held = orch
-            .acquire_jj_store_lock_with_timeout(
+            .hold_jj_store_lock_on_another_task(
                 &store,
                 crate::orchestrator::StoreLockClass::Foreground,
                 "test holds the store",
-                None,
             )
-            .await
-            .unwrap();
+            .await;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         let started = Instant::now();
@@ -13731,14 +15865,7 @@ pub(crate) mod host_batch_tests {
         assert!(refusal.unwrap().contains("cairn:~/batches/req-d"));
         let different = call_request(json!({"commands": [{"command": "cargo check"}]}));
         assert_eq!(reissue_refusal(&orch, &different).await, None);
-        orch.db
-            .local
-            .execute(
-                "UPDATE run_batch_detached SET state='settled' WHERE request_id='req-d'",
-                (),
-            )
-            .await
-            .unwrap();
+        detached::settle_answered_inline(&orch, &orch.db.local, "req-d", "passed", "done").await;
         assert_eq!(reissue_refusal(&orch, &call_request(payload)).await, None);
     }
 

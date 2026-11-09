@@ -24,7 +24,7 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
-use jj_lib::op_store::RefTarget;
+use jj_lib::op_store::{OperationId, RefTarget};
 use jj_lib::ref_name::{RefName, RemoteRefSymbol};
 use jj_lib::repo::{ReadonlyRepo, Repo as _, StoreFactories};
 use jj_lib::repo_path::RepoPathBuf;
@@ -703,6 +703,276 @@ pub fn repoint_bookmark_if_unchanged(
     ))
 }
 
+/// The commits the local bookmark `bookmark` names at the store's current
+/// operation head, sorted: one for a settled bookmark, several for a conflicted
+/// name, none when it is absent. A pure jj-lib read: no jj command runs, so no
+/// working-copy snapshot or operation settle can happen as a side effect.
+pub fn local_bookmark_targets(
+    repository_path: &Path,
+    bookmark: &str,
+) -> Result<Vec<String>, String> {
+    futures::executor::block_on(async {
+        let repo = load_repo_at_head(repository_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut targets = repo
+            .view()
+            .get_local_bookmark(RefName::new(bookmark))
+            .added_ids()
+            .map(|id| id.hex())
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    })
+}
+
+/// `branch@origin` as the store records it: its commit (`None` when absent)
+/// and whether it is tracked. A pure jj-lib read at the operation head; a
+/// conflicted record is an error, never one of its sides.
+pub fn recorded_origin_bookmark(
+    repository_path: &Path,
+    branch: &str,
+) -> Result<(Option<String>, bool), String> {
+    futures::executor::block_on(async {
+        let repo = load_repo_at_head(repository_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let symbol =
+            RefName::new(branch).to_remote_symbol(jj_lib::ref_name::RemoteName::new("origin"));
+        let remote = repo.view().get_remote_bookmark(symbol);
+        let target = normal_target(&remote.target, branch)?;
+        Ok((target, remote.is_tracked()))
+    })
+}
+
+fn normal_target(target: &RefTarget, branch: &str) -> Result<Option<String>, String> {
+    if target.is_absent() {
+        return Ok(None);
+    }
+    target.as_normal().map(|id| Some(id.hex())).ok_or_else(|| {
+        format!(
+            "`{branch}@origin` is conflicted ({})",
+            target
+                .added_ids()
+                .map(|id| id.hex())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )
+    })
+}
+
+/// One record of origin's copy of a branch: the store's `branch@origin` moves
+/// from exactly `expected` to `target` (`None` = absent), tracked when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginRecord {
+    pub branch: String,
+    pub expected: Option<String>,
+    pub target: Option<String>,
+    /// Also take the record into the LOCAL bookmark: it moves from exactly
+    /// this commit to `target` in the same transaction, and only that branch
+    /// is exported to git. `None` leaves the local bookmark untouched.
+    pub advance_local_from: Option<String>,
+}
+
+/// Write origin records in ONE jj transaction that touches only those refs.
+///
+/// Each `branch@origin` is set to its target (tracked) or removed, and jj's
+/// record of the git ref `refs/remotes/origin/<branch>` is set to match, so a
+/// later import sees no change there to fold in. No local bookmark is merged,
+/// and none moves unless its record names `advance_local_from` (then it moves
+/// by compare-and-swap and only that branch is exported); no other ref is
+/// imported or exported: this is the narrow alternative to a whole-store
+/// `jj git import` / `jj git export`. Every record is compare-and-swapped against
+/// `expected` first; any mismatch refuses the whole transaction. A target
+/// commit jj has not seen yet (one just fetched) is imported into the backend
+/// and made visible, as an import would. The caller has already written the
+/// git refs themselves and holds the store lock.
+pub fn record_origin_bookmarks(
+    repository_path: &Path,
+    records: &[OriginRecord],
+    description: &str,
+) -> Result<(), OriginRecordError> {
+    futures::executor::block_on(async {
+        let staged = async {
+            let repo = load_repo_at_head(repository_path)
+                .await
+                .map_err(|error| error.to_string())?;
+            let origin = jj_lib::ref_name::RemoteName::new("origin");
+            let mut targets = Vec::new();
+            for record in records {
+                let symbol = RefName::new(&record.branch).to_remote_symbol(origin);
+                let current = normal_target(
+                    &repo.view().get_remote_bookmark(symbol).target,
+                    &record.branch,
+                )?;
+                if current != record.expected {
+                    return Err(format!(
+                    "`{}@origin` moved after it was judged (expected {}, now {}); nothing recorded",
+                    record.branch,
+                    record.expected.as_deref().unwrap_or("<absent>"),
+                    current.as_deref().unwrap_or("<absent>")
+                ));
+                }
+                if let Some(expected_local) = &record.advance_local_from {
+                    let local = repo
+                        .view()
+                        .get_local_bookmark(RefName::new(&record.branch))
+                        .as_normal()
+                        .map(|id| id.hex());
+                    if local.as_ref() != Some(expected_local) || record.target.is_none() {
+                        return Err(format!(
+                            "`{}` moved after it was judged (expected {expected_local}, now {}); \
+                         nothing recorded",
+                            record.branch,
+                            local.as_deref().unwrap_or("<absent or conflicted>")
+                        ));
+                    }
+                }
+                targets.push(
+                    record
+                        .target
+                        .as_deref()
+                        .map(|hex| {
+                            CommitId::try_from_hex(hex)
+                                .ok_or_else(|| format!("`{hex}` is not a full commit id"))
+                        })
+                        .transpose()?,
+                );
+            }
+            let present: Vec<&CommitId> = targets.iter().flatten().collect();
+            jj_lib::git::get_git_backend(repo.store())
+                .map_err(|error| error.to_string())?
+                .import_head_commits(present.iter().copied())
+                .map_err(|error| format!("import origin's commits into the store: {error}"))?;
+            let mut heads = Vec::new();
+            for id in &present {
+                heads.push(
+                    repo.store()
+                        .get_commit(id)
+                        .map_err(|error| format!("read origin's commit {}: {error}", id.hex()))?,
+                );
+            }
+            let mut tx = repo.start_transaction();
+            tx.repo_mut()
+                .add_heads(&heads)
+                .await
+                .map_err(|error| format!("make origin's commits visible: {error}"))?;
+            for (record, target) in records.iter().zip(&targets) {
+                let symbol = RefName::new(&record.branch).to_remote_symbol(origin);
+                let ref_target = target
+                    .clone()
+                    .map_or_else(RefTarget::absent, RefTarget::normal);
+                let remote = match target {
+                    Some(_) => jj_lib::op_store::RemoteRef {
+                        target: ref_target.clone(),
+                        state: jj_lib::op_store::RemoteRefState::Tracked,
+                    },
+                    None => jj_lib::op_store::RemoteRef::absent_ref().clone(),
+                };
+                tx.repo_mut().set_remote_bookmark(symbol, remote);
+                let git_ref = format!("refs/remotes/origin/{}", record.branch);
+                if record.advance_local_from.is_some() {
+                    tx.repo_mut().set_local_bookmark_target(
+                        RefName::new(&record.branch),
+                        ref_target.clone(),
+                    );
+                }
+                tx.repo_mut()
+                    .set_git_ref_target(jj_lib::ref_name::GitRefName::new(&git_ref), ref_target);
+            }
+            let advanced: Vec<&str> = records
+                .iter()
+                .filter(|record| record.advance_local_from.is_some())
+                .map(|record| record.branch.as_str())
+                .collect();
+            if !advanced.is_empty() {
+                let stats = jj_lib::git::export_some_refs(tx.repo_mut(), |kind, symbol| {
+                    matches!(kind, jj_lib::git::GitRefKind::Bookmark)
+                        && advanced
+                            .iter()
+                            .any(|branch| symbol.name == RefName::new(branch))
+                })
+                .map_err(|error| format!("export {}: {error}", advanced.join(", ")))?;
+                if !stats.failed_bookmarks.is_empty() {
+                    return Err(format!(
+                        "export refused {:?}; nothing recorded",
+                        stats.failed_bookmarks
+                    ));
+                }
+            }
+            Ok::<_, String>(tx)
+        };
+        let tx = staged.await.map_err(OriginRecordError::BeforeCommit)?;
+        commit_origin_record(tx, description).await
+    })
+}
+
+/// Why [`record_origin_bookmarks`] did not report success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginRecordError {
+    /// Refused or failed before the commit: nothing in the store changed
+    /// (an export the transaction ran may have moved its git ref; the caller
+    /// restores it).
+    BeforeCommit(String),
+    /// The commit itself reported an error. jj writes the operation before it
+    /// publishes the operation head, so the record may or may not be visible:
+    /// the caller must re-read the store before deciding.
+    AtCommit(String),
+}
+
+impl std::fmt::Display for OriginRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeCommit(error) => f.write_str(error),
+            Self::AtCommit(error) => write!(
+                f,
+                "the origin record's commit reported an error, so it may or may not have \
+                 committed: {error}"
+            ),
+        }
+    }
+}
+
+async fn commit_origin_record(
+    tx: jj_lib::transaction::Transaction,
+    description: &str,
+) -> Result<(), OriginRecordError> {
+    if let Some((visible, error)) = take_injected_origin_commit_failure() {
+        if visible {
+            tx.commit(description.to_string())
+                .await
+                .map_err(|error| OriginRecordError::AtCommit(error.to_string()))?;
+        }
+        return Err(OriginRecordError::AtCommit(error));
+    }
+    tx.commit(description.to_string())
+        .await
+        .map(|_| ())
+        .map_err(|error| OriginRecordError::AtCommit(format!("commit the origin record: {error}")))
+}
+
+#[cfg(test)]
+static INJECTED_ORIGIN_COMMIT_FAILURE: std::sync::Mutex<Option<(bool, String)>> =
+    std::sync::Mutex::new(None);
+
+/// Make the next origin record's commit report `error`, after committing when
+/// `visible` (the operation landed) or instead of it.
+#[cfg(test)]
+pub(crate) fn inject_origin_record_commit_failure(visible: bool, error: &str) {
+    *INJECTED_ORIGIN_COMMIT_FAILURE.lock().unwrap() = Some((visible, error.to_string()));
+}
+
+#[cfg(test)]
+fn take_injected_origin_commit_failure() -> Option<(bool, String)> {
+    INJECTED_ORIGIN_COMMIT_FAILURE.lock().unwrap().take()
+}
+
+#[cfg(not(test))]
+fn take_injected_origin_commit_failure() -> Option<(bool, String)> {
+    None
+}
+
 async fn repoint_bookmark_if_unchanged_inner(
     repository_path: &Path,
     bookmark: &str,
@@ -1081,6 +1351,26 @@ async fn resolve_coordinate_inner(
     repository_path: &Path,
     coordinate: &str,
 ) -> Result<String, CoordinateResolutionError> {
+    if let Some(id) = CommitId::try_from_hex(coordinate) {
+        let workspace =
+            load_workspace(repository_path).map_err(CoordinateResolutionError::Repository)?;
+        let store = workspace.repo_loader().store();
+        if coordinate.len() == store.commit_id_length() * 2 {
+            // An exact object does not depend on a bookmark or operation head.
+            return store
+                .get_commit(&id)
+                .map(|commit| commit.id().hex())
+                .map_err(|error| match error {
+                    jj_lib::backend::BackendError::ObjectNotFound { .. } => {
+                        CoordinateResolutionError::Absent {
+                            coordinate: coordinate.to_string(),
+                            diagnostic: error.to_string(),
+                        }
+                    }
+                    _ => CoordinateResolutionError::Repository(error.to_string()),
+                });
+        }
+    }
     let repo = load_repo_at_head(repository_path).await?;
     resolve_symbol_at(&repo, coordinate).map(|id| id.hex())
 }
@@ -1218,12 +1508,7 @@ fn precheck_at(repo: &ReadonlyRepo, destination: &str, branch: &str) -> Bookmark
     };
     // An unreadable commit or index answer is reported as divergent so the
     // caller runs the CLI probe instead of trusting a guess.
-    let divergent = repo
-        .store()
-        .get_commit(&tip)
-        .ok()
-        .and_then(|commit| repo.resolve_change_id(commit.change_id()).ok())
-        .is_none_or(|targets| targets.is_none_or(|targets| targets.is_divergent()));
+    let divergent = jj::branch_tip_divergent(repo, branch, &tip).unwrap_or(true);
     BookmarkPrecheck {
         destination,
         tip: Some(tip.hex()),
@@ -1248,6 +1533,108 @@ pub(crate) fn load_workspace(repository_path: &Path) -> Result<Workspace, String
             repository_path.display()
         )
     })
+}
+
+/// The store's operation log as one read-only observation.
+///
+/// jj records concurrent writers as several operation heads and merges them,
+/// writing the merge as a new operation, the next time any command loads the
+/// repository at its head. That includes `jj log`, `jj bookmark list` and
+/// `jj op log`, with or without `--ignore-working-copy` (verified against jj
+/// 0.42), so no CLI query can observe a split log without ending it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettledOperation {
+    /// Exactly one operation head, by full hexadecimal ID. Every read pinned to
+    /// it sees one immutable view.
+    Single(String),
+    /// Concurrent operation heads a reader may not merge, sorted. Each holds a
+    /// different bookmark view, so a symbolic read has no single answer.
+    Split(Vec<String>),
+}
+
+/// Read the store's operation heads in process, without running jj and so
+/// without settling a split log. The one rule for "settled" is
+/// [`settled_head`], which [`load_repo_at_head`] shares.
+pub fn settled_operation(repository_path: &Path) -> Result<SettledOperation, String> {
+    let workspace = load_workspace(repository_path)?;
+    let heads =
+        futures::executor::block_on(workspace.repo_loader().op_heads_store().get_op_heads())
+            .map_err(|error| {
+                format!(
+                    "read the operation heads of {}: {error}",
+                    repository_path.display()
+                )
+            })?;
+    Ok(match settled_head(heads) {
+        Ok(head) => SettledOperation::Single(head.hex()),
+        Err(heads) => SettledOperation::Split(heads.iter().map(|head| head.hex()).collect()),
+    })
+}
+
+/// One operation head whose index holds every commit in `commits`, for a read
+/// addressed only by immutable commit IDs.
+///
+/// Such a read needs no bookmark view, so a split log does not refuse it: any
+/// operation that indexes the commits answers identically. A commit a later
+/// operation hid (a candidate built and undone, say) stays in the index of
+/// every descendant operation, so it remains readable here. Heads are tried in
+/// sorted order and nothing is written.
+pub fn operation_indexing(repository_path: &Path, commits: &[&str]) -> Result<String, String> {
+    let ids = commits
+        .iter()
+        .map(|hex| {
+            CommitId::try_from_hex(hex)
+                .filter(|_| !hex.is_empty())
+                .ok_or_else(|| format!("`{hex}` is not a hexadecimal commit ID"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    futures::executor::block_on(async {
+        let workspace = load_workspace(repository_path)?;
+        let loader = workspace.repo_loader();
+        let mut heads = loader
+            .op_heads_store()
+            .get_op_heads()
+            .await
+            .map_err(|error| error.to_string())?;
+        heads.sort();
+        for head in &heads {
+            let operation = loader
+                .load_operation(head)
+                .await
+                .map_err(|error| error.to_string())?;
+            let repo = loader
+                .load_at(&operation)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut indexes_all = true;
+            for id in &ids {
+                if !repo.index().has_id(id).map_err(|error| error.to_string())? {
+                    indexes_all = false;
+                    break;
+                }
+            }
+            if indexes_all {
+                return Ok(head.hex());
+            }
+        }
+        Err(format!(
+            "none of the {} operation heads of {} indexes every commit of [{}]",
+            heads.len(),
+            repository_path.display(),
+            commits.join(", ")
+        ))
+    })
+}
+
+/// The single operation head, or every head (sorted) when there is not exactly
+/// one. The one place the store decides whether it is settled.
+fn settled_head(mut heads: Vec<OperationId>) -> Result<OperationId, Vec<OperationId>> {
+    heads.sort();
+    if heads.len() == 1 {
+        Ok(heads.remove(0))
+    } else {
+        Err(heads)
+    }
 }
 
 /// Build an immutable, unpublished import candidate at an exact source operation.
@@ -1389,11 +1776,74 @@ async fn load_repo_at_head(
     );
     let workspace = Workspace::load(&settings, repository_path, &stores, &working_copies)
         .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
-    workspace
-        .repo_loader()
-        .load_at_head()
+    let loader = workspace.repo_loader();
+    let heads = loader
+        .op_heads_store()
+        .get_op_heads()
+        .await
+        .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
+    let head = settled_head(heads).map_err(|heads| {
+        CoordinateResolutionError::Repository(format!(
+            "the store has {} operation heads; literal inspection requires one settled operation \
+             and does not reconcile them",
+            heads.len()
+        ))
+    })?;
+    // load_at_head resolves concurrent operations by publishing a merged view.
+    // A read must instead capture one operation or refuse an unsettled store.
+    let operation = loader
+        .load_operation(&head)
+        .await
+        .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
+    loader
+        .load_at(&operation)
         .await
         .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))
+}
+
+/// An index-only union for queries addressed entirely by immutable commit IDs.
+/// No bookmark view is merged, no descendants are replayed, and no operation is
+/// written. Symbolic resolution must still use one settled operation instead.
+pub(crate) async fn load_repo_for_history(
+    repository_path: &Path,
+) -> Result<Box<dyn jj_lib::repo::Repo>, CoordinateResolutionError> {
+    let workspace =
+        load_workspace(repository_path).map_err(CoordinateResolutionError::Repository)?;
+    let loader = workspace.repo_loader();
+    let mut heads = loader
+        .op_heads_store()
+        .get_op_heads()
+        .await
+        .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
+    heads.sort();
+    if heads.is_empty() || heads.len() > 64 {
+        return Err(CoordinateResolutionError::Repository(format!(
+            "immutable history inspection needs 1 to 64 operation heads, found {}",
+            heads.len()
+        )));
+    }
+    let mut repositories = Vec::with_capacity(heads.len());
+    for head in heads {
+        let operation = loader
+            .load_operation(&head)
+            .await
+            .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
+        repositories.push(
+            loader
+                .load_at(&operation)
+                .await
+                .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?,
+        );
+    }
+    let first = repositories.remove(0);
+    let mut union =
+        jj_lib::repo::MutableRepo::new(first.clone(), first.readonly_index(), first.view());
+    for repository in repositories {
+        union
+            .merge_index(&repository)
+            .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?;
+    }
+    Ok(Box::new(union))
 }
 
 /// Resolve one user coordinate against an already-loaded repository.
@@ -1525,7 +1975,7 @@ async fn merge_base_inner(
     let repo = load_repo_at_head(repository_path).await?;
     let left_id = resolve_symbol_at(&repo, left)?;
     let right_id = resolve_symbol_at(&repo, right)?;
-    let base = best_common_ancestor(&repo, &left_id, &right_id)
+    let base = best_common_ancestor(repo.as_ref(), &left_id, &right_id)
         .map_err(CoordinateResolutionError::Repository)?
         .ok_or_else(|| CoordinateResolutionError::Absent {
             coordinate: format!("{right}...{left}"),
@@ -1545,7 +1995,7 @@ async fn merge_base_inner(
 /// Both ids must already be in the index; `common_ancestors` does not guard
 /// against an unknown id.
 pub(crate) fn best_common_ancestor(
-    repo: &ReadonlyRepo,
+    repo: &dyn jj_lib::repo::Repo,
     left: &CommitId,
     right: &CommitId,
 ) -> Result<Option<CommitId>, String> {
@@ -2652,6 +3102,342 @@ mod tests {
         }
         // An unrelated name is untouched by the neighbouring conflict.
         assert!(runtime.block_on(resolve_coordinate(&store, "main")).is_ok());
+    }
+
+    /// The operation heads as jj's own op-heads directory lists them, read
+    /// independently of every function under test.
+    fn op_heads(store: &Path) -> Vec<String> {
+        let mut heads = std::fs::read_dir(store.join(".jj/repo/op_heads/heads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        heads.sort();
+        heads
+    }
+
+    /// One new commit on `parent` under bookmark `name`, in its own operation.
+    fn commit_with_bookmark(store: &Path, parent: &str, name: &str) -> String {
+        runtime().block_on(async {
+            let repo = load_repo_at_head(store).await.unwrap();
+            let parent_id = CommitId::try_from_hex(parent).unwrap();
+            let tree = repo.store().get_commit(&parent_id).unwrap().tree();
+            let mut tx = repo.start_transaction();
+            let commit = tx
+                .repo_mut()
+                .new_commit(vec![parent_id], tree)
+                .set_description(name)
+                .write()
+                .await
+                .unwrap();
+            tx.repo_mut().set_local_bookmark_target(
+                RefName::new(name),
+                RefTarget::normal(commit.id().clone()),
+            );
+            tx.commit(format!("create `{name}`")).await.unwrap();
+            commit.id().hex()
+        })
+    }
+
+    /// Two concurrent operations loaded from the same settled head, each adding
+    /// a commit on `parent` under its own bookmark (`left`, `right`), leaving
+    /// two operation heads. Returns the two commits.
+    fn split_operations(store: &Path, parent: &str) -> (String, String) {
+        runtime().block_on(async {
+            let repo = load_repo_at_head(store).await.unwrap();
+            let parent_id = CommitId::try_from_hex(parent).unwrap();
+            let tree = repo.store().get_commit(&parent_id).unwrap().tree();
+            let mut sides = Vec::new();
+            for name in ["left", "right"] {
+                let mut tx = repo.start_transaction();
+                let commit = tx
+                    .repo_mut()
+                    .new_commit(vec![parent_id.clone()], tree.clone())
+                    .set_description(format!("{name} operation only"))
+                    .write()
+                    .await
+                    .unwrap();
+                tx.repo_mut().set_local_bookmark_target(
+                    RefName::new(name),
+                    RefTarget::normal(commit.id().clone()),
+                );
+                sides.push((name, commit.id().hex(), tx));
+            }
+            let mut commits = Vec::new();
+            for (name, commit, tx) in sides {
+                tx.commit(format!("concurrent {name}")).await.unwrap();
+                commits.push(commit);
+            }
+            (commits.remove(0), commits.remove(0))
+        })
+    }
+
+    /// The pure operation query and the pinned read environments built on it,
+    /// against the real jj CLI: a split log is reported, never merged, by the
+    /// query and by every read probe run through a pinned environment, while
+    /// the same probe unpinned merges it.
+    #[test]
+    fn pinned_reads_observe_a_split_operation_log_without_settling_it() {
+        let Some(bin) = jj::testing::jj_bin() else {
+            return;
+        };
+        let (dir, store, local, _) = conflicted_bookmark_fixture();
+        let jj = jj::JjEnv::with_binary(bin, &dir.path().join("home"));
+
+        // Settled: the query names the one head, and a pinned read answers.
+        let settled = op_heads(&store);
+        assert_eq!(settled.len(), 1);
+        assert_eq!(
+            settled_operation(&store).unwrap(),
+            SettledOperation::Single(settled[0].clone())
+        );
+        let pinned = jj.pin_settled_read(&store).unwrap();
+        assert_eq!(pinned.pinned_operation(), Some(settled[0].as_str()));
+        assert_eq!(
+            jj::bookmark_commit_checked(&pinned, &store, "keep-l").unwrap(),
+            Some(local.clone())
+        );
+        assert_eq!(op_heads(&store), settled);
+
+        // A candidate built and then undone is hidden, yet stays readable by its
+        // full ID from the current operation: the landing validator's shape.
+        let candidate = commit_with_bookmark(&store, &local, "candidate");
+        jj.run(
+            &store,
+            &["op", "restore", &settled[0], "--ignore-working-copy"],
+            "test: undo the candidate",
+        )
+        .unwrap();
+        let restored = op_heads(&store);
+        assert_eq!(restored.len(), 1);
+        let reader = jj.pin_settled_read(&store).unwrap();
+        assert_eq!(
+            jj::revset_commit_checked(&reader, &store, &format!("{candidate} & visible()"))
+                .unwrap(),
+            None,
+            "the undone candidate is hidden"
+        );
+        let reader = jj.pin_immutable_read(&store, &[&candidate]).unwrap();
+        assert_eq!(
+            jj::file_show(&reader, &store, &candidate, "f.txt").unwrap(),
+            b"base\n"
+        );
+        assert_eq!(op_heads(&store), restored);
+
+        // Split: the query reports both heads and writes nothing.
+        let (left, right) = split_operations(&store, &local);
+        let split = op_heads(&store);
+        assert_eq!(split.len(), 2, "fixture must have concurrent operations");
+        assert_eq!(
+            settled_operation(&store).unwrap(),
+            SettledOperation::Split(split.clone())
+        );
+        assert_eq!(op_heads(&store), split, "the query writes nothing");
+        let refused = jj
+            .pin_settled_read(&store)
+            .err()
+            .expect("a split log refuses a symbolic pin");
+        assert!(
+            refused.contains("2 concurrent operation heads"),
+            "{refused}"
+        );
+        assert_eq!(op_heads(&store), split);
+
+        // An immutable read pins to a head that indexes what it reads: each side
+        // holds only its own commit, both hold the shared history.
+        let left_reader = jj.pin_immutable_read(&store, &[&left]).unwrap();
+        let right_reader = jj.pin_immutable_read(&store, &[&right]).unwrap();
+        assert_ne!(
+            left_reader.pinned_operation(),
+            right_reader.pinned_operation()
+        );
+        assert!(jj.pin_immutable_read(&store, &[&left, &right]).is_err());
+        let shared = jj
+            .pin_immutable_read(&store, &[&local, &candidate])
+            .unwrap();
+        assert_eq!(shared.pinned_operation(), Some(split[0].as_str()));
+        assert_eq!(op_heads(&store), split);
+
+        // Every read probe, pinned, leaves both heads.
+        assert_eq!(
+            jj::bookmark_commit_checked(&left_reader, &store, "left").unwrap(),
+            Some(left.clone())
+        );
+        assert_eq!(op_heads(&store), split, "bookmark_commit_checked");
+        assert_eq!(
+            jj::bookmark_commit(&right_reader, &store, "right"),
+            Some(right.clone())
+        );
+        assert_eq!(op_heads(&store), split, "bookmark_commit");
+        assert!(jj::conflicted_commits_checked(
+            &left_reader,
+            &store,
+            "::bookmarks(exact:\"left\")"
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(op_heads(&store), split, "conflicted_commits_checked");
+        assert!(!jj::branch_has_conflict(&left_reader, &store, "left").unwrap());
+        assert_eq!(op_heads(&store), split, "branch_has_conflict");
+        assert!(jj::revset_descends_from(
+            &left_reader,
+            &store,
+            "bookmarks(exact:\"left\")",
+            &local
+        ));
+        assert_eq!(op_heads(&store), split, "revset_descends_from");
+        assert_eq!(
+            jj::file_show(&shared, &store, &candidate, "f.txt").unwrap(),
+            b"base\n"
+        );
+        assert_eq!(op_heads(&store), split, "file_show");
+
+        // The same read unpinned is not a read: it merges the split log.
+        assert_eq!(
+            jj::bookmark_commit(&jj, &store, "keep-l"),
+            Some(local.clone())
+        );
+        assert_eq!(
+            op_heads(&store).len(),
+            1,
+            "jj 0.42 merges a split log on any unpinned load at head"
+        );
+    }
+
+    /// The Git-object reads (tree hash, tree entries, own patch) find the
+    /// store's backend from disk: on a split operation log they answer for exact
+    /// commits and leave both heads, from the store itself, from a secondary
+    /// workspace's pointer file, and from a plain Git checkout.
+    #[test]
+    fn git_object_reads_resolve_the_backend_without_loading_jj() {
+        let Some(bin) = jj::testing::jj_bin() else {
+            return;
+        };
+        let (dir, store, local, _) = conflicted_bookmark_fixture();
+        let project = dir.path().join("project");
+        let jj = jj::JjEnv::with_binary(bin, &dir.path().join("home"));
+        let (left, _right) = split_operations(&store, &local);
+        let split = op_heads(&store);
+        assert_eq!(split.len(), 2, "fixture must have concurrent operations");
+
+        // A secondary workspace names the store through a pointer file.
+        let secondary = dir.path().join("secondary");
+        std::fs::create_dir_all(secondary.join(".jj")).unwrap();
+        std::fs::write(
+            secondary.join(".jj/repo"),
+            store.join(".jj/repo").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let tree = git_rev(&project, &format!("{left}^{{tree}}"));
+        for root in [&store, &secondary, &project] {
+            assert_eq!(
+                jj::sealed_tree_hash_via_git(&jj, root, &left).unwrap(),
+                tree,
+                "{}",
+                root.display()
+            );
+            assert!(jj::tree_entries(&jj, root, &left)
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "f.txt"));
+            let own = jj::own_patch_against(&jj, root, &left, &local).unwrap();
+            assert_eq!(own.base, local);
+            assert_eq!(
+                op_heads(&store),
+                split,
+                "{} settled nothing",
+                root.display()
+            );
+        }
+        assert_eq!(
+            jj::backend_git_dir(&secondary),
+            jj::backend_git_dir(&store),
+            "a workspace and its store share one backend"
+        );
+
+        // A `.jj` that names no readable store is an error, never a guess.
+        let broken = dir.path().join("broken");
+        std::fs::create_dir_all(broken.join(".jj")).unwrap();
+        assert!(jj::sealed_tree_hash_via_git(&jj, &broken, &left).is_err());
+    }
+
+    #[test]
+    fn literal_reads_refuse_divergent_operations_without_publishing_a_merge() {
+        let (_dir, store, local, _) = conflicted_bookmark_fixture();
+        runtime().block_on(async {
+            let repo = load_repo_at_head(&store).await.unwrap();
+            let parent_id = CommitId::try_from_hex(&local).unwrap();
+            let parent = repo.store().get_commit(&parent_id).unwrap();
+            let mut left = repo.start_transaction();
+            let left_commit = left
+                .repo_mut()
+                .new_commit(vec![parent_id.clone()], parent.tree())
+                .set_description("left operation only")
+                .write()
+                .await
+                .unwrap();
+            left.repo_mut().set_local_bookmark_target(
+                RefName::new("left"),
+                RefTarget::normal(left_commit.id().clone()),
+            );
+            let mut right = repo.start_transaction();
+            let right_commit = right
+                .repo_mut()
+                .new_commit(vec![parent_id], parent.tree())
+                .set_description("right operation only")
+                .write()
+                .await
+                .unwrap();
+            right.repo_mut().set_local_bookmark_target(
+                RefName::new("right"),
+                RefTarget::normal(right_commit.id().clone()),
+            );
+            left.commit("concurrent left").await.unwrap();
+            right.commit("concurrent right").await.unwrap();
+            let mut before = repo.op_heads_store().get_op_heads().await.unwrap();
+            before.sort();
+            assert_eq!(before.len(), 2, "fixture must have concurrent operations");
+
+            for coordinate in ["main", "agent/x"] {
+                let error = resolve_coordinate(&store, coordinate).await.unwrap_err();
+                assert!(matches!(error, CoordinateResolutionError::Repository(_)));
+                assert!(error.to_string().contains("2 operation heads"), "{error}");
+            }
+            assert_eq!(resolve_coordinate(&store, &local).await.unwrap(), local);
+            let ancestry = history::ancestry(
+                &store,
+                &local,
+                &local,
+                10,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(ancestry.ahead.count, 0);
+            assert_eq!(ancestry.behind.count, 0);
+            assert!(ancestry.from_in_to && ancestry.to_in_from);
+            for id in [left_commit.id().hex(), right_commit.id().hex()] {
+                assert_eq!(resolve_coordinate(&store, &id).await.unwrap(), id);
+            }
+            let across = history::ancestry(
+                &store,
+                &left_commit.id().hex(),
+                &right_commit.id().hex(),
+                10,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(across.ahead.count, 1);
+            assert_eq!(across.behind.count, 1);
+            assert_eq!(across.merge_base.as_deref(), Some(local.as_str()));
+            let mut after = repo.op_heads_store().get_op_heads().await.unwrap();
+            after.sort();
+            assert_eq!(
+                after, before,
+                "inspection must not reconcile operation heads"
+            );
+        });
     }
 
     #[test]

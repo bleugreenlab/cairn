@@ -203,6 +203,30 @@ fn render_request_observation(project: &str, handle: &str, value: &serde_json::V
                 lines.push(format!("{fence}\n{output}\n{fence}"));
             }
         }
+        "conflictsWithBase" => {
+            lines.push("- State: conflicts with base".into());
+            for (label, key) in [
+                ("Branch", "branch"),
+                ("Head", "head"),
+                ("Base branch", "baseBranch"),
+                ("Base commit", "baseCommit"),
+            ] {
+                if let Some(value) = text(&value[key]) {
+                    lines.push(format!("- {label}: {value}"));
+                }
+            }
+            if let Some(paths) = value["paths"].as_array() {
+                lines.push(format!(
+                    "- Conflicting paths: {}",
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            lines.push("- No test verdict: branch preparation conflicted with its base.".into());
+        }
         "failed" => {
             lines.push("- State: failed".into());
             lines.push(format!(
@@ -1336,6 +1360,33 @@ mod tests {
         assert!(!page.contains("Tier"), "{page}");
         let foreign = read_project_check_observation(&orch, "other", &handle).await;
         assert!(foreign.contains("unknown in this project"), "{foreign}");
+    }
+
+    #[tokio::test]
+    async fn request_handle_reads_a_base_conflict_as_its_own_state_without_a_verdict() {
+        let (_root, orch) = request_fixture().await;
+        let handle = request_handle_row(
+            &orch,
+            Some(serde_json::json!({"state":"conflictsWithBase",
+                "branch":"agent/proj-1-builder-0","head":"head-commit",
+                "baseBranch":"main","baseCommit":"base-commit",
+                "paths":["src/shared.rs","docs/notes.md"]})),
+        )
+        .await;
+        let page = read_project_check_observation(&orch, "proj", &handle).await;
+        for line in [
+            "- State: conflicts with base",
+            "- Branch: agent/proj-1-builder-0",
+            "- Head: head-commit",
+            "- Base branch: main",
+            "- Base commit: base-commit",
+            "- Conflicting paths: src/shared.rs, docs/notes.md",
+            "- No test verdict: branch preparation conflicted with its base.",
+        ] {
+            assert!(page.contains(line), "missing {line:?} in {page}");
+        }
+        assert!(!page.contains("State: failed"), "{page}");
+        assert!(!page.contains("Error:"), "{page}");
     }
 
     #[tokio::test]

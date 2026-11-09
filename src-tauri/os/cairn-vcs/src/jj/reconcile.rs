@@ -1,6 +1,5 @@
 //! Guarded flatten recovery and sibling reconcile onto an advanced tip.
 use super::*;
-use std::cell::RefCell;
 use std::path::Path;
 
 fn record_failure(report: &mut ReconcileReport, branch: &str, error: String) {
@@ -37,95 +36,30 @@ fn record_conflict(report: &mut ReconcileReport, branch: &str, diagnostic: Confl
         .insert(branch.to_string(), diagnostic);
 }
 
-/// The set of paths a branch changes relative to a dest, plus which of those are
-/// deletions. Captured before a flatten and re-checked after: [`squash_branch_onto`]
-/// restores the exact clean-tip tree, so the post-flatten footprint MUST match
-/// the pre-flatten one. A footprint mismatch — above all a NEW deletion of a dest
-/// file — means the flatten re-parented a stale tree (wrong base/tip) and would
-/// silently revert base files, so the guard rejects it.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct BranchFootprint {
-    changed: std::collections::BTreeSet<String>,
-    deletions: std::collections::BTreeSet<String>,
-}
-
-/// Compute the tree diff footprint of `dest_commit..tip_commit` over the store.
-/// Uses the same `jj diff --git` → [`parse_git_diff`] path as `node_changed_files`,
-/// so a rename is decomposed into an added new path plus a deleted old path.
-fn branch_footprint(
-    jj: &JjEnv,
-    store: &Path,
-    dest_commit: &str,
-    tip_commit: &str,
-) -> Result<BranchFootprint, String> {
-    let out = jj.run(
-        store,
-        &[
-            "diff",
-            "--ignore-working-copy",
-            "--git",
-            "--from",
-            dest_commit,
-            "--to",
-            tip_commit,
-        ],
-        "jj diff (flatten footprint)",
-    )?;
-    let mut footprint = BranchFootprint::default();
-    for change in parse_git_diff(&out) {
-        footprint.changed.insert(change.path.clone());
-        if change.status == "deleted" {
-            footprint.deletions.insert(change.path.clone());
-        }
-        if let Some(prev) = change.previous_path {
-            // A rename removes the old path from the tree.
-            footprint.changed.insert(prev.clone());
-            footprint.deletions.insert(prev);
-        }
-    }
-    Ok(footprint)
-}
-
-/// Reset `branch` back to `tip` (a deliberate sideways/backwards move) and
-/// re-export the ref to git. Used to UNDO a [`squash_branch_onto`] when a
-/// post-squash guard in [`flatten_branch_recovery`] refuses the result: the squash
-/// has already moved the bookmark, so without this a rejected flatten would leave
-/// the visible branch rewritten.
-///
-/// BOTH halves of the restore are propagated. The bookmark move puts the store
-/// back; the VERIFIED export proves `refs/heads/<branch>` came back with it. A
-/// refused export does not self-heal, so discarding that verdict would report the
-/// restore as complete while the backing ref stayed parked on the rejected
-/// flatten — the exact state this function exists to prevent. Returning it cannot
-/// mask the guard failure that got us here: the sole caller is
-/// [`flatten_branch_recovery`]'s `fail`, which hands back the guard's own reason
-/// with a [`rollback_incomplete`] line after it.
+/// Restore only the explicitly observed source after a failed squash export.
+/// A concurrent owner commit wins; its head is never replaced by rollback.
 pub(crate) fn restore_bookmark(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
+    expected_current: &str,
     tip: &str,
 ) -> Result<(), String> {
-    jj.run(
-        store,
-        &[
-            "bookmark",
-            "set",
-            branch,
-            "-r",
-            tip,
-            "--allow-backwards",
-            "--ignore-working-copy",
-        ],
-        "flatten: restore bookmark after guard failure",
-    )?;
-    export_git_verified(
+    super::packed_refs::with_packed_refs_patience_for(
         jj,
-        store,
-        true,
-        "flatten: git export after restore",
-        &[(branch, tip)],
-    )
+        PackedRefs::JjStore(store),
+        "restore exact squash source",
+        || {
+            crate::repoint_bookmark_if_unchanged(
+                store,
+                branch,
+                &[expected_current.to_string()],
+                tip,
+                "restore exact source after refused squash export",
+            )
+        },
+    )?;
+    super::advance::export_accepted_branch(jj, store, branch, tip)
 }
 
 /// The store's current operation id (the newest entry in the op log). Paired with
@@ -137,6 +71,10 @@ pub(crate) fn restore_bookmark(
 /// LOCAL-VIEW op between snapshot and restore is the caller's own. Pushes and
 /// fetches deliberately run without the lock and may interleave; they write only
 /// remote-tracking state, which [`restore_operation`] leaves alone.
+///
+/// Not a pure read: like every unpinned jj command it merges a split operation
+/// log first and reports the merge. A read that must not settle the store uses
+/// [`crate::settled_operation`] instead.
 ///
 /// In a budgeted environment the read also snapshots every local bookmark and
 /// backing Git head at that operation, so a later [`restore_operation`] to it
@@ -237,381 +175,6 @@ pub(crate) fn restore_operation_and_export(
     super::export_bookmark_advance(jj, store, true, branch, ctx)
 }
 
-/// Local bookmarks that ride a commit inside `range_revset`, excluding `exclude`.
-/// A base advance that bakes conflicts into a branch's intermediate commits can
-/// leave a SIBLING bookmark pointing at one of those intermediates (its own tip
-/// is one of this branch's lineage commits, so it has no seals of its own). When
-/// this branch is flattened, that rider is orphaned onto an abandoned lineage;
-/// [`flatten_branch_recovery`] re-points each such rider onto the flattened
-/// commit. `local_bookmarks` is the jj 0.42 template keyword for a commit's local
-/// bookmarks; `--ignore-working-copy` keeps the enumeration store-driven.
-pub fn local_bookmarks_in_range(
-    jj: &JjEnv,
-    store: &Path,
-    range_revset: &str,
-    exclude: &str,
-) -> Vec<String> {
-    jj.run(
-        store,
-        &[
-            "log",
-            "-r",
-            range_revset,
-            "--no-graph",
-            "-T",
-            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
-            "--ignore-working-copy",
-        ],
-        "jj log (rider bookmarks in range)",
-    )
-    .unwrap_or_default()
-    .lines()
-    .map(str::trim)
-    .filter(|name| !name.is_empty() && *name != exclude)
-    .map(ToOwned::to_owned)
-    .collect::<std::collections::BTreeSet<_>>()
-    .into_iter()
-    .collect()
-}
-
-/// The outcome of a guarded flatten recovery.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlattenReport {
-    /// The single commit the branch now points at: its tree equals the clean
-    /// rebased tip and its parent is `dest_commit`.
-    pub flattened_commit: String,
-    /// How many conflicted intermediate commits the flatten collapsed away
-    /// (advisory count).
-    pub collapsed_conflicted_commits: usize,
-    /// Orphaned twins of the PRE-flatten change-id that were abandoned in the
-    /// twin-cleanup pass.
-    pub abandoned_twins: Vec<String>,
-    /// Sibling bookmarks that rode a flattened-away intermediate commit and were
-    /// re-pointed onto the flattened commit (so a later `reconcile_siblings` does
-    /// not resurrect the orphaned lineage).
-    pub repointed_bookmarks: Vec<String>,
-}
-
-/// Guarded collapse of a branch to ONE commit on `dest_commit` whose tree equals
-/// its clean rebased tip, for the default-branch squash landing.
-///
-/// That landing is the one place a collapse is the intended shape: the branch
-/// lands as one commit under its PR title whatever its history. Everywhere else
-/// a clean-tip / conflicted-intermediate branch is healed in place by
-/// [`heal_conflicted_ancestry`], because collapsing it there erases published
-/// history under a message that describes only the tip. The collapse discards
-/// any conflicted intermediates while preserving the exact net tree, behind two
-/// guards:
-///
-/// - **Pre-guard:** the branch tip must genuinely descend from `dest_commit`.
-///   Otherwise the squash would re-parent a stale tree onto dest and revert dest's
-///   own files (the wrong-base reversion). Fails with a typed guard error.
-/// - **Post-guard (footprint):** after the squash, the flattened tree must equal
-///   the pre-flatten tip tree AND the flatten must delete no dest path that was
-///   not already a deletion in the pre-flatten footprint. A violation is a
-///   wrong-base/wrong-tip bug; the caller escalates rather than landing a
-///   footprint-unsafe flatten.
-///
-/// Then a **twin-cleanup** pass: the squash mints a fresh change-id, so any commit
-/// still sharing the PRE-flatten change-id is an orphaned twin (including the
-/// "every twin conflicted" divergence that [`collapse_divergent_bookmark`] cannot
-/// resolve). Now that a clean flattened commit exists they are safe to abandon.
-///
-/// The caller MUST hold the per-store lock (like [`collapse_divergent_bookmark`])
-/// so the flatten cannot itself fork the op log. `message` becomes the flattened
-/// commit's description, and must describe the whole branch (the PR title), never
-/// the tip commit's own message.
-pub fn flatten_branch_recovery(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest_commit: &str,
-    message: &str,
-) -> Result<FlattenReport, String> {
-    let branch_revset = format!("bookmarks(exact:{branch:?})");
-
-    // Pre-guard: the branch must genuinely descend from the dest it is about to be
-    // flattened onto, or the squash re-parents a stale tree and reverts base files.
-    if !revset_descends_from(jj, store, &branch_revset, dest_commit) {
-        return Err(format!(
-            "flatten guard: branch `{branch}` does not descend from dest `{dest_commit}`; refusing to flatten (would re-parent a stale tree and revert base files)"
-        ));
-    }
-
-    let pre_tip = bookmark_commit(jj, store, branch)
-        .ok_or_else(|| format!("flatten: branch `{branch}` did not resolve"))?;
-    let pre_change_id = change_id_of(jj, store, branch);
-    let pre_footprint = branch_footprint(jj, store, dest_commit, &pre_tip)?;
-    let pre_tree = sealed_tree_hash_via_git(jj, store, &pre_tip).ok();
-    let collapsed_conflicted_commits =
-        conflicted_commits(jj, store, &format!("{dest_commit}..{branch_revset}")).len();
-
-    // Enumerate sibling bookmarks riding the about-to-be-flattened lineage BEFORE
-    // the squash (afterwards the range collapses and their commits leave it). Any
-    // bookmark in `dest..branch` other than `branch` itself sits on one of this
-    // branch's own lineage commits and would be orphaned onto an abandoned line by
-    // the flatten; it is re-pointed onto the flattened commit once the guards pass.
-    let riders = local_bookmarks_in_range(
-        jj,
-        store,
-        &format!("{dest_commit}..{branch_revset}"),
-        branch,
-    );
-
-    // Snapshot where each rider sits BEFORE the squash, while it is still on its
-    // own commit. This is the last moment the pre-flatten position is readable,
-    // and a refusal has to be able to put it back. A rider whose target cannot be
-    // read is refused HERE, before anything is mutated, rather than moved with no
-    // way home.
-    let mut rider_origins: Vec<(String, String)> = Vec::new();
-    for rider in &riders {
-        let origin = bookmark_commit(jj, store, rider).ok_or_else(|| {
-            format!(
-                "flatten: refusing to flatten `{branch}`: rider bookmark `{rider}` did not resolve, \
-                 so a refused flatten could not restore it"
-            )
-        })?;
-        rider_origins.push((rider.clone(), origin));
-    }
-
-    // Every bookmark this function has MOVED since the squash, paired with the
-    // commit it pointed at beforehand. A refusal must undo all of them.
-    //
-    // Restoring only `branch` is not enough, and the residue is not cosmetic: a
-    // rider left on the flattened commit is a child of `dest_commit`, so it is no
-    // longer inside `dest..branch`. The rider enumeration above cannot see it on a
-    // later attempt, while its git ref still names a commit on the lineage that
-    // attempt will abandon — the exact orphan-and-resurrect the preservation pass
-    // below exists to prevent, reached through the path meant to prevent it.
-    let moved_bookmarks: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
-
-    // Installed BEFORE the squash, because the squash itself moves the bookmark
-    // partway through: it repoints the branch at an empty commit on dest and only
-    // then restores the tree into it. Any failure from there on — inside the
-    // squash, a footprint mismatch, a transient tree-hash read, an unresolved
-    // post tip — must restore the pre-squash shape, or a refused flatten would
-    // leave the visible branch mutated (or empty) despite reporting a refusal.
-    // `fail` performs that restore and returns the reason to hand back.
-    //
-    // `branch` goes back first: it is the head that makes the pre-flatten lineage
-    // visible again, and the riders are restored onto commits within it. A
-    // branch that never moved is left alone, since then neither has its git ref.
-    let fail = |reason: String| -> String {
-        let mut unrestored = Vec::new();
-        if bookmark_commit(jj, store, branch).as_deref() != Some(pre_tip.as_str()) {
-            if let Err(e) = restore_bookmark(jj, store, branch, &pre_tip) {
-                log::error!(
-                    "flatten: the refusal for {branch} could not put it back at {pre_tip}: {e}"
-                );
-                unrestored.push(format!(
-                    "`{branch}` could not be proven back at {pre_tip}: {e}"
-                ));
-            }
-        }
-        for (bookmark, origin) in moved_bookmarks.borrow().iter() {
-            if let Err(e) = restore_bookmark(jj, store, bookmark, origin) {
-                log::error!(
-                    "flatten: the refusal for {branch} left `{bookmark}` off {origin}: {e}"
-                );
-                unrestored.push(format!(
-                    "`{bookmark}` could not be proven back at {origin}: {e}"
-                ));
-            }
-        }
-        if unrestored.is_empty() {
-            return reason;
-        }
-        // The reason still leads, so a guard refusal stays recognizable; the
-        // marker is the separate, louder fact that the store may now disagree
-        // with git over the refused flatten.
-        format!(
-            "{reason}\n{}",
-            rollback_incomplete(&format!(
-                "the refused flatten was not fully undone: {}",
-                unrestored.join("; ")
-            ))
-        )
-    };
-
-    // Collapse the branch to one commit on dest whose tree = the clean rebased tip.
-    if let Err(error) = squash_branch_onto(jj, store, branch, dest_commit, message) {
-        return Err(fail(error));
-    }
-
-    let post_tip = match bookmark_commit(jj, store, branch) {
-        Some(commit) => commit,
-        None => {
-            return Err(fail(format!(
-                "flatten: branch `{branch}` did not resolve after squash"
-            )))
-        }
-    };
-
-    // Post-guard (footprint): a wrong-base/wrong-tip squash would delete dest files
-    // the branch never touched. Reject any NEW deletion, naming the offending paths.
-    let post_footprint = match branch_footprint(jj, store, dest_commit, &post_tip) {
-        Ok(footprint) => footprint,
-        Err(e) => return Err(fail(e)),
-    };
-    let new_deletions: Vec<String> = post_footprint
-        .deletions
-        .difference(&pre_footprint.deletions)
-        .cloned()
-        .collect();
-    if !new_deletions.is_empty() {
-        return Err(fail(format!(
-            "flatten footprint guard: flattening `{branch}` onto `{dest_commit}` would delete base file(s) the branch did not delete: {}. Refusing (wrong-base/wrong-tip flatten).",
-            new_deletions.join(", ")
-        )));
-    }
-    // The restore should have copied the tip tree exactly; verify byte-for-byte via
-    // the git tree object when it resolves (advisory fallback: skip on git hiccup).
-    if let Some(pre_tree) = pre_tree {
-        let post_tree = match sealed_tree_hash_via_git(jj, store, &post_tip) {
-            Ok(tree) => tree,
-            Err(e) => return Err(fail(e)),
-        };
-        if post_tree != pre_tree {
-            return Err(fail(format!(
-                "flatten footprint guard: flattened `{branch}` tree {post_tree} does not match the pre-flatten tip tree {pre_tree}. Refusing (wrong-base/wrong-tip flatten)."
-            )));
-        }
-    }
-
-    // Re-point every rider sibling onto the flattened commit BEFORE the twin
-    // cleanup. Bookmark preservation is fail-closed: abandoning a bookmark head
-    // and its parent together can delete the bookmark, so no candidate lineage is
-    // abandoned unless every affected bookmark has a proven surviving target.
-    let mut repointed_bookmarks = Vec::new();
-    for (rider, origin) in &rider_origins {
-        match jj.run(
-            store,
-            &[
-                "bookmark",
-                "set",
-                rider,
-                "-r",
-                &post_tip,
-                "--allow-backwards",
-                "--ignore-working-copy",
-            ],
-            "flatten: re-point rider bookmark",
-        ) {
-            Ok(_) => {
-                moved_bookmarks
-                    .borrow_mut()
-                    .push((rider.clone(), origin.clone()));
-                // The store move is only half of "proven surviving target". Until
-                // `refs/heads/<rider>` holds the flattened commit the survivor
-                // exists only in jj's view, while the backing ref still names the
-                // lineage the twin cleanup below is about to abandon — and the next
-                // `jj git import` reads that ref back, resurrecting the orphaned
-                // conflicted line this re-point exists to retire. A refused export
-                // does not self-heal, so the verdict is the git half of the proof
-                // and gates the abandon exactly as the bookmark move does.
-                if let Err(e) = export_git_verified(
-                    jj,
-                    store,
-                    true,
-                    "flatten: git export after rider re-point",
-                    &[(rider.as_str(), post_tip.as_str())],
-                ) {
-                    return Err(fail(format!(
-                        "flatten: could not prove bookmark `{rider}` reached git at surviving commit {post_tip}; no orphaned lineage was abandoned: {e}"
-                    )));
-                }
-                repointed_bookmarks.push(rider.clone());
-            }
-            Err(e) => {
-                return Err(fail(format!(
-                    "flatten: could not safely re-point bookmark `{rider}` to surviving commit {post_tip}; no orphaned lineage was abandoned: {e}"
-                )))
-            }
-        }
-    }
-
-    // Twin cleanup: the squash minted a fresh change-id, so any commit still
-    // sharing the PRE-flatten change-id is an orphaned twin (the old lineage tip,
-    // or every twin of an ambiguous conflicted divergence). Drop them now that a
-    // clean flattened commit exists.
-    let flattened_change_id = change_id_of(jj, store, branch);
-    let mut abandoned_twins = Vec::new();
-    if !pre_change_id.is_empty() && pre_change_id != flattened_change_id {
-        for commit in visible_commit_ids_for_change(jj, store, &pre_change_id) {
-            if commit == post_tip {
-                continue;
-            }
-            let affected = local_bookmarks_in_range(jj, store, &commit, branch);
-            for bookmark in &affected {
-                jj.run(
-                    store,
-                    &[
-                        "bookmark",
-                        "set",
-                        bookmark,
-                        "-r",
-                        &post_tip,
-                        "--allow-backwards",
-                        "--ignore-working-copy",
-                    ],
-                    "flatten: preserve twin bookmark",
-                )
-                .map_err(|error| {
-                    fail(format!(
-                        "flatten: refusing to abandon {commit}: bookmark `{bookmark}` could not be moved to proven survivor {post_tip}: {error}"
-                    ))
-                })?;
-                // Enumerated as a bookmark ON `commit`, so that is where a refusal
-                // must put it back.
-                moved_bookmarks
-                    .borrow_mut()
-                    .push((bookmark.clone(), commit.clone()));
-                if bookmark_commit(jj, store, bookmark).as_deref() != Some(post_tip.as_str()) {
-                    return Err(fail(format!(
-                        "flatten: refusing to abandon {commit}: bookmark `{bookmark}` did not resolve to proven survivor {post_tip} after re-point"
-                    )));
-                }
-                // The same two-halved proof as the rider re-point, gating the
-                // abandon this loop performs once every affected bookmark is
-                // preserved: the store says the bookmark survives, and this proves
-                // `refs/heads/*` says so too, before the commit it used to name
-                // stops being reachable through jj.
-                if let Err(error) = export_git_verified(
-                    jj,
-                    store,
-                    true,
-                    "flatten: git export after twin bookmark preservation",
-                    &[(bookmark.as_str(), post_tip.as_str())],
-                ) {
-                    return Err(fail(format!(
-                        "flatten: refusing to abandon {commit}: bookmark `{bookmark}` could not be proven at surviving commit {post_tip} in git: {error}"
-                    )));
-                }
-                if !repointed_bookmarks.contains(bookmark) {
-                    repointed_bookmarks.push(bookmark.clone());
-                }
-            }
-            // One transaction, so a lost lock repeats it safely.
-            match run_store_rewrite(
-                jj,
-                store,
-                &["abandon", &commit, "--ignore-working-copy"],
-                "flatten: abandon orphaned twin",
-            ) {
-                Ok(_) => abandoned_twins.push(commit),
-                Err(e) => log::warn!("flatten: abandoning orphaned twin {commit} failed: {e}"),
-            }
-        }
-    }
-
-    Ok(FlattenReport {
-        flattened_commit: post_tip,
-        collapsed_conflicted_commits,
-        abandoned_twins,
-        repointed_bookmarks,
-    })
-}
-
 /// Whether this project has an `origin` remote. Publication sites use absence as a
 /// successful nothing-to-publish result. If discovery fails, callers preserve the
 /// configured-origin failure signal rather than silently treating unreadable remote
@@ -659,10 +222,9 @@ pub(crate) fn publish_reconciled_bookmark(
 }
 
 #[derive(Clone, Copy)]
-struct ReconcilePublication<'a> {
+struct ReconcilePublication {
     clean: bool,
     healed: bool,
-    preserve_bookmarks: &'a std::collections::BTreeSet<String>,
 }
 
 /// Where a branch this pass rebased stood immediately before the rebase, so a
@@ -837,7 +399,7 @@ fn classify_reconciled_sibling(
     store: &Path,
     branch: &str,
     dest_commit: Option<&str>,
-    publication: ReconcilePublication<'_>,
+    publication: ReconcilePublication,
     rollback: Option<&RebaseRollback>,
     report: &mut ReconcileReport,
 ) {
@@ -892,13 +454,7 @@ fn classify_reconciled_sibling(
         // carries, child-PR landings included.
         Some(FlattenState::IntermediateOnly) => {
             let dest = dest_commit.expect("IntermediateOnly implies a concrete dest");
-            match heal_conflicted_ancestry_preserving(
-                jj,
-                store,
-                branch,
-                dest,
-                publication.preserve_bookmarks,
-            ) {
+            match heal_conflicted_ancestry(jj, store, branch, dest) {
                 Ok(heal) => {
                     // The heal rewrote commit ids, so the PR head must move even
                     // when a plain clean rebase would have been skipped.
@@ -1063,26 +619,14 @@ pub fn ref_lock_deferral(error: &str) -> Option<String> {
 /// Rebase one sibling onto the reconcile dest, recording the outcome. Returns
 /// where the branch stood before the rebase when the caller should go on to
 /// classify the sibling, and `None` when the outcome is already recorded.
-///
-/// `RebasedOverConflictedAncestry` deliberately continues to classification: that
-/// is the clean-tip / conflicted-intermediate shape, and
-/// [`classify_reconciled_sibling`] heals it in place, which is the whole reason
-/// the branch had to be moved onto its dest first. A take-committed-tip replay
-/// produces exactly this shape on any branch with more than one commit: the
-/// carry resolves the tip, and the commit where the conflict first arose stays
-/// flagged below it.
 fn rebase_sibling(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
     integration_branch: &str,
     resolution: Option<&ResolutionCarry>,
-    replay_options: &super::merge::RebaseOptions,
     report: &mut ReconcileReport,
-) -> Option<(
-    RebaseRollback,
-    std::collections::BTreeMap<String, ConflictDiagnostic>,
-)> {
+) -> Option<RebaseRollback> {
     // Captured before the rebase so a classification that cannot keep the
     // result can return the store to exactly here. Exact under the per-store
     // lock every caller holds.
@@ -1096,46 +640,23 @@ fn rebase_sibling(
             return None;
         }
     };
-    let mut descendant_conflicts = std::collections::BTreeMap::new();
-    let proceed = match rebase_branch_onto_with_resolution(
-        jj,
-        store,
-        branch,
-        integration_branch,
-        resolution,
-        replay_options,
-    ) {
-        Ok(RebaseOutcome::Rebased { held_descendants }) => {
-            descendant_conflicts = held_descendants;
-            true
-        }
-        Ok(RebaseOutcome::RebasedOverConflictedAncestry {
-            paths,
-            held_descendants,
-        }) => {
-            descendant_conflicts = held_descendants;
-            log::info!(
-                "jj reconcile: {branch} rebased clean-tip over conflicted history ({}); handing it \
-                 to flatten recovery",
-                if paths.is_empty() {
-                    "<none enumerated>".to_string()
-                } else {
-                    paths.join(", ")
-                }
-            );
-            true
-        }
-        Ok(RebaseOutcome::Conflicted { diagnostic }) => {
-            record_conflict(report, branch, diagnostic);
-            false
-        }
-        Err(error) => {
-            log::warn!("jj reconcile: rebase {branch} onto {integration_branch} failed: {error}");
-            record_failure(report, branch, error);
-            false
-        }
-    };
-    proceed.then_some((rollback, descendant_conflicts))
+    let proceed =
+        match rebase_branch_onto_with_resolution(jj, store, branch, integration_branch, resolution)
+        {
+            Ok(RebaseOutcome::Rebased) => true,
+            Ok(RebaseOutcome::Conflicted { diagnostic }) => {
+                record_conflict(report, branch, *diagnostic);
+                false
+            }
+            Err(error) => {
+                log::warn!(
+                    "jj reconcile: rebase {branch} onto {integration_branch} failed: {error}"
+                );
+                record_failure(report, branch, error);
+                false
+            }
+        };
+    proceed.then_some(rollback)
 }
 
 /// Reconcile runner-owned sibling bookmarks onto the locally advanced integration
@@ -1196,9 +717,6 @@ pub fn reconcile_resolved_sibling_without_publication(
 /// How one reconcile pass treats its siblings.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileOptions {
-    /// Exact original ownership cut for one held sibling.
-    pub source_cut: Option<(String, String)>,
-    pub preserve_bookmarks: std::collections::BTreeSet<String>,
     /// Publish each moved sibling to origin as part of the pass.
     pub publish: bool,
     /// An explicitly requested committed resolution for one named sibling.
@@ -1298,14 +816,6 @@ pub fn reconcile_siblings_with_options(
                 dest_commit.as_deref(),
                 publish,
                 resolution,
-                &super::merge::RebaseOptions {
-                    source_cut: options
-                        .source_cut
-                        .as_ref()
-                        .filter(|(name, _)| name == branch)
-                        .map(|(_, cut)| cut.clone()),
-                    preserve_bookmarks: options.preserve_bookmarks.clone(),
-                },
                 &mut report,
             );
         }
@@ -1432,7 +942,6 @@ fn reconcile_one_sibling(
     dest_commit: Option<&str>,
     publish: bool,
     resolution: Option<(&str, &ResolutionCarry)>,
-    replay_options: &super::merge::RebaseOptions,
     report: &mut ReconcileReport,
 ) {
     let already_on_dest = dest_commit
@@ -1441,7 +950,6 @@ fn reconcile_one_sibling(
     let mut push_clean = !already_on_dest;
     let mut trivial_fast_forward = false;
     let mut rollback = None;
-    let mut descendant_conflicts = std::collections::BTreeMap::new();
     let carry = resolution
         .filter(|(resolved, _)| *resolved == branch)
         .map(|(_, carry)| carry);
@@ -1458,19 +966,8 @@ fn reconcile_one_sibling(
             push_clean = false;
             trivial_fast_forward = true;
         } else {
-            match rebase_sibling(
-                jj,
-                store,
-                branch,
-                integration_branch,
-                carry,
-                replay_options,
-                report,
-            ) {
-                Some((before, held)) => {
-                    rollback = Some(before);
-                    descendant_conflicts = held;
-                }
+            match rebase_sibling(jj, store, branch, integration_branch, carry, report) {
+                Some(before) => rollback = Some(before),
                 None => return,
             }
         }
@@ -1491,7 +988,6 @@ fn reconcile_one_sibling(
         ReconcilePublication {
             clean: push_clean && publish,
             healed: publish,
-            preserve_bookmarks: &replay_options.preserve_bookmarks,
         },
         rollback.as_ref(),
         report,
@@ -1513,11 +1009,6 @@ fn reconcile_one_sibling(
                 branch,
                 super::merge::roll_back_rebase(jj, store, branch, &rollback.pre_op, error),
             );
-        }
-    }
-    if report.rebased_clean.iter().any(|name| name == branch) {
-        for (descendant, diagnostic) in descendant_conflicts {
-            record_conflict(report, &descendant, diagnostic);
         }
     }
 }

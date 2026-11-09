@@ -97,24 +97,15 @@ fn timeout_promotion_never_returns() {
     );
 }
 
-/// `jj::seal` resolves a workspace's branch ownership by reading
-/// `.jj/cairn-branch` AT CALL TIME. That is sound for a fixture which provisions a
-/// workspace and seals it in the same breath, and unsound for the commit barrier,
-/// whose seal runs after a batch that can write that very file: a batch which
-/// deleted the marker would get a locally committed, UNPUBLISHED seal reported to
-/// it as a successful commit on its branch, and one which planted a marker would
-/// opt a checkout Cairn does not own into Cairn publication.
-///
-/// The VCS backend therefore captures ownership when it is constructed during
-/// request preflight and passes it to `jj::seal_paths`. Nothing in the type system
-/// separates the two entry points — `jj::seal` is `pub`, and reaching for it here
-/// would compile and silently reintroduce the defect — so the production edge is
-/// banned structurally rather than left to a doc comment and review.
+/// Ambient runs classify physical checkouts before executing the batch. A
+/// Cairn residence refuses publication; an unmanaged jj checkout seals locally
+/// without advancing a bookmark. Reading a marker after commands execute would
+/// let those commands nominate a managed branch for publication. The generic
+/// marker-reading seal entry point must therefore stay outside this backend.
 #[test]
 fn the_vcs_backend_never_resolves_seal_ownership_at_call_time() {
-    // `jj::seal_paths(` does not contain `jj::seal(`, so the ban names the
-    // marker-reading entry point exactly, with no carve-out for the file's own
-    // fixtures: they pass their branch explicitly too.
+    // `jj::seal_paths(` does not contain `jj::seal(`: this bans only the
+    // entry point that could infer publication authority from the checkout.
     assert_absent("mcp/vcs.rs", &["jj::seal("]);
 }
 

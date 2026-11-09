@@ -327,3 +327,18 @@ async fn a_path_that_never_matches_is_still_bounded_by_the_deadline() {
         Err(HistoryError::TimedOut { .. })
     ));
 }
+
+#[tokio::test]
+async fn indexed_containment_distinguishes_descendants_siblings_and_missing_objects() {
+    let fx = fixture().await;
+    let path = fx.dir.path();
+    assert!(contains(path, &fx.c0, &fx.merge).await.unwrap());
+    assert!(contains(path, &fx.f2, &fx.merge).await.unwrap());
+    assert!(contains(path, &fx.c2, &fx.c2).await.unwrap());
+    assert!(!contains(path, &fx.merge, &fx.c0).await.unwrap());
+    assert!(!contains(path, &fx.c2, &fx.f2).await.unwrap());
+    assert!(matches!(
+        contains(path, &"f".repeat(40), &fx.merge).await,
+        Err(HistoryError::UnknownCommit(_))
+    ));
+}

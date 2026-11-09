@@ -35,9 +35,112 @@ fn gate_accepts_the_rebase_replay_action() {
     assert!(std::ptr::eq(spec, rebase_patch_spec()));
 }
 
+/// The canonical rebase patch spec the gate must hand to dispatch.
 fn rebase_patch_spec() -> &'static MutationSpec {
     cairn_common::contract::mutation_spec(ResourceKind::NodeRebase, ChangeMode::Patch)
         .expect("the node rebase contract declares patch")
+}
+
+/// The rebase spec's label names every action dispatch accepts.
+const REBASE_LABEL: &str =
+    "replay this branch, take origin's fast-forward of it or its base, retry its recovery repair, rebuild it from attested coordinates, set its catch-up mode, mark its review, or dismiss an unknown acceptance";
+
+#[test]
+fn the_rebase_label_names_every_accepted_action() {
+    assert_eq!(rebase_patch_spec().label, REBASE_LABEL);
+}
+
+/// A flagged branch's rebuild carries its four attested coordinates; without
+/// them declared the gate would refuse them as unknown keys.
+#[test]
+fn gate_accepts_rebuild_coordinates() {
+    let it = item(
+        "cairn://p/cairn/1/1/builder/rebase",
+        ChangeMode::Patch,
+        Some(serde_json::json!({
+            "action": "rebuild",
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "source_base": "123456789abcdef0123456789abcdef012345678",
+            "source_base_reason": "the original isolated mint",
+            "expected_tip": "abcdef0123456789abcdef0123456789abcdef01"
+        })),
+    );
+    let spec = gate(&it).expect("the rebuild is gated in");
+    assert!(std::ptr::eq(spec, rebase_patch_spec()));
+}
+
+/// Setting or ending merge catch-up mode and marking the owner's review of the
+/// base are dispatched rebase actions, so their keys have to clear the gate; a
+/// declared action the gate refused would be advertised and unreachable.
+#[test]
+fn gate_accepts_catch_up_mode_and_mark_reviewed() {
+    for payload in [
+        serde_json::json!({
+            "action": "catch-up-mode",
+            "mode": "merge",
+            "review_paths": ["src/**"],
+            "reviewed_through": "0123456789abcdef0123456789abcdef01234567"
+        }),
+        serde_json::json!({"action": "catch-up-mode", "mode": "replay"}),
+        serde_json::json!({
+            "action": "mark-reviewed",
+            "through": "0123456789abcdef0123456789abcdef01234567"
+        }),
+    ] {
+        let it = item(
+            "cairn://p/cairn/1/1/builder/rebase",
+            ChangeMode::Patch,
+            Some(payload.clone()),
+        );
+        let spec = gate(&it).unwrap_or_else(|failure| panic!("{payload}: {}", failure.error));
+        assert!(std::ptr::eq(spec, rebase_patch_spec()));
+    }
+}
+
+/// The only repair for an `unknown` acceptance has to reach dispatch with its
+/// three coordinates; without them declared, the gate would refuse the keys
+/// as unknown and the debt would have no in-product resolution.
+#[test]
+fn gate_accepts_dismissing_an_unknown_acceptance() {
+    let it = item(
+        "cairn://p/cairn/1/1/builder/rebase",
+        ChangeMode::Patch,
+        Some(serde_json::json!({
+            "action": "dismiss-acceptance",
+            "acceptance_id": "acceptance-1",
+            "expected_head": "0123456789abcdef0123456789abcdef01234567",
+            "reason": "superseded by the owner's rewrite"
+        })),
+    );
+    let spec = gate(&it).expect("the dismissal is gated in");
+    assert!(std::ptr::eq(spec, rebase_patch_spec()));
+    for key in ["acceptance_id", "expected_head", "reason"] {
+        assert!(
+            spec.optional.iter().any(|optional| optional.key == key),
+            "the rebase contract declares {key}"
+        );
+    }
+}
+
+/// The dismissal keys are dedicated to the rebase contract: no sibling node
+/// resource may start advertising a dismissal because a spec was shared.
+#[test]
+fn only_the_rebase_contract_advertises_the_dismissal_keys() {
+    for contract in cairn_common::contract::RESOURCE_CONTRACTS {
+        for spec in contract.mutations {
+            let advertises = spec.optional.iter().chain(spec.required).any(|key| {
+                matches!(key.key, "acceptance_id" | "expected_head")
+                    || key.note().contains("dismiss-acceptance")
+            });
+            assert_eq!(
+                advertises,
+                contract.kind == ResourceKind::NodeRebase,
+                "{:?} {:?}",
+                contract.kind,
+                spec.label
+            );
+        }
+    }
 }
 
 /// The sanctioned repair for a branch the store holds behind origin (cairn/5038)

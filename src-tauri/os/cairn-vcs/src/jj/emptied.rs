@@ -7,21 +7,21 @@
 //! leaves the tree of every commit after it as it was, so it is never a choice
 //! for anyone to make. Every rewrite that can empty a commit drops it:
 //!
-//! - the base-advance rebase skips the commits it empties (`jj rebase
-//!   --skip-emptied` in [`super::rebase_branch_onto_with_resolution`]) and
-//!   logs what it dropped;
+//! - the canonical detached replay skips the commits it newly empties and
+//!   reports their names only after acceptance; originally empty commits stay;
 //! - the conflict heal abandons the commits its restores empty, and names them
 //!   in the healed commit's note;
 //! - publication drops whatever empty commit got past both
 //!   ([`drop_empty_commits`]), such as one from a store older than these rules
 //!   or one jj made outside Cairn.
 //!
-//! A merge commit is never dropped: its bookmarks would have no single parent
-//! to move to. What is dropped is always named as `<short id> "<subject>"`.
+//! A commit that remains a merge is never dropped: there is no single parent
+//! to move to. A fully proven parent-integration collapse becomes linear first;
+//! canonical replay then drops it only if it has no remaining own change.
+//! What is dropped is always named as `<short id> "<subject>"`.
 
 use super::heal::{same_tree, scope_commits, undo_branch_rewrite, ScopeCommit};
 use super::*;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 /// How a dropped commit is named in a log line, a note, or a merge record.
@@ -52,57 +52,6 @@ pub(super) fn abandon_empty(
 
 fn own_range(dest: &str, branch: &str) -> String {
     format!("({dest})..bookmarks(exact:{branch:?})")
-}
-
-/// The branch's own commits above `dest`, as `(change id, label)`, read before
-/// a rewrite that may drop some so [`dropped_since`] can name them after. A
-/// failed read answers nothing: the report is a log line, never a reason to
-/// refuse the rewrite.
-pub(super) fn own_commits(
-    jj: &JjEnv,
-    store: &Path,
-    dest: &str,
-    branch: &str,
-) -> Vec<(String, String)> {
-    match scope_commits(jj, store, &own_range(dest, branch)) {
-        Ok(commits) => commits
-            .into_iter()
-            .map(|commit| {
-                let label = dropped_label(&commit.commit_id, &commit.subject);
-                (commit.change_id, label)
-            })
-            .collect(),
-        Err(error) => {
-            log::debug!("emptied commits: could not read `{branch}`'s own commits: {error}");
-            Vec::new()
-        }
-    }
-}
-
-/// The labels of the commits in `before` the branch no longer carries above
-/// `dest`.
-pub(super) fn dropped_since(
-    jj: &JjEnv,
-    store: &Path,
-    dest: &str,
-    branch: &str,
-    before: &[(String, String)],
-) -> Vec<String> {
-    if before.is_empty() {
-        return Vec::new();
-    }
-    let after: BTreeSet<String> = match scope_commits(jj, store, &own_range(dest, branch)) {
-        Ok(commits) => commits.into_iter().map(|commit| commit.change_id).collect(),
-        Err(error) => {
-            log::debug!("emptied commits: could not re-read `{branch}`'s own commits: {error}");
-            return Vec::new();
-        }
-    };
-    before
-        .iter()
-        .filter(|(change, _)| !after.contains(change))
-        .map(|(_, label)| label.clone())
-        .collect()
 }
 
 /// The outcome of [`drop_empty_commits`].

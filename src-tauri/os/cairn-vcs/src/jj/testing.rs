@@ -2,6 +2,103 @@
 use super::*;
 use std::path::Path;
 
+/// Hold the real maintenance exclusion while an application fixture tries to
+/// read store metadata. Dropping this guard releases maintenance admission.
+pub struct StoreReclamationGuard {
+    _guard: super::object_lease::Reclamation,
+}
+
+pub fn hold_store_reclamation(store: &Path) -> Result<StoreReclamationGuard, String> {
+    Ok(StoreReclamationGuard {
+        _guard: super::object_lease::Reclamation::for_store(store)?,
+    })
+}
+
+/// Hold every publication to `store` after its store transaction lands and
+/// before its export leg runs, until [`PublicationPause::release`] or drop.
+///
+/// The publication blocks the thread it runs on, inside its caller's poll.
+/// That is how a test cancels a caller in the middle of a real publication and
+/// observes what its store guard does meanwhile.
+pub struct PublicationPause {
+    gate: std::sync::Arc<PauseGate>,
+}
+
+#[derive(Default)]
+struct PauseGate {
+    state: std::sync::Mutex<PauseState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PauseState {
+    reached: bool,
+    released: bool,
+}
+
+type PauseRegistry = std::sync::Mutex<Vec<(std::path::PathBuf, std::sync::Arc<PauseGate>)>>;
+
+/// Process-wide because the paused publication runs on whichever runtime
+/// thread polled its caller, which a thread-local could not follow.
+static PUBLICATION_PAUSES: PauseRegistry = std::sync::Mutex::new(Vec::new());
+
+pub fn pause_publication_after_landing(store: &Path) -> PublicationPause {
+    let gate = std::sync::Arc::new(PauseGate::default());
+    PUBLICATION_PAUSES
+        .lock()
+        .unwrap()
+        .push((store.to_path_buf(), gate.clone()));
+    PublicationPause { gate }
+}
+
+impl PublicationPause {
+    /// Wait until a publication is held at the pause. `false` on timeout.
+    pub fn wait_until_paused(&self, timeout: std::time::Duration) -> bool {
+        let state = self.gate.state.lock().unwrap();
+        let (state, _) = self
+            .gate
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.reached)
+            .unwrap();
+        state.reached
+    }
+
+    /// Let the held publication run its export leg.
+    pub fn release(&self) {
+        self.gate.state.lock().unwrap().released = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+impl Drop for PublicationPause {
+    fn drop(&mut self) {
+        self.release();
+        PUBLICATION_PAUSES
+            .lock()
+            .unwrap()
+            .retain(|(_, gate)| !std::sync::Arc::ptr_eq(gate, &self.gate));
+    }
+}
+
+/// The publication's landed-but-not-exported point. Holds there while a
+/// [`PublicationPause`] for `store` is armed and unreleased.
+pub(crate) fn publication_landed(store: &Path) {
+    let gate = PUBLICATION_PAUSES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(paused, _)| paused == store)
+        .map(|(_, gate)| gate.clone());
+    let Some(gate) = gate else { return };
+    let mut state = gate.state.lock().unwrap();
+    state.reached = true;
+    gate.changed.notify_all();
+    let _released = gate
+        .changed
+        .wait_while(state, |state| !state.released)
+        .unwrap();
+}
+
 /// The jj artifact `scripts/ensure-sidecar.ts` provisions for this host under
 /// `src-tauri/binaries`, when it is present.
 ///
@@ -145,18 +242,81 @@ pub fn git_stdout(repo: &Path, args: &[&str]) -> String {
 /// construct it here: a branch carrying conflict-flagged commits still arrives
 /// from stores that predate the guard and from `jj` run outside Cairn, and
 /// flatten recovery exists precisely to clear it.
+///
+/// Each call commits at a time no earlier call in this process used. A fixture
+/// that rolls the store back and repeats the same rebase would otherwise, within
+/// one second, mint the commit id of the rebase it undid (git commit times have
+/// one-second resolution), and jj refuses a newly created commit it already
+/// indexed.
 pub fn rebase_recording_conflict(jj: &JjEnv, store: &Path, branch: &str, dest: &str) {
+    let timestamp = format!("debug.commit-timestamp={}", unique_commit_timestamp());
     jj.run(
         store,
-        &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
+        &[
+            "rebase",
+            "-b",
+            branch,
+            "-o",
+            dest,
+            "--ignore-working-copy",
+            "--config",
+            &timestamp,
+        ],
         "test fixture: unguarded rebase",
     )
     .unwrap();
 }
 
+/// An RFC 3339 UTC time, at or after now, strictly later than any earlier
+/// call in this process returned.
+fn unique_commit_timestamp() -> String {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let next = |last: i64| last.max(now - 1) + 1;
+    let secs = next(
+        LAST.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
+            .unwrap(),
+    );
+    // Civil date from days since the epoch (Howard Hinnant's algorithm).
+    let (days, of_day) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / 3_600,
+        of_day % 3_600 / 60,
+        of_day % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_commit_timestamps_are_rfc3339_and_strictly_increasing() {
+        let first = unique_commit_timestamp();
+        let second = unique_commit_timestamp();
+        assert!(second > first, "{first} then {second}");
+        let bytes = first.as_bytes();
+        assert_eq!(bytes.len(), 20, "{first}");
+        assert_eq!(
+            (bytes[4], bytes[7], bytes[10], bytes[19]),
+            (b'-', b'-', b'T', b'Z'),
+            "{first}"
+        );
+    }
 
     #[test]
     fn an_unresolvable_jj_records_the_calling_test_as_a_jj_skip() {

@@ -44,6 +44,8 @@ mod read;
 mod read_contract_tests;
 mod rebase;
 mod rebuilds;
+#[cfg(test)]
+pub(crate) use rebase::read_node_rebase;
 mod recipes;
 pub mod references;
 mod requests;

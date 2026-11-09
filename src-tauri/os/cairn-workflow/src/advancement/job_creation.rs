@@ -388,11 +388,8 @@ async fn default_branch_for_project(
 
     // The project-config `defaultBranch` override wins over the stored column,
     // so branch preparation and the UI share one base coordinate.
-    let config = cairn_config::project_settings::load_project_settings_read_only(
-        std::path::Path::new(&repo_path),
-    );
-    Ok(cairn_config::project_settings::resolve_default_branch(
-        &config,
+    Ok(cairn_config::project_settings::effective_default_branch(
+        Some(std::path::Path::new(&repo_path)),
         stored_default_branch.as_deref(),
     ))
 }

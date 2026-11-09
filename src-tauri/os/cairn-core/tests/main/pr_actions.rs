@@ -4,7 +4,7 @@
 
 use crate::common;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -175,6 +175,45 @@ fn add_github_origin(repo: &Path) {
         .status()
         .unwrap();
     assert!(status.success(), "git remote add origin failed");
+}
+
+/// Give `repo` an origin a landing can fetch: a local bare repository holding
+/// `main`, at a path ending `github.com/octo/widget.git` so the repository
+/// still reads as GitHub's `octo/widget` for the mocked API. Every landing
+/// judges against origin's actual target, so a remote-PR fixture needs one.
+/// Returns the directory holding it (keep it alive) and the bare repository.
+fn add_fetchable_github_origin(repo: &Path) -> (TempDir, PathBuf) {
+    let host = tempfile::tempdir().unwrap();
+    let origin = host.path().join("github.com/octo/widget.git");
+    std::fs::create_dir_all(&origin).unwrap();
+    let origin_url = origin.to_string_lossy().into_owned();
+    for (dir, args) in [
+        (
+            origin.as_path(),
+            &["init", "-q", "--bare", "-b", "main"][..],
+        ),
+        (repo, &["remote", "add", "origin", origin_url.as_str()][..]),
+        (repo, &["push", "-q", "origin", "main"][..]),
+    ] {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+    (host, origin)
+}
+
+/// The commit `branch` names in a git repository.
+fn git_rev_parse(repo: &Path, branch: &str) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git rev-parse {branch} failed");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Run a jj template query against a project's shared store and return trimmed
@@ -1481,24 +1520,23 @@ async fn pin_bump_merge_lands_a_verified_bump_and_records_its_evidence() {
     }
 }
 
-/// A real remote PR landing on the default branch merges through GitHub's merge
-/// API — not the local jj fold. The shared store is provisioned (every merge
-/// reads the executor protocol ledger from it before choosing a route) with
-/// `feature` sealed ahead of `main`, so the local fold COULD land it; the store's
-/// `main` staying put is what shows GitHub took the merge. GitHub's success
-/// advances the base out of band, and Cairn then marks the merge request merged
-/// and resolves the issue.
+/// A real remote PR landing on the default branch lands by the store fold,
+/// published to origin by a leased fast-forward of `main`; GitHub's merge API is
+/// not a landing route, so it is not mocked here and a call to it would fail
+/// the merge. Origin and the store's `main` both name the landing, and Cairn
+/// marks the merge request merged and resolves the issue.
 #[tokio::test]
-async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
+async fn merge_pr_for_job_remote_default_branch_lands_by_a_leased_push_to_origin() {
     let Some(bin) = common::jj_bin() else {
         eprintln!(
-            "skipping merge_pr_for_job_remote_default_branch_merges_via_github: jj not resolvable"
+            "skipping merge_pr_for_job_remote_default_branch_lands_by_a_leased_push_to_origin: \
+             jj not resolvable"
         );
         return;
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    add_github_origin(repo.path());
+    let (_origin_dir, origin) = add_fetchable_github_origin(repo.path());
     insert_github_app(&db).await;
     let project = create_project(&db, "gh", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
@@ -1510,7 +1548,6 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
 
     let http = MockHttpClient::new()
         .respond_to("access_tokens", token_response())
-        .respond_to("/pulls/5/merge", merge_response(200))
         // Best-effort source-branch delete + background reconcile endpoints.
         .respond_to("/git/refs/heads/feature", merge_response(200))
         .respond_to("/pulls/5/files", files_response())
@@ -1522,62 +1559,73 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
 
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
         .unwrap();
-    assert!(msg.contains("via GitHub"), "reports a GitHub merge: {msg}");
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+    let landed = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    assert_ne!(
+        landed, base_before,
+        "the landing advanced the store's `main`"
+    );
     assert_eq!(
-        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
-        base_before,
-        "GitHub owns the landing: the local fold must not advance the store's `main`"
+        git_rev_parse(&origin, "main"),
+        landed,
+        "origin's `main` took the store's landing"
     );
 }
 
-/// FAIL-CLOSED: when GitHub refuses the merge (405 not-mergeable), Cairn surfaces
-/// an actionable error and marks NOTHING — the merge request stays open and the
-/// issue stays active. The error points at the PR (no local markers exist, since
-/// the local conflict gate passed).
+/// FAIL-CLOSED: when origin refuses the landing's push (its receiver protects
+/// `main`), Cairn surfaces the refusal and marks NOTHING — the merge request
+/// stays open, the issue stays active, and neither origin's nor the store's
+/// `main` moves.
+#[cfg(unix)]
 #[tokio::test]
-async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
+async fn merge_pr_for_job_remote_refused_publication_leaves_unmarked() {
+    use std::os::unix::fs::PermissionsExt;
     let Some(bin) = common::jj_bin() else {
         eprintln!(
-            "skipping merge_pr_for_job_remote_merge_failure_leaves_unmarked: jj not resolvable"
+            "skipping merge_pr_for_job_remote_refused_publication_leaves_unmarked: jj not \
+             resolvable"
         );
         return;
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    add_github_origin(repo.path());
+    let (_origin_dir, origin) = add_fetchable_github_origin(repo.path());
     insert_github_app(&db).await;
     let project = create_project(&db, "ghf", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
 
-    let http = MockHttpClient::new()
-        .respond_to("access_tokens", token_response())
-        .respond_to("/pulls/5/merge", merge_response(405));
+    let http = MockHttpClient::new().respond_to("access_tokens", token_response());
     let (cfg, orch) = orchestrator_with_http(db, http).await;
     let config_dir = cfg.path().join("config");
     provision_jj_merge(&config_dir, repo.path());
     let base_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    let origin_before = git_rev_parse(&origin, "main");
+    let hook = origin.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho 'main is protected' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
         .await
-        .expect_err("a GitHub-refused merge must fail closed");
+        .expect_err("a landing origin refuses must fail closed");
     assert!(
-        err.contains("GitHub refused"),
-        "points at the PR, not local markers: {err}"
+        err.contains("Nothing was published"),
+        "says the refused landing published nothing: {err}"
     );
     assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
     assert_eq!(
         jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
         base_before,
-        "a refused GitHub merge must not fall back to the local fold"
+        "the store's `main` never names a landing origin refused"
     );
+    assert_eq!(git_rev_parse(&origin, "main"), origin_before);
 }
 
 /// The landing rules a project declares for the binder tests: one numbered
@@ -1954,7 +2002,7 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
         .await
         .expect_err("a conflicted source must be refused");
     assert!(
-        err.contains("recorded conflict"),
+        err.contains("`feature` conflicts with base `main`"),
         "names the conflict: {err}"
     );
     assert!(
@@ -1962,7 +2010,7 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
         "names the conflicted file: {err}"
     );
     assert!(
-        err.contains("resolve-at-base"),
+        err.contains("conflict session") && err.contains("cairn:~/rebase"),
         "names the recovery path: {err}"
     );
     // The refusal fires at the gate, before the fold: the PR is not merged.

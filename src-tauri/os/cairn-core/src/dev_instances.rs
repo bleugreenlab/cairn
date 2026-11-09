@@ -542,28 +542,33 @@ pub async fn resolve_launch_coordinate(
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = managed_store.clone();
     let repository = repository_path.clone();
+    let journal = crate::execution::routing::owning_db_for_project(&orch.db, &request.project_id)
+        .await
+        .map_err(|error| DevInstanceLaunchFailure::InvalidProject {
+            diagnostic: error.to_string(),
+        })?;
     let imported = {
-        let _store_guard = orch
+        let store_guard = orch
             .acquire_jj_store_lock(
                 &managed_store,
                 crate::orchestrator::StoreLockClass::Foreground,
                 "project store import: dev instance launch",
             )
             .await;
-        tokio::task::spawn_blocking(move || {
+        // The bracket owns the guard on its own task, so a cancelled launcher
+        // cannot release the writer exclusion while the import still runs.
+        orch.bracket_store_mutation(store_guard, None, journal, &request.project_id, move || {
             crate::jj::ensure_project_store(&jj, &store, &repository)
         })
         .await
+        .map(|(_guard, ())| ())
     };
-    imported
-        .map_err(|error| error.to_string())
-        .and_then(|prepared| prepared)
-        .map_err(|diagnostic| DevInstanceLaunchFailure::InvalidProject {
-            diagnostic: format!(
-                "project '{}' is not ready to launch: {diagnostic}",
-                request.project_id
-            ),
-        })?;
+    imported.map_err(|diagnostic| DevInstanceLaunchFailure::InvalidProject {
+        diagnostic: format!(
+            "project '{}' is not ready to launch: {diagnostic}",
+            request.project_id
+        ),
+    })?;
 
     let explicit = request
         .selector

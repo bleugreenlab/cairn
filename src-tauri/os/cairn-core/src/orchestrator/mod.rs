@@ -67,11 +67,16 @@ pub mod startup_readiness;
 pub use startup_readiness::StartupReadiness;
 mod store_lock;
 use store_lock::summarize_bounded;
+pub(crate) use store_lock::BatchAdmission;
+#[cfg(test)]
+pub(crate) use store_lock::BranchAdmissionRefusal;
+pub(crate) use store_lock::BranchWritePermit;
 #[cfg(test)]
 use store_lock::JJ_STORE_LOCK_SAMPLE_CAPACITY;
 pub(crate) use store_lock::{
     branch_preparation_operation, describe_preparation_wait, StoreLockStatus,
 };
+pub(crate) use store_lock::{BranchReservation, BranchReservations, GuardOperation};
 pub use store_lock::{
     EdgeHold, JjStoreGuard, JjStoreLockMetrics, JjStoreOperationTrace, JjStorePhaseTimer,
     StoreLockClass,
@@ -918,6 +923,7 @@ impl OrchestratorBuilder {
             job_launch_claims: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
+            branch_reservations: Arc::default(),
             base_branch_sync: Arc::default(),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             build_service_reconcile: Arc::new(Mutex::new(())),
@@ -1980,6 +1986,9 @@ pub struct Orchestrator {
     /// reconciles from different executions on the same project store serialize.
     jj_store_locks: Arc<Mutex<HashMap<String, Arc<store_lock::PriorityLock>>>>,
     jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
+    /// Bookmarks reserved across network I/O (`store_lock::BranchReservations`):
+    /// taken before the store lock, held by every writer that moves them.
+    branch_reservations: Arc<BranchReservations>,
 
     /// What this process knows about origin's copy of each project's base
     /// branches (the default branch and every tracked integration branch), the
@@ -3637,6 +3646,7 @@ impl Orchestrator {
             loop {
                 interval.tick().await;
                 crate::pr_data::actions::reconcile_approved_merges(&orch).await;
+                crate::pr_data::actions::reconcile_pending_landings(&orch).await;
             }
         });
     }
@@ -3758,7 +3768,7 @@ impl Orchestrator {
             // unverified 'main' schema default. The catch-up and merges resolve
             // onto the stored default, so this repair must land first. Best-effort
             // and logged per project.
-            crate::projects::crud::reconcile_default_branches(&orch.db.local).await;
+            crate::projects::crud::reconcile_default_branches(&orch).await;
 
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
@@ -3775,34 +3785,53 @@ impl Orchestrator {
         });
     }
 
-    /// Drain durable sibling intents periodically, including work re-queued when
-    /// a branch is protected by an in-flight RunBatch bracket.
+    /// Settle the base-scoped reconcile queue a previous process left behind,
+    /// and retry conflict-marker projections still pending.
     ///
-    /// This loop is the ONLY thing that ever revisits a deferred base advance, so
-    /// its liveness is the liveness of the whole recovery path. Each pass
-    /// therefore runs as its own task and is joined here: a panic inside the
-    /// sweep surfaces as a `JoinError` on this side instead of unwinding the
-    /// loop. Run inline, one panic — a database assertion, a subprocess parse —
-    /// silently retires the sweep for the lifetime of the process, and every
-    /// branch whose advance was deferred waits forever on a worker that no longer
-    /// exists, with nothing in the logs and nothing on the branch to say so.
-    pub fn spawn_reconcile_intent_sweep(&self) {
+    /// Base advance is lazy, so nothing here replays a branch, sends a note or
+    /// wakes anyone (`base_advance::retirement`). The first pass captures, by
+    /// id, the intents a previous process left queued; only those are retired,
+    /// which is exact under the supported single-orchestrator stop, upgrade,
+    /// start. Each pass runs as its own task so a panic costs one cycle, not
+    /// the loop.
+    pub fn spawn_base_advance_upkeep(&self) {
         let orch = self.clone();
+        let queue = Arc::new(crate::orchestrator::base_advance::retirement::LegacyQueue::default());
         tokio::spawn(async move {
+            let mut recovered = false;
             loop {
-                let pass = orch.clone();
+                let (pass, queue) = (orch.clone(), queue.clone());
+                let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let reported = retired.clone();
                 let joined = crate::orchestrator::base_advance::supervised_sweep_pass(async move {
-                    crate::orchestrator::base_advance::sweep_reconcile_intents(&pass).await;
+                    let complete =
+                        crate::orchestrator::base_advance::retirement::upkeep_pass(&pass, &queue)
+                            .await;
+                    reported.store(complete, std::sync::atomic::Ordering::SeqCst);
                 })
                 .await;
                 if let Err(error) = joined {
                     log::error!(
-                        "jj reconcile sweep pass ended abnormally and was not completed; \
-                         retrying on the next cycle. Deferred base advances stay queued until a \
-                         pass succeeds: {error}"
+                        "base advance upkeep pass ended abnormally; retrying on the next cycle: \
+                         {error}"
                     );
                 }
-                tokio::time::sleep(crate::orchestrator::base_advance::RECONCILE_SWEEP_INTERVAL)
+                // Once the previous process's queue is fully retired (a pass
+                // that completed without error and left nothing to retire),
+                // serve the explicit replay requests it accepted, by exact
+                // branch. Until then, each cycle tries again.
+                // `retired` is set only by a pass that ran to completion.
+                if !recovered && retired.load(std::sync::atomic::Ordering::SeqCst) {
+                    recovered = true;
+                    let recovery = orch.clone();
+                    tokio::spawn(async move {
+                        crate::orchestrator::base_advance::serve_pending_replay_requests(
+                            &recovery, None,
+                        )
+                        .await;
+                    });
+                }
+                tokio::time::sleep(crate::orchestrator::base_advance::retirement::UPKEEP_INTERVAL)
                     .await;
             }
         });
@@ -5292,7 +5321,7 @@ mod tests {
         .build();
         let store = config_dir.join("jj-stores").join("timeout-test");
         let held = orch
-            .acquire_jj_store_lock(
+            .hold_jj_store_lock_on_another_task(
                 &store,
                 crate::orchestrator::StoreLockClass::Foreground,
                 "timeout test holder",
@@ -5309,7 +5338,7 @@ mod tests {
             .await;
         assert!(result.is_err(), "a bounded waiter must time out");
 
-        drop(held);
+        held.release().await;
         orch.acquire_jj_store_lock_with_timeout(
             &store,
             crate::orchestrator::StoreLockClass::Foreground,

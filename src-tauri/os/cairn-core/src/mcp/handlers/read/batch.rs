@@ -1152,6 +1152,10 @@ mod tests {
         }
         git(repo.path(), &["update-ref", "refs/heads/main", &parent]);
         commits.reverse();
+        // A read resolves refs in the project's store and never creates it;
+        // registering a project does, and this fixture inserts its row directly.
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        crate::jj::coordinate_repository(&jj, &orch.config_dir, repo.path()).unwrap();
         let repo_path = repo.path().display().to_string();
         orch.db
             .local

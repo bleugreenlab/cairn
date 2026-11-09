@@ -37,6 +37,7 @@
 use super::*;
 use crate::checkout::{reattach_checkout_head, CheckoutGit, CheckoutRepairPolicy};
 use cairn_platform::services::GitOutput;
+use jj_lib::object_id::ObjectId as _;
 use std::path::{Path, PathBuf};
 
 /// Export's Git operations share the same deadline as its jj commands. The
@@ -123,7 +124,7 @@ pub fn export_git_preserving_checkout(
     ignore_working_copy: bool,
     ctx: &str,
 ) -> Result<(), String> {
-    export_git_verified(jj, export_cwd, ignore_working_copy, ctx, &[])
+    export_git_scoped(jj, export_cwd, ignore_working_copy, ctx, &[]).map_err(String::from)
 }
 
 /// [`export_git_preserving_checkout`] plus a proof that the export landed.
@@ -226,6 +227,25 @@ pub(crate) fn export_git_guarded(
     ctx: &str,
     expect: &[(&str, &str)],
 ) -> Result<(), ExportError> {
+    if expect.is_empty()
+        || expect
+            .iter()
+            .any(|(branch, commit)| branch.is_empty() || commit.is_empty())
+    {
+        return Err(ExportError::Failed(format!(
+            "{EXPORT_FREEZE_MSG} ({ctx}): named export requires nonempty exact expectations"
+        )));
+    }
+    export_git_scoped(jj, export_cwd, ignore_working_copy, ctx, expect)
+}
+
+fn export_git_scoped(
+    jj: &JjEnv,
+    export_cwd: &Path,
+    ignore_working_copy: bool,
+    ctx: &str,
+    expect: &[(&str, &str)],
+) -> Result<(), ExportError> {
     let checkout = resolve_backing_checkout(export_cwd);
     let git = ScopedGit(jj);
     if !expect.is_empty() {
@@ -243,15 +263,9 @@ pub(crate) fn export_git_guarded(
         };
         refuse_scaffolded_ref_moves(&git, repo, ctx, expect)?;
     }
-    let before = checkout
-        .as_deref()
-        .and_then(|repo| snapshot_checkout_head(&git, repo));
-
-    let exported = run_export(jj, export_cwd, ignore_working_copy, ctx);
-
-    if let (Some(repo), Some(before)) = (checkout.as_deref(), before.as_ref()) {
-        repair_export_detach(&git, repo, before, jj.checkout_repair_policy);
-    }
+    let exported = with_checkout_head_preserved(jj, export_cwd, || {
+        run_export(jj, export_cwd, ignore_working_copy, ctx, expect)
+    });
     let export_stderr = exported?;
 
     let Some(repo) = checkout.as_deref().filter(|_| !expect.is_empty()) else {
@@ -268,6 +282,26 @@ pub(crate) fn export_git_guarded(
         &export_stderr,
     )
     .map_err(ExportError::Failed)
+}
+
+/// Run `export`, any step that may move the branch the project checkout's
+/// HEAD is attached to, and repair the detach it caused. The one HEAD repair
+/// every export path shares; see the module documentation.
+pub(crate) fn with_checkout_head_preserved<T>(
+    jj: &JjEnv,
+    export_cwd: &Path,
+    export: impl FnOnce() -> T,
+) -> T {
+    let checkout = resolve_backing_checkout(export_cwd);
+    let git = ScopedGit(jj);
+    let before = checkout
+        .as_deref()
+        .and_then(|repo| snapshot_checkout_head(&git, repo));
+    let result = export();
+    if let (Some(repo), Some(before)) = (checkout.as_deref(), before.as_ref()) {
+        repair_export_detach(&git, repo, before, jj.checkout_repair_policy);
+    }
+    result
 }
 
 /// Stable marker phrase carried by every [`ExportError::ConflictScaffolding`]
@@ -361,7 +395,64 @@ fn run_export(
     export_cwd: &Path,
     ignore_working_copy: bool,
     ctx: &str,
+    expect: &[(&str, &str)],
 ) -> Result<String, String> {
+    if !expect.is_empty() {
+        return super::packed_refs::with_packed_refs_patience_for(
+            jj,
+            super::PackedRefs::JjStore(export_cwd),
+            ctx,
+            || {
+                futures::executor::block_on(async {
+                    jj.check_operation_budget(ctx)?;
+                    let repo = crate::load_repo_at_head(export_cwd)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for (branch, expected) in expect {
+                        let target = repo
+                            .view()
+                            .get_local_bookmark(jj_lib::ref_name::RefName::new(branch));
+                        if target.as_normal().map(|id| id.hex()).as_deref() != Some(*expected) {
+                            return Ok(format!(
+                                "{ctx}: bookmark `{branch}` moved before scoped export"
+                            ));
+                        }
+                    }
+                    let mut tx = repo.start_transaction();
+                    let stats = jj_lib::git::export_some_refs(tx.repo_mut(), |kind, symbol| {
+                        named_git_bookmark(kind, symbol, expect)
+                    })
+                    .map_err(|error| format!("{ctx}: {error}"))?;
+                    let stderr = if stats.failed_bookmarks.is_empty() {
+                        String::new()
+                    } else {
+                        let refused: Vec<String> = stats
+                            .failed_bookmarks
+                            .iter()
+                            .map(|(symbol, reason)| {
+                                format!("{}: {}", symbol.as_ref(), export_error_chain(reason))
+                            })
+                            .collect();
+                        format!("{ctx}: refused {}", refused.join("; "))
+                    };
+                    // Like `jj git export`, an export that changed nothing writes
+                    // no operation. Verification exports run outside the store
+                    // lock, so an unconditional commit would split the operation
+                    // log under a concurrent locked writer, and literal readers
+                    // refuse a split log.
+                    if tx.repo().has_changes() {
+                        tx.commit(format!("{ctx} (named refs)"))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if super::packed_refs_lock_error(&stderr) {
+                        return Err(stderr);
+                    }
+                    Ok(stderr)
+                })
+            },
+        );
+    }
     let args: &[&str] = if ignore_working_copy {
         &["git", "export", "--ignore-working-copy"]
     } else {
@@ -395,6 +486,33 @@ fn run_export(
             Ok(stderr)
         },
     )
+}
+
+/// An error with its whole source chain, as `jj git export` prints a refused
+/// ref. The lock loss that patience retries lives only in the source: jj's own
+/// message for it is a bare "Failed to set", and the variant's `Debug` drops
+/// gix's packed-refs lock message, which `packed_refs_lock_error` recognizes.
+fn export_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
+fn named_git_bookmark(
+    kind: jj_lib::git::GitRefKind,
+    symbol: jj_lib::ref_name::RemoteRefSymbol<'_>,
+    expect: &[(&str, &str)],
+) -> bool {
+    matches!(kind, jj_lib::git::GitRefKind::Bookmark)
+        && symbol.remote == jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+        && expect
+            .iter()
+            .any(|(branch, _)| symbol.name == jj_lib::ref_name::RefName::new(branch))
 }
 
 /// The commit `refs/heads/<branch>` currently holds in `repo`, or `None` when the
@@ -568,7 +686,34 @@ fn repair_frozen_export(
     ctx: &str,
     frozen: &[(&str, &str, Option<String>)],
 ) {
-    if let Err(error) = import_git(jj, export_cwd) {
+    let expect: Vec<_> = frozen
+        .iter()
+        .map(|(branch, expected, _)| (*branch, *expected))
+        .collect();
+    let imported = futures::executor::block_on(async {
+        jj.check_operation_budget(ctx)?;
+        let repo = crate::load_repo_at_head(export_cwd)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = repo.start_transaction();
+        let options = jj_lib::git::GitImportOptions {
+            abandon_unreachable_commits: false,
+            record_synthetic_predecessors: false,
+            remote_auto_track_bookmarks: std::collections::HashMap::new(),
+        };
+        jj_lib::git::import_some_refs(tx.repo_mut(), &options, |kind, symbol| {
+            named_git_bookmark(kind, symbol, &expect)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if tx.repo().has_changes() {
+            tx.commit(format!("{ctx} (import frozen named refs)"))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<_, String>(())
+    });
+    if let Err(error) = imported {
         log::warn!("{ctx}: import while repairing a frozen export failed: {error}");
     }
     // The re-point is a compare-and-swap against the targets read after the
@@ -604,7 +749,9 @@ fn repair_frozen_export(
             log::warn!("{ctx}: re-pointing `{branch}` to {expected} during repair failed: {error}");
         }
     }
-    if let Err(error) = run_export(jj, export_cwd, ignore_working_copy, ctx) {
+    if let Err(error) = with_checkout_head_preserved(jj, export_cwd, || {
+        run_export(jj, export_cwd, ignore_working_copy, ctx, &expect)
+    }) {
         log::warn!("{ctx}: re-export while repairing a frozen ref failed: {error}");
     }
 }
@@ -648,6 +795,11 @@ pub(crate) fn export_bookmark_advance_guarded(
     branch: &str,
     ctx: &str,
 ) -> Result<(), ExportError> {
+    if branch.is_empty() {
+        return Err(ExportError::Failed(format!(
+            "{EXPORT_FREEZE_MSG} ({ctx}): named export requires a branch"
+        )));
+    }
     let commit = bookmark_commit_checked(jj, cwd, branch)
         .and_then(|commit| {
             commit.ok_or_else(|| {
@@ -796,32 +948,21 @@ pub(crate) fn confirm_origin_tip(
     }
 }
 
+/// The canonical jj repository directory behind the store or workspace at
+/// `cwd`, or `None` when it cannot be resolved. A store's `.jj/repo` is the repo
+/// directory itself; a workspace's names the shared store's repo directory, so
+/// two workspaces of one store resolve to the same path.
+pub fn repository_directory(cwd: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(super::worktree::jj_repo_dir(cwd)?).ok()
+}
+
 /// Resolve the primary project checkout backing the jj store/workspace at
 /// `export_cwd`, or `None` when the topology cannot be resolved (best-effort:
 /// an unresolvable checkout simply skips the HEAD repair).
 ///
-/// A jj store's `.jj/repo` is the repo directory itself; a workspace's `.jj/repo`
-/// is a file naming the shared store's repo directory (relative to that file).
 /// The store's git backend records the project's `.git` in `store/git_target`,
 /// and Cairn always inits the store against the project's MAIN checkout, so the
 /// checkout is the worktree that owns that `.git` — its parent directory.
-pub fn repository_directory(cwd: &Path) -> Option<PathBuf> {
-    let repo_pointer = cwd.join(".jj").join("repo");
-    let store_repo = if repo_pointer.is_dir() {
-        repo_pointer
-    } else {
-        let target = std::fs::read_to_string(&repo_pointer).ok()?;
-        let target = PathBuf::from(target.trim());
-        if target.is_absolute() {
-            target
-        } else {
-            repo_pointer.parent()?.join(target)
-        }
-    };
-
-    std::fs::canonicalize(store_repo).ok()
-}
-
 pub(crate) fn resolve_backing_checkout(export_cwd: &Path) -> Option<PathBuf> {
     let store_repo = repository_directory(export_cwd)?;
     let git_target_file = store_repo.join("store").join("git_target");
@@ -1157,6 +1298,37 @@ mod operation_budget_tests {
     use super::*;
 
     #[test]
+    fn named_export_never_falls_back_to_a_global_export() {
+        let temp = tempfile::tempdir().unwrap();
+        let jj = JjEnv::with_binary("must-not-run-jj", temp.path());
+        let missing = temp.path().join("must-not-load-a-store");
+        for result in [
+            export_git_verified(&jj, &missing, true, "empty scope", &[]),
+            export_git_guarded(&jj, &missing, true, "empty scope", &[]).map_err(String::from),
+            export_bookmark_advance(&jj, &missing, true, "", "empty branch"),
+            export_bookmark_advance_guarded(&jj, &missing, true, "", "empty branch")
+                .map_err(String::from),
+        ] {
+            let error = result.unwrap_err();
+            assert!(is_export_freeze_error(&error), "{error}");
+            assert!(error.contains("requires"), "{error}");
+        }
+        let source = include_str!("export.rs");
+        let start = source.find("\npub(crate) fn export_git_guarded(").unwrap();
+        let end = source[start..].find("\n}\n").unwrap() + start;
+        let named = &source[start..end];
+        assert!(named.contains("expect.is_empty()"));
+        assert!(!named.contains("run_export("));
+        let start = source
+            .find("\npub fn export_git_preserving_checkout(")
+            .unwrap();
+        let end = source[start..].find("\n}\n").unwrap() + start;
+        let global = &source[start..end];
+        assert!(global.contains("export_git_scoped("));
+        assert!(global.contains("&[]"));
+    }
+
+    #[test]
     fn operation_budget_covers_git_export_probes_and_checkout_repair() {
         let temp = tempfile::tempdir().unwrap();
         let jj = JjEnv::with_binary("unused-jj", temp.path())
@@ -1179,17 +1351,6 @@ mod operation_budget_tests {
     }
 }
 
-fn export_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(error) = source {
-        message.push_str(": ");
-        message.push_str(&error.to_string());
-        source = error.source();
-    }
-    message
-}
-
 /// Export exactly the clean bookmarks whose immutable tips the caller observed.
 /// The caller holds the store lock and commits native authority before calling;
 /// this never moves native bookmarks or rewinds a historical operation.
@@ -1207,9 +1368,17 @@ pub(crate) async fn export_selected_bookmarks_inner(
     expectations: &[(&str, &str)],
 ) -> Result<(), String> {
     use jj_lib::backend::CommitId;
-    use jj_lib::object_id::ObjectId as _;
     use jj_lib::ref_name::RefName;
     use jj_lib::repo::Repo as _;
+    if expectations.is_empty()
+        || expectations
+            .iter()
+            .any(|(name, tip)| name.is_empty() || tip.is_empty())
+    {
+        return Err(format!(
+            "{EXPORT_FREEZE_MSG} (scoped git export): named export requires nonempty exact expectations"
+        ));
+    }
     let repo = crate::load_repo_at_head(store)
         .await
         .map_err(|e| e.to_string())?;
@@ -1232,49 +1401,46 @@ pub(crate) async fn export_selected_bookmarks_inner(
             .await?;
     }
     let git_repo = jj_lib::git::get_git_repo(repo.store()).map_err(|e| e.to_string())?;
-    let checkout = resolve_backing_checkout(store);
-    let git = ScopedGit(jj);
-    let before = checkout
-        .as_deref()
-        .and_then(|path| snapshot_checkout_head(&git, path));
     let mut tx = repo.start_transaction();
-    let export = super::packed_refs::with_packed_refs_patience_for(
-        jj,
-        PackedRefs::JjStore(store),
-        "scoped git export",
-        || {
-            let stats = jj_lib::git::export_some_refs(tx.repo_mut(), |kind, symbol| {
-                matches!(kind, jj_lib::git::GitRefKind::Bookmark)
-                    && symbol.remote == jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
-                    && expectations
+    let export = with_checkout_head_preserved(jj, store, || {
+        super::packed_refs::with_packed_refs_patience_for(
+            jj,
+            PackedRefs::JjStore(store),
+            "scoped git export",
+            || {
+                let stats = jj_lib::git::export_some_refs(tx.repo_mut(), |kind, symbol| {
+                    matches!(kind, jj_lib::git::GitRefKind::Bookmark)
+                        && symbol.remote == jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+                        && expectations
+                            .iter()
+                            .any(|(name, _)| *name == symbol.name.as_str())
+                })
+                .map_err(|error| export_error_chain(&error))?;
+                if stats.failed_bookmarks.is_empty() {
+                    Ok(())
+                } else {
+                    // FailedToSet/FailedToDelete retain the typed source chain.
+                    // Debug output loses the displayed packed-ref lock diagnosis
+                    // that the canonical retry policy and classifier both consume.
+                    Err(stats
+                        .failed_bookmarks
                         .iter()
-                        .any(|(name, _)| *name == symbol.name.as_str())
-            })
-            .map_err(|error| export_error_chain(&error))?;
-            if stats.failed_bookmarks.is_empty() {
-                Ok(())
-            } else {
-                // FailedToSet/FailedToDelete retain the typed source chain.
-                // Debug output loses the displayed packed-ref lock diagnosis
-                // that the canonical retry policy and classifier both consume.
-                Err(stats
-                    .failed_bookmarks
-                    .iter()
-                    .map(|(symbol, reason)| {
-                        format!("{}: {}", symbol.name.as_str(), export_error_chain(reason))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            }
-        },
-    );
-    if let (Some(path), Some(before)) = (checkout.as_deref(), before.as_ref()) {
-        repair_export_detach(&git, path, before, jj.checkout_repair_policy);
+                        .map(|(symbol, reason)| {
+                            format!("{}: {}", symbol.name.as_str(), export_error_chain(reason))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                }
+            },
+        )
+    });
+    // Even a partial export records exactly the refs it did move; one that
+    // moved nothing writes no operation, as `run_export`'s named path does.
+    if tx.repo().has_changes() {
+        tx.commit("export selected clean bookmarks".to_string())
+            .await
+            .map_err(|e| format!("scoped export bookkeeping failed: {e}"))?;
     }
-    // Even a partial export records exactly the refs it did move.
-    tx.commit("export selected clean bookmarks".to_string())
-        .await
-        .map_err(|e| format!("scoped export bookkeeping failed: {e}"))?;
     export?;
     for (name, tip) in expectations {
         let read = jj.command_output(
