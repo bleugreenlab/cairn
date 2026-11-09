@@ -289,10 +289,8 @@ async fn a_granted_claude_sign_in_is_journaled_and_finished_with_a_pasted_code()
 
     let page = read(&f, &account_uri).await;
     assert!(page.contains(&format!("started by {}", f.node)), "{page}");
-    assert!(
-        page.contains(&format!("completed as {SIGNED_IN_EMAIL}")),
-        "{page}"
-    );
+    assert!(page.contains("completed (max)"), "{page}");
+    assert!(!page.contains(SIGNED_IN_EMAIL), "{page}");
     let rows = journal(&f).await;
     assert_eq!(
         rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),

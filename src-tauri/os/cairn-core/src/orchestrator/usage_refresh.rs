@@ -656,11 +656,12 @@ mod tests {
             "{list}"
         );
         assert!(
-            list.contains(
-                "Accept the updated Consumer Terms at claude.ai signed in as owner@example.com"
-            ),
+            list.contains(&format!(
+                "Accept the updated Consumer Terms at claude.ai signed in as {terms}"
+            )),
             "{list}"
         );
+        assert!(!list.contains("owner@example.com"), "{list}");
         assert!(
             list.contains("blocked: usage credits are exhausted"),
             "{list}"

@@ -1682,7 +1682,7 @@ pub(crate) fn render_account(facet: &dyn Models, id: &str, sign_ins: &AccountSig
     let now = chrono::Utc::now().timestamp();
     let mut out = format!(
         "# Model account {}\n\n",
-        account["label"].as_str().unwrap_or(id)
+        agent_account_name(id, account["label"].as_str().unwrap_or_default())
     );
     let resets = account_resets(facet, &ModelScope::workspace());
     account_block(account, now, &sign_ins.pending, &resets, &mut out);
@@ -1741,8 +1741,10 @@ fn pool_block(pool: &ProviderPoolSnapshot, label: &str, out: &mut String) {
         pool.accounts
             .iter()
             .find(|account| account.account_id == account_id)
-            .map(|account| account.label.clone())
-            .unwrap_or_else(|| account_id.to_string())
+            .map_or(account_id, |account| {
+                agent_account_name(&account.account_id, &account.label)
+            })
+            .to_string()
     };
     for family in &pool.families {
         let _ = write!(
@@ -3419,6 +3421,57 @@ mod tests {
             &mut out,
         );
         assert!(out.starts_with("- **Team key** `acc_2` — "), "{out}");
+    }
+
+    /// Sign-in labels an account with its login's email, so neither the
+    /// account's own page nor the usage page it feeds may print that label.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_labelled_with_its_email_reads_without_it() {
+        use crate::credentials::{ApiProvider, ProviderAuth};
+        use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
+        const EMAIL: &str = "signed-in@example.com";
+        let orch = seeded_orchestrator().await;
+        let account = orch
+            .add_account(
+                ApiProvider::Anthropic,
+                EMAIL.into(),
+                ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap();
+        orch.update_account_metadata(&account.id, Some(EMAIL.to_string()), None)
+            .unwrap();
+        orch.record_account_health(
+            &account.id,
+            vec![ProviderUsageWindow {
+                id: "session".to_string(),
+                label: "Session".to_string(),
+                scope: ProviderUsageScope::Session,
+                scope_target: None,
+                used_percent: 40.0,
+                remaining_percent: 60.0,
+                resets_at: Some(chrono::Utc::now().timestamp() + 3_600),
+                reset_at_text: None,
+                window_duration_mins: None,
+            }],
+            None,
+        )
+        .unwrap();
+
+        let page = read(&orch, &format!("cairn://models/accounts/{}", account.id)).await;
+        assert!(
+            page.starts_with(&format!("# Model account {}\n", account.id)),
+            "{page}"
+        );
+        assert!(!page.contains(EMAIL), "{page}");
+        assert!(!page.contains("signed-in@"), "{page}");
+
+        let usage = read(&orch, "cairn://models/usage?provider=claude").await;
+        assert!(
+            usage.contains(&format!("  - {}: 60%\n", account.id)),
+            "{usage}"
+        );
+        assert!(!usage.contains(EMAIL), "{usage}");
     }
 
     #[test]
