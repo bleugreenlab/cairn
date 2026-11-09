@@ -3223,6 +3223,7 @@ impl Orchestrator {
         )
         .await;
         let failed = report.end == PassEnd::FoldFailed
+            || report.folds.iter().any(|fold| !fold.succeeded())
             || report.rules.iter().any(|rule| rule.error.is_some());
         if failed {
             log::warn!("retention pass: {report}");

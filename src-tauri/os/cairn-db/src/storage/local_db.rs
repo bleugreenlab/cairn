@@ -2170,6 +2170,7 @@ impl LocalDb {
                 duration: started.elapsed(),
                 drain: DrainReport::not_closed(),
                 slow: false,
+                in_engine: true,
             });
         }
 
@@ -2251,6 +2252,7 @@ impl LocalDb {
             duration: started.elapsed(),
             drain,
             slow,
+            in_engine: false,
         };
         if abandoned {
             log::warn!(
@@ -3170,6 +3172,9 @@ pub struct CheckpointReport {
     /// shut. Read beside [`Self::fold_mib_per_s`]: a slow fold at a healthy
     /// rate is a big log, a slow fold at a collapsed rate is a starved host.
     pub slow: bool,
+    /// The pass neither closed the gate nor attempted, because an earlier
+    /// attempt is still running in the engine.
+    pub in_engine: bool,
 }
 
 impl CheckpointReport {

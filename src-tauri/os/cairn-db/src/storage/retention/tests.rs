@@ -338,7 +338,7 @@ async fn a_pass_folds_a_grown_log_and_ends_at_its_fold_budget() {
     let report = run(&db, budget, &[Eviction::DoneOutbox]).await;
 
     assert_eq!(report.folds.len(), 1);
-    assert!(report.folds[0].succeeded, "{:?}", report.folds);
+    assert!(report.folds[0].succeeded(), "{:?}", report.folds);
     assert_eq!(report.end, PassEnd::FoldBudget);
     assert_eq!(report.rows(), 1);
 }
@@ -448,7 +448,7 @@ async fn a_passs_first_fold_does_not_train_the_estimate() {
     state.deleted_page(Eviction::DoneOutbox);
     let carried = run_rules(&db, NOW, budget, &mut state, &[Eviction::DoneOutbox]).await;
     assert_eq!(carried.folds.len(), 1, "{carried}");
-    assert!(carried.folds[0].succeeded, "{carried}");
+    assert!(carried.folds[0].succeeded(), "{carried}");
     assert!(state.unfolded.is_none());
     assert_eq!(state.fold_ms_per_page(Eviction::DoneOutbox), None);
 
@@ -1092,6 +1092,101 @@ async fn a_slow_write_folds_what_is_due_then_ends_the_pass() {
         assert_eq!(report.folds.len(), folds, "{report}");
         assert_eq!(state.unfolded.is_some(), carried, "{report}");
     }
+}
+
+/// Open a read transaction outside the pool and hold it, as the long pooled
+/// holders in production do, so a fold's drain expires on it. Returns the
+/// holder and the line the drain names it by.
+async fn hold_a_transaction(db: &LocalDb) -> (TrackedConnection, u32) {
+    let line = line!() + 1;
+    let holder = db.connect().await.unwrap();
+    holder.execute(db.concurrent_begin(), ()).await.unwrap();
+    let mut rows = holder
+        .query("SELECT COUNT(*) FROM effect_outbox", ())
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap();
+    drop(rows);
+    (holder, line)
+}
+
+/// A connection held past the drain budget fails the fold, and with the log
+/// under the threshold that costs the pass nothing: it deletes its pages,
+/// asks again once a window has been deleted, and the line names the holder.
+/// The page carried from a previous pass makes the pass open on a settling
+/// fold, as in production.
+#[tokio::test]
+async fn a_held_connection_fails_the_fold_but_not_the_pass_under_the_threshold() {
+    let (_temp, db) = private_db().await;
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    let budget = EvictorBudget {
+        fold_work_target: Some(Duration::from_millis(500)),
+        folds_per_pass: 8,
+        ..UNBOUNDED
+    };
+    let mut state = EvictorState::default();
+    state.deleted_page(Eviction::DoneOutbox);
+
+    let (holder, line) = hold_a_transaction(&db).await;
+    let report = run_rules(&db, NOW, budget, &mut state, &[Eviction::DoneOutbox]).await;
+    drop(holder);
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert_eq!(report.rows(), 1, "{report}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM effect_outbox").await, 0);
+    assert_eq!(
+        report.folds.len(),
+        2,
+        "the settling fold and one retry after the page: {report}"
+    );
+    assert!(
+        report.folds.iter().all(|fold| !fold.succeeded()),
+        "{report}"
+    );
+    assert!(
+        report.to_string().contains(&format!(
+            "folds_failed=2 fold_failed=drain(still_open=1 oldest={}:{line}/",
+            file!()
+        )),
+        "{report}"
+    );
+    assert!(
+        state.unfolded.is_some(),
+        "the unfolded pages carry to the next pass"
+    );
+}
+
+/// The same holder ends the pass before it deletes anything when the log is
+/// at the threshold, because deleting more would only grow it.
+#[tokio::test]
+async fn a_held_connection_ends_the_pass_when_the_log_needs_the_fold() {
+    let (_temp, db) = private_db().await;
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    let budget = EvictorBudget {
+        fold_at_log_bytes: 0,
+        folds_per_pass: 8,
+        ..UNBOUNDED
+    };
+
+    let (holder, line) = hold_a_transaction(&db).await;
+    let report = run(&db, budget, &[Eviction::DoneOutbox]).await;
+    drop(holder);
+
+    assert_eq!(report.end, PassEnd::FoldFailed, "{report}");
+    assert_eq!(report.rows(), 0, "{report}");
+    assert_eq!(report.folds.len(), 1, "{report}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM effect_outbox").await, 1);
+    let rendered = report.to_string();
+    assert!(rendered.starts_with("end=FoldFailed rows=0 "), "{rendered}");
+    assert!(
+        rendered.contains(&format!(
+            "folds_failed=1 fold_failed=drain(still_open=1 oldest={}:{line}/",
+            file!()
+        )),
+        "{rendered}"
+    );
 }
 
 /// Delete `pages` of `rule` and fold them for `work_ms`.

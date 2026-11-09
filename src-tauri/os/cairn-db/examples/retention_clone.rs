@@ -289,7 +289,7 @@ async fn catchup(path: &str, now: &str, rules: &str) -> Res<Json> {
                     "ms": fold.duration.as_millis() as u64,
                     "work_ms": fold.work().as_millis() as u64,
                     "drain_ms": fold.drain.as_millis() as u64,
-                    "ok": fold.succeeded,
+                    "ok": fold.succeeded(),
                 })
             }));
             let Some(result) = report.rules.first() else {
@@ -555,7 +555,7 @@ async fn passes(path: &str, now: &str, n: &str, folds: Option<&&str>) -> Res<Jso
                 "before_mib": fold.log_bytes_before as f64 / 1048576.0,
                 "work_ms": fold.work().as_millis() as u64,
                 "drain_ms": fold.drain.as_millis() as u64,
-                "ok": fold.succeeded,
+                "ok": fold.succeeded(),
             })).collect::<Vec<_>>(),
             "line": report.to_string(),
         }));

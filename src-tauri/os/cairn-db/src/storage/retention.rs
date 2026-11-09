@@ -28,8 +28,10 @@
 //! large), then one short write that deletes exactly those rowids. Pages are
 //! separate transactions, so the checkpoint can fold the logical log between
 //! them. When the log has grown past [`EvictorBudget::fold_at_log_bytes`], the
-//! pass folds it before the next page, and ends the pass if the fold fails
-//! (tenet 1260). No delete is an `IN (SELECT ...)` (cairn/5332): the rowids
+//! pass folds it before the next page, and ends the pass if that fold fails
+//! (tenet 1260). A fold the pass asks for under that size, to bound what its
+//! own pages will cost, does not end the pass when it fails: the pass keeps
+//! paging and retries it later. No delete is an `IN (SELECT ...)` (cairn/5332): the rowids
 //! are selected first and bound as a literal list.
 //!
 //! The journals (`effect_outbox`, `search_outbox`, `message_streams`) are
@@ -46,7 +48,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::storage::{DbResult, DrainBudget, LocalDb, RowExt, TrackedConnection};
+use super::local_db::Site;
+use crate::storage::{
+    Caller, CheckpointReport, DbResult, DrainBudget, LocalDb, RowExt, TrackedConnection,
+};
 use crate::turso::Value;
 
 /// What bounds a table's size.
@@ -1682,8 +1687,62 @@ pub enum PassEnd {
     FoldBudget,
     /// A page's write took at least [`EvictorBudget::slow_write`].
     SlowWrite,
-    /// A fold failed; deleting more would only grow the log.
+    /// A fold the pass needed failed: the log was at or past
+    /// [`EvictorBudget::fold_at_log_bytes`], so deleting more would only grow
+    /// it, or an earlier checkpoint attempt is still running in the engine.
     FoldFailed,
+}
+
+/// Why a fold did not fold.
+#[derive(Debug, Clone)]
+pub enum FoldFailure {
+    /// The drain expired with connections still open. The attempts ran and
+    /// lost to them.
+    Drain {
+        still_open: usize,
+        /// The longest-held of them: where it was asked for and how long it
+        /// had been out.
+        oldest: Option<(Caller, Duration)>,
+    },
+    /// The drain finished and the engine still refused, or no connection
+    /// could be had for the fold.
+    Engine(String),
+    /// An earlier attempt is still running in the engine, so the fold neither
+    /// closed the gate nor tried.
+    InEngine,
+}
+
+impl FoldFailure {
+    /// Why `checkpoint` failed, or `None` when it folded.
+    fn of(checkpoint: &CheckpointReport) -> Option<Self> {
+        let error = checkpoint.error.as_ref()?;
+        Some(if checkpoint.in_engine {
+            Self::InEngine
+        } else if !checkpoint.drain.drained {
+            Self::Drain {
+                still_open: checkpoint.drain.still_open,
+                oldest: checkpoint.drain.oldest,
+            }
+        } else {
+            Self::Engine(error.clone())
+        })
+    }
+}
+
+impl std::fmt::Display for FoldFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Drain { still_open, oldest } => {
+                write!(f, "drain(still_open={still_open}")?;
+                if let Some((caller, age)) = oldest {
+                    write!(f, " oldest={}/{}ms", Site(caller), age.as_millis())?;
+                }
+                write!(f, ")")
+            }
+            Self::Engine(error) => write!(f, "engine({error})"),
+            Self::InEngine => write!(f, "in_engine"),
+        }
+    }
 }
 
 /// One fold the pass asked for.
@@ -1695,13 +1754,18 @@ pub struct FoldRecord {
     pub duration: Duration,
     /// The drain: the stall every other database call paid before the fold.
     pub drain: Duration,
-    pub succeeded: bool,
+    /// Why the fold did not fold, or `None` when it did.
+    pub failure: Option<FoldFailure>,
 }
 
 impl FoldRecord {
     /// The fold's own work, the part that scales with what was deleted.
     pub fn work(&self) -> Duration {
         self.duration.saturating_sub(self.drain)
+    }
+
+    pub fn succeeded(&self) -> bool {
+        self.failure.is_none()
     }
 }
 
@@ -1754,6 +1818,14 @@ impl std::fmt::Display for PassReport {
                 .unwrap_or(0),
             self.log_peak_bytes as f64 / (1024.0 * 1024.0),
         )?;
+        let failures: Vec<&FoldFailure> = self
+            .folds
+            .iter()
+            .filter_map(|fold| fold.failure.as_ref())
+            .collect();
+        if let Some(last) = failures.last() {
+            write!(f, " folds_failed={} fold_failed={last}", failures.len())?;
+        }
         for rule in &self.rules {
             write!(
                 f,
@@ -1817,6 +1889,10 @@ pub async fn run_rules(
     };
     let mut rows_total = 0usize;
     let mut slow_write = false;
+    let mut folding = Folding {
+        settling: true,
+        since_failure: None,
+    };
     'rules: for &eviction in rules {
         let mut rule = RuleReport {
             eviction,
@@ -1833,7 +1909,8 @@ pub async fn run_rules(
             if slow_write {
                 // The pass is over whichever way this goes, unless the fold it
                 // owes fails, which is the worse news to report.
-                let fold = fold_if_due(db, budget, state, eviction, &mut report).await;
+                let fold =
+                    fold_if_due(db, budget, state, &mut folding, eviction, &mut report).await;
                 report.end = match fold {
                     Some(PassEnd::FoldFailed) => PassEnd::FoldFailed,
                     _ => PassEnd::SlowWrite,
@@ -1842,7 +1919,9 @@ pub async fn run_rules(
                 report.end = PassEnd::TimeBudget;
             } else if rows_total >= budget.pass_rows {
                 report.end = PassEnd::RowBudget;
-            } else if let Some(end) = fold_if_due(db, budget, state, eviction, &mut report).await {
+            } else if let Some(end) =
+                fold_if_due(db, budget, state, &mut folding, eviction, &mut report).await
+            {
                 report.end = end;
             }
             if report.end != PassEnd::Complete {
@@ -1854,6 +1933,9 @@ pub async fn run_rules(
                     rule.select_ms.push(page.select.as_millis() as u64);
                     if page.rows > 0 {
                         state.deleted_page(eviction);
+                        if let Some(pages) = folding.since_failure.as_mut() {
+                            *pages += 1;
+                        }
                         rule.pages += 1;
                         rule.rows += page.rows;
                         rule.max_page_rows = rule.max_page_rows.max(page.rows);
@@ -1876,19 +1958,43 @@ pub async fn run_rules(
         }
         report.rules.push(rule);
     }
+    // A fold that failed under the ceiling left its pages, and any deleted
+    // since, for a later fold. Try once more before the pass leaves them to the
+    // next one, unless nothing was deleted since the failure.
+    if report.end != PassEnd::FoldFailed && folding.since_failure.is_some_and(|pages| pages > 0) {
+        if let Some(PassEnd::FoldFailed) = fold(db, budget, state, &mut folding, &mut report).await
+        {
+            report.end = PassEnd::FoldFailed;
+        }
+    }
     report.duration = started.elapsed();
     report
 }
 
+/// What the pass knows about its own folds so far.
+struct Folding {
+    /// No fold has succeeded since the pass began or since a fold failed. The
+    /// next fold to succeed then covers log and pages whose window did not
+    /// begin at a fold of this pass, so it settles them without training the
+    /// estimate (see [`EvictorState`]).
+    settling: bool,
+    /// Pages deleted since a fold failed, while no fold has succeeded since.
+    since_failure: Option<usize>,
+}
+
 /// Fold before `next` deletes another page when the log has passed the
 /// budget's threshold or the unfolded pages would cost more than the fold
-/// target. The pass's first fold counts against the fold budget like any other
-/// but does not train the estimate (see [`EvictorState`]). Returns why the pass
-/// must end, if it must.
+/// target. Returns why the pass must end, if it must.
+///
+/// After a fold fails, the pass does not ask again until it has deleted
+/// another window's worth of `next`'s pages, so a holder that outlives one
+/// drain does not close the gate before every page. A fold of a log past the
+/// threshold is due regardless.
 async fn fold_if_due(
     db: &LocalDb,
     budget: EvictorBudget,
     state: &mut EvictorState,
+    folding: &mut Folding,
     next: Eviction,
     report: &mut PassReport,
 ) -> Option<PassEnd> {
@@ -1896,48 +2002,76 @@ async fn fold_if_due(
     report.log_peak_bytes = report.log_peak_bytes.max(log_bytes);
     let cost_due = budget
         .fold_work_target
-        .is_some_and(|target| state.fold_due(next, target));
+        .is_some_and(|target| match folding.since_failure {
+            Some(pages) => pages >= state.pages_per_fold(next, target),
+            None => state.fold_due(next, target),
+        });
     if log_bytes < budget.fold_at_log_bytes && !cost_due {
         return None;
     }
+    fold(db, budget, state, folding, report).await
+}
+
+/// Fold now, within the pass's fold budget, and return why the pass must end,
+/// if it must.
+///
+/// A failed fold ends the pass only when the fold was required, because the
+/// log was at or past the threshold, or when an earlier attempt is still in
+/// the engine and any fold this pass asks for would be refused the same way.
+/// Under the threshold the fold was only bounding what the pass's own pages
+/// will cost to fold, and one connection held past the drain budget is enough
+/// to fail it: on 11-06 that ended 22 of 64 passes having deleted nothing, with
+/// the log at 3 to 37 MiB (cairn/6324).
+async fn fold(
+    db: &LocalDb,
+    budget: EvictorBudget,
+    state: &mut EvictorState,
+    folding: &mut Folding,
+    report: &mut PassReport,
+) -> Option<PassEnd> {
     if report.folds.len() >= budget.folds_per_pass {
         return Some(PassEnd::FoldBudget);
     }
+    let log_bytes = db.logical_log_bytes();
+    let required = log_bytes >= budget.fold_at_log_bytes;
     let outcome = db
         .checkpoint(3, Duration::from_millis(50), DrainBudget::PRODUCTION)
         .await;
-    let (record, succeeded) = match outcome {
-        Ok(checkpoint) => {
-            let succeeded = checkpoint.succeeded();
-            (
-                FoldRecord {
-                    log_bytes_before: checkpoint.log_bytes_before,
-                    log_bytes_after: checkpoint.log_bytes_after,
-                    duration: checkpoint.duration,
-                    drain: checkpoint.drain.waited,
-                    succeeded,
-                },
-                succeeded,
-            )
-        }
-        Err(_) => (
-            FoldRecord {
-                log_bytes_before: log_bytes,
-                log_bytes_after: db.logical_log_bytes(),
-                duration: Duration::ZERO,
-                drain: Duration::ZERO,
-                succeeded: false,
-            },
-            false,
-        ),
+    let record = match outcome {
+        Ok(checkpoint) => FoldRecord {
+            log_bytes_before: checkpoint.log_bytes_before,
+            log_bytes_after: checkpoint.log_bytes_after,
+            duration: checkpoint.duration,
+            drain: checkpoint.drain.waited,
+            failure: FoldFailure::of(&checkpoint),
+        },
+        Err(error) => FoldRecord {
+            log_bytes_before: log_bytes,
+            log_bytes_after: db.logical_log_bytes(),
+            duration: Duration::ZERO,
+            drain: Duration::ZERO,
+            failure: Some(FoldFailure::Engine(error.to_string())),
+        },
     };
-    if succeeded && report.folds.is_empty() {
-        state.settled();
-    } else if succeeded {
-        state.folded(record.work());
-    }
+    let end = match &record.failure {
+        None => {
+            if folding.settling {
+                state.settled();
+            } else {
+                state.folded(record.work());
+            }
+            folding.settling = false;
+            folding.since_failure = None;
+            None
+        }
+        Some(failure) => {
+            folding.settling = true;
+            folding.since_failure = Some(0);
+            (required || matches!(failure, FoldFailure::InEngine)).then_some(PassEnd::FoldFailed)
+        }
+    };
     report.folds.push(record);
-    (!succeeded).then_some(PassEnd::FoldFailed)
+    end
 }
 
 #[cfg(test)]
