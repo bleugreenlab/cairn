@@ -26,6 +26,8 @@ struct Host {
     /// SQL the host runs against the owning database while it answers a
     /// decision: whatever lands while the model call is in flight.
     during_condition: Mutex<Option<String>>,
+    /// The stored `output` an action completes with; `None` stores none.
+    action_output: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -118,10 +120,11 @@ impl WorkflowHost for Host {
                 ..
             } => {
                 self.calls.lock().unwrap().push("action".into());
+                let output = self.action_output.lock().unwrap().clone();
                 self.owning
                     .execute(
-                        "UPDATE action_runs SET status = 'complete' WHERE id = ?1",
-                        params![action_run_id],
+                        "UPDATE action_runs SET status = 'complete', output = ?2 WHERE id = ?1",
+                        params![action_run_id, output.as_deref()],
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -159,6 +162,7 @@ async fn fixture(team: bool) -> (WorkflowRuntime, Arc<Host>, tempfile::TempDir) 
         condition_requests: Mutex::new(vec![]),
         condition_outcomes: Mutex::new(vec![]),
         during_condition: Mutex::new(None),
+        action_output: Mutex::new(None),
     });
     let runtime = WorkflowRuntime::new(
         host.clone(),
@@ -471,6 +475,76 @@ async fn a_decision_node_routes_on_the_pick_and_records_the_answer() {
         "the evaluation row is the decision's record"
     );
     assert_eq!(*host.calls.lock().unwrap(), ["condition", "agent"]);
+}
+
+/// A custom shell action's stdout is stored whole for code. A decision node
+/// that reads it through a context edge hands its model the bounded form, cut
+/// on the output's own lines with the marker, and the action's record keeps
+/// every byte.
+#[tokio::test]
+async fn a_decision_is_asked_about_a_large_action_output_bounded_while_the_record_stays_whole() {
+    let (runtime, host, _dir) = fixture(true).await;
+    let mut action = node("action", "action");
+    action["actionConfig"] = serde_json::json!({"action":"echo"});
+    let mut context = edge("action", "context-out", "condition");
+    context["id"] = "action-condition-context".into();
+    context["edgeType"] = "context".into();
+    context["targetHandle"] = "context-in".into();
+    seed(
+        &host.owning,
+        vec![
+            node("trigger", "trigger"),
+            action,
+            decision_node(yes_or_no()),
+            node("agent", "agent"),
+        ],
+        vec![
+            edge("trigger", "control-out", "action"),
+            edge("action", "control-out", "condition"),
+            context,
+            edge("condition", "no", "agent"),
+        ],
+    )
+    .await;
+    host.owning.execute_script("INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,created_at,updated_at) VALUES('job','exec','agent','issue','p','pending','agent','agent',1,1)").await.unwrap();
+    let stdout = format!("{}the verdict line", "build log line\n".repeat(10_000));
+    let output = serde_json::json!({"stdout": stdout, "stderr": "", "exit_code": 0}).to_string();
+    *host.action_output.lock().unwrap() = Some(output.clone());
+    *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
+
+    effects::run::execute_effects(&runtime, vec![advance(None)])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *host.calls.lock().unwrap(),
+        ["action", "condition", "agent"]
+    );
+    let stored = host
+        .owning
+        .query_one("SELECT output FROM action_runs".to_string(), (), |row| {
+            use storage::RowExt;
+            row.text(0)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, output, "the action's record keeps its whole output");
+
+    let input = host.condition_requests.lock().unwrap()[0].input.clone();
+    let asked: serde_json::Value = serde_json::from_str(&input).unwrap();
+    let seen = asked["context"]["stdout"].as_str().unwrap();
+    let ceiling = storage::render::CLIENT_TOOL_RESULT_BYTE_CEILING;
+    assert!(stdout.len() > ceiling);
+    assert!(
+        seen.len() <= ceiling,
+        "{} bytes reached the model",
+        seen.len()
+    );
+    assert!(seen.contains("--- elided"), "the cut is marked");
+    assert!(
+        seen.starts_with("build log line\n") && seen.ends_with("\nthe verdict line"),
+        "the head and the tail survive on whole lines"
+    );
 }
 
 #[tokio::test]

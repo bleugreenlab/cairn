@@ -7350,6 +7350,15 @@ pub struct LearnedResourceEstimate {
 /// alone makes. `Ready` still echoes the identity exactly as the executor sent
 /// it, so an executor of any age reads the same frame it always did. What a
 /// runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/4940 does not move the number. No frame, variant or field changes.
+/// It names the link's frame limit (`LINK_FRAME_BYTE_LIMIT`) and the budget
+/// a relay response is held under (`RELAY_RESPONSE_BYTE_BUDGET`), and the
+/// runner now answers a response past that budget with the existing
+/// `McpRelayResult::Rejected`, which every executor already decodes and hands
+/// to its caller as a refused call. What a runner gets wrong talking to an
+/// older executor: nothing. That executor would have dropped the link on the
+/// oversized frame instead; it now receives a small frame it already reads.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -20344,6 +20353,51 @@ pub struct ProcessBatchItemOutcome {
 pub enum McpRelayResult {
     Success { response: CallbackResponse },
     Rejected { diagnostic: String },
+}
+
+/// The largest single frame the executor link carries. The executor dials with
+/// tungstenite's default configuration, whose `max_frame_size` is 16 MiB, and a
+/// frame past it ends the session, taking every call relayed over the link
+/// with it.
+pub const LINK_FRAME_BYTE_LIMIT: usize = 16 << 20;
+
+/// What one serialized relay response ([`ExecutorMessage::McpRelayResponse`])
+/// may carry: [`LINK_FRAME_BYTE_LIMIT`] less room for the frame's own wrapper.
+/// The runner answers a response past it with [`McpRelayResult::Rejected`]
+/// rather than send a frame that would drop the link.
+pub const RELAY_RESPONSE_BYTE_BUDGET: usize = 15 << 20;
+
+/// Bytes `text` costs inside a relay response frame. A `read` or `run` result
+/// is JSON-escaped twice on its way there: into its envelope's `text`, then as
+/// the [`CallbackResponse::result`] string inside the frame. Each escape
+/// doubles a quote or backslash and spells out a control character, so a quote
+/// costs 4 bytes, a newline 3, and another control byte 7 (`\\u00XX`).
+pub fn relay_wire_len(text: &str) -> usize {
+    text.bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' => 4,
+            b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 3,
+            0x00..=0x1f => 7,
+            _ => 1,
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod relay_wire_tests {
+    use super::relay_wire_len;
+
+    /// The count is exactly what two JSON encodings produce, less the quotes
+    /// the encodings themselves add.
+    #[test]
+    fn relay_wire_len_matches_two_json_encodings() {
+        let text = "plain \"quoted\" back\\slash\nnew\rline\ttab\u{8}\u{c}\u{1}\u{1f} café ✓";
+        let once = serde_json::to_string(text).unwrap();
+        let twice = serde_json::to_string(&once).unwrap();
+        // Outer quotes of the second encoding, plus the first encoding's two
+        // quotes escaped to two bytes each.
+        assert_eq!(twice.len(), relay_wire_len(text) + 6);
+    }
 }
 
 /// What the runner asks a deployment's head to do. Only the head acts; a

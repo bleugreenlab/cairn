@@ -6222,8 +6222,8 @@ async fn finalize_delta_receipt(
 
 use hygiene::check_cd_commands;
 use output::{
-    collect_run_data, collect_run_images, compose_run_output, run_envelope, run_envelope_with_data,
-    run_input_refusal,
+    collect_run_data, collect_run_images, compose_run_output, run_budget_for, run_envelope,
+    run_envelope_with_data, run_input_refusal, RunOutputBudget,
 };
 use process::run_one;
 pub(crate) use process::READ_ONLY_CHECKOUT_DENIAL;
@@ -7156,8 +7156,13 @@ async fn prepare_and_run_batch(
         .await
         {
             read_equivalent::BatchRoute::Served(outcomes) => {
-                let text = compose_run_output(&outcomes);
-                return run_envelope(text, collect_run_images(outcomes));
+                let composed = compose_run_output(&outcomes, run_budget_for(request));
+                return run_envelope_with_data(
+                    composed.text,
+                    collect_run_images(outcomes),
+                    None,
+                    composed.over_ceiling,
+                );
             }
             read_equivalent::BatchRoute::Machine(notes) => notes
                 .into_iter()
@@ -7793,7 +7798,12 @@ fn settled_envelope(settled: SettledRunBatch) -> String {
     if settled.suspended {
         return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
     }
-    run_envelope_with_data(settled.text, settled.images, settled.data)
+    run_envelope_with_data(
+        settled.text,
+        settled.images,
+        settled.data,
+        settled.over_ceiling,
+    )
 }
 
 fn joined_host_outcomes(
@@ -8606,6 +8616,8 @@ struct SettledRunBatch {
     text: String,
     images: Vec<cairn_common::read::ImageBlock>,
     data: Option<Vec<serde_json::Value>>,
+    /// The items a code-facing batch refused to return past its ceiling.
+    over_ceiling: Option<cairn_common::read::OverCeiling>,
     suspended: bool,
     /// One phrase for how the batch ended, which a detached batch's notice
     /// states: "succeeded", "2 of 3 items failed", or the run's own failure.
@@ -8619,6 +8631,7 @@ impl SettledRunBatch {
             text,
             images: Vec::new(),
             data: None,
+            over_ceiling: None,
             suspended: false,
         }
     }
@@ -8628,6 +8641,7 @@ impl SettledRunBatch {
             text: String::new(),
             images: Vec::new(),
             data: None,
+            over_ceiling: None,
             suspended: true,
             verdict: "suspended on an item's own approval".into(),
         }
@@ -8645,9 +8659,15 @@ impl SettledRunBatch {
             text,
             data: collect_run_data(&mut outcomes),
             images: collect_run_images(outcomes),
+            over_ceiling: None,
             suspended: false,
             verdict,
         }
+    }
+
+    fn with_over_ceiling(mut self, over_ceiling: Option<cairn_common::read::OverCeiling>) -> Self {
+        self.over_ceiling = over_ceiling;
+        self
     }
 }
 
@@ -11387,7 +11407,9 @@ pub(crate) fn compose_adopted_result(
     {
         Ok(items) => {
             let (outcomes, _) = pace::time_batch(items, None, metadata.duration_ms, None);
-            let body = compose_run_output(&outcomes);
+            // No caller's request survives to this text: it opens a notice, so
+            // it composes for the model context the notice lands in.
+            let body = compose_run_output(&outcomes, RunOutputBudget::Context).text;
             (outcomes, body)
         }
         Err(error) => (
@@ -11704,7 +11726,9 @@ async fn settle_run_batch(
             outcome.body.push_str(note);
         }
     }
-    let mut result = compose_run_output(&outcomes);
+    let composed = compose_run_output(&outcomes, run_budget_for(&s.request));
+    let over_ceiling = composed.over_ceiling;
+    let mut result = composed.text;
     if let Some(label) = &s.revision_label {
         result = format!("{}\n\n{result}", ran_against_line(label, cell_origin));
     }
@@ -11776,7 +11800,7 @@ async fn settle_run_batch(
         } else {
             result
         };
-        return SettledRunBatch::settled(text, outcomes);
+        return SettledRunBatch::settled(text, outcomes).with_over_ceiling(over_ceiling);
     }
 
     // Publish an authenticated cell delta through the runner-owned logical-head
@@ -12118,7 +12142,7 @@ async fn settle_run_batch(
     } else {
         result
     };
-    SettledRunBatch::settled(text, outcomes)
+    SettledRunBatch::settled(text, outcomes).with_over_ceiling(over_ceiling)
 }
 
 /// The Cairn environment a placed process carries to whatever machine runs it.
@@ -14160,6 +14184,8 @@ pub(crate) mod host_batch_tests {
     #[derive(Clone)]
     enum FirstAnswer {
         Complete,
+        /// The tool answers with this text.
+        Text(String),
         InputRequired {
             input_requests: serde_json::Value,
             request_state: Option<String>,
@@ -14260,6 +14286,9 @@ pub(crate) mod host_batch_tests {
                 FirstAnswer::Complete => {
                     McpCallOutcome::Complete(McpToolCallResult::from_text("the tool answered"))
                 }
+                FirstAnswer::Text(text) => {
+                    McpCallOutcome::Complete(McpToolCallResult::from_text(&text))
+                }
                 FirstAnswer::InputRequired {
                     input_requests,
                     request_state,
@@ -14349,6 +14378,49 @@ pub(crate) mod host_batch_tests {
 
     fn was(abandoned: &std::sync::atomic::AtomicBool) -> bool {
         abandoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A tool's JSON reply past the model-context cap reaches a code caller
+    /// (an `@cairn/sdk` script, which stamps no origin) whole, so it parses; a
+    /// model-facing call of the same batch still arrives capped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_item_result_past_45k_reaches_a_code_caller_whole() {
+        let reports: Vec<serde_json::Value> = (0..600)
+            .map(|id| json!({"id": id, "body": "r".repeat(100)}))
+            .collect();
+        let reply = json!({ "reports": reports }).to_string();
+        assert!(reply.len() > 60_000);
+        for model_facing in [false, true] {
+            let orch = env().await;
+            scripted_tool(
+                &orch,
+                Duration::ZERO,
+                [("big", Duration::ZERO, FirstAnswer::Text(reply.clone()))],
+            );
+            let (mut settlement, mut batch) =
+                batch_of(&orch, mcp_item_named("big", None), false).await;
+            if model_facing {
+                for payload in [&mut settlement.request.payload, &mut batch.request.payload] {
+                    cairn_common::protocol::stamp_callback_origin(
+                        payload,
+                        cairn_common::protocol::MODEL_FACING_ORIGIN,
+                    );
+                }
+            }
+            let envelope =
+                run_suspendable_host_batch(&orch, settlement, batch, Duration::from_secs(5)).await;
+            let envelope: cairn_common::read::RunBatchEnvelope =
+                serde_json::from_str(&envelope).unwrap();
+            assert_eq!(envelope.over_ceiling, None);
+            if model_facing {
+                assert!(envelope.text.contains("--- elided"), "{}", envelope.text);
+                assert!(envelope.text.len() <= 45_000);
+            } else {
+                let parsed: serde_json::Value = serde_json::from_str(&envelope.text)
+                    .unwrap_or_else(|error| panic!("{error}: {}", &envelope.text[..200]));
+                assert_eq!(parsed["reports"].as_array().map(Vec::len), Some(600));
+            }
+        }
     }
 
     /// The contract this change exists for: an MCP call declared longer than

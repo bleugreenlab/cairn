@@ -411,6 +411,7 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
                 images: Vec::new(),
                 invalid_input: false,
                 data: None,
+                over_ceiling: None,
             },
         };
         // Core composes the text within its own cap, and a model door's reply

@@ -183,6 +183,49 @@ async fn a_served_read_is_deduped_only_for_a_model_facing_run() {
     );
 }
 
+/// A read-shaped item is served under its caller's read budget: a program's run
+/// gets a body past the model-context frame whole, and a model-facing run of
+/// the same item gets read's framed page with its continue footer.
+#[tokio::test]
+async fn a_served_read_past_the_context_frame_reaches_a_program_whole() {
+    use cairn_common::protocol::{stamp_callback_origin, MODEL_FACING_ORIGIN};
+
+    let run_id = "run-read-whole";
+    let (temp, _db, orch, cwd) = setup_without_executor(run_id).await;
+    let big = temp.path().join("big.txt");
+    let body: String = (0..20_000).map(|n| format!("line {n}\n")).collect();
+    assert!(body.len() > 150_000);
+    std::fs::write(&big, &body).unwrap();
+    let run = |model_facing: bool| {
+        let mut payload = one_command(&format!("cat {}", big.display()));
+        if model_facing {
+            stamp_callback_origin(&mut payload, MODEL_FACING_ORIGIN);
+        }
+        let request = request(&cwd, Some(run_id), payload);
+        let orch = &orch;
+        async move { run_text(&handle_run(orch, &request).await) }
+    };
+
+    let program = run(false).await;
+    assert!(
+        program.starts_with("↳ read "),
+        "served: {}",
+        &program[..200]
+    );
+    assert!(
+        program.contains("line 0\n") && program.contains("line 19999"),
+        "a program's served read is whole"
+    );
+    assert!(program.len() > body.len(), "{}", program.len());
+    assert!(!program.contains("continue:"));
+
+    let model = run(true).await;
+    assert!(model.starts_with("↳ read "), "served: {}", &model[..200]);
+    assert!(model.contains("line 0\n") && !model.contains("line 19999"));
+    assert!(model.contains("continue:"), "the model's page is framed");
+    assert!(model.len() < 60_000, "{}", model.len());
+}
+
 /// The same fixture proves the assertion above has teeth. Anything without a
 /// read equivalent, and any batch holding one, still needs the executor that
 /// does not exist.

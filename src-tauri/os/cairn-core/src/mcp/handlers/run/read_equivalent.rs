@@ -1017,9 +1017,7 @@ pub(super) async fn try_serve_batch(
     };
 
     let options = ReadOptions {
-        budget: view::ReadBudget::FramedContext {
-            frame_bytes: framing_bytes(resolved, targets.len()),
-        },
+        budget: served_read_budget(request, resolved, targets.len()),
         include_bodies: true,
         fence_ask: FenceAsk::Decline,
     };
@@ -1118,6 +1116,23 @@ pub(super) async fn try_serve_batch(
         );
     }
     BatchRoute::Served(stop_after_failure(outcomes, sequential, stop_on_error))
+}
+
+/// The budget a served batch's read composes under: the one `read` itself
+/// would use for this caller ([`read::read_budget_for`]), with a model-facing
+/// read's context budget framed for the run result's own text. A code caller
+/// reads every target whole, as its `read` would.
+fn served_read_budget(
+    request: &McpCallbackRequest,
+    resolved: &[(String, Result<RunSpec, String>)],
+    targets: usize,
+) -> view::ReadBudget {
+    match read::read_budget_for(request) {
+        view::ReadBudget::Context => view::ReadBudget::FramedContext {
+            frame_bytes: framing_bytes(resolved, targets),
+        },
+        budget => budget,
+    }
 }
 
 /// Bytes the run result adds around the read's segments: each item's
@@ -1688,12 +1703,12 @@ mod tests {
         let hit = meta(SegmentKind::Grep, Some(3), Some(1));
         let miss = meta(SegmentKind::Grep, None, Some(0));
         let error = meta(SegmentKind::Error, None, None);
-        assert_eq!(ExitRule::Search.status(&[hit.clone()]), 0);
-        assert_eq!(ExitRule::Search.status(&[miss.clone()]), 1);
+        assert_eq!(ExitRule::Search.status(std::slice::from_ref(&hit)), 0);
+        assert_eq!(ExitRule::Search.status(std::slice::from_ref(&miss)), 1);
         assert_eq!(ExitRule::Search.status(&[miss.clone(), hit.clone()]), 0);
         assert_eq!(ExitRule::Search.status(&[hit.clone(), error.clone()]), 2);
         assert_eq!(ExitRule::Pipeline.status(&[miss.clone(), error.clone()]), 0);
-        assert_eq!(ExitRule::FailsWith(1).status(&[hit.clone()]), 0);
+        assert_eq!(ExitRule::FailsWith(1).status(std::slice::from_ref(&hit)), 0);
         assert_eq!(ExitRule::FailsWith(1).status(&[hit, error]), 1);
     }
 

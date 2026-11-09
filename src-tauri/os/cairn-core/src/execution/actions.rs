@@ -333,23 +333,64 @@ async fn execute_shell_action(
         .map_err(|error| format!("Failed to resolve action run identity: {error}"))?
         .ok_or_else(|| format!("Implementation job {job_id} has no authenticated run identity"))?;
     let residence = crate::scratch::ensure_job_scratch_dir(&job_id, None);
-    let request = crate::mcp::types::McpCallbackRequest {
+    let request = shell_action_request(
+        residence.to_string_lossy().into_owned(),
+        run_id,
+        &command,
+        &config.name,
+        &action_run.id,
+    );
+    let encoded = crate::mcp::handlers::run::handle_run(orch, &request).await;
+    let envelope: cairn_common::read::RunBatchEnvelope = serde_json::from_str(&encoded)
+        .map_err(|error| format!("Action executor returned an invalid result: {error}"))?;
+    shell_action_result(envelope).map(Some)
+}
+
+/// The `run` callback a custom shell action executes as. It carries no
+/// model-facing origin, because its result is stored for code: the next
+/// action's command template and a condition's expression read it whole. The
+/// one reader that hands it to a model, a decision node, bounds it there
+/// (`cairn_workflow::conditions`).
+fn shell_action_request(
+    cwd: String,
+    run_id: String,
+    command: &str,
+    action_name: &str,
+    action_run_id: &str,
+) -> crate::mcp::types::McpCallbackRequest {
+    crate::mcp::types::McpCallbackRequest {
         answer_bound_ms: None,
-        cwd: residence.to_string_lossy().into_owned(),
+        cwd,
         run_id: Some(run_id),
         tool: "run".to_string(),
         payload: serde_json::json!({
             "commands": [{ "command": command }],
             "sequential": true,
-            "commit_msg": format!("action: {}", config.name),
+            "commit_msg": format!("action: {action_name}"),
         }),
-        tool_use_id: Some(format!("action:{}", action_run.id)),
+        tool_use_id: Some(format!("action:{action_run_id}")),
         thread_id: None,
         origin: None,
-    };
-    let encoded = crate::mcp::handlers::run::handle_run(orch, &request).await;
-    let envelope: cairn_common::read::RunBatchEnvelope = serde_json::from_str(&encoded)
-        .map_err(|error| format!("Action executor returned an invalid result: {error}"))?;
+    }
+}
+
+/// A shell action's result from its run batch: the command's whole stdout on
+/// success. A failed command fails the action with the batch text. So does an
+/// output the batch refused for being past the code-facing ceiling, because
+/// the refusal line standing in its place is not the command's output and must
+/// not be recorded, or passed downstream, as if it were.
+fn shell_action_result(
+    envelope: cairn_common::read::RunBatchEnvelope,
+) -> Result<serde_json::Value, String> {
+    if let Some(over) = &envelope.over_ceiling {
+        let bytes = over.items.iter().map(|item| item.bytes).max().unwrap_or(0);
+        return Err(format!(
+            "Action output was not recorded: the command printed {bytes} bytes, past what one \
+             run returns ({} bytes per command, {} per batch). Write large output to a file \
+             and print its path instead.",
+            over.ceiling_bytes, over.batch_ceiling_bytes
+        ));
+    }
     let failure = envelope.text.lines().rev().find_map(|line| {
         line.strip_prefix("Exit code: ")
             .and_then(|code| code.trim().parse::<i32>().ok())
@@ -365,11 +406,11 @@ async fn execute_shell_action(
         return Err(envelope.text);
     }
 
-    Ok(Some(serde_json::json!({
+    Ok(serde_json::json!({
         "stdout": envelope.text.trim(),
         "stderr": "",
         "exit_code": 0
-    })))
+    }))
 }
 
 /// Resolve input values for an action from context edges.
@@ -3813,5 +3854,50 @@ mod tests {
             !crate::jj::is_working_copy_dirty(&jj, &ws_path).unwrap(),
             "the ledger seal leaves the working copy clean"
         );
+    }
+
+    fn run_envelope(
+        text: &str,
+        over_ceiling: Option<cairn_common::read::OverCeiling>,
+    ) -> cairn_common::read::RunBatchEnvelope {
+        cairn_common::read::RunBatchEnvelope {
+            text: text.to_string(),
+            images: vec![],
+            invalid_input: false,
+            data: None,
+            over_ceiling,
+        }
+    }
+
+    /// A shell action's run is composed for code, so an output past the 45k a
+    /// model's context is held to is recorded whole. The decision node that
+    /// hands it to a model bounds it there.
+    #[test]
+    fn a_shell_action_records_its_whole_output() {
+        let request =
+            shell_action_request("/tmp".into(), "run".into(), "make report", "report", "ar");
+        assert!(!request.is_model_facing());
+
+        let stdout = format!("{}the verdict line", "build log line\n".repeat(10_000));
+        let result = shell_action_result(run_envelope(&stdout, None)).unwrap();
+        assert_eq!(result["stdout"], stdout.as_str());
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[test]
+    fn a_shell_action_whose_output_was_refused_fails_instead_of_recording_the_refusal() {
+        let over = cairn_common::read::OverCeiling {
+            ceiling_bytes: 8 << 20,
+            batch_ceiling_bytes: 12 << 20,
+            items: vec![cairn_common::read::OverCeilingItem {
+                index: 0,
+                header: "make report".into(),
+                bytes: 9 << 20,
+            }],
+        };
+        let error =
+            shell_action_result(run_envelope("refused: output too large", Some(over))).unwrap_err();
+        assert!(error.contains(&(9_usize << 20).to_string()), "{error}");
+        assert!(error.contains(&(8_usize << 20).to_string()), "{error}");
     }
 }

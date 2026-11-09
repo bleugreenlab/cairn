@@ -314,4 +314,205 @@ pub struct RunBatchEnvelope {
     /// parsing composed text, and the agent-facing edges ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<serde_json::Value>>,
+    /// The items whose output was too large to return to code, each replaced
+    /// in `text` by a one-line refusal; absent when every item fit. Only a
+    /// batch composed for code (not for a model's context) carries every item
+    /// whole and so can set it; the SDKs raise it as a typed error, and the
+    /// agent-facing edges never see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_ceiling: Option<OverCeiling>,
+}
+
+/// The run items a code-facing batch refused to return (see
+/// [`RunBatchEnvelope::over_ceiling`]): each one's output was past
+/// `ceiling_bytes`, or would have carried the batch past
+/// `batch_ceiling_bytes`, which is measured as the text crosses the wire
+/// ([`crate::executor_protocol::relay_wire_len`]) so the response fits one
+/// executor-link frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverCeiling {
+    pub ceiling_bytes: usize,
+    pub batch_ceiling_bytes: usize,
+    pub items: Vec<OverCeilingItem>,
+}
+
+/// One item refused under [`OverCeiling`]: its position in the batch, its
+/// header, and the size of the output it produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverCeilingItem {
+    pub index: usize,
+    pub header: String,
+    pub bytes: usize,
+}
+
+/// Share of an elided body's budget kept from its head (the opening context: a
+/// command echo, the first lines). The rest keeps the tail, because command
+/// output is read end-first: error summaries, test failures, the last `&&`
+/// segment and exit codes all sit at the end.
+const ELIDED_HEAD_PERCENT: usize = 15;
+
+/// Bytes held back inside a budget for the elision marker, so head, marker and
+/// tail together never exceed it.
+const ELISION_MARKER_RESERVE: usize = 96;
+
+/// `body` cut to at most `budget` bytes for a model's context: a short head and
+/// a long tail, with a `--- elided N lines / M chars; tail kept below ---`
+/// marker between them stating what was dropped. A body within budget comes
+/// back unchanged. The tail runs to the body's byte-exact end, so a trailing
+/// note survives, and starts on a whole line, so it never opens on a fragment
+/// that reads as corrupted output; the skipped partial line counts in the
+/// marker. This is the one elision a model sees for text that code receives
+/// whole: a capped `run` item, and a decision node's input.
+pub fn elide_tail_biased(body: &str, budget: usize) -> String {
+    if body.len() <= budget {
+        return body.to_string();
+    }
+    let content_budget = budget.saturating_sub(ELISION_MARKER_RESERVE);
+    let head_budget = content_budget * ELIDED_HEAD_PERCENT / 100;
+    let tail_budget = content_budget.saturating_sub(head_budget);
+
+    // Head: snap down to a line boundary for a clean cut (only ever shrinks it).
+    let head_end = floor_char_boundary(body, head_budget);
+    let head_end = body[..head_end]
+        .rfind('\n')
+        .map(|i| i + 1)
+        .unwrap_or(head_end);
+
+    // Tail: the last `tail_budget` bytes, snapped up to a char boundary. The end
+    // of the body is always retained, so a trailing note survives.
+    let raw_tail_start = body.len().saturating_sub(tail_budget);
+    let mut tail_start = ceil_char_boundary(body, raw_tail_start).max(head_end);
+
+    // Advance the tail start to the next line boundary so the tail begins on a
+    // whole line. Only advance when a newline leaves real content after it;
+    // otherwise the byte-exact end (and any trailing note riding it) would be
+    // elided. The skipped partial line folds into the elided span below,
+    // keeping the marker count accurate.
+    if tail_start > head_end {
+        if let Some(rel) = body[tail_start..].find('\n') {
+            let line_start = tail_start + rel + 1;
+            if line_start < body.len() {
+                tail_start = line_start;
+            }
+        }
+    }
+
+    let elided = &body[head_end..tail_start];
+    let elided_chars = elided.len();
+    let elided_lines = elided.matches('\n').count();
+    let head = &body[..head_end];
+    let tail = &body[tail_start..];
+    let head_sep = if head.is_empty() || head.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!(
+        "{head}{head_sep}--- elided {elided_lines} lines / {elided_chars} chars; tail kept below ---\n{tail}"
+    )
+}
+
+/// Largest byte index `<= idx` that is a UTF-8 char boundary.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Smallest byte index `>= idx` that is a UTF-8 char boundary.
+fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A trailing detached-terminal note rides in the tail and is never elided.
+    #[test]
+    fn elision_preserves_a_trailing_note() {
+        let note = "Command still running; detached to \
+            cairn://p/cairn/1632/1/builder/terminal/run-1 — readable and killable there.";
+        let body = format!("{}\n\n{}", "p".repeat(50_000), note);
+        let capped = elide_tail_biased(&body, 4_000);
+        assert!(capped.len() <= 4_000);
+        assert!(
+            capped.ends_with(note),
+            "the trailing note must survive the cap"
+        );
+        assert!(capped.contains("--- elided"));
+    }
+
+    // The elision marker reports the actual dropped span.
+    #[test]
+    fn elision_counts_are_accurate() {
+        let body = (0..1_000)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = elide_tail_biased(&body, 2_000);
+        // Parse "--- elided N lines / M chars; ..."
+        let marker = capped
+            .lines()
+            .find(|l| l.starts_with("--- elided"))
+            .expect("marker present");
+        let chars: usize = marker
+            .split("/ ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .expect("char count parses");
+        // Reconstructed length: head + tail + elided chars == original length.
+        let head_tail: usize = capped
+            .lines()
+            .filter(|l| !l.starts_with("--- elided"))
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            .saturating_sub(1);
+        // Within a few bytes of the original (newline accounting around the marker).
+        let reconstructed = head_tail + chars;
+        assert!(
+            reconstructed.abs_diff(body.len()) <= 4,
+            "reconstructed {reconstructed} vs original {}",
+            body.len()
+        );
+    }
+
+    // The retained tail begins on a whole source line, never a mid-line
+    // fragment that would read as corrupted output (e.g. `94548` for `194548`).
+    #[test]
+    fn elision_starts_the_tail_on_a_complete_line() {
+        // Variable-width lines: a byte-exact tail start would land mid-line and
+        // surface a partial number; the snap-to-line must avoid that.
+        let lines: Vec<String> = (0..4_000)
+            .map(|i| format!("{}-entry", 90_000 + i * 7))
+            .collect();
+        let body = lines.join("\n");
+        let capped = elide_tail_biased(&body, 2_000);
+        let tail = capped
+            .split_once("tail kept below ---\n")
+            .map(|(_, t)| t)
+            .expect("elision marker present");
+        let first_tail_line = tail.lines().next().expect("a tail line");
+        assert!(
+            lines.iter().any(|l| l == first_tail_line),
+            "first tail line {first_tail_line:?} is not a complete source line"
+        );
+    }
+
+    // Multibyte content is sliced on char boundaries (no panic).
+    #[test]
+    fn elision_is_multibyte_boundary_safe() {
+        let body = "é".repeat(40_000); // 2 bytes each → 80_000 bytes
+        let capped = elide_tail_biased(&body, 5_000);
+        assert!(capped.len() <= 5_000);
+        assert!(capped.contains("--- elided"));
+    }
 }

@@ -812,6 +812,7 @@ mod tests {
             images: vec![cairn_common::read::ImageBlock::inline("image/png", "b64")],
             invalid_input: false,
             data: None,
+            over_ceiling: None,
         };
         let serialized = serde_json::to_string(&envelope).unwrap();
         let parsed: RunBatchEnvelope = serde_json::from_str(&serialized).unwrap();

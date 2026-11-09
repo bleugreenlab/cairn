@@ -237,7 +237,7 @@ async fn evaluate_decision_node(
         node_id: node.id.clone(),
         node_name: node.name.clone(),
         decision: definition.clone(),
-        input: crate::condition::serialize_context_for_ai(context),
+        input: decision_input(context),
     };
     let decision = match host.decide(request).await {
         Ok(decision) => decision,
@@ -261,6 +261,43 @@ async fn evaluate_decision_node(
             reason,
             decision: Some(decision),
         },
+    }
+}
+
+/// The text a decision node's model is asked about. It lands in a model's
+/// prompt, so every string in the gathered context is held to the ceiling an
+/// agent's tool result is held to, cut with the elision a model sees on any
+/// capped `run` output. Upstream text the engine keeps whole for code (a custom
+/// shell action's stdout, an artifact's body) thus reaches the model no larger
+/// than an agent's own `run` would show it, while the context a condition's
+/// expression reads, and every record it came from, stay whole. Each string is
+/// cut before serializing, so the cut falls on the text's own lines rather than
+/// inside the one JSON line that quotes it.
+fn decision_input(context: &serde_json::Value) -> String {
+    let mut bounded = context.clone();
+    bound_strings(
+        &mut bounded,
+        crate::storage::render::CLIENT_TOOL_RESULT_BYTE_CEILING,
+    );
+    crate::condition::serialize_context_for_ai(&bounded)
+}
+
+fn bound_strings(value: &mut serde_json::Value, budget: usize) {
+    match value {
+        serde_json::Value::String(text) if text.len() > budget => {
+            *text = cairn_common::read::elide_tail_biased(text, budget);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                bound_strings(item, budget);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for field in fields.values_mut() {
+                bound_strings(field, budget);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -2,26 +2,76 @@
 //! envelope, and the streamable-`tail` pipeline transform.
 
 use super::types::ItemOutcome;
-use cairn_common::read::{ImageBlock, RunBatchEnvelope};
+use crate::mcp::handlers::read::view;
+use crate::mcp::types::McpCallbackRequest;
+use cairn_common::executor_protocol::{relay_wire_len, RELAY_RESPONSE_BYTE_BUDGET};
+use cairn_common::read::{
+    elide_tail_biased, ImageBlock, OverCeiling, OverCeilingItem, RunBatchEnvelope,
+};
 
-/// Max chars the capped items of a composed batch result share: command output
-/// is read end-first, and this keeps it below the size at which an agent CLI
-/// moves a tool result out of the conversation. An item carried whole
-/// ([`ItemOutcome::whole`], a model door's reply) is outside it, so a batch
-/// holding one can compose past it; the agent-facing edges pass the text
-/// through untouched either way.
-const MAX_RUN_RESULT_CHARS: usize = 45_000;
+/// What a batch composed for code may carry in total, measured as its item
+/// bodies cost on the wire ([`relay_wire_len`]). A script's call usually
+/// reaches the host through an executor's relay, whose response crosses the
+/// link as one frame, so a batch is bounded below [`RELAY_RESPONSE_BYTE_BUDGET`]
+/// with room left for item headers, refusal lines, a model door's `data`,
+/// images, and reminders.
+const WHOLE_RUN_BATCH_WIRE_BYTES: usize = 12 << 20;
+const _: () = assert!(WHOLE_RUN_BATCH_WIRE_BYTES < RELAY_RESPONSE_BYTE_BUDGET);
 
-/// Percent of an item's char budget reserved for the head (leading context: the
-/// command echo and opening lines). The remainder holds the tail. Command output
-/// is read end-first — error summaries, test failures, the last `&&` segment, and
-/// exit codes all live at the end — so the per-item cap is tail-biased.
-const ITEM_HEAD_PERCENT: usize = 15;
+/// Max bytes the capped items of a batch composed for a model's context
+/// ([`RunOutputBudget::Context`]) share: command output is read end-first, and
+/// this keeps it below the size at which an agent CLI moves a tool result out
+/// of the conversation. An item carried whole ([`ItemOutcome::whole`], a model
+/// door's reply) is outside it, so a batch holding one can compose past it; the
+/// agent-facing edges pass the text through untouched either way. A batch
+/// composed for code never applies it.
+const MAX_RUN_RESULT_BYTES: usize = 45_000;
 
-/// Bytes reserved inside a per-item budget for the elision marker, so a capped
-/// body (head + marker + tail) never exceeds its budget. This is what keeps the
-/// composed batch within `MAX_RUN_RESULT_CHARS`, so the CLI passes it untouched.
-const ELISION_MARKER_RESERVE: usize = 96;
+/// How much of each item a composed batch result may carry, chosen by whoever
+/// the result is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunOutputBudget {
+    /// The result lands in a model's context: the capped items share
+    /// [`MAX_RUN_RESULT_BYTES`], each tail-biased within its share.
+    Context,
+    /// The result lands in code that parses it: every item is carried whole,
+    /// and one whose output is past `byte_ceiling`, or that would carry the
+    /// batch's wire cost past `batch_wire_ceiling`, is refused by type
+    /// ([`ComposedRun::over_ceiling`]) rather than cut.
+    Whole {
+        byte_ceiling: usize,
+        batch_wire_ceiling: usize,
+    },
+}
+
+/// The budget a `run` batch's output composes under. The 45k cap exists to
+/// keep a batch result from flooding a model's context, so only a call a
+/// model-facing edge stamped (the MCP tools, the HTTP-loop backend) composes
+/// under it. Every other caller hands the text to code that parses it: an
+/// `@cairn/sdk` script, a service's `ctx.cairn`, a `@cairn/harness` workflow,
+/// a custom shell action. Those receive every item whole, up to
+/// [`view::WHOLE_READ_BYTE_CEILING`] per item and [`WHOLE_RUN_BATCH_WIRE_BYTES`]
+/// for the batch. An agent that runs one of them
+/// inside its own `run` still sees only what that outer batch's cap lets
+/// through, so the guard sits where text enters a model's context.
+pub(super) fn run_budget_for(request: &McpCallbackRequest) -> RunOutputBudget {
+    if request.is_model_facing() {
+        RunOutputBudget::Context
+    } else {
+        RunOutputBudget::Whole {
+            byte_ceiling: view::WHOLE_READ_BYTE_CEILING,
+            batch_wire_ceiling: WHOLE_RUN_BATCH_WIRE_BYTES,
+        }
+    }
+}
+
+/// A composed batch result: its text, and under [`RunOutputBudget::Whole`] the
+/// items refused for being past the ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ComposedRun {
+    pub(super) text: String,
+    pub(super) over_ceiling: Option<OverCeiling>,
+}
 
 /// Smallest per-item body budget worth showing. Below this an item is omitted
 /// whole (the last-resort path) rather than reduced to a useless sliver. Sized
@@ -33,92 +83,32 @@ const MIN_ITEM_BODY_BUDGET: usize = 512;
 /// inter-segment separators, so the composed result stays under the cap.
 const OMISSION_NOTE_RESERVE: usize = 256;
 
-/// Largest byte index `<= idx` that is a UTF-8 char boundary.
-fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
-}
-
-/// Smallest byte index `>= idx` that is a UTF-8 char boundary.
-fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    idx
-}
-
-/// Tail-biased head+tail cap for one command body. Keeps a small head (~15%, the
-/// command's opening context) and a large tail (~85%, the signal), with an
-/// elision marker between stating how many lines and chars were dropped. The tail
-/// extends to the byte-exact end of the body, so a trailing note — e.g. the
-/// detached-terminal pointer a promoted item appends — is always retained as long
-/// as the item clears `MIN_ITEM_BODY_BUDGET`. Its start is snapped forward to the
-/// next line boundary so the displayed tail begins on a whole line rather than a
-/// mid-line fragment (which reads as corrupted output); the skipped partial line
-/// folds into the elision count. The result never exceeds `budget`.
-fn cap_item_body_tail_biased(body: &str, budget: usize) -> String {
-    if body.len() <= budget {
-        return body.to_string();
-    }
-    let content_budget = budget.saturating_sub(ELISION_MARKER_RESERVE);
-    let head_budget = content_budget * ITEM_HEAD_PERCENT / 100;
-    let tail_budget = content_budget.saturating_sub(head_budget);
-
-    // Head: snap down to a line boundary for a clean cut (only ever shrinks it).
-    let head_end = floor_char_boundary(body, head_budget);
-    let head_end = body[..head_end]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(head_end);
-
-    // Tail: the last `tail_budget` bytes, snapped up to a char boundary. The end
-    // of the body is always retained, so a trailing note survives.
-    let raw_tail_start = body.len().saturating_sub(tail_budget);
-    let mut tail_start = ceil_char_boundary(body, raw_tail_start).max(head_end);
-
-    // Advance the tail start to the next line boundary so the displayed tail
-    // begins on a whole line, not a mid-line fragment. Only advance when a
-    // newline leaves real content after it — otherwise the byte-exact end (and
-    // any trailing note riding it) would be elided. The skipped partial line
-    // folds into the elided span below, keeping the marker count accurate.
-    if tail_start > head_end {
-        if let Some(rel) = body[tail_start..].find('\n') {
-            let line_start = tail_start + rel + 1;
-            if line_start < body.len() {
-                tail_start = line_start;
-            }
-        }
-    }
-
-    let elided = &body[head_end..tail_start];
-    let elided_chars = elided.len();
-    let elided_lines = elided.matches('\n').count();
-    let head = &body[..head_end];
-    let tail = &body[tail_start..];
-    let head_sep = if head.is_empty() || head.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    format!(
-        "{head}{head_sep}--- elided {elided_lines} lines / {elided_chars} chars; tail kept below ---\n{tail}"
-    )
-}
-
 /// Render one item's body block (no header): tail-capped to `body_budget`
 /// unless the item is carried whole, with an empty body shown as `(no output)`.
 fn render_item_body(outcome: &ItemOutcome, body_budget: usize) -> String {
+    if outcome.whole || outcome.body.is_empty() {
+        whole_item_body(outcome)
+    } else {
+        elide_tail_biased(&outcome.body, body_budget)
+    }
+}
+
+/// One item's full body block (no header), `(no output)` when empty.
+fn whole_item_body(outcome: &ItemOutcome) -> String {
     if outcome.body.is_empty() {
         "(no output)".to_string()
-    } else if outcome.whole {
-        outcome.body.clone()
     } else {
-        cap_item_body_tail_biased(&outcome.body, body_budget)
+        outcome.body.clone()
+    }
+}
+
+/// `bytes` as a ceiling is stated: whole MiB when it is one, else bytes.
+fn ceiling_label(bytes: usize) -> String {
+    const MIB: usize = 1 << 20;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -150,20 +140,23 @@ fn water_fill_budgets(natural: &[usize], total: usize) -> Vec<usize> {
 /// Serializing a struct of string/array fields does not fail in practice; the
 /// fallback returns the bare text so a run never errors on rendering.
 pub(super) fn run_envelope(text: String, images: Vec<ImageBlock>) -> String {
-    run_envelope_with_data(text, images, None)
+    run_envelope_with_data(text, images, None, None)
 }
 
-/// [`run_envelope`] carrying each item's typed result ([`collect_run_data`]).
+/// [`run_envelope`] carrying each item's typed result ([`collect_run_data`])
+/// and the items refused past the code-facing ceiling ([`ComposedRun`]).
 pub(super) fn run_envelope_with_data(
     text: String,
     images: Vec<ImageBlock>,
     data: Option<Vec<serde_json::Value>>,
+    over_ceiling: Option<OverCeiling>,
 ) -> String {
     encode_envelope(RunBatchEnvelope {
         text,
         images,
         data,
         invalid_input: false,
+        over_ceiling,
     })
 }
 
@@ -175,6 +168,7 @@ pub(super) fn run_input_refusal(text: String) -> String {
         images: Vec::new(),
         invalid_input: true,
         data: None,
+        over_ceiling: None,
     })
 }
 
@@ -201,9 +195,94 @@ pub(super) fn collect_run_data(outcomes: &mut [ItemOutcome]) -> Option<Vec<serde
     )
 }
 
-/// Compose per-item outcomes into a single result string. A single item returns
-/// its (tail-capped) body directly with no header. Multiple items are labeled
-/// `=== <header> ===` in input order; `MAX_RUN_RESULT_CHARS` is divided fairly
+/// Compose per-item outcomes into a single result under `budget`, which the
+/// caller chooses for who the result is for ([`run_budget_for`]). It is never
+/// read from the payload: a result's audience is a fact about the caller, not
+/// a request a caller may make.
+///
+/// A single item renders its body directly with no header; several are
+/// labeled `=== <header> ===` in input order, under either budget.
+pub(super) fn compose_run_output(outcomes: &[ItemOutcome], budget: RunOutputBudget) -> ComposedRun {
+    match budget {
+        RunOutputBudget::Context => ComposedRun {
+            text: compose_for_context(outcomes),
+            over_ceiling: None,
+        },
+        RunOutputBudget::Whole {
+            byte_ceiling,
+            batch_wire_ceiling,
+        } => compose_whole(outcomes, byte_ceiling, batch_wire_ceiling),
+    }
+}
+
+/// [`RunOutputBudget::Whole`]: every item rendered in full, never water-filled,
+/// elided, or omitted. An item past `byte_ceiling` is replaced by a one-line
+/// refusal and listed in [`ComposedRun::over_ceiling`], so a script fails by
+/// type rather than parsing cut text. An item already carried whole is outside
+/// the per-item ceiling, as it is outside the context cap: a served read was
+/// bounded by read itself, and a model door's reply is data.
+///
+/// Every item, whole ones included, counts toward `batch_wire_ceiling` in
+/// input order. An item that would carry the batch past it is refused the same
+/// way, so a batch's response always fits the executor link's frame and the
+/// caller gets a typed refusal instead of a dropped link.
+fn compose_whole(
+    outcomes: &[ItemOutcome],
+    byte_ceiling: usize,
+    batch_wire_ceiling: usize,
+) -> ComposedRun {
+    let mut refused: Vec<OverCeilingItem> = Vec::new();
+    let mut wire_spent = 0usize;
+    let bodies: Vec<String> = outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            let bytes = outcome.body.len();
+            let refusal = if !outcome.whole && bytes > byte_ceiling {
+                format!(
+                    "`{}`: output of {bytes} bytes exceeds the {} ceiling for a result returned to code; write it to a file and read that instead.",
+                    outcome.header,
+                    ceiling_label(byte_ceiling),
+                )
+            } else {
+                let wire = relay_wire_len(&outcome.body);
+                if wire_spent + wire <= batch_wire_ceiling {
+                    wire_spent += wire;
+                    return whole_item_body(outcome);
+                }
+                format!(
+                    "`{}`: output of {bytes} bytes would carry this batch past the {} a result returned to code may hold, measured as it crosses the wire; write it to a file and read that instead.",
+                    outcome.header,
+                    ceiling_label(batch_wire_ceiling),
+                )
+            };
+            refused.push(OverCeilingItem {
+                index,
+                header: outcome.header.clone(),
+                bytes,
+            });
+            refusal
+        })
+        .collect();
+    let text = if outcomes.len() == 1 {
+        bodies.into_iter().next().unwrap_or_default()
+    } else {
+        outcomes
+            .iter()
+            .zip(bodies)
+            .map(|(outcome, body)| format!("=== {} ===\n{body}", outcome.header))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let over_ceiling = (!refused.is_empty()).then_some(OverCeiling {
+        ceiling_bytes: byte_ceiling,
+        batch_ceiling_bytes: batch_wire_ceiling,
+        items: refused,
+    });
+    ComposedRun { text, over_ceiling }
+}
+
+/// [`RunOutputBudget::Context`]: `MAX_RUN_RESULT_BYTES` is divided fairly
 /// across the capped items (water-filling) and each one's body is tail-capped
 /// within its share, so every item surfaces meaningful output. Whole-item
 /// omission, with a named note, remains only as a last resort for pathological
@@ -211,10 +290,10 @@ pub(super) fn collect_run_data(outcomes: &mut [ItemOutcome]) -> Option<Vec<serde
 ///
 /// An item carried whole ([`ItemOutcome::whole`]) is never capped, shared, or
 /// omitted: it renders its full body and takes nothing from the other items'
-/// budget. Without one, the composed result stays under `MAX_RUN_RESULT_CHARS`.
-pub(super) fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
+/// budget. Without one, the composed result stays under `MAX_RUN_RESULT_BYTES`.
+fn compose_for_context(outcomes: &[ItemOutcome]) -> String {
     if outcomes.len() == 1 {
-        return render_item_body(&outcomes[0], MAX_RUN_RESULT_CHARS);
+        return render_item_body(&outcomes[0], MAX_RUN_RESULT_BYTES);
     }
 
     let headers: Vec<String> = outcomes
@@ -237,7 +316,7 @@ pub(super) fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
         })
         .collect();
 
-    let total_budget = MAX_RUN_RESULT_CHARS.saturating_sub(OMISSION_NOTE_RESERVE);
+    let total_budget = MAX_RUN_RESULT_BYTES.saturating_sub(OMISSION_NOTE_RESERVE);
     let capped: Vec<usize> = (0..outcomes.len())
         .filter(|&i| !outcomes[i].whole)
         .collect();
@@ -278,7 +357,7 @@ pub(super) fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
             "--- {} of {} items omitted (batch {}K char cap); re-run each scoped (grep/tail the command) or open a terminal resource: {} ---",
             omitted.len(),
             outcomes.len(),
-            MAX_RUN_RESULT_CHARS / 1000,
+            MAX_RUN_RESULT_BYTES / 1000,
             omitted.join(", "),
         ));
     }
@@ -653,6 +732,13 @@ fn parse_line_count(value: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// The batch as a model-facing caller receives it.
+    fn context(outcomes: &[ItemOutcome]) -> String {
+        let composed = compose_run_output(outcomes, RunOutputBudget::Context);
+        assert_eq!(composed.over_ceiling, None);
+        composed.text
+    }
+
     fn outcome(header: &str, body: &str, succeeded: bool) -> ItemOutcome {
         ItemOutcome {
             header: header.to_string(),
@@ -712,13 +798,13 @@ mod tests {
     #[test]
     fn compose_single_returns_body_without_header() {
         let outcomes = vec![outcome("echo hi", "hi", true)];
-        assert_eq!(compose_run_output(&outcomes), "hi");
+        assert_eq!(context(&outcomes), "hi");
     }
 
     #[test]
     fn compose_single_empty_body_is_no_output() {
         let outcomes = vec![outcome("true", "", true)];
-        assert_eq!(compose_run_output(&outcomes), "(no output)");
+        assert_eq!(context(&outcomes), "(no output)");
     }
 
     #[test]
@@ -727,7 +813,7 @@ mod tests {
             outcome("cmd a", "alpha", true),
             outcome("cmd b", "beta", true),
         ];
-        let text = compose_run_output(&outcomes);
+        let text = context(&outcomes);
         let ia = text.find("=== cmd a ===").unwrap();
         let ialpha = text.find("alpha").unwrap();
         let ib = text.find("=== cmd b ===").unwrap();
@@ -740,7 +826,7 @@ mod tests {
     #[test]
     fn compose_multi_inlines_empty_body_as_no_output() {
         let outcomes = vec![outcome("a", "", false), outcome("b", "out", true)];
-        let text = compose_run_output(&outcomes);
+        let text = context(&outcomes);
         assert!(text.contains("=== a ===\n(no output)"));
         assert!(text.contains("=== b ===\nout"));
     }
@@ -755,7 +841,7 @@ mod tests {
             outcome("git diff --stat", "1 file changed", true),
             outcome("git diff", &huge, true),
         ];
-        let text = compose_run_output(&outcomes);
+        let text = context(&outcomes);
         // First (small) item surfaces whole.
         assert!(text.contains("=== git diff --stat ===\n1 file changed"));
         // Second (huge) item surfaces, tail-biased with an elision marker, and its
@@ -765,7 +851,7 @@ mod tests {
         assert!(text.contains("TAIL-OF-DIFF"));
         // Nothing is omitted, and the result stays within the cap.
         assert!(!text.contains("items omitted"));
-        assert!(text.len() <= MAX_RUN_RESULT_CHARS);
+        assert!(text.len() <= MAX_RUN_RESULT_BYTES);
     }
 
     // A 3-item batch where item 1 floods the output still shows items 2 and 3.
@@ -777,12 +863,12 @@ mod tests {
             outcome("item-two", "SECOND-OUTPUT", true),
             outcome("item-three", "THIRD-OUTPUT", true),
         ];
-        let text = compose_run_output(&outcomes);
+        let text = context(&outcomes);
         assert!(text.contains("=== item-two ===\nSECOND-OUTPUT"));
         assert!(text.contains("=== item-three ===\nTHIRD-OUTPUT"));
         assert!(text.contains("--- elided"));
         assert!(!text.contains("items omitted"));
-        assert!(text.len() <= MAX_RUN_RESULT_CHARS);
+        assert!(text.len() <= MAX_RUN_RESULT_BYTES);
     }
 
     // Single-item path is tail-biased: a body that exceeds the cap keeps a head
@@ -791,13 +877,13 @@ mod tests {
     fn compose_single_tail_biased_keeps_head_and_tail() {
         let body = format!(
             "HEAD-SENTINEL\n{}\nTAIL-SENTINEL",
-            "m".repeat(MAX_RUN_RESULT_CHARS * 2)
+            "m".repeat(MAX_RUN_RESULT_BYTES * 2)
         );
-        let text = compose_run_output(&[outcome("big", &body, true)]);
+        let text = context(&[outcome("big", &body, true)]);
         assert!(text.starts_with("HEAD-SENTINEL"));
         assert!(text.ends_with("TAIL-SENTINEL"));
         assert!(text.contains("--- elided"));
-        assert!(text.len() <= MAX_RUN_RESULT_CHARS);
+        assert!(text.len() <= MAX_RUN_RESULT_BYTES);
     }
 
     fn whole(header: &str, body: &str) -> ItemOutcome {
@@ -812,18 +898,18 @@ mod tests {
     #[test]
     fn compose_single_whole_item_is_never_capped() {
         let body = format!("[{}]", vec!["0.0123456789"; 20_000].join(","));
-        assert!(body.len() > MAX_RUN_RESULT_CHARS * 4);
-        assert_eq!(compose_run_output(&[whole("embed", &body)]), body);
+        assert!(body.len() > MAX_RUN_RESULT_BYTES * 4);
+        assert_eq!(context(&[whole("embed", &body)]), body);
     }
 
     // Beside capped items, a whole item renders in full and takes nothing from
     // their shared budget, so they cap exactly as they would without it.
     #[test]
     fn compose_multi_whole_item_renders_in_full_outside_the_shared_budget() {
-        let reply = "7".repeat(MAX_RUN_RESULT_CHARS * 2);
+        let reply = "7".repeat(MAX_RUN_RESULT_BYTES * 2);
         let flood = format!("HEAD\n{}\nTAIL", "f".repeat(100_000));
-        let alone = compose_run_output(&[outcome("flood", &flood, true), outcome("b", "B", true)]);
-        let text = compose_run_output(&[
+        let alone = context(&[outcome("flood", &flood, true), outcome("b", "B", true)]);
+        let text = context(&[
             outcome("flood", &flood, true),
             whole("cairn://models/embed", &reply),
             outcome("b", "B", true),
@@ -834,87 +920,6 @@ mod tests {
         assert_eq!(without_reply, alone);
     }
 
-    // A trailing detached-terminal note rides in the tail and is never elided.
-    #[test]
-    fn cap_item_body_preserves_trailing_promoted_note() {
-        let note = "Command still running; detached to \
-            cairn://p/cairn/1632/1/builder/terminal/run-1 — readable and killable there.";
-        let body = format!("{}\n\n{}", "p".repeat(50_000), note);
-        let capped = cap_item_body_tail_biased(&body, 4_000);
-        assert!(capped.len() <= 4_000);
-        assert!(capped.ends_with(note), "promoted note must survive the cap");
-        assert!(capped.contains("--- elided"));
-    }
-
-    // The elision marker reports the actual dropped span.
-    #[test]
-    fn cap_item_body_elision_counts_are_accurate() {
-        let body = (0..1_000)
-            .map(|i| format!("line-{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let budget = 2_000;
-        let capped = cap_item_body_tail_biased(&body, budget);
-        // Parse "--- elided N lines / M chars; ..."
-        let marker = capped
-            .lines()
-            .find(|l| l.starts_with("--- elided"))
-            .expect("marker present");
-        let chars: usize = marker
-            .split("/ ")
-            .nth(1)
-            .and_then(|s| s.split(' ').next())
-            .and_then(|s| s.parse().ok())
-            .expect("char count parses");
-        // Reconstructed length: head + tail + elided chars == original length.
-        let head_tail: usize = capped
-            .lines()
-            .filter(|l| !l.starts_with("--- elided"))
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-            .saturating_sub(1);
-        // Within a few bytes of the original (newline accounting around the marker).
-        let reconstructed = head_tail + chars;
-        assert!(
-            reconstructed.abs_diff(body.len()) <= 4,
-            "reconstructed {reconstructed} vs original {}",
-            body.len()
-        );
-    }
-
-    // The retained tail begins on a whole source line, never a mid-line
-    // fragment that would read as corrupted output (e.g. `94548` for `194548`).
-    #[test]
-    fn cap_item_body_first_tail_line_is_complete() {
-        // Variable-width lines: a byte-exact tail start would land mid-line and
-        // surface a partial number; the snap-to-line fix must avoid that.
-        let lines: Vec<String> = (0..4_000)
-            .map(|i| format!("{}-entry", 90_000 + i * 7))
-            .collect();
-        let body = lines.join("\n");
-        let capped = cap_item_body_tail_biased(&body, 2_000);
-        let tail = capped
-            .split_once("tail kept below ---\n")
-            .map(|(_, t)| t)
-            .expect("elision marker present");
-        let first_tail_line = tail.lines().next().expect("a tail line");
-        assert!(
-            lines.iter().any(|l| l == first_tail_line),
-            "first tail line {first_tail_line:?} is not a complete source line"
-        );
-    }
-
-    // Multibyte content is sliced on char boundaries (no panic).
-    #[test]
-    fn cap_item_body_multibyte_boundary_safe() {
-        let body = "é".repeat(40_000); // 2 bytes each → 80_000 bytes
-        let capped = cap_item_body_tail_biased(&body, 5_000);
-        assert!(capped.len() <= 5_000);
-        assert!(capped.contains("--- elided"));
-        // Round-trips as valid UTF-8 by construction (String), nothing to assert
-        // beyond the absence of a panic above.
-    }
-
     // Pathological item counts fall back to whole-item omission, with advice to
     // re-run scoped or use a terminal — never an offset-continuation footer.
     #[test]
@@ -923,11 +928,11 @@ mod tests {
         let outcomes: Vec<ItemOutcome> = (0..400)
             .map(|i| outcome(&format!("cmd-{i}"), &big, true))
             .collect();
-        let text = compose_run_output(&outcomes);
+        let text = context(&outcomes);
         assert!(text.contains("items omitted"));
         assert!(text.contains("re-run each scoped"));
         assert!(!text.contains("Call again with offset"));
-        assert!(text.len() <= MAX_RUN_RESULT_CHARS);
+        assert!(text.len() <= MAX_RUN_RESULT_BYTES);
     }
 
     // The composed result never exceeds the batch cap, even when every item floods.
@@ -937,8 +942,8 @@ mod tests {
         let outcomes: Vec<ItemOutcome> = (0..8)
             .map(|i| outcome(&format!("c{i}"), &flood, true))
             .collect();
-        let text = compose_run_output(&outcomes);
-        assert!(text.len() <= MAX_RUN_RESULT_CHARS);
+        let text = context(&outcomes);
+        assert!(text.len() <= MAX_RUN_RESULT_BYTES);
     }
 
     // Water-filling: small items keep their full size; the large item absorbs the
@@ -955,6 +960,165 @@ mod tests {
             alloc[2]
         );
         assert!(alloc.iter().sum::<usize>() <= 45_000);
+    }
+
+    fn for_code(outcomes: &[ItemOutcome]) -> ComposedRun {
+        compose_run_output(
+            outcomes,
+            RunOutputBudget::Whole {
+                byte_ceiling: view::WHOLE_READ_BYTE_CEILING,
+                batch_wire_ceiling: WHOLE_RUN_BATCH_WIRE_BYTES,
+            },
+        )
+    }
+
+    // A script parses what it receives, so a body past the context cap
+    // arrives byte for byte rather than head-and-tail with an elision marker.
+    #[test]
+    fn whole_budget_carries_a_body_past_the_context_cap_unelided() {
+        let body = format!("{{\"rows\":[{}]}}", vec!["\"r\""; 15_000].join(","));
+        assert!(body.len() > 60_000);
+        let composed = for_code(&[outcome("cairn://mcp/cairn-bugs/list_reports", &body, true)]);
+        assert_eq!(composed.text, body);
+        assert_eq!(composed.over_ceiling, None);
+        assert!(context(&[outcome("x", &body, true)]).contains("--- elided"));
+    }
+
+    #[test]
+    fn whole_budget_never_water_fills_or_omits_items() {
+        let flood = "f".repeat(20_000);
+        let outcomes: Vec<ItemOutcome> = (0..8)
+            .map(|i| outcome(&format!("c{i}"), &flood, true))
+            .chain([outcome("empty", "", true)])
+            .collect();
+        let composed = for_code(&outcomes);
+        assert!(composed.text.len() > MAX_RUN_RESULT_BYTES);
+        for i in 0..8 {
+            assert!(composed.text.contains(&format!("=== c{i} ===\n{flood}")));
+        }
+        assert!(composed.text.ends_with("=== empty ===\n(no output)"));
+        assert!(!composed.text.contains("--- elided"));
+        assert!(!composed.text.contains("items omitted"));
+        assert_eq!(composed.over_ceiling, None);
+    }
+
+    // Past the ceiling an item is refused by type, not cut, and the batch's
+    // other items still arrive whole beside the refusal.
+    #[test]
+    fn whole_budget_refuses_an_item_past_the_ceiling_by_type() {
+        let outcomes = vec![
+            outcome("small", "S", true),
+            outcome("huge", &"h".repeat(2_048), true),
+            whole("cairn://models/embed", &"7".repeat(4_096)),
+        ];
+        let composed = compose_run_output(
+            &outcomes,
+            RunOutputBudget::Whole {
+                byte_ceiling: 1_024,
+                batch_wire_ceiling: 1 << 20,
+            },
+        );
+        assert_eq!(
+            composed.over_ceiling,
+            Some(OverCeiling {
+                ceiling_bytes: 1_024,
+                batch_ceiling_bytes: 1 << 20,
+                items: vec![OverCeilingItem {
+                    index: 1,
+                    header: "huge".to_string(),
+                    bytes: 2_048,
+                }],
+            })
+        );
+        assert!(composed.text.contains("=== small ===\nS\n"));
+        assert!(composed.text.contains(
+            "=== huge ===\n`huge`: output of 2048 bytes exceeds the 1024 bytes ceiling for a result returned to code"
+        ));
+        assert!(!composed.text.contains(&"h".repeat(2_048)));
+        // A model door's reply is carried whole, outside the ceiling.
+        assert!(composed.text.ends_with(&"7".repeat(4_096)));
+    }
+
+    // Items that each fit can still add up past what one response frame
+    // carries; the batch budget refuses the ones that would, counting each
+    // body as it costs on the wire, and later items that fit still arrive.
+    #[test]
+    fn whole_budget_refuses_items_that_would_carry_the_batch_past_its_wire_budget() {
+        let outcomes = vec![
+            outcome("a", &"a".repeat(900), true),
+            outcome("b", &"b".repeat(900), true),
+            outcome("c", &"c".repeat(900), true),
+            // 100 bytes raw, 400 once escaped twice into the frame.
+            outcome("quotes", &"\"".repeat(100), true),
+            whole("cairn://models/embed", &"7".repeat(300)),
+            outcome("tiny", "t", true),
+        ];
+        let composed = compose_run_output(
+            &outcomes,
+            RunOutputBudget::Whole {
+                byte_ceiling: 1_024,
+                batch_wire_ceiling: 2_048,
+            },
+        );
+        let refused = |index: usize, header: &str, bytes: usize| OverCeilingItem {
+            index,
+            header: header.to_string(),
+            bytes,
+        };
+        assert_eq!(
+            composed.over_ceiling,
+            Some(OverCeiling {
+                ceiling_bytes: 1_024,
+                batch_ceiling_bytes: 2_048,
+                items: vec![
+                    refused(2, "c", 900),
+                    refused(3, "quotes", 100),
+                    refused(4, "cairn://models/embed", 300),
+                ],
+            })
+        );
+        assert!(composed
+            .text
+            .contains(&format!("=== a ===\n{}\n", "a".repeat(900))));
+        assert!(composed
+            .text
+            .contains(&format!("=== b ===\n{}\n", "b".repeat(900))));
+        assert!(composed.text.contains(
+            "=== c ===\n`c`: output of 900 bytes would carry this batch past the 2048 bytes a result returned to code may hold"
+        ));
+        assert!(!composed.text.contains(&"\"".repeat(100)));
+        assert!(composed.text.ends_with("=== tiny ===\nt"));
+    }
+
+    // The production batch budget leaves the response, escaped twice, inside
+    // one link frame even when every byte is the costliest to escape.
+    #[test]
+    fn the_batch_wire_budget_fits_one_relay_frame() {
+        let quotes = "\"".repeat(3 << 20);
+        let outcomes = vec![outcome("one", &quotes, true), outcome("two", &quotes, true)];
+        let composed = for_code(&outcomes);
+        assert_eq!(
+            composed.over_ceiling.as_ref().map(|over| over
+                .items
+                .iter()
+                .map(|item| item.index)
+                .collect::<Vec<_>>()),
+            Some(vec![1])
+        );
+        let envelope =
+            run_envelope_with_data(composed.text, Vec::new(), None, composed.over_ceiling);
+        let frame = serde_json::to_string(&envelope).unwrap();
+        assert!(
+            frame.len() < RELAY_RESPONSE_BYTE_BUDGET,
+            "{} bytes on the wire",
+            frame.len()
+        );
+    }
+
+    #[test]
+    fn ceiling_label_names_whole_mebibytes() {
+        assert_eq!(ceiling_label(view::WHOLE_READ_BYTE_CEILING), "8 MiB");
+        assert_eq!(ceiling_label(1_024), "1024 bytes");
     }
     #[test]
     fn strip_streamable_tail_recognizes_last_n_line_forms() {

@@ -2057,6 +2057,14 @@ mod tests {
             "{}",
             program.text
         );
+        // The program's own unchanged repeat in the same turn is data too.
+        let program_repeat = read_batch_envelope_for_origin(&orch, one(), run, None).await;
+        assert_ne!(program_repeat.segments[0].kind, SegmentKind::Duplicate);
+        assert!(
+            program_repeat.text.contains("Leaderboard"),
+            "{}",
+            program_repeat.text
+        );
 
         let model_repeat = read_batch_envelope_for_run(&orch, one(), run).await;
         assert_eq!(model_repeat.segments[0].kind, SegmentKind::Duplicate);

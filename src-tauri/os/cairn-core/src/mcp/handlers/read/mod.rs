@@ -13,7 +13,8 @@ pub(crate) mod overlay;
 use cairn_common::read::ReadSegment;
 
 pub(crate) use batch::{
-    compose_read, handle_read_batch, read_batch, Composed, ReadCursorState, ReadOptions,
+    compose_read, handle_read_batch, read_batch, read_budget_for, Composed, ReadCursorState,
+    ReadOptions,
 };
 pub use file::handle_read_file;
 pub(crate) use file::produce_file_segment_with;
