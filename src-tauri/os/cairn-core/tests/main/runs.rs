@@ -2150,7 +2150,7 @@ async fn reconcile_stale_runs_leaves_a_durably_queued_launch_for_recovery() {
 /// stranded `idle`, holding an operator message that arrived while it was parked
 /// (a self-suspended head holds pushes until its wait resolves). One boot settles
 /// the batch, claims the unblock once, and resumes the session on its live
-/// process: each Task result arrives with its delayed-delivery notice, and the
+/// process before the sweep returns: each Task result arrives with its delayed-delivery notice, and the
 /// held message is delivered with the unblock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_once() {

@@ -468,16 +468,17 @@ fn execution_id_of(orch: &crate::orchestrator::Orchestrator, job_id: &str) -> Op
     .flatten()
 }
 
-/// Settle the thread tasks a liveness-only release stranded `idle`, then deliver
-/// each one to a parent that is still parked waiting for it.
+/// Settle the thread tasks a liveness-only release stranded `idle`.
 ///
 /// Each execution is swept once, settling all of its stranded tasks together, so
-/// a blocking batch has every sibling terminal before the first delivery runs and
-/// its parent wakes exactly once. The settlement is quiet (see
-/// `ChangeCause::Repaired`); the only thing a parent can receive is the repair
-/// resume, which wakes nothing whose head has moved on and pushes nothing for a
-/// background task. Executions swept here are recorded in `swept` so the
-/// reprojection that follows does not sweep them a second time.
+/// a blocking batch has every sibling terminal before any delivery runs and its
+/// parent wakes exactly once. The settlement is quiet (see
+/// `ChangeCause::Repaired`); the only thing a parent can receive is the Repair
+/// resume `settle_stranded_jobs` runs on this thread, which wakes nothing whose
+/// head has moved on, pushes nothing for a background task, and leads each
+/// result with its delayed-delivery notice. Every delivery has finished when this
+/// returns. Executions swept here are recorded in `swept` so the reprojection
+/// that follows does not sweep them a second time.
 fn settle_stranded_thread_tasks(
     orch: &crate::orchestrator::Orchestrator,
     stranded: Vec<String>,
@@ -501,23 +502,12 @@ fn settle_stranded_thread_tasks(
                     continue;
                 }
             };
-        let settled: Vec<&str> = changes
+        let settled = changes
             .iter()
             .filter(|change| settle.contains(&change.job_id) && change.to.is_terminal())
-            .map(|change| change.job_id.as_str())
-            .collect();
-        if !settled.is_empty() {
-            log::info!(
-                "Settled {} stranded thread task(s) in execution {execution_id}",
-                settled.len()
-            );
-        }
-        for job_id in settled {
-            if let Err(error) =
-                crate::execution::delegation::resume_parked_parent_after_repair(orch, job_id)
-            {
-                log::warn!("Repair delivery for stranded thread task {job_id} failed: {error}");
-            }
+            .count();
+        if settled > 0 {
+            log::info!("Settled {settled} stranded thread task(s) in execution {execution_id}");
         }
     }
 }

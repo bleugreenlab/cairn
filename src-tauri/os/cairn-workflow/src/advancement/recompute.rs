@@ -2332,19 +2332,41 @@ pub fn recompute_execution_jobs(
 
 /// Boot repair for stranded work: sweep `execution_id` once, settling the jobs
 /// in `settle_job_ids` (see [`sweep_execution_jobs_conn`]) while every other job
-/// derives as usual, and return the status changes so the caller can wake any
-/// parent still parked on the settled jobs. Settled changes carry
-/// [`ChangeCause::Repaired`] and are published as db-changes only.
+/// derives as usual, and return the status changes. Settled changes carry
+/// [`ChangeCause::Repaired`]: they announce nothing and advance nothing.
+///
+/// A parent still parked on a settled job is woken here, in
+/// [`crate::runtime::ParentResume::Repair`] mode, on the caller's thread, and
+/// publishing does not also dispatch that resume. Boot repair holds no launch
+/// lock, so the resume can run inline, and every repaired result has reached its
+/// parent, led by its delayed-delivery notice, before this returns. The caller
+/// does not resume the parent itself.
 pub fn settle_stranded_jobs(
     runtime: &WorkflowRuntime,
     execution_id: &str,
     settle_job_ids: &HashSet<String>,
 ) -> Result<Vec<JobStatusChange>, String> {
-    sweep_execution_jobs(runtime, execution_id, settle_job_ids.clone())
+    let changes = sweep_execution_jobs(runtime, execution_id, settle_job_ids.clone())?;
+    for change in changes
+        .iter()
+        .filter(|change| settle_job_ids.contains(&change.job_id))
+    {
+        if let Some(mode) = change.parent_resume() {
+            if let Err(error) = runtime.host.resume_parent(&change.job_id, mode) {
+                log::warn!(
+                    "Repair delivery for stranded job {} failed: {error}",
+                    change.job_id
+                );
+            }
+        }
+    }
+    Ok(changes)
 }
 
 /// The one effect path for an execution sweep: write the projection in a
 /// transaction, publish it, and advance the DAG on an announced completion.
+/// Jobs in `settle_job_ids` are settled, and their parents are resumed by
+/// [`settle_stranded_jobs`], not by the publish.
 fn sweep_execution_jobs(
     runtime: &WorkflowRuntime,
     execution_id: &str,
@@ -2353,11 +2375,12 @@ fn sweep_execution_jobs(
     let execution_id_owned = execution_id.to_string();
     let claimed_launch_job_ids = runtime.host.claimed_launch_job_ids();
     let db = runtime.database(WorkflowOwner::Execution(&execution_id_owned))?;
+    let settling = settle_job_ids.clone();
     let outcome = run_advancement_db(async move {
         db.write(|conn| {
             let execution_id = execution_id_owned.clone();
             let claimed_launch_job_ids = claimed_launch_job_ids.clone();
-            let settle_job_ids = settle_job_ids.clone();
+            let settle_job_ids = settling.clone();
             Box::pin(async move {
                 sweep_execution_jobs_conn(
                     conn,
@@ -2372,7 +2395,7 @@ fn sweep_execution_jobs(
         .map_err(|e| e.to_string())
     })?;
 
-    publish_recompute_outcome(runtime, execution_id, outcome)
+    publish_outcome(runtime, execution_id, outcome, &settle_job_ids)
 }
 
 /// Publish only after the owning transaction has committed all projections.
@@ -2382,12 +2405,26 @@ pub(super) fn publish_recompute_outcome(
     execution_id: &str,
     outcome: RecomputeOutcome,
 ) -> Result<Vec<JobStatusChange>, String> {
+    publish_outcome(runtime, execution_id, outcome, &HashSet::new())
+}
+
+/// [`publish_recompute_outcome`], leaving the parent resume of each job in
+/// `resumed_by_caller` to the caller.
+fn publish_outcome(
+    runtime: &WorkflowRuntime,
+    execution_id: &str,
+    outcome: RecomputeOutcome,
+    resumed_by_caller: &HashSet<String>,
+) -> Result<Vec<JobStatusChange>, String> {
     if outcome.changes.is_empty() && outcome.newly_terminal_issue_ids.is_empty() {
         return Ok(outcome.changes);
     }
 
     runtime.host.projection_changed(execution_id, &outcome);
     for change in &outcome.changes {
+        if resumed_by_caller.contains(&change.job_id) {
+            continue;
+        }
         if let Some(mode) = change.parent_resume() {
             dispatch_parent_resume(runtime, &change.job_id, mode);
         }
@@ -2417,7 +2454,8 @@ pub(super) fn publish_recompute_outcome(
 /// Wake the parent of a delegated child this sweep settled, on its own thread.
 ///
 /// Every settlement passes through here, not only the turn ends that also
-/// resume explicitly: a boot reproject, a stranded-job repair, a sweep. Off the
+/// resume explicitly: a boot reproject, a sweep. A stranded-job repair is the
+/// one exception: [`settle_stranded_jobs`] resumes inline instead. Off the
 /// caller's thread because the resume may launch the parent's next turn, and a
 /// recompute can run under locks that launch would also take. The resume's
 /// anchor claim makes a race with an explicit resume deliver once.
