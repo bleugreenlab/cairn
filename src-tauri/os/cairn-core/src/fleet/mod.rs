@@ -18079,6 +18079,12 @@ struct ScoredCandidate<'a> {
     reservation: Option<&'a resource_profiles::ResolvedResourceProfile>,
     /// Why this machine's readings cannot be decided on, when they cannot.
     blindness: Option<PlacementRejectionReason>,
+    /// Set when that blindness is only readings this machine has not taken
+    /// yet ([`blind_only_for_want_of_a_first_sample`]). Never-measured
+    /// telemetry fails open (tenet 302), so such a machine is offered work
+    /// that nothing seeing can take; a reading that failed or went stale is
+    /// evidence, and still refuses.
+    never_sampled: bool,
     /// Set when the machine is measured and the resolved demand does not fit.
     misfit: Option<PlacementRejectionReason>,
     /// Set when the resolved demand does not fit beside the model residents
@@ -18151,6 +18157,8 @@ impl<'a> ScoredCandidate<'a> {
     ) -> Self {
         let machine = &entry.health.machine;
         let blindness = placement_blindness(machine, now_unix_ms);
+        let never_sampled =
+            blindness.is_some() && blind_only_for_want_of_a_first_sample(machine, now_unix_ms);
         // Memory and volume remain eligibility evidence: a machine that cannot
         // hold the work cannot be the fastest at it. They are no longer ranking
         // keys, because how much a machine has left says nothing about how long
@@ -18284,6 +18292,7 @@ impl<'a> ScoredCandidate<'a> {
             sync_cost,
             reservation,
             blindness,
+            never_sampled,
             misfit,
             model_room: None,
             over_ceiling,
@@ -18499,13 +18508,19 @@ fn rank_candidates<'a, 'b>(
                 .cmp(&b.entry.identity.executor_id)
         })
     };
-    let usable = |candidate: &&ScoredCandidate<'a>| {
+    // A blind remote is no spill target while anything placement can see, or
+    // the work's own home, can take the work. When nothing can, a machine that
+    // is blind only because it has not sampled yet is offered it: absence of
+    // telemetry must not strand a machine (tenet 302), and a freshly attached
+    // executor is in exactly that state until its first sample lands.
+    let usable_with = |candidate: &&ScoredCandidate<'a>, admit_never_sampled: bool| {
         candidate.excluded.is_none()
             && candidate.model_room.is_none()
             && (candidate.blindness.is_none()
                 || settled_by_caller
                 || candidate.entry.colocated
-                || !exercising_spill)
+                || !exercising_spill
+                || (admit_never_sampled && candidate.never_sampled))
             && !(exercising_spill
                 && matches!(
                     policy.profile.stance(request.placement_work_class),
@@ -18513,6 +18528,10 @@ fn rank_candidates<'a, 'b>(
                 )
                 && candidate.entry.colocated)
     };
+    let admit_never_sampled = !scored
+        .iter()
+        .any(|candidate| usable_with(&candidate, false));
+    let usable = |candidate: &&ScoredCandidate<'a>| usable_with(candidate, admit_never_sampled);
     // A machine too small for the class prior is taken only when nothing
     // that can hold it is usable; otherwise ranking would still choose it
     // whenever every larger machine was outranked on some later key.
@@ -19427,6 +19446,37 @@ fn placement_blindness(
             },
         )
     })
+}
+
+/// Whether this machine is blind only for want of a first sample: some
+/// placement reading is `NotSampled`, none carries any other gap, and every
+/// reading it did take is within the staleness bound. A failed or stale
+/// reading is a measurement that stopped, which is evidence (tenet 1441); a
+/// reading never taken is not, and fails open (tenet 302).
+fn blind_only_for_want_of_a_first_sample(
+    machine: &cairn_common::executor_protocol::MachineTelemetry,
+    now_unix_ms: u64,
+) -> bool {
+    use cairn_common::executor_protocol::MeasurementGap;
+    let gaps = machine.placement_gaps();
+    !gaps.is_empty()
+        && gaps
+            .iter()
+            .all(|(_, gap)| *gap == MeasurementGap::NotSampled)
+        && [
+            machine.cpu.value().map(|_| machine.cpu.age_ms(now_unix_ms)),
+            machine
+                .memory
+                .value()
+                .map(|_| machine.memory.age_ms(now_unix_ms)),
+            machine
+                .volume
+                .value()
+                .map(|_| machine.volume.age_ms(now_unix_ms)),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|age_ms| age_ms <= EXECUTOR_TELEMETRY_STALE_AFTER_MS)
 }
 
 /// Whether this repository can be recreated on a machine that does not already
@@ -32487,15 +32537,19 @@ mod tests {
         assert!(draft.selected.is_none(), "{draft:?}");
     }
 
-    /// And when the constraint leaves only blind machines, the answer is the
-    /// typed telemetry refusal. Narrowing the fleet cannot make absent evidence
-    /// safe to act on.
+    /// And when the constraint leaves only machines whose readings stopped,
+    /// the answer is the typed telemetry refusal. Narrowing the fleet cannot
+    /// make a measurement that stopped safe to act on.
     #[test]
     fn a_platform_constrained_spill_batch_with_only_blind_remotes_refuses() {
-        let connections = HashMap::from([
-            fleet_entry("bglab-ub", "linux", 0, &[]),
-            fleet_entry("bglab-win", "linux", 0, &[]),
-        ]);
+        let (ub_id, mut ub) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured_at(&mut ub, 0.05, 48 * GIB, 900 * GIB, NOW - 200_000);
+        let (win_id, mut win) = fleet_entry("bglab-win", "linux", 0, &[]);
+        Arc::make_mut(&mut win.health).machine.cpu = Measurement::unavailable(
+            NOW,
+            cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
+        );
+        let connections = HashMap::from([(ub_id, ub), (win_id, win)]);
         let mut request = spillable_request();
         request.executor = Some(ExecutorSelector {
             os: Some("linux".into()),
@@ -32504,7 +32558,7 @@ mod tests {
         let refusal = place(&connections, &request).unwrap_err();
         assert!(refusal.contains("bglab-ub"), "{refusal}");
         assert!(refusal.contains("bglab-win"), "{refusal}");
-        assert!(refusal.contains("unavailable"), "{refusal}");
+        assert!(refusal.contains("sampling failed"), "{refusal}");
     }
 
     /// Naming one machine is different: the caller settled placement, there is
@@ -32546,15 +32600,79 @@ mod tests {
         );
     }
 
-    /// A blind fleet with nowhere to fall back to refuses in words, carrying the
-    /// same evidence a success would. Running it somewhere unexamined would be
-    /// the silent degradation this policy exists to prevent.
+    /// A fleet whose measurements failed, with nowhere to fall back to, refuses
+    /// in words carrying the same evidence a success would. A reading that was
+    /// attempted and failed is evidence, and acting against it would be the
+    /// silent degradation this policy exists to prevent. One reading never
+    /// taken beside it does not make the machine merely unsampled.
     #[test]
     fn an_unmeasurable_fleet_with_no_home_refuses_with_its_evidence() {
-        let connections = HashMap::from([fleet_entry("bglab-ub", "linux", 0, &[])]);
+        let (id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        Arc::make_mut(&mut remote.health).machine.volume = Measurement::unavailable(
+            NOW,
+            cairn_common::executor_protocol::MeasurementGap::SamplingFailed,
+        );
+        let connections = HashMap::from([(id, remote)]);
         let refusal = place(&connections, &spillable_request()).unwrap_err();
         assert!(refusal.contains("bglab-ub"), "{refusal}");
         assert!(refusal.contains("unavailable"), "{refusal}");
+    }
+
+    /// cairn/6557, the bginf-sp2 specimen: one machine drained, the other
+    /// attached but not yet through its first sample, and no home. Its
+    /// telemetry was never measured, which fails open (tenet 302), so it is
+    /// offered the work rather than the request being refused, and the record
+    /// says the decision was blind and which reading was missing.
+    #[test]
+    fn a_machine_that_has_not_sampled_yet_takes_work_nothing_seeing_can() {
+        let (drained_id, mut drained) = fleet_entry("scratch-b", "linux", 0, &[]);
+        measured(&mut drained, 0.05, 48 * GIB, 900 * GIB);
+        drained.drained = true;
+        let (fresh_id, fresh) = fleet_entry("scratch-a", "linux", 0, &[]);
+        let connections = HashMap::from([(drained_id, drained), (fresh_id, fresh)]);
+
+        let draft = place(&connections, &spillable_request()).unwrap();
+        let selection = chosen(&draft);
+        assert_eq!(selection.executor_id, "scratch-a");
+        assert_eq!(selection.reason, PlacementReason::MeasuredBlindFleet);
+        assert_eq!(
+            selection.readings.cpu.gap(),
+            Some(cairn_common::executor_protocol::MeasurementGap::NotSampled),
+            "the decision names the missing reading"
+        );
+        assert_eq!(
+            rejection_for(&draft, "scratch-b"),
+            &PlacementRejectionReason::Drained
+        );
+    }
+
+    /// The fallback is a last resort, never a preference: beside a machine
+    /// placement can see, an unsampled one is still not a spill target.
+    #[test]
+    fn an_unsampled_machine_never_outranks_a_measured_one() {
+        let (measured_id, mut measured_remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(&mut measured_remote, 0.95, 4 * GIB, 900 * GIB);
+        let (fresh_id, fresh) = fleet_entry("bglab-sp2", "linux", 0, &[]);
+        let connections = HashMap::from([(measured_id, measured_remote), (fresh_id, fresh)]);
+
+        let draft = place(&connections, &spillable_request()).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "bglab-ub");
+        assert!(matches!(
+            rejection_for(&draft, "bglab-sp2"),
+            PlacementRejectionReason::TelemetryGap { .. }
+        ));
+    }
+
+    /// A machine whose other readings are fresh but whose CPU sample has gone
+    /// stale stopped measuring; that is not "not sampled yet", and it refuses.
+    #[test]
+    fn a_stale_reading_beside_an_unsampled_one_still_refuses() {
+        let (id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured_at(&mut remote, 0.05, 48 * GIB, 900 * GIB, NOW - 200_000);
+        Arc::make_mut(&mut remote.health).machine.volume = Measurement::default();
+        let connections = HashMap::from([(id, remote)]);
+        let refusal = place(&connections, &spillable_request()).unwrap_err();
+        assert!(refusal.contains("bglab-ub"), "{refusal}");
     }
 
     /// Both machines answered this request, one on disk and one on host

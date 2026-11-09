@@ -7304,6 +7304,12 @@ pub struct LearnedResourceEstimate {
 /// put back. A runner talking to an older executor gets nothing wrong: that
 /// executor never undid staging, never names staged-only paths, and never
 /// sends the field, which defaults to absent.
+///
+/// cairn/6557 does not move the number. No frame, variant or field changes:
+/// [`PlacementReason::MeasuredBlindFleet`] only widens its documented meaning
+/// to cover a spill offered to a machine that has not sampled yet, a choice the
+/// runner alone makes from readings every executor already sends. An executor
+/// never decodes a placement reason, so an older one gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -16707,10 +16713,12 @@ pub enum PlacementReason {
     /// history for this command at this warmth. Spill-eligible work was placed
     /// there to acquire the observations future earliest-verdict decisions need.
     BootstrapExploration,
-    /// Nothing in the fleet had complete, fresh placement readings, so no
-    /// measured comparison was possible and the work stayed on its home
-    /// executor. Named explicitly because it is exactly the state that must not
-    /// pass for a measured decision.
+    /// No machine with complete, fresh placement readings could take the work,
+    /// so no measured comparison was possible. The work went to its home
+    /// executor, or, with no home that could take it, to a machine that had
+    /// not sampled yet (never-measured telemetry fails open). The selection's
+    /// readings name the gap. Named explicitly because it is exactly the state
+    /// that must not pass for a measured decision.
     MeasuredBlindFleet,
 }
 
