@@ -941,6 +941,104 @@ async fn five_crashes_inside_the_window_fail_the_service() {
         .unwrap();
 }
 
+/// An automatic restart the substrate will not place started no process, so
+/// it spends none of the crash budget: more refusals in a row than
+/// [`CRASH_LIMIT`] leave the service backing off, never `failed`, and the
+/// first placement that succeeds serves again with no one acting.
+#[tokio::test]
+async fn restarts_the_substrate_refuses_are_retried_without_spending_the_crash_budget() {
+    let h = harness().await;
+    call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap();
+    let refusals = CRASH_LIMIT + 1;
+    for _ in 0..refusals {
+        h.host.refuse.lock().unwrap().push_back(unroutable());
+    }
+
+    let crash = call(&h.orch, request("echo", "crash", agent()))
+        .await
+        .unwrap_err();
+    assert_eq!(crash.code, "service_crashed");
+    // One crash's backoff, then every refusal's, so wait past `eventually`'s.
+    for _ in 0..1_500 {
+        let state = status(&h, "echo").state;
+        assert_ne!(
+            state,
+            ServiceState::Failed,
+            "{:?}",
+            log_texts(&h, "echo").await
+        );
+        if state == ServiceState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(status(&h, "echo").state, ServiceState::Running);
+    assert!(
+        h.host.refuse.lock().unwrap().is_empty(),
+        "every refusal was met"
+    );
+    let value = call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap();
+    assert_eq!(value["generation"], 2 + refusals as u64);
+
+    let log = log_texts(&h, "echo").await;
+    assert_eq!(
+        log.iter()
+            .filter(|text| text.contains("not counted as a crash"))
+            .count(),
+        refusals,
+        "{log:?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|text| text.contains("the service is failed")),
+        "{log:?}"
+    );
+}
+
+/// Entering `failed` stops the service and its schedule, so its owning thread
+/// is told, once per entry.
+#[tokio::test]
+async fn entering_failed_wakes_the_owning_thread() {
+    let h = thread_harness().await;
+    h.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+             VALUES ('spanish-run', 'p', 'spanish-session', 'completed', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let cell = h
+        .orch
+        .project_services
+        .supervisor
+        .cell("p", "cairn", &spanish(), "tutor");
+    const FAILED_NOTICES: &str =
+        "SELECT COUNT(*) FROM messages WHERE content LIKE 'Service `tutor` is failed%'";
+    for crash in 0..CRASH_LIMIT {
+        assert_eq!(count(&h, FAILED_NOTICES).await, 0, "not before it fails");
+        crashed(&h.orch, &cell, crash as u64, "crashed on purpose").await;
+    }
+    assert_eq!(tutor().status(&h.orch).unwrap().state, ServiceState::Failed);
+    assert_eq!(count(&h, FAILED_NOTICES).await, 1);
+    let notice = h
+        .orch
+        .db
+        .local
+        .query_text("SELECT content FROM messages", ())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(notice.contains("crashed on purpose"), "{notice}");
+    assert!(notice.contains(&format!("{TUTOR}/status")), "{notice}");
+}
+
 #[tokio::test]
 async fn a_source_change_replaces_without_dropping_an_in_flight_call() {
     let h = harness().await;

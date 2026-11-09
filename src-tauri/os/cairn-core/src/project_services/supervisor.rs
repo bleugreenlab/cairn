@@ -52,6 +52,13 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
 const CRASH_LIMIT: usize = 5;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// The first wait before an automatic restart the substrate refused to place
+/// is tried again; each further refusal doubles it, up to [`MAX_BACKOFF`].
+const PLACEMENT_RETRY_BASE: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(1)
+};
 /// The largest params a call may carry.
 pub(crate) const MAX_PARAMS_BYTES: usize = 1024 * 1024;
 const RECENT_CALLS: usize = 10;
@@ -408,6 +415,9 @@ struct CellState {
     generation: u64,
     current: Option<Arc<Incarnation>>,
     crashes: VecDeque<Instant>,
+    /// Automatic restarts the substrate has refused to place in a row. Kept
+    /// apart from `crashes`: a process that never started did not crash.
+    placement_refusals: u32,
     restarts: u64,
     backoff_until: Option<Instant>,
     last_error: Option<String>,
@@ -1105,6 +1115,7 @@ fn install(orch: &Orchestrator, cell: &Arc<Cell>, incarnation: Arc<Incarnation>)
         state.current = Some(incarnation);
         state.status = ServiceState::Running;
         state.backoff_until = None;
+        state.placement_refusals = 0;
     }
     machine::announce_state(orch, cell);
     if let Some(idle) = idle {
@@ -1509,6 +1520,9 @@ async fn record_crash(orch: &Orchestrator, cell: &Arc<Cell>, generation: u64, wh
     };
     lifecycle(orch, cell, generation, &text, "runner").await;
     machine::announce_state(orch, cell);
+    if delay.is_none() && status == ServiceState::Failed {
+        notify_failed(orch, cell, generation, what).await;
+    }
     if let Some((delay, expected_generation)) = delay {
         let (orch, cell) = (orch.clone(), cell.clone());
         tokio::spawn(async move {
@@ -1540,6 +1554,9 @@ async fn restart_after_backoff(orch: &Orchestrator, cell: &Arc<Cell>, expected_g
     };
     match result {
         Ok(incarnation) => install(orch, cell, incarnation),
+        Err(error) if error.code == PLACEMENT_UNAVAILABLE => {
+            retry_placement(orch, cell, &error.message).await;
+        }
         Err(error) => {
             let generation = cell.state.lock().unwrap().generation;
             crashed(
@@ -1550,6 +1567,91 @@ async fn restart_after_backoff(orch: &Orchestrator, cell: &Arc<Cell>, expected_g
             )
             .await;
         }
+    }
+}
+
+/// Wait, then try an automatic restart again that the substrate refused to
+/// place.
+///
+/// The refusal is about the fleet (no residency granted, no route to the
+/// executor), and no process started, so it is not a crash and does not
+/// count toward [`CRASH_LIMIT`]: a service whose machine is briefly
+/// unplaceable must not end up `failed` for it. It backs off on its own
+/// count instead, and keeps trying until a placement succeeds or an operator
+/// stops it.
+///
+/// Boxed for the same reason as [`crashed`]: a refused retry retries again.
+fn retry_placement<'a>(
+    orch: &'a Orchestrator,
+    cell: &'a Arc<Cell>,
+    refusal: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let retry = {
+            let mut state = cell.state.lock().unwrap();
+            if state.current.is_some() || state.sticky_stop {
+                None
+            } else {
+                state.placement_refusals = state.placement_refusals.saturating_add(1);
+                let exponent = state.placement_refusals.saturating_sub(1).min(12);
+                let delay = PLACEMENT_RETRY_BASE
+                    .saturating_mul(1u32 << exponent)
+                    .min(MAX_BACKOFF);
+                state.status = ServiceState::Backoff;
+                state.backoff_until = Some(Instant::now() + delay);
+                state.last_error = Some(refusal.to_string());
+                Some((delay, state.generation, state.placement_refusals))
+            }
+        };
+        let Some((delay, generation, refusals)) = retry else {
+            return;
+        };
+        lifecycle(
+            orch,
+            cell,
+            generation,
+            &format!(
+                "restart not placed ({refusal}); not counted as a crash, placing again in {}ms (refusal {refusals})",
+                delay.as_millis()
+            ),
+            "runner",
+        )
+        .await;
+        machine::announce_state(orch, cell);
+        let (orch, cell) = (orch.clone(), cell.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            restart_after_backoff(&orch, &cell, generation).await;
+        });
+    })
+}
+
+/// What a service's owner is told when it enters `failed`.
+fn failed_notice(service: &str, home: &str, what: &str) -> String {
+    format!(
+        "Service `{service}` is failed: it crashed {CRASH_LIMIT} times in {} minutes, most recently: \
+         {what}. It stays failed, and its schedule does not run, until it is started, restarted, \
+         or its source changes; nothing restarts it automatically. {home}/status and {home}/log \
+         say more.",
+        CRASH_WINDOW.as_secs() / 60
+    )
+}
+
+/// Tell the owning thread its service has entered `failed`.
+///
+/// A failed service runs nothing, its schedule included, so for a thread
+/// whose intake is that schedule this is the moment the work stops. The
+/// call-failure streak notice cannot stand in for it: a streak begins once and
+/// had usually already been sent for the first crash. Keyed by the instant
+/// as well as the generation, because generations restart from one with the
+/// runner, and each entry into `failed` is its own event.
+async fn notify_failed(orch: &Orchestrator, cell: &Arc<Cell>, generation: u64, what: &str) {
+    let home = cell.home();
+    let content = failed_notice(&cell.service, &home, what);
+    let key = format!("service-failed:{home}:{generation}:{}", now_ms());
+    if let Err(error) = super::notify_owner(orch, &orch.db.local, &cell.owner, &key, &content).await
+    {
+        tracing::warn!(%error, service = %cell.service, "could not send a failed-service notice");
     }
 }
 
@@ -1751,6 +1853,7 @@ async fn start_attached(
         let mut state = cell.state.lock().unwrap();
         state.sticky_stop = false;
         state.crashes.clear();
+        state.placement_refusals = 0;
         if matches!(state.status, ServiceState::Failed | ServiceState::Backoff) {
             state.status = ServiceState::Stopped;
         }
@@ -1815,6 +1918,7 @@ async fn restart_attached(
         let mut state = cell.state.lock().unwrap();
         state.sticky_stop = false;
         state.crashes.clear();
+        state.placement_refusals = 0;
     }
     let package = read_package(orch, &cell).await?;
     replace(orch, &cell, &package, actor).await

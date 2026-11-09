@@ -233,10 +233,10 @@ impl<K: Eq, V> BoundedCache<K, V> {
 // (the tracked path layout) do. Both are needed alongside the committed lockfile.
 type MetadataKey = (PathBuf, [u8; 32]);
 static METADATA: OnceLock<Mutex<BoundedCache<MetadataKey, String>>> = OnceLock::new();
-type TreeCache = Mutex<BoundedCache<(PathBuf, String), CommitTree>>;
+// Shared, not cloned, on a hit: a tree listing is every path in the repository.
+type TreeCache = Mutex<BoundedCache<(PathBuf, String), std::sync::Arc<CommitTree>>>;
 static TREES: OnceLock<TreeCache> = OnceLock::new();
 
-#[derive(Clone)]
 struct CommitTree {
     blobs: std::collections::BTreeMap<String, String>,
     nonregular: BTreeSet<String>,
@@ -247,7 +247,7 @@ impl CommitTree {
         repository: &Path,
         target: &str,
         run: &mut impl FnMut(&str, &Path, &[String]) -> Result<String, DistanceUnknown>,
-    ) -> Result<Self, DistanceUnknown> {
+    ) -> Result<std::sync::Arc<Self>, DistanceUnknown> {
         let target = run(
             "git",
             repository,
@@ -266,7 +266,7 @@ impl CommitTree {
             .lock()
             .map_err(|_| DistanceUnknown("commit tree cache poisoned".into()))?;
         if let Some(tree) = cache.get(&key) {
-            return Ok(tree.clone());
+            return Ok(std::sync::Arc::clone(tree));
         }
         let listing = run(
             "git",
@@ -279,8 +279,8 @@ impl CommitTree {
                 target,
             ],
         )?;
-        let tree = Self::parse(&listing)?;
-        cache.insert(key, tree.clone());
+        let tree = std::sync::Arc::new(Self::parse(&listing)?);
+        cache.insert(key, std::sync::Arc::clone(&tree));
         Ok(tree)
     }
 

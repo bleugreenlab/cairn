@@ -5609,6 +5609,14 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6631 does not move the number. The runner now prices placement's
+/// sync cost and cache distance from a cache filled off the placement path,
+/// and shares a cached commit tree in `cache_distance` instead of cloning it.
+/// Both are runner-side computations over commits the runner already holds; no
+/// frame, variant or field changes, and a placement that has not priced a pair
+/// yet records the `Unknown` sync cost and absent distance every peer already
+/// reads. What a runner gets wrong talking to an older executor: nothing.
+///
 /// cairn/6596 does not move the number. No frame, variant or field changes.
 /// The runner now ends a connection superseded by a newer generation of the
 /// same executor within a liveness tick, refuses to issue that connection an
@@ -5634,6 +5642,18 @@ pub struct LearnedResourceEstimate {
 /// admits that machine under a named not-measured gap, never as zero or
 /// healthy. An older runner ignores the field, and the executor enforces its
 /// own floor whether or not the runner reads it.
+///
+/// cairn/6528 does not move the number. An ungranted `Acquire` that finds no
+/// residency to converge on (none for the holder, or only a releasing husk it
+/// just discarded) is now refused as `notFound` instead of `admission`, with
+/// the same diagnostic. Both kinds already exist, and the runner's acquisition
+/// verdict reads them alike: either is structural without a cell outcome, and
+/// a service lease reports either as ungranted. The runner now also answers a
+/// `notFound` reattachment by forgetting that route and placing the same
+/// acquisition through the queue. What a runner gets wrong talking to an older
+/// executor: nothing new; that executor still answers `admission`, which the
+/// runner returns to its caller as it did before. An older runner reads a
+/// newer executor's `notFound` as it read `admission`.
 ///
 /// cairn/5991 does not move the number. It removes the
 /// `cairn://executors/<name>/<verb>` address from the shared URI grammar and
@@ -22900,6 +22920,107 @@ mod tests {
         ] {
             assert!(valid.validate().is_ok(), "{valid:?}");
         }
+    }
+
+    /// The pin a batch hands its shells: the selector's own place, nothing it
+    /// requires of the machine, and nothing at all when it names no place.
+    #[test]
+    fn a_placement_pin_keeps_only_where_and_never_swaps_it() {
+        let capabilities = ExecutorSelector {
+            required_toolchains: vec!["rust".into()],
+            requires_macos_nested_sandbox_write: true,
+            containment: Some(WorkloadEnvelope::page_call()),
+            page_call_programs: vec!["bun".into()],
+            ..ExecutorSelector::default()
+        };
+        assert_eq!(
+            ExecutorSelector {
+                os: Some("linux".into()),
+                ..capabilities.clone()
+            }
+            .placement_pin(),
+            Some(ExecutorSelector {
+                os: Some("linux".into()),
+                ..ExecutorSelector::default()
+            })
+        );
+        assert_eq!(
+            ExecutorSelector {
+                name: Some("fedora".into()),
+                ..capabilities.clone()
+            }
+            .placement_pin(),
+            Some(ExecutorSelector {
+                name: Some("fedora".into()),
+                ..ExecutorSelector::default()
+            })
+        );
+        assert_eq!(capabilities.placement_pin(), None);
+        assert_eq!(ExecutorSelector::default().placement_pin(), None);
+    }
+
+    /// A check placement pin says only where: each capability is refused on
+    /// its own, every known platform and a bare name are accepted, and an
+    /// envelope that states no edge is refused by plain validation.
+    #[test]
+    fn a_placement_pin_refuses_each_capability_on_its_own() {
+        let linux = || ExecutorSelector {
+            os: Some("linux".into()),
+            ..ExecutorSelector::default()
+        };
+        let mut valid: Vec<ExecutorSelector> = EXECUTOR_PLATFORMS
+            .iter()
+            .map(|os| ExecutorSelector {
+                os: Some((*os).into()),
+                ..ExecutorSelector::default()
+            })
+            .collect();
+        valid.push(ExecutorSelector {
+            name: Some("fedora".into()),
+            ..ExecutorSelector::default()
+        });
+        for pin in valid {
+            assert!(pin.validate_placement_pin().is_ok(), "{pin:?}");
+        }
+        for capability in [
+            ExecutorSelector {
+                required_toolchains: vec!["rust".into()],
+                ..linux()
+            },
+            ExecutorSelector {
+                requires_macos_nested_sandbox_write: true,
+                ..linux()
+            },
+            ExecutorSelector {
+                containment: Some(WorkloadEnvelope::page_call()),
+                ..linux()
+            },
+            ExecutorSelector {
+                page_call_programs: vec!["bun".into()],
+                ..linux()
+            },
+        ] {
+            let error = capability.validate_placement_pin().unwrap_err();
+            assert!(
+                error.contains("states only name or os"),
+                "{capability:?}: {error}"
+            );
+        }
+        let unknown = ExecutorSelector {
+            os: Some("plan9".into()),
+            ..ExecutorSelector::default()
+        };
+        let error = unknown.validate_placement_pin().unwrap_err();
+        assert!(error.contains("not a platform"), "{error}");
+        let no_edge = ExecutorSelector {
+            containment: Some(WorkloadEnvelope {
+                process_class: ProcessClass::BatchSpawn,
+                edges: Vec::new(),
+            }),
+            ..ExecutorSelector::default()
+        };
+        let error = no_edge.validate().unwrap_err();
+        assert!(error.contains("at least one edge"), "{error}");
     }
 
     /// Refusals are built from this, so it has to name what was asked for in

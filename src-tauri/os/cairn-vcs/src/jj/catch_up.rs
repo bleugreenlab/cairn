@@ -855,9 +855,18 @@ mod tests {
         );
         let since = fx.operations_since(&ops);
         assert_eq!(
-            since.iter().filter(|op| op.contains("rebase")).count(),
+            since
+                .iter()
+                .filter(|op| op.starts_with(&format!("advance `{child}` onto ")))
+                .count(),
             1,
-            "exactly one rebase ran, the child's: {since:?}"
+            "exactly one advance ran for the child: {since:?}"
+        );
+        assert!(
+            since
+                .iter()
+                .all(|op| !op.starts_with(&format!("advance `{BRANCH}` onto "))),
+            "the parent was not replayed: {since:?}"
         );
     }
 }

@@ -409,6 +409,12 @@ impl IMessageExecutor for PlacedProcessExecutor {
             ServicePlacementHealth::ExecutorOffline => Some(ChannelHealth::Unavailable {
                 reason: format!("executor {} offline", self.lease.executor_name()),
             }),
+            ServicePlacementHealth::ResidencyGone => Some(ChannelHealth::Unavailable {
+                reason: format!(
+                    "its execution environment on {} is gone; the next start places it again",
+                    self.lease.executor_name()
+                ),
+            }),
             ServicePlacementHealth::ProcessDown {
                 process_key,
                 exit_code,

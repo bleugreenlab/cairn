@@ -356,6 +356,8 @@ pub(crate) struct LaneRow {
     pub(crate) row: CheckResultCacheEntry,
     /// A newer attempt at the same inputs that ended without a verdict, kept
     /// so a surface can say it happened without letting it stand for the lane.
+    /// It is the latest such attempt (the first to arrive among equally new
+    /// ones), and only one recorded strictly after the answer it sits beside.
     pub(crate) newer_attempt: Option<CheckResultCacheEntry>,
     /// The lane breaker holding this review lane, when its newest
     /// infrastructure failure belongs to a tripped group
@@ -3565,6 +3567,56 @@ mod tests {
         };
         let lane = select_lane_row([newer_pass.clone(), red]).unwrap();
         assert_eq!(lane.row, newer_pass, "between answers, the newer wins");
+    }
+
+    /// Ties and repeated attempts under the same ruling: arrival order breaks a
+    /// tie in either class, the attempt reported beside an answer is the latest
+    /// one, and an attempt recorded at the answer's own instant did not come
+    /// after it.
+    #[test]
+    fn ties_go_to_the_first_arrival_and_only_a_strictly_newer_attempt_is_kept() {
+        let at = |row: CheckResultCacheEntry, ran_at: i64| CheckResultCacheEntry {
+            source_observation_id: None,
+            ran_at,
+            ..row
+        };
+        let red = at(verdict_row("lane", false), 100);
+        let pass = at(verdict_row("lane", true), 100);
+        assert_eq!(
+            select_lane_row([red.clone(), pass.clone()]).unwrap().row,
+            red
+        );
+        assert_eq!(
+            select_lane_row([pass.clone(), red.clone()]).unwrap().row,
+            pass
+        );
+
+        let killed = died_row("lane", CheckFailureKind::Killed, 300);
+        let older = died_row("lane", CheckFailureKind::Infrastructure, 250);
+        let lane = select_lane_row([killed.clone(), older, pass.clone()]).unwrap();
+        assert_eq!(lane.row, pass);
+        assert_eq!(
+            lane.newer_attempt,
+            Some(killed.clone()),
+            "the latest attempt is the one reported"
+        );
+
+        let tied = died_row("lane", CheckFailureKind::Infrastructure, 300);
+        let lane = select_lane_row([killed.clone(), tied.clone(), pass.clone()]).unwrap();
+        assert_eq!(
+            lane.newer_attempt,
+            Some(killed.clone()),
+            "the first to arrive among equally new attempts"
+        );
+        assert_eq!(select_lane_row([killed.clone(), tied]).unwrap().row, killed);
+
+        let simultaneous = died_row("lane", CheckFailureKind::Killed, 100);
+        let lane = select_lane_row([simultaneous, pass.clone()]).unwrap();
+        assert_eq!(lane.row, pass);
+        assert_eq!(
+            lane.newer_attempt, None,
+            "an attempt at the answer's own instant did not come after it"
+        );
     }
 
     /// Specimen 1 (cairn/4604): a suppressed lane opened a wake with "2 of 5

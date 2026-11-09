@@ -23,6 +23,7 @@ pub(crate) mod placement;
 pub(crate) mod placement_default;
 pub mod pools;
 pub(crate) mod preparation;
+mod pricing;
 pub(crate) mod purpose;
 pub(crate) mod queue;
 mod reliability;
@@ -86,7 +87,6 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1731,6 +1731,9 @@ pub struct Fleet {
     /// placement must consume its exploration slot before concurrent ranking can
     /// spend the same slot.
     exploration_by_work_class: Arc<Mutex<HashMap<PlacementWorkClass, ExplorationState>>>,
+    /// What syncing a candidate and rebuilding its warm slots would cost, priced
+    /// once per commit pair in the background (see [`pricing`]).
+    placement_prices: Arc<pricing::PlacementPrices>,
     /// Rate limit for the pushed telemetry frame. One per runner rather than
     /// one per connection: an N-machine fleet beating independently would
     /// otherwise emit at N times the intended cadence, each connection
@@ -2132,6 +2135,20 @@ struct GrantedCell {
 /// `StaleEpoch` itself. Erring short refuses operations on a cell that exists
 /// because a report was slow.
 const GRANT_CONFIRMATION_GRACE_MS: u64 = 60_000;
+
+/// How long an acquisition whose reattachment found no environment waits
+/// before resolving its route again, so a snapshot still reporting a cell the
+/// executor is releasing cannot spin it.
+const REATTACH_REFUSED_PACE_MS: u64 = 250;
+
+/// What [`Fleet::reattach_residency`] leaves the acquisition to do.
+enum Reattached {
+    /// The executor's answer, which is the acquisition's.
+    Answered(Box<ResidencyResult>),
+    /// The route named an environment its executor no longer holds and is
+    /// gone; place the acquisition again.
+    RouteForgotten,
+}
 
 /// The executor and cell a non-acquiring residency operation addresses.
 #[derive(Debug)]
@@ -3637,7 +3654,10 @@ fn note_slow_section(section: &str, caller: &std::panic::Location<'_>, elapsed: 
 #[derive(Clone)]
 struct ExecutorConnectionState {
     identity: ExecutorIdentity,
-    advertisement: ExecutorAdvertisement,
+    /// Shared for the reason `snapshot` is: every placement pass copies the
+    /// connection table, and each copy would otherwise clone every machine's
+    /// capabilities, warm roots, and scratch replicas.
+    advertisement: Arc<ExecutorAdvertisement>,
     generation: u64,
     sender: mpsc::UnboundedSender<ExecutorMessage>,
     /// Shared rather than owned so a placement pass can copy the connection
@@ -4408,7 +4428,7 @@ impl Fleet {
         let advertised_scratches = advertisement.node_scratches.clone();
         let mut connection = ExecutorConnectionState {
             identity: advertisement.identity.clone(),
-            advertisement,
+            advertisement: Arc::new(advertisement),
             generation,
             sender,
             snapshot: Arc::default(),
@@ -6180,7 +6200,7 @@ impl Fleet {
         }
         let scratches_changed = advertisement.node_scratches != entry.advertisement.node_scratches;
         let replicas = scratches_changed.then(|| advertisement.node_scratches.clone());
-        entry.advertisement = advertisement;
+        entry.advertisement = Arc::new(advertisement);
         entry.last_progress_unix_ms = unix_time_ms();
         update(entry);
         drop(connections);
@@ -9647,6 +9667,75 @@ impl Fleet {
         }
     }
 
+    /// Reattach an owner to the environment its route says `executor_id`
+    /// holds: an acquisition sent with no queue grant, which the executor
+    /// answers only by converging on a residency it still has.
+    ///
+    /// The route can outlive the environment. An executor that reclaimed or
+    /// released the residency (a lapsed heartbeat, a release still finishing
+    /// that a snapshot reported mid-way) answers `NotFound`, and asking it
+    /// again would get the same answer forever: the service supervisor's
+    /// restarts were refused this way until the service was marked failed
+    /// (cairn/6528). So that route is forgotten and the caller places the same
+    /// acquisition through the queue, the one path that can build a fresh
+    /// environment. Retrying is paced, because a snapshot taken before the
+    /// release finished can report the cell again and restore the route, and
+    /// bounded by the acquisition's wait horizon.
+    async fn reattach_residency(
+        &self,
+        orch: &Orchestrator,
+        acquisition: ResidencyAcquireRequest,
+        executor_id: &str,
+        original: &ResidencyAcquireRequest,
+    ) -> Reattached {
+        let holder = acquisition.holder.clone();
+        let result = self
+            .operate_residency_rpc(
+                orch,
+                ResidencyOperation::Acquire {
+                    request: acquisition,
+                },
+            )
+            .await;
+        if !matches!(
+            result,
+            ResidencyResult::Failed {
+                kind: ResidencyFailureKind::NotFound,
+                ..
+            }
+        ) {
+            return Reattached::Answered(Box::new(result));
+        }
+        tracing::info!(
+            %holder,
+            executor = %self.executor_name_for_text(executor_id),
+            "the routed executor holds no environment for this owner; placing it through the queue"
+        );
+        self.forget_unheld_route(&holder, executor_id);
+        let remaining = original.wait_horizon_unix_ms.saturating_sub(unix_time_ms());
+        if remaining == 0 {
+            return Reattached::Answered(Box::new(result));
+        }
+        tokio::time::sleep(Duration::from_millis(
+            remaining.min(REATTACH_REFUSED_PACE_MS),
+        ))
+        .await;
+        Reattached::RouteForgotten
+    }
+
+    /// Drop the one route, and the grant evidence beside it, that says
+    /// `executor_id` holds `holder`'s environment after it answered that it
+    /// does not.
+    fn forget_unheld_route(&self, holder: &ResidencyHolder, executor_id: &str) {
+        let key = (executor_id.to_owned(), holder.storage_key());
+        if let Err(error) = self.update_residency_routes(|routes| {
+            routes.remove(&key);
+            self.granted_cells.lock().unwrap().remove(&key);
+        }) {
+            tracing::error!(%error, "persist unheld residency route removal failed");
+        }
+    }
+
     /// One claim on one machine. `retry` is set, with the refusal's sentence,
     /// when the machine granted this attempt refused and another may take it.
     async fn acquire_residency_attempt(
@@ -9690,7 +9779,7 @@ impl Fleet {
             }
             let mut acquisition = original.clone();
             match self.resolve_residency_acquire_route(&mut acquisition) {
-                Ok(Some(_)) => {
+                Ok(Some(selected)) => {
                     // A winner may have entered between the first check and
                     // route resolution. Do not dispatch into its pending route.
                     if self
@@ -9700,14 +9789,13 @@ impl Fleet {
                     {
                         continue;
                     }
-                    return self
-                        .operate_residency_rpc(
-                            orch,
-                            ResidencyOperation::Acquire {
-                                request: acquisition,
-                            },
-                        )
-                        .await;
+                    match self
+                        .reattach_residency(orch, acquisition, &selected.executor_id, original)
+                        .await
+                    {
+                        Reattached::Answered(result) => return *result,
+                        Reattached::RouteForgotten => continue,
+                    }
                 }
                 Ok(None) => {}
                 Err(failure) => return failure,
@@ -9764,19 +9852,19 @@ impl Fleet {
                 self.queue
                     .take(&identity, queue::TerminalState::Cancelled, unix_time_ms());
                 self.binding_changed.notify_waiters();
-                return match routed {
-                    Ok(Some(_)) => {
-                        self.operate_residency_rpc(
-                            orch,
-                            ResidencyOperation::Acquire {
-                                request: acquisition,
-                            },
-                        )
-                        .await
+                match routed {
+                    Ok(Some(selected)) => {
+                        match self
+                            .reattach_residency(orch, acquisition, &selected.executor_id, original)
+                            .await
+                        {
+                            Reattached::Answered(result) => return *result,
+                            Reattached::RouteForgotten => continue,
+                        }
                     }
-                    Err(failure) => failure,
+                    Err(failure) => return failure,
                     Ok(None) => unreachable!(),
-                };
+                }
             }
             break (entry_id, entry_rx, placement, prepared);
         };
@@ -14585,7 +14673,7 @@ impl Fleet {
                     policy,
                     &declined,
                     &view,
-                    repository_sync_cost,
+                    |request, entry| self.priced_sync_cost(request, entry),
                 )
             })
             .await;
@@ -14743,6 +14831,14 @@ impl Fleet {
         }
     }
 
+    /// The sync cost placement reads for `entry`: from the runner's price cache,
+    /// never by walking the repository on the placement path.
+    fn priced_sync_cost(&self, request: &CellRequest, entry: &ExecutorConnectionState) -> SyncCost {
+        repository_sync_cost(request, entry, |repository, roots, target| {
+            self.placement_prices.sync_cost(repository, roots, target)
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     async fn select_executor_once_with(
         &self,
@@ -14796,7 +14892,18 @@ impl Fleet {
                 }
             }
         }
-        let cache_distances = candidate_cache_distances(&estimation_entries, request, now);
+        // Measured once per (candidate, request) here and handed to both
+        // rankings below; a pair not yet priced is absent, which ranks as an
+        // unknown distance, and is ready for the next pass.
+        let cache_distances = candidate_cache_distances_with(
+            &estimation_entries,
+            request,
+            now,
+            |repository, head, target| {
+                self.placement_prices
+                    .cache_distance(repository, head, target)
+            },
+        );
         for entry in &estimation_entries {
             let context = ReservationPlan::context_for(
                 &entry.identity.device_id,
@@ -15796,7 +15903,7 @@ fn choose_executor(
         connections,
         request,
         &HashMap::new(),
-        repository_sync_cost,
+        measured_sync_cost,
         // The fixture clock, not the wall clock. Every fixture machine stamps
         // its last progress at `NOW`, and placement rejects a connection that
         // has been silent past the freshness bound — so reading the real clock
@@ -15806,6 +15913,16 @@ fn choose_executor(
     )?
     .selected
     .map(|(selected, _)| selected))
+}
+
+/// The sync cost a fixture placement prices synchronously, walking the object
+/// graph inline rather than through the runner's background cache.
+#[cfg(test)]
+fn measured_sync_cost(request: &CellRequest, entry: &ExecutorConnectionState) -> SyncCost {
+    repository_sync_cost(request, entry, |repository, roots, target| {
+        pricing::missing_reachable_object_bytes(repository, target, roots)
+            .map_or(SyncCost::Unknown, SyncCost::Known)
+    })
 }
 
 /// Predict every usable candidate with no profile store behind it.
@@ -15916,7 +16033,12 @@ fn choose_executor_with_policy(
     )?;
     let (predictions, sync_costs) =
         prior_predictions(&survey.usable, request, &estimate, now_unix_ms);
-    let cache_distances = candidate_cache_distances(&survey.usable, request, now_unix_ms);
+    let cache_distances = candidate_cache_distances_with(
+        &survey.usable,
+        request,
+        now_unix_ms,
+        |repo, head, target| cairn_common::cache_distance::cache_distance(repo, head, target).ok(),
+    );
     rank_survey(
         request,
         survey,
@@ -18773,16 +18895,6 @@ fn rank_candidates<'a, 'b>(
 /// Measure only the surveyed machines' idle slots for this project. The
 /// caller owns a metadata snapshot, not the connections or queue lock. A
 /// target-labelled last_distance is history and deliberately never read here.
-fn candidate_cache_distances(
-    entries: &[&ExecutorConnectionState],
-    request: &CellRequest,
-    now_unix_ms: u64,
-) -> HashMap<String, cairn_common::cache_distance::CacheDistance> {
-    candidate_cache_distances_with(entries, request, now_unix_ms, |repository, head, target| {
-        cairn_common::cache_distance::cache_distance(repository, head, target).ok()
-    })
-}
-
 fn candidate_cache_distances_with(
     entries: &[&ExecutorConnectionState],
     request: &CellRequest,
@@ -19551,7 +19663,14 @@ fn sync_cost_key(cost: SyncCost) -> (bool, u64) {
     }
 }
 
-fn repository_sync_cost(request: &CellRequest, entry: &ExecutorConnectionState) -> SyncCost {
+/// What moving this request's repository onto `entry` costs. The answers that
+/// need no git are given here; the rest go to `price`, called with the local
+/// repository path, the machine's warm roots for it, and the target commit.
+fn repository_sync_cost(
+    request: &CellRequest,
+    entry: &ExecutorConnectionState,
+    price: impl FnOnce(&str, &[String], &str) -> SyncCost,
+) -> SyncCost {
     if entry.colocated {
         return SyncCost::Known(0);
     }
@@ -19574,83 +19693,7 @@ fn repository_sync_cost(request: &CellRequest, entry: &ExecutorConnectionState) 
     let Some(repository_path) = request.repository.colocated_path() else {
         return SyncCost::Unknown;
     };
-    missing_reachable_object_bytes(repository_path, &request.base_commit, &warm_root_commits)
-        .map(SyncCost::Known)
-        .unwrap_or(SyncCost::Unknown)
-}
-
-// Canonical object bytes are a stable placement approximation, not predicted
-// compressed wire bytes. Pack deltas, Git LFS, submodules, shallow/promisor
-// history, and stale advertised roots can all make the eventual transfer differ.
-fn missing_reachable_object_bytes(
-    repository: &str,
-    base_commit: &str,
-    warm_root_commits: &[String],
-) -> Result<u64, String> {
-    let mut revision_args = vec!["rev-list", "--objects", "--no-object-names", base_commit];
-    let exclusions: Vec<_> = warm_root_commits
-        .iter()
-        .map(|commit| format!("^{commit}"))
-        .collect();
-    revision_args.extend(exclusions.iter().map(String::as_str));
-
-    let objects = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(revision_args)
-        .output()
-        .map_err(|error| format!("failed to enumerate repository objects: {error}"))?;
-    if !objects.status.success() {
-        return Err(String::from_utf8_lossy(&objects.stderr).trim().to_string());
-    }
-    if objects.stdout.is_empty() {
-        return Ok(0);
-    }
-
-    inspect_object_sizes(repository, objects.stdout)
-}
-
-fn inspect_object_sizes(repository: &str, object_ids: Vec<u8>) -> Result<u64, String> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(["cat-file", "--batch-check=%(objectsize)"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to inspect repository objects: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "git cat-file stdin was unavailable".to_string())?;
-    // cat-file writes one response per input line. Feeding all object IDs before
-    // reading its piped stdout deadlocks once both OS pipe buffers fill, which is
-    // routine for a clone-sized repository. Feed stdin concurrently while
-    // wait_with_output drains stdout and stderr.
-    let writer = std::thread::spawn(move || stdin.write_all(&object_ids));
-    let sizes = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to read repository object sizes: {error}"))?;
-    writer
-        .join()
-        .map_err(|_| "git object input writer panicked".to_string())?
-        .map_err(|error| format!("failed to send repository objects to git: {error}"))?;
-    if !sizes.status.success() {
-        return Err(String::from_utf8_lossy(&sizes.stderr).trim().to_string());
-    }
-
-    String::from_utf8(sizes.stdout)
-        .map_err(|error| format!("git returned non-UTF-8 object sizes: {error}"))?
-        .lines()
-        .try_fold(0_u64, |total, size| {
-            let size = size
-                .parse::<u64>()
-                .map_err(|error| format!("git returned invalid object size {size:?}: {error}"))?;
-            total
-                .checked_add(size)
-                .ok_or_else(|| "repository object size total overflowed u64".to_string())
-        })
+    price(repository_path, &warm_root_commits, &request.base_commit)
 }
 
 fn aggregate_batch_learned_estimates(
@@ -20415,7 +20458,7 @@ fn executor_health_snapshot(
         heartbeat_age_ms,
         liveness_age_ms,
         telemetry_stale,
-        advertisement: entry.advertisement.clone(),
+        advertisement: (*entry.advertisement).clone(),
         admission: entry.health.admission.clone(),
         queues: entry.health.queues.clone(),
         host: entry.health.host.clone(),
@@ -22127,7 +22170,13 @@ mod tests {
         let (_, entry) = fleet_entry("dialed-in", "linux", 0, &[]);
 
         assert!(fleet
-            .attach_advertised_executor(entry.advertisement, entry.sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(entry.advertisement),
+                entry.sender,
+                false,
+                None,
+                None
+            )
             .is_err());
 
         // Refused outright rather than half-attached: nothing may be sent a
@@ -23070,20 +23119,33 @@ mod tests {
             .is_err());
     }
 
+    /// More objects than both pipe buffers hold, so the walk only finishes if
+    /// `cat-file`'s answers are drained while `rev-list` is still listing.
     #[test]
-    fn object_size_exchange_drains_output_while_feeding_clone_sized_input() {
+    fn object_size_walk_streams_a_clone_sized_object_list() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
-        write_file(repo.path(), "base.txt", b"base");
+        let files = 20_000_u64;
+        for index in 0..files {
+            write_file(
+                repo.path(),
+                &format!("d{}/f{index:05}.txt", index % 100),
+                format!("{index:07}\n").as_bytes(),
+            );
+        }
         let commit = commit_all(repo.path(), "base");
         let repository = repo.path().to_str().unwrap();
-        let one = inspect_object_sizes(repository, format!("{commit}\n").into_bytes()).unwrap();
-        let count = 100_000_u64;
-        let object_ids = format!("{commit}\n").repeat(count as usize).into_bytes();
-
+        let total = pricing::missing_reachable_object_bytes(repository, &commit, &[]).unwrap();
+        // Every blob is eight bytes; the commit and trees add the rest.
+        assert!(total > files * 8, "{total}");
         assert_eq!(
-            inspect_object_sizes(repository, object_ids).unwrap(),
-            one * count
+            pricing::missing_reachable_object_bytes(
+                repository,
+                &commit,
+                std::slice::from_ref(&commit)
+            )
+            .unwrap(),
+            0
         );
     }
 
@@ -23290,7 +23352,7 @@ mod tests {
     fn dial_remote(pool: &Fleet, executor_id: &str) -> u64 {
         let (_, connection) = fleet_entry(executor_id, "linux", 0, &[]);
         pool.attach_advertised_executor(
-            connection.advertisement,
+            Arc::unwrap_or_clone(connection.advertisement),
             connection.sender,
             false,
             None,
@@ -25644,7 +25706,7 @@ mod tests {
         let mut connections = pool.lock_connections();
         let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
         entry.last_progress_unix_ms = unix_time_ms();
-        entry.advertisement.liveness_observed_at_unix_ms =
+        Arc::make_mut(&mut entry.advertisement).liveness_observed_at_unix_ms =
             Some(unix_time_ms().saturating_sub(age_ms));
         entry.link_clock.stage_facts_recomputed(age_ms);
     }
@@ -25674,11 +25736,12 @@ mod tests {
         let mut connections = pool.lock_connections();
         let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
         let began = unix_time_ms().saturating_sub(LIVENESS_REFRESH_BOUND_MS);
-        entry.advertisement.facts_stale_refresh_blocked = Some(LivenessRefreshBlocked {
-            phase,
-            pass_started_unix_ms: began,
-            phase_entered_unix_ms: began,
-        });
+        Arc::make_mut(&mut entry.advertisement).facts_stale_refresh_blocked =
+            Some(LivenessRefreshBlocked {
+                phase,
+                pass_started_unix_ms: began,
+                phase_entered_unix_ms: began,
+            });
     }
 
     /// The bounce is not free: it ends the executor daemon and every batch
@@ -25888,7 +25951,7 @@ mod tests {
             let mut connections = pool.lock_connections();
             let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
             entry.last_progress_unix_ms = unix_time_ms();
-            entry.advertisement.liveness_observed_at_unix_ms =
+            Arc::make_mut(&mut entry.advertisement).liveness_observed_at_unix_ms =
                 Some(unix_time_ms().saturating_sub(900_000));
             entry.link_clock.stage_facts_recomputed(10_000);
         }
@@ -25934,6 +25997,7 @@ mod tests {
                 .get(COLOCATED_EXECUTOR_ID)
                 .unwrap()
                 .advertisement
+                .as_ref()
                 .clone();
             advertisement.observed_at_unix_ms = unix_time_ms();
             advertisement.liveness_observed_at_unix_ms = liveness_observed_at_unix_ms;
@@ -27073,7 +27137,17 @@ mod tests {
             candidate_cache_distances_with(&[&entry], &request, NOW, |_, _, _| None).is_empty()
         );
         // A real non-repository directory must also fail gracefully through the production measurer.
-        assert!(candidate_cache_distances(&[&entry], &request, NOW).is_empty());
+        let prices = pricing::PlacementPrices::default();
+        for _ in 0..2 {
+            assert!(candidate_cache_distances_with(
+                &[&entry],
+                &request,
+                NOW,
+                |repo, head, target| { prices.cache_distance(repo, head, target) }
+            )
+            .is_empty());
+            prices.settle();
+        }
         request = distance_request(&directory.path().join("absent"));
         assert!(
             candidate_cache_distances_with(&[&entry], &request, NOW, |_, _, _| panic!(
@@ -27535,7 +27609,7 @@ mod tests {
                 machine_role: MachineRole::General,
                 model_residents: Vec::new(),
                 identity: identity.clone(),
-                advertisement: ExecutorAdvertisement {
+                advertisement: Arc::new(ExecutorAdvertisement {
                     identity,
                     capabilities: ExecutorCapabilities {
                         os: os.into(),
@@ -27572,7 +27646,7 @@ mod tests {
                     facts_stale_refresh_blocked: None,
                     last_refresh: None,
                     node_scratches: Vec::new(),
-                },
+                }),
                 generation: 1,
                 sender,
                 snapshot: Arc::default(),
@@ -28021,7 +28095,9 @@ mod tests {
             ),
         ] {
             let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-            entry.advertisement.capabilities.memory_budget_bytes = budget;
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .memory_budget_bytes = budget;
             measured_at(&mut entry, cpu, available, 500 * GIB, now);
             if !measured {
                 connections.insert(id, entry);
@@ -28067,7 +28143,9 @@ mod tests {
         let mut measured_on = None;
         for (id, total) in [("bgsrv-ub", 13_000_000_000_u64), ("other", other_total)] {
             let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-            entry.advertisement.capabilities.memory_budget_bytes = Some(total / 100 * 85);
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .memory_budget_bytes = Some(total / 100 * 85);
             measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
             Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
                 now,
@@ -28145,7 +28223,9 @@ mod tests {
             .unwrap()
         };
         let (id, mut entry) = answering_fleet_entry("bgsrv-ub", "linux", 0, &[]);
-        entry.advertisement.capabilities.memory_budget_bytes = Some(11_042_782_208);
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .memory_budget_bytes = Some(11_042_782_208);
         {
             let health = Arc::make_mut(&mut entry.health);
             health.machine.memory = Measurement::measured(
@@ -28346,7 +28426,9 @@ mod tests {
         let pool = Fleet::default();
         let now = unix_time_ms();
         let (id, mut entry) = answering_fleet_entry("bgsrv-ub", "linux", 0, &[]);
-        entry.advertisement.capabilities.memory_budget_bytes = Some(11_042_782_208);
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .memory_budget_bytes = Some(11_042_782_208);
         let kill =
             |pid: u32, at: u64, command: &str| cairn_common::executor_protocol::OomKillReport {
                 killed_at_unix_ms: at,
@@ -28522,7 +28604,9 @@ mod tests {
             let mut small = None;
             for (id, total) in [("bgsrv-ub", 12_992_276_070_u64), ("bbs", 62 * GIB)] {
                 let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-                entry.advertisement.capabilities.memory_budget_bytes = Some(total / 100 * 85);
+                Arc::make_mut(&mut entry.advertisement)
+                    .capabilities
+                    .memory_budget_bytes = Some(total / 100 * 85);
                 measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
                 Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
                     now,
@@ -28673,7 +28757,9 @@ mod tests {
         let now = unix_time_ms();
         let total = 24 * GIB;
         let (id, mut entry) = fleet_entry_at("bgsrv-mac", "macos", 0, &[], now);
-        entry.advertisement.capabilities.memory_budget_bytes = Some(total / 100 * 85);
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .memory_budget_bytes = Some(total / 100 * 85);
         measured_at(&mut entry, 0.01, total - 3 * GIB, 500 * GIB, now);
         Arc::make_mut(&mut entry.health).machine.memory = Measurement::measured(
             now,
@@ -28992,7 +29078,9 @@ mod tests {
             ("fedora", 100 * GIB, 60 * GIB),
         ] {
             let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
-            entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .memory_budget_bytes = Some(budget);
             measured_at(&mut entry, 0.01, available, 500 * GIB, now);
             if id == "bgsrv-ub" {
                 // The size it had when the kernel killed the command there.
@@ -29297,7 +29385,9 @@ mod tests {
             ("fedora", "linux", 125 * GIB, true),
         ] {
             let (id, mut entry) = fleet_entry_at(id, os, 0, &[], now);
-            entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .memory_budget_bytes = Some(budget);
             runtime_update_hold_fixture(&mut entry, update_hold);
             measured_at(&mut entry, 0.01, budget, 500 * GIB, now);
             resource_profiles::seed_memory_profile_for_test(
@@ -29382,7 +29472,9 @@ mod tests {
         let mut connections = HashMap::new();
         for id in ["bgsrv-mac", "bgsrv-mac-2"] {
             let (id, mut entry) = fleet_entry_at(id, "macos", 0, &[], now);
-            entry.advertisement.capabilities.memory_budget_bytes = Some(11_042_782_208);
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .memory_budget_bytes = Some(11_042_782_208);
             measured_at(&mut entry, 0.01, 10 * GIB, 500 * GIB, now);
             resource_profiles::seed_memory_profile_for_test(
                 db.clone(),
@@ -29658,8 +29750,8 @@ mod tests {
     fn zero_unit_request_ignores_unmeasured_running_cargo_when_capacity_is_free() {
         let (_, mut entry) = fleet_entry("local", "linux", 0, &[]);
         measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-        entry.advertisement.observed_at_unix_ms = NOW;
-        entry.advertisement.liveness_observed_at_unix_ms = Some(NOW);
+        Arc::make_mut(&mut entry.advertisement).observed_at_unix_ms = NOW;
+        Arc::make_mut(&mut entry.advertisement).liveness_observed_at_unix_ms = Some(NOW);
         Arc::make_mut(&mut entry.health)
             .admission
             .concurrency_capacity = Some(14);
@@ -29698,8 +29790,8 @@ mod tests {
     fn full_machine_forecasts_the_kth_capacity_release_not_the_sum() {
         let (_, mut entry) = fleet_entry("local", "linux", 0, &[]);
         measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
-        entry.advertisement.observed_at_unix_ms = NOW;
-        entry.advertisement.liveness_observed_at_unix_ms = Some(NOW);
+        Arc::make_mut(&mut entry.advertisement).observed_at_unix_ms = NOW;
+        Arc::make_mut(&mut entry.advertisement).liveness_observed_at_unix_ms = Some(NOW);
         Arc::make_mut(&mut entry.health)
             .admission
             .concurrency_capacity = Some(4);
@@ -32247,7 +32339,7 @@ mod tests {
             MachineSample::of_report(&fresh)
         };
         let beat = |id: &str, machine: Option<MachineSample>| {
-            let advertisement = pool.lock_connections()[id].advertisement.clone();
+            let advertisement = pool.lock_connections()[id].advertisement.as_ref().clone();
             assert!(pool.handle_executor_message(
                 id,
                 1,
@@ -33245,7 +33337,13 @@ mod tests {
         assert_eq!(fedora(&fleet).map(|stranded| stranded.refusals), Some(3));
         let (_, entry) = fleet_entry("fedora", "linux", 0, &[]);
         let generation = fleet
-            .attach_advertised_executor(entry.advertisement, entry.sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(entry.advertisement),
+                entry.sender,
+                false,
+                None,
+                None,
+            )
             .expect("fedora attaches");
         assert!(fleet.disconnect_advertised_executor("fedora", generation));
         assert_eq!(fedora(&fleet), None, "attaching ends the run of refusals");
@@ -33343,7 +33441,13 @@ mod tests {
         fleet.declare_enrolled_remote("sp1", "sp1", "linux", "aarch64");
         let (_, first) = fleet_entry("sp1", "linux", 0, &[]);
         let generation = fleet
-            .attach_advertised_executor(first.advertisement, first.sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(first.advertisement),
+                first.sender,
+                false,
+                None,
+                None,
+            )
             .expect("generation 1 attaches");
         assert!(fleet.disconnect_advertised_executor("sp1", generation));
         assert!(
@@ -33366,7 +33470,13 @@ mod tests {
         assert!(!waiting.is_finished(), "no generation is attached yet");
         let (_, second) = fleet_entry("sp1", "linux", 0, &[]);
         let later = fleet
-            .attach_advertised_executor(second.advertisement, second.sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(second.advertisement),
+                second.sender,
+                false,
+                None,
+                None,
+            )
             .expect("generation 2 attaches");
 
         assert!(later > generation);
@@ -33950,11 +34060,14 @@ mod tests {
             let (key, mut entry) = fleet_entry(id, "linux", 0, &[]);
             measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
             entry.machine_role = role;
-            entry.advertisement.capabilities.toolchains =
-                toolchains.iter().map(|name| name.to_string()).collect();
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .toolchains = toolchains.iter().map(|name| name.to_string()).collect();
             // Enrolled without `--project`, as a service box is: a scratch-only
             // residency's project is its service id, which no project list names.
-            entry.advertisement.capabilities.projects_served = Vec::new();
+            Arc::make_mut(&mut entry.advertisement)
+                .capabilities
+                .projects_served = Vec::new();
             (key, entry)
         };
         let mut connections = HashMap::from([
@@ -34763,7 +34876,7 @@ mod tests {
     fn a_stale_connection_keeps_the_measurements_it_last_carried() {
         let pool = Fleet::default();
         let (executor_id, connection) = fleet_entry("gone-quiet", "macos", 0, &[]);
-        let mut advertisement = connection.advertisement.clone();
+        let mut advertisement = connection.advertisement.as_ref().clone();
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
 
@@ -34813,8 +34926,14 @@ mod tests {
         let (colocated_sender, _colocated_receiver) = mpsc::unbounded_channel();
         pool.attach_executor(colocated_sender);
         let (_, managed) = fleet_entry("managed", "linux", 0, &[]);
-        pool.attach_advertised_executor(managed.advertisement, managed.sender, false, None, None)
-            .expect("attach");
+        pool.attach_advertised_executor(
+            Arc::unwrap_or_clone(managed.advertisement),
+            managed.sender,
+            false,
+            None,
+            None,
+        )
+        .expect("attach");
 
         let attribution: Vec<_> = pool
             .executor_health(1)
@@ -35325,14 +35444,16 @@ mod tests {
             fleet_entry("bgsrv-ub", "linux", 0, &[]),
             fleet_entry("bglab-win", "windows", 0, &[]),
         ]);
-        connections
-            .get_mut(COLOCATED_EXECUTOR_ID)
-            .unwrap()
-            .advertisement
-            .capabilities
-            .sandbox = Some(floored);
+        Arc::make_mut(
+            &mut connections
+                .get_mut(COLOCATED_EXECUTOR_ID)
+                .unwrap()
+                .advertisement,
+        )
+        .capabilities
+        .sandbox = Some(floored);
         let mac = connections.get_mut("bgsrv-mac").unwrap();
-        mac.advertisement.capabilities.sandbox = Some(capable);
+        Arc::make_mut(&mut mac.advertisement).capabilities.sandbox = Some(capable);
         runtime_update_hold_fixture(mac, true);
         let mut request = targeted_request("macos");
         request.executor = Some(ExecutorSelector {
@@ -35371,12 +35492,14 @@ mod tests {
 
         // Just attached, before its first sandbox probe has reported: a wait
         // with an age, not evidence that the capability is absent.
-        connections
-            .get_mut(COLOCATED_EXECUTOR_ID)
-            .unwrap()
-            .advertisement
-            .capabilities
-            .sandbox = None;
+        Arc::make_mut(
+            &mut connections
+                .get_mut(COLOCATED_EXECUTOR_ID)
+                .unwrap()
+                .advertisement,
+        )
+        .capabilities
+        .sandbox = None;
         let refusal = place(&connections, &request).unwrap_err();
         assert!(
             refusal.contains(
@@ -35390,7 +35513,7 @@ mod tests {
     fn heartbeat_refreshes_live_executor_health_report() {
         let pool = Fleet::default();
         let (executor_id, connection) = fleet_entry("live", "macos", 0, &[]);
-        let mut advertisement = connection.advertisement.clone();
+        let mut advertisement = connection.advertisement.as_ref().clone();
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
 
@@ -35464,7 +35587,7 @@ mod tests {
     fn a_beat_on_schedule_carrying_facts_that_stopped_moving_is_not_online() {
         let pool = Fleet::default();
         let (executor_id, connection) = fleet_entry("wedged", "macos", 0, &[]);
-        let mut advertisement = connection.advertisement.clone();
+        let mut advertisement = connection.advertisement.as_ref().clone();
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
 
@@ -35524,7 +35647,7 @@ mod tests {
     fn an_executor_that_reports_no_payload_age_is_judged_on_its_heartbeat() {
         let pool = Fleet::default();
         let (executor_id, connection) = fleet_entry("silent-about-age", "macos", 0, &[]);
-        let mut advertisement = connection.advertisement.clone();
+        let mut advertisement = connection.advertisement.as_ref().clone();
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
 
@@ -35614,7 +35737,7 @@ mod tests {
         let (_, connection) = fleet_entry(&executor_id, "macos", 0, &[]);
         let generation = pool
             .attach_advertised_executor(
-                connection.advertisement,
+                Arc::unwrap_or_clone(connection.advertisement),
                 connection.sender,
                 false,
                 None,
@@ -35946,13 +36069,15 @@ mod tests {
         );
 
         let unserved = two_remotes();
-        unserved
-            .lock_connections()
-            .get_mut("fast")
-            .unwrap()
-            .advertisement
-            .capabilities
-            .projects_served = vec!["another-project".into()];
+        Arc::make_mut(
+            &mut unserved
+                .lock_connections()
+                .get_mut("fast")
+                .unwrap()
+                .advertisement,
+        )
+        .capabilities
+        .projects_served = vec!["another-project".into()];
         assert_relief_near(
             &unserved.occupancy_for_at(scope, NOW),
             300_000,
@@ -36677,7 +36802,13 @@ mod tests {
         let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
         let generation = orch
             .fleet
-            .attach_advertised_executor(advertised.advertisement, sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(advertised.advertisement),
+                sender,
+                false,
+                None,
+                None,
+            )
             .expect("attach an enrolled machine");
 
         let mut request = provenance_request();
@@ -36791,7 +36922,13 @@ mod tests {
         let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
         let generation = orch
             .fleet
-            .attach_advertised_executor(advertised.advertisement, sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(advertised.advertisement),
+                sender,
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let mut request = provenance_request();
         request.repository = RepositoryLocator::ScratchOnly {
@@ -37835,7 +37972,13 @@ mod tests {
         let (sender, mut remote) = mpsc::unbounded_channel();
         let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
         orch.fleet
-            .attach_advertised_executor(advertised.advertisement, sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(advertised.advertisement),
+                sender,
+                false,
+                None,
+                None,
+            )
             .expect("attach an enrolled machine");
 
         let mut request = provenance_request();
@@ -37911,7 +38054,13 @@ mod tests {
         let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
         let generation = orch
             .fleet
-            .attach_advertised_executor(advertised.advertisement, sender, false, None, None)
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(advertised.advertisement),
+                sender,
+                false,
+                None,
+                None,
+            )
             .expect("attach an enrolled machine");
 
         let mut request = provenance_request();
@@ -38980,8 +39129,9 @@ mod tests {
         let base = commit_all(repo.path(), "base");
 
         let cold =
-            missing_reachable_object_bytes(repo.path().to_str().unwrap(), &base, &[]).unwrap();
-        let incremental = missing_reachable_object_bytes(
+            pricing::missing_reachable_object_bytes(repo.path().to_str().unwrap(), &base, &[])
+                .unwrap();
+        let incremental = pricing::missing_reachable_object_bytes(
             repo.path().to_str().unwrap(),
             &base,
             std::slice::from_ref(&warm),
@@ -38994,20 +39144,145 @@ mod tests {
         init_repo(unrelated_repo.path());
         write_file(unrelated_repo.path(), "other.txt", b"other");
         let unrelated = commit_all(unrelated_repo.path(), "other");
-        assert!(
-            missing_reachable_object_bytes(repo.path().to_str().unwrap(), &base, &[unrelated],)
-                .is_err()
-        );
+        assert!(pricing::missing_reachable_object_bytes(
+            repo.path().to_str().unwrap(),
+            &base,
+            &[unrelated],
+        )
+        .is_err());
     }
 
     #[test]
     fn warm_root_is_zero_only_for_the_requested_repository() {
         let (_, mut entry) = fleet_entry("warm", "linux", 0, &["base"]);
         let request = targeted_request("linux");
-        assert_eq!(repository_sync_cost(&request, &entry), SyncCost::Known(0));
+        assert_eq!(measured_sync_cost(&request, &entry), SyncCost::Known(0));
 
-        entry.advertisement.warm_roots[0].repository.repository_id = "other-repo".into();
-        assert_eq!(repository_sync_cost(&request, &entry), SyncCost::Unknown);
+        Arc::make_mut(&mut entry.advertisement).warm_roots[0]
+            .repository
+            .repository_id = "other-repo".into();
+        assert_eq!(measured_sync_cost(&request, &entry), SyncCost::Unknown);
+    }
+
+    /// Each sync walk a counted runner was asked for: (target, warm roots).
+    type WalkLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+    /// Each distance a counted runner was asked for: (slot head, target).
+    type MeasureLog = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// A runner whose repository prices are counted rather than computed, with
+    /// two remote candidates that advertise the same warm root and one idle
+    /// slot at the same head.
+    fn priced_fleet() -> (Fleet, WalkLog, MeasureLog, tempfile::TempDir) {
+        let walks = Arc::new(Mutex::new(Vec::new()));
+        let measures = Arc::new(Mutex::new(Vec::new()));
+        let (walked, measured) = (Arc::clone(&walks), Arc::clone(&measures));
+        let pool = Fleet {
+            placement_prices: Arc::new(pricing::PlacementPrices::with(
+                move |_, target, roots| {
+                    walked
+                        .lock()
+                        .unwrap()
+                        .push((target.to_owned(), roots.to_vec()));
+                    Ok(4096)
+                },
+                move |_, head, target| {
+                    measured
+                        .lock()
+                        .unwrap()
+                        .push((head.to_owned(), target.to_owned()));
+                    Some(cairn_common::cache_distance::CacheDistance {
+                        files: 3,
+                        ..Default::default()
+                    })
+                },
+            )),
+            ..Fleet::default()
+        };
+        for id in ["first", "second"] {
+            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &["warm"], unix_time_ms());
+            let health = Arc::make_mut(&mut entry.health);
+            health.inventory.authority = InventoryAuthorityState::Authoritative;
+            health.slots = vec![distance_slot("near")];
+            pool.lock_connections().insert(id, entry);
+        }
+        (pool, walks, measures, tempfile::tempdir().unwrap())
+    }
+
+    fn place_priced(pool: &Fleet, request: &CellRequest) -> PlacementSelection {
+        let placement = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pool.select_executor_once_with(
+                request,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |request, entry| pool.priced_sync_cost(request, entry),
+            ))
+            .unwrap()
+            .placed()
+            .unwrap();
+        match placement.decision.outcome {
+            PlacementOutcome::Selected(selection) => *selection,
+            other => panic!("expected a selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unpriced_pair_places_unmeasured_and_the_next_placement_reads_its_price() {
+        let (pool, walks, measures, directory) = priced_fleet();
+        let request = distance_request(directory.path());
+
+        let first = place_priced(&pool, &request);
+        assert_eq!(first.sync_cost, PlacementSyncCost::Unknown);
+        assert_eq!(first.cache_distance, None);
+
+        pool.placement_prices.settle();
+        let second = place_priced(&pool, &request);
+        assert_eq!(second.sync_cost, PlacementSyncCost::Known { bytes: 4096 });
+        assert_eq!(
+            second
+                .cache_distance
+                .map(|measured| measured.distance.files),
+            Some(3)
+        );
+        // Two candidates sharing a warm root and a slot head: one computation
+        // of each price, for this request's target.
+        assert_eq!(
+            *walks.lock().unwrap(),
+            vec![("current-target".to_owned(), vec!["warm".to_owned()])]
+        );
+        assert_eq!(
+            *measures.lock().unwrap(),
+            vec![("near".to_owned(), "current-target".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_priced_target_is_placed_again_without_starting_git() {
+        let (pool, walks, measures, directory) = priced_fleet();
+        let request = distance_request(directory.path());
+        place_priced(&pool, &request);
+        pool.placement_prices.settle();
+        let started = pool.placement_prices.computations_started();
+        assert_eq!(started, 2);
+
+        for _ in 0..5 {
+            place_priced(&pool, &request);
+        }
+        pool.placement_prices.settle();
+        assert_eq!(pool.placement_prices.computations_started(), started);
+        assert_eq!(walks.lock().unwrap().len(), 1);
+        assert_eq!(measures.lock().unwrap().len(), 1);
+
+        // A new target is new pairs: priced once more, then never again.
+        let mut next = request.clone();
+        next.base_commit = "next-target".into();
+        place_priced(&pool, &next);
+        pool.placement_prices.settle();
+        place_priced(&pool, &next);
+        assert_eq!(pool.placement_prices.computations_started(), started + 2);
     }
 
     #[test]
@@ -41071,7 +41346,7 @@ mod tests {
         let (_, advertised) = fleet_entry(id, os, 0, &[]);
         let generation = pool
             .attach_advertised_executor(
-                advertised.advertisement,
+                Arc::unwrap_or_clone(advertised.advertisement),
                 sender,
                 id == COLOCATED_EXECUTOR_ID,
                 None,
@@ -42001,6 +42276,7 @@ mod tests {
                     .get(COLOCATED_EXECUTOR_ID)
                     .unwrap()
                     .advertisement
+                    .as_ref()
                     .clone();
                 fleet.handle_executor_message(
                     COLOCATED_EXECUTOR_ID,
@@ -43730,7 +44006,10 @@ mod tests {
     fn an_attached_machine_on_the_platform_without_the_toolchain_leaves_it_unplaceable() {
         let fleet = windows_check_fleet();
         let (id, mut windows) = fleet_entry("bgsrv-win", "windows", 0, &[]);
-        windows.advertisement.capabilities.toolchains.clear();
+        Arc::make_mut(&mut windows.advertisement)
+            .capabilities
+            .toolchains
+            .clear();
         fleet.lock_connections().insert(id, windows);
         let reason = fleet
             .unplaceable_reason(Some(&rust_selector()), &["windows".to_string()])
@@ -45099,6 +45378,92 @@ mod tests {
             }).await;
     }
 
+    /// A route can outlive the environment it names: the executor released or
+    /// reclaimed the residency, and answers a reattachment that it holds
+    /// nothing to converge on. Reattaching again would get that answer
+    /// forever, which is how a service's automatic restarts were refused until
+    /// it failed (cairn/6528). The fleet forgets the route and places the same
+    /// acquisition through the queue, so it is granted a fresh environment.
+    #[tokio::test]
+    async fn residency_reattachment_to_a_released_environment_is_placed_through_the_queue() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let request = residency_queue_request("released");
+            let (first, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    let entry = residency_queue_offer(&mut remote).await;
+                    orch.fleet.handle_executor_message(
+                        "remote",
+                        generation,
+                        ExecutorMessage::Claim {
+                            entry_id: entry.clone(),
+                        },
+                    );
+                    let (correlation, granted) =
+                        residency_queue_grant(&mut remote, Some(&entry)).await;
+                    residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
+                }
+            );
+            assert!(matches!(first, ResidencyResult::State { .. }), "{first:?}");
+            assert_eq!(orch.fleet.residency_routes.lock().unwrap().len(), 1);
+
+            let mut again = request.clone();
+            again.waiting_since_unix_ms = unix_time_ms();
+            again.wait_horizon_unix_ms = unix_time_ms() + 10_000;
+            let (second, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: again.clone()
+                    }
+                ),
+                async {
+                    let (correlation, reattach) = residency_queue_grant(&mut remote, None).await;
+                    assert_eq!(reattach.holder, request.holder);
+                    orch.fleet.handle_executor_message(
+                        "remote",
+                        generation,
+                        ExecutorMessage::ResidencyResponse {
+                            correlation_id: correlation,
+                            result: residency_core_failure(
+                                ResidencyFailureKind::NotFound,
+                                "residency acquisition cannot converge; the runner must place this acquisition through the execution queue",
+                                None,
+                            ),
+                        },
+                    );
+                    let entry = residency_queue_offer(&mut remote).await;
+                    assert!(
+                        orch.fleet.residency_routes.lock().unwrap().is_empty(),
+                        "the route to the released environment is forgotten"
+                    );
+                    orch.fleet.handle_executor_message(
+                        "remote",
+                        generation,
+                        ExecutorMessage::Claim {
+                            entry_id: entry.clone(),
+                        },
+                    );
+                    let (correlation, granted) =
+                        residency_queue_grant(&mut remote, Some(&entry)).await;
+                    residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
+                }
+            );
+            assert!(matches!(second, ResidencyResult::State { .. }), "{second:?}");
+            assert_eq!(orch.fleet.residency_routes.lock().unwrap().len(), 1);
+            assert_eq!(orch.fleet.queue.len(), 0);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn residency_queue_claim_then_route_persistence_failure_has_no_object_authority() {
         residency_queue_scenario(async {
@@ -45171,7 +45536,9 @@ mod tests {
     const SETUP: &str = "setup-bun-install";
 
     fn advertising(entry: &mut ExecutorConnectionState, toolchains: &[&str]) {
-        entry.advertisement.capabilities.toolchains = toolchains
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .toolchains = toolchains
             .iter()
             .map(|toolchain| toolchain.to_string())
             .collect();
@@ -45234,23 +45601,24 @@ mod tests {
     }
 
     fn probed(entry: &mut ExecutorConnectionState, bun_detected: bool) {
-        entry.advertisement.capabilities.toolchain_detection =
-            Some(cairn_common::executor_protocol::ToolchainDetection {
-                account: "dev".into(),
-                home: "/home/dev".into(),
-                probes: vec![cairn_common::executor_protocol::ToolchainProbe {
-                    toolchain: "bun".into(),
-                    command: "bun --version".into(),
-                    detected: bun_detected,
-                    resolved_path: bun_detected.then(|| "/home/dev/.bun/bin/bun".into()),
-                    detail: if bun_detected {
-                        "1.2.3".into()
-                    } else {
-                        "could not run: No such file or directory".into()
-                    },
-                    build_sha256: None,
-                }],
-            });
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .toolchain_detection = Some(cairn_common::executor_protocol::ToolchainDetection {
+            account: "dev".into(),
+            home: "/home/dev".into(),
+            probes: vec![cairn_common::executor_protocol::ToolchainProbe {
+                toolchain: "bun".into(),
+                command: "bun --version".into(),
+                detected: bun_detected,
+                resolved_path: bun_detected.then(|| "/home/dev/.bun/bin/bun".into()),
+                detail: if bun_detected {
+                    "1.2.3".into()
+                } else {
+                    "could not run: No such file or directory".into()
+                },
+                build_sha256: None,
+            }],
+        });
         advertising(entry, if bun_detected { &["bun"] } else { &[] });
     }
 
@@ -45380,8 +45748,9 @@ mod tests {
         use cairn_common::executor_protocol::{BuildPrerequisiteCheck, BuildPrerequisiteStatus};
         let (_, mut bbs) = fleet_entry("bbs", "linux", 0, &[]);
         advertising(&mut bbs, &["bun", "rust"]);
-        bbs.advertisement.capabilities.build_prerequisites =
-            Some(prerequisites(BuildPrerequisiteStatus::Missing));
+        Arc::make_mut(&mut bbs.advertisement)
+            .capabilities
+            .build_prerequisites = Some(prerequisites(BuildPrerequisiteStatus::Missing));
         let rust_lane = |scripts: &[&str], toolchains: &[&str], setup: &[&str]| {
             let mut request = spillable_request();
             request.executor = (!toolchains.is_empty()).then(|| ExecutorSelector {
@@ -45426,7 +45795,9 @@ mod tests {
             Some(prerequisites(BuildPrerequisiteStatus::Unchecked)),
             None,
         ] {
-            bbs.advertisement.capabilities.build_prerequisites = unknown;
+            Arc::make_mut(&mut bbs.advertisement)
+                .capabilities
+                .build_prerequisites = unknown;
             assert_eq!(
                 verdict(
                     &bbs,
@@ -45438,7 +45809,7 @@ mod tests {
         // A MISSING from a probe whose script died on the shell's own error
         // about its staged copy, as executors before the staging fix reported
         // it, is not a verdict about the machine.
-        bbs.advertisement.capabilities.build_prerequisites = Some(BuildPrerequisiteCheck {
+        Arc::make_mut(&mut bbs.advertisement).capabilities.build_prerequisites = Some(BuildPrerequisiteCheck {
             detail: "/var/folders/k1/T/cairn-prerequisite-b440083b/setup-self-hosted-runner-linux.sh: line 26: /var/folders/k1/T/cairn-prerequisite-b440083b/lib/runner-isolation.sh: No such file or directory".into(),
             ..prerequisites(BuildPrerequisiteStatus::Missing)
         });
@@ -45450,8 +45821,9 @@ mod tests {
             None
         );
         // A re-attach whose verdict reads satisfied lifts it.
-        bbs.advertisement.capabilities.build_prerequisites =
-            Some(prerequisites(BuildPrerequisiteStatus::Satisfied));
+        Arc::make_mut(&mut bbs.advertisement)
+            .capabilities
+            .build_prerequisites = Some(prerequisites(BuildPrerequisiteStatus::Satisfied));
         assert_eq!(
             verdict(
                 &bbs,
@@ -45476,7 +45848,9 @@ mod tests {
     fn windows_without_clang_cl() -> ExecutorConnectionState {
         let (_, mut win) = fleet_entry("bgsrv-win", "windows", 0, &[]);
         advertising(&mut win, &["bun", "rust"]);
-        win.advertisement.capabilities.build_prerequisites = Some(missing_clang_cl());
+        Arc::make_mut(&mut win.advertisement)
+            .capabilities
+            .build_prerequisites = Some(missing_clang_cl());
         win
     }
 
@@ -45582,11 +45956,12 @@ mod tests {
 
         // The verdict a re-attach brings once clang-cl is installed lets the
         // environment in.
-        win.advertisement.capabilities.build_prerequisites =
-            Some(cairn_common::executor_protocol::BuildPrerequisiteCheck {
-                status: cairn_common::executor_protocol::BuildPrerequisiteStatus::Satisfied,
-                ..missing_clang_cl()
-            });
+        Arc::make_mut(&mut win.advertisement)
+            .capabilities
+            .build_prerequisites = Some(cairn_common::executor_protocol::BuildPrerequisiteCheck {
+            status: cairn_common::executor_protocol::BuildPrerequisiteStatus::Satisfied,
+            ..missing_clang_cl()
+        });
         assert!(!gated(&win, &home));
     }
 
@@ -45596,7 +45971,10 @@ mod tests {
         let pool = Fleet::default();
         let (id, mut entry) = fleet_entry("bgsrv-ub2", "linux", 0, &[]);
         advertising(&mut entry, &[]);
-        entry.advertisement.capabilities.projects_served.clear();
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .projects_served
+            .clear();
         pool.lock_connections().insert(id, entry);
         pool.known_project_requirements.lock().unwrap().extend([
             ("p".to_string(), project_needs(&["bun"], &[])),
@@ -45647,7 +46025,10 @@ mod tests {
         let pool = Fleet::default();
         let (id, mut entry) = fleet_entry("bgsrv-ub2", "linux", 0, &[]);
         // Serves every project, so only the refusal can tell p from q.
-        entry.advertisement.capabilities.projects_served.clear();
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .projects_served
+            .clear();
         pool.lock_connections().insert(id, entry);
         let outcome = pool.note_preparation_refusal(
             not_found("bun install --frozen-lockfile", "bun"),
@@ -45716,12 +46097,13 @@ mod tests {
     }
 
     fn github(entry: &mut ExecutorConnectionState, state: Option<GithubCredentialState>) {
-        entry.advertisement.capabilities.github_credential =
-            state.map(|state| GithubCredentialEvidence {
-                state,
-                measured_at_unix_ms: NOW,
-                probed_repositories: Vec::new(),
-            });
+        Arc::make_mut(&mut entry.advertisement)
+            .capabilities
+            .github_credential = state.map(|state| GithubCredentialEvidence {
+            state,
+            measured_at_unix_ms: NOW,
+            probed_repositories: Vec::new(),
+        });
     }
 
     fn needs_github() -> ProjectPlacementRequirements {

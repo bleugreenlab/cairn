@@ -69,6 +69,9 @@ pub(crate) struct OneShotOutput {
 pub(crate) enum ServicePlacementHealth {
     Ready,
     ExecutorOffline,
+    /// A start found the residency gone: its executor no longer holds it, or
+    /// no executor routes it at all. The next start reacquires.
+    ResidencyGone,
     ProcessDown {
         process_key: String,
         exit_code: Option<i32>,
@@ -680,6 +683,34 @@ impl LeaseCore {
         if !matches!(self.health(), ServicePlacementHealth::Ready) {
             self.recover().await?;
         }
+        match self.start_once(key, role, launch).await {
+            Ok(subscription) => Ok(subscription),
+            // The fence names an environment that is gone, so every start
+            // under it is refused the same way until renewal happens to fail
+            // and recover. Recover now, through the same acquisition renewal
+            // uses, and start once more on the new fence. A refusal that only
+            // says the machine is not answering is not this, and is returned.
+            Err(StartRefusal {
+                residency_gone: true,
+                error,
+            }) => {
+                tracing::info!(%error, holder = %self.current_fence().holder, "the service residency is gone; reacquiring before starting");
+                *self.health.lock().unwrap() = ServicePlacementHealth::ResidencyGone;
+                self.recover().await?;
+                self.start_once(key, role, launch)
+                    .await
+                    .map_err(|refusal| refusal.error)
+            }
+            Err(refusal) => Err(refusal.error),
+        }
+    }
+
+    async fn start_once(
+        &self,
+        key: &str,
+        role: &str,
+        launch: &ResidentLaunch,
+    ) -> Result<ResidentSubscription, StartRefusal> {
         let fence = self.current_fence();
         let process_key = key.to_string();
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -716,7 +747,25 @@ impl LeaseCore {
             Ok(generation) => generation,
             Err(error) => {
                 self.routes.lock().unwrap().remove(&process_key);
-                return Err(error);
+                let residency_gone = match &result {
+                    ResidencyResult::Failed {
+                        kind: ResidencyFailureKind::NotFound | ResidencyFailureKind::StaleEpoch,
+                        ..
+                    } => true,
+                    ResidencyResult::Failed {
+                        kind: ResidencyFailureKind::Unavailable,
+                        ..
+                    } => self
+                        .orch
+                        .fleet
+                        .residency_route_executor(&fence.holder)
+                        .is_none(),
+                    _ => false,
+                };
+                return Err(StartRefusal {
+                    error,
+                    residency_gone,
+                });
             }
         };
         if let Some(route) = self.routes.lock().unwrap().get_mut(&process_key) {
@@ -791,6 +840,13 @@ impl LeaseCore {
             .await
             .map_err(ServicePlacementError::Operation)
     }
+}
+
+/// A start the executor or the route table refused, and whether the refusal
+/// says the lease's residency is gone rather than unreachable.
+struct StartRefusal {
+    error: ServicePlacementError,
+    residency_gone: bool,
 }
 
 /// What a lease refuses before it places anything.
