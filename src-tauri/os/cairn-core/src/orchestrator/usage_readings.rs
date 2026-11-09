@@ -94,7 +94,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let db = LocalDb::open(root.join("orch.db")).await.unwrap();
+        let db = LocalDb::open_migrated_for_test(root.join("orch.db"))
+            .await
+            .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
         let db_state = Arc::new(DbState::new(Arc::new(db), search));
         let services = Arc::new(TestServicesBuilder::new().build());

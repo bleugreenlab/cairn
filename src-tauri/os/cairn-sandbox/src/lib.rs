@@ -296,6 +296,29 @@ pub fn sandbox_capability_evidence() -> cairn_common::executor_protocol::Sandbox
     evidence
 }
 
+/// Keeps this process's sandbox violation stream running while held.
+///
+/// A fenced spawn whose denials will be read back ([`detect_denial`],
+/// [`IsolatedChild::denials_since`]) takes one before it spawns and keeps it
+/// until it has read them, because the stream only sees denials made while it
+/// runs. The stream is shared by every holder and stops a minute after the
+/// last is dropped, so a process with nothing fenced in flight runs no `log`
+/// process. Inert off macOS, where no denied path is recovered out of band.
+#[must_use = "the violation stream stops once the last watch is dropped"]
+pub struct ViolationWatch {
+    #[cfg(target_os = "macos")]
+    _lease: macos::ViolationLease,
+}
+
+/// Start or join this process's violation stream; see [`ViolationWatch`].
+/// Blocks for up to two seconds when it starts one.
+pub fn watch_violations() -> ViolationWatch {
+    ViolationWatch {
+        #[cfg(target_os = "macos")]
+        _lease: macos::watch_violations(),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn violation_recovery() -> Option<cairn_common::executor_protocol::ViolationRecoveryEvidence> {
     Some(macos::violation_recovery())

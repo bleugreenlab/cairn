@@ -1550,6 +1550,15 @@ async fn execute_process(
     let sandboxed = fence_mode.is_some();
     let confinement = run_confinement.into_confinement();
     let floored = matches!(confinement, sandbox::Confinement::CredentialFloor);
+    // Held until the denial below is classified: the violation stream only
+    // sees denials made while it runs.
+    let _violation_watch = if sandboxed {
+        tokio::task::spawn_blocking(sandbox::watch_violations)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let spawn_started = std::time::SystemTime::now();
     let applied_confinement = confinement.clone();
 

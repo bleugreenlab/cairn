@@ -715,6 +715,12 @@ pub struct ViolationRecoveryEvidence {
     pub access: ViolationStreamAccess,
     pub outcome: ViolationRecoveryOutcome,
     pub measured_at_unix_ms: u64,
+    /// The `log stream` watchers the executor had running when it reported:
+    /// each runs only while a fenced spawn or the recovery canary needs it,
+    /// and a minute after, so an idle executor reports 0. Absent from an
+    /// executor that predates the count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_watchers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -7330,6 +7336,13 @@ pub struct LearnedResourceEstimate {
 /// to cover a spill offered to a machine that has not sampled yet, a choice the
 /// runner alone makes from readings every executor already sends. An executor
 /// never decodes a placement reason, so an older one gets nothing wrong.
+///
+/// cairn/6632 does not move the number. [`ViolationRecoveryEvidence`] gains an
+/// optional `liveWatchers`, the count of `log stream` watchers the executor
+/// was running when it reported, which only the runner's executor page reads.
+/// An older executor never sends it, so the field defaults to absent and the
+/// page leaves the count out, as it did before; an older runner ignores the
+/// field. What a runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above

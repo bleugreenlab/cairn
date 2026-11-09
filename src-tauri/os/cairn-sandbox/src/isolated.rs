@@ -89,12 +89,12 @@ impl IsolatedChild {
         }
     }
 
-    /// Start watching for this host's sandbox denials, so a child spawned after
-    /// this call can have its own read back by [`Self::denials_since`]. Blocks
-    /// for up to two seconds the first time; a no-op off macOS.
-    pub fn watch_violations(&self) {
-        #[cfg(target_os = "macos")]
-        crate::macos::watch_violations();
+    /// Watch for this host's sandbox denials while the returned watch is held,
+    /// so a child spawned meanwhile can have its own read back by
+    /// [`Self::denials_since`]. Blocks for up to two seconds when it starts the
+    /// stream; inert off macOS.
+    pub fn watch_violations(&self) -> crate::ViolationWatch {
+        crate::watch_violations()
     }
 
     /// What the kernel refused this child since `since`, as `operation target`

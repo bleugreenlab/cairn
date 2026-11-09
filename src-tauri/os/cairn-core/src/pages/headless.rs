@@ -517,10 +517,11 @@ async fn run_child(
         "--no-install".to_string(),
         host.to_string_lossy().into_owned(),
     ]);
-    // On macOS, watch the violation log first, so a child the profile kills at
-    // startup can be told what it was refused. Elsewhere this is a no-op.
+    // On macOS, watch the violation log first, and until the render is over,
+    // so a child the profile kills can be told what it was refused. Elsewhere
+    // this is inert.
     let watcher = isolated.clone();
-    let _ = tokio::task::spawn_blocking(move || watcher.watch_violations()).await;
+    let _violation_watch = tokio::task::spawn_blocking(move || watcher.watch_violations()).await;
     let spawned_at = std::time::SystemTime::now();
     let mut command = tokio::process::Command::new(program);
     command

@@ -17,9 +17,9 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) fn current_process_is_confined() -> bool {
@@ -260,14 +260,13 @@ fn regex_rules(patterns: &[String]) -> String {
 
 /// Rewrite argv to run under `sandbox-exec` with the generated profile.
 ///
-/// Also makes sure the violation stream is watching, since it can only report
-/// a denial made while it was running (see [`detect_violation`]).
+/// A spawn whose denials will be read back holds a [`ViolationLease`] from
+/// before it spawns (see [`detect_violation`]); wrapping starts nothing.
 pub(crate) fn wrap_argv(
     program: &str,
     args: &[String],
     policy: &SandboxPolicy,
 ) -> (String, Vec<String>) {
-    let _ = ViolationStream::watching();
     wrap_argv_with_profile(
         program,
         args,
@@ -327,13 +326,15 @@ pub struct SandboxViolation {
 /// denied call only inside the message, so the spawned pid cannot select it;
 /// the tag the spawn's profile attached to its deny rules does. `since` keeps
 /// apart spawns that share one policy, and so one tag.
+///
+/// A stream started now could not have seen the denial, so only one already
+/// running is asked: the caller holds a [`ViolationLease`] from before the
+/// spawn until this returns.
 pub(crate) fn detect_violation(
     tag: &crate::ViolationTag,
     since: SystemTime,
 ) -> Option<SandboxViolation> {
-    // A stream started now could not have seen the denial, so only one that
-    // was already watching is asked.
-    let stream = ViolationStream::current()?;
+    let stream = watchers().current()?;
     stream.await_tagged(tag.as_str(), since, VIOLATION_ARRIVAL_WAIT)
 }
 
@@ -345,7 +346,8 @@ const VIOLATION_ARRIVAL_WAIT: Duration = Duration::from_millis(1500);
 /// What the kernel's Seatbelt extension is logged as sending from.
 const KERNEL_SANDBOX_SENDER: &str = "/Sandbox";
 
-/// A command that runs `argv` and stops it when this process exits.
+/// A command that runs `argv` and stops it when this process exits, or when
+/// the wrapper is sent SIGTERM.
 ///
 /// macOS has no parent-death signal, so a long-lived child such as `log stream`
 /// would outlive this process until its next matching entry. The wrapper ties
@@ -355,6 +357,13 @@ const KERNEL_SANDBOX_SENDER: &str = "/Sandbox";
 /// wrapper's, so a command that exits on its own still closes the caller's end
 /// and a refusal it prints reaches the caller; the killer's own output goes to
 /// /dev/null.
+///
+/// The pipe closes only when every copy of its write end does, and std makes
+/// a pipe on macOS with `pipe` then `FD_CLOEXEC` in two steps, so a process
+/// another thread spawns between them inherits one. A caller stopping the
+/// command on purpose therefore signals the wrapper as well: its TERM trap
+/// kills the command and the reader, so nothing waits on the pipe. Whichever
+/// way the command ends, the reader goes with it.
 ///
 /// When the command is `sudo`, the kill lands on sudo, because the root `log`
 /// beneath it is not this account's to signal, and sudo relays it. sudo drops
@@ -368,7 +377,10 @@ fn tied_to_this_process(argv: &[&str]) -> Command {
 "$@" </dev/null &
 l=$!
 { read -r _ <&3; kill "$l"; } >/dev/null 2>&1 &
-wait "$l""#;
+k=$!
+trap 'kill "$l" "$k" 2>/dev/null' TERM
+wait "$l"
+kill "$k" 2>/dev/null"#;
     let mut command = Command::new("/bin/sh");
     command
         .args(["-c", WRAPPER, "sh"])
@@ -486,22 +498,26 @@ fn refusal_reason(
     }
 }
 
-/// One process-wide `log stream` of tagged kernel Seatbelt violations.
+/// One `log stream` of tagged kernel Seatbelt violations.
 ///
 /// A stream rather than a `log show` query afterwards: the persisted log does
 /// not hold these entries. Asked for a spawn's denials moments later, `log
 /// show` returns nothing, top-level process or descendant alike, while a live
-/// stream receives them as the kernel emits them.
+/// stream receives them as the kernel emits them. So a stream must already be
+/// running when a denial is made; [`Watchers`] decides when one runs.
 pub(crate) struct ViolationStream {
     seen: Mutex<Seen>,
     arrived: Condvar,
     alive: AtomicBool,
     access: ViolationStreamAccess,
-    /// Whether a canary denial came back through this stream, once asked.
-    recovery: Mutex<Option<RecoveryMeasurement>>,
-    /// Held, never written: when this process exits the pipe closes, and the
-    /// wrapper in [`ViolationStream::start`] stops `log stream` in response.
-    _lifeline: Mutex<std::process::ChildStdin>,
+    /// The command line, for a person reading what recovered a denial.
+    spawned: String,
+    /// The wrapper, until the reader reaps it. [`Self::stop`] signals it only
+    /// while it is held here unreaped, so its pid cannot name another process.
+    wrapper: Mutex<Option<std::process::Child>>,
+    /// Held, never written. Closing it, on [`Self::stop`] or when this process
+    /// exits, makes the wrapper in [`tied_to_this_process`] stop `log stream`.
+    lifeline: Mutex<Option<std::process::ChildStdin>>,
 }
 
 #[derive(Default)]
@@ -518,9 +534,32 @@ struct Seen {
 }
 
 struct RecoveryMeasurement {
+    access: ViolationStreamAccess,
     outcome: ViolationRecoveryOutcome,
     at: Instant,
     at_unix_ms: u64,
+}
+
+impl RecoveryMeasurement {
+    fn now(access: ViolationStreamAccess, outcome: ViolationRecoveryOutcome) -> Self {
+        Self {
+            access,
+            outcome,
+            at: Instant::now(),
+            at_unix_ms: crate::nested::unix_now_ms(),
+        }
+    }
+
+    fn refused(refusal: &StreamRefusal) -> Self {
+        Self {
+            access: refusal.access,
+            outcome: ViolationRecoveryOutcome::Unmeasured {
+                reason: refusal.reason.clone(),
+            },
+            at: refusal.at,
+            at_unix_ms: refusal.at_unix_ms,
+        }
+    }
 }
 
 /// A start that failed: how it was attempted, when, and what refused it.
@@ -555,12 +594,10 @@ enum StreamStart {
     Ended(Option<i32>),
 }
 
-/// The running stream, or why it last failed to start, so a process that
-/// cannot stream (a sandboxed one: `log` refuses to run there) does not pay a
-/// spawn attempt for every fenced command, and can say why it is blind.
-static VIOLATION_STREAM: Mutex<Option<StreamSlot>> = Mutex::new(None);
-
 const STREAM_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// How long a stream outlives the last lease on it, so a run of fenced spawns
+/// shares one `log` process instead of starting one each.
+const STREAM_LINGER: Duration = Duration::from_secs(60);
 const STREAM_READY_WAIT: Duration = Duration::from_secs(2);
 /// How long a stream that has exited gets to finish handing over its stderr.
 const COMPLAINT_WAIT: Duration = Duration::from_millis(500);
@@ -568,15 +605,103 @@ const COMPLAINT_LIMIT: usize = 4096;
 const KEPT_VIOLATIONS: usize = 1024;
 const VIOLATION_RETENTION: Duration = Duration::from_secs(600);
 
-impl ViolationStream {
-    /// The running stream, starting one when there is none.
-    pub(crate) fn watching() -> Option<Arc<Self>> {
-        Self::watching_or_refusal().ok()
+/// This process's violation stream, and how many holders need it.
+///
+/// `log stream` filters every unified-log message and costs a few percent of a
+/// core for as long as it runs, so it runs only while something will read a
+/// denial back: a fenced spawn, from before it spawns until it has read its
+/// denials, and the recovery canary. Each holds a [`ViolationLease`]. The first
+/// lease starts the stream, later ones share it, and it is stopped
+/// [`STREAM_LINGER`] after the last is released, so an idle process runs none.
+pub(crate) struct Watchers {
+    state: Mutex<WatchState>,
+    /// The last recovery measurement. It outlives the stream it was made on:
+    /// a canary that came back says how this process's streams recover until
+    /// a start is refused.
+    recovery: Mutex<Option<RecoveryMeasurement>>,
+    /// Wrappers started and not yet reaped: this process's live watchers.
+    live: Arc<AtomicUsize>,
+    linger: Duration,
+    access: fn() -> ViolationStreamAccess,
+    argv: Box<dyn Fn(ViolationStreamAccess) -> Vec<String> + Send + Sync>,
+}
+
+#[derive(Default)]
+struct WatchState {
+    /// The running stream, or why the last start failed, so a process that
+    /// cannot stream (a sandboxed one: `log` refuses to run there) does not pay
+    /// a spawn attempt for every fenced command, and can say why it is blind.
+    slot: Option<StreamSlot>,
+    leases: usize,
+    /// When the last lease was released, while none is held.
+    idle_since: Option<Instant>,
+    /// Whether a linger thread is counting down `idle_since`.
+    lingering: bool,
+}
+
+/// Keeps this process's violation stream running while held. Dropping it, on
+/// whatever path its holder leaves by (a panic or a cancelled task included),
+/// releases it.
+pub struct ViolationLease {
+    watchers: Arc<Watchers>,
+    stream: Result<Arc<ViolationStream>, StreamRefusal>,
+}
+
+impl Drop for ViolationLease {
+    fn drop(&mut self) {
+        self.watchers.release();
+    }
+}
+
+fn watchers() -> &'static Arc<Watchers> {
+    static WATCHERS: OnceLock<Arc<Watchers>> = OnceLock::new();
+    WATCHERS.get_or_init(|| {
+        Watchers::new(
+            STREAM_LINGER,
+            stream_access,
+            Box::new(crate::violation_stream_spawn_argv),
+        )
+    })
+}
+
+impl Watchers {
+    fn new(
+        linger: Duration,
+        access: fn() -> ViolationStreamAccess,
+        argv: Box<dyn Fn(ViolationStreamAccess) -> Vec<String> + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(WatchState::default()),
+            recovery: Mutex::new(None),
+            live: Arc::new(AtomicUsize::new(0)),
+            linger,
+            access,
+            argv,
+        })
     }
 
-    fn watching_or_refusal() -> Result<Arc<Self>, StreamRefusal> {
-        let mut slot = VIOLATION_STREAM.lock().unwrap_or_else(|p| p.into_inner());
-        match slot.as_ref() {
+    fn state(&self) -> MutexGuard<'_, WatchState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A lease on the running stream, starting one when there is none. Blocks
+    /// for up to [`STREAM_READY_WAIT`] when it starts one.
+    fn lease(self: &Arc<Self>) -> ViolationLease {
+        let mut state = self.state();
+        state.leases += 1;
+        state.idle_since = None;
+        let stream = self.running_or_refusal(&mut state);
+        ViolationLease {
+            watchers: self.clone(),
+            stream,
+        }
+    }
+
+    fn running_or_refusal(
+        &self,
+        state: &mut WatchState,
+    ) -> Result<Arc<ViolationStream>, StreamRefusal> {
+        match state.slot.as_ref() {
             Some(StreamSlot::Running(stream)) if stream.alive.load(Ordering::Acquire) => {
                 return Ok(stream.clone())
             }
@@ -588,24 +713,136 @@ impl ViolationStream {
         // Asked per start rather than per spawn: membership is a directory
         // service query, and an account moving in or out of `admin` reaches
         // the next start, which a refused stream makes within a minute.
-        let started = Self::start(stream_access());
-        *slot = Some(match &started {
+        let access = (self.access)();
+        let started = ViolationStream::start(access, (self.argv)(access), &self.live);
+        state.slot = Some(match &started {
             Ok(stream) => StreamSlot::Running(stream.clone()),
             Err(refusal) => StreamSlot::Refused(refusal.clone()),
         });
         started
     }
 
-    fn current() -> Option<Arc<Self>> {
-        match VIOLATION_STREAM.lock().ok()?.as_ref()? {
+    fn release(self: &Arc<Self>) {
+        let mut state = self.state();
+        state.leases = state.leases.saturating_sub(1);
+        if state.leases > 0 {
+            return;
+        }
+        state.idle_since = Some(Instant::now());
+        if state.lingering {
+            return;
+        }
+        state.lingering = true;
+        drop(state);
+        let watchers = self.clone();
+        let armed = std::thread::Builder::new()
+            .name("cairn-sandbox-violations-linger".into())
+            .spawn(move || watchers.linger_then_stop());
+        if armed.is_err() {
+            let mut state = self.state();
+            state.lingering = false;
+            if state.leases == 0 {
+                Self::stop_running(&mut state);
+            }
+        }
+    }
+
+    /// Wait out [`Self::linger`] from the last release, then stop the stream
+    /// unless a lease was taken meanwhile. One such thread at a time.
+    fn linger_then_stop(&self) {
+        let mut state = self.state();
+        while let Some(idle_since) = state.idle_since.filter(|_| state.leases == 0) {
+            let left = self.linger.saturating_sub(idle_since.elapsed());
+            if left.is_zero() {
+                Self::stop_running(&mut state);
+                break;
+            }
+            drop(state);
+            std::thread::sleep(left);
+            state = self.state();
+        }
+        state.lingering = false;
+    }
+
+    fn stop_running(state: &mut WatchState) {
+        state.idle_since = None;
+        if let Some(StreamSlot::Running(stream)) = state
+            .slot
+            .take_if(|slot| matches!(slot, StreamSlot::Running(_)))
+        {
+            stream.stop();
+        }
+    }
+
+    fn current(&self) -> Option<Arc<ViolationStream>> {
+        match self.state().slot.as_ref()? {
             StreamSlot::Running(stream) => Some(stream.clone()),
             StreamSlot::Refused(_) => None,
         }
     }
 
-    fn start(access: ViolationStreamAccess) -> Result<Arc<Self>, StreamRefusal> {
+    /// Wrappers this process has started and not yet reaped.
+    fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Whether a fenced spawn's denial is recovered by path on this machine,
+    /// measured by recovering one.
+    ///
+    /// A stream that started is not yet evidence: one whose access or predicate
+    /// matched nothing would start just the same. So the first ask takes a
+    /// lease, denies a canary write under a fresh tag, and waits for it to come
+    /// back with its path. A canary that came back holds until a later start
+    /// is refused, so asking again starts no stream; one that did not, and a
+    /// refused start, are retried after [`STREAM_RETRY_AFTER`]. That retry is
+    /// what turns this Measured on the next liveness pass after the operator
+    /// installs the sudo rule, with no restart.
+    fn recovery(self: &Arc<Self>) -> ViolationRecoveryEvidence {
+        let mut held = self.recovery.lock().unwrap_or_else(|p| p.into_inner());
+        let refused = match self.state().slot.as_ref() {
+            Some(StreamSlot::Refused(refusal)) => Some(refusal.clone()),
+            _ => None,
+        };
+        if let Some(refusal) = refused {
+            if held
+                .as_ref()
+                .is_none_or(|measured| measured.at < refusal.at)
+            {
+                *held = Some(RecoveryMeasurement::refused(&refusal));
+            }
+        }
+        let remeasure = held.as_ref().is_none_or(|measured| {
+            matches!(
+                measured.outcome,
+                ViolationRecoveryOutcome::Unmeasured { .. }
+            ) && measured.at.elapsed() >= STREAM_RETRY_AFTER
+        });
+        if remeasure {
+            let lease = self.lease();
+            *held = Some(match &lease.stream {
+                Ok(stream) => {
+                    RecoveryMeasurement::now(stream.access, recover_a_canary_denial(stream))
+                }
+                Err(refusal) => RecoveryMeasurement::refused(refusal),
+            });
+        }
+        let measured = held.as_ref().expect("measured above");
+        ViolationRecoveryEvidence {
+            access: measured.access,
+            outcome: measured.outcome.clone(),
+            measured_at_unix_ms: measured.at_unix_ms,
+            live_watchers: Some(u32::try_from(self.live()).unwrap_or(u32::MAX)),
+        }
+    }
+}
+
+impl ViolationStream {
+    fn start(
+        access: ViolationStreamAccess,
+        argv: Vec<String>,
+        live: &Arc<AtomicUsize>,
+    ) -> Result<Arc<Self>, StreamRefusal> {
         let refused = |reason: String| StreamRefusal::now(access, reason);
-        let argv = crate::violation_stream_spawn_argv(access);
         let spawned = argv.join(" ");
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let mut child = tied_to_this_process(&argv)
@@ -620,18 +857,21 @@ impl ViolationStream {
             let _ = child.wait();
             return Err(refused(format!("`{spawned}` started without its pipes")));
         };
+        live.fetch_add(1, Ordering::AcqRel);
         let stream = Arc::new(Self {
             seen: Mutex::new(Seen::default()),
             arrived: Condvar::new(),
             alive: AtomicBool::new(true),
             access,
-            recovery: Mutex::new(None),
-            _lifeline: Mutex::new(lifeline),
+            spawned: spawned.clone(),
+            wrapper: Mutex::new(Some(child)),
+            lifeline: Mutex::new(Some(lifeline)),
         });
         let complaint = complaint_of(stderr);
         let (ready, first_line) = std::sync::mpsc::channel();
         let reader = stream.clone();
-        std::thread::Builder::new()
+        let reaped = live.clone();
+        let reading = std::thread::Builder::new()
             .name("cairn-sandbox-violations".into())
             .spawn(move || {
                 let mut ready = Some(ready);
@@ -645,12 +885,20 @@ impl ViolationStream {
                 }
                 reader.alive.store(false, Ordering::Release);
                 reader.arrived.notify_all();
-                let exit = child.wait().ok().and_then(|status| status.code());
+                let exit = reader.reap();
+                reaped.fetch_sub(1, Ordering::AcqRel);
                 if let Some(ready) = ready {
                     let _ = ready.send(StreamStart::Ended(exit));
                 }
-            })
-            .map_err(|error| refused(format!("could not start the stream's reader: {error}")))?;
+            });
+        if let Err(error) = reading {
+            stream.stop();
+            stream.reap();
+            live.fetch_sub(1, Ordering::AcqRel);
+            return Err(refused(format!(
+                "could not start the stream's reader: {error}"
+            )));
+        }
         match first_line.recv_timeout(STREAM_READY_WAIT) {
             Ok(StreamStart::Announced) | Err(RecvTimeoutError::Timeout) => {}
             Ok(StreamStart::Ended(exit)) => {
@@ -670,6 +918,41 @@ impl ViolationStream {
                 "`{spawned}` exited just after announcing itself"
             )))
         }
+    }
+
+    /// Stop `log stream` now. The lifeline is closed, and the wrapper is sent
+    /// SIGTERM as well, because a copy of the lifeline another process
+    /// inherited would keep the pipe open (see [`tied_to_this_process`]).
+    fn stop(&self) {
+        drop(
+            self.lifeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
+        if let Some(wrapper) = self
+            .wrapper
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            // SAFETY: a plain signal to a child that is not yet reaped, so its
+            // pid is still its own.
+            unsafe { libc::kill(wrapper.id() as libc::pid_t, libc::SIGTERM) };
+        }
+    }
+
+    /// Wait for the wrapper, once its output has closed, and give back its
+    /// exit code.
+    fn reap(&self) -> Option<i32> {
+        let wrapper = self
+            .wrapper
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        wrapper
+            .and_then(|mut wrapper| wrapper.wait().ok())
+            .and_then(|status| status.code())
     }
 
     fn record(&self, line: &str) {
@@ -804,57 +1087,18 @@ fn complaint_of(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<
     received
 }
 
-/// Whether a fenced spawn's denial is recovered by path on this machine,
-/// measured by recovering one.
-///
-/// A stream that started is not yet evidence: one whose access or predicate
-/// matched nothing would start just the same. So each stream's first ask denies
-/// a canary write under a fresh tag and waits for it to come back with its
-/// path. A canary that came back holds for the stream's life; one that did not
-/// is retried after [`STREAM_RETRY_AFTER`]. A stream that could not start is
-/// retried on the same cadence, which is what turns this Measured on the next
-/// liveness pass after the operator installs the sudo rule, with no restart.
+/// Whether a fenced spawn's denial is recovered by path on this machine; see
+/// [`Watchers::recovery`].
 pub(crate) fn violation_recovery() -> ViolationRecoveryEvidence {
-    let stream = match ViolationStream::watching_or_refusal() {
-        Ok(stream) => stream,
-        Err(refusal) => {
-            return ViolationRecoveryEvidence {
-                access: refusal.access,
-                outcome: ViolationRecoveryOutcome::Unmeasured {
-                    reason: refusal.reason,
-                },
-                measured_at_unix_ms: refusal.at_unix_ms,
-            }
-        }
-    };
-    let mut held = stream.recovery.lock().unwrap_or_else(|p| p.into_inner());
-    let remeasure = held.as_ref().is_none_or(|measured| {
-        matches!(
-            measured.outcome,
-            ViolationRecoveryOutcome::Unmeasured { .. }
-        ) && measured.at.elapsed() >= STREAM_RETRY_AFTER
-    });
-    if remeasure {
-        *held = Some(RecoveryMeasurement {
-            outcome: recover_a_canary_denial(stream.access),
-            at: Instant::now(),
-            at_unix_ms: crate::nested::unix_now_ms(),
-        });
-    }
-    let measured = held.as_ref().expect("measured above");
-    ViolationRecoveryEvidence {
-        access: stream.access,
-        outcome: measured.outcome.clone(),
-        measured_at_unix_ms: measured.at_unix_ms,
-    }
+    watchers().recovery()
 }
 
-/// Deny one write the way a fenced spawn's is denied, then recover it from the
-/// stream the way a fenced spawn's caller does.
+/// Deny one write the way a fenced spawn's is denied, then recover it from
+/// `stream` the way a fenced spawn's caller does.
 ///
 /// The target sits in a sibling temp directory with nothing writable granted
 /// beside the worktree, so the profile denies it, and nothing is ever written.
-fn recover_a_canary_denial(access: ViolationStreamAccess) -> ViolationRecoveryOutcome {
+fn recover_a_canary_denial(stream: &ViolationStream) -> ViolationRecoveryOutcome {
     let unmeasured = |reason: String| ViolationRecoveryOutcome::Unmeasured { reason };
     let (worktree, outside) = match (tempfile::tempdir(), tempfile::tempdir()) {
         (Ok(worktree), Ok(outside)) => (worktree, outside),
@@ -904,13 +1148,13 @@ fn recover_a_canary_denial(access: ViolationStreamAccess) -> ViolationRecoveryOu
             stderr.trim()
         ));
     }
-    match detect_violation(&policy.violation_tag, since) {
+    match stream.await_tagged(policy.violation_tag.as_str(), since, VIOLATION_ARRIVAL_WAIT) {
         Some(violation) if violation.path == target => ViolationRecoveryOutcome::Measured {
             detail: format!(
                 "a canary {} of {} was denied and recovered by path through `{}`",
                 violation.operation,
                 target.display(),
-                crate::violation_stream_spawn_argv(access).join(" ")
+                stream.spawned
             ),
         },
         Some(violation) => unmeasured(format!(
@@ -1003,10 +1247,11 @@ fn tagged_kernel_violation(line: &str) -> Option<(String, String)> {
     Some((tag.as_str().to_string(), violation.trim().to_string()))
 }
 
-/// Start the process-wide violation stream if it is not running, so a spawn
-/// made after this can have its denials read back. Best-effort.
-pub(crate) fn watch_violations() {
-    let _ = ViolationStream::watching();
+/// A lease on this process's violation stream, starting it if it is not
+/// running, so a spawn made while it is held can have its denials read back.
+/// Best-effort: a stream that cannot start leaves recovery command-scoped.
+pub(crate) fn watch_violations() -> ViolationLease {
+    watchers().lease()
 }
 
 /// The distinct denials a profile tagged `tag` made since `since`, waiting up
@@ -1016,7 +1261,8 @@ pub(crate) fn denials_since(
     since: SystemTime,
     wait: Duration,
 ) -> Vec<String> {
-    ViolationStream::current()
+    watchers()
+        .current()
         .map(|stream| stream.tagged_denials(tag.as_str(), since, wait))
         .unwrap_or_default()
 }
@@ -1633,6 +1879,7 @@ mod tests {
         policy: &SandboxPolicy,
         script: String,
     ) -> (Option<crate::SandboxDenial>, String) {
+        let _watch = watch_violations();
         let since = SystemTime::now();
         let (program, args) = wrap_argv("/bin/sh", &["-c".into(), script], policy);
         let out = Command::new(program).args(args).output().unwrap();
@@ -1648,7 +1895,7 @@ mod tests {
             since,
             true,
         );
-        let stream = ViolationStream::current().map_or_else(
+        let stream = watchers().current().map_or_else(
             || format!("no violation stream is running: {}", last_refusal()),
             |stream| stream.describe(policy.violation_tag.as_str()),
         );
@@ -1878,19 +2125,173 @@ mod tests {
         ) {
             return;
         }
-        let first = ViolationStream::watching_or_refusal()
-            .unwrap_or_else(|refusal| panic!("the stream did not start: {}", refusal.reason));
-        let second = ViolationStream::watching().expect("the stream is still running");
-        assert!(Arc::ptr_eq(&first, &second));
+        let (first, second) = (watch_violations(), watch_violations());
+        let (Ok(first), Ok(second)) = (&first.stream, &second.stream) else {
+            panic!("the stream did not start: {}", last_refusal());
+        };
+        assert!(Arc::ptr_eq(first, second));
+    }
+
+    /// A stand-in for `log stream` that appends its pid to `pids`, announces
+    /// itself the way `log` does, and would otherwise run for ten minutes.
+    fn stand_in_watchers(linger: Duration, pids: &Path) -> Arc<Watchers> {
+        let pids = pids.to_path_buf();
+        Watchers::new(
+            linger,
+            || ViolationStreamAccess::Admin,
+            Box::new(move |_| {
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "echo $$ >> '{}'; echo announced; exec /bin/sleep 600",
+                        pids.display()
+                    ),
+                ]
+            }),
+        )
+    }
+
+    fn recorded_pids(pids: &Path) -> Vec<libc::pid_t> {
+        std::fs::read_to_string(pids)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    fn stream_of(lease: &ViolationLease) -> &Arc<ViolationStream> {
+        match &lease.stream {
+            Ok(stream) => stream,
+            Err(refusal) => panic!("the stand-in stream did not start: {}", refusal.reason),
+        }
+    }
+
+    /// Wait for every watcher to be reaped and every stand-in to have exited.
+    fn assert_none_survive(watchers: &Watchers, pids: &Path, when: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let live = watchers.live();
+            // A null signal: ESRCH once the process is gone and reaped.
+            let running: Vec<_> = recorded_pids(pids)
+                .into_iter()
+                .filter(|pid| {
+                    let probed = unsafe { libc::kill(*pid, 0) };
+                    probed == 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                })
+                .collect();
+            if live == 0 && running.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{when}: {live} watcher(s) still live, stand-in(s) {running:?} still running"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Holders share one stream, a held lease keeps it, and once the last is
+    /// released nothing it started survives. Twice, as liveness passes ask.
+    #[test]
+    fn a_stream_runs_only_while_a_lease_is_held() {
+        let dir = tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let watchers = stand_in_watchers(Duration::ZERO, &pids);
+        for round in 1..=2 {
+            let (first, second) = (watchers.lease(), watchers.lease());
+            assert!(Arc::ptr_eq(stream_of(&first), stream_of(&second)));
+            assert_eq!(watchers.live(), 1, "round {round}: one watcher for both");
+            drop(first);
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(watchers.live(), 1, "round {round}: a held lease keeps it");
+            drop(second);
+            assert_none_survive(&watchers, &pids, &format!("round {round}"));
+        }
+        assert_eq!(recorded_pids(&pids).len(), 2, "each round started its own");
+    }
+
+    /// A spawn soon after a release reuses the lingering stream, and the
+    /// stream stops once the linger runs out with nothing holding it.
+    #[test]
+    fn a_released_stream_lingers_for_the_next_spawn_then_stops() {
+        let dir = tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let watchers = stand_in_watchers(Duration::from_millis(500), &pids);
+        let first = watchers.lease();
+        let stream = stream_of(&first).clone();
+        drop(first);
+        let second = watchers.lease();
+        assert!(Arc::ptr_eq(&stream, stream_of(&second)));
+        drop(second);
+        assert_eq!(recorded_pids(&pids).len(), 1);
+        assert_none_survive(&watchers, &pids, "after the linger");
+    }
+
+    /// The recovery probe takes its own lease and leaves nothing running once
+    /// it has measured, however often it is asked.
+    #[test]
+    fn the_recovery_probe_leaves_no_watcher_behind() {
+        let dir = tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let watchers = stand_in_watchers(Duration::ZERO, &pids);
+        for probe in 1..=2 {
+            let evidence = watchers.recovery();
+            assert!(
+                matches!(
+                    evidence.outcome,
+                    ViolationRecoveryOutcome::Unmeasured { .. }
+                ),
+                "a stand-in stream never carries the canary's violation"
+            );
+            assert!(evidence.live_watchers.is_some());
+            assert_none_survive(&watchers, &pids, &format!("probe {probe}"));
+        }
+    }
+
+    /// A holder cancelled mid-run, here by a panic, still releases its lease.
+    #[test]
+    fn a_holder_that_panics_still_releases_its_lease() {
+        let dir = tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let watchers = stand_in_watchers(Duration::ZERO, &pids);
+        let holder = watchers.clone();
+        let outcome = std::thread::spawn(move || {
+            let _lease = holder.lease();
+            assert_eq!(holder.live(), 1);
+            panic!("the holder is cancelled mid-run");
+        })
+        .join();
+        assert!(outcome.is_err());
+        assert_none_survive(&watchers, &pids, "after the holder panicked");
+    }
+
+    /// A copy of the lifeline another process inherited keeps the pipe open,
+    /// so stopping a stream must not rest on the pipe closing.
+    #[test]
+    fn a_stream_stops_even_when_its_lifeline_was_inherited() {
+        use std::os::fd::AsRawFd as _;
+        let dir = tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let watchers = stand_in_watchers(Duration::ZERO, &pids);
+        let lease = watchers.lease();
+        let inherited = {
+            let lifeline = stream_of(&lease).lifeline.lock().unwrap();
+            let fd = lifeline.as_ref().unwrap().as_raw_fd();
+            // SAFETY: duplicates an open descriptor, close-on-exec.
+            unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+        };
+        assert!(inherited >= 0);
+        drop(lease);
+        assert_none_survive(&watchers, &pids, "with the lifeline held open");
+        // SAFETY: closes the descriptor duplicated above, once.
+        unsafe { libc::close(inherited) };
     }
 
     /// Why the last start failed, for a failing live test to show.
     fn last_refusal() -> String {
-        match VIOLATION_STREAM
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
+        match watchers().state().slot.as_ref() {
             Some(StreamSlot::Refused(refusal)) => refusal.reason.clone(),
             Some(StreamSlot::Running(_)) => "a stream is recorded as running".into(),
             None => "no start was attempted".into(),

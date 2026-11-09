@@ -5612,11 +5612,22 @@ fn render_macos_fence(
         Some(EdgeDisposition::Unmeasured { reason }) => format!("denials unmeasured ({reason})"),
         None => "denials not reported".to_string(),
     };
-    let recovery = capabilities
+    let evidence = capabilities
         .sandbox
         .as_ref()
         .and_then(|evidence| evidence.violation_recovery.as_ref());
-    let recovery = match recovery {
+    // Each watcher is a `log stream` the executor runs only while fenced work
+    // needs it, so a count that stays above 0 on an idle machine is a leak.
+    let watchers = evidence
+        .and_then(|evidence| evidence.live_watchers)
+        .map(|count| {
+            format!(
+                "; {count} violation watcher{} running",
+                if count == 1 { "" } else { "s" }
+            )
+        })
+        .unwrap_or_default();
+    let recovery = match evidence {
         None => "recovery not reported by this executor".to_string(),
         Some(evidence) => {
             let measured = age(beat_observed_at_unix_ms
@@ -5636,7 +5647,7 @@ fn render_macos_fence(
             }
         }
     };
-    format!("- Fence: {denials}; {recovery}\n")
+    format!("- Fence: {denials}; {recovery}{watchers}\n")
 }
 
 /// What a fenced Linux batch on this machine is actually kept from, in one
@@ -7596,6 +7607,7 @@ mod tests {
                     reason: "sudo rule absent: this executor account is not in admin".into(),
                 },
                 measured_at_unix_ms: 1_000_000 - 30_000,
+                live_watchers: None,
             }),
         };
         capabilities.sandbox = Some(evidence.clone());
@@ -7613,12 +7625,13 @@ mod tests {
                 detail: "a canary file-write-create was denied and recovered by path".into(),
             },
             measured_at_unix_ms: 1_000_000 - 5_000,
+            live_watchers: Some(0),
         });
         executor.health.advertisement.capabilities.sandbox = Some(evidence);
         let rendered = render_executor(&executor);
         assert!(
             rendered.contains(&format!(
-                "- Fence: {denials}; recovery measured 9s ago through the operator's sudo rule: a canary file-write-create was denied and recovered by path\n"
+                "- Fence: {denials}; recovery measured 9s ago through the operator's sudo rule: a canary file-write-create was denied and recovered by path; 0 violation watchers running\n"
             )),
             "{rendered}"
         );
