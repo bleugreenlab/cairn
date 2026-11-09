@@ -168,7 +168,7 @@ When the suite you are landing into is not already green, a failure is only your
 
     run({commands:[{command:"bun run test src/parser.test.ts"}], branch:"main"})
 
-It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked files the batch writes are discarded, it cannot be combined with `commit_msg`, and an MCP-tool or REPL batch executes on the host and is rejected. Before spending a branch run on a base comparison, read the ledger — `cairn:@/check-results/<base>?suite=S&environment=current` — and for diffs, fork points, history, and blame read `cairn:@/vcs/{diff,ancestry,log,blame}`, which answer from the store with no checkout.
+It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked files the batch writes persist across its items and are discarded once when it ends, so a later item can test what an earlier one patched; it cannot be combined with `commit_msg`, and an MCP-tool or REPL batch executes on the host and is rejected. Before spending a branch run on a base comparison, read the ledger — `cairn:@/check-results/<base>?suite=S&environment=current` — and for diffs, fork points, history, and blame read `cairn:@/vcs/{diff,ancestry,log,blame}`, which answer from the store with no checkout.
 
 ### Interpreters
 

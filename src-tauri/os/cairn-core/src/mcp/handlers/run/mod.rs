@@ -9407,7 +9407,7 @@ async fn settle_run_batch(
                 result.push_str("\n\n");
             }
             result.push_str(&format!(
-                "Verdict-only run modified {} tracked path(s); the mutation was discarded: {}",
+                "Verdict-only run modified {} tracked path(s); the mutation was discarded when the batch ended: {}",
                 modified_paths.len(),
                 modified_paths.into_iter().collect::<Vec<_>>().join(", ")
             ));

@@ -294,8 +294,9 @@ pub struct RunInput {
     pub commit_msg: Option<String>,
     /// Run the batch against another revision — a branch name, a commit, or a
     /// node URI — to tell a regression from a failure already on the base.
-    /// Verdict-only: tracked writes are discarded, and commit_msg, MCP, and
-    /// REPL items are rejected.
+    /// Verdict-only: tracked writes persist across its items and are discarded
+    /// once when the batch ends, and commit_msg, MCP, and REPL items are
+    /// rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Which machine runs this batch: `{name}` for one executor by its public

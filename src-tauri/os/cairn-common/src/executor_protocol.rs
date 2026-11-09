@@ -7273,6 +7273,18 @@ pub struct LearnedResourceEstimate {
 /// too: it admits a resident job's pinned batch or terminal, and the boolean is
 /// true only while a hold refusing all new admission stands, so a self-update
 /// alone sends `false`, as the memory-only update hold did before owned drains.
+///
+/// cairn/5365 does not move the number. An executor now attributes and reverts
+/// tracked edits after each item only for a check lane's sequential
+/// verdict-only batch. Any other verdict-only batch, such as an agent's
+/// `branch:` run, keeps its items' edits across the batch and reports them once
+/// in the batch outcome's `trackedModifications` when its bracket seals. No
+/// frame, variant or field changes. What a runner gets wrong talking to an
+/// older executor: nothing it decodes differently. It already unions the
+/// batch-level and per-item evidence into one discard note, and the older
+/// executor keeps resetting between an agent batch's items as before. An older
+/// runner reads the batch-level field it always read. The build-hash rollout
+/// delivers it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above

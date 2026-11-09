@@ -101,11 +101,15 @@ async fn act(
 #[tokio::test]
 async fn threads_pitch_join_retitle_and_leave_camps_through_their_resources() {
     let (orch, emitter) = orch_with_project().await;
+    // Without a general thread, base camp's lead falls to the oldest active
+    // thread, and threads created in the same second tie-break on random ids.
+    let (general, _) = thread_run(&orch, "general").await;
     let (devops, devops_run) = thread_run(&orch, "devops").await;
     let (execution, exec_run) = thread_run(&orch, "execution").await;
-    crate::camps::ensure_project_base_camp(&orch.db.local, "p")
+    let base = crate::camps::ensure_project_base_camp(&orch.db.local, "p")
         .await
         .unwrap();
+    assert_eq!(base.lead_thread_id, general);
 
     let pitched = act(
         &orch,

@@ -1058,3 +1058,62 @@ async fn a_branch_scoped_run_never_joins_the_job_environment() {
         "a branch-scoped run's scratch write did not flow back to the node: {after}"
     );
 }
+
+/// A branch-scoped batch reads like a script. A later item sees what an earlier
+/// item wrote to a tracked file, and the whole batch is discarded once when it
+/// ends, so neither the job's checkout nor the next branch run's cell sees it.
+/// A patch-then-test batch against the base otherwise tests the unpatched tree.
+#[tokio::test]
+async fn a_branch_batchs_later_items_see_earlier_items_tracked_edits() {
+    if common::skip_if_fenced("a_branch_batchs_later_items_see_earlier_items_tracked_edits") {
+        return;
+    }
+    let fixture = fixture().await;
+
+    // The marker is reported through a command substitution, so the expected
+    // text appears only in what the batch printed, never in its echoed header.
+    let patched = fixture
+        .run(json!({
+            "branch": "main",
+            "sequential": true,
+            "stop_on_error": false,
+            "commands": [
+                { "command": "echo branch-patch >> tracked.txt" },
+                { "command": "echo \"seen=$(tail -1 tracked.txt)\"" }
+            ]
+        }))
+        .await;
+    assert!(
+        patched.contains("seen=branch-patch"),
+        "a later item did not see an earlier item's tracked edit: {patched}"
+    );
+    assert!(
+        patched.contains(
+            "Verdict-only run modified 1 tracked path(s); the mutation was discarded when the batch ended: tracked.txt"
+        ),
+        "the batch did not report discarding its edit once: {patched}"
+    );
+
+    let job = fixture
+        .shell("echo \"job-tail=$(tail -1 tracked.txt)\"")
+        .await;
+    assert!(
+        job.contains("job-tail=tracked"),
+        "a branch batch's tracked edit reached the job's checkout: {job}"
+    );
+
+    let next = fixture
+        .run(json!({
+            "branch": "main",
+            "commands": [{ "command": "echo \"next-tail=$(tail -1 tracked.txt)\"; git status --porcelain" }]
+        }))
+        .await;
+    assert!(
+        next.contains("next-tail=tracked"),
+        "the next branch run did not start from a clean tree: {next}"
+    );
+    assert!(
+        !next.contains(" M tracked.txt"),
+        "the next branch run inherited a modified tree: {next}"
+    );
+}
