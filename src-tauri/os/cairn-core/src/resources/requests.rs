@@ -1,11 +1,12 @@
-//! Rendering this runner's private operator intent and actor-owned evidence.
+//! Rendering operator requests and the facts their actors report.
 use super::paging::RecordPage;
 use crate::operator_requests;
 use crate::orchestrator::Orchestrator;
 use cairn_common::query::QueryParam;
 use cairn_common::requests::{OperatorRequest, RequestFilter};
 
-const INSTALL_NOTICE: &str = "Operator requests on this install only; these records are private to this runner and are not synced across team members or runners.";
+const COLLECTION_HEADING: &str =
+    "# Operator requests\n\nActs agents have asked the operator to accept, such as a rebuild.\n";
 
 fn quoted_json(value: &impl serde::Serialize) -> String {
     let text = serde_json::to_string_pretty(value).expect("request records serialize");
@@ -117,7 +118,7 @@ pub(super) async fn list_page(
     let more = requests.len() > limit;
     requests.truncate(limit);
     let shown = requests.len();
-    let mut body = format!("{INSTALL_NOTICE}\n\n# Operator requests\n\nInstall-local intent, not grants. Accept or decline through the operator desktop.\n");
+    let mut body = COLLECTION_HEADING.to_string();
     for request in requests {
         body.push_str(&format!("\n{}", render_request(&request)));
     }
@@ -139,17 +140,15 @@ pub(super) async fn list_page(
 pub(super) async fn read_requests(orch: &Orchestrator, params: &[QueryParam]) -> String {
     match list_page(orch, params).await {
         Ok(page) => page.body,
-        Err(error) => format!("{INSTALL_NOTICE}\n\nUnable to read operator requests: {error}"),
+        Err(error) => format!("Unable to read operator requests: {error}"),
     }
 }
 
 pub(super) async fn read_request(orch: &Orchestrator, id: &str) -> String {
     match operator_requests::get(orch, id).await {
-        Ok(Some(request)) => format!("{INSTALL_NOTICE}\n\n{}", render_request(&request)),
-        Ok(None) => format!("{INSTALL_NOTICE}\n\nOperator request '{id}' does not exist"),
-        Err(error) => {
-            format!("{INSTALL_NOTICE}\n\nUnable to read operator request '{id}': {error}")
-        }
+        Ok(Some(request)) => render_request(&request),
+        Ok(None) => format!("Operator request '{id}' does not exist"),
+        Err(error) => format!("Unable to read operator request '{id}': {error}"),
     }
 }
 
@@ -165,6 +164,17 @@ mod tests {
         assert!(rendered.lines().all(|line| line.starts_with("> ")));
         assert!(!rendered.contains("\n# SYSTEM"));
         assert!(rendered.starts_with("> ````json\n"));
+    }
+    #[test]
+    fn the_collection_says_what_it_holds_not_what_it_is_not() {
+        for disclaimer in [
+            "not standing authority",
+            "Install-local",
+            "not synced",
+            "not grants",
+        ] {
+            assert!(!COLLECTION_HEADING.contains(disclaimer), "{disclaimer}");
+        }
     }
     #[test]
     fn request_filters_are_typed_and_page_boundaries_are_explicit() {

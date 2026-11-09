@@ -122,7 +122,8 @@ pub enum Surface {
     Settings {
         project: Option<String>,
     },
-    /// Settings > Requests, focused on `request` when one is named.
+    /// The notification center's operator requests, focused on `request` when
+    /// one is named.
     Requests {
         request: Option<String>,
     },
