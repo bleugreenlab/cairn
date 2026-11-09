@@ -972,13 +972,16 @@ fn attach_executor(
     // credential is bound to the generation this machine actually holds.
     let object_channel = object_base_url.map(|base_url| {
         let identity = test_executor_identity(executor_id, colocated);
-        let (bearer_token, expires_at_unix_ms) = orch.object_plane.issue_credential(
-            executor_id,
-            &identity.device_id,
-            "test-runner-device",
-            attached_generation,
-            unix_time_ms(),
-        );
+        let (bearer_token, expires_at_unix_ms) = orch
+            .object_plane
+            .issue_credential(
+                executor_id,
+                &identity.device_id,
+                "test-runner-device",
+                attached_generation,
+                unix_time_ms(),
+            )
+            .expect("the attached generation is the newest");
         ObjectChannelCredential {
             base_url,
             bearer_token,

@@ -216,6 +216,7 @@ async fn fetch(
                 .orch
                 .object_plane
                 .authenticate(token, common::unix_time_ms())
+                .ok()
         });
     if authenticated.is_none()
         || !server

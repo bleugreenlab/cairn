@@ -13,11 +13,8 @@ impl Orchestrator {
         advertisement: &ExecutorAdvertisement,
         generation: u64,
     ) {
-        for team_id in self.db.open_team_ids().await {
-            if let Some(team_db) = self.db.team_db(&team_id).await {
-                upsert_executor(&team_db, advertisement, generation, "online").await;
-            }
-        }
+        self.write_registry_all_teams(advertisement, generation, "online")
+            .await;
     }
 
     pub async fn mark_executor_offline_all_teams(
@@ -25,9 +22,30 @@ impl Orchestrator {
         advertisement: &ExecutorAdvertisement,
         generation: u64,
     ) {
+        self.write_registry_all_teams(advertisement, generation, "offline")
+            .await;
+    }
+
+    async fn write_registry_all_teams(
+        &self,
+        advertisement: &ExecutorAdvertisement,
+        generation: u64,
+        status: &str,
+    ) {
+        let executor_id = &advertisement.identity.executor_id;
+        let Some(_permit) = self
+            .fleet
+            .registry_write_permit(executor_id, generation)
+            .await
+        else {
+            log::info!(
+                "executor registry write skipped executor_id={executor_id} generation={generation} status={status}: a newer generation holds the row"
+            );
+            return;
+        };
         for team_id in self.db.open_team_ids().await {
             if let Some(team_db) = self.db.team_db(&team_id).await {
-                upsert_executor(&team_db, advertisement, generation, "offline").await;
+                upsert_executor(&team_db, advertisement, generation, status).await;
             }
         }
     }
@@ -79,6 +97,52 @@ mod tests {
     use super::*;
     use crate::storage::{MigrationRunner, RowExt, TEAM_MIGRATIONS};
     use cairn_common::executor_protocol::{ExecutorCapabilities, ExecutorIdentity};
+
+    /// A superseded generation's registry writes never land after its
+    /// replacement's: one already under way when the replacement attaches
+    /// finishes first, and every later one, online or offline, is refused.
+    #[tokio::test]
+    async fn a_superseded_generations_registry_writes_never_land_after_the_live_ones() {
+        let fleet = crate::fleet::Fleet::default();
+        let (old_sender, _old_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let old = fleet.attach_executor(old_sender);
+        let executor_id = fleet.executor_health(0)[0].identity.executor_id.clone();
+        let in_flight = fleet
+            .registry_write_permit(&executor_id, old)
+            .await
+            .expect("the only generation may write");
+
+        let (live_sender, _live_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let live = fleet.attach_executor(live_sender);
+        let waiting = {
+            let fleet = fleet.clone();
+            let executor_id = executor_id.clone();
+            tokio::spawn(async move {
+                fleet
+                    .registry_write_permit(&executor_id, live)
+                    .await
+                    .is_some()
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "the replacement's write waits for the one under way"
+        );
+        drop(in_flight);
+        assert!(waiting.await.unwrap());
+
+        assert!(fleet
+            .registry_write_permit(&executor_id, old)
+            .await
+            .is_none());
+        assert!(fleet
+            .registry_write_permit(&executor_id, live)
+            .await
+            .is_some());
+    }
 
     #[tokio::test]
     async fn advertisement_upsert_and_disconnect_are_non_secret() {

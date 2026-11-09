@@ -220,7 +220,11 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn authenticate(orch: &Orchestrator, headers: &HeaderMap) -> Result<(String, u64), Refusal> {
+fn authenticate(
+    orch: &Orchestrator,
+    route: &str,
+    headers: &HeaderMap,
+) -> Result<(String, u64), Refusal> {
     let token = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -229,7 +233,8 @@ fn authenticate(orch: &Orchestrator, headers: &HeaderMap) -> Result<(String, u64
     let session = orch
         .object_plane
         .authenticate(token, now_ms().max(0) as u64)
-        .ok_or_else(|| {
+        .map_err(|refusal| {
+            orch.object_plane.report_refusal(route, None, &refusal);
             refuse(
                 StatusCode::UNAUTHORIZED,
                 "invalid object-channel credential",
@@ -312,7 +317,7 @@ async fn skeleton(
 ) -> Response {
     into_response(
         async {
-            let (executor, generation) = authenticate(&orch, &headers)?;
+            let (executor, generation) = authenticate(&orch, "/scratch/skeleton", &headers)?;
             let scratch =
                 authorized_scratch(&orch, &executor, generation, &request.scratch_id).await?;
             let config_dir = orch.config_dir.clone();
@@ -348,7 +353,7 @@ async fn blobs(
 ) -> Response {
     into_response(
         async {
-            let (executor, generation) = authenticate(&orch, &headers)?;
+            let (executor, generation) = authenticate(&orch, "/scratch/blobs", &headers)?;
             let scratch =
                 authorized_scratch(&orch, &executor, generation, &request.scratch_id).await?;
             if request.oids.is_empty() {
@@ -419,7 +424,7 @@ async fn begin(
 ) -> Response {
     into_response(
         async {
-            let (executor, generation) = authenticate(&orch, &headers)?;
+            let (executor, generation) = authenticate(&orch, "/scratch/upload/begin", &headers)?;
             let scratch =
                 authorized_scratch(&orch, &executor, generation, &request.scratch_id).await?;
             validate_changes(&request.changes)?;
@@ -517,7 +522,7 @@ async fn upload_pack(
 ) -> Response {
     into_response(
         async {
-            let (executor, generation) = authenticate(&orch, &headers)?;
+            let (executor, generation) = authenticate(&orch, "/scratch/upload/pack", &headers)?;
             let upload_id = headers
                 .get(SCRATCH_UPLOAD_HEADER)
                 .and_then(|value| value.to_str().ok())
@@ -563,7 +568,7 @@ async fn complete(
 ) -> Response {
     into_response(
         async {
-            let (executor, generation) = authenticate(&orch, &headers)?;
+            let (executor, generation) = authenticate(&orch, "/scratch/upload/complete", &headers)?;
             let (scratch_id, _) = session_paths(&orch, &request.upload_id, &executor, generation)?;
             let lock = orch.object_plane.scratch.lock(&scratch_id);
             let _held = lock.lock().await;

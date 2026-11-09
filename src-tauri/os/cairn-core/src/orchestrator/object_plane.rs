@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cairn_common::executor_protocol::{
     CellRequest, CloudObjectGrantRequest, CloudObjectOperation, DeltaUploadReceipt,
@@ -14,6 +15,12 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 
 const CREDENTIAL_TTL_MS: u64 = 15 * 60 * 1000;
 const STAGED_UPLOAD_TTL_MS: u64 = 60 * 60 * 1000;
+/// How many retired token hashes are kept to name a refused credential. A
+/// retired token outlives its usefulness once it would have expired anyway.
+const RETIRED_CREDENTIAL_CAP: usize = 256;
+/// At most one refusal line per executor in this interval; the rest are
+/// counted into the next.
+const REFUSAL_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct ValidatedObjectPack {
@@ -227,6 +234,197 @@ struct PreviousObjectCredential {
     expires_at_unix_ms: u64,
 }
 
+/// Why a token stopped being accepted before its expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialRetirement {
+    /// A newer connection generation of the same executor was issued.
+    Superseded { by: u64 },
+    /// Its own generation rotated it out and its grace passed.
+    Rotated,
+    /// Its connection ended.
+    Revoked,
+}
+
+impl std::fmt::Display for CredentialRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Superseded { by } => write!(f, "superseded by generation {by}"),
+            Self::Rotated => f.write_str("rotated"),
+            Self::Revoked => f.write_str("revoked"),
+        }
+    }
+}
+
+/// The session an executor holds now, named beside a refusal so the line says
+/// what the presented token lost to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredObjectSession {
+    pub generation: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+/// Why an object-channel token was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectAuthRefusal {
+    /// Not a token this runner issued, or one retired long enough ago that it
+    /// is no longer remembered.
+    Unknown,
+    Expired {
+        executor_id: String,
+        generation: u64,
+        expired_at_unix_ms: u64,
+        stored: Option<StoredObjectSession>,
+    },
+    Retired {
+        executor_id: String,
+        generation: u64,
+        retired_at_unix_ms: u64,
+        cause: CredentialRetirement,
+        stored: Option<StoredObjectSession>,
+    },
+}
+
+impl ObjectAuthRefusal {
+    pub fn executor_id(&self) -> Option<&str> {
+        match self {
+            Self::Unknown => None,
+            Self::Expired { executor_id, .. } | Self::Retired { executor_id, .. } => {
+                Some(executor_id)
+            }
+        }
+    }
+
+    /// What counts as the same refusal when repeats are folded together.
+    fn signature(&self) -> String {
+        match self {
+            Self::Unknown => "unknown".into(),
+            Self::Expired { generation, .. } => format!("expired:{generation}"),
+            Self::Retired {
+                generation, cause, ..
+            } => format!("retired:{generation}:{cause}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ObjectAuthRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stored =
+            |f: &mut std::fmt::Formatter<'_>, stored: &Option<StoredObjectSession>| match stored {
+                Some(stored) => write!(
+                    f,
+                    " stored_generation={} stored_expires_at_unix_ms={}",
+                    stored.generation, stored.expires_at_unix_ms
+                ),
+                None => f.write_str(" stored=none"),
+            };
+        match self {
+            Self::Unknown => f.write_str("unknown token"),
+            Self::Expired {
+                executor_id,
+                generation,
+                expired_at_unix_ms,
+                stored: current,
+            } => {
+                write!(
+                    f,
+                    "expired executor_id={executor_id} generation={generation} expired_at_unix_ms={expired_at_unix_ms}"
+                )?;
+                stored(f, current)
+            }
+            Self::Retired {
+                executor_id,
+                generation,
+                retired_at_unix_ms,
+                cause,
+                stored: current,
+            } => {
+                write!(
+                    f,
+                    "retired executor_id={executor_id} generation={generation} retired_at_unix_ms={retired_at_unix_ms} cause=\"{cause}\""
+                )?;
+                stored(f, current)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetiredObjectCredential {
+    token_hash: [u8; 32],
+    executor_id: String,
+    generation: u64,
+    retired_at_unix_ms: u64,
+    cause: CredentialRetirement,
+}
+
+/// Every executor's live session and the newest connection generation this
+/// runner has issued it, under one lock so the two never disagree.
+///
+/// The newest generation is a one-way mark. A connection task can outlive the
+/// connection that replaced it (a runner pump stuck across a link bounce woke
+/// to a refresh tick after the executor had redialled), and a session keyed
+/// only by executor let that task's refresh replace the live generation's
+/// token and its teardown delete it. Generations only rise within a runner
+/// process, so an issue below the mark is always a superseded task, and the
+/// mark outlives `revoke` so one cannot plant a session after the live one
+/// ends either.
+#[derive(Default)]
+struct CredentialBook {
+    sessions: HashMap<String, ObjectCredentialSession>,
+    newest_generation: HashMap<String, u64>,
+    /// Hashes only, never tokens: enough to name a refused one.
+    retired: VecDeque<RetiredObjectCredential>,
+}
+
+impl CredentialBook {
+    fn retire(
+        &mut self,
+        token_hash: [u8; 32],
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+        cause: CredentialRetirement,
+    ) {
+        self.retired.push_back(RetiredObjectCredential {
+            token_hash,
+            executor_id: executor_id.to_owned(),
+            generation,
+            retired_at_unix_ms: now_unix_ms,
+            cause,
+        });
+        while self.retired.len() > RETIRED_CREDENTIAL_CAP {
+            self.retired.pop_front();
+        }
+    }
+
+    fn prune_retired(&mut self, now_unix_ms: u64) {
+        self.retired.retain(|retired| {
+            retired.retired_at_unix_ms.saturating_add(CREDENTIAL_TTL_MS) >= now_unix_ms
+        });
+    }
+
+    fn stored(&self, executor_id: &str) -> Option<StoredObjectSession> {
+        self.sessions
+            .get(executor_id)
+            .map(|session| StoredObjectSession {
+                generation: session.generation,
+                expires_at_unix_ms: session.expires_at_unix_ms,
+            })
+    }
+}
+
+/// One refusal line per executor per interval, so a burst of retries against
+/// a dead token stays readable.
+struct RefusalReports(Mutex<crate::repeat_report::KeyedRepeatReporter<String>>);
+
+impl Default for RefusalReports {
+    fn default() -> Self {
+        Self(Mutex::new(crate::repeat_report::KeyedRepeatReporter::new(
+            REFUSAL_REPORT_INTERVAL,
+        )))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthenticatedObjectSession {
     pub executor_id: String,
@@ -244,7 +442,8 @@ pub struct StagedDeltaUpload {
 
 #[derive(Clone, Default)]
 pub struct ObjectPlaneState {
-    sessions: Arc<Mutex<HashMap<String, ObjectCredentialSession>>>,
+    credentials: Arc<Mutex<CredentialBook>>,
+    refusal_reports: Arc<RefusalReports>,
     authorized: Arc<Mutex<HashMap<(String, String), AuthorizedTransfer>>>,
     staged: Arc<Mutex<HashMap<String, StagedDeltaUpload>>>,
     /// The node scratch routes' grants and in-flight write-backs, revoked with
@@ -259,6 +458,9 @@ struct AuthorizedTransfer {
 }
 
 impl ObjectPlaneState {
+    /// Issue (or rotate) `generation`'s object-channel credential. `None` when
+    /// a newer generation of this executor has already been issued: the caller
+    /// is a superseded connection and must not touch the live session.
     pub fn issue_credential(
         &self,
         executor_id: &str,
@@ -266,22 +468,78 @@ impl ObjectPlaneState {
         runner_device_id: &str,
         generation: u64,
         now_unix_ms: u64,
-    ) -> (String, u64) {
+    ) -> Option<(String, u64)> {
+        let mut book = self.credentials.lock().unwrap();
+        book.prune_retired(now_unix_ms);
+        if let Some(newest) = book
+            .newest_generation
+            .get(executor_id)
+            .copied()
+            .filter(|newest| generation < *newest)
+        {
+            log::warn!(
+                "object-channel credential issue refused: executor_id={executor_id} generation={generation} is superseded by generation={newest}"
+            );
+            return None;
+        }
+        book.newest_generation
+            .insert(executor_id.to_owned(), generation);
         let token = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
         let expires_at_unix_ms = now_unix_ms.saturating_add(CREDENTIAL_TTL_MS);
-        let mut sessions = self.sessions.lock().unwrap();
-        let previous_token = sessions.get(executor_id).and_then(|session| {
-            (session.generation == generation && session.expires_at_unix_ms >= now_unix_ms)
-                .then_some(PreviousObjectCredential {
-                    token_hash: session.token_hash,
-                    expires_at_unix_ms: session.expires_at_unix_ms,
-                })
-        });
-        sessions.insert(
+        let previous_token = match book.sessions.remove(executor_id) {
+            Some(session) if session.generation == generation => {
+                if let Some(previous) = session.previous_token {
+                    book.retire(
+                        previous.token_hash,
+                        executor_id,
+                        generation,
+                        now_unix_ms,
+                        CredentialRetirement::Rotated,
+                    );
+                }
+                if session.expires_at_unix_ms >= now_unix_ms {
+                    Some(PreviousObjectCredential {
+                        token_hash: session.token_hash,
+                        expires_at_unix_ms: session.expires_at_unix_ms,
+                    })
+                } else {
+                    book.retire(
+                        session.token_hash,
+                        executor_id,
+                        generation,
+                        now_unix_ms,
+                        CredentialRetirement::Rotated,
+                    );
+                    None
+                }
+            }
+            Some(session) => {
+                let cause = CredentialRetirement::Superseded { by: generation };
+                book.retire(
+                    session.token_hash,
+                    executor_id,
+                    session.generation,
+                    now_unix_ms,
+                    cause,
+                );
+                if let Some(previous) = session.previous_token {
+                    book.retire(
+                        previous.token_hash,
+                        executor_id,
+                        session.generation,
+                        now_unix_ms,
+                        cause,
+                    );
+                }
+                None
+            }
+            None => None,
+        };
+        book.sessions.insert(
             executor_id.to_owned(),
             ObjectCredentialSession {
                 device_id: device_id.to_owned(),
@@ -292,16 +550,49 @@ impl ObjectPlaneState {
                 previous_token,
             },
         );
-        (token, expires_at_unix_ms)
+        Some((token, expires_at_unix_ms))
+    }
+
+    /// Whether `generation` holds an unexpired session for this executor. A
+    /// live connection that finds it does not has lost its session to
+    /// something it did not do, and re-issues.
+    pub fn holds_session(&self, executor_id: &str, generation: u64, now_unix_ms: u64) -> bool {
+        self.credentials
+            .lock()
+            .unwrap()
+            .sessions
+            .get(executor_id)
+            .is_some_and(|session| {
+                session.generation == generation && session.expires_at_unix_ms >= now_unix_ms
+            })
     }
 
     pub fn revoke(&self, executor_id: &str, generation: u64) {
-        let mut sessions = self.sessions.lock().unwrap();
-        if sessions
+        let mut book = self.credentials.lock().unwrap();
+        if book
+            .sessions
             .get(executor_id)
             .is_some_and(|session| session.generation == generation)
         {
-            sessions.remove(executor_id);
+            let now = unix_time_ms();
+            if let Some(session) = book.sessions.remove(executor_id) {
+                book.retire(
+                    session.token_hash,
+                    executor_id,
+                    generation,
+                    now,
+                    CredentialRetirement::Revoked,
+                );
+                if let Some(previous) = session.previous_token {
+                    book.retire(
+                        previous.token_hash,
+                        executor_id,
+                        generation,
+                        now,
+                        CredentialRetirement::Rotated,
+                    );
+                }
+            }
             self.scratch.revoke_connection(executor_id, generation);
             self.authorized.lock().unwrap().retain(|_, transfer| {
                 transfer.coordinate.executor_id != executor_id
@@ -399,24 +690,91 @@ impl ObjectPlaneState {
         &self,
         token: &str,
         now_unix_ms: u64,
-    ) -> Option<AuthenticatedObjectSession> {
+    ) -> Result<AuthenticatedObjectSession, ObjectAuthRefusal> {
         let candidate = hash_bytes(token.as_bytes());
-        let sessions = self.sessions.lock().unwrap();
-        let (executor_id, session) = sessions.iter().find(|(_, session)| {
-            let current = session.expires_at_unix_ms >= now_unix_ms
-                && constant_time_eq(&candidate, &session.token_hash);
-            let previous = session.previous_token.as_ref().is_some_and(|previous| {
-                previous.expires_at_unix_ms >= now_unix_ms
-                    && constant_time_eq(&candidate, &previous.token_hash)
+        let book = self.credentials.lock().unwrap();
+        let mut expired = None;
+        for (executor_id, session) in &book.sessions {
+            let matched_expiry = if constant_time_eq(&candidate, &session.token_hash) {
+                Some(session.expires_at_unix_ms)
+            } else {
+                session
+                    .previous_token
+                    .as_ref()
+                    .filter(|previous| constant_time_eq(&candidate, &previous.token_hash))
+                    .map(|previous| previous.expires_at_unix_ms)
+            };
+            match matched_expiry {
+                Some(expires_at) if expires_at >= now_unix_ms => {
+                    return Ok(AuthenticatedObjectSession {
+                        executor_id: executor_id.clone(),
+                        device_id: session.device_id.clone(),
+                        runner_device_id: session.runner_device_id.clone(),
+                        generation: session.generation,
+                    });
+                }
+                Some(expires_at) => expired = Some((executor_id, session.generation, expires_at)),
+                None => {}
+            }
+        }
+        if let Some((executor_id, generation, expired_at_unix_ms)) = expired {
+            return Err(ObjectAuthRefusal::Expired {
+                executor_id: executor_id.clone(),
+                generation,
+                expired_at_unix_ms,
+                stored: book.stored(executor_id),
             });
-            current || previous
-        })?;
-        Some(AuthenticatedObjectSession {
-            executor_id: executor_id.clone(),
-            device_id: session.device_id.clone(),
-            runner_device_id: session.runner_device_id.clone(),
-            generation: session.generation,
+        }
+        let retired = book
+            .retired
+            .iter()
+            .rev()
+            .find(|retired| constant_time_eq(&candidate, &retired.token_hash));
+        Err(match retired {
+            Some(retired) => ObjectAuthRefusal::Retired {
+                executor_id: retired.executor_id.clone(),
+                generation: retired.generation,
+                retired_at_unix_ms: retired.retired_at_unix_ms,
+                cause: retired.cause,
+                stored: book.stored(&retired.executor_id),
+            },
+            None => ObjectAuthRefusal::Unknown,
         })
+    }
+
+    /// Log one refused object-channel request, at most one line per executor
+    /// per interval with the rest counted into the next. Every route that
+    /// authenticates an object-channel token reports through here so they all
+    /// say the same thing. `presented` is the executor and generation the
+    /// request claimed, when it carried a coordinate. Returns the line logged.
+    pub fn report_refusal(
+        &self,
+        route: &str,
+        presented: Option<(&str, u64)>,
+        refusal: &ObjectAuthRefusal,
+    ) -> Option<String> {
+        let presented_text = match presented {
+            Some((executor_id, generation)) => {
+                format!("executor_id={executor_id} generation={generation}")
+            }
+            None => "none".into(),
+        };
+        let message = format!(
+            "object-channel credential refused route={route} presented {presented_text} refusal={refusal}"
+        );
+        let key = presented
+            .map(|(executor_id, _)| executor_id)
+            .or_else(|| refusal.executor_id())
+            .unwrap_or("<unidentified>")
+            .to_owned();
+        let line = self.refusal_reports.0.lock().unwrap().record(
+            Instant::now(),
+            key,
+            &format!("{route}:{}", refusal.signature()),
+            &message,
+        )?;
+        log::warn!("{line}");
+        Some(line)
     }
 
     pub fn stage_delta(
@@ -459,9 +817,10 @@ impl ObjectPlaneState {
     /// commit-barrier consumer uses this instead of trusting executor JSON.
     pub fn staged_delta(&self, receipt: &DeltaUploadReceipt) -> Option<StagedDeltaUpload> {
         let session_is_current = self
-            .sessions
+            .credentials
             .lock()
             .unwrap()
+            .sessions
             .get(&receipt.coordinate.executor_id)
             .is_some_and(|session| {
                 session.generation == receipt.coordinate.connection_generation
@@ -623,14 +982,144 @@ mod tests {
     #[test]
     fn reconnect_invalidates_old_credential_and_disconnect_is_generation_guarded() {
         let state = ObjectPlaneState::default();
-        let (old, _) = state.issue_credential("executor", "device", "runner", 1, 100);
-        let (new, _) = state.issue_credential("executor", "device", "runner", 2, 100);
-        assert!(state.authenticate(&old, 101).is_none());
+        let (old, _) = state
+            .issue_credential("executor", "device", "runner", 1, 100)
+            .unwrap();
+        let (new, _) = state
+            .issue_credential("executor", "device", "runner", 2, 100)
+            .unwrap();
+        assert!(state.authenticate(&old, 101).is_err());
         assert_eq!(state.authenticate(&new, 101).unwrap().generation, 2);
         state.revoke("executor", 1);
-        assert!(state.authenticate(&new, 101).is_some());
+        assert!(state.authenticate(&new, 101).is_ok());
         state.revoke("executor", 2);
-        assert!(state.authenticate(&new, 101).is_none());
+        assert!(state.authenticate(&new, 101).is_err());
+    }
+
+    /// The 11-08 specimen: a superseded connection task's late refresh and
+    /// teardown ran after the executor's next generation attached.
+    #[test]
+    fn a_stale_refresh_after_reconnect_leaves_the_live_credential_valid() {
+        let state = ObjectPlaneState::default();
+        state
+            .issue_credential("executor", "device", "runner", 3, 100)
+            .unwrap();
+        let (live, _) = state
+            .issue_credential("executor", "device", "runner", 4, 100)
+            .unwrap();
+        assert!(
+            state
+                .issue_credential("executor", "device", "runner", 3, 101)
+                .is_none(),
+            "a superseded generation must not be issued a credential"
+        );
+        assert!(
+            state.authenticate(&live, 102).is_ok(),
+            "a stale generation's refresh replaced the live credential"
+        );
+        state.revoke("executor", 3);
+        assert!(
+            state.authenticate(&live, 103).is_ok(),
+            "a stale generation's teardown deleted the live session"
+        );
+        assert!(state.holds_session("executor", 4, 103));
+        assert!(!state.holds_session("executor", 3, 103));
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_issue_after_the_live_session_ends() {
+        let state = ObjectPlaneState::default();
+        state
+            .issue_credential("executor", "device", "runner", 4, 100)
+            .unwrap();
+        state.revoke("executor", 4);
+        assert!(state
+            .issue_credential("executor", "device", "runner", 3, 101)
+            .is_none());
+        assert!(state.credentials.lock().unwrap().sessions.is_empty());
+        // The next generation is still welcome.
+        assert!(state
+            .issue_credential("executor", "device", "runner", 5, 102)
+            .is_some());
+    }
+
+    #[test]
+    fn a_superseded_token_is_refused_naming_both_generations() {
+        let state = ObjectPlaneState::default();
+        let (old, _) = state
+            .issue_credential("executor", "device", "runner", 3, 100)
+            .unwrap();
+        let (live, live_expires) = state
+            .issue_credential("executor", "device", "runner", 4, 200)
+            .unwrap();
+        assert_eq!(
+            state.authenticate(&old, 201).unwrap_err(),
+            ObjectAuthRefusal::Retired {
+                executor_id: "executor".into(),
+                generation: 3,
+                retired_at_unix_ms: 200,
+                cause: CredentialRetirement::Superseded { by: 4 },
+                stored: Some(StoredObjectSession {
+                    generation: 4,
+                    expires_at_unix_ms: live_expires,
+                }),
+            }
+        );
+        assert_eq!(
+            state.authenticate("not a token", 201).unwrap_err(),
+            ObjectAuthRefusal::Unknown
+        );
+        assert_eq!(
+            state.authenticate(&live, live_expires + 1).unwrap_err(),
+            ObjectAuthRefusal::Expired {
+                executor_id: "executor".into(),
+                generation: 4,
+                expired_at_unix_ms: live_expires,
+                stored: Some(StoredObjectSession {
+                    generation: 4,
+                    expires_at_unix_ms: live_expires,
+                }),
+            }
+        );
+        state.revoke("executor", 4);
+        assert!(matches!(
+            state.authenticate(&live, 201).unwrap_err(),
+            ObjectAuthRefusal::Retired {
+                generation: 4,
+                cause: CredentialRetirement::Revoked,
+                stored: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_refusal_is_reported_once_per_executor_per_interval_naming_what_it_lost_to() {
+        let state = ObjectPlaneState::default();
+        let (old, _) = state
+            .issue_credential("executor", "device", "runner", 3, 100)
+            .unwrap();
+        state
+            .issue_credential("executor", "device", "runner", 4, 200)
+            .unwrap();
+        let refusal = state.authenticate(&old, 201).unwrap_err();
+        let line = state
+            .report_refusal("/fetch", Some(("executor", 3)), &refusal)
+            .expect("the first refusal is reported");
+        for expected in [
+            "object-channel credential refused route=/fetch",
+            "presented executor_id=executor generation=3",
+            "cause=\"superseded by generation 4\"",
+            "stored_generation=4",
+        ] {
+            assert!(line.contains(expected), "{line} lacks {expected}");
+        }
+        assert!(
+            state
+                .report_refusal("/fetch", Some(("executor", 3)), &refusal)
+                .is_none(),
+            "an identical repeat inside the interval is folded into the next line"
+        );
     }
 
     #[test]
@@ -698,14 +1187,18 @@ mod tests {
     #[test]
     fn credential_rotation_keeps_a_live_generation_authenticated_past_the_old_ttl() {
         let state = ObjectPlaneState::default();
-        let (old, old_expires) = state.issue_credential("executor", "device", "runner", 1, 100);
-        let (rotated, rotated_expires) = state.issue_credential(
-            "executor",
-            "device",
-            "runner",
-            1,
-            old_expires.saturating_sub(1),
-        );
+        let (old, old_expires) = state
+            .issue_credential("executor", "device", "runner", 1, 100)
+            .unwrap();
+        let (rotated, rotated_expires) = state
+            .issue_credential(
+                "executor",
+                "device",
+                "runner",
+                1,
+                old_expires.saturating_sub(1),
+            )
+            .unwrap();
         assert_eq!(
             state
                 .authenticate(&old, old_expires.saturating_sub(1))
@@ -716,7 +1209,7 @@ mod tests {
         );
         assert!(state
             .authenticate(&old, old_expires.saturating_add(1))
-            .is_none());
+            .is_err());
         assert_eq!(
             state
                 .authenticate(&rotated, old_expires.saturating_add(1))
@@ -747,10 +1240,13 @@ mod tests {
             .unwrap();
         assert_eq!(first.path, second.path);
         assert!(state.staged_delta(&receipt).is_none());
-        let (_token, _) = state.issue_credential("executor", "device", "runner", 1, unix_time_ms());
+        state
+            .issue_credential("executor", "device", "runner", 1, unix_time_ms())
+            .unwrap();
         assert_eq!(state.staged_delta(&receipt).unwrap().path, first.path);
-        let (_replacement, _) =
-            state.issue_credential("executor", "device", "runner", 2, unix_time_ms());
+        state
+            .issue_credential("executor", "device", "runner", 2, unix_time_ms())
+            .unwrap();
         assert!(state.staged_delta(&receipt).is_none());
         let mut conflicting = receipt;
         conflicting.content_hash = "different".into();

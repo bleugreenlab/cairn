@@ -697,7 +697,7 @@ fn authenticated(state: &ObjectServerState, headers: &HeaderMap) -> bool {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            state.orch.object_plane.authenticate(token, now)
+            state.orch.object_plane.authenticate(token, now).ok()
         })
         .is_some()
 }

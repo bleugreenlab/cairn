@@ -114,13 +114,16 @@ async fn world(config: Option<&str>) -> World {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let machine = |id: &'static str, writer: &'static str, root: PathBuf| {
-        let (token, _) = orch.object_plane.issue_credential(
-            id,
-            &format!("{id}-device"),
-            "runner",
-            1,
-            chrono::Utc::now().timestamp_millis() as u64,
-        );
+        let (token, _) = orch
+            .object_plane
+            .issue_credential(
+                id,
+                &format!("{id}-device"),
+                "runner",
+                1,
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .expect("a first generation is issued");
         orch.object_plane.scratch.authorize(id, 1, &scratch.id);
         Machine {
             replicas: Replicas::new(root),
@@ -145,13 +148,17 @@ impl World {
     /// object-channel credential for that connection generation, and the
     /// scratch granted to it, as its advertisement grants a replica.
     fn attach(&self, executor_id: &str, generation: u64) -> ObjectChannelCredential {
-        let (bearer_token, expires_at_unix_ms) = self.orch.object_plane.issue_credential(
-            executor_id,
-            &format!("{executor_id}-device"),
-            "runner",
-            generation,
-            chrono::Utc::now().timestamp_millis() as u64,
-        );
+        let (bearer_token, expires_at_unix_ms) = self
+            .orch
+            .object_plane
+            .issue_credential(
+                executor_id,
+                &format!("{executor_id}-device"),
+                "runner",
+                generation,
+                chrono::Utc::now().timestamp_millis() as u64,
+            )
+            .expect("an attach issues its generation");
         self.orch
             .object_plane
             .scratch

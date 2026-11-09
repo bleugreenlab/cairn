@@ -1525,6 +1525,9 @@ pub struct Fleet {
     listener_rotation_control: Arc<Mutex<Option<Arc<dyn ListenerRotationControl>>>>,
     connections: Arc<Mutex<HashMap<String, ExecutorConnectionState>>>,
     connection_generations: Arc<Mutex<HashMap<String, u64>>>,
+    /// One lock per executor serializing its synced registry writes; see
+    /// [`Fleet::registry_write_permit`].
+    registry_write_fences: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Each machine's recent load, by executor identity. Beside
     /// `connections` rather than in them, so a link that drops and reattaches
     /// keeps the machine's history: the ring is the runner's account of the
@@ -5636,6 +5639,52 @@ impl Fleet {
     /// The clock the transport's reader and ingest tasks stamp for this
     /// connection. Fetched once after attach and stamped lock-free, so the
     /// stamps never wait on the connection table they describe.
+    /// Permission for `generation` to write this executor's synced registry
+    /// row, held across the write. `None` once a newer generation has attached.
+    ///
+    /// A replaced connection's writes (its registry writer draining a last
+    /// "online" upsert, its teardown's "offline" mark) can otherwise land after
+    /// its replacement's and put the old generation back on the row. The check
+    /// and the write happen under one per-executor lock, so a write already
+    /// under way when the replacement attaches finishes before any of the
+    /// replacement's begins, and every later one is refused. The newest
+    /// generation is this process's own counter, so a runner restart starts
+    /// it over and the new runner's first write is never fenced out by a row
+    /// the previous one left.
+    pub async fn registry_write_permit(
+        &self,
+        executor_id: &str,
+        generation: u64,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let fence = self
+            .registry_write_fences
+            .lock()
+            .unwrap()
+            .entry(executor_id.to_owned())
+            .or_default()
+            .clone();
+        let permit = fence.lock_owned().await;
+        let newest = self
+            .connection_generations
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .copied();
+        (newest == Some(generation)).then_some(permit)
+    }
+
+    /// The generation this executor's registered connection holds, if any.
+    ///
+    /// An attach replaces the entry and ends the replaced generation's work,
+    /// but the replaced connection's task keeps running until its own socket
+    /// fails. That task reads this to learn it is superseded and stop, rather
+    /// than act for a connection the fleet has already moved past.
+    pub fn connected_generation(&self, executor_id: &str) -> Option<u64> {
+        self.lock_connections()
+            .get(executor_id)
+            .map(|entry| entry.generation)
+    }
+
     pub fn link_clock(
         &self,
         executor_id: &str,

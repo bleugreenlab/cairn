@@ -5609,6 +5609,16 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6596 does not move the number. No frame, variant or field changes.
+/// The runner now ends a connection superseded by a newer generation of the
+/// same executor within a liveness tick, refuses to issue that connection an
+/// object-channel credential, and re-issues a live connection's lost one with
+/// the existing `ObjectChannelUpdated` frame, which every executor already
+/// applies. An executor now ignores an `ObjectChannelUpdated` naming a
+/// generation other than its session's; a runner only ever sends one naming
+/// the connection it travels on. What a runner gets wrong talking to an older
+/// executor: nothing.
+///
 /// cairn/6023 does not move the number. It adds an optional `pipeHealth` field
 /// to [`HostHealth`] and to [`MachineSample`]: the executor's fresh-pipe
 /// evidence ([`crate::pipe_health::PipeHealth`]), which the runner assesses
