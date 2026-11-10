@@ -724,11 +724,12 @@ async fn a_deadline_after_dispatch_cancels_the_call_and_revokes_its_bearer() {
     );
     // Long enough that delegation and admission cannot plausibly spend it,
     // so the frame is sent; `dispatched` fails by phase if it is not.
-    let mut linger = request("patient", "linger", agent());
+    let method = "linger";
+    let mut linger = request("patient", method, agent());
     linger.timeout = Some(Duration::from_secs(30));
     let orch = h.orch.clone();
     let mut caller = tokio::spawn(async move { call(&orch, linger).await });
-    let call_frame = dispatched(&h, "linger", &mut caller).await;
+    let call_frame = dispatched(&h, method, &mut caller).await;
     let (run_id, token) = authority_of(&call_frame);
     assert!(
         h.orch.run_bearers.verify(&token, &local()).is_ok(),
@@ -753,7 +754,7 @@ async fn a_deadline_after_dispatch_cancels_the_call_and_revokes_its_bearer() {
     assert_eq!(cancels.len(), 1, "{cancels:?}");
     assert_eq!(cancels[0]["id"], call_frame["id"]);
     assert_eq!(
-        calls_of(&h, "hang").len(),
+        calls_of(&h, method).len(),
         1,
         "a timed-out call is not resent"
     );

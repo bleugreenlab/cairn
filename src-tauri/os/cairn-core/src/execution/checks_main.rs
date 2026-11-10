@@ -2403,6 +2403,9 @@ fn host_ended_compile_cause(row: &CadenceRow) -> Option<String> {
         HostEnding::Storage(error) => format!(
             "infrastructure: the host's storage failed ({error}){krate}, so the run exited {exit} without a verdict on the tree. The error is the operating system's, not a compiler error about the code, so the tree is not implicated and there is no compile error to match against a break on main"
         ),
+        HostEnding::WriteDenied(error) => format!(
+            "infrastructure: the operating system refused the compiler's write of its build output ({error}){krate}, so the run exited {exit} without a verdict on the tree. The refusal is the machine's write access to its build directory and recurs until that access changes; it is not a compiler error about the code, so the tree is not implicated and there is no compile error to match against a break on main"
+        ),
     })
 }
 
@@ -5317,7 +5320,7 @@ pub(crate) fn render_heartbeat(
 mod tests {
     use super::*;
     use crate::execution::checks::host_ended_compile_specimens::{
-        COMPILE_ERROR_TAIL, DISK_FULL_TAIL, KILLED_RMCP_TAIL,
+        COMPILE_ERROR_TAIL, DISK_FULL_TAIL, KILLED_RMCP_TAIL, MIRROR_WRITE_DENIED_TAIL,
     };
 
     fn row(id: &str, commit: &str, ran_at_ms: i64, tests: &[(&str, TestOutcome)]) -> CadenceRow {
@@ -8309,6 +8312,42 @@ mod tests {
         assert!(matches!(
             classify_row(compile_row("io", &io)),
             CadenceVerdict::Death { cause, .. } if cause.contains("(Input/output error)")
+        ));
+    }
+
+    /// cairn/6279: a compile whose output writes the operating system refused
+    /// (the external-host mirror's dep-info, outside any build slot) is a death
+    /// naming the refusal through the store's predicate, and a compile error
+    /// beside it stays the tree's.
+    #[test]
+    fn a_compile_whose_output_write_the_os_refused_is_a_death_that_names_the_refusal() {
+        let verdict = classify_row(compile_row("denied", MIRROR_WRITE_DENIED_TAIL));
+        let CadenceVerdict::Death {
+            row: Some(_),
+            cause,
+        } = &verdict
+        else {
+            panic!("a refused output write is a death that keeps its row: {verdict:?}");
+        };
+        assert!(
+            cause.starts_with(
+                "infrastructure: the operating system refused the compiler's write of its build output (Operation not permitted) while compiling `cfg-if`"
+            ),
+            "{cause}"
+        );
+        assert!(
+            cause.contains("recurs until that access changes"),
+            "{cause}"
+        );
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
+        assert!(text.contains("Cause class: **death**"), "{text}");
+        assert!(text.contains("the tree is not implicated"), "{text}");
+        assert!(matches!(
+            classify_row(compile_row(
+                "mixed",
+                &format!("{COMPILE_ERROR_TAIL}\n{MIRROR_WRITE_DENIED_TAIL}")
+            )),
+            CadenceVerdict::NoVerdict { row: Some(_), .. }
         ));
     }
 

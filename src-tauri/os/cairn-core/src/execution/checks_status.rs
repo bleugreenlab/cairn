@@ -149,9 +149,13 @@ pub(crate) fn verdict_evidence_from_facts(
     verdict_evidence_with_expectation(passed, parsed, None)
 }
 
-/// Only a known non-enumerating command can rely on its exit status alone.
-/// Structured results retain authority, including incomplete or disowned greens.
-fn verdict_evidence_with_expectation(
+/// [`verdict_evidence`] for a reader that knows whether the lane's command owes
+/// a test enumeration (`Some(is_test_runner_command(command))`), or `None` when
+/// it does not know the command. Only a known non-enumerating command can rely
+/// on its exit status alone, so a script check's parse-less green is its
+/// verdict while a test runner's or an unknown command's is not. Structured
+/// results retain authority, including incomplete or disowned greens.
+pub(crate) fn verdict_evidence_with_expectation(
     passed: bool,
     parsed: Option<&VerdictFacts<'_>>,
     expects_enumeration: Option<bool>,
@@ -2356,10 +2360,19 @@ pub(crate) async fn check_wake_body(orch: &Orchestrator, job_id: &str) -> Option
             log::debug!("check wake body for job {job_id}: recorded plan unreadable: {error}");
             BTreeMap::new()
         });
+    let cancelled = latest_wave_cancellations(&db, job_id)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "check wake body for job {job_id}: the newest wave's cancelled lanes are \
+                 unreadable ({error}); their earlier rows may stand in for them"
+            );
+            None
+        });
     match crate::execution::cache::latest_check_results_for_job(&db, job_id).await {
         Ok(lanes) => {
             let attributions = wake_attributions(orch, &db, job_id, &lanes).await;
-            format_check_wake_body(&lanes, &unsupported, &attributions)
+            format_check_wake_body(&lanes, &unsupported, &attributions, cancelled.as_ref())
         }
         Err(error) => {
             log::debug!("check wake body for job {job_id}: {error}");
@@ -2410,6 +2423,60 @@ async fn latest_planned_unsupported(
         .unwrap_or_default())
 }
 
+/// The lanes the newest settled wave for a job planned and Cairn cancelled
+/// before they produced a verdict, as that wave recorded them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WaveCancellations {
+    pub(crate) lanes: Vec<crate::execution::checks_turn_end::CancelledLane>,
+    /// When the wave settled, in unix ms. A row recorded after it answers its
+    /// lane, at whatever inputs.
+    pub(crate) settled_at: i64,
+    /// Whether the runner's stop cut the wave short, so the next boot re-runs
+    /// it rather than the next wave for the tree.
+    pub(crate) by_restart: bool,
+}
+
+/// The cancellations of the newest wave that answered for its head or says
+/// why it could not: one that `completed` (and so cancelled nothing) or one
+/// that recorded cancelled lanes. A wave still running, or one withdrawn
+/// before its lanes ran, says nothing about lanes an earlier wave left without
+/// a verdict, so it is passed over; a newer completed wave clears them.
+/// `None` when the newest such wave cancelled nothing.
+async fn latest_wave_cancellations(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<WaveCancellations>, String> {
+    let newest = db
+        .query_opt(
+            "SELECT cancelled_lanes_json, updated_at, state, reason FROM turn_end_check_attempts
+              WHERE job_id = ?1 AND (state = 'completed' OR cancelled_lanes_json IS NOT NULL)
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+            (job_id.to_string(),),
+            |row| {
+                Ok((
+                    row.opt_text(0)?,
+                    row.i64(1)?,
+                    row.text(2)?,
+                    row.opt_text(3)?,
+                ))
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((Some(json), settled_at, state, reason)) = newest else {
+        return Ok(None);
+    };
+    let lanes = serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    Ok(Some(WaveCancellations {
+        lanes,
+        settled_at,
+        by_restart: crate::execution::checks_turn_end::attempt_interrupted_by_restart(
+            &state,
+            reason.as_deref(),
+        ),
+    }))
+}
+
 async fn latest_recorded_wave_plan(
     db: &LocalDb,
     job_id: &str,
@@ -2450,16 +2517,45 @@ async fn latest_recorded_wave_plan(
 /// A check in `unsupported` is listed by its notice, exactly as `/checks` lists
 /// it, and whatever row it last recorded is set aside: that row is about a tree
 /// before the head, and the head has no verdict for it, red or green.
+///
+/// A lane the newest settled wave records as `cancelled` is the same case: a
+/// cancellation writes no row, so the lane's newest row is an earlier tree's.
+/// Unless a row has answered it since (one at the inputs the wave planned, or
+/// one recorded after the wave settled), the lane is listed as cancelled and
+/// counted without a verdict, and its earlier row is set aside.
 pub(crate) fn format_check_wake_body(
     lanes: &[LaneRow],
     unsupported: &BTreeMap<String, UnsupportedCheck>,
     attributions: &HashMap<String, BaseAttribution>,
+    cancellations: Option<&WaveCancellations>,
 ) -> Option<String> {
+    let mut cancelled: Vec<&crate::execution::checks_turn_end::CancelledLane> = cancellations
+        .map(|wave| {
+            wave.lanes
+                .iter()
+                .filter(|cancelled| !unsupported.contains_key(&cancelled.name))
+                .filter(|cancelled| {
+                    !lanes.iter().any(|lane| {
+                        lane.row.check_name == cancelled.name
+                            && (lane.row.input_hash == cancelled.input_hash
+                                || lane.row.ran_at > wave.settled_at)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    cancelled.sort_by(|left, right| left.name.cmp(&right.name));
+    cancelled.dedup_by(|left, right| left.name == right.name);
     let mut lanes: Vec<&LaneRow> = lanes
         .iter()
         .filter(|lane| !unsupported.contains_key(&lane.row.check_name))
+        .filter(|lane| {
+            !cancelled
+                .iter()
+                .any(|cancelled| cancelled.name == lane.row.check_name)
+        })
         .collect();
-    if lanes.is_empty() && unsupported.is_empty() {
+    if lanes.is_empty() && unsupported.is_empty() && cancelled.is_empty() {
         return None;
     }
     lanes.sort_by(|left, right| left.row.check_name.cmp(&right.row.check_name));
@@ -2492,9 +2588,10 @@ pub(crate) fn format_check_wake_body(
             existence => no_verdict.push((row, existence)),
         }
     }
-    let judged = passing.len() + failing.len() + uncharged.len() + no_verdict.len();
-    let clean = failing.is_empty() && uncharged.is_empty() && no_verdict.is_empty();
-    let mut out = match (failing.len(), no_verdict.len()) {
+    let silent = no_verdict.len() + cancelled.len();
+    let judged = passing.len() + failing.len() + uncharged.len() + silent;
+    let clean = failing.is_empty() && uncharged.is_empty() && silent == 0;
+    let mut out = match (failing.len(), silent) {
         (failed, silent) if !uncharged.is_empty() => {
             let failed = match failed {
                 0 => "none failing".to_string(),
@@ -2562,6 +2659,29 @@ pub(crate) fn format_check_wake_body(
             .collect();
         out.push_str(&format!(
             "\n- \u{2298} also without a verdict: {}",
+            join_capped(&rest, WAKE_ROLLUP_NAMES)
+        ));
+    }
+    let rerun = if cancellations.is_some_and(|wave| wave.by_restart) {
+        "the runner's next boot re-runs its wave"
+    } else {
+        "it runs again the next time checks run for this tree"
+    };
+    for lane in cancelled.iter().take(WAKE_DETAILED_FAILURES) {
+        out.push_str(&format!(
+            "\n- \u{2298} {} \u{2014} cancelled before it produced a verdict on this head: {}; \
+             no verdict was recorded, and {rerun}",
+            lane.name, lane.cause
+        ));
+    }
+    if cancelled.len() > WAKE_DETAILED_FAILURES {
+        let rest: Vec<String> = cancelled
+            .iter()
+            .skip(WAKE_DETAILED_FAILURES)
+            .map(|lane| lane.name.clone())
+            .collect();
+        out.push_str(&format!(
+            "\n- \u{2298} also cancelled without a verdict: {}",
             join_capped(&rest, WAKE_ROLLUP_NAMES)
         ));
     }
@@ -3391,7 +3511,122 @@ mod tests {
     /// A wake body over rows that each answer their own lane.
     fn wake(rows: impl IntoIterator<Item = CheckResultCacheEntry>) -> Option<String> {
         let lanes: Vec<LaneRow> = rows.into_iter().map(LaneRow::from).collect();
-        format_check_wake_body(&lanes, &BTreeMap::new(), &HashMap::new())
+        format_check_wake_body(&lanes, &BTreeMap::new(), &HashMap::new(), None)
+    }
+
+    fn cancelled(name: &str, settled_at: i64, by_restart: bool) -> WaveCancellations {
+        WaveCancellations {
+            lanes: vec![crate::execution::checks_turn_end::CancelledLane {
+                name: name.to_string(),
+                input_hash: format!("head-{name}"),
+                cause: "Cairn's runner is stopping".to_string(),
+            }],
+            settled_at,
+            by_restart,
+        }
+    }
+
+    /// cairn/6422 (cairn/6274's wave): the runner's stop cancelled lanes that
+    /// had passed on an earlier tree. A cancellation writes no row, so each
+    /// lane's newest row was that earlier pass, and the notice announced every
+    /// lane passing. The cancelled lane is counted without a verdict, named as
+    /// cancelled, and its earlier row is not read as the head's.
+    #[test]
+    fn a_lane_the_newest_wave_cancelled_is_not_announced_by_an_earlier_trees_pass() {
+        let lanes: Vec<LaneRow> = [
+            verdict_row("rust-lint", true),
+            verdict_row("rust-fmt", true),
+        ]
+        .into_iter()
+        .map(LaneRow::from)
+        .collect();
+        let wave = cancelled("rust-lint", 10, true);
+
+        let body =
+            format_check_wake_body(&lanes, &BTreeMap::new(), &HashMap::new(), Some(&wave)).unwrap();
+
+        assert!(
+            body.starts_with(
+                "Project checks on this node: none failing; 1 of 2 without a verdict."
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("all 2 passing"), "{body}");
+        assert!(
+            body.contains(
+                "\n- \u{2298} rust-lint \u{2014} cancelled before it produced a verdict on this \
+                 head: Cairn's runner is stopping; no verdict was recorded, and the runner's next \
+                 boot re-runs its wave"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\n- \u{2713} passing: rust-fmt"), "{body}");
+
+        let not_restart = cancelled("rust-lint", 10, false);
+        let body = format_check_wake_body(
+            &lanes,
+            &BTreeMap::new(),
+            &HashMap::new(),
+            Some(&not_restart),
+        )
+        .unwrap();
+        assert!(
+            body.contains("it runs again the next time checks run for this tree"),
+            "{body}"
+        );
+
+        // A cancelled lane that never recorded a row anywhere is still counted.
+        let body =
+            format_check_wake_body(&lanes[1..], &BTreeMap::new(), &HashMap::new(), Some(&wave))
+                .unwrap();
+        assert!(
+            body.starts_with(
+                "Project checks on this node: none failing; 1 of 2 without a verdict."
+            ),
+            "{body}"
+        );
+    }
+
+    /// A cancelled lane is answered again by a row at the inputs the wave
+    /// planned, or by any row recorded after the wave settled; either stands
+    /// for the lane, and a wave that cancelled nothing changes nothing.
+    #[test]
+    fn a_cancelled_lane_answered_since_reads_as_its_answer() {
+        let wave = cancelled("rust-lint", 10, true);
+        let mut same_inputs = verdict_row("rust-lint", true);
+        same_inputs.input_hash = "head-rust-lint".to_string();
+        let mut recorded_since = verdict_row("rust-lint", true);
+        recorded_since.ran_at = 11;
+        for row in [same_inputs, recorded_since] {
+            let lanes = vec![
+                LaneRow::from(row),
+                LaneRow::from(verdict_row("rust-fmt", true)),
+            ];
+            let body =
+                format_check_wake_body(&lanes, &BTreeMap::new(), &HashMap::new(), Some(&wave))
+                    .unwrap();
+            assert!(
+                body.starts_with(
+                    "Project checks on this node: all 2 passing (rust-fmt, rust-lint)."
+                ),
+                "{body}"
+            );
+        }
+
+        let lanes = vec![LaneRow::from(verdict_row("rust-fmt", true))];
+        assert_eq!(
+            format_check_wake_body(&lanes, &BTreeMap::new(), &HashMap::new(), None),
+            format_check_wake_body(
+                &lanes,
+                &BTreeMap::new(),
+                &HashMap::new(),
+                Some(&WaveCancellations {
+                    lanes: Vec::new(),
+                    settled_at: 10,
+                    by_restart: false,
+                })
+            ),
+        );
     }
 
     /// A check the head declares with a key this build does not know, as a
@@ -3433,7 +3668,7 @@ mod tests {
         .map(LaneRow::from)
         .collect();
 
-        let body = format_check_wake_body(&lanes, &unsupported, &HashMap::new()).unwrap();
+        let body = format_check_wake_body(&lanes, &unsupported, &HashMap::new(), None).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: all 1 passing (rust-fmt)."),
@@ -3466,7 +3701,7 @@ mod tests {
             .map(LaneRow::from)
             .collect();
 
-        let body = format_check_wake_body(&lanes, &unsupported, &HashMap::new()).unwrap();
+        let body = format_check_wake_body(&lanes, &unsupported, &HashMap::new(), None).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: 1 of 2 failing."),
@@ -3478,14 +3713,15 @@ mod tests {
             "{body}"
         );
 
-        let only_unsupported = format_check_wake_body(&[], &unsupported, &HashMap::new()).unwrap();
+        let only_unsupported =
+            format_check_wake_body(&[], &unsupported, &HashMap::new(), None).unwrap();
         assert!(
             only_unsupported.starts_with("Project checks on this node: no lane holds a verdict."),
             "{only_unsupported}"
         );
         assert!(only_unsupported.contains("- dead-code: needs a newer Cairn"));
         assert_eq!(
-            format_check_wake_body(&[], &BTreeMap::new(), &HashMap::new()),
+            format_check_wake_body(&[], &BTreeMap::new(), &HashMap::new(), None),
             None
         );
     }
@@ -3701,7 +3937,8 @@ mod tests {
         ])
         .unwrap();
 
-        let body = format_check_wake_body(&[lane], &BTreeMap::new(), &HashMap::new()).unwrap();
+        let body =
+            format_check_wake_body(&[lane], &BTreeMap::new(), &HashMap::new(), None).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: all 1 passing (frontend-tests)."),
@@ -3772,7 +4009,7 @@ mod tests {
             .map(LaneRow::from)
             .collect();
 
-        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &attributions).unwrap();
+        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &attributions, None).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: 1 of 2 failing."),
@@ -3821,7 +4058,7 @@ mod tests {
             .map(LaneRow::from)
             .collect();
 
-        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &attributions).unwrap();
+        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &attributions, None).unwrap();
 
         assert!(
             body.starts_with(
@@ -3842,7 +4079,7 @@ mod tests {
             "rust-tests".to_string(),
             partition("newbase", "linux", &lane, Some(&main), Some(256)),
         )]);
-        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &stale).unwrap();
+        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &stale, None).unwrap();
         assert!(
             body.starts_with("Project checks on this node: 1 of 2 failing."),
             "{body}"

@@ -1,0 +1,11 @@
+-- lineage: shared
+-- cairn/6422: the lanes a review wave planned that Cairn cancelled before they
+-- produced a verdict, kept on the wave's attempt row as a JSON array of
+-- {name, inputHash, cause}.
+--
+-- A cancellation records no check row by design (it says nothing about the
+-- tree or a machine), so without this the lane's newest row is an earlier
+-- tree's, and the delivered `turn-checks:` notice read that row as the head's
+-- state: cairn/6274's wave announced fourteen lanes passing while the runner's
+-- shutdown had cancelled three of them. NULL means the wave cancelled none.
+ALTER TABLE turn_end_check_attempts ADD COLUMN cancelled_lanes_json TEXT;

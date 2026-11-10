@@ -1956,7 +1956,7 @@ mod tests {
     #[test]
     fn check_run_response_prints_a_script_verdict_public_handle() {
         let reference = "cairn://p/cairn/check-observations/1234567890abcdef12345678";
-        for (suite, disposition) in ["licenses", "frontend-build"]
+        for (suite, disposition) in ["licenses", "frontend-build", "smoke"]
             .into_iter()
             .flat_map(|suite| {
                 ["fresh", "cached"]
@@ -1964,18 +1964,17 @@ mod tests {
                     .map(move |disposition| (suite, disposition))
             })
         {
-            let (summary, passed) = render_check_run_response(
-                &serde_json::json!({
-                    "ok": true, "result": {
-                        "checkName": suite, "commitSha": "1234567890abcdef",
-                        "disposition": disposition, "passed": true, "verified": true,
-                        "exitCode": 0, "reusable": true, "observationRef": reference
-                    }
-                })
-                .to_string(),
-            )
-            .unwrap();
+            let response = serde_json::json!({
+                "ok": true, "result": {
+                    "checkName": suite, "commitSha": "1234567890abcdef",
+                    "disposition": disposition, "passed": true, "verified": true,
+                    "exitCode": 0, "reusable": true, "observationRef": reference
+                }
+            })
+            .to_string();
+            let (summary, passed) = render_check_run_response(&response).unwrap();
             assert!(passed, "{summary}");
+            assert_eq!(check_response_exit_code(&response, passed), 0, "{summary}");
             assert!(summary.contains(&format!("{suite} ✓")), "{summary}");
             assert!(summary.contains(reference), "{summary}");
             assert!(!summary.contains("unverified"), "{summary}");

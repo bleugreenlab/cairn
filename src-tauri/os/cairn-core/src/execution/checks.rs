@@ -2217,11 +2217,16 @@ pub(crate) const NO_VERDICT_SUPPRESSED: &str = "suppressed";
 /// recorder may not have used, which is exactly how a verdict that ran on another
 /// machine came back as "not recorded".
 ///
-/// `command` is the configured command the run executed. A green with no
-/// structured result is verified only for a command that is not a test runner
-/// (a build, a type check, a validator script): a test runner must show its
-/// tests ran. An unknown command (a request recorded before its command was
-/// kept) is held to the test runner's bar.
+/// `command` is the configured command the run executed. Whether its green is
+/// verified is the `/checks` board's own answer
+/// ([`verdict_evidence_with_expectation`] over the lane's [`row_existence`]): a
+/// green with no structured result is verified only for a command that is not a
+/// test runner (a build, a type check, a validator script), and an unknown
+/// command (a request recorded before its command was kept) is held to the test
+/// runner's bar.
+///
+/// [`verdict_evidence_with_expectation`]: crate::execution::checks_status::verdict_evidence_with_expectation
+/// [`row_existence`]: crate::execution::checks_status::row_existence
 fn manual_configured_check_result(
     check_name: &str,
     project_key: &str,
@@ -2231,36 +2236,32 @@ fn manual_configured_check_result(
     command: Option<&str>,
     outcome: CheckOutcome,
 ) -> ManualConfiguredCheckResult {
-    use crate::execution::checks_status::{row_existence, LaneExistence, VerdictEvidence};
+    use crate::execution::checks_status::{
+        row_existence, verdict_evidence_with_expectation, LaneExistence, VerdictEvidence,
+    };
 
     let no_verdict = manual_check_no_verdict(&outcome);
+    let facts = outcome
+        .parsed
+        .as_ref()
+        .map(ParsedCheckResult::verdict_facts);
     let existence = row_existence(
         outcome.passed,
         outcome.failure_kind.map(CheckFailureKind::as_str),
         outcome.suppressed_after,
-        outcome
-            .parsed
-            .as_ref()
-            .map(ParsedCheckResult::verdict_facts)
-            .as_ref(),
+        facts.as_ref(),
     );
-    let unparsed_test_run = outcome.parsed.is_none()
-        && command.is_none_or(crate::execution::check_parsers::is_test_runner_command);
-    let verified =
-        outcome.passed && matches!(existence, LaneExistence::Complete) && !unparsed_test_run;
-    let unverified_reason = if outcome.passed && !verified {
-        Some(
-            match crate::execution::checks_status::verdict_evidence(
-                outcome.passed,
-                outcome.parsed.as_ref(),
-            ) {
-                VerdictEvidence::Unverified(reason) => reason.to_string(),
-                _ => existence.describe(),
-            },
-        )
-    } else {
-        None
-    };
+    let evidence = verdict_evidence_with_expectation(
+        outcome.passed,
+        facts.as_ref(),
+        command.map(crate::execution::check_parsers::is_test_runner_command),
+    );
+    let verified = matches!(evidence, VerdictEvidence::Verified)
+        && matches!(existence, LaneExistence::Complete);
+    let unverified_reason = (outcome.passed && !verified).then(|| match evidence {
+        VerdictEvidence::Unverified(reason) => reason.to_string(),
+        _ => existence.describe(),
+    });
     let tier = outcome
         .parsed
         .as_ref()
@@ -7258,10 +7259,11 @@ fn terminating_signal(signal: i32) -> Option<&'static str> {
 /// A compile the tree did not fail: cargo reports a crate that could not
 /// compile, the same output says the host ended it, and no compiler error
 /// about the code appears anywhere. The host ends a compile by signalling its
-/// process from outside (a stall stop, a pressure reclaim, a cell operation)
-/// or by failing its storage (a full disk, an I/O error). Either way it is
-/// the execution side of the seam, and there is no rustc signature to match
-/// against a build break.
+/// process from outside (a stall stop, a pressure reclaim, a cell operation),
+/// by failing its storage (a full disk, an I/O error), or by refusing the
+/// compiler's write of its own build output (a sandbox or grant that does not
+/// cover the target directory). Each is the execution side of the seam, and
+/// there is no rustc signature to match against a build break.
 ///
 /// One predicate serves both halves: the store's classifier reads it over the
 /// run's whole output to store the row as `infrastructure`, and the main
@@ -7280,6 +7282,9 @@ pub(crate) enum HostEnding {
     Signal(&'static str),
     /// The operating system's storage error, as the OS words it.
     Storage(&'static str),
+    /// The operating system refused rustc's write of its own build output
+    /// (dep-info, object, metadata), as the OS words the refusal.
+    WriteDenied(&'static str),
 }
 
 impl HostEndedCompile {
@@ -7295,6 +7300,15 @@ impl HostEndedCompile {
                 format!("a compiler process was killed by {signal}{krate}")
             }
             HostEnding::Storage(error) => format!("the host's storage failed ({error}){krate}"),
+            // No crate: cargo fails every crate the refusal reaches, in
+            // scheduling order, and the lane breaker signs the reason, so a
+            // named crate would make one standing refusal sign differently on
+            // each run. The evidence line names the refused path.
+            HostEnding::WriteDenied(error) => format!(
+                "the operating system refused the compiler's write of its build output \
+                 ({error}), a refusal that recurs on this machine until its write access to \
+                 that directory changes, not one that clears with time"
+            ),
         }
     }
 }
@@ -7322,6 +7336,8 @@ pub(crate) fn host_ended_compile(output: &str) -> Option<HostEndedCompile> {
             krate = krate.or_else(|| backticked(subject));
         } else if let Some(storage) = storage_error(line) {
             by = by.or(Some((index, HostEnding::Storage(storage))));
+        } else if let Some(denial) = output_write_denial(line) {
+            by = by.or(Some((index, HostEnding::WriteDenied(denial))));
         } else if let Some(signal) = process_signal(line) {
             by = by.or(Some((index, HostEnding::Signal(signal))));
         } else if line.starts_with("error: ") {
@@ -7351,6 +7367,31 @@ fn storage_error(line: &str) -> Option<&'static str> {
     ]
     .into_iter()
     .find_map(|(needle, words)| line.contains(needle).then_some(words))
+}
+
+/// The operating system's refusal of a write rustc makes to its own build
+/// output, as the OS words it. Only rustc's output-write diagnostics count,
+/// each opening its own `error:` line: dep-info (`error writing dependencies
+/// to`), codegen output (`could not write output to`), and metadata (`failed
+/// to write`). A permission error a program or test prints, or a line that
+/// merely contains a target path and `os error 1`, is not one.
+fn output_write_denial(line: &str) -> Option<&'static str> {
+    let line = line.to_ascii_lowercase();
+    let diagnostic = line.strip_prefix("error: ")?;
+    [
+        "error writing dependencies to ",
+        "could not write output to ",
+        "failed to write ",
+    ]
+    .iter()
+    .any(|write| diagnostic.starts_with(write))
+    .then_some(())?;
+    [
+        ("operation not permitted", "Operation not permitted"),
+        ("permission denied", "Permission denied"),
+    ]
+    .into_iter()
+    .find_map(|(needle, words)| diagnostic.contains(needle).then_some(words))
 }
 
 fn backticked(text: &str) -> Option<String> {
@@ -7403,6 +7444,66 @@ pub(crate) mod host_ended_compile_specimens {
         Caused by:\n\
         \x20 process didn't exit successfully: `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name cairn_core --edition=2021 os/cairn-core/src/lib.rs --test --cfg 'feature=\"test-utils\"'` (signal: 9, SIGKILL: kill)\n\
         error: script \"test:rust\" exited with code 101";
+
+    /// Observation ee7c3dbd24184705a40079c9's output tail verbatim (cairn/6279;
+    /// external-host at `469994a7` on local macos/aarch64): the macOS executor
+    /// sandbox refused rustc's dep-info writes into the public mirror's target
+    /// directory under the executor's temp root, which is not a build slot.
+    pub(crate) const MIRROR_WRITE_DENIED_TAIL: &str = r#"check:external-host: assemble the public mirror in /Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/mirror
+check:external-host: the mirror drops an unpublished dev-dependency from cairn-core: cairn-exec = { path = "../../cairn-exec" }
+check:external-host: build the mirror's libraries and binaries
+
+
+stderr:
+$ bun run scripts/check-external-host.ts
+   Compiling libc v0.2.186
+   Compiling proc-macro2 v1.0.104
+   Compiling unicode-ident v1.0.22
+   Compiling quote v1.0.46
+   Compiling serde_core v1.0.228
+    Checking cfg-if v1.0.4
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling serde v1.0.228
+    Checking memchr v2.7.6
+   Compiling version_check v0.9.5
+   Compiling typenum v1.19.0
+    Checking itoa v1.0.17
+    Checking scopeguard v1.2.0
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/unicode_ident-c06507b1980ce130.d`: Operation not permitted (os error 1)
+
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/itoa-af600afa55fe7352.d`: Operation not permitted (os error 1)
+
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/scopeguard-4d17c248b4b80907.d`: Operation not permitted (os error 1)
+
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/cfg_if-05a4a27a6f52301a.d`: Operation not permitted (os error 1)
+
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/shlex-e069bb4a1a487a53.d`: Operation not permitted (os error 1)
+
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/find_msvc_tools-1ca8c1877fee2a48.d`: Operation not permitted (os error 1)
+
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/version_check-188de0cca3df455f.d`: Operation not permitted (os error 1)
+
+error: could not compile `cfg-if` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/memchr-3eddcbc0de07913c.d`: Operation not permitted (os error 1)
+
+error: could not compile `itoa` (lib) due to 1 previous error
+error: could not compile `scopeguard` (lib) due to 1 previous error
+error: could not compile `unicode-ident` (lib) due to 1 previous error
+error: could not compile `shlex` (lib) due to 1 previous error
+error: could not compile `find-msvc-tools` (lib) due to 1 previous error
+error: could not compile `version_check` (lib) due to 1 previous error
+error: could not compile `memchr` (lib) due to 1 previous error
+check:external-host: build the mirror's libraries and binaries failed
+error: script "check:external-host" exited with code 101
+
+
+Exit code: 101"#;
+
+    /// The first refused write in [`MIRROR_WRITE_DENIED_TAIL`], which a
+    /// classification of it must cite.
+    pub(crate) const MIRROR_WRITE_DENIED_EVIDENCE: &str = "error: error writing dependencies to `/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target/debug/deps/unicode_ident-c06507b1980ce130.d`: Operation not permitted (os error 1)";
 
     /// A compile the tree failed: a coded diagnostic with its location.
     pub(crate) const COMPILE_ERROR_TAIL: &str = "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
@@ -18974,6 +19075,7 @@ cairn-common = { path = "../cairn-common" }
             &io,
             &windows,
             build_script,
+            MIRROR_WRITE_DENIED_TAIL,
             COMPILE_ERROR_TAIL,
             &segv,
             &beside_error,
@@ -18995,6 +19097,204 @@ cairn-common = { path = "../cairn-common" }
                 (reread.by, reread.krate),
                 (ended.by, ended.krate),
                 "{stored}"
+            );
+        }
+    }
+
+    /// cairn/6279: the external-host mirror builds under the executor's temp
+    /// root, outside any build slot, and the macOS sandbox refused rustc's
+    /// dep-info writes there. The retained output replays as a host-ended
+    /// compile: infrastructure citing the first refused write, charged to the
+    /// machine, never reused, never a red, rendered as no tally, and signed the
+    /// same however cargo ordered the crates, so the lane breaker holds a
+    /// standing refusal instead of rerunning it as if time would repair it.
+    #[test]
+    fn a_compiler_output_write_the_os_refused_outside_a_build_slot_is_not_a_verdict() {
+        use super::host_ended_compile_specimens::*;
+        let command = "bun run check:external-host";
+        let classify =
+            |output: &str| classify_check_failure(command, Some(101), false, false, None, output);
+        let reason_head = "Cairn: the operating system refused the compiler's write of its build \
+                           output (Operation not permitted)";
+
+        let mut classification = classify(MIRROR_WRITE_DENIED_TAIL);
+        attach_executor_provenance(&mut classification, Some("local"));
+        let classification = classification.expect("a refused output write is classified");
+        assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+        assert!(
+            !classification.cache_corruption,
+            "no uncached retry: the cache is not implicated"
+        );
+        assert_eq!(classification.implied_requirement, None);
+        let reason = &classification.reason;
+        assert!(reason.starts_with(reason_head), "{reason}");
+        assert!(reason.contains("recurs on this machine"), "{reason}");
+        assert!(reason.contains("not one that clears with time"), "{reason}");
+        assert!(reason.contains("not a verdict on the tree"), "{reason}");
+        assert!(reason.ends_with(" on executor `local`"), "{reason}");
+        assert_eq!(
+            MIRROR_WRITE_DENIED_TAIL
+                .lines()
+                .nth(classification.evidence_line.expect("evidence is cited")),
+            Some(MIRROR_WRITE_DENIED_EVIDENCE),
+            "the evidence is the first refused write"
+        );
+        assert!(classification.kind.is_infrastructure());
+        assert!(
+            !classification.kind.is_verdict_about_the_code(),
+            "never a red charged to the branch"
+        );
+        assert!(!check_reuse_decision(command, Some(classification.kind), None).reusable);
+        assert!(
+            check_reuse_decision(command, None, None).reusable,
+            "unclassified, this red was served as a reusable verdict"
+        );
+        assert_eq!(
+            infra_repair_domain(None, Some(classification.kind)),
+            InfraRepairDomain::Environment,
+            "charged to the machine, not the head"
+        );
+
+        // Rendered as the death it is: still failed, no test tally, and the
+        // stored excerpt keeps the refused write.
+        let mut rendered = outcome("external-host", false, Some(101));
+        rendered.failure_kind = Some(classification.kind);
+        rendered.output_tail =
+            classified_output_excerpt(MIRROR_WRITE_DENIED_TAIL, Some(&classification), None);
+        assert!(!rendered.passed);
+        let annotation = summary_annotation(&rendered).expect("a classified death is annotated");
+        assert!(
+            annotation.starts_with("infrastructure/toolchain failure"),
+            "{annotation}"
+        );
+        assert!(
+            !annotation.contains("passed") && !annotation.contains("tests"),
+            "{annotation}"
+        );
+        assert!(
+            rendered.output_tail.contains(MIRROR_WRITE_DENIED_EVIDENCE),
+            "{}",
+            rendered.output_tail
+        );
+
+        // One standing refusal signs one way, whichever crate cargo reached
+        // first and whichever checkout's temp key the mirror lives under.
+        let signature = |output: &str| {
+            let classification = classify(output).expect("classified");
+            let (cause, evidence) = failure_cause_and_evidence(None, Some(&classification), output);
+            crate::execution::lane_breaker::failure_signature(
+                classification.kind.as_str(),
+                &cause,
+                101,
+                &evidence,
+            )
+        };
+        let reordered = MIRROR_WRITE_DENIED_TAIL
+            .replacen(MIRROR_WRITE_DENIED_EVIDENCE, "", 1)
+            .replace("could not compile `cfg-if`", "could not compile `memchr`")
+            .replace("cbf981ee2f28", "0a1b2c3d4e5f");
+        assert_eq!(signature(MIRROR_WRITE_DENIED_TAIL), signature(&reordered));
+
+        // Positive controls: the same refusal inside a build slot, and rustc's
+        // other output writes.
+        let slot = MIRROR_WRITE_DENIED_TAIL.replace(
+            "/Volumes/Builds/cairn-executor/tmp/cbf981ee2f28/cairn-external-host-5a853c8ef436/target",
+            "/Users/dev/.cairn-exec/build-slots/cairn/slot-5/src-tauri/target",
+        );
+        for output in [
+            slot.as_str(),
+            "error: could not write output to /tmp/m/target/debug/deps/a-1.a.o: Permission denied (os error 13)\nerror: could not compile `a` (lib) due to 1 previous error",
+            "error: failed to write /tmp/m/target/debug/deps/liba-1.rmeta: Operation not permitted (os error 1)\nerror: could not compile `a` (lib) due to 1 previous error",
+        ] {
+            let classification = classify(output).unwrap_or_else(|| panic!("{output}"));
+            assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+            assert!(
+                classification
+                    .reason
+                    .starts_with("Cairn: the operating system refused the compiler's write"),
+                "{}",
+                classification.reason
+            );
+        }
+
+        // Not evidence: a bare EPERM line on a target path outside a build
+        // slot, a refused write outside any compile, test names and result
+        // payloads that quote the diagnostic, an expected permission-denial
+        // test's output beside its failing row, and an exit that says nothing.
+        let quoted = "error: error writing dependencies to `/t/target/debug/deps/a.d`: Operation not permitted (os error 1)";
+        let without_denials = MIRROR_WRITE_DENIED_TAIL
+            .lines()
+            .filter(|line| !line.contains("error writing dependencies"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sessions_assertion = "running 1 test\n\
+            test sessions::resume::tests::resumes_after_compaction ... FAILED\n\n\
+            failures:\n\n\
+            ---- sessions::resume::tests::resumes_after_compaction stdout ----\n\n\
+            thread 'sessions::resume::tests::resumes_after_compaction' panicked at os/cairn-core/src/sessions/resume.rs:88:9:\n\
+            assertion `left == right` failed\n\
+            \x20 left: 2\n\
+            \x20right: 3\n\n\
+            test result: FAILED. 0 passed; 1 failed; 0 ignored\n\n\
+            error: test failed, to rerun pass `-p cairn-core --lib`";
+        for (output, why) in [
+            (
+                "error: could not compile `cfg-if` (lib)\nOperation not permitted (os error 1) at /Volumes/Builds/cairn-executor/tmp/x/cairn-external-host-y/target/debug/deps/.tmp1".to_string(),
+                "a bare EPERM line is not rustc's output-write diagnostic",
+            ),
+            (
+                "error: failed to write /tmp/cairn-external-host-x/target/report.json: Operation not permitted (os error 1)\nerror: script \"check:x\" exited with code 101".to_string(),
+                "a refused write outside a compile names no compile the host ended",
+            ),
+            (
+                format!(" ✓ scripts/lib/classifier.test.ts > classifier > {quoted} 0ms\nerror: could not compile `a` (lib)\nerror: script \"test\" exited with code 101"),
+                "a test name quoting the diagnostic is data",
+            ),
+            (
+                format!("{RESULT_ARTIFACT_JSON_MARKER}{{\"schemaVersion\":1,\"parser\":\"nextest\",\"tests\":[{{\"name\":\"{quoted}\"}}]}}\nerror: could not compile `a` (lib)"),
+                "a structured result quoting the diagnostic is data",
+            ),
+            (
+                format!("test sandbox::tests::refuses_a_read_only_target ... FAILED\n{quoted}\nerror: could not compile `a` (lib)\nerror: test failed, to rerun pass `-p cairn-exec --lib`"),
+                "an expected denial beside a failing test is that test's red",
+            ),
+            (
+                COMPILE_ERROR_TAIL.to_string(),
+                "a compile error is the tree's red",
+            ),
+            (
+                format!("{COMPILE_ERROR_TAIL}\n{MIRROR_WRITE_DENIED_TAIL}"),
+                "a compile error beside a refused write is still the tree's",
+            ),
+            (
+                sessions_assertion.to_string(),
+                "a sessions assertion is the tree's red",
+            ),
+            (
+                format!("{MIRROR_WRITE_DENIED_TAIL}\n{sessions_assertion}"),
+                "a named failing test beside a refused write is still the tree's",
+            ),
+            (
+                "check:external-host: build the mirror's libraries and binaries failed\nerror: script \"check:external-host\" exited with code 101".to_string(),
+                "an exit 101 that names no cause stays ordinary",
+            ),
+            (
+                without_denials,
+                "cargo's could-not-compile summary alone is not host evidence",
+            ),
+        ] {
+            assert_eq!(classify(&output), None, "{why}: {output}");
+        }
+
+        // A build that recovered from a cache failure passed; no warning it
+        // printed on the way can turn the pass into anything else.
+        let recovered = "warning: sccache failed fatally; compiling directly without cache\n\
+                         sccache: encountered fatal error: failed to create output file\n\
+                         \x20   Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.20s";
+        for output in [recovered, MIRROR_WRITE_DENIED_TAIL] {
+            assert_eq!(
+                classify_check_failure(command, Some(0), false, false, None, output),
+                None
             );
         }
     }
@@ -22520,11 +22820,13 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             assert!(!stored.reusable, "{command}");
         }
         // The same parse-less green from a command that is not a test runner
-        // is a complete answer.
+        // is a complete answer, as the merge gates read it: a script whose
+        // first word is `test` is a shell test, not a test runner.
         for (name, command) in [
             ("frontend-build", "bunx --bun vite build"),
             ("workspace-compile", "cargo check --workspace --locked"),
             ("rust-lint", "bun run check:rust"),
+            ("smoke", "test -f README.md"),
         ] {
             let input_hash = format!("ih-parse-less-{name}");
             let outcome = run_parse_less_green(db.clone(), name, command, &input_hash).await;

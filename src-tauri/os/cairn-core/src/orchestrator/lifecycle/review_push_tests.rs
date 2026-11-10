@@ -5311,6 +5311,261 @@ async fn an_operator_compact_leaves_the_wave_running_and_its_verdict_reaches_the
     assert_eq!(current_session(&orch.db.local).await.0, successor);
 }
 
+/// cairn/6422 (cairn/6274's wave): the runner began shutting down while one
+/// of a wave's two placement groups was still on its machine. The other had
+/// passed, and the cancelled lane had passed on an earlier tree. The wave is
+/// not `completed`: it settles as cut short by the stop and names the lane,
+/// the notice counts the lane without a verdict instead of reading its
+/// earlier pass as the head's, and the next boot re-runs the wave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+async fn a_wave_the_runner_stop_cuts_short_is_neither_completed_nor_announced_passing() {
+    use cairn_common::executor_protocol::{CellOutcome, ExecutorMessage};
+
+    let bin = crate::jj::tests::jj_bin().expect("this acceptance requires jj");
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    insert_artifact(&db, "create-pr", 1).await;
+    // `only-b`'s pass on an earlier tree: the row a reader that ignores the
+    // cancellation would announce as the head's.
+    db.execute_script(
+        "INSERT INTO check_result_cache
+           (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+            output_tail, duration_ms, ran_at, job_id, infra_failure_streak)
+         VALUES('p-rev','earlier-tree','earlier-input','only-b',0,1,'ok',1,1,'j-prod',0);",
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-6422-shutdown-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    let platform = crate::fleet::ExecutorPlatform::this_process();
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    // A selector on one lane only puts the lanes in different placement
+    // groups, so one can finish while the other is still running.
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        format!(
+            "checks:\n  only-a:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{os}]\n  only-b:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{os}]\n    executor:\n      os: {os}\n",
+            os = platform.os
+        ),
+    )
+    .unwrap();
+    std::fs::write(workspace.join("change.rs"), "the change under review\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "a wave the stop cuts short", None).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+
+    let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    let (attempt, slot) = claimed_slot(&orch, "j-prod");
+    let wave = tokio::spawn(crate::execution::checks_turn_end::run_turn_end_checks(
+        orch.clone(),
+        "j-prod".to_string(),
+        slot,
+    ));
+
+    // Play the machine: answer `only-a` with a pass, and hold `only-b` until
+    // `only-a` has answered, then begin the runner's shutdown with `only-b`
+    // still on the machine.
+    let platform_os = platform.os.clone();
+    let platform_arch = platform.arch.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let mut a_answered = false;
+        let mut b_running = false;
+        loop {
+            if a_answered && b_running {
+                orch.fleet.begin_runner_shutdown();
+                return;
+            }
+            match executor
+                .recv()
+                .await
+                .expect("the fake fleet link stays open")
+            {
+                ExecutorMessage::Offer { entry_id, .. } => {
+                    orch.fleet.handle_executor_message(
+                        crate::fleet::COLOCATED_EXECUTOR_ID,
+                        generation,
+                        ExecutorMessage::Claim { entry_id },
+                    );
+                }
+                ExecutorMessage::Granted {
+                    request,
+                    batch: Some(batch),
+                    ..
+                } => {
+                    let headers: Vec<_> =
+                        batch.items.iter().map(|item| item.header.clone()).collect();
+                    if headers == ["only-b"] {
+                        b_running = true;
+                        continue;
+                    }
+                    assert_eq!(headers, ["only-a"], "one lane per placement group");
+                    let plan = attempt_plan(&orch.db.local, &attempt).await;
+                    let outcomes = serde_json::json!([{
+                        "header": "only-a", "body": "only-a output",
+                        "succeeded": true, "suspended": false, "exitCode": 0,
+                        "startedAtUnixMs": 1, "finishedAtUnixMs": 2, "durationMs": 1,
+                    }]);
+                    let metadata = serde_json::from_value(serde_json::json!({
+                        "executorId": crate::fleet::COLOCATED_EXECUTOR_ID,
+                        "executorDeviceId": "local-device",
+                        "executorConnectionGeneration": generation,
+                        "slotId": "cell", "cellEpoch": 1,
+                        "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+                        "verdictPlatform": platform_os, "verdictArch": platform_arch,
+                        "toolchainFingerprint": plan.expected_toolchain,
+                        "verdictEnvironmentHash": cairn_checkenv::verdict_environment_hash(
+                            Vec::<String>::new(), |name| std::env::var(name).ok()
+                        ),
+                    }))
+                    .unwrap();
+                    orch.fleet.handle_executor_message(
+                        crate::fleet::COLOCATED_EXECUTOR_ID,
+                        generation,
+                        ExecutorMessage::Result {
+                            request_id: request.request_id.clone(),
+                            attempt_id: request.attempt_id.clone(),
+                            outcome: CellOutcome::Completed {
+                                request_id: request.request_id.clone(),
+                                attempt_id: request.attempt_id.clone(),
+                                exit_code: Some(0),
+                                output: outcomes.to_string(),
+                                timed_out: false,
+                                metadata,
+                                mutation_delta: None,
+                                sandbox_denials: Vec::new(),
+                                tracked_modifications: None,
+                                node_scratch: None,
+                            },
+                        },
+                    );
+                    // Wait for its group to record before the stop begins.
+                    loop {
+                        let recorded = orch
+                            .db
+                            .local
+                            .query_one(
+                                "SELECT COUNT(*) FROM check_result_observations
+                                  WHERE job_id='j-prod' AND check_name='only-a'",
+                                (),
+                                |row| row.i64(0),
+                            )
+                            .await
+                            .unwrap();
+                        if recorded > 0 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    a_answered = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("both lanes reach the fake machine");
+    tokio::time::timeout(std::time::Duration::from_secs(120), wave)
+        .await
+        .expect("the wave settles once the stop cancels its running lane")
+        .expect("the wave does not panic");
+
+    let plan = attempt_plan(&orch.db.local, &attempt).await;
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    let settled = rows.iter().find(|row| row.0 == attempt).unwrap();
+    assert_eq!(settled.1, "failed", "never `completed`: {rows:?}");
+    let reason = settled.2.as_deref().unwrap_or_default();
+    assert!(
+        reason.starts_with(crate::execution::checks_turn_end::RUNNER_STOP_CANCELLED_REASON)
+            && reason.contains("1 of 2 lane(s) cancelled with no verdict (only-b)"),
+        "the outcome names the cancelled lane: {reason}"
+    );
+    let cancelled: Vec<crate::execution::checks_turn_end::CancelledLane> = {
+        let json = orch
+            .db
+            .local
+            .query_one(
+                "SELECT cancelled_lanes_json FROM turn_end_check_attempts WHERE id=?1",
+                (attempt.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    };
+    assert_eq!(
+        cancelled
+            .iter()
+            .map(|lane| (lane.name.as_str(), lane.input_hash.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("only-b", plan.input_hashes["only-b"].as_str())]
+    );
+    let observed = orch
+        .db
+        .local
+        .query_all(
+            "SELECT check_name, verdict FROM check_result_observations
+              WHERE job_id='j-prod' AND commit_sha=?1 ORDER BY check_name",
+            (plan.head.clone(),),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        observed,
+        vec![("only-a".to_string(), "passed".to_string())],
+        "the cancelled lane recorded nothing for the head"
+    );
+
+    let delivered: Vec<_> = pending(&orch, "j-prod")
+        .await
+        .into_iter()
+        .filter(|push| push.key.starts_with("turn-checks:"))
+        .collect();
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    let body = crate::execution::checks_status::check_wake_body(&orch, "j-prod")
+        .await
+        .expect("the notice has a body");
+    assert!(
+        body.starts_with("Project checks on this node: none failing; 1 of 2 without a verdict."),
+        "{body}"
+    );
+    assert!(!body.contains("all 2 passing"), "{body}");
+    assert!(
+        body.contains("only-b \u{2014} cancelled before it produced a verdict on this head")
+            && body.contains("the runner's next boot re-runs its wave"),
+        "{body}"
+    );
+
+    assert_eq!(
+        super::rearm_review_checks_on_startup(&orch).await,
+        1,
+        "the next boot re-runs the wave the stop cut short"
+    );
+    assert!(wave_scheduled(&orch, "j-prod"));
+}
+
 /// A Compact does not change what makes a wave stale. A commit landing after
 /// the Compact cancels the wave because its branch advanced, and its release
 /// arms the successor wave for the new tree, as it would without a Compact.

@@ -832,7 +832,8 @@ fn short_job(job_id: &str) -> &str {
 
 /// Whether the job's current turn-end wave was cut off by the restart: the
 /// startup reconciliation failed it with the restart's reason because the
-/// process that owned it is gone.
+/// process that owned it is gone, or it settled while the runner was stopping
+/// with lanes the stop cancelled.
 async fn wave_interrupted_by_restart(orch: &Orchestrator, job_id: &str) -> bool {
     let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
         return false;
@@ -840,9 +841,10 @@ async fn wave_interrupted_by_restart(orch: &Orchestrator, job_id: &str) -> bool 
     matches!(
         crate::execution::checks_turn_end::current_turn_end_attempt(&db, job_id).await,
         Ok(Some(attempt))
-            if attempt.state == "failed"
-                && attempt.reason.as_deref()
-                    == Some(crate::execution::checks_turn_end::RESTART_INTERRUPTED_REASON)
+            if crate::execution::checks_turn_end::attempt_interrupted_by_restart(
+                &attempt.state,
+                attempt.reason.as_deref(),
+            )
     )
 }
 

@@ -277,6 +277,16 @@ enum TurnEndDisposition {
     /// out, unresolved). No verdict, no wake.
     Unprepared(String),
     CompletedWithDelivery,
+    /// The wave delivered what its lanes recorded, but Cairn cancelled some of
+    /// them before they produced a verdict ([`CancelledLane`]). Never
+    /// `completed`: a wave holding a no-verdict lane did not answer for its
+    /// head. One the runner's own stop cut short settles the way the startup
+    /// reconciliation settles a wave the restart interrupted, so the next boot
+    /// re-runs it ([`attempt_interrupted_by_restart`]).
+    LanesCancelled {
+        reason: String,
+        by_runner_stop: bool,
+    },
 }
 impl TurnEndDisposition {
     fn terminal(&self) -> (&'static str, String) {
@@ -291,6 +301,14 @@ impl TurnEndDisposition {
                 "completed",
                 "check wave completed and delivery was persisted".into(),
             ),
+            Self::LanesCancelled {
+                reason,
+                by_runner_stop: true,
+            } => ("failed", reason.clone()),
+            Self::LanesCancelled {
+                reason,
+                by_runner_stop: false,
+            } => ("cancelled", reason.clone()),
         }
     }
 }
@@ -440,6 +458,146 @@ pub(crate) async fn current_turn_end_attempt(
 /// attempts.
 pub(crate) const RESTART_INTERRUPTED_REASON: &str =
     "host restarted before the turn-end check attempt reached a durable terminal state";
+
+/// The reason a wave opens with when this runner's own stop cancelled some of
+/// its lanes before they produced a verdict. The wave got as far as settling,
+/// so the startup reconciliation never sees it moving; this prefix is how the
+/// next boot still knows it is owed.
+pub(crate) const RUNNER_STOP_CANCELLED_REASON: &str = "the runner stopped while the check wave ran";
+
+/// Whether an attempt in `state` with `reason` was cut short by a restart and
+/// so is owed a fresh wave at the next boot: either the reconciliation failed
+/// it because its process is gone, or it settled itself while the runner was
+/// stopping, with lanes the stop cancelled.
+pub(crate) fn attempt_interrupted_by_restart(state: &str, reason: Option<&str>) -> bool {
+    state == "failed"
+        && reason.is_some_and(|reason| {
+            reason == RESTART_INTERRUPTED_REASON || reason.starts_with(RUNNER_STOP_CANCELLED_REASON)
+        })
+}
+
+/// A lane a wave planned and Cairn cancelled before it produced a verdict on
+/// the wave's head.
+///
+/// A cancellation records no check row, by design: it says nothing about the
+/// tree or a machine. So the lane's newest row is an earlier tree's, and a
+/// reader that takes "no row on this head" to mean "not part of the wave"
+/// reports that earlier row as the head's state. The wave keeps these on its
+/// attempt row (`cancelled_lanes_json`) for the delivered notice to name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CancelledLane {
+    pub name: String,
+    /// The lane's input hash at the wave's head: a row recorded at these
+    /// inputs answers the lane whenever it was recorded.
+    pub input_hash: String,
+    /// Why Cairn cancelled it, as the clause after "cancelled: ".
+    pub cause: String,
+}
+
+/// Every lane among `outcomes` (in plan order, beside `plans`) that ended
+/// cancelled, without a verdict.
+///
+/// While this runner is stopping, a lane that ended without a verdict and
+/// without a recorded observation was ended by the stop, whatever shape the
+/// ending took on the way out (a persistence task the shutdown aborted, a
+/// result lost with its link), the same rule the main cadence applies. A lane
+/// that was never offered to placement, or that the breaker holds, is waiting
+/// on its own cause and is not a casualty of the stop.
+fn cancelled_lanes(
+    plans: &[(CheckPlan, String)],
+    outcomes: &[CheckOutcome],
+    runner_stopping: bool,
+) -> Vec<CancelledLane> {
+    plans
+        .iter()
+        .zip(outcomes)
+        .filter_map(|((_, input_hash), outcome)| {
+            let cause = match outcome.failure_kind {
+                Some(CheckFailureKind::Cancelled) => outcome
+                    .not_recorded
+                    .as_deref()
+                    .and_then(|reason| reason.strip_prefix("cancelled: "))
+                    .unwrap_or("cause not recorded")
+                    .to_string(),
+                Some(kind)
+                    if runner_stopping
+                        && outcome.recorded.is_none()
+                        && !outcome.cached
+                        && outcome.suppressed_after.is_none()
+                        && !kind.attempted_nothing()
+                        && !kind.is_verdict_about_the_code() =>
+                {
+                    crate::fleet::CancelCause::RunnerStopping.sentence()
+                }
+                _ => return None,
+            };
+            Some(CancelledLane {
+                name: outcome.name.clone(),
+                input_hash: input_hash.clone(),
+                cause,
+            })
+        })
+        .collect()
+}
+
+/// The terminal reason of a wave that cancelled `cancelled` of its `planned`
+/// lanes: how many, which, and who re-runs them.
+fn lanes_cancelled_reason(
+    cancelled: &[CancelledLane],
+    planned: usize,
+    by_runner_stop: bool,
+) -> String {
+    let names = cancelled
+        .iter()
+        .map(|lane| lane.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count = cancelled.len();
+    if by_runner_stop {
+        format!(
+            "{RUNNER_STOP_CANCELLED_REASON}: {count} of {planned} lane(s) cancelled with no \
+             verdict ({names}); the next boot re-runs this wave"
+        )
+    } else {
+        let causes = cancelled
+            .iter()
+            .map(|lane| format!("{}: {}", lane.name, lane.cause))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "check wave delivered with {count} of {planned} lane(s) cancelled before a verdict \
+             ({causes}); they run again on the next wave for this tree"
+        )
+    }
+}
+
+/// Keep the wave's cancelled lanes on its attempt row, BEFORE its notice is
+/// delivered: the notice renders when it is consumed, which may be the next
+/// boot, and reads them from here. Unlike the plan, a failure here fails the
+/// wave, because delivering without it would announce the lanes' earlier rows
+/// as this head's verdicts.
+async fn record_cancelled_lanes(
+    db: &LocalDb,
+    job_id: &str,
+    attempt_id: &str,
+    lanes: &[CancelledLane],
+) -> Result<(), String> {
+    let json = serde_json::to_string(lanes).map_err(|error| error.to_string())?;
+    db.execute(
+        "UPDATE turn_end_check_attempts SET cancelled_lanes_json = ?1
+          WHERE id = ?2 AND job_id = ?3",
+        (json.as_str(), attempt_id, job_id),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "could not record the wave's cancelled lanes ({error}); delivering nothing rather \
+             than a notice that would read their earlier rows as this head's"
+        )
+    })
+}
 
 pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) {
     const REASON: &str = RESTART_INTERRUPTED_REASON;
@@ -1996,6 +2154,31 @@ async fn run_turn_end_checks_inner(
             .collect::<Vec<_>>()
     };
 
+    // Read once, here: a stop that begins after every lane has recorded its
+    // verdict changes nothing about them, and the settlement below may itself
+    // run seconds into the stop (cairn/6274's was persisted five seconds in).
+    let runner_stopping = orch.fleet.runner_stopping_since().is_some();
+    let cancelled = cancelled_lanes(&to_run, &outcomes, runner_stopping);
+    if !cancelled.is_empty() {
+        record_cancelled_lanes(&owning, job_id, attempt_id, &cancelled).await?;
+        log::info!(
+            "turn-end checks for job {}: {} of {} lane(s) cancelled before a verdict [{}]{}",
+            short_id(job_id),
+            cancelled.len(),
+            to_run.len(),
+            cancelled
+                .iter()
+                .map(|lane| format!("{}: {}", lane.name, lane.cause))
+                .collect::<Vec<_>>()
+                .join("; "),
+            if runner_stopping {
+                "; the runner is stopping, so the next boot re-runs this wave"
+            } else {
+                ""
+            }
+        );
+    }
+
     let verdicts: Vec<String> = outcomes
         .iter()
         .map(|o| {
@@ -2108,7 +2291,14 @@ async fn run_turn_end_checks_inner(
             );
         }
     }
-    Ok(TurnEndDisposition::CompletedWithDelivery)
+    if cancelled.is_empty() {
+        Ok(TurnEndDisposition::CompletedWithDelivery)
+    } else {
+        Ok(TurnEndDisposition::LanesCancelled {
+            reason: lanes_cancelled_reason(&cancelled, to_run.len(), runner_stopping),
+            by_runner_stop: runner_stopping,
+        })
+    }
 }
 
 /// One verdict the `pinBump` gate will require of a bump: a check on a platform.
@@ -6472,6 +6662,112 @@ pinBumps:
             assert_eq!(state, expected_state);
             assert_eq!(reason, expected_reason);
         }
+    }
+
+    /// cairn/6422: a cancelled lane holds no verdict and writes no row, so the
+    /// wave names it. While the runner is stopping, a lane that ended with no
+    /// verdict and no recorded observation is the stop's casualty too; a lane
+    /// waiting on its own cause (never placed, held by the breaker) is not.
+    #[test]
+    fn a_waves_cancelled_lanes_are_named_and_a_runner_stop_claims_its_rowless_no_verdicts() {
+        let names = ["passed", "red", "cancelled", "lost", "unplaceable", "held"];
+        let plans: Vec<_> = names.iter().map(|name| uncached_plan(name)).collect();
+        let mut cancelled = outcome("cancelled", false, Some(CheckFailureKind::Cancelled), "");
+        cancelled.not_recorded = Some("cancelled: Cairn's runner is stopping".into());
+        let mut lost = outcome("lost", false, Some(CheckFailureKind::Infrastructure), "");
+        lost.not_recorded = Some("review group persistence task failed: task was cancelled".into());
+        let mut held = outcome("held", false, Some(CheckFailureKind::Infrastructure), "");
+        held.suppressed_after = Some(3);
+        let outcomes = vec![
+            outcome("passed", true, None, ""),
+            outcome("red", false, None, "assertion failed"),
+            cancelled,
+            lost,
+            outcome(
+                "unplaceable",
+                false,
+                Some(CheckFailureKind::NotPlaceable),
+                "",
+            ),
+            held,
+        ];
+
+        let running = cancelled_lanes(&plans, &outcomes, false);
+        assert_eq!(
+            running,
+            vec![CancelledLane {
+                name: "cancelled".into(),
+                input_hash: "input-cancelled".into(),
+                cause: "Cairn's runner is stopping".into(),
+            }]
+        );
+
+        let stopping = cancelled_lanes(&plans, &outcomes, true);
+        assert_eq!(
+            stopping
+                .iter()
+                .map(|lane| (lane.name.as_str(), lane.input_hash.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("cancelled", "input-cancelled"), ("lost", "input-lost")],
+        );
+        assert_eq!(stopping[1].cause, "Cairn's runner is stopping");
+
+        assert!(cancelled_lanes(&plans[..2], &outcomes[..2], true).is_empty());
+    }
+
+    /// A wave with a cancelled lane is never `completed`. One the runner's stop
+    /// cut short is owed a fresh wave at the next boot; one cancelled for any
+    /// other cause names its lanes and leaves them to the next wave.
+    #[test]
+    fn a_wave_with_cancelled_lanes_never_settles_completed() {
+        let lanes = [
+            CancelledLane {
+                name: "rust-lint".into(),
+                input_hash: "a".into(),
+                cause: "Cairn's runner is stopping".into(),
+            },
+            CancelledLane {
+                name: "rust-tests".into(),
+                input_hash: "b".into(),
+                cause: "Cairn's runner is stopping".into(),
+            },
+        ];
+
+        let (state, reason) = TurnEndDisposition::LanesCancelled {
+            reason: lanes_cancelled_reason(&lanes, 14, true),
+            by_runner_stop: true,
+        }
+        .terminal();
+        assert_eq!(state, "failed");
+        assert!(reason.starts_with(RUNNER_STOP_CANCELLED_REASON), "{reason}");
+        assert!(
+            reason.contains("2 of 14 lane(s) cancelled with no verdict (rust-lint, rust-tests)"),
+            "{reason}"
+        );
+        assert!(attempt_interrupted_by_restart(&state, Some(&reason)));
+
+        let (state, reason) = TurnEndDisposition::LanesCancelled {
+            reason: lanes_cancelled_reason(&lanes[..1], 14, false),
+            by_runner_stop: false,
+        }
+        .terminal();
+        assert_eq!(state, "cancelled");
+        assert!(
+            reason.contains("1 of 14 lane(s) cancelled before a verdict (rust-lint: Cairn's runner is stopping)"),
+            "{reason}"
+        );
+        assert!(!attempt_interrupted_by_restart(&state, Some(&reason)));
+
+        assert!(attempt_interrupted_by_restart(
+            "failed",
+            Some(RESTART_INTERRUPTED_REASON)
+        ));
+        let (state, reason) = TurnEndDisposition::CompletedWithDelivery.terminal();
+        assert!(!attempt_interrupted_by_restart(state, Some(&reason)));
+        assert!(!attempt_interrupted_by_restart(
+            "failed",
+            Some("an inner error")
+        ));
     }
 }
 
