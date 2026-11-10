@@ -24,22 +24,38 @@ pub(crate) fn label_from_row_at(row: &cairn_db::turso::Row, offset: usize) -> Db
     })
 }
 
-pub fn slugify(text: &str) -> String {
-    const MAX_LEN: usize = 48;
-    let mut slug = String::new();
+/// The full normalized spelling of a label name: lowercase ASCII alphanumerics
+/// with every run of anything else collapsed to one `-`, never truncated.
+///
+/// This, not the id, is what decides whether two references name the same
+/// label. Ids are capped by [`slugify`], so distinct long names can share an id
+/// prefix; their keys still differ. Empty when the text has no alphanumerics.
+pub fn label_key(text: &str) -> String {
+    let mut key = String::new();
     let mut prev_dash = false;
     for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
+            key.push(ch.to_ascii_lowercase());
             prev_dash = false;
-        } else if !slug.is_empty() && !prev_dash {
-            slug.push('-');
+        } else if !key.is_empty() && !prev_dash {
+            key.push('-');
             prev_dash = true;
         }
-        if slug.len() >= MAX_LEN {
-            break;
-        }
     }
+    while key.ends_with('-') {
+        key.pop();
+    }
+    key
+}
+
+/// The id stem a new label is minted from: its [`label_key`] capped at
+/// `MAX_LEN`. A capped stem is not an identity; `unique_label_id_conn`
+/// disambiguates collisions and lookups compare full keys.
+pub fn slugify(text: &str) -> String {
+    const MAX_LEN: usize = 48;
+    let mut slug = label_key(text);
+    // `label_key` is pure ASCII, so any byte offset is a char boundary.
+    slug.truncate(MAX_LEN);
     while slug.ends_with('-') {
         slug.pop();
     }

@@ -3,49 +3,57 @@ use std::collections::{HashMap, HashSet};
 use cairn_db::turso::params;
 
 use crate::labels::crud::{
-    create_label_conn, label_from_row, label_from_row_at, slugify, DEFAULT_WORKSPACE_ID,
+    create_label_conn, label_from_row, label_from_row_at, label_key, list_labels_conn,
+    DEFAULT_WORKSPACE_ID,
 };
 use crate::models::{CreateLabel, Label};
 use crate::storage::{DbResult, RowExt};
 
-/// Find the label a reference names: its id, its display name
-/// case-insensitively, or the slug those words produce. The slug arm is what
+/// Find the label a reference names: its exact id, its display name
+/// case-insensitively, or a name with the same full [`label_key`]. The key arm
 /// keeps prose and slug spellings of the same label ("Needs Review",
 /// "needs-review") on one row instead of minting near-duplicates.
+///
+/// The key arm compares against names, never ids: ids are capped stems, so
+/// two long names sharing a prefix would otherwise resolve to whichever label
+/// minted the stem first.
 async fn find_label_ref(
     conn: &cairn_db::storage::TrackedConnection,
     workspace_id: &str,
     value: &str,
 ) -> Result<Option<Label>, String> {
-    // `slugify` falls back to the literal "label" for a reference with no
-    // alphanumerics, which would bind such a reference to an unrelated label
-    // that happens to own that id. Only offer the slug arm when the reference
-    // genuinely derives one.
-    let slug = slugify(value);
-    let slug = value
-        .chars()
-        .any(|ch| ch.is_ascii_alphanumeric())
-        .then_some(slug.as_str());
     let mut rows = conn
         .query(
             "SELECT id, workspace_id, name, color, created_at, updated_at
              FROM labels
-             WHERE workspace_id = ?1 AND (id = ?2 OR name = ?2 COLLATE NOCASE OR id = ?3)
-             ORDER BY CASE
-                 WHEN id = ?2 THEN 0
-                 WHEN name = ?2 COLLATE NOCASE THEN 1
-                 ELSE 2
-             END, id ASC
+             WHERE workspace_id = ?1 AND (id = ?2 OR name = ?2 COLLATE NOCASE)
+             ORDER BY CASE WHEN id = ?2 THEN 0 ELSE 1 END, id ASC
              LIMIT 1",
-            params![workspace_id, value, slug],
+            params![workspace_id, value],
         )
         .await
         .map_err(|error| error.to_string())?;
-    rows.next()
+    if let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
+        return label_from_row(&row)
+            .map(Some)
+            .map_err(|error| error.to_string());
+    }
+
+    // A reference with no alphanumerics has an empty key, which names nothing;
+    // matching it would bind it to any other unslugifiable label.
+    let key = label_key(value);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    // The key is not expressible in SQL, so this arm walks the workspace
+    // vocabulary; the lowest id wins for determinism.
+    let mut labels = list_labels_conn(conn, workspace_id)
         .await
-        .map_err(|error| error.to_string())?
-        .map(|row| label_from_row(&row).map_err(|error| error.to_string()))
-        .transpose()
+        .map_err(|error| error.to_string())?;
+    labels.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(labels
+        .into_iter()
+        .find(|label| label_key(&label.name) == key))
 }
 
 /// Resolve a label reference, creating the label when nothing matches.
@@ -275,6 +283,68 @@ mod tests {
                 assert!(created, "an unslugifiable reference is its own label");
                 assert_eq!(label.name, "🎉");
                 assert_eq!(label.id, "label-2");
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Ids are capped slugs, so two long names can mint the same stem. The
+    /// stem must not become the identity: each name is its own label, and
+    /// each resolves back to itself by name or by its full slug spelling.
+    #[tokio::test]
+    async fn names_sharing_a_capped_slug_prefix_are_distinct_labels() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_issue(conn, "i-one", 1).await;
+                let prefix =
+                    "incident:test-failure:cairn_core::orchestrator::real_store_collision_tests::";
+                let first = format!("{prefix}first_test");
+                let second = format!("{prefix}second_test");
+                assert_eq!(
+                    crate::labels::crud::slugify(&first),
+                    crate::labels::crud::slugify(&second),
+                    "premise: both names mint the same capped stem"
+                );
+
+                let created =
+                    replace_issue_labels(conn, "i-one", &[first.clone(), second.clone()], 3)
+                        .await
+                        .unwrap();
+                assert_eq!(created.len(), 2);
+                assert_ne!(created[0].id, created[1].id);
+                let mut attached = list_labels_for_issue(conn, "i-one")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|label| label.name)
+                    .collect::<Vec<_>>();
+                attached.sort();
+                assert_eq!(attached, vec![first.clone(), second.clone()]);
+
+                for (name, owner) in [(&first, &created[0]), (&second, &created[1])] {
+                    for reference in [name.clone(), label_key(name)] {
+                        let (label, minted) =
+                            resolve_or_create_label_ref(conn, DEFAULT_WORKSPACE_ID, &reference, 4)
+                                .await
+                                .unwrap();
+                        assert_eq!(label.id, owner.id, "reference '{reference}'");
+                        assert!(!minted, "reference '{reference}' should reuse the label");
+                    }
+                }
+
+                // The stem spelled as prose is a shorter, different name: it is
+                // a new label, not whichever long name minted the stem first.
+                let stem_prose = created[0].id.replace('-', " ");
+                let (label, minted) =
+                    resolve_or_create_label_ref(conn, DEFAULT_WORKSPACE_ID, &stem_prose, 5)
+                        .await
+                        .unwrap();
+                assert!(minted, "'{stem_prose}' names neither long label");
+                assert_ne!(label.id, created[0].id);
+                assert_ne!(label.id, created[1].id);
                 Ok(())
             })
         })

@@ -573,6 +573,43 @@ async fn patching_an_issue_with_an_unknown_label_creates_the_label() {
     );
 }
 
+/// Incident ownership labels carry a full test id, so names in one module share
+/// a slug prefix longer than the id cap. Each must still be its own label, and
+/// the issue must carry and render every one.
+#[tokio::test]
+async fn patching_labels_whose_names_share_a_long_slug_prefix_attaches_each() {
+    let orch = seeded_orch().await;
+    let (_issue_id, number) = seed_issue(&orch).await;
+    let prefix = "incident:test-failure:cairn_core::orchestrator::real_store_collision_tests::";
+    let names = [
+        format!("{prefix}first_test"),
+        format!("{prefix}second_test"),
+    ];
+
+    let item = change_item(
+        &format!("cairn://p/cairn/{number}"),
+        ChangeMode::Patch,
+        Some(serde_json::json!({"labels": names})),
+    );
+    apply(&orch, &item).await.unwrap();
+
+    let vocabulary = crate::labels::crud::list_labels(&orch.db.local)
+        .await
+        .unwrap();
+    let mut vocabulary_names = vocabulary
+        .iter()
+        .map(|label| label.name.clone())
+        .collect::<Vec<_>>();
+    vocabulary_names.sort();
+    assert_eq!(vocabulary_names, names.to_vec());
+
+    let rendered =
+        crate::resources::issue::read_issue(&orch.db.local, &orch.db.local, "cairn", number).await;
+    for name in &names {
+        assert!(rendered.contains(name.as_str()), "{name} in: {rendered}");
+    }
+}
+
 #[tokio::test]
 async fn comments_get_sequential_per_issue_seqs() {
     let orch = seeded_orch().await;
