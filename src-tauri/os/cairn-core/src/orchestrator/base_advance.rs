@@ -960,7 +960,10 @@ fn plan_resolution_carry(
     // path an earlier replay carried and then rolled back is no longer
     // conflicting here, and leaving it out would let it conflict again.
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for path in session.replay_paths(&baseline.basis) {
+    for path in session.replay_paths(
+        &baseline.basis,
+        crate::orchestrator::conflict_session::ReplayScope::Carry,
+    ) {
         groups
             .entry(baseline.baseline_for(&path).to_string())
             .or_default()
@@ -1082,7 +1085,9 @@ fn replay_baseline_at(
             }
             Some((session, Err(error))) => {
                 log::warn!("{ctx} unreadable; measuring from the session's stored basis: {error}");
-                session.resolution_basis.clone()
+                session
+                    .without_superseded(jj, store, session.resolution_basis.clone())
+                    .map_err(|error| format!("{ctx}: {error}"))?
             }
         };
     let baseline = ReplayBaseline { fork, basis }.verified(jj, store, pre_tip);
@@ -1196,7 +1201,8 @@ pub(crate) struct InflightRunBatch {
     /// about it: child tasks share their parent's branch, so a child's batch
     /// holds the parent's branch too.
     pub(crate) job_id: String,
-    /// That job's home URI, when it resolves: the node whose turn to stop.
+    /// That job's home URI, when it resolves: the batch's cancel address
+    /// (`<holder>/batches/<request_id>`) sits under it.
     pub(crate) holder: Option<String>,
     /// The batch's placement request, which is what cancellation addresses.
     pub(crate) request_id: String,
@@ -1204,11 +1210,21 @@ pub(crate) struct InflightRunBatch {
     /// When the batch parked its turn (Unix milliseconds). The batch itself
     /// started up to one synchronous window before that.
     pub(crate) parked_at_ms: i64,
+    /// Where the batch stands now, when this runner holds its task: the item
+    /// running and for how long, or what it queues for. `None` for a batch
+    /// this runner does not hold, and wherever the reader has no fleet to ask
+    /// ([`Self::with_live_progress`]).
+    pub(crate) progress: Option<crate::mcp::handlers::run::detached::BatchProgress>,
 }
 
 impl InflightRunBatch {
-    /// ``run batch `REQUEST` ("LABEL") on cairn://p/…, parked since 2026-10-18 04:28 PDT``
+    /// ``run batch `REQUEST` ("LABEL") on cairn://p/…, parked since 2026-10-18 04:28 PDT;
+    /// now running item 3 of 5 (`cargo nextest run`) for 14m 2s``
     pub(crate) fn describe(&self) -> String {
+        self.describe_at(chrono::Utc::now().timestamp_millis())
+    }
+
+    pub(crate) fn describe_at(&self, now_ms: i64) -> String {
         let label = self
             .label
             .as_deref()
@@ -1221,7 +1237,29 @@ impl InflightRunBatch {
         let parked = crate::clock::stamp_millis(self.parked_at_ms)
             .map(|stamp| format!(", parked since {stamp}"))
             .unwrap_or_default();
-        format!("run batch `{}`{label}{owner}{parked}", self.request_id)
+        let progress = self
+            .progress
+            .as_ref()
+            .map(|progress| format!("; {}", progress.describe(now_ms)))
+            .unwrap_or_default();
+        format!(
+            "run batch `{}`{label}{owner}{parked}{progress}",
+            self.request_id
+        )
+    }
+
+    /// The batch's own resource, whose `action:"cancel"` patch ends it. A
+    /// task's holder already ends in `/task/<name>`.
+    pub(crate) fn cancel_uri(&self) -> Option<String> {
+        self.holder
+            .as_deref()
+            .map(|holder| format!("{holder}/batches/{}", self.request_id))
+    }
+
+    /// Fill in where the batch stands now, when this runner holds its task.
+    pub(crate) fn with_live_progress(mut self, orch: &crate::orchestrator::Orchestrator) -> Self {
+        self.progress = crate::mcp::handlers::run::detached::live_progress(orch, &self.request_id);
+        self
     }
 
     /// Fill in the holder's home URI. Best effort: an unresolved URI falls
@@ -1261,6 +1299,7 @@ fn run_batch_from_wait(
             request_id,
             label,
             parked_at_ms: created_at,
+            progress: None,
         }),
         _ => None,
     }
@@ -1276,6 +1315,7 @@ fn run_batch_from_detached(
         request_id: row.text(1)?,
         label: row.opt_text(2)?,
         parked_at_ms: row.get::<i64>(3)?,
+        progress: None,
     })
 }
 
@@ -1408,6 +1448,26 @@ pub(crate) async fn inflight_run_batch_except(
     })
 }
 
+/// Whether `job_id` and `other` are both on one live branch of one project:
+/// a node and the tasks that share its branch, which hold it together at the
+/// mutation boundary ([`inflight_run_batch_on_branch`]).
+pub(crate) async fn shares_live_branch(
+    db: &LocalDb,
+    job_id: &str,
+    other: &str,
+) -> Result<bool, String> {
+    let sql = format!(
+        "SELECT EXISTS(
+           SELECT 1 FROM jobs j JOIN jobs o ON o.project_id = j.project_id AND o.branch = j.branch
+            WHERE j.id = ?1 AND o.id = ?2 AND j.branch IS NOT NULL AND {LIVE_JOB_PREDICATE})"
+    );
+    db.query_one(sql, params![job_id.to_string(), other.to_string()], |row| {
+        Ok(row.i64(0)? != 0)
+    })
+    .await
+    .map_err(|error| format!("read whether two jobs share a branch: {error}"))
+}
+
 /// What a deferral at the mutation boundary is waiting on, read from the live
 /// suspension rows of every job on the branch: the batch that holds it, that
 /// nothing does any more, or that this could not be read. Shared by the rebase
@@ -1417,11 +1477,16 @@ pub(crate) fn mutation_boundary_hold(batch: &Result<Option<InflightRunBatch>, St
     match batch {
         Ok(Some(batch)) => format!(
             "It is held by {}: a branch is never rewritten under a batch that may commit to it. \
-             The hold ends when that batch finishes or is stopped (stopping the turn that owns \
-             it cancels it). Nothing revisits it on a timer: after that, the branch is carried \
-             onto its base at its next commit, requested check or run, or merge, or when the \
-             replay is requested again.",
-            batch.describe()
+             The hold ends when that batch finishes; when it is cancelled, by its owning node or \
+             the operator, with {}; or when the operator stops the node, which stops every run \
+             under it. Ending a turn does not release it: a suspended batch outlives the turn \
+             that started it. To cancel it and request the replay in one step: \
+             `write({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{action:\"replay\",cancel_holding_batch:true}}}}]}})`. \
+             Nothing revisits it on a timer: after that, the branch is carried onto its base at \
+             its next commit, requested check or run, or merge, or when the replay is requested \
+             again.",
+            batch.describe(),
+            cancel_action(batch)
         ),
         Ok(None) => "No run batch is in flight on this branch now, on this node or any other \
                      that shares it, so nothing holds the boundary any more: the branch is \
@@ -1431,6 +1496,20 @@ pub(crate) fn mutation_boundary_hold(batch: &Result<Option<InflightRunBatch>, St
         Err(error) => {
             format!("Whether a run batch on this branch still holds it is unknown: {error}.")
         }
+    }
+}
+
+/// The copy-paste cancel for a holding batch, or where to find it when its
+/// owner's home did not resolve.
+pub(crate) fn cancel_action(batch: &InflightRunBatch) -> String {
+    match batch.cancel_uri() {
+        Some(uri) => format!(
+            "`write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`"
+        ),
+        None => format!(
+            "an `action:\"cancel\"` patch on `batches/{}` under job `{}`'s home",
+            batch.request_id, batch.job_id
+        ),
     }
 }
 
@@ -4013,6 +4092,74 @@ mod tests {
         assert_eq!(origin_tip(), third, "a later commit advances origin");
     }
 
+    fn held() -> Result<Option<InflightRunBatch>, String> {
+        Ok(Some(InflightRunBatch {
+            job_id: "job-builder".into(),
+            holder: Some("cairn://p/cairn/5069/1/builder".into()),
+            request_id: "ba0e0085".into(),
+            label: Some("rust-tests on main".into()),
+            parked_at_ms: 1_760_788_078_000,
+            progress: None,
+        }))
+    }
+
+    /// The 5222 specimen: the hold named the batch by its description and
+    /// advised "stopping the turn", which an agent reads as ending its own
+    /// turn, which releases nothing. The hold now names the item running and
+    /// for how long, offers the batch's own cancel as a copy-paste action and
+    /// the one-step replay, names the operator's node Stop, and says ending a
+    /// turn does not release it.
+    #[test]
+    fn the_hold_names_the_running_item_and_offers_the_batch_cancel() {
+        use crate::mcp::handlers::run::detached::BatchProgress;
+        let started = 1_760_788_078_000;
+        let mut batch = held().unwrap().unwrap();
+        batch.progress = Some(BatchProgress::Running {
+            index: 2,
+            total: 5,
+            header: "cargo nextest run -p cairn-core".into(),
+            since_ms: started,
+        });
+        assert!(
+            batch
+                .describe_at(started + 14 * 60_000)
+                .contains("now running item 3 of 5 (`cargo nextest run -p cairn-core`) for 14m 0s"),
+            "{}",
+            batch.describe_at(started + 14 * 60_000)
+        );
+        let said = mutation_boundary_hold(&Ok(Some(batch)));
+        assert!(said.contains("now running item 3 of 5"), "{said}");
+        assert!(
+            said.contains(
+                "target:\"cairn://p/cairn/5069/1/builder/batches/ba0e0085\",mode:\"patch\",payload:{action:\"cancel\"}"
+            ),
+            "offers the batch's own cancel: {said}"
+        );
+        assert!(said.contains("cancel_holding_batch:true"), "{said}");
+        assert!(said.contains("operator stops the node"), "{said}");
+        assert!(said.contains("Ending a turn does not release it"), "{said}");
+        assert!(
+            said.contains("next commit, requested check or run, or merge"),
+            "{said}"
+        );
+        assert!(!said.contains("stopping the turn"), "{said}");
+        assert!(!said.contains("or is stopped"), "{said}");
+
+        let mut task = held().unwrap().unwrap();
+        task.holder = Some("cairn://p/cairn/5069/1/builder/task/verify".into());
+        assert_eq!(
+            task.cancel_uri().as_deref(),
+            Some("cairn://p/cairn/5069/1/builder/task/verify/batches/ba0e0085")
+        );
+        let mut unresolved = held().unwrap().unwrap();
+        unresolved.holder = None;
+        let said = mutation_boundary_hold(&Ok(Some(unresolved)));
+        assert!(
+            said.contains("`batches/ba0e0085` under job `job-builder`"),
+            "{said}"
+        );
+    }
+
     /// A host batch parks on a run-batch row too, but it holds no tree and
     /// cannot commit, so it must not hold its branch at the boundary. A row
     /// written before the marker existed reads as a tree batch and still holds.
@@ -4182,6 +4329,7 @@ mod tests {
                 request_id: "req-detached".into(),
                 label: Some("cargo test".into()),
                 parked_at_ms: 7,
+                progress: None,
             })
         );
         assert!(mutation_boundary_hold(&hold).contains("`req-detached`"));

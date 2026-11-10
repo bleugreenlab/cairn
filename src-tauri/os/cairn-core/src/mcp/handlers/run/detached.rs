@@ -149,27 +149,164 @@ impl Drop for LiveResolver {
     }
 }
 
-/// Request ids whose batch task is still running in this process, from
-/// preparation through publication. It covers what the fleet registry does
+/// The batches whose task is still running in this process, from preparation
+/// through publication, by request id. It covers what the fleet registry does
 /// not: a batch between placement attempts, or settling after its process
-/// ended.
-static LIVE_BATCHES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::LazyLock::new(Default::default);
+/// ended. Each entry is the batch's own control, so a cancel addressed by
+/// request id reaches the one batch it names ([`super::cancel`]).
+static LIVE_BATCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::BatchControl>>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Marks one batch's task as running for as long as it lives.
 pub(crate) struct LiveBatch(String);
 
 impl LiveBatch {
-    pub(crate) fn claim(request_id: &str) -> Self {
+    pub(super) fn claim(control: &std::sync::Arc<super::BatchControl>) -> Self {
+        let request_id = control.request_id.clone();
         LIVE_BATCHES
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(request_id.to_string());
+            .insert(request_id.clone(), control.clone());
         PLACED_HERE
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(request_id.to_string());
-        Self(request_id.to_string())
+            .insert(request_id.clone());
+        Self(request_id)
+    }
+
+    /// A live batch under `request_id` with nothing behind it, for a test
+    /// outside this module that needs only the registry to say it is alive.
+    #[cfg(test)]
+    pub(crate) fn claim_for_test(request_id: &str) -> Self {
+        Self::claim(&super::BatchControl::with_request_id(request_id, false))
+    }
+}
+
+/// The control of a batch whose task is running in this process.
+pub(super) fn live_control(request_id: &str) -> Option<std::sync::Arc<super::BatchControl>> {
+    LIVE_BATCHES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(request_id)
+        .cloned()
+}
+
+/// Who a live batch belongs to: its job, and that job's home URI (the
+/// node or task whose `batches/<request_id>` addresses it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BatchOwner {
+    pub(crate) job_id: String,
+    pub(crate) home: Option<String>,
+}
+
+/// The owner of a batch whose task is running in this process, once its run
+/// context has resolved.
+pub(crate) fn live_owner(request_id: &str) -> Option<BatchOwner> {
+    live_control(request_id)?.owner()
+}
+
+/// Where a batch whose task runs in this process stands now, in the terms a
+/// reader deciding whether to wait for it needs.
+pub(crate) fn live_progress(orch: &Orchestrator, request_id: &str) -> Option<BatchProgress> {
+    Some(live_control(request_id)?.progress(&orch.fleet))
+}
+
+/// Item `index` of a live batch has started. Reached from the host item loop
+/// and from a machine's per-item report; a request with no live batch here (a
+/// check lane, a batch an earlier runner placed) is ignored.
+pub(crate) fn note_item_started(request_id: &str, index: usize) {
+    if let Some(control) = live_control(request_id) {
+        control.item_started(index, chrono::Utc::now().timestamp_millis());
+    }
+}
+
+/// Item `index` of a live batch has finished.
+pub(crate) fn note_item_finished(request_id: &str, index: usize) {
+    if let Some(control) = live_control(request_id) {
+        control.item_finished(index);
+    }
+}
+
+/// The longest item header a progress line quotes; a shell item's header is
+/// its whole command line.
+const PROGRESS_HEADER_CHARS: usize = 80;
+
+/// Where a live batch stands, for the rebase hold and the batch's own page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BatchProgress {
+    /// No machine has it: `waiting` is what it waits for.
+    Queued { waiting: String },
+    /// One item is running: item `index` (0-based) of `total`, since
+    /// `since_ms` (Unix milliseconds).
+    Running {
+        index: usize,
+        total: usize,
+        header: String,
+        since_ms: i64,
+    },
+    /// Several items of a parallel batch are running, the earliest since
+    /// `since_ms`.
+    Parallel {
+        running: usize,
+        total: usize,
+        since_ms: i64,
+    },
+    /// A machine has it and has not reported an item running.
+    Placed { on: String },
+    /// Its task is alive here but no machine holds it: between placement
+    /// attempts.
+    InRunner,
+    /// Settlement has begun: it is publishing its result, and any commit it
+    /// carries is being written.
+    Settling,
+}
+
+impl BatchProgress {
+    /// One clause, as `now_ms` sees it: ``now running item 3 of 5 (`cargo
+    /// nextest run`) for 14m 2s``.
+    pub(crate) fn describe(&self, now_ms: i64) -> String {
+        let elapsed = |since: i64| {
+            crate::execution::checks_status::human_duration(
+                now_ms.saturating_sub(since).max(0) as u64
+            )
+        };
+        match self {
+            Self::Queued { waiting } => format!("queued for a machine: {waiting}"),
+            Self::Running {
+                index,
+                total,
+                header,
+                since_ms,
+            } => {
+                let mut quoted: String = header.chars().take(PROGRESS_HEADER_CHARS).collect();
+                if header.chars().count() > PROGRESS_HEADER_CHARS {
+                    quoted.push('…');
+                }
+                format!(
+                    "now running item {} of {total} (`{quoted}`) for {}",
+                    index + 1,
+                    elapsed(*since_ms)
+                )
+            }
+            Self::Parallel {
+                running,
+                total,
+                since_ms,
+            } => format!(
+                "now running {running} of its {total} items in parallel, the first for {}",
+                elapsed(*since_ms)
+            ),
+            Self::Placed { on } => {
+                format!("placed on `{on}`, which has not yet reported an item running")
+            }
+            Self::InRunner => {
+                "between placement attempts; no machine holds it right now".to_string()
+            }
+            Self::Settling => {
+                "publishing its result now; a commit it carries is being written".to_string()
+            }
+        }
     }
 }
 
@@ -202,7 +339,7 @@ pub(crate) fn batch_is_live(orch: &Orchestrator, request_id: &str) -> bool {
     LIVE_BATCHES
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .contains(request_id)
+        .contains_key(request_id)
         || orch.is_cell_request_in_flight(request_id)
 }
 

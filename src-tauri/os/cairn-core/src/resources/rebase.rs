@@ -36,11 +36,11 @@ use cairn_common::query::QueryParam;
 
 use super::common::{find_node_job, find_query_value, node_branch, read_resource};
 use crate::orchestrator::base_advance::{
-    inflight_run_batch_on_branch, mutation_boundary_hold, InflightRunBatch,
+    cancel_action, inflight_run_batch_on_branch, mutation_boundary_hold, InflightRunBatch,
 };
 use crate::orchestrator::conflict_session::{
     assess_session_tip, load_active_session, load_latest_session, load_reconcile_pass,
-    ConflictSession, MarkerState, ReplayPass, SessionFile, TipAssessment, Unproven,
+    ConflictSession, MarkerState, ReplayPass, ReplayScope, SessionFile, TipAssessment, Unproven,
 };
 use crate::orchestrator::replay_base::{
     load_base_candidates, resolve_base, BaseCandidates, BaseSource,
@@ -218,7 +218,7 @@ pub(crate) async fn read_node_rebase(
     );
     // The owner's own request, whatever any session says: a held plain
     // request has no session at all, and a closed request's reason outlives one.
-    let request_section = explicit_request_section(&db, &rows.job_id, &branch).await;
+    let request_section = explicit_request_section(orch, &db, &rows.job_id, &branch).await;
     let session = match load_active_session(&db, &branch).await {
         Ok(Some(session)) => session,
         Ok(None) => {
@@ -233,7 +233,9 @@ pub(crate) async fn read_node_rebase(
     let rendered = match request.view {
         RebaseView::Summary => {
             let standing = load_live_standing(orch, &rows, &view, &branch, &session).await;
+            let placed = replay_scope(orch, &db, &rows, &branch).await;
             render_summary(
+                placed,
                 orch,
                 project,
                 number,
@@ -261,13 +263,15 @@ pub(crate) async fn read_node_rebase(
 /// The branch's newest explicit replay request with the hold it is waiting
 /// on, or nothing when it has none.
 async fn explicit_request_section(
+    orch: &Orchestrator,
     db: &crate::storage::LocalDb,
     job_id: &str,
     branch: &str,
 ) -> String {
     match crate::orchestrator::conflict_session::latest_replay_request(db, job_id, branch).await {
         Ok(Some(request)) => {
-            let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
+            let hold =
+                with_live_progress(orch, inflight_run_batch_on_branch(db, job_id, branch).await);
             render_request_section(&request, &hold)
         }
         Ok(None) => String::new(),
@@ -336,9 +340,11 @@ fn render_request_section(
         ReplayRequestState::Pending => match hold {
             Ok(Some(batch)) => format!(
                 "{accepted} is **pending**: {} holds this branch, and the request is served on its \
-                 own when that batch completes, or at the orchestrator's next start. You do not \
-                 need to request it again.",
-                batch.describe()
+                 own when that batch completes or is cancelled, or at the orchestrator's next \
+                 start. You do not need to request it again. To serve it now, cancel that batch \
+                 with {}.",
+                batch.describe(),
+                cancel_action(batch)
             ),
             Ok(None) => format!(
                 "{accepted} is **pending**, and nothing holds this branch now. It is served at the \
@@ -479,7 +485,7 @@ async fn render_closed_session(
              stands\n\n{}\n{}\n{}\n",
             standing.base_branch,
             standing.destination,
-            load_advance_state(db, job_id, branch, standing).await,
+            load_advance_state(orch, db, job_id, branch, standing).await,
             standing.superseded_note(),
             replay_next_action(&standing.base_branch),
         ),
@@ -907,14 +913,23 @@ async fn own_origin_section(orch: &Orchestrator, rows: &NodeRebaseRows, branch: 
 /// batch on this branch — this node's or a child task's sharing it — holds
 /// the mutation boundary now.
 async fn load_advance_state(
+    orch: &Orchestrator,
     db: &crate::storage::LocalDb,
     job_id: &str,
     branch: &str,
     standing: &BaseStanding,
 ) -> String {
     let pass = load_reconcile_pass(db, branch, &standing.store_path, &standing.destination).await;
-    let hold = inflight_run_batch_on_branch(db, job_id, branch).await;
+    let hold = with_live_progress(orch, inflight_run_batch_on_branch(db, job_id, branch).await);
     advance_state(&standing.destination, &pass, &hold)
+}
+
+/// The live hold with where its batch stands now, when this runner holds it.
+fn with_live_progress(
+    orch: &Orchestrator,
+    hold: Result<Option<InflightRunBatch>, String>,
+) -> Result<Option<InflightRunBatch>, String> {
+    hold.map(|batch| batch.map(|batch| batch.with_live_progress(orch)))
 }
 
 /// How this branch is carried onto its base from here. Base advance is lazy:
@@ -1269,7 +1284,7 @@ async fn render_no_session(
     let advance = if standing.carries_base {
         String::new()
     } else {
-        load_advance_state(db, job_id, branch, &standing).await
+        load_advance_state(orch, db, job_id, branch, &standing).await
     };
     let BaseStanding {
         base_branch,
@@ -1399,8 +1414,28 @@ fn file_table(title: &str, files: &[&SessionFile]) -> String {
     out
 }
 
+/// What a take-committed-tip replay of `branch` would place from its tip, so
+/// the page judges the paths the guard judges. A mode that cannot be read is
+/// read as the rebase carry, the wider scope: the page then shows more, never
+/// less, than the guard can refuse on.
+async fn replay_scope(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    rows: &NodeRebaseRows,
+    branch: &str,
+) -> ReplayScope {
+    let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch).await) else {
+        return ReplayScope::Carry;
+    };
+    match crate::orchestrator::catch_up::mode_for(db, project_id, &store, branch).await {
+        Ok(Some(_)) => ReplayScope::CatchUpMerge,
+        _ => ReplayScope::Carry,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_summary(
+    placed: ReplayScope,
     orch: &Orchestrator,
     project: &str,
     number: i32,
@@ -1499,7 +1534,10 @@ fn render_summary(
     // whole-file restore drop anything. Computed once so the sections below can
     // never disagree with each other or with the guard on the replay itself.
     let (assessment, assessment_unknown) = match view.pinned() {
-        Ok((jj, store)) => (assess_session_tip(jj, store, session), String::new()),
+        Ok((jj, store)) => (
+            assess_session_tip(jj, store, session, placed),
+            String::new(),
+        ),
         Err(reason) => (
             None,
             format!(
@@ -2612,6 +2650,7 @@ mod tests {
             request_id: "ba0e0085".to_string(),
             label: Some("rust-tests on main".to_string()),
             parked_at_ms: 130_000,
+            progress: None,
         }))
     }
 
@@ -2625,10 +2664,13 @@ mod tests {
         assert!(
             deferred.contains("run batch `ba0e0085` (\"rust-tests on main\")")
                 && deferred.contains("on cairn://p/cairn/5069/1/builder")
-                && deferred.contains("finishes or is stopped")
+                && deferred.contains("The hold ends when that batch finishes")
+                && deferred.contains("cairn://p/cairn/5069/1/builder/batches/ba0e0085")
+                && deferred.contains("action:\"cancel\"")
                 && deferred.contains("next commit, requested check or run, or merge"),
             "names the holding batch and what ends the hold: {deferred}"
         );
+        assert!(!deferred.contains("stopping the turn"), "{deferred}");
         assert!(!deferred.contains("never ran"), "{deferred}");
 
         let released = advance_state("279ddbcf", &Ok(Some(deferred_pass())), &Ok(None));
@@ -2685,8 +2727,11 @@ mod tests {
                 && held_now.contains("**pending**")
                 && held_now.contains("run batch `ba0e0085`")
                 && held_now.contains("when that batch completes")
-                && held_now.contains("do not need to request it again"),
-            "{held_now}"
+                && held_now.contains("do not need to request it again")
+                && held_now.contains(
+                    "target:\"cairn://p/cairn/5069/1/builder/batches/ba0e0085\",mode:\"patch\",payload:{action:\"cancel\"}"
+                ),
+            "names the batch's own cancel: {held_now}"
         );
         assert!(!held_now.contains("automatic"), "{held_now}");
 

@@ -373,6 +373,16 @@ pub(crate) const REBASE_DISMISS_REASON: KeySpec = KeySpec::new(
     KeyType::Str,
     "dismiss-acceptance only: why retiring the row is correct, recorded with it. The row's drop claims were never proven and are discarded, not accepted; a later publication must still account for every commit only origin holds, and may still refuse",
 );
+pub(crate) const REBASE_CANCEL_HOLDING_BATCH: KeySpec = KeySpec::new(
+    "cancel_holding_batch",
+    KeyType::Bool,
+    "replay only: first cancel the run batch holding this branch at the mutation boundary (it is validating a tip the replay supersedes), then request the replay; a batch already publishing is left to finish and its commit stands",
+);
+pub(crate) const BATCH_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "cancel — stop this one run batch: its machine work ends, a call waiting on it resumes once with a result saying who cancelled it, and it releases its branch; nothing else on the node is touched. A batch already publishing its result is left to finish, and its commit stands. Its owning node, a node sharing its branch, or the operator may cancel it",
+);
 pub(crate) const REBASE_CATCH_UP_MODE: KeySpec = KeySpec::new(
     "mode",
     KeyType::Str,

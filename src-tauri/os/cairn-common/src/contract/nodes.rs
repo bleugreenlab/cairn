@@ -272,6 +272,7 @@ pub(crate) const NODE_REBASE_CONTRACT: ResourceContract = ResourceContract {
         optional: &[
             REBASE_FINGERPRINT,
             REBASE_RESOLUTION,
+            REBASE_CANCEL_HOLDING_BATCH,
             REBASE_DROP_INCOMING_REASON,
             REBASE_FAST_FORWARD_BRANCH,
             REBASE_CATCH_UP_MODE,

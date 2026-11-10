@@ -476,8 +476,8 @@ async fn replay(
                         if matches!(how, Settle::Held) {
                             refusal.push_str(
                                 "\n\nYour request is recorded. It is served on its own when that \
-                                 batch completes; if the batch is stopped instead, it is served \
-                                 at the orchestrator's next start, or you can request it again.",
+                                 batch ends, whether it completes or is cancelled, or at the \
+                                 orchestrator's next start; you do not need to request it again.",
                             );
                         }
                         return Err(settle(marker, how, refusal).await);
@@ -1168,11 +1168,23 @@ async fn plan_take_committed_tip(
     // EXHAUSTIVE, not the read path's capped form: the restore covers every
     // conflicting path, so the decision has to. A stated reason is also the
     // resolution of every file the tip deletes, entered before the assessment.
+    // Read once: the guard judges exactly what this replay will place.
+    let merge_mode = crate::orchestrator::catch_up::mode_for(db, project_id, store, branch)
+        .await
+        .map_err(PlanStop::Refused)?
+        .is_some();
+    let placed = if merge_mode {
+        conflict_session::ReplayScope::CatchUpMerge
+    } else {
+        conflict_session::ReplayScope::Carry
+    };
     let left = budget.admit(branch, ASSESSMENT).map_err(PlanStop::Answer)?;
     let scope = AssessmentScope {
         phase: "take-committed-tip assessment",
         branch,
-        candidate_paths: session.replay_paths(&session.resolution_basis).len(),
+        candidate_paths: session
+            .replay_paths(&session.resolution_basis, placed)
+            .len(),
     };
     let (assessed_store, assessed_session) = (store.to_path_buf(), session.clone());
     let reason = ask.drop_incoming_reason.map(str::to_string);
@@ -1182,6 +1194,7 @@ async fn plan_take_committed_tip(
             &assessed_store,
             &assessed_session,
             reason.as_deref(),
+            placed,
         ))
     })
     .await
@@ -1257,11 +1270,7 @@ async fn plan_take_committed_tip(
     let relationship = load_relationship(db, project_id, branch, Some(ask.job_id), None)
         .await
         .map_err(|refusal| PlanStop::Refused(refusal.to_string()))?;
-    if crate::orchestrator::catch_up::mode_for(db, project_id, store, branch)
-        .await
-        .map_err(PlanStop::Refused)?
-        .is_some()
-    {
+    if merge_mode {
         let destination = session.theirs.clone().ok_or_else(|| {
             PlanStop::Refused(
                 "the merge conflict session has no pinned destination; re-read cairn:~/rebase"
@@ -1298,7 +1307,12 @@ async fn plan_take_committed_tip(
     let scope = AssessmentScope {
         phase: "resolution carry plan",
         branch,
-        candidate_paths: session.replay_paths(&session.resolution_basis).len(),
+        candidate_paths: session
+            .replay_paths(
+                &session.resolution_basis,
+                conflict_session::ReplayScope::Carry,
+            )
+            .len(),
     };
     let (planned_store, planned_base) = (store.to_path_buf(), base.clone());
     let plan = conflict_session::bounded_store_assessment(jj, left, scope, move |jj| {
@@ -1435,8 +1449,9 @@ fn not_landed(
         )),
         PreparationRefusal::Busy(BusyReason::RunBatch(batch)) => Err(format!(
             "{batch} may still commit to `{branch}`, so it is not rewritten under it and no \
-             replay was accepted. Request the replay again once that batch finishes or is \
-             stopped (stopping the turn that owns it cancels it)."
+             replay was accepted yet. Cancelling that batch ends the hold now: request the \
+             replay with `cancel_holding_batch:true`, which cancels it first, or patch \
+             `action:\"cancel\"` on the batch's own address, which cairn:~/rebase names."
         )),
         PreparationRefusal::Busy(BusyReason::StoreLock { holder }) => Err(format!(
             "The project's version-control store stayed busy (held by {}) for the rest of this \

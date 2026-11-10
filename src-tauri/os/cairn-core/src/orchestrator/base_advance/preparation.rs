@@ -3945,6 +3945,11 @@ impl Context<'_> {
                 .unwrap_or_default();
         };
         let (session, store) = (previous.clone(), self.store.clone());
+        // Read on the previous session's sides, then narrowed to what the new
+        // session's base has not superseded, so the stored row stays as small
+        // as what it still claims.
+        let mut reopened = previous.clone();
+        reopened.base = diagnostic.base.clone();
         let assessed = bounded_store_assessment(
             &self.jj.at_operation(&coordinate.operation),
             within_deadline(self.request, self.request.compute_budget),
@@ -3953,7 +3958,10 @@ impl Context<'_> {
                 branch: &self.request.branch,
                 candidate_paths: previous.conflicting().count(),
             },
-            move |jj| session.resolution_basis_at(jj, &store, &ours),
+            move |jj| {
+                let basis = session.resolution_basis_at(jj, &store, &ours)?;
+                reopened.without_superseded(jj, &store, basis)
+            },
         )
         .await;
         match assessed {

@@ -1105,6 +1105,56 @@ pub fn paths_changed_between(
         .collect())
 }
 
+/// Which of `commits` `head` already contains — each equal to `head` or one of
+/// its ancestors — in one jj call.
+///
+/// A commit the store does not hold is not contained: `present()` reads it as
+/// nothing rather than failing the whole question. Only hex commit ids are
+/// asked about; anything else is not contained, and a non-hex `head` contains
+/// nothing, so no caller's string is ever parsed as revset syntax. An
+/// abbreviated id is matched against the full id jj prints.
+pub fn commits_contained_in(
+    jj: &JjEnv,
+    store: &Path,
+    commits: &[String],
+    head: &str,
+) -> Result<BTreeSet<String>, String> {
+    let is_commit_id = |id: &str| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let asked: Vec<&String> = commits.iter().filter(|id| is_commit_id(id)).collect();
+    if asked.is_empty() || !is_commit_id(head) {
+        return Ok(BTreeSet::new());
+    }
+    let union = asked
+        .iter()
+        .map(|id| format!("present({id})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let revset = format!("({union}) & ::{head}");
+    let listed = jj.run(
+        store,
+        &[
+            "log",
+            "--no-graph",
+            "--ignore-working-copy",
+            "-r",
+            &revset,
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+        "jj log (commits a head contains)",
+    )?;
+    let contained: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    Ok(asked
+        .into_iter()
+        .filter(|id| contained.iter().any(|full| full.starts_with(id.as_str())))
+        .cloned()
+        .collect())
+}
+
 /// One commit, as a refusal names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingCommit {

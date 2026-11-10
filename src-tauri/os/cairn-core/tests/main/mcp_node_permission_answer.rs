@@ -75,11 +75,9 @@ async fn insert_permission_fixture(db: &LocalDb) {
     insert_builder_node(db, &project_id, Filing::default()).await;
 }
 
-/// How `issue-1` was filed. Its parent edge and creating job are written in the
-/// issue's own INSERT, as a real filing writes them: a later UPDATE of a
-/// parent column is an adoption, which the database revokes for good, so a
-/// fixture that wants creator-proven authority must never establish it that
-/// way. The parent rows must therefore exist first.
+/// How `issue-1` was filed: its parent edge and creating job, written in the
+/// issue's own INSERT as a real filing writes them. The parent rows must
+/// therefore exist first.
 #[derive(Clone, Copy, Default)]
 struct Filing {
     parent_issue: Option<&'static str>,
@@ -1164,70 +1162,47 @@ async fn ancestor_cannot_allow_a_crossing_outside_its_effective_grants() {
         .contains("/etc/hosts"));
 }
 
-/// An issue→issue or issue→thread edge confers answering authority only when
-/// its `parent_job_id` proves the parent filed the child. The grandparent
-/// thread answers only when BOTH edges on the way up carry that proof; a
-/// missing proof on either edge is attention routing and nothing more.
+/// Issue→issue and issue→thread edges confer answering authority as they
+/// stand, whether or not the parent filed the child: the grandparent thread
+/// answers across both edges with or without a recorded filer on either.
 #[tokio::test]
-async fn grandparent_thread_can_answer_only_through_creator_proven_issue_parent_edges() {
-    for (child_proof, parent_proof) in [(false, false), (true, false), (false, true), (true, true)]
+async fn grandparent_thread_answers_through_the_parent_edges_as_they_stand() {
+    for (child_filed, parent_filed) in [(false, false), (true, false), (false, true), (true, true)]
     {
-        let case = format!("child_proof={child_proof} parent_proof={parent_proof}");
+        let case = format!("child_filed={child_filed} parent_filed={parent_filed}");
         let (temp, db) = common::migrated_db().await;
         let db = Arc::new(db);
         insert_filed_permission_fixture(
             &db,
-            Some(parent_proof),
+            Some(parent_filed),
             Filing {
                 parent_issue: Some("parent-issue"),
                 parent_thread: None,
-                creator_job: child_proof.then_some("parent-job"),
+                creator_job: child_filed.then_some("parent-job"),
             },
         )
         .await;
         let orch = orchestrator(&temp, db.clone());
-        // The grandparent already holds the crossing grant, so a refused allow
-        // is about lineage, not about missing effect grants.
-        orch.session_allowed_crossings
-            .lock()
-            .unwrap()
-            .insert("/etc/hosts".to_string());
         let target = "cairn://p/tpa/1/1/builder/permissions/perm-1";
-        if child_proof && parent_proof {
-            let result = handle_write(
-                &orch,
-                &change_request_as(
-                    "run-other",
-                    permission_patch(target, json!({"decision": "deny"})),
-                ),
-            )
-            .await;
-            assert!(
-                result.contains("Answered permission perm-1"),
-                "{case}: {result}"
-            );
-            assert_eq!(perm_status(&db).await.as_deref(), Some("denied"), "{case}");
-            assert_resolution_actor(&db, "perm-row-1", "cairn://p/tpa/other", "run-other").await;
-        } else {
-            let mut refusals = 0;
-            assert_lineage_refuses_both(
-                &orch,
-                &db,
+        let result = handle_write(
+            &orch,
+            &change_request_as(
                 "run-other",
-                target,
-                "perm-row-1",
-                &mut refusals,
-                &case,
-            )
-            .await;
-            operator_deny(&orch, &db, "perm-row-1").await;
-        }
+                permission_patch(target, json!({"decision": "deny"})),
+            ),
+        )
+        .await;
+        assert!(
+            result.contains("Answered permission perm-1"),
+            "{case}: {result}"
+        );
+        assert_eq!(perm_status(&db).await.as_deref(), Some("denied"), "{case}");
+        assert_resolution_actor(&db, "perm-row-1", "cairn://p/tpa/other", "run-other").await;
     }
 }
 
-/// `issue-1` genuinely filed by `parent-issue`'s builder, which thread `other`
-/// genuinely filed: both edges carry creator proof from INSERT. Thread
-/// `adopter` exists but has never filed anything.
+/// `issue-1` filed by `parent-issue`'s builder, which thread `other` filed.
+/// Thread `adopter` exists but has never filed anything.
 async fn insert_issue_parent_lineage(db: &LocalDb) {
     insert_filed_permission_fixture(
         db,
@@ -1265,8 +1240,11 @@ async fn refusal_journal_count(db: &LocalDb, request_id: &str) -> i64 {
     ).await.unwrap()
 }
 
+/// Reparenting through the real issue write moves answering authority with the
+/// edge: the former parent and grandparent are refused, and the new parent
+/// thread answers though it never filed the child.
 #[tokio::test]
-async fn real_issue_reparent_revokes_former_parent_and_grandparent_permission_authority() {
+async fn reparenting_moves_answer_authority_to_the_new_parent() {
     for orphan_first in [false, true] {
         let (temp, db) = common::migrated_db().await;
         let db = Arc::new(db);
@@ -1278,8 +1256,8 @@ async fn real_issue_reparent_revokes_former_parent_and_grandparent_permission_au
             .lock()
             .unwrap()
             .insert("/etc/hosts".to_string());
-        // Positive controls: before the edge changes, the creator-proven parent
-        // and grandparent genuinely answer, so the refusals below are revocation.
+        // Positive controls: before the edge changes, the parent and
+        // grandparent answer, so the refusals below are the move's doing.
         for (run_id, home, segment, row) in [
             (
                 "run-parent",
@@ -1350,8 +1328,6 @@ async fn real_issue_reparent_revokes_former_parent_and_grandparent_permission_au
                 Some("parent-job"),
                 "creator provenance deliberately survives reparenting",
             );
-            assert_revocation_is_monotonic(&db, "issue-1", &format!("orphan_first={orphan_first}"))
-                .await;
             for run_id in ["run-parent", "run-other"] {
                 for decision in ["allow", "deny"] {
                     let result = handle_write(
@@ -1372,24 +1348,25 @@ async fn real_issue_reparent_revokes_former_parent_and_grandparent_permission_au
                 }
             }
         }
-        // Adoption is attention routing only: the adopting thread never filed
-        // the child, so it cannot answer either. The operator still can.
-        assert_lineage_refuses_both(
+        // The adopting thread is the parent now, so it answers.
+        let result = handle_write(
             &orch,
-            &db,
-            "run-new",
-            target,
-            "perm-row-1",
-            &mut refusals,
-            &format!("adopter orphan_first={orphan_first}"),
+            &change_request_as(
+                "run-new",
+                permission_patch(target, json!({"decision": "deny"})),
+            ),
         )
         .await;
-        operator_deny(&orch, &db, "perm-row-1").await;
+        assert!(
+            result.contains("Answered permission perm-1"),
+            "adopter orphan_first={orphan_first}: {result}"
+        );
+        assert_resolution_actor(&db, "perm-row-1", "cairn://p/tpa/adopter", "run-new").await;
     }
 }
 
 // ============================================================================
-// Mutable parent edges never create answering authority
+// Answering authority follows the parent edges as they stand
 // ============================================================================
 
 /// Every allow/deny from `run_id` is refused on lineage, journaled once each,
@@ -1459,61 +1436,6 @@ async fn assert_answers(
         "{case}"
     );
     assert_resolution_actor(db, request_id, adopter.home, adopter.run).await;
-}
-
-/// The authenticated operator answers a prompt no agent may: refusal leaves the
-/// prompt answerable, it does not strand it.
-async fn operator_deny(
-    orch: &cairn_core::internal::orchestrator::Orchestrator,
-    db: &LocalDb,
-    request_id: &str,
-) {
-    use cairn_common::identity::{
-        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, CredentialRef,
-        PrincipalRef, VerificationMethod, VerificationRecord, VerificationStatus,
-        VerificationStrength,
-    };
-    use cairn_core::internal::mcp::handlers::permission::{
-        resolve_permission_request, OperatorApproval, PermissionAnswer, PermissionDecision,
-    };
-
-    let actor = PrincipalRef::Machine {
-        device_id: "test-device".to_string(),
-    };
-    let verification = VerificationRecord::new(
-        VerificationMethod::DesktopCredential,
-        VerificationStatus::Verified,
-        None,
-        None,
-        None,
-        Some(CredentialRef::new("desktop_operator_credential").unwrap()),
-        VerificationStrength::new("local_shared_secret").unwrap(),
-        1,
-    )
-    .unwrap();
-    let evidence = AppearanceEvidence::new(
-        AppearanceTransport::AuthenticatedDesktop,
-        Address::Desktop {
-            device_id: "test-device".to_string(),
-        },
-        verification,
-        1,
-        None,
-    )
-    .unwrap();
-    let appearance = AppearanceSnapshot::new(actor.clone(), evidence, vec![], None).unwrap();
-    let approval = OperatorApproval::authenticated(actor, appearance).unwrap();
-    resolve_permission_request(
-        orch,
-        request_id,
-        PermissionAnswer::from_operator(PermissionDecision::Deny, approval),
-    )
-    .await
-    .expect("the operator answers a prompt its agents may not");
-    assert_eq!(
-        perm_status_of(db, request_id).await.as_deref(),
-        Some("denied")
-    );
 }
 
 /// An agent that can write a parent edge: an issue node (`tpa/2`) or a thread
@@ -1606,7 +1528,7 @@ async fn parent_columns(
     for column in ["parent_issue_id", "parent_thread_id", "parent_job_id"] {
         columns.push(
             db.query_opt_text(
-                &format!("SELECT {column} FROM issues WHERE id = ?1"),
+                format!("SELECT {column} FROM issues WHERE id = ?1"),
                 params![issue_id],
             )
             .await
@@ -1617,90 +1539,6 @@ async fn parent_columns(
     let thread = columns.pop().unwrap();
     let issue = columns.pop().unwrap();
     (issue, thread, parent_job)
-}
-
-/// The child's filing-edge revocation stamp, as text so the assertion does not
-/// depend on the column's storage type.
-async fn filing_revoked_at(db: &LocalDb, issue_id: &str) -> Option<String> {
-    db.query_opt_text(
-        "SELECT CAST(filing_parent_revoked_at AS TEXT) FROM issues WHERE id = ?1",
-        params![issue_id],
-    )
-    .await
-    .unwrap()
-}
-
-/// Once set, revocation is permanent in the database itself: no direct UPDATE
-/// may clear or move it, and the row cannot be REPLACEd back to an unrevoked
-/// one. Each attempt must fail and leave the stamp and the edge untouched.
-async fn assert_revocation_is_monotonic(db: &LocalDb, issue_id: &str, case: &str) {
-    let stamp = filing_revoked_at(db, issue_id).await;
-    assert!(stamp.is_some(), "{case}: the edge change must have revoked");
-    let edge = parent_columns(db, issue_id).await;
-    for (attempt, sql) in [
-        (
-            "clear",
-            "UPDATE issues SET filing_parent_revoked_at = NULL WHERE id = ?1",
-        ),
-        (
-            "move",
-            "UPDATE issues SET filing_parent_revoked_at = filing_parent_revoked_at + 1 WHERE id = ?1",
-        ),
-        (
-            "replace",
-            "REPLACE INTO issues(id, project_id, number, title, status, attention, parent_issue_id, parent_thread_id, parent_job_id, created_at, updated_at)
-             SELECT id, project_id, number, title, status, attention, parent_issue_id, parent_thread_id, parent_job_id, created_at, updated_at
-             FROM issues WHERE id = ?1",
-        ),
-    ] {
-        let outcome = db.execute(sql, params![issue_id]).await;
-        assert!(
-            outcome.is_err(),
-            "{case}: {attempt} of a revoked filing edge must be refused by the database"
-        );
-        assert_eq!(filing_revoked_at(db, issue_id).await, stamp, "{case}: {attempt}");
-        assert_eq!(parent_columns(db, issue_id).await, edge, "{case}: {attempt}");
-    }
-}
-
-/// An unrevoked filed row cannot be REPLACEd into a different edge or creator
-/// with no revocation stamp: that would mint creator proof by SQL rather than
-/// by filing. Each attempt must fail and leave the row as filed.
-async fn assert_unrevoked_replace_with_new_edge_is_refused(
-    db: &LocalDb,
-    issue_id: &str,
-    case: &str,
-) {
-    let edge = parent_columns(db, issue_id).await;
-    assert_eq!(filing_revoked_at(db, issue_id).await, None, "{case}");
-    for (changed, columns) in [
-        ("parent edge", "'issue-1', NULL, parent_job_id"),
-        (
-            "creator proof",
-            "parent_issue_id, parent_thread_id, 'job-1'",
-        ),
-    ] {
-        let sql = format!(
-            "REPLACE INTO issues(id, project_id, number, title, status, attention, parent_issue_id, parent_thread_id, parent_job_id, created_at, updated_at, filing_parent_revoked_at)
-             SELECT id, project_id, number, title, status, attention, {columns}, created_at, updated_at, NULL
-             FROM issues WHERE id = ?1"
-        );
-        let outcome = db.execute(sql.as_str(), params![issue_id]).await;
-        assert!(
-            outcome.is_err(),
-            "{case}: REPLACE with a changed {changed} and no stamp must be refused"
-        );
-        assert_eq!(
-            parent_columns(db, issue_id).await,
-            edge,
-            "{case}: {changed}"
-        );
-        assert_eq!(
-            filing_revoked_at(db, issue_id).await,
-            None,
-            "{case}: {changed}"
-        );
-    }
 }
 
 fn current_edge(adopter: Adopter) -> (Option<String>, Option<String>) {
@@ -1766,12 +1604,10 @@ async fn file_child_with_pending_prompts(
     (id, number)
 }
 
-/// Security ruling on PR #5037, cases (1) and (2): an agent that adopts an
-/// unrelated issue gains attention routing only. Neither its deny nor its
-/// allow (within a grant it holds) is accepted; each refusal is journaled and
-/// the prompt stays pending for the operator.
+/// An agent that adopts an issue is its parent, and answers its prompts like
+/// one that filed it (an allow still only within a grant it holds).
 #[tokio::test]
-async fn adopting_an_unrelated_issue_confers_no_answer_authority() {
+async fn adopting_an_issue_confers_answer_authority() {
     for adopter in [ISSUE_ADOPTER, THREAD_ADOPTER] {
         let case = format!("{} adopter", adopter.label);
         let (temp, db) = common::migrated_db().await;
@@ -1781,39 +1617,30 @@ async fn adopting_an_unrelated_issue_confers_no_answer_authority() {
         grant_hosts(&orch);
 
         let result = patch_parent(&orch, adopter.run, 1, json!(adopter.parent_uri)).await;
-        let (issue, thread, parent_job) = parent_columns(&db, "issue-1").await;
+        let (issue, thread, _) = parent_columns(&db, "issue-1").await;
         assert_eq!(
             (issue, thread),
             current_edge(adopter),
             "{case}: the adoption must persist: {result}"
         );
-        assert_eq!(
-            parent_job, None,
-            "{case}: adoption must never mint creator proof"
-        );
-        assert_revocation_is_monotonic(&db, "issue-1", &case).await;
-
-        let mut refusals = 0;
-        assert_lineage_refuses_both(
+        assert_answers(
             &orch,
             &db,
-            adopter.run,
+            adopter,
             "cairn://p/tpa/1/1/builder/permissions/perm-1",
             "perm-row-1",
-            &mut refusals,
+            "allow",
             &case,
         )
         .await;
-        operator_deny(&orch, &db, "perm-row-1").await;
     }
 }
 
-/// Security ruling cases (3)/(4) and the same-parent no-op, on the real write
-/// path: a child A files really is A's to answer, and naming the current
-/// parent again revokes nothing. The first real edge change (orphan) revokes
-/// it, and re-adoption by the very same A never restores it.
+/// On the real write path: a child A files is A's to answer, and naming the
+/// current parent again changes nothing. Orphaned, its prompts go to the
+/// operator alone; re-adopted, A answers again.
 #[tokio::test]
-async fn a_filed_child_orphaned_then_readopted_by_its_filer_loses_answer_authority_for_good() {
+async fn an_orphaned_child_answers_to_the_operator_until_readopted() {
     // The issue filer names its own issue; the thread filer relies on the
     // ordinary inferred parent a thread's filing gets.
     for (adopter, explicit_parent) in [
@@ -1847,12 +1674,6 @@ async fn a_filed_child_orphaned_then_readopted_by_its_filer_loses_answer_authori
             "{case}: filing must store the edge and the authenticated creating job",
         );
 
-        assert_eq!(
-            filing_revoked_at(&db, &child).await,
-            None,
-            "{case}: the filing INSERT itself must not revoke its own edge"
-        );
-
         // Positive control: the filer answers its genuine child.
         assert_answers(
             &orch,
@@ -1865,7 +1686,7 @@ async fn a_filed_child_orphaned_then_readopted_by_its_filer_loses_answer_authori
         )
         .await;
 
-        // Naming the current parent again is not a change and revokes nothing.
+        // Naming the current parent again is not a change.
         let result = patch_parent(&orch, adopter.run, number, json!(adopter.parent_uri)).await;
         assert_eq!(
             parent_columns(&db, &child).await,
@@ -1882,18 +1703,6 @@ async fn a_filed_child_orphaned_then_readopted_by_its_filer_loses_answer_authori
             &case,
         )
         .await;
-
-        assert_eq!(
-            filing_revoked_at(&db, &child).await,
-            None,
-            "{case}: naming the current parent again must not revoke"
-        );
-        assert_unrevoked_replace_with_new_edge_is_refused(&db, &child, &case).await;
-        assert_eq!(
-            perm_status_of(&db, "child-perm-c").await.as_deref(),
-            Some("pending"),
-            "{case}: a refused REPLACE leaves the child's prompt untouched"
-        );
 
         // Orphan: the edge is gone; creator provenance deliberately survives.
         let result = patch_parent(&orch, adopter.run, number, serde_json::Value::Null).await;
@@ -1914,43 +1723,30 @@ async fn a_filed_child_orphaned_then_readopted_by_its_filer_loses_answer_authori
         )
         .await;
 
-        let orphan_stamp = filing_revoked_at(&db, &child).await;
-        assert!(orphan_stamp.is_some(), "{case}: orphaning must revoke");
-
-        // Re-adoption by the same filer restores the identical stored edge, but
-        // the revocation is monotonic.
+        // Re-adoption restores the edge, and with it the authority.
         let result = patch_parent(&orch, adopter.run, number, json!(adopter.parent_uri)).await;
         assert_eq!(
             parent_columns(&db, &child).await,
             filed,
             "{case}: re-adopt: {result}"
         );
-        assert_lineage_refuses_both(
+        assert_answers(
             &orch,
             &db,
-            adopter.run,
+            adopter,
             &target("perm-c"),
             "child-perm-c",
-            &mut refusals,
+            "deny",
             &format!("{case} re-adopted"),
         )
         .await;
-        assert_eq!(
-            filing_revoked_at(&db, &child).await,
-            orphan_stamp,
-            "{case}: re-adoption must neither clear nor restamp the revocation"
-        );
-        assert_revocation_is_monotonic(&db, &child, &case).await;
-        operator_deny(&orch, &db, "child-perm-c").await;
     }
 }
 
-/// A child A filed under some other issue records A's job as its creator, but
-/// moving it under A afterwards is an adoption, not a filing: even though the
-/// stored `parent_job_id` now names a job of the current parent, the edge
-/// change revoked it.
+/// A child A filed under some other issue, then moved under A, answers to A:
+/// the edge as it stands is what counts.
 #[tokio::test]
-async fn a_child_filed_elsewhere_then_moved_under_its_filer_gains_no_answer_authority() {
+async fn a_child_moved_under_a_new_parent_answers_to_it() {
     for adopter in [ISSUE_ADOPTER, THREAD_ADOPTER] {
         let case = format!("{} filer", adopter.label);
         let (temp, db) = common::migrated_db().await;
@@ -1976,7 +1772,6 @@ async fn a_child_filed_elsewhere_then_moved_under_its_filer_gains_no_answer_auth
             ),
             "{case}: filing under tpa/1 records the filer as creator"
         );
-        assert_eq!(filing_revoked_at(&db, &child).await, None, "{case}");
         let result = patch_parent(&orch, adopter.run, number, json!(adopter.parent_uri)).await;
         let (issue, thread) = current_edge(adopter);
         assert_eq!(
@@ -1984,152 +1779,17 @@ async fn a_child_filed_elsewhere_then_moved_under_its_filer_gains_no_answer_auth
             (issue, thread, Some(adopter.job.to_string())),
             "{case}: move: {result}"
         );
-        let mut refusals = 0;
-        assert_lineage_refuses_both(
+        assert_answers(
             &orch,
             &db,
-            adopter.run,
+            adopter,
             &format!("cairn://p/tpa/{number}/1/builder/permissions/perm-a"),
             "child-perm-a",
-            &mut refusals,
+            "deny",
             &case,
         )
         .await;
-        assert_revocation_is_monotonic(&db, &child, &case).await;
-        operator_deny(&orch, &db, "child-perm-a").await;
     }
-}
-
-/// Security's final ruling: an issue that already had a parent edge before the
-/// revocation migration fails closed, even with a creator `parent_job_id` that
-/// matches its current parent. No lifetime reparent journal exists, so a
-/// matching pair cannot prove the edge was never adopted back. This runs the
-/// real upgrade: a database migrated up to just before the revocation
-/// migration holds a genuine legacy lineage, then the full set is applied.
-#[tokio::test]
-async fn legacy_parent_edges_fail_closed_after_the_revocation_upgrade() {
-    use cairn_db::storage::{MigrationRunner, TURSO_MIGRATIONS};
-
-    let temp = tempfile::tempdir().unwrap();
-    let db = Arc::new(
-        LocalDb::open(temp.path().join("legacy.turso.db"))
-            .await
-            .unwrap(),
-    );
-    // The pre-upgrade era is the prefix before the revocation migration: later
-    // migrations may depend on its column, so they are never applied without it.
-    let index = TURSO_MIGRATIONS
-        .iter()
-        .position(|migration| migration.name() == "issue_filing_parent_revocation")
-        .expect("the revocation migration is registered");
-    MigrationRunner::new(TURSO_MIGRATIONS[..index].to_vec())
-        .run(&db)
-        .await
-        .unwrap();
-
-    // Every edge here is a genuine filing with its matching creator: issue-1
-    // by parent-issue's builder, parent-issue by thread `other`.
-    insert_filed_permission_fixture(
-        &db,
-        Some(true),
-        Filing {
-            parent_issue: Some("parent-issue"),
-            parent_thread: None,
-            creator_job: Some("parent-job"),
-        },
-    )
-    .await;
-
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
-        .await
-        .unwrap();
-    for issue_id in ["issue-1", "parent-issue"] {
-        assert!(
-            filing_revoked_at(&db, issue_id).await.is_some(),
-            "{issue_id}: a pre-existing parent edge must be revoked by the upgrade"
-        );
-    }
-    assert_eq!(
-        parent_columns(&db, "issue-1").await,
-        (
-            Some("parent-issue".to_string()),
-            None,
-            Some("parent-job".to_string())
-        ),
-        "the upgrade keeps the edge and creator provenance; it revokes, never clears"
-    );
-    assert_revocation_is_monotonic(&db, "issue-1", "legacy").await;
-
-    let orch = orchestrator(&temp, db.clone());
-    grant_hosts(&orch);
-    let mut refusals = 0;
-    for run_id in ["run-parent", "run-other"] {
-        assert_lineage_refuses_both(
-            &orch,
-            &db,
-            run_id,
-            "cairn://p/tpa/1/1/builder/permissions/perm-1",
-            "perm-row-1",
-            &mut refusals,
-            "legacy",
-        )
-        .await;
-    }
-    operator_deny(&orch, &db, "perm-row-1").await;
-}
-
-/// Creator proof is part of the filing edge: rewriting `parent_job_id` with
-/// ordinary SQL revokes the edge just as moving it does, and writing the
-/// original filer back does not un-revoke it.
-#[tokio::test]
-async fn a_raw_creator_proof_rewrite_revokes_the_filing_edge() {
-    let (temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-    insert_filed_permission_fixture(&db, None, THREAD_FILED).await;
-    assert_eq!(
-        filing_revoked_at(&db, "issue-1").await,
-        None,
-        "a filing INSERT does not revoke its own edge"
-    );
-    fixture_sql(
-        &db,
-        "UPDATE issues SET parent_job_id = 'job-1' WHERE id = 'issue-1'",
-    )
-    .await;
-    let stamp = filing_revoked_at(&db, "issue-1").await;
-    assert!(stamp.is_some(), "rewriting the creator must revoke");
-    fixture_sql(
-        &db,
-        "UPDATE issues SET parent_job_id = 'other-job' WHERE id = 'issue-1'",
-    )
-    .await;
-    assert_eq!(filing_revoked_at(&db, "issue-1").await, stamp);
-    assert_eq!(
-        parent_columns(&db, "issue-1").await,
-        (
-            None,
-            Some("other-thread".to_string()),
-            Some("other-job".to_string())
-        ),
-        "the row looks exactly as filed, but its proof is spent"
-    );
-    assert_revocation_is_monotonic(&db, "issue-1", "proof rewrite").await;
-
-    let orch = orchestrator(&temp, db.clone());
-    grant_hosts(&orch);
-    let mut refusals = 0;
-    assert_lineage_refuses_both(
-        &orch,
-        &db,
-        "run-other",
-        "cairn://p/tpa/1/1/builder/permissions/perm-1",
-        "perm-row-1",
-        &mut refusals,
-        "proof rewrite",
-    )
-    .await;
-    operator_deny(&orch, &db, "perm-row-1").await;
 }
 
 async fn check_claude_ancestor_core_tool_grants(mcp_prompt: bool) {

@@ -11,7 +11,6 @@ use cairn_attention::wakes::GateOwner;
 use cairn_common::authorization::{
     AuthorityAction, AuthorityAudience, AuthorityPlace, AuthorityPrincipal, AuthorityScope,
 };
-use cairn_db::lineage::FilingParent;
 use cairn_db::turso::params;
 
 use crate::models::Job;
@@ -129,14 +128,12 @@ pub async fn check_confirmation(
     authorize(orch, &db, job_id, confirmer).await
 }
 
-/// What the gate's own rows say: the chain that produced the artifact, whom
-/// the gate waits on, and whether the parent edge that routing followed
-/// carries filing proof.
+/// What the gate's own rows say: the chain that produced the artifact and whom
+/// the gate waits on through the issue's parent edges as they stand now.
 struct GateFacts {
     producer_root: String,
     owner: GateOwner,
     owner_label: Option<String>,
-    edge_proven: bool,
 }
 
 /// The authenticated confirmer's own rows.
@@ -156,10 +153,10 @@ async fn authorize(
         return Ok(());
     }
     let gate = gate_facts(db, job_id).await?;
-    let may_confirm = match (&gate.owner, &gate.owner_label, gate.edge_proven) {
-        (GateOwner::Operator, _, _) | (_, _, false) => "the operator".to_string(),
-        (_, Some(label), true) => format!("{label} (this issue's gate owner) or the operator"),
-        (_, None, true) => "this issue's gate owner or the operator".to_string(),
+    let may_confirm = match (&gate.owner, &gate.owner_label) {
+        (GateOwner::Operator, _) => "the operator".to_string(),
+        (_, Some(label)) => format!("{label} (this issue's gate owner) or the operator"),
+        (_, None) => "this issue's gate owner or the operator".to_string(),
     };
     let refuse = |reason: String| {
         Err(ConfirmError::Refused(ConfirmRefusal {
@@ -194,17 +191,13 @@ async fn authorize(
         GateOwner::Thread(owner) => caller.thread_session_of.as_ref() == Some(owner),
         GateOwner::Operator => false,
     };
-    match (&gate.owner, is_owner, gate.edge_proven) {
-        (GateOwner::Operator, _, _) => refuse(
+    match (&gate.owner, is_owner) {
+        (GateOwner::Operator, _) => refuse(
             "No thread or node coordinates this issue, so its gate waits on the operator."
                 .to_string(),
         ),
-        (_, false, _) => refuse("The confirming run is not this issue's gate owner.".to_string()),
-        (_, true, false) => refuse(
-            "The issue's parent edge carries no filing proof (it was adopted, reparented, or filed before filing proof existed), so routing to its parent confers no authority to confirm."
-                .to_string(),
-        ),
-        (_, true, true) => Ok(()),
+        (_, false) => refuse("The confirming run is not this issue's gate owner.".to_string()),
+        (_, true) => Ok(()),
     }
 }
 
@@ -234,27 +227,21 @@ async fn gate_facts(db: &LocalDb, job_id: &str) -> Result<GateFacts, ConfirmErro
                     producer_root,
                     owner: GateOwner::Operator,
                     owner_label: None,
-                    edge_proven: false,
                 });
             };
             let owner =
                 crate::orchestrator::wakes::gate_owner_for_child_conn(conn, &issue_id).await?;
-            let (edge_proven, owner_label) = match &owner {
-                GateOwner::Job(owner_job) => (
-                    filing_edge_proven_conn(conn, &issue_id, FilingParent::Issue).await?,
-                    cairn_db::lineage::home_uri_for_job_conn(conn, owner_job).await?,
-                ),
-                GateOwner::Thread(thread_id) => (
-                    filing_edge_proven_conn(conn, &issue_id, FilingParent::Thread).await?,
-                    thread_uri_conn(conn, thread_id).await?,
-                ),
-                GateOwner::Operator => (false, None),
+            let owner_label = match &owner {
+                GateOwner::Job(owner_job) => {
+                    cairn_db::lineage::home_uri_for_job_conn(conn, owner_job).await?
+                }
+                GateOwner::Thread(thread_id) => thread_uri_conn(conn, thread_id).await?,
+                GateOwner::Operator => None,
             };
             Ok(GateFacts {
                 producer_root,
                 owner,
                 owner_label,
-                edge_proven,
             })
         })
     })
@@ -318,34 +305,6 @@ async fn chain_root_conn(conn: &TrackedConnection, job_id: &str) -> DbResult<Opt
         )
         .await?;
     crate::storage::next_text(&mut rows, 0).await
-}
-
-/// Whether the child's parent edge on `arm`, the one gate routing followed,
-/// still confers authority under the filing-proof rule permission answers
-/// also apply ([`FilingParent::proof_sql`]). A merely routed or adopted edge
-/// confers nothing.
-async fn filing_edge_proven_conn(
-    conn: &TrackedConnection,
-    issue_id: &str,
-    arm: FilingParent,
-) -> DbResult<bool> {
-    // Routing reaches a parent thread only when the child has no parent issue,
-    // so the thread edge speaks for the gate only on such a child.
-    let routed = match arm {
-        FilingParent::Issue => "",
-        FilingParent::Thread => " AND i.parent_issue_id IS NULL",
-    };
-    let mut rows = conn
-        .query(
-            &format!(
-                "SELECT 1 FROM issues i JOIN jobs j ON {proof}
-                 WHERE i.id = ?1{routed} LIMIT 1",
-                proof = arm.proof_sql()
-            ),
-            params![issue_id],
-        )
-        .await?;
-    Ok(rows.next().await?.is_some())
 }
 
 async fn thread_uri_conn(conn: &TrackedConnection, thread_id: &str) -> DbResult<Option<String>> {
@@ -434,7 +393,3 @@ async fn journal_refusal(
             ))
         })
 }
-
-#[cfg(test)]
-#[path = "checkpoints_filing_proof_tests.rs"]
-mod filing_proof_tests;

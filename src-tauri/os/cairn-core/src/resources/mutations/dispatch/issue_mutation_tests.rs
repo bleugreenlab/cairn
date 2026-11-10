@@ -2848,6 +2848,8 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::NodePage => "cairn://p/cairn/1/1/builder/pages/board",
         K::NodeTerminal => "cairn://p/cairn/1/1/builder/terminal/dev",
         K::NodeRepl => "cairn://p/cairn/1/1/builder/repl/analysis",
+        K::NodeBatch => "cairn://p/cairn/1/1/builder/batches/ba0e0085",
+        K::TaskBatch => "cairn://p/cairn/1/1/builder/task/sub/batches/ba0e0085",
         K::TaskTerminal => "cairn://p/cairn/1/1/builder/task/sub/terminal/dev",
         K::TaskMessages => "cairn://p/cairn/1/1/builder/task/sub/messages",
         K::TaskArtifact => "cairn://p/cairn/1/1/builder/task/sub/result",

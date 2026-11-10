@@ -5623,6 +5623,14 @@ pub struct LearnedResourceEstimate {
 /// yet records the `Unknown` sync cost and absent distance every peer already
 /// reads. What a runner gets wrong talking to an older executor: nothing.
 ///
+/// cairn/5457 does not move the number. No frame, variant or field changes.
+/// The runner now also reads the `ProcessItemStarted` and
+/// `ProcessItemCompleted` callbacks of an agent's run batch, which every
+/// executor already sends to any batch that names a runner context, to show
+/// which item is running; and cancelling one run batch sends the existing
+/// `Cancel` for its request. What a runner gets wrong talking to an older
+/// executor: nothing.
+///
 /// cairn/6596 does not move the number. No frame, variant or field changes.
 /// The runner now ends a connection superseded by a newer generation of the
 /// same executor within a liveness tick, refuses to issue that connection an

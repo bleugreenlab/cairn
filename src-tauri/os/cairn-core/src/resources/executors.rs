@@ -2180,6 +2180,7 @@ pub(crate) fn render_placements(executor: &ExecutorInspection) -> String {
             executor.name,
             decision.request_id,
         ));
+        out.push_str(&run_batch_line(&decision.request_id));
     }
     out.push('\n');
     out
@@ -3115,7 +3116,20 @@ pub(crate) fn render_placement(executor: &ExecutorInspection, request_id: &str) 
         executor.name, decision.request_id
     );
     render_placement_detail(&mut out, decision);
+    out.push_str(&run_batch_line(&decision.request_id));
     out
+}
+
+/// For a request that is a run batch this runner holds: the batch's own
+/// resource, whose `action:"cancel"` patch ends that batch and nothing else.
+/// The fleet request id of a run batch is the batch's request id.
+fn run_batch_line(request_id: &str) -> String {
+    match crate::mcp::handlers::run::detached::live_owner(request_id).and_then(|owner| owner.home) {
+        Some(home) => format!(
+            "  - Run batch: `{home}/batches/{request_id}`; cancel it with `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`\n"
+        ),
+        None => String::new(),
+    }
 }
 
 /// What a placement request asked for, in the terms a reader can act on. A pin

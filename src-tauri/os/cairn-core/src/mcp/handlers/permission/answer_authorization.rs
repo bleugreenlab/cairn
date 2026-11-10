@@ -3,7 +3,6 @@ use super::*;
 use cairn_common::authorization::{
     AuthorityAction, AuthorityAudience, AuthorityPlace, AuthorityPrincipal, AuthorityScope,
 };
-use cairn_db::lineage::FilingParent;
 
 /// Called before the first-answer claim and again when executing a recovered
 /// winner. Persisted edges, not URI prefixes or payload claims, confer ancestry.
@@ -155,8 +154,9 @@ async fn check_agent(
 
 /// Whether `answering_job` is in the strict ancestor lineage of the job that
 /// raised `request_id`. Job edges are persisted parentage; an issue's parent
-/// edges count only where [`FilingParent::proof_sql`] proves them, checked at
-/// every hop the walk crosses.
+/// edges (`parent_issue_id`, `parent_thread_id`) count as they stand now,
+/// however they were made. The issue's filing job is an ancestor only while it
+/// sits on the issue's current parent issue.
 pub(crate) async fn is_ancestor(
     db: &LocalDb,
     request_id: &str,
@@ -164,7 +164,7 @@ pub(crate) async fn is_ancestor(
 ) -> Result<bool, String> {
     let request_id = request_id.to_string();
     let answering_job = answering_job.to_string();
-    let sql = format!(
+    let sql = String::from(
         "WITH RECURSIVE
                  requester AS (
                      SELECT COALESCE(pr.job_id, r.job_id) AS job_id,
@@ -180,14 +180,14 @@ pub(crate) async fn is_ancestor(
                      FROM jobs j LEFT JOIN executions e ON e.id = j.execution_id
                      WHERE COALESCE(j.issue_id, e.issue_id) IS NOT NULL
                      UNION ALL
-                     SELECT 'issue', i.id, 'issue', i.parent_issue_id FROM issues i
-                     JOIN jobs j ON {issue_proof}
+                     SELECT 'issue', id, 'issue', parent_issue_id FROM issues
+                     WHERE parent_issue_id IS NOT NULL
                      UNION ALL
                      SELECT 'issue', i.id, 'job', i.parent_job_id FROM issues i
-                     JOIN jobs j ON {issue_proof}
+                     JOIN jobs j ON j.id = i.parent_job_id AND j.issue_id = i.parent_issue_id
                      UNION ALL
-                     SELECT 'issue', i.id, 'thread', i.parent_thread_id FROM issues i
-                     JOIN jobs j ON {thread_proof}
+                     SELECT 'issue', id, 'thread', parent_thread_id FROM issues
+                     WHERE parent_thread_id IS NOT NULL
                  ),
                  lineage(kind, id) AS (
                      SELECT 'job', job_id FROM requester
@@ -204,8 +204,6 @@ pub(crate) async fn is_ancestor(
                      OR (a.parent_job_id IS NULL AND a.uri_segment = 'thread'
                          AND EXISTS (SELECT 1 FROM lineage WHERE kind = 'thread' AND id = a.thread_id))
                  ) LIMIT 1",
-        issue_proof = FilingParent::Issue.proof_sql(),
-        thread_proof = FilingParent::Thread.proof_sql(),
     );
     db.read(move |conn| {
         let request_id = request_id.clone();

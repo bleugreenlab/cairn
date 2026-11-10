@@ -638,10 +638,44 @@ pub(super) async fn read_node_batches(
         Ok(None) => return "Could not resolve this job's batch home.".to_string(),
         Err(error) => return format!("Could not resolve this job's batch home: {error}"),
     };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let in_flight = match open_batch_waits(db, &job_id).await {
+        Ok(waits) => waits,
+        Err(error) => return format!("Could not read this job's in-flight batches: {error}"),
+    };
     match request_id {
         Some(request_id) => match detached::load(db, request_id).await {
             Ok(Some(batch)) if batch.job_id == job_id => {
-                detached::render(&batch, &detached::live_state(orch, &batch))
+                let mut out = detached::render(&batch, &detached::live_state(orch, &batch));
+                if matches!(
+                    batch.state,
+                    detached::DetachedState::Parked | detached::DetachedState::Running
+                ) {
+                    if let Some(progress) = detached::live_progress(orch, request_id) {
+                        out.push_str(&format!("Progress: {}.\n", progress.describe(now_ms)));
+                    }
+                    out.push_str(&cancel_line(&home, request_id));
+                }
+                out
+            }
+            Ok(None) if in_flight.iter().any(|wait| wait.request_id == request_id) => {
+                let wait = in_flight
+                    .iter()
+                    .find(|wait| wait.request_id == request_id)
+                    .expect("checked above");
+                render_in_flight(orch, &home, wait, now_ms)
+            }
+            Ok(None)
+                if detached::live_owner(request_id)
+                    .is_some_and(|owner| owner.job_id == job_id) =>
+            {
+                let progress = detached::live_progress(orch, request_id)
+                    .map(|progress| format!("Progress: {}.\n", progress.describe(now_ms)))
+                    .unwrap_or_default();
+                format!(
+                    "# Run batch `{request_id}`\n\nState: running; its call is still waiting on it inline.\n{progress}{}",
+                    cancel_line(&home, request_id)
+                )
             }
             Ok(Some(batch)) => {
                 match crate::jobs::queries::home_uri_for_job(db, &batch.job_id).await {
@@ -657,11 +691,28 @@ pub(super) async fn read_node_batches(
             Err(error) => format!("Could not read run batch `{request_id}`: {error}"),
         },
         None => match detached::for_job(db, &job_id).await {
-            Ok(batches) if batches.is_empty() => format!(
-                "# Batches ({label})\n\nNo run batch owned by this job has kept running past its call. Tasks' batches live under each task's own `batches` collection.\n"
+            Ok(batches) if batches.is_empty() && in_flight.is_empty() => format!(
+                "# Batches ({label})\n\nNo run batch owned by this job is in flight or has kept running past its call. Tasks' batches live under each task's own `batches` collection.\n"
             ),
             Ok(batches) => {
                 let mut out = format!("# Batches ({label})\n\nOnly this job's batches; tasks have their own `batches` collections.\n\n");
+                if !in_flight.is_empty() {
+                    out.push_str("## In flight, their calls suspended\n\n");
+                    for wait in &in_flight {
+                        let progress = detached::live_progress(orch, &wait.request_id)
+                            .map(|progress| format!("; {}", progress.describe(now_ms)))
+                            .unwrap_or_default();
+                        out.push_str(&format!(
+                            "- `{home}/batches/{}` '{}'{progress}\n",
+                            wait.request_id,
+                            wait.label.as_deref().unwrap_or("unnamed")
+                        ));
+                    }
+                    out.push('\n');
+                }
+                if !batches.is_empty() {
+                    out.push_str("## Outlived their calls\n\n");
+                }
                 for batch in batches {
                     let live = detached::live_state(orch, &batch);
                     out.push_str(&format!(
@@ -669,11 +720,76 @@ pub(super) async fn read_node_batches(
                         detached::summary_line(&batch, &home, &live)
                     ));
                 }
+                out.push_str("\nCancel one in flight with an `action:\"cancel\"` patch on its own `batches/<request_id>`.\n");
                 out
             }
             Err(error) => format!("Could not read this job's batches: {error}"),
         },
     }
+}
+
+/// A run batch whose call is suspended on it: its open run-batch wait.
+struct OpenBatchWait {
+    request_id: String,
+    label: Option<String>,
+    created_at: i64,
+    state: String,
+}
+
+/// The job's run batches whose calls are suspended on them, newest first.
+async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWait>, String> {
+    db.query_all(
+        "SELECT json_extract(condition_json, '$.request_id'), json_extract(condition_json, '$.label'), created_at, state
+           FROM agent_waits
+          WHERE job_id = ?1 AND state IN ('pending', 'resolving')
+            AND json_extract(condition_json, '$.kind') = 'run_batch'
+          ORDER BY created_at DESC",
+        (job_id.to_string(),),
+        |row| {
+            Ok(OpenBatchWait {
+                request_id: row.text(0)?,
+                label: row.opt_text(1)?,
+                created_at: row.get::<i64>(2)?,
+                state: row.text(3)?,
+            })
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn cancel_line(home: &str, request_id: &str) -> String {
+    format!(
+        "\nCancel this batch only: `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`. A call waiting on it resumes with a cancelled result; a commit it is already writing stands.\n"
+    )
+}
+
+/// The page of a batch whose call is suspended on it.
+fn render_in_flight(
+    orch: &crate::orchestrator::Orchestrator,
+    home: &str,
+    wait: &OpenBatchWait,
+    now_ms: i64,
+) -> String {
+    use crate::mcp::handlers::run::detached;
+    let since = crate::clock::stamp_millis(wait.created_at)
+        .map(|stamp| format!(" since {stamp}"))
+        .unwrap_or_default();
+    let state = if wait.state == "resolving" {
+        "settled; its result is being delivered to its call".to_string()
+    } else {
+        format!("in flight, its call suspended on it{since}")
+    };
+    let progress = match detached::live_progress(orch, &wait.request_id) {
+        Some(progress) => format!("Progress: {}.\n", progress.describe(now_ms)),
+        None => "Progress: this runner holds no task for it; it settles from its machine's own report.\n".to_string(),
+    };
+    format!(
+        "# Run batch `{}`\n\nLabel: {}\nState: {state}\n{progress}{}",
+        wait.request_id,
+        wait.label.as_deref().unwrap_or("unnamed"),
+        cancel_line(home, &wait.request_id)
+    )
 }
 
 pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_id: &str) -> String {

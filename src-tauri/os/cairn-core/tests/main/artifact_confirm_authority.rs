@@ -5,9 +5,9 @@
 //! sibling node on the same issue. Around it sit thread `design` (the child's
 //! filing parent in most cases), an unrelated thread `other`, and, for the
 //! coordinator case, issue `cfa/2` whose coordinator node filed `cfa/1`.
-//! Only the gate owner, through a parent edge carrying filing proof, or the
-//! operator may confirm; every refusal is journaled and leaves the gate
-//! pending.
+//! Only the gate owner, through the parent edges as they stand however they
+//! were made, or the operator may confirm, and never the chain that produced
+//! the artifact; every refusal is journaled and leaves the gate pending.
 
 use crate::common;
 
@@ -74,7 +74,7 @@ struct Filing {
     creator_job: Option<&'static str>,
 }
 
-/// Filed by thread `design`, with the thread's session job as proof.
+/// Filed by thread `design`, its session job recorded as the filer.
 const THREAD_FILED: Filing = Filing {
     parent_issue: None,
     parent_thread: Some("thread-design"),
@@ -88,9 +88,9 @@ const COORDINATOR_FILED: Filing = Filing {
     creator_job: Some("job-coord"),
 };
 
-/// Routed under thread `design` with no creator proof: a legacy child, or one
-/// adopted rather than filed.
-const THREAD_ROUTED_ONLY: Filing = Filing {
+/// Under thread `design` with no recorded filer: a legacy child, or one adopted
+/// rather than filed.
+const THREAD_ADOPTED: Filing = Filing {
     parent_issue: None,
     parent_thread: Some("thread-design"),
     creator_job: None,
@@ -366,34 +366,32 @@ async fn the_coordinator_node_that_filed_the_child_confirms_its_plan() {
     assert_confirms(&orch, &db, "run-job-coord").await;
 }
 
+/// How the edge was made does not matter: a thread that adopted the child, or
+/// one it was routed to with no recorded filer, confirms like one that filed
+/// it. The producer is still refused.
 #[tokio::test]
-async fn a_routed_but_unproven_thread_edge_leaves_the_gate_to_the_operator() {
-    let (_temp, db, orch) = fixture(THREAD_ROUTED_ONLY).await;
-    let result = confirm_as(&orch, Some("run-design")).await;
-    assert!(result.contains("carries no filing proof"), "{result}");
-    assert_refused(&orch, &db, Some("run-design"), "the operator").await;
-    operator_confirms(&orch, &db).await;
+async fn an_adopted_childs_parent_thread_confirms_its_plan() {
+    let (_temp, db, orch) = fixture(THREAD_ADOPTED).await;
+    assert_refused(&orch, &db, Some("run-job-planner"), DESIGN_OR_OPERATOR).await;
+    assert_refused(&orch, &db, Some("run-other"), DESIGN_OR_OPERATOR).await;
+    assert_confirms(&orch, &db, "run-design").await;
 }
 
+/// A child filed by one coordinator and reparented to a thread answers to its
+/// new parent thread; the filer that no longer parents it is refused.
 #[tokio::test]
-async fn reparenting_a_filed_child_revokes_its_threads_confirm_authority_for_good() {
-    let (_temp, db, orch) = fixture(THREAD_FILED).await;
-    // Orphan, then re-adopt under the same thread: the filing edge is revoked
-    // permanently, though routing still reaches the thread.
+async fn a_reparented_childs_new_parent_thread_confirms_its_plan() {
+    let (_temp, db, orch) = fixture(COORDINATOR_FILED).await;
     db.execute(
-        "UPDATE issues SET parent_thread_id = NULL WHERE id = 'i-1'",
+        "UPDATE issues SET parent_issue_id = NULL, parent_thread_id = 'thread-other' WHERE id = 'i-1'",
         (),
     )
     .await
     .unwrap();
-    db.execute(
-        "UPDATE issues SET parent_thread_id = 'thread-design' WHERE id = 'i-1'",
-        (),
-    )
-    .await
-    .unwrap();
-    assert_refused(&orch, &db, Some("run-design"), "the operator").await;
-    operator_confirms(&orch, &db).await;
+    let other_or_operator = "cairn://p/cfa/other (this issue's gate owner) or the operator";
+    assert_refused(&orch, &db, Some("run-job-coord"), other_or_operator).await;
+    assert_refused(&orch, &db, Some("run-design"), other_or_operator).await;
+    assert_confirms(&orch, &db, "run-other").await;
 }
 
 #[tokio::test]

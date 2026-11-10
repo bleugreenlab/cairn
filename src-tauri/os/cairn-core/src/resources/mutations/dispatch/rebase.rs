@@ -51,6 +51,9 @@ enum RebaseAction<'a> {
         fingerprint: Option<&'a str>,
         take_committed_tip: bool,
         drop_incoming_reason: Option<&'a str>,
+        /// Cancel the run batch holding the branch at the mutation boundary
+        /// first, so the replay is not held behind it.
+        cancel_holding_batch: bool,
     },
     FastForwardFromOrigin {
         base: bool,
@@ -71,11 +74,12 @@ struct Dismissal<'a> {
 }
 
 const DISMISSAL_KEYS: [&str; 3] = ["acceptance_id", "expected_head", "reason"];
-const REPLAY_AND_FAST_FORWARD_KEYS: [&str; 4] = [
+const REPLAY_AND_FAST_FORWARD_KEYS: [&str; 5] = [
     "fingerprint",
     "resolution",
     "drop_incoming_reason",
     "branch",
+    "cancel_holding_batch",
 ];
 const MAX_DISMISSAL_REASON_CHARS: usize = 2000;
 const DISMISSAL_PURPOSE: &str = "dismiss an unknown acceptance";
@@ -121,6 +125,14 @@ fn parse_rebase_action(payload: &serde_json::Value) -> Result<RebaseAction<'_>, 
         }
         return Ok(RebaseAction::Repair);
     }
+    let cancel_holding_batch = match payload.get("cancel_holding_batch") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(cancel)) => *cancel,
+        Some(_) => return Err("payload.cancel_holding_batch is true or false".to_string()),
+    };
+    if cancel_holding_batch && action != "replay" {
+        return Err("payload.cancel_holding_batch applies only to replay: it cancels the run batch holding this branch at the mutation boundary, then requests the replay".to_string());
+    }
     let fast_forward_branch = payload_non_empty_str(payload, "branch", &[]);
     if fast_forward_branch.is_some() && action != "fast-forward-from-origin" {
         return Err("payload.branch applies only to fast-forward-from-origin".to_string());
@@ -153,6 +165,7 @@ fn parse_rebase_action(payload: &serde_json::Value) -> Result<RebaseAction<'_>, 
             fingerprint,
             take_committed_tip: resolution.is_some(),
             drop_incoming_reason,
+            cancel_holding_batch,
         }
     })
 }
@@ -506,23 +519,42 @@ async fn writer(
     request: &McpCallbackRequest,
     owning_job: &str,
 ) -> Result<String, String> {
-    if request.run_id.as_deref().is_none_or(str::is_empty) {
-        return Ok("operator".to_string());
-    }
-    let (context, _) =
-        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
-    if context.job_id != owning_job {
-        return Err(
+    match super::writer(orch, request).await? {
+        super::Writer::Run { job_id, .. } if job_id != owning_job => Err(
             "Refused: only this branch's owning node or the operator may change its rebase state. \
              Nothing changed."
                 .to_string(),
-        );
+        ),
+        writer => Ok(writer.principal().to_string()),
     }
-    Ok(
-        crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
-            .await
-            .unwrap_or_else(|_| format!("run {}", context.run_id)),
+}
+
+/// Cancel the run batch holding `branch` at the mutation boundary, for a
+/// replay that would otherwise defer behind it: that batch is validating a
+/// tip the replay supersedes. The branch's owner or the operator only, as for
+/// any rebase-state change. A batch already publishing is left to finish; its
+/// commit stands and the replay carries it.
+async fn cancel_holding(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let by = writer(orch, request, job_id).await?;
+    let Some(batch) =
+        crate::orchestrator::base_advance::inflight_run_batch_on_branch(db, job_id, branch).await?
+    else {
+        return Ok("No run batch held this branch, so nothing was cancelled.\n\n".to_string());
+    };
+    let report = crate::mcp::handlers::run::cancel::cancel_batch(
+        orch,
+        &batch.request_id,
+        &by,
+        crate::mcp::handlers::run::cancel::CANCEL_SETTLE_WAIT,
     )
+    .await;
+    Ok(format!("{}\n\n", report.sentence(&batch.request_id)))
 }
 
 /// The commit `revision` names, proven to lie in both the branch's and the
@@ -901,7 +933,11 @@ async fn rebuild(
         crate::orchestrator::base_advance::inflight_run_batch_on_branch(&db, &rows.job_id, &branch)
             .await?
     {
-        return Err(format!("Rebuild refused while {} can still publish to this branch; finish or stop that batch and retry.", batch.describe()));
+        return Err(format!(
+            "Rebuild refused while {} can still publish to this branch; let that batch finish or cancel it with {}, then retry.",
+            batch.describe(),
+            crate::orchestrator::base_advance::cancel_action(&batch)
+        ));
     }
     // Read under the store lock, where a parent's session is opened or
     // settled, so the answer cannot change before the native call below.
@@ -1100,24 +1136,44 @@ pub(super) async fn dispatch(
                         .map_err(|error| build_failure(index, item, error))?
                     }
                 }
-                RebaseAction::Replay { .. } if dry_run => {
-                    format!("Would request a store-side replay of `{branch}`")
+                RebaseAction::Replay {
+                    cancel_holding_batch,
+                    ..
+                } if dry_run => {
+                    if cancel_holding_batch {
+                        format!(
+                            "Would cancel the run batch holding `{branch}`, if any, and request a store-side replay of it"
+                        )
+                    } else {
+                        format!("Would request a store-side replay of `{branch}`")
+                    }
                 }
                 RebaseAction::Replay {
                     fingerprint,
                     take_committed_tip,
                     drop_incoming_reason,
-                } => crate::orchestrator::base_advance::request_branch_replay(
-                    orch,
-                    &db,
-                    &rows.job_id,
-                    &branch,
-                    fingerprint,
-                    take_committed_tip,
-                    drop_incoming_reason,
-                )
-                .await
-                .map_err(|error| build_failure(index, item, error))?,
+                    cancel_holding_batch,
+                } => {
+                    let cancelled = if cancel_holding_batch {
+                        cancel_holding(orch, request, &db, &rows.job_id, &branch)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?
+                    } else {
+                        String::new()
+                    };
+                    let replay = crate::orchestrator::base_advance::request_branch_replay(
+                        orch,
+                        &db,
+                        &rows.job_id,
+                        &branch,
+                        fingerprint,
+                        take_committed_tip,
+                        drop_incoming_reason,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    format!("{cancelled}{replay}")
+                }
             }
         }
         _ => return Ok(None),
@@ -1856,6 +1912,19 @@ mod tests {
                 fingerprint: Some("fp"),
                 take_committed_tip: true,
                 drop_incoming_reason: Some("moot"),
+                cancel_holding_batch: false,
+            }
+        );
+        assert_eq!(
+            parse_rebase_action(
+                &serde_json::json!({"action": "replay", "cancel_holding_batch": true})
+            )
+            .unwrap(),
+            RebaseAction::Replay {
+                fingerprint: None,
+                take_committed_tip: false,
+                drop_incoming_reason: None,
+                cancel_holding_batch: true,
             }
         );
         assert_eq!(
@@ -1869,6 +1938,8 @@ mod tests {
             (serde_json::json!({"action": "undo"}), "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got 'undo'"),
             (serde_json::json!({"action": "replay", "branch": "base"}), "payload.branch applies only to fast-forward-from-origin"),
             (serde_json::json!({"action": "replay", "resolution": "ours"}), "payload.resolution must be 'take-committed-tip' when provided"),
+            (serde_json::json!({"action": "replay", "cancel_holding_batch": "yes"}), "payload.cancel_holding_batch is true or false"),
+            (serde_json::json!({"action": "fast-forward-from-origin", "cancel_holding_batch": true}), "payload.cancel_holding_batch applies only to replay: it cancels the run batch holding this branch at the mutation boundary, then requests the replay"),
         ] {
             assert_eq!(parse_rebase_action(&payload).unwrap_err(), expected);
         }

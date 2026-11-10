@@ -1399,3 +1399,67 @@ async fn merge_mode_explicit_resolution_carry_stays_anchored_to_the_session_dest
     );
     assert_eq!(show(&h, &caught_up.head_after, "later.txt"), "later");
 }
+
+/// A merge catch-up takes only the session's conflicting paths from the tip.
+/// A live basis entry on a file the merge does not conflict on, whose recorded
+/// sides read as lossy, must not refuse the replay: that file is the merge's
+/// own result, with both sides in its ancestry. The rebase carry's scope still
+/// judges it, which is what keeps a rolled-back carry placed.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn merge_mode_take_committed_tip_judges_only_the_paths_it_takes_from_the_tip() {
+    use crate::orchestrator::conflict_session::{
+        assess_session_tip_exhaustively, ReplayScope, RestoreProof,
+    };
+
+    let h = harness_or_skip!("explicit_merge_scope");
+    h.enable_merge_mode().await;
+    let first = h.commit(&h.branch_ws, BRANCH, "other.txt", "mine\n");
+    let more = h.commit(&h.branch_ws, BRANCH, "other.txt", "mine\nmore\n");
+    h.commit(&h.branch_ws, BRANCH, "other.txt", "mine\n");
+    let (d1, resolved) = resolved_conflict(&h).await;
+    let fork = git(&h.repo, &["merge-base", &resolved, &d1]);
+    assert!(!h.is_ancestor(&more, &fork), "the entry's side is live");
+    let entry = serde_json::json!([{"path": "other.txt", "base": first, "theirs": more}]);
+    h.db.execute(
+        "UPDATE jj_reconcile_items SET resolution_basis_json = ?1
+         WHERE bookmark = ?2 AND resolution_state = 'open'",
+        (entry.to_string(), BRANCH),
+    )
+    .await
+    .unwrap();
+    let session = load_active_session(&h.db, BRANCH).await.unwrap().unwrap();
+    assert!(session.conflicting().all(|file| file.path == "shared.txt"));
+
+    let lossy_under =
+        |scope| match assess_session_tip_exhaustively(&h.jj, &h.store, &session, None, scope) {
+            RestoreProof::Assessed(assessment) => assessment
+                .paths
+                .iter()
+                .filter(|path| matches!(path.verdict, crate::jj::RestoreVerdict::Lossy(_)))
+                .map(|path| path.path.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("the tip is assessed: {other:?}"),
+        };
+    assert_eq!(
+        lossy_under(ReplayScope::Carry),
+        vec!["other.txt".to_string()],
+        "the rebase carry would place it, so it judges it"
+    );
+    assert!(lossy_under(ReplayScope::CatchUpMerge).is_empty());
+
+    let prior = git(&h.repo, &["rev-list", &resolved, "^main"])
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let answer = request_branch_replay(&h.orch, &h.db, JOB, BRANCH, None, true, None)
+        .await
+        .unwrap_or_else(|refusal| panic!("the merge replay was refused: {refusal}"));
+    let installed = h.tip(BRANCH);
+    assert!(answer.contains("not a green build"), "{answer}");
+    h.assert_merge_advance(&resolved, &d1, &installed, &prior)
+        .await;
+    assert_eq!(show(&h, &installed, "shared.txt"), "original\nA\nX");
+    assert_eq!(show(&h, &installed, "other.txt"), "mine");
+    assert!(load_active_session(&h.db, BRANCH).await.unwrap().is_none());
+}

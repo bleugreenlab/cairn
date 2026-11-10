@@ -498,6 +498,179 @@ async fn a_carried_file_rolled_back_with_its_neighbour_lands_on_the_next_retry()
     assert!(open_session(&r).await.is_none());
 }
 
+/// Bug-sink #709/#710 (cairn/4113's merge catch-up): a stored basis full of
+/// entries attested against sides the branch has since absorbed into its
+/// history. Each was judged against its old base, so content the old base
+/// lacked and both sides now share read as incoming work the restore drops,
+/// and the replay was refused on files that do not conflict at all.
+///
+/// The branch lands on D1, which carries D0's `A` in every `fNN.txt`, then
+/// removes those lines as its own work. D2 conflicts on `LIST` alone. The
+/// session's stored basis is then given what the 4113 row held: every
+/// `fNN.txt` resolved against D0 from M0. Against those sides each file is
+/// lossy; against this session's they are the branch's own edits. The replay
+/// judges only the real conflict and lands with the branch's removals intact.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn entries_against_sides_the_base_already_contains_raise_no_phantom_drop() {
+    let bin = jj_or_skip!();
+    let files: Vec<String> = (0..20).map(|n| format!("f{n:02}.txt")).collect();
+    let mut base_files: Vec<(&str, &str)> =
+        files.iter().map(|path| (path.as_str(), "head\n")).collect();
+    base_files.push((LIST, "head\n"));
+    let r = replay_harness(&bin, "corpus-superseded-basis.db", &base_files).await;
+    let m0 = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, "main").unwrap();
+
+    let with_a: Vec<(&str, &str)> = files
+        .iter()
+        .map(|path| (path.as_str(), "head\nA\n"))
+        .collect();
+    let d0 = commit(&r.fx, &r.main_ws, MAIN_LINE, &with_a, "D0 appends A");
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(LIST, "head\nX\n")],
+        "branch appends X",
+    );
+    let d1 = commit(
+        &r.fx,
+        &r.main_ws,
+        MAIN_LINE,
+        &[(LIST, "head\nA\n")],
+        "D1 appends A to the list",
+    );
+    set_main(&r.fx, &d1);
+    owner_commit_conflicts(&r).await;
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(LIST, "head\nA\nX\n")],
+        "resolve against D1",
+    );
+    request_take_committed_tip(&r).await;
+    assert!(carries(&r, &d1), "the first replay lands on D1");
+    assert!(open_session(&r).await.is_none());
+    // The landed replay moved the bookmark past the workspace.
+    let _ = crate::jj::update_stale(&r.fx.jj, &r.branch_ws);
+    r.fx.jj
+        .run(&r.branch_ws, &["new", BRANCH], "start on the landed tip")
+        .unwrap();
+
+    let mut own: Vec<(&str, &str)> = files.iter().map(|path| (path.as_str(), "head\n")).collect();
+    own.push((LIST, "head\nA\nX\nY\n"));
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &own,
+        "branch drops A, appends Y",
+    );
+    let d2 = commit(
+        &r.fx,
+        &r.main_ws,
+        MAIN_LINE,
+        &[(LIST, "head\nA\nB\n")],
+        "D2 appends B to the list",
+    );
+    set_main(&r.fx, &d2);
+    owner_commit_conflicts(&r).await;
+    let session = open_session(&r).await.expect("D2 conflicts on the list");
+    assert_eq!(session.base.as_deref(), Some(d1.as_str()));
+    assert_eq!(
+        session
+            .conflicting()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![LIST]
+    );
+
+    let stale: Vec<serde_json::Value> = files
+        .iter()
+        .map(|path| serde_json::json!({"path": path, "base": m0, "theirs": d0}))
+        .collect();
+    r.db.execute(
+        "UPDATE jj_reconcile_items SET resolution_basis_json = ?1
+         WHERE bookmark = ?2 AND resolution_state = 'open'",
+        params![serde_json::to_string(&stale).unwrap(), BRANCH],
+    )
+    .await
+    .unwrap();
+    let resolved = commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(LIST, "head\nA\nB\nX\nY\n")],
+        "resolve against D2",
+    );
+    let session = open_session(&r).await.unwrap();
+    assert_eq!(session.resolution_basis.len(), files.len());
+
+    // The phantom is real under the stale sides.
+    let under_stale = crate::jj::assess_paths(&r.fx.jj, &r.fx.store, &m0, &resolved, &d0, &files);
+    assert!(
+        under_stale
+            .iter()
+            .all(|path| matches!(path.verdict, crate::jj::RestoreVerdict::Lossy(_))),
+        "each file reads as dropping D0's line against M0: {under_stale:?}"
+    );
+
+    let basis = session
+        .resolution_basis_at(&r.fx.jj, &r.fx.store, &resolved)
+        .unwrap();
+    assert_eq!(
+        basis.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![LIST],
+        "D1 contains D0, so every stale entry is superseded"
+    );
+    // Preparation's baseline is `verified` over exactly that basis, so a
+    // superseded entry never costs it an assessment.
+    let baseline = crate::orchestrator::base_advance::replay_baseline_at(
+        &r.fx.jj,
+        &r.fx.store,
+        BRANCH,
+        Some(&session),
+        &resolved,
+        &d2,
+    )
+    .unwrap()
+    .expect("the tip and D2 have a fork");
+    assert!(
+        files.iter().all(|path| !baseline.basis.contains_key(path)),
+        "{:?}",
+        baseline.basis
+    );
+    let crate::orchestrator::conflict_session::RestoreProof::Assessed(assessment) =
+        crate::orchestrator::conflict_session::assess_session_tip_exhaustively(
+            &r.fx.jj,
+            &r.fx.store,
+            &session,
+            None,
+            crate::orchestrator::conflict_session::ReplayScope::Carry,
+        )
+    else {
+        panic!("the tip is assessed");
+    };
+    assert_eq!(
+        assessment
+            .paths
+            .iter()
+            .map(|path| path.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![LIST],
+        "only the real conflict is judged"
+    );
+
+    let answer = request_take_committed_tip(&r).await;
+    assert!(carries(&r, &d2), "the replay landed: {answer}");
+    assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nB\nX\nY\n");
+    for path in &files {
+        assert_eq!(text_at(&r.fx, BRANCH, path), "head\n", "{path}");
+    }
+    assert!(open_session(&r).await.is_none());
+}
+
 /// Scenario 1c: D2 changes the same file somewhere the resolution did not
 /// touch, so the resolution is carried onto it and all three changes land.
 #[tokio::test(flavor = "multi_thread")]
@@ -862,9 +1035,13 @@ async fn a_base_edit_after_the_attestation_is_refused_by_name() {
     assert!(!why.contains("since that resolution was made"), "{why}");
 
     // The page reads the same assessment: the statement, and what outran it.
-    let page =
-        crate::orchestrator::conflict_session::assess_session_tip(&r.fx.jj, &r.fx.store, &fresh)
-            .expect("the page assesses the tip");
+    let page = crate::orchestrator::conflict_session::assess_session_tip(
+        &r.fx.jj,
+        &r.fx.store,
+        &fresh,
+        crate::orchestrator::conflict_session::ReplayScope::Carry,
+    )
+    .expect("the page assesses the tip");
     assert_eq!(
         page.attested
             .get(FENCE)

@@ -7306,7 +7306,7 @@ mod tests {
         insert_as(&orch.db.local, &held, Establish::Hold)
             .await
             .unwrap();
-        let live = super::super::run::detached::LiveBatch::claim("request-1");
+        let live = super::super::run::detached::LiveBatch::claim_for_test("request-1");
         for sql in [
             "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('later-turn','session-1','run-1','job-1',2,'running','initial',2,2)",
             "UPDATE jobs SET current_turn_id='later-turn' WHERE id='job-1'",

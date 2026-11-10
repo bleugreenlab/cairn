@@ -14,6 +14,7 @@ mod agents;
 mod artifacts;
 mod attachments;
 pub(crate) use attachments::attachment_removal_authority;
+mod batches;
 mod browsers;
 mod bug;
 mod channels;
@@ -81,6 +82,41 @@ use cairn_common::contract::{contract_for, MutationSpec};
 use cairn_platform::stack::off_frame;
 use cairn_uri::CairnResource;
 use cairn_uri::ResourceKind;
+
+/// Who a resource write acts for: the operator, for a write no run makes, or
+/// the run's job and that job's home URI.
+pub(super) enum Writer {
+    Operator,
+    Run { job_id: String, home: String },
+}
+
+impl Writer {
+    /// The principal a write names in what it records and answers.
+    pub(super) fn principal(&self) -> &str {
+        match self {
+            Self::Operator => "operator",
+            Self::Run { home, .. } => home,
+        }
+    }
+}
+
+pub(super) async fn writer(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Result<Writer, String> {
+    if request.run_id.as_deref().is_none_or(str::is_empty) {
+        return Ok(Writer::Operator);
+    }
+    let (context, _) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await?;
+    let home = crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+        .await
+        .unwrap_or_else(|_| format!("run {}", context.run_id));
+    Ok(Writer::Run {
+        job_id: context.job_id,
+        home,
+    })
+}
 
 fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&serde_json::Value> {
     item.payload
@@ -447,6 +483,10 @@ pub(crate) async fn dispatch_resource_change_under_store(
         summary
     } else if let Some(summary) =
         off_frame(|| rebase::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| batches::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =

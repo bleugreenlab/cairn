@@ -9,6 +9,7 @@
 //! [`redact`] (secret redaction). [`handle_run`] wires them together.
 
 pub(crate) mod adopted;
+pub(crate) mod cancel;
 mod checks;
 mod commit_barrier;
 pub(crate) mod detached;
@@ -6742,7 +6743,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         control.request_id,
         request.run_id.as_deref().unwrap_or("(none)")
     );
-    let live = detached::LiveBatch::claim(&control.request_id);
+    let live = detached::LiveBatch::claim(&control);
     // Registered before anything is placed, so no result of this batch is
     // acknowledged before its answer has reached where it was going.
     let result_ack = orch.fleet.defer_result_ack(&control.request_id);
@@ -6939,6 +6940,14 @@ async fn prepare_and_run_batch(
     } else {
         (None, None)
     };
+    if let Some(context) = run_context.as_ref() {
+        control.set_owner(detached::BatchOwner {
+            job_id: context.job_id.clone(),
+            home: super::run_context::lookup_home_uri_routed(&orch.db, request)
+                .await
+                .ok(),
+        });
+    }
     let transcript_event_uri = match (run_context.as_ref(), run_db.as_deref()) {
         (Some(context), Some(db)) => {
             run_transcript_event_uri(
@@ -6967,6 +6976,7 @@ async fn prepare_and_run_batch(
             *spec = taken.and_then(page_call_spec);
         }
     }
+    control.set_items(resolved.iter().map(|(header, _)| header.clone()).collect());
 
     // Executor containment and the logical fence adjudicate filesystem crossings.
     // Placement is a preflight batch invariant. A call may contain exactly one
@@ -7708,6 +7718,9 @@ async fn run_host_items(
                 break;
             }
             let stream_id = run_item_stream_id(&tool_use_id, index);
+            if let Some(request_id) = batch_request_id {
+                detached::note_item_started(request_id, index);
+            }
             let outcome = off_frame(|| {
                 run_one(
                     orch,
@@ -7722,6 +7735,9 @@ async fn run_host_items(
                 )
             })
             .await;
+            if let Some(request_id) = batch_request_id {
+                detached::note_item_finished(request_id, index);
+            }
             // A suspend stops the (sequential) batch: the whole call re-runs on
             // resume once the fence is answered.
             let stop = outcome.suspended || (!outcome.succeeded && stop_on_error);
@@ -7747,7 +7763,10 @@ async fn run_host_items(
         let interrupt = interrupt.cloned();
         let batch_request_id = batch_request_id.map(str::to_owned);
         handles.push(AbortOnDrop(tokio::spawn(async move {
-            run_one(
+            if let Some(request_id) = batch_request_id.as_deref() {
+                detached::note_item_started(request_id, index);
+            }
+            let outcome = run_one(
                 &orch,
                 &request,
                 &cwd,
@@ -7758,7 +7777,11 @@ async fn run_host_items(
                 spec,
                 interrupt.as_ref(),
             )
-            .await
+            .await;
+            if let Some(request_id) = batch_request_id.as_deref() {
+                detached::note_item_finished(request_id, index);
+            }
+            outcome
         })));
     }
     let mut outcomes = Vec::with_capacity(handles.len());
@@ -9021,13 +9044,13 @@ async fn run_routed_batch(
     });
     let ceiling = deadlines.arrival + RUN_BATCH_CEILING;
     let (joined, ceiling_detail) = match tokio::time::timeout_at(ceiling, &mut handle).await {
-        Ok(joined) => (joined, None),
+        Ok(joined) => (joined, routed_cancel_detail(control, false)),
         Err(_) => {
             // Both halves are needed: the flag stops a batch that is between
             // placement attempts, and the fleet cancel stops one that is
             // queued or running inside an attempt.
             control.stop(orch);
-            (handle.await, Some(RUN_CEILING_DETAIL.to_string()))
+            (handle.await, routed_cancel_detail(control, true))
         }
     };
     control.phase_done("place+run");
@@ -9039,6 +9062,16 @@ async fn run_routed_batch(
     control.phase_done("settle");
     control.set_verdict(settled.verdict.clone());
     settled_envelope(settled)
+}
+
+/// The detail a routed batch's cancelled outcome settles with: the ceiling's
+/// when the ceiling stopped it, else the principal's who cancelled this one
+/// batch ([`cancel::cancel_batch`]). Any other cancellation carries none.
+fn routed_cancel_detail(control: &BatchControl, hit_ceiling: bool) -> Option<String> {
+    if hit_ceiling {
+        return Some(RUN_CEILING_DETAIL.to_string());
+    }
+    control.cancelled_detail()
 }
 
 /// What a batch abandoned by its call before settlement settles to. Its call
@@ -9648,12 +9681,33 @@ struct BatchControl {
     /// What it was waiting on when it was stopped, taken before the fleet
     /// withdraws its request, because the withdrawal forgets the declines.
     stopped_unplaced: std::sync::Mutex<Option<String>>,
+    /// The job the batch runs for and its home, once its run context has
+    /// resolved: what a cancel's authority check and the executor page name.
+    owner: std::sync::Mutex<Option<detached::BatchOwner>>,
+    /// Its items' headers and which of them are running, for a reader asking
+    /// how long the batch will hold its branch.
+    items: std::sync::Mutex<ItemProgress>,
+    /// The principal that cancelled this one batch ([`cancel::cancel_batch`]),
+    /// which its cancelled result names.
+    cancelled_by: std::sync::Mutex<Option<String>>,
+}
+
+/// What a batch's items are doing, as its own task and its machine report.
+#[derive(Default)]
+struct ItemProgress {
+    headers: Vec<String>,
+    /// Running items: index and start (Unix milliseconds).
+    running: Vec<(usize, i64)>,
 }
 
 impl BatchControl {
     fn new(commits: bool) -> std::sync::Arc<Self> {
+        Self::with_request_id(&Uuid::new_v4().to_string(), commits)
+    }
+
+    fn with_request_id(request_id: &str, commits: bool) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            request_id: Uuid::new_v4().to_string(),
+            request_id: request_id.to_string(),
             commits,
             stop_placement: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             settle_gate: std::sync::atomic::AtomicU8::new(SETTLE_RUNNING),
@@ -9677,7 +9731,112 @@ impl BatchControl {
             }),
             ever_claimed: std::sync::atomic::AtomicBool::new(false),
             stopped_unplaced: std::sync::Mutex::new(None),
+            owner: std::sync::Mutex::new(None),
+            items: std::sync::Mutex::new(ItemProgress::default()),
+            cancelled_by: std::sync::Mutex::new(None),
         })
+    }
+
+    fn set_owner(&self, owner: detached::BatchOwner) {
+        *self.owner.lock().unwrap_or_else(|p| p.into_inner()) = Some(owner);
+    }
+
+    fn owner(&self) -> Option<detached::BatchOwner> {
+        self.owner.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn set_items(&self, headers: Vec<String>) {
+        self.items.lock().unwrap_or_else(|p| p.into_inner()).headers = headers;
+    }
+
+    fn item_started(&self, index: usize, at_ms: i64) {
+        let mut items = self.items.lock().unwrap_or_else(|p| p.into_inner());
+        if !items.running.iter().any(|(running, _)| *running == index) {
+            items.running.push((index, at_ms));
+        }
+    }
+
+    fn item_finished(&self, index: usize) {
+        self.items
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .running
+            .retain(|(running, _)| *running != index);
+    }
+
+    /// Whether settlement, and with it any commit, has begun.
+    fn settling(&self) -> bool {
+        self.settle_gate.load(std::sync::atomic::Ordering::SeqCst) == SETTLE_STARTED
+    }
+
+    fn set_cancelled_by(&self, by: &str) {
+        let mut cancelled = self.cancelled_by.lock().unwrap_or_else(|p| p.into_inner());
+        if cancelled.is_none() {
+            *cancelled = Some(by.to_string());
+        }
+    }
+
+    /// The detail a batch cancelled by a principal settles with, so its call
+    /// resumes saying who ended it.
+    fn cancelled_detail(&self) -> Option<String> {
+        self.cancelled_by
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            .map(|by| format!("cancelled by {by}."))
+    }
+
+    /// The verdict settlement reached, once it has.
+    fn settled_verdict(&self) -> Option<String> {
+        self.verdict
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Where the batch stands now: settling, waiting for a machine, the item
+    /// a machine (or the host loop) reports running, or placed with none
+    /// reported yet.
+    fn progress(&self, fleet: &crate::fleet::Fleet) -> detached::BatchProgress {
+        use detached::BatchProgress;
+        if self.settling() {
+            return BatchProgress::Settling;
+        }
+        if let Some(waiting) = self.unplaced() {
+            return BatchProgress::Queued {
+                waiting: fleet.unplaced_wait(&self.request_id).unwrap_or(waiting),
+            };
+        }
+        {
+            let items = self.items.lock().unwrap_or_else(|p| p.into_inner());
+            match items.running.as_slice() {
+                [] => {}
+                [(index, since_ms)] => {
+                    return BatchProgress::Running {
+                        index: *index,
+                        total: items.headers.len().max(index + 1),
+                        header: items.headers.get(*index).cloned().unwrap_or_default(),
+                        since_ms: *since_ms,
+                    }
+                }
+                many => {
+                    return BatchProgress::Parallel {
+                        running: many.len(),
+                        total: items.headers.len().max(many.len()),
+                        since_ms: many.iter().map(|(_, since)| *since).min().unwrap_or(0),
+                    }
+                }
+            }
+        }
+        if let Some(executor_id) = fleet.claimed_executor_of(&self.request_id) {
+            return BatchProgress::Placed {
+                on: fleet.executor_name_for_text(&executor_id),
+            };
+        }
+        if let Some(waiting) = fleet.unplaced_wait(&self.request_id) {
+            return BatchProgress::Queued { waiting };
+        }
+        BatchProgress::InRunner
     }
 
     fn stage(&self) -> std::sync::MutexGuard<'_, PlacementStage> {
@@ -14907,6 +15066,54 @@ pub(crate) mod host_batch_tests {
         assert!(was(&abandoned));
     }
 
+    /// A host item cancelled by a principal names them in its own body, and
+    /// that name survives composition for a model's context and for code alike,
+    /// even beside a sibling large enough that the context budget elides it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_principal_cancel_names_its_canceller_under_either_output_budget() {
+        let orch = env().await;
+        let (abandoned, _) = slow_tool(&orch, Duration::from_secs(30));
+        let (_, batch) = batch_of(&orch, mcp_item(Some(60_000)), true).await;
+        let (interrupter, interrupt) = crate::responses::interruption();
+
+        let (mut outcomes, ()) = tokio::join!(
+            run_host_items(&orch, batch, Some(&interrupt), None),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                interrupter.interrupt(Interruption::Cancelled("cancelled by operator".into()));
+            }
+        );
+        assert!(was(&abandoned));
+        let named = "stopped: cancelled by operator.";
+        assert!(outcomes[0].body.contains(named), "{}", outcomes[0].body);
+        outcomes.push(ItemOutcome {
+            header: "cargo nextest run".into(),
+            body: "x".repeat(200_000),
+            succeeded: true,
+            suspended: false,
+            images: Vec::new(),
+            tracked_modifications: None,
+            data: None,
+            whole: false,
+        });
+
+        for budget in [
+            RunOutputBudget::Context,
+            RunOutputBudget::Whole {
+                byte_ceiling: 1 << 20,
+                batch_wire_ceiling: 12 << 20,
+            },
+        ] {
+            let composed = compose_run_output(&outcomes, budget);
+            assert!(
+                composed.text.contains(named),
+                "{budget:?}: {}",
+                composed.text
+            );
+            assert_eq!(composed.over_ceiling, None, "{budget:?}");
+        }
+    }
+
     /// A nested `cairn.run` has nothing to park on, so an MCP call it makes
     /// ends at the window with the same why a response gets, and is cancelled.
     #[tokio::test(flavor = "multi_thread")]
@@ -16098,6 +16305,429 @@ pub(crate) mod host_batch_tests {
         let _ = tx.send(batch_answer(&RunFailure::Cancelled(None).text()));
         let (verdict, _) = settled_verdict_and_output(&orch, &control.request_id).await;
         assert_eq!(verdict, "it was cancelled");
+    }
+
+    /// A routed batch's own task as `handle_run` spawns it, reduced to what a
+    /// cancel meets. It is live in this runner until it has answered. Its
+    /// machine work ends when the batch is stopped, as the fleet's `Cancel`
+    /// ends it, or with `finish`'s text; and it settles through the routed
+    /// tail's own detail ([`routed_cancel_detail`]), failure composition,
+    /// gate, and verdict.
+    fn simulated_routed_batch(
+        control: std::sync::Arc<BatchControl>,
+        tx: tokio::sync::oneshot::Sender<BatchAnswer>,
+        mut finish: tokio::sync::oneshot::Receiver<String>,
+    ) -> tokio::task::JoinHandle<()> {
+        let live = detached::LiveBatch::claim(&control);
+        tokio::spawn(async move {
+            let _live = live;
+            let text = loop {
+                if control
+                    .stop_placement
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break failure_without_result(
+                        &CellOutcome::Cancelled {
+                            request_id: control.request_id.clone(),
+                            attempt_id: String::new(),
+                        },
+                        None,
+                        control.commits,
+                        routed_cancel_detail(&control, false),
+                    )
+                    .expect("a cancelled outcome is a failure")
+                    .text();
+                }
+                match finish.try_recv() {
+                    Ok(text) => break text,
+                    Err(_) => tokio::time::sleep(ms(20)).await,
+                }
+            };
+            assert!(control.begin_settling(), "nothing abandoned the batch");
+            control.set_verdict(detached::verdict_from_text(&text));
+            let _ = tx.send(batch_answer(&text));
+        })
+    }
+
+    /// Park a commit-capable `run` call on `tool` whose batch is simulated.
+    async fn park_simulated_batch(
+        orch: &Orchestrator,
+        tool: &str,
+        control: &std::sync::Arc<BatchControl>,
+    ) -> tokio::sync::oneshot::Sender<String> {
+        let request = McpCallbackRequest {
+            tool_use_id: Some(tool.into()),
+            ..call_request(
+                json!({"commands": [{"command": "cargo nextest run"}], "commit_msg": "verify"}),
+            )
+        };
+        let deadlines = CallDeadlines::new(
+            tokio::time::Instant::now(),
+            ms(100),
+            ms(300),
+            ms(4_000),
+            None,
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        simulated_routed_batch(control.clone(), tx, finish_rx);
+        let text = answer_call(orch, &request, deadlines, control.clone(), rx).await;
+        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
+        finish_tx
+    }
+
+    const BUILDER: &str = "cairn://p/prj/1/1/builder";
+
+    fn write_request(run_id: Option<&str>) -> McpCallbackRequest {
+        McpCallbackRequest {
+            run_id: run_id.map(str::to_string),
+            tool: "write".into(),
+            tool_use_id: Some("tool-write".into()),
+            ..call_request(json!({}))
+        }
+    }
+
+    async fn cancel_through_write(
+        orch: &Orchestrator,
+        run_id: Option<&str>,
+        target: &str,
+        dry_run: bool,
+    ) -> Result<String, String> {
+        let item = crate::mcp::types::ChangeItem {
+            target: target.to_string(),
+            mode: crate::mcp::types::ChangeMode::Patch,
+            payload: Some(json!({"action": "cancel"})),
+        };
+        crate::resources::mutations::dispatch_resource_change(
+            orch,
+            &write_request(run_id),
+            0,
+            &item,
+            dry_run,
+        )
+        .await
+        .map(|applied| applied.summary)
+        .map_err(|failure| failure.error)
+    }
+
+    /// cairn/5457's acceptance. Batch A, commit-capable, is parked on its
+    /// branch and holds it at the base-advance boundary; batch B of the same
+    /// node runs detached. The owning node cancels A at A's own address. Only
+    /// A's fleet request is cancelled; A's call resumes its turn once, with a
+    /// result naming who cancelled it; the hold is released; and B is
+    /// untouched. (That a released hold is replayed by the next sweep is
+    /// `base_advance`'s
+    /// `a_pass_left_with_only_held_branches_completes_and_replays_them_once_released`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_owner_cancels_one_parked_batch_and_releases_its_branch() {
+        let orch = env().await;
+        orch.db
+            .local
+            .execute("UPDATE jobs SET branch='agent/cancel' WHERE id='job-1'", ())
+            .await
+            .unwrap();
+        let a = BatchControl::new(true);
+        a.set_owner(detached::BatchOwner {
+            job_id: "job-1".into(),
+            home: Some(BUILDER.into()),
+        });
+        a.set_items(vec!["cargo nextest run".into()]);
+        let _a_claim = orch
+            .fleet
+            .claim_job_command_for_test(&a.request_id, "job-1", 1);
+        let _finish_a = park_simulated_batch(&orch, "tool-1", &a).await;
+        a.item_started(0, chrono::Utc::now().timestamp_millis());
+
+        // B: the same node's batch, running detached on a cell of its own.
+        let b = BatchControl::new(false);
+        b.set_owner(detached::BatchOwner {
+            job_id: "job-1".into(),
+            home: Some(BUILDER.into()),
+        });
+        let _b_live = detached::LiveBatch::claim(&b);
+        let _b_claim = orch
+            .fleet
+            .claim_job_command_for_test(&b.request_id, "job-1", 1);
+        detached::insert(
+            &orch.db.local,
+            &detached::DetachedBatch {
+                request_id: b.request_id.clone(),
+                job_id: "job-1".into(),
+                run_id: "run-1".into(),
+                label: Some("bun run lint".into()),
+                identity: None,
+                commits: false,
+                holds_branch: false,
+                state: detached::DetachedState::Running,
+                waiting_on: None,
+                verdict: None,
+                output: None,
+                commit_id: None,
+                reason: TRANSPORT_CLOSED.into(),
+                lost_evidence: None,
+                created_ms: 1,
+                settled_ms: None,
+                notified_ms: None,
+                settlement: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let hold = crate::orchestrator::base_advance::inflight_run_batch_on_branch(
+            &orch.db.local,
+            "job-1",
+            "agent/cancel",
+        )
+        .await
+        .unwrap()
+        .expect("the parked commit-capable batch holds its branch")
+        .with_live_progress(&orch);
+        assert_eq!(hold.request_id, a.request_id);
+        let said = crate::orchestrator::base_advance::mutation_boundary_hold(&Ok(Some(hold)));
+        assert!(
+            said.contains("now running item 1 of 1 (`cargo nextest run`)"),
+            "{said}"
+        );
+        let a_uri = format!("{BUILDER}/batches/{}", a.request_id);
+        assert!(said.contains(&a_uri), "{said}");
+
+        let answer = cancel_through_write(&orch, Some("run-1"), &a_uri, false)
+            .await
+            .unwrap_or_else(|refusal| panic!("{refusal}"));
+        assert!(answer.starts_with("Cancelled run batch"), "{answer}");
+
+        assert!(orch.fleet.was_retired_for_test(&a.request_id));
+        assert!(
+            !orch.fleet.was_retired_for_test(&b.request_id),
+            "only the cancelled batch's request is retired"
+        );
+        let named = format!("Run cancelled: cancelled by {BUILDER}.");
+        let resumed = eventually(Duration::from_secs(10), || {
+            tool_result_containing(&orch, &named)
+        })
+        .await;
+        assert!(
+            resumed.is_some(),
+            "A's call resumes saying who cancelled it"
+        );
+        assert_eq!(successor_turns(&orch).await, 1, "the turn resumes once");
+        assert!(
+            crate::orchestrator::base_advance::inflight_run_batch_on_branch(
+                &orch.db.local,
+                "job-1",
+                "agent/cancel",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the cancelled batch no longer holds its branch"
+        );
+
+        assert_eq!(
+            detached_state(&orch, &b.request_id).await.as_deref(),
+            Some("running")
+        );
+        assert!(!b.stop_placement.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(orch.fleet.claimed_executor_of(&b.request_id).is_some());
+        assert_eq!(run_batch_notices(&orch).await, 0);
+    }
+
+    /// A cancel that arrives once settlement has begun touches nothing: the
+    /// batch may already be writing its commit, so it publishes its own result
+    /// and its call resumes with that, never with a cancellation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_after_settlement_began_leaves_the_commit_standing() {
+        let orch = env().await;
+        let control = BatchControl::new(true);
+        let finish = park_simulated_batch(&orch, "tool-1", &control).await;
+        assert!(
+            control.begin_settling(),
+            "settlement begins: the commit is being written"
+        );
+
+        let report =
+            cancel::cancel_batch(&orch, &control.request_id, BUILDER, Duration::from_secs(5)).await;
+        assert_eq!(report, cancel::CancelReport::AlreadySettling);
+        assert!(!control
+            .stop_placement
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(control.cancelled_detail(), None);
+
+        let _ = finish.send("cargo nextest run: ok\n\n\u{2713} Committed changes (abc1234)".into());
+        let resumed = eventually(Duration::from_secs(10), || {
+            tool_result_containing(&orch, "Committed changes (abc1234)")
+        })
+        .await
+        .expect("the call resumes with the batch's own result");
+        assert!(!resumed.contains(RUN_CANCELLED), "{resumed}");
+    }
+
+    /// 4741's case: a batch still queued for admission, cancelled by the
+    /// operator, settles as never placed with nothing run, naming the
+    /// canceller, and the session and job are untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_queued_batch_says_nothing_ran_and_who_cancelled_it() {
+        let orch = env().await;
+        let (control, tx) = a_call_whose_transport_closed(&orch).await;
+        control.begin_placement(
+            "waiting for the job's residency on bgsrv-mac: running `batch-1`".into(),
+            true,
+        );
+        let (_finish, finish_rx) = tokio::sync::oneshot::channel();
+        simulated_routed_batch(control.clone(), tx, finish_rx);
+
+        let report = cancel::cancel_batch(
+            &orch,
+            &control.request_id,
+            "operator",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::Stopped { settled: true });
+        let (verdict, output) = settled_verdict_and_output(&orch, &control.request_id).await;
+        assert!(verdict.starts_with("it was never placed"), "{verdict}");
+        assert!(output.contains("cancelled by operator"), "{output}");
+        assert!(output.contains("none of its commands ran"), "{output}");
+        assert_eq!(
+            count(
+                &orch,
+                "SELECT COUNT(*) FROM sessions WHERE id='session-1' AND status='open'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &orch,
+                "SELECT COUNT(*) FROM jobs WHERE id='job-1' AND status='running'"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// Comment 2's case: the batch's call is gone (it ran on detached). The
+    /// cancel settles its row as cancelled and queues one notice for the job;
+    /// it resolves no wait and mints no turn, so a live turn is undisturbed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_detached_batch_queues_its_notice_and_wakes_no_turn() {
+        let orch = env().await;
+        let (control, tx) = a_call_whose_transport_closed(&orch).await;
+        let _claimed = orch
+            .fleet
+            .claim_job_command_for_test(&control.request_id, "job-1", 1);
+        let (_finish, finish_rx) = tokio::sync::oneshot::channel();
+        simulated_routed_batch(control.clone(), tx, finish_rx);
+
+        let report = cancel::cancel_batch(
+            &orch,
+            &control.request_id,
+            "operator",
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(report, cancel::CancelReport::Stopped { settled: true });
+        let (verdict, output) = settled_verdict_and_output(&orch, &control.request_id).await;
+        assert_eq!(verdict, "it was cancelled");
+        assert!(
+            output.starts_with("Run cancelled: cancelled by operator."),
+            "{output}"
+        );
+        assert_eq!(run_batch_notices(&orch).await, 1);
+        assert_eq!(count(&orch, "SELECT COUNT(*) FROM agent_waits").await, 0);
+        assert_eq!(successor_turns(&orch).await, 0);
+        assert_eq!(
+            count(
+                &orch,
+                "SELECT COUNT(*) FROM turns WHERE id='pred-turn' AND state='running'"
+            )
+            .await,
+            1,
+            "the live turn is not interrupted"
+        );
+    }
+
+    /// A batch an earlier runner placed has no task here, only the fleet's
+    /// request (what cairn/6612 makes common across an orderly restart). The
+    /// cancel still reaches it, through the same `Cancel`, and its machine's
+    /// report settles it. One with neither is refused as not live.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_held_only_by_the_fleet_is_cancelled_through_its_request() {
+        let orch = env().await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _claimed = orch
+            .fleet
+            .claim_job_command_for_test(&request_id, "job-1", 1);
+        let report = cancel::cancel_batch(&orch, &request_id, "operator", Duration::ZERO).await;
+        assert_eq!(report, cancel::CancelReport::Retracted);
+        assert!(orch.fleet.was_retired_for_test(&request_id));
+
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            cancel::cancel_batch(&orch, &unknown, "operator", Duration::ZERO).await,
+            cancel::CancelReport::NotLive
+        );
+    }
+
+    /// Who may cancel: the operator; the owning node; a node sharing its
+    /// branch (a parent and its task); never an unrelated node, which is told
+    /// whose batch it is. A cancel addressed under the wrong node is refused
+    /// naming the right address.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_owner_a_branch_sharer_or_the_operator_may_cancel_a_batch() {
+        let orch = env().await;
+        for sql in [
+            "UPDATE jobs SET branch='agent/cancel' WHERE id='job-1'",
+            "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment,branch) VALUES ('job-2','e','i','p','Reviewer','running',1,1,'reviewer','agent/other')",
+            "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-2','job-2','open','handle-2',1,1)",
+            "INSERT INTO runs (id,issue_id,project_id,job_id,status,session_id,created_at,updated_at) VALUES ('run-2','i','p','job-2','live','session-2',1,1)",
+        ] {
+            orch.db.local.execute(sql, ()).await.unwrap();
+        }
+        let control = BatchControl::new(false);
+        control.set_owner(detached::BatchOwner {
+            job_id: "job-1".into(),
+            home: Some(BUILDER.into()),
+        });
+        let _live = detached::LiveBatch::claim(&control);
+        let own = format!("{BUILDER}/batches/{}", control.request_id);
+
+        let refused = cancel_through_write(&orch, Some("run-2"), &own, true)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains(&format!("belongs to {BUILDER}")) && refused.contains("operator"),
+            "{refused}"
+        );
+
+        let elsewhere = format!("cairn://p/prj/1/1/reviewer/batches/{}", control.request_id);
+        let misaddressed = cancel_through_write(&orch, None, &elsewhere, true)
+            .await
+            .unwrap_err();
+        assert!(
+            misaddressed.contains(&format!("Address it at `{own}`")),
+            "{misaddressed}"
+        );
+
+        for run_id in [None, Some("run-1")] {
+            let allowed = cancel_through_write(&orch, run_id, &own, true)
+                .await
+                .unwrap_or_else(|refusal| panic!("{refusal}"));
+            assert!(allowed.starts_with("Would cancel"), "{allowed}");
+        }
+        orch.db
+            .local
+            .execute("UPDATE jobs SET branch='agent/cancel' WHERE id='job-2'", ())
+            .await
+            .unwrap();
+        let sharer = cancel_through_write(&orch, Some("run-2"), &own, true)
+            .await
+            .unwrap_or_else(|refusal| panic!("a node on the same branch may cancel: {refusal}"));
+        assert!(sharer.starts_with("Would cancel"), "{sharer}");
+        assert!(!control
+            .stop_placement
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// Supersession retains the identity of work still running, so a reissue

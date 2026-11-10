@@ -255,6 +255,23 @@ pub(crate) struct ReplayPass {
     pub(crate) updated_at: i64,
 }
 
+/// Which paths a take-committed-tip replay places from the committed tip, and
+/// so which paths its guard has to judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayScope {
+    /// A replay that rebases the branch: the carry places the session's
+    /// conflicting paths and every path an earlier resolution covered. A path
+    /// carried by an earlier replay and then rolled back with it is no longer
+    /// conflicting here, and leaving it out would let the next replay conflict
+    /// on it again.
+    Carry,
+    /// A merge catch-up: the replay is a merge commit of the base, the tip and
+    /// the incoming side, and only the session's conflicting paths are taken
+    /// from the tip. Every other path is the merge's own result, with both
+    /// sides in its ancestry, so no restore of it can drop incoming work.
+    CatchUpMerge,
+}
+
 /// The merge base and incoming side one path was resolved against.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResolvedSide {
@@ -311,6 +328,16 @@ fn encode_basis(basis: &ResolutionBasis) -> Result<Option<String>, String> {
     serde_json::to_string(&rows)
         .map(Some)
         .map_err(|error| format!("encode resolution basis: {error}"))
+}
+
+/// `basis` without every entry whose incoming side is in `contained`: the
+/// sides the session's merge base already holds. Pure, so the rule is provable
+/// without a store; see [`ConflictSession::without_superseded`].
+fn drop_superseded(basis: ResolutionBasis, contained: &BTreeSet<String>) -> ResolutionBasis {
+    basis
+        .into_iter()
+        .filter(|(_, side)| !contained.contains(&side.theirs))
+        .collect()
 }
 
 /// An undecodable basis reads as empty: every path is then judged against the
@@ -423,6 +450,7 @@ impl ConflictSession {
         mut basis: ResolutionBasis,
         deleted: &BTreeSet<String>,
         reason: &str,
+        scope: ReplayScope,
     ) -> (ResolutionBasis, Vec<String>) {
         let (false, Some(base), Some(theirs)) = (
             self.is_base_drift(),
@@ -432,7 +460,7 @@ impl ConflictSession {
             return (basis, Vec::new());
         };
         let mut attested = Vec::new();
-        for path in self.replay_paths(&basis) {
+        for path in self.replay_paths(&basis, scope) {
             let covered = basis
                 .get(&path)
                 .is_some_and(|side| side.attested.is_some() && side.is_against(base, theirs));
@@ -492,7 +520,7 @@ impl ConflictSession {
         tip: &str,
     ) -> Result<ResolutionBasis, String> {
         let Some(ours) = self.ours.as_deref() else {
-            return Ok(self.resolution_basis.clone());
+            return self.without_superseded(jj, store, self.resolution_basis.clone());
         };
         let paths: Vec<String> = self.conflicting().map(|file| file.path.clone()).collect();
         let mut resolved = crate::jj::paths_changed_between(jj, store, ours, tip, &paths)?;
@@ -534,21 +562,66 @@ impl ConflictSession {
                 .filter(|path| !present.contains(path))
                 .collect()
         };
-        Ok(self.basis_after(&resolved, &still_deleted))
+        self.without_superseded(jj, store, self.basis_after(&resolved, &still_deleted))
     }
 
-    /// Every path a take-committed-tip replay has to place: the paths this
-    /// session conflicts on, and every path an earlier resolution covered. A
-    /// path carried by an earlier replay and then rolled back with it is no
-    /// longer conflicting here, and dropping it would let the next replay
-    /// conflict on it again.
-    pub(crate) fn replay_paths(&self, basis: &ResolutionBasis) -> Vec<String> {
-        self.conflicting()
-            .map(|file| file.path.clone())
-            .chain(basis.keys().cloned())
+    /// `basis` without the entries this session's merge base has superseded.
+    ///
+    /// An entry says the tip holds its `theirs` linearly, without that side in
+    /// its ancestry, so the branch's work on the path is measured from that
+    /// side rather than from the fork. Once this session's base contains the
+    /// side — a later replay or catch-up merge put it into the branch's
+    /// history — the fork is the newer measurement, and judging the path
+    /// against the entry's older sides merges content both sides already share
+    /// a second time: a whole-file restore that drops nothing reads as dropping
+    /// incoming work. Such an entry is no evidence about this session's merge
+    /// either way, so a conflicting path it alone covered is unresolved again.
+    ///
+    /// An entry whose side the base does not contain is kept. That is what a
+    /// replay that carried a path and then rolled back leaves behind: the
+    /// branch did not move, so neither did its base, and the next replay still
+    /// has to place the path.
+    ///
+    /// A store that cannot answer keeps every entry, which can only make a
+    /// replay refuse; a timeout is an error, never an answer.
+    pub(crate) fn without_superseded(
+        &self,
+        jj: &JjEnv,
+        store: &Path,
+        basis: ResolutionBasis,
+    ) -> Result<ResolutionBasis, String> {
+        let Some(base) = self.base.as_deref() else {
+            return Ok(basis);
+        };
+        let sides: Vec<String> = basis
+            .values()
+            .map(|side| side.theirs.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
+            .collect();
+        match crate::jj::commits_contained_in(jj, store, &sides, base) {
+            Ok(contained) => Ok(drop_superseded(basis, &contained)),
+            Err(error) if crate::jj::is_jj_timeout_error(&error) => Err(error),
+            Err(error) => {
+                log::warn!(
+                    "conflict session for `{}`: which resolved sides `{base}` contains could not \
+                     be read ({error}); keeping every resolution basis entry",
+                    self.bookmark
+                );
+                Ok(basis)
+            }
+        }
+    }
+
+    /// Every path a take-committed-tip replay places from the tip, under
+    /// `scope`; see [`ReplayScope`].
+    pub(crate) fn replay_paths(&self, basis: &ResolutionBasis, scope: ReplayScope) -> Vec<String> {
+        let conflicting = self.conflicting().map(|file| file.path.clone());
+        let paths: BTreeSet<String> = match scope {
+            ReplayScope::Carry => conflicting.chain(basis.keys().cloned()).collect(),
+            ReplayScope::CatchUpMerge => conflicting.collect(),
+        };
+        paths.into_iter().collect()
     }
 
     /// Whether this session was written by a build that agrees with this one
@@ -822,8 +895,9 @@ pub(crate) fn assess_session_tip(
     jj: &JjEnv,
     store: &Path,
     session: &ConflictSession,
+    scope: ReplayScope,
 ) -> Option<TipAssessment> {
-    assess_session_tip_within(jj, store, session, Some(MAX_ASSESSED_PATHS))
+    assess_session_tip_within(jj, store, session, scope, Some(MAX_ASSESSED_PATHS))
 }
 
 /// What an attempt to prove a whole-file restore safe actually produced.
@@ -865,6 +939,7 @@ pub(crate) fn assess_session_tip_exhaustively(
     store: &Path,
     session: &ConflictSession,
     attestation: Option<&str>,
+    scope: ReplayScope,
 ) -> RestoreProof {
     if session.is_base_drift() {
         return RestoreProof::NothingToProve;
@@ -892,7 +967,7 @@ pub(crate) fn assess_session_tip_exhaustively(
             ))
         }
     };
-    let deleted = match session.deleted_at(jj, store, &tip, &session.replay_paths(&basis)) {
+    let deleted = match session.deleted_at(jj, store, &tip, &session.replay_paths(&basis, scope)) {
         Ok(deleted) => deleted,
         Err(error) => {
             return RestoreProof::Unavailable(format!(
@@ -901,11 +976,11 @@ pub(crate) fn assess_session_tip_exhaustively(
         }
     };
     let (basis, newly_attested) = match attestation {
-        Some(reason) => session.attest_deletions(basis, &deleted, reason),
+        Some(reason) => session.attest_deletions(basis, &deleted, reason, scope),
         None => (basis, Vec::new()),
     };
     let mut assessment =
-        assess_against_basis(jj, store, session, base, &basis, &deleted, tip, None);
+        assess_against_basis(jj, store, session, base, &basis, &deleted, tip, scope, None);
     assessment.newly_attested = newly_attested;
     RestoreProof::Assessed(assessment)
 }
@@ -914,6 +989,7 @@ fn assess_session_tip_within(
     jj: &JjEnv,
     store: &Path,
     session: &ConflictSession,
+    scope: ReplayScope,
     limit: Option<usize>,
 ) -> Option<TipAssessment> {
     if session.is_base_drift() {
@@ -930,10 +1006,10 @@ fn assess_session_tip_within(
     // A store that cannot say which files are deleted leaves each such path
     // with its own verdict, which reports it as not assessed.
     let deleted = session
-        .deleted_at(jj, store, &tip, &session.replay_paths(&basis))
+        .deleted_at(jj, store, &tip, &session.replay_paths(&basis, scope))
         .unwrap_or_default();
     Some(assess_against_basis(
-        jj, store, session, base, &basis, &deleted, tip, limit,
+        jj, store, session, base, &basis, &deleted, tip, scope, limit,
     ))
 }
 
@@ -954,9 +1030,10 @@ fn assess_against_basis(
     basis: &ResolutionBasis,
     deleted: &BTreeSet<String>,
     tip: String,
+    scope: ReplayScope,
     limit: Option<usize>,
 ) -> TipAssessment {
-    let all = session.replay_paths(basis);
+    let all = session.replay_paths(basis, scope);
     let limit = limit.unwrap_or(all.len());
     let truncated = all.len().saturating_sub(limit);
     let session_theirs = session.theirs.clone().unwrap_or_default();
@@ -2700,8 +2777,12 @@ mod tests {
             .insert("moved.rs".to_string(), side("d1"));
         let deleted = changed(&["fence.rs", "auth.rs", "kept.rs", "moved.rs", "elsewhere.rs"]);
 
-        let (basis, newly) =
-            open.attest_deletions(open.resolution_basis.clone(), &deleted, "ported #4372");
+        let (basis, newly) = open.attest_deletions(
+            open.resolution_basis.clone(),
+            &deleted,
+            "ported #4372",
+            ReplayScope::Carry,
+        );
         assert_eq!(newly, vec!["auth.rs", "fence.rs", "moved.rs"]);
         for path in ["auth.rs", "fence.rs", "moved.rs"] {
             assert_eq!(
@@ -2720,8 +2801,12 @@ mod tests {
 
         let mut drift = open.clone();
         drift.condition = ConflictCondition::BaseDrift.as_str().to_string();
-        let (unchanged, none) =
-            drift.attest_deletions(drift.resolution_basis.clone(), &deleted, "ported #4372");
+        let (unchanged, none) = drift.attest_deletions(
+            drift.resolution_basis.clone(),
+            &deleted,
+            "ported #4372",
+            ReplayScope::Carry,
+        );
         assert!(none.is_empty());
         assert_eq!(unchanged, drift.resolution_basis);
     }
@@ -2969,8 +3054,39 @@ mod tests {
             .resolution_basis
             .insert("g.txt".to_string(), side("d1"));
         assert_eq!(
-            retried.replay_paths(&retried.resolution_basis),
+            retried.replay_paths(&retried.resolution_basis, ReplayScope::Carry),
             vec!["f.txt".to_string(), "g.txt".to_string()]
+        );
+        // A catch-up merge takes only the conflicts from the tip; `f.txt` is
+        // the merge's own result there, so neither its placement nor its
+        // deletion is the replay's to judge.
+        assert_eq!(
+            retried.replay_paths(&retried.resolution_basis, ReplayScope::CatchUpMerge),
+            vec!["g.txt".to_string()]
+        );
+        let (_, attested) = retried.attest_deletions(
+            retried.resolution_basis.clone(),
+            &changed(&["f.txt"]),
+            "moved",
+            ReplayScope::CatchUpMerge,
+        );
+        assert!(attested.is_empty(), "{attested:?}");
+    }
+
+    /// An entry whose side the session's base already contains is superseded,
+    /// attested or not; one whose side it does not contain — the rolled-back
+    /// carry above, or a resolution against this session's own sides — stays.
+    #[test]
+    fn only_entries_whose_side_the_base_contains_are_superseded() {
+        let mut basis = ResolutionBasis::new();
+        basis.insert("config.yaml".to_string(), side("d0"));
+        basis.insert("gone.rs".to_string(), attested("d0", "moved"));
+        basis.insert("f.txt".to_string(), side("d1"));
+        basis.insert("g.txt".to_string(), side("d2"));
+        let kept = drop_superseded(basis, &changed(&["d0"]));
+        assert_eq!(
+            kept.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["f.txt", "g.txt"]
         );
     }
 

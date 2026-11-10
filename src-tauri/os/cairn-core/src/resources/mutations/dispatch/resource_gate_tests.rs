@@ -35,6 +35,29 @@ fn gate_accepts_the_rebase_replay_action() {
     assert!(std::ptr::eq(spec, rebase_patch_spec()));
 }
 
+/// The batch cancel and the one-step replay that uses it are documented
+/// actions, so the gate admits them at every address a batch has.
+#[test]
+fn gate_accepts_the_batch_cancel_and_the_replay_that_cancels_the_holding_batch() {
+    for target in [
+        "cairn://p/cairn/1/1/builder/batches/req-1",
+        "cairn://p/cairn/1/1/builder/task/verify/batches/req-1",
+    ] {
+        let it = item(
+            target,
+            ChangeMode::Patch,
+            Some(serde_json::json!({"action": "cancel"})),
+        );
+        assert!(gate(&it).is_ok(), "{target}");
+    }
+    let it = item(
+        "cairn://p/cairn/1/1/builder/rebase",
+        ChangeMode::Patch,
+        Some(serde_json::json!({"action": "replay", "cancel_holding_batch": true})),
+    );
+    assert!(gate(&it).is_ok());
+}
+
 /// The canonical rebase patch spec the gate must hand to dispatch.
 fn rebase_patch_spec() -> &'static MutationSpec {
     cairn_common::contract::mutation_spec(ResourceKind::NodeRebase, ChangeMode::Patch)

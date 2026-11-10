@@ -114,9 +114,9 @@ pub enum GateOwner {
 /// [`coordinating_job_for_child`] it never establishes a thread session, so an
 /// evaluator or authorization check may ask it freely.
 ///
-/// This is *routing*. It says whom the gate is addressed to, not that the
-/// parent edge it followed confers authority; an authority check must also
-/// prove the edge (see `docs/authorization.md`).
+/// The gate owner is also who may confirm the child's gated artifact besides
+/// the operator (see `docs/authorization.md`), so it reads the parent edges as
+/// they stand, however they were made.
 pub async fn gate_owner_for_child_conn(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     conn: &cairn_db::storage::TrackedConnection,

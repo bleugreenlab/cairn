@@ -3353,7 +3353,7 @@ pub(super) mod tests {
     /// half is blocked by the inherited team claim-ledger outage (cairn/6489),
     /// not by answer authority, and is outside this pin.
     #[tokio::test]
-    async fn a_moved_childs_former_filing_parent_cannot_answer_its_permission_prompt() {
+    async fn a_moved_childs_parent_is_still_its_ancestor_after_the_move() {
         use crate::mcp::handlers::permission::{
             resolve_permission_request, AnswerSurface, PermissionAnswer, PermissionDecision,
         };
@@ -3584,8 +3584,7 @@ pub(super) mod tests {
         };
         let answer = |segment: &str, decision: &str| json!({"target": prompt_target(segment), "mode": "patch", "payload": {"decision": decision}});
 
-        // Positive controls: before the move the filer genuinely answers both
-        // ways, so what follows is the move's doing, not a fixture gap.
+        // Before the move the parent answers both ways.
         for ((id, segment), decision, status) in [
             (prompts[0], "deny", "denied"),
             (prompts[1], "allow", "allowed"),
@@ -3630,57 +3629,43 @@ pub(super) mod tests {
         // the canonical resolver by request id. The node-coordinate lookup in
         // front of that resolver reads only the private database, so it cannot
         // address a team project's prompt by URI.
-        let mut refusals = 0;
-        for decision in [PermissionDecision::Deny, PermissionDecision::Allow] {
-            let agent = crate::mcp::handlers::run_context::authenticated_agent_for_run(
-                &orch.db,
-                &moved_parent_run,
-            )
+        // The child's parent edge moved with it, so the rekeyed parent is still
+        // its ancestor: the ancestry check passes. Past it, the first-answer
+        // claim on a team database currently fails on the missing
+        // `channel_ask_action` table (cairn/6489); once that is fixed the
+        // answer is accepted outright.
+        let agent = crate::mcp::handlers::run_context::authenticated_agent_for_run(
+            &orch.db,
+            &moved_parent_run,
+        )
+        .await
+        .expect("the parent authenticates as its moved run");
+        let (actor, appearance) = agent.appearance(chrono::Utc::now().timestamp()).unwrap();
+        let agent_answer =
+            PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
+                .with_authenticated_appearance(actor, appearance)
+                .unwrap();
+        let result = resolve_permission_request(&orch, &moved_prompt, agent_answer)
             .await
-            .expect("the former parent authenticates as its moved run");
-            let (actor, appearance) = agent.appearance(chrono::Utc::now().timestamp()).unwrap();
-            let agent_answer =
-                PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
-                    .with_authenticated_appearance(actor, appearance)
-                    .unwrap();
-            let decision = format!("{decision:?}");
-            let result = resolve_permission_request(&orch, &moved_prompt, agent_answer)
-                .await
-                .map(|_| "accepted".to_string())
-                .unwrap_or_else(|refusal| refusal);
-            // `not an ancestor` is reached only after the answering run
-            // authenticated and its home matched its stored run, and before
-            // the first-answer claim, so a refusal here never claims.
-            assert!(
-                result.contains("not an ancestor"),
-                "post-move {decision}: {result}"
-            );
-            assert_eq!(
-                team.query_one(
-                    "SELECT status, resolution_actor FROM permission_requests WHERE id = ?1",
-                    (moved_prompt.clone(),),
-                    |row| Ok((row.text(0)?, row.opt_text(1)?)),
-                )
-                .await
-                .unwrap(),
-                ("pending".to_string(), None),
-                "post-move {decision}: the prompt stays pending and unattributed"
-            );
-            refusals += 1;
-            assert_eq!(
-                count(
-                    &local,
-                    &format!(
-                        "SELECT COUNT(*) FROM authorization_events
-                         WHERE request_uri = '{moved_prompt}' AND reason = 'permission_answer_authority'
-                           AND outcome = 'forbidden'"
-                    ),
-                )
-                .await,
-                refusals,
-                "post-move {decision}: the refusal is journaled"
-            );
-        }
+            .map(|_| "accepted".to_string())
+            .unwrap_or_else(|refusal| refusal);
+        assert!(
+            result == "accepted" || result.contains("channel_ask_action"),
+            "post-move: the parent must pass the ancestry check: {result}"
+        );
+        assert_eq!(
+            count(
+                &local,
+                &format!(
+                    "SELECT COUNT(*) FROM authorization_events
+                     WHERE request_uri = '{moved_prompt}' AND reason = 'permission_answer_authority'
+                       AND outcome = 'forbidden'"
+                ),
+            )
+            .await,
+            0,
+            "post-move: no lineage refusal is journaled"
+        );
     }
 
     // === Quiesce-gate (`blocking_work`) tests ===

@@ -379,6 +379,14 @@ fn check_index_from_stream_id(stream_id: &str) -> Option<usize> {
         .and_then(|(_, index)| index.parse().ok())
 }
 
+/// The item index of an agent run batch's stream, `{tool_use_id}:{index}`
+/// ([`serialize_process_batch`]).
+fn run_item_index_from_stream_id(stream_id: &str) -> Option<usize> {
+    stream_id
+        .rsplit_once(':')
+        .and_then(|(_, index)| index.parse().ok())
+}
+
 fn format_duration_annotation(duration_ms: u64) -> String {
     if duration_ms >= 1_000 {
         format!("{:.1}s", duration_ms as f64 / 1_000.0)
@@ -1885,6 +1893,10 @@ struct RunnerCallbackContext {
     request: Option<crate::mcp::types::McpCallbackRequest>,
     run_context: Option<crate::mcp::handlers::RunContext>,
     check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
+    /// The request of the agent run batch this context serves, whose live
+    /// control hears its per-item start and completion reports
+    /// ([`crate::mcp::handlers::run::detached::note_item_started`]).
+    run_batch_request_id: Option<String>,
     /// Whether this batch runs in the project's externally owned live checkout.
     ///
     /// Stated from the submitted repository locator, never inferred from the
@@ -8792,6 +8804,16 @@ impl Fleet {
             .any(|(id, _)| id == request_id)
     }
 
+    /// Whether any attempt of `request_id` was retired (told to cancel).
+    #[cfg(test)]
+    pub(crate) fn was_retired_for_test(&self, request_id: &str) -> bool {
+        self.cancelled_leaders
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == request_id)
+    }
+
     pub(crate) fn cancel_request(&self, request_id: &str) -> CancelOutcome {
         let subscriber = self
             .in_flight
@@ -12777,6 +12799,7 @@ impl Fleet {
                                 request: None,
                                 run_context,
                                 check_status_board,
+                                run_batch_request_id: None,
                                 live_checkout: false,
                                 executor_binding: None,
                                 output: coalesced_output.clone(),
@@ -12974,6 +12997,7 @@ impl Fleet {
                     request: Some(batch.request.clone()),
                     run_context: batch.run_context.clone(),
                     check_status_board: None,
+                    run_batch_request_id: Some(request.request_id.clone()),
                     live_checkout: runs_in_live_checkout(&request.repository),
                     executor_binding: None,
                     output: output.clone(),
@@ -13078,6 +13102,7 @@ impl Fleet {
                     request: None,
                     run_context,
                     check_status_board,
+                    run_batch_request_id: None,
                     live_checkout: false,
                     executor_binding: None,
                     output: output.clone(),
@@ -13207,6 +13232,10 @@ impl Fleet {
                     if let Some(index) = check_index_from_stream_id(&stream_id) {
                         board.transition(index, "running", None);
                     }
+                } else if let Some(request_id) = context.run_batch_request_id.as_deref() {
+                    if let Some(index) = run_item_index_from_stream_id(&stream_id) {
+                        crate::mcp::handlers::run::detached::note_item_started(request_id, index);
+                    }
                 }
                 RunnerCallbackResult::Completed
             }
@@ -13254,6 +13283,10 @@ impl Fleet {
                             if succeeded { "passed" } else { "failed" },
                             annotation,
                         );
+                    }
+                } else if let Some(request_id) = context.run_batch_request_id.as_deref() {
+                    if let Some(index) = run_item_index_from_stream_id(&stream_id) {
+                        crate::mcp::handlers::run::detached::note_item_finished(request_id, index);
                     }
                 }
                 RunnerCallbackResult::Completed
@@ -23149,6 +23182,7 @@ mod tests {
                     request: Some(relay_request(Some("run-1"))),
                     run_context: None,
                     check_status_board: None,
+                    run_batch_request_id: None,
                     live_checkout: false,
                     executor_binding: Some(RunnerContextExecutorBinding {
                         executor_id: "executor-1".into(),
@@ -23159,6 +23193,71 @@ mod tests {
                     output: output_guard::RelayedOutput::shared(),
                 },
             ),
+        );
+    }
+
+    /// A machine's per-item reports for an agent's run batch reach that
+    /// batch's live control, so the rebase hold can name the item running; a
+    /// report for a request with no live batch here changes nothing.
+    #[tokio::test]
+    async fn a_run_batch_item_report_marks_the_item_running_on_its_live_control() {
+        use crate::mcp::handlers::run::detached::{self, BatchProgress};
+        let dir = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(dir.path()).await;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _live = detached::LiveBatch::claim_for_test(&request_id);
+        orch.fleet.runner_contexts.lock().unwrap().insert(
+            "run-batch-context".into(),
+            RunnerContextEntry::new(
+                "run-batch-context",
+                &format!("{request_id}:attempt-1"),
+                RunnerCallbackContext {
+                    request: None,
+                    run_context: None,
+                    check_status_board: None,
+                    run_batch_request_id: Some(request_id.clone()),
+                    live_checkout: false,
+                    executor_binding: None,
+                    output: output_guard::RelayedOutput::shared(),
+                },
+            ),
+        );
+        orch.fleet
+            .handle_runner_callback(
+                &orch,
+                RunnerCallback::ProcessItemStarted {
+                    runner_context_id: "run-batch-context".into(),
+                    stream_id: "tool-1:2".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                detached::live_progress(&orch, &request_id),
+                Some(BatchProgress::Running { index: 2, .. })
+            ),
+            "{:?}",
+            detached::live_progress(&orch, &request_id)
+        );
+        orch.fleet
+            .handle_runner_callback(
+                &orch,
+                RunnerCallback::ProcessItemCompleted {
+                    runner_context_id: "run-batch-context".into(),
+                    stream_id: "tool-1:2".into(),
+                    succeeded: true,
+                    exit_code: Some(0),
+                    timed_out: false,
+                    duration_ms: 1_000,
+                },
+            )
+            .await;
+        assert!(
+            !matches!(
+                detached::live_progress(&orch, &request_id),
+                Some(BatchProgress::Running { .. })
+            ),
+            "a finished item is no longer reported running"
         );
     }
 
@@ -41205,6 +41304,7 @@ mod tests {
                     request: None,
                     run_context: None,
                     check_status_board: None,
+                    run_batch_request_id: None,
                     live_checkout: false,
                     executor_binding: Some(RunnerContextExecutorBinding {
                         executor_id: "executor-3824".into(),
@@ -47183,6 +47283,7 @@ mod handoff_tests {
                     }),
                     run_context: None,
                     check_status_board: None,
+                    run_batch_request_id: None,
                     live_checkout: false,
                     executor_binding: Some(RunnerContextExecutorBinding {
                         executor_id: "executor-1".into(),

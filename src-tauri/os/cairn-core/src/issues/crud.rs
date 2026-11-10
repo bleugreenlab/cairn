@@ -1135,10 +1135,8 @@ mod tests {
 
     /// Canonical create keeps the authenticated filing job as creator provenance
     /// on thread children, whether the thread was named explicitly or inferred
-    /// from the filing run, exactly as it always has on issue children. Every
-    /// edge here is established by the canonical insert itself, never by a later
-    /// parent UPDATE, so each filing edge starts unrevoked. A child with no
-    /// parent edge records no filer.
+    /// from the filing run, exactly as it always has on issue children. A child
+    /// with no parent edge records no filer.
     #[tokio::test]
     async fn canonical_create_retains_the_authenticated_filer_on_thread_children() {
         let db = crate::storage::migrated_test_db("issue-create-thread-filer.db").await;
@@ -1161,7 +1159,7 @@ mod tests {
             db: &LocalDb,
             parent_uri: Option<&str>,
             inferred_thread: Option<&str>,
-        ) -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+        ) -> (Option<String>, Option<String>, Option<String>) {
             let context = IssueCreationContext {
                 parent_uri: parent_uri.map(str::to_string),
                 inferred_parent_thread_id: inferred_thread.map(str::to_string),
@@ -1187,17 +1185,10 @@ mod tests {
                 .await
                 .unwrap();
                 db.query_one(
-                    "SELECT parent_issue_id, parent_thread_id, parent_job_id, filing_parent_revoked_at
+                    "SELECT parent_issue_id, parent_thread_id, parent_job_id
                      FROM issues WHERE id = ?1",
                     params![issue.id.as_str()],
-                    |row| {
-                        Ok((
-                            row.opt_text(0)?,
-                            row.opt_text(1)?,
-                            row.opt_text(2)?,
-                            row.opt_i64(3)?,
-                        ))
-                    },
+                    |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
                 )
                 .await
                 .unwrap()
@@ -1207,22 +1198,22 @@ mod tests {
 
         assert_eq!(
             file(&db, Some("cairn://p/prj/topic"), None).await,
-            (None, some("t"), some("session"), None),
-            "an explicitly thread-parented child keeps its filer, unrevoked"
+            (None, some("t"), some("session")),
+            "an explicitly thread-parented child keeps its filer"
         );
         assert_eq!(
             file(&db, None, Some("t")).await,
-            (None, some("t"), some("session"), None),
-            "a child inferred onto the filing run's thread keeps its filer, unrevoked"
+            (None, some("t"), some("session")),
+            "a child inferred onto the filing run's thread keeps its filer"
         );
         assert_eq!(
             file(&db, Some("cairn://p/prj/1"), None).await,
-            (some("parent"), None, some("session"), None),
-            "an issue-parented child keeps its filer, unrevoked"
+            (some("parent"), None, some("session")),
+            "an issue-parented child keeps its filer"
         );
         assert_eq!(
             file(&db, None, None).await,
-            (None, None, None, None),
+            (None, None, None),
             "an unparented child records no filer"
         );
     }
