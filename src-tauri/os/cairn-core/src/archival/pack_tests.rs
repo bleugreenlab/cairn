@@ -463,7 +463,7 @@ async fn the_cursor_resumes_mid_walk() {
 #[test]
 fn no_statement_of_the_pass_deletes() {
     // The pass writes catalog rows and its cursor and nothing else.
-    let source = include_str!("pack.rs");
+    let source = concat!(include_str!("pack.rs"), include_str!("pack_threads.rs"));
     for forbidden in ["DELETE", "evicted_at =", "UPDATE events"] {
         assert!(
             !source.contains(forbidden),
@@ -493,7 +493,7 @@ fn the_report_names_skips_and_why_it_stopped() {
     };
     let line = report.to_string();
     assert!(
-        line.starts_with("2 executions packed (3.0 MiB packed"),
+        line.starts_with("2 scopes packed (3.0 MiB packed"),
         "{line}"
     );
     assert!(line.contains("22 skipped"), "{line}");
@@ -547,4 +547,136 @@ async fn the_pass_statements_stay_on_their_indexes() {
         "{live}"
     );
     assert!(!live.contains("SCAN runs"), "{live}");
+}
+
+async fn seed_thread(db: &LocalDb) {
+    db.execute_script(format!(
+        "INSERT INTO threads(id, project_id, name, created_at, updated_at)
+           VALUES ('thread','proj','performance',1,1);
+         INSERT INTO jobs(id, project_id, thread_id, uri_segment, status, current_session_id, created_at, updated_at)
+           VALUES ('tj','proj','thread','thread','running','s3',1,1);
+         INSERT INTO sessions(id, job_id, sequence, status, created_at, closed_at, updated_at)
+           VALUES ('s1','tj',1,'closed',1,{OLD},1), ('s2','tj',2,'closed',2,{OLD},2),
+                  ('s3','tj',3,'open',3,NULL,3);
+         INSERT INTO thread_compactions(job_id, generation, source_session_id, recency_start_block,
+              source_bytes, candidate_bytes, trigger, created_at)
+           VALUES ('tj',1,'s2',0,100,10,'manual',1);"
+    )).await.unwrap();
+    for n in 1..=3 {
+        db.execute_script(format!(
+            "INSERT INTO runs(id, job_id, session_id, project_id, status, created_at, updated_at)
+               VALUES ('tr{n}','tj','s{n}','proj','exited',{n},{n});
+             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('te{n}','tr{n}','s{n}',1,1,'assistant','{{\"eventType\":\"assistant\",\"content\":\"body\"}}',1);"
+        )).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn both_sources_pack_without_changing_history_and_report_their_budget() {
+    let db = migrated_test_db("pack-thread-both.db").await;
+    seed_project(&db).await;
+    seed_execution(&db, 1, "merged", Some(OLD), "exited").await;
+    seed_thread(&db).await;
+    let events = count(&db, "SELECT COUNT(*) FROM events").await;
+    let report = run_pack_pass_at(&db, NOW, policy(), budget()).await;
+    assert_eq!(report.packed, 2, "{report}");
+    assert_eq!(report.executions.packed, 1, "{report}");
+    assert_eq!(report.threads.packed, 1, "{report}");
+    assert_eq!(report.remaining, Some(0), "{report}");
+    assert_eq!(catalogued(&db).await, ["tj/1-2", "x1"]);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM events").await, events);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM history_tier_sessions WHERE session_id='s3'"
+        )
+        .await,
+        0
+    );
+    assert!(!db.has_evicted_history());
+    assert!(report.to_string().contains("thread ranges: 1 packed"));
+    assert!(report.to_string().contains("budget "));
+    let again = run_pack_pass_at(&db, NOW, policy(), budget()).await;
+    assert_eq!(again.packed, 0, "{again}");
+    assert_eq!(again.staleness_probes, 1, "{again}");
+    assert_eq!(again.stale_ranges, 0, "{again}");
+}
+
+#[tokio::test]
+async fn thread_cursor_resumes_within_an_owner_after_the_shared_unit_limit() {
+    let db = migrated_test_db("pack-thread-cursor.db").await;
+    seed_project(&db).await;
+    seed_thread(&db).await;
+    let policy = PackPolicy {
+        bytes_per_row: Some(100_000),
+        ..policy()
+    };
+    let budget = PackBudget {
+        max_pack_bytes: 128_000,
+        max_executions: 1,
+        ..budget()
+    };
+    let first = run_pack_pass_at(&db, NOW, policy, budget).await;
+    assert_eq!(first.threads.packed, 1, "{first}");
+    assert_eq!(catalogued(&db).await, ["tj/1-1"]);
+    assert_eq!(
+        progress::load(&db, progress::PACK_THREAD)
+            .await
+            .unwrap()
+            .cursor,
+        None
+    );
+    let second = run_pack_pass_at(&db, NOW, policy, budget).await;
+    assert_eq!(second.threads.packed, 1, "{second}");
+    assert_eq!(catalogued(&db).await, ["tj/1-1", "tj/2-2"]);
+    let third = run_pack_pass_at(&db, NOW, policy, budget).await;
+    assert_eq!(third.packed, 0, "{third}");
+    assert_eq!(
+        progress::load(&db, progress::PACK_THREAD).await.unwrap(),
+        Progress::default()
+    );
+}
+
+#[tokio::test]
+async fn execution_backlog_yields_the_reserved_third_to_threads() {
+    let db = migrated_test_db("pack-thread-reserved.db").await;
+    seed_project(&db).await;
+    seed_execution(&db, 1, "merged", Some(OLD), "exited").await;
+    seed_thread(&db).await;
+    let budget = budget();
+    let started = Instant::now() - execution_deadline(budget.pass_time);
+    let store = db.content_store().unwrap();
+    let mut report = PackReport {
+        bytes_per_row: 1_000,
+        ..PackReport::default()
+    };
+    let done = walk_executions(
+        &db,
+        store.as_ref(),
+        NOW,
+        NOW - 30 * DAY,
+        budget,
+        started + execution_deadline(budget.pass_time),
+        &mut report,
+    )
+    .await
+    .map_err(|s| s.reason)
+    .unwrap();
+    assert!(!done);
+    assert_eq!(report.executions.packed, 0);
+    assert!(threads::walk(
+        &db,
+        store.as_ref(),
+        NOW,
+        NOW - 30 * DAY,
+        budget,
+        started,
+        &mut report
+    )
+    .await
+    .map_err(|s| s.reason)
+    .unwrap());
+    assert_eq!(report.threads.packed, 1, "{report}");
+    assert_eq!(catalogued(&db).await, ["tj/1-2"]);
 }

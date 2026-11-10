@@ -29,7 +29,7 @@
 //! supervises — [`runtime`] and [`recent_log`] — because that is the manager's
 //! fact, and the only witness to a daemon that died before it could say why.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -407,11 +407,29 @@ impl ServiceSpec {
     }
 
     fn log_path(&self, stream: &str) -> String {
-        self.log_dir
-            .join(format!("{}.{stream}.log", self.log_prefix))
+        service_log_file(&self.log_dir, &self.log_prefix, stream)
             .display()
             .to_string()
     }
+}
+
+/// The file a launchd unit sends one of the service's streams (`out`, `err`)
+/// to: `<log_dir>/<log_prefix>.<stream>.log`. The systemd unit sets no
+/// `StandardOutput=`/`StandardError=`, so on Linux both streams go to the user
+/// journal and these files are never written.
+pub fn service_log_file(log_dir: &Path, log_prefix: &str, stream: &str) -> PathBuf {
+    log_dir.join(format!("{log_prefix}.{stream}.log"))
+}
+
+/// The runner service's log basename, so its launchd logs are
+/// `<home>/orch.out.log` and `<home>/orch.err.log`.
+pub const RUNNER_LOG_PREFIX: &str = "orch";
+
+/// The runner service's stderr log under the Cairn home `home`: the plist's
+/// `StandardErrorPath`. The runner's own rotation and the desktop's status view
+/// both read it through here, so the three can never name different files.
+pub fn runner_stderr_log(home: &Path) -> PathBuf {
+    service_log_file(home, RUNNER_LOG_PREFIX, "err")
 }
 
 // ─── Pure unit generators (compiled on every platform, asserted by tests) ────

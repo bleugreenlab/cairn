@@ -77,6 +77,9 @@ pub mod encode;
 pub mod testing;
 #[cfg(test)]
 mod tests;
+pub mod thread_range;
+#[cfg(test)]
+mod thread_range_tests;
 pub mod write;
 
 use std::collections::{BTreeMap, HashMap};

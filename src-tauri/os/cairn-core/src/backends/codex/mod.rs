@@ -9,6 +9,7 @@ pub(crate) use backend_impl::{codex_image_transport, discover_catalog_blocking};
 mod events;
 mod permissions;
 pub mod pool;
+mod retention;
 mod runtime;
 mod thread_params;
 

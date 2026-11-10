@@ -5,6 +5,7 @@ pub mod control;
 pub mod home;
 pub mod models;
 pub mod params;
+pub mod retention;
 mod server;
 pub mod thread;
 

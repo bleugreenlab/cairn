@@ -142,9 +142,10 @@ pub struct LogConfig {
     /// Cap for the pretty stderr layer, independent of the file layer's `level`
     /// and still overridable by `RUST_LOG`. `None` keeps the historical `info`
     /// default. The installed runner service sets this to `Quiet` (warn-only):
-    /// launchd redirects its stderr into an unrotated `runner.err.log`, so
-    /// mirroring the full INFO stream there grew it without bound — the rotated
-    /// JSONL file layer keeps the full stream instead.
+    /// launchd appends its stderr to `orch.err.log`
+    /// ([`crate::service::runner_stderr_log`]), which only a coarse size cap
+    /// rotates, so mirroring the full INFO stream there grew it to gigabytes —
+    /// the rotated JSONL file layer keeps the full stream instead.
     pub stderr_level: Option<LogLevel>,
     /// Number of days JSONL files remain in the shared log directory. `None`
     /// leaves shared-directory housekeeping to a settings-aware owner process.
@@ -777,7 +778,7 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
 
         // Scrubbed for the same reason the file layer is, and not only for the
         // operator reading a console: the installed runner service has launchd
-        // redirect its stderr into `runner.err.log`, so this layer is a durable
+        // append its stderr to `orch.err.log`, so this layer is a durable
         // sink too.
         let stderr_layer = fmt::layer()
             .with_writer(ScrubbedWriter::text(std::io::stderr))

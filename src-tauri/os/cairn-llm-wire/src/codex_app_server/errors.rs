@@ -44,11 +44,14 @@ pub fn active_turn_id_from_mismatch(error: &str) -> Option<String> {
         .then(|| active_turn_id.to_string())
 }
 
-/// `thread/resume` (or fork) of a thread id Codex has no rollout for, which
-/// Cairn answers by starting a fresh thread. An empty `thread_id` matches any
-/// thread.
-pub fn is_missing_rollout_error(err: &str, thread_id: &str) -> bool {
-    err.contains("no rollout found for thread id")
+/// A request naming a thread Codex no longer has, which Cairn answers by
+/// rebuilding a fresh thread from its own transcript. `thread/resume` and
+/// `thread/fork` say "no rollout found for thread id X"; `thread/goal/get`,
+/// which a resume asks first when it clears a native goal, says "thread not
+/// found: X". Both are what a thread removed by the Codex home's retention pass
+/// answers. An empty `thread_id` matches any thread.
+pub fn is_missing_thread_error(err: &str, thread_id: &str) -> bool {
+    (err.contains("no rollout found for thread id") || err.contains("thread not found: "))
         && (thread_id.is_empty() || err.contains(thread_id))
 }
 
@@ -99,11 +102,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_rollout_matches_only_the_named_thread() {
-        let error = "no rollout found for thread id 019a-thread";
-        assert!(is_missing_rollout_error(error, "019a-thread"));
-        assert!(is_missing_rollout_error(error, ""));
-        assert!(!is_missing_rollout_error(error, "other-thread"));
-        assert!(!is_missing_rollout_error("thread not loaded", ""));
+    fn missing_thread_matches_only_the_named_thread() {
+        for error in [
+            "no rollout found for thread id 019a-thread",
+            "thread not found: 019a-thread",
+        ] {
+            assert!(is_missing_thread_error(error, "019a-thread"), "{error}");
+            assert!(is_missing_thread_error(error, ""), "{error}");
+            assert!(!is_missing_thread_error(error, "other-thread"), "{error}");
+        }
+        assert!(!is_missing_thread_error("thread not loaded", ""));
     }
 }

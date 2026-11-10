@@ -15,6 +15,8 @@ pub(crate) const OFFLOAD_BLOBS: &str = "offload_blobs";
 /// The history pack pass: the `(completed_at, execution_id)` of the last
 /// candidate visited, as `watermark` and `cursor`.
 pub(crate) const PACK: &str = "pack";
+/// Thread-range walk: last session job fully visited, independent of executions.
+pub(crate) const PACK_THREAD: &str = "pack_thread";
 /// The archive root this database's stored bytes live in, recorded when an
 /// archive is first opened (its `cursor`). Once set, boot never creates an
 /// archive in place of a missing one.

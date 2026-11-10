@@ -17,7 +17,7 @@ use cairn_models::session::events::codex::EventMapper;
 use cairn_models::session::events::{SessionEvent, TurnStatus};
 use cairn_models::session::one_shot::await_one_shot;
 use cairn_models::wire::codex_app_server::errors::{
-    active_turn_id_from_mismatch, is_missing_rollout_error, is_no_active_turn_error,
+    active_turn_id_from_mismatch, is_missing_thread_error, is_no_active_turn_error,
     is_selected_model_capacity_error,
 };
 use cairn_models::wire::codex_app_server::goal::{GoalStatus, GoalUpdatedNotification};
@@ -468,9 +468,28 @@ pub fn resume_unknown_thread_falls_back(env: &ContractEnv) -> CaseResult {
         Ok(result) => return Err(c.fail(format!("Codex resumed a thread it never had ({result})"))),
         Err(error) => error,
     };
-    c.that(is_missing_rollout_error(&error, &unknown), || {
-        format!("Codex's text for resuming an unknown thread is {error}, which is_missing_rollout_error does not match")
+    c.that(is_missing_thread_error(&error, &unknown), || {
+        format!("Codex's text for resuming an unknown thread is {error}, which is_missing_thread_error does not match")
     })?;
+    // A resume that clears a native goal asks `thread/goal/get` first, and a
+    // fork names its source; a thread pruned from the Codex home must read as
+    // missing to both, or the session fails instead of rebuilding.
+    for (method, params) in [
+        ("thread/goal/get", json!({"threadId": unknown})),
+        ("thread/fork", json!({"threadId": unknown})),
+    ] {
+        let error = match client.send_request(method, params) {
+            Ok(result) => {
+                return Err(c.fail(format!(
+                    "Codex answered {method} for a thread it never had ({result})"
+                )))
+            }
+            Err(error) => error,
+        };
+        c.that(is_missing_thread_error(&error, &unknown), || {
+            format!("Codex's text for {method} of an unknown thread is {error}, which is_missing_thread_error does not match")
+        })?;
+    }
     let session = c.ok(
         env.open(&client, Open::new().mcp(mcp).resume(&unknown)),
         "opening a resume of the unknown thread",

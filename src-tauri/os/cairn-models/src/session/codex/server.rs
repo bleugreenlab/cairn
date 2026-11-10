@@ -22,7 +22,7 @@ use crate::interface::session::{
     ServerLaunch, SessionError, SessionEvents, SessionFacts, SessionHost, SessionProvider,
     SessionSpec, SessionStart,
 };
-use crate::wire::codex_app_server::errors::is_missing_rollout_error;
+use crate::wire::codex_app_server::errors::is_missing_thread_error;
 
 /// Opens Codex threads.
 #[derive(Debug, Clone, Copy, Default)]
@@ -189,7 +189,7 @@ impl SessionProvider for CodexAppServer {
                         );
                         response
                     }
-                    Err(error) if is_missing_rollout_error(&error, backend_id) => {
+                    Err(error) if is_missing_thread_error(&error, backend_id) => {
                         log::warn!(
                             "Codex thread/resume failed for stale thread {}, starting fresh thread with transcript preload",
                             backend_id
@@ -220,28 +220,48 @@ impl SessionProvider for CodexAppServer {
                     session_id,
                     source_backend_id
                 );
-                let response = client
-                    .send_request(
-                        "thread/fork",
-                        build_thread_fork_params(
-                            source_backend_id,
-                            &cwd,
-                            approval_policy,
-                            sandbox_mode,
-                            model,
-                            effort,
-                            service_tier,
-                            base,
-                            developer,
-                        ),
-                    )
-                    .map_err(SessionError::Protocol)?;
-                log::info!(
-                    "Codex session start dispatched thread/fork for cairn_session_id={} source_backend_id={}",
-                    session_id,
-                    source_backend_id
+                let forked = client.send_request(
+                    "thread/fork",
+                    build_thread_fork_params(
+                        source_backend_id,
+                        &cwd,
+                        approval_policy,
+                        sandbox_mode,
+                        model,
+                        effort,
+                        service_tier,
+                        base,
+                        developer,
+                    ),
                 );
-                response
+                match forked {
+                    Ok(response) => {
+                        log::info!(
+                            "Codex session start dispatched thread/fork for cairn_session_id={} source_backend_id={}",
+                            session_id,
+                            source_backend_id
+                        );
+                        response
+                    }
+                    // The source thread was pruned from the Codex home (or
+                    // never reached it): rebuild from the source session's
+                    // transcript, as a stale resume does.
+                    Err(error) if is_missing_thread_error(&error, source_backend_id) => {
+                        log::warn!(
+                            "Codex thread/fork failed for missing source thread {}, starting fresh thread with transcript preload",
+                            source_backend_id
+                        );
+                        if let Some(text) = fallback_text() {
+                            opening_text = Some(text);
+                        }
+                        let response = client
+                            .send_request("thread/start", start_params())
+                            .map_err(SessionError::Protocol)?;
+                        rebuilt = true;
+                        response
+                    }
+                    Err(error) => return Err(SessionError::Protocol(error)),
+                }
             }
             SessionStart::New { session_id } => {
                 log::info!(
@@ -806,6 +826,59 @@ mod tests {
             methods(&requests),
             [
                 "thread/resume",
+                "thread/start",
+                "mcpServerStatus/list",
+                "turn/start"
+            ]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[3]["params"]["input"],
+            crate::wire::codex_app_server::build_codex_input(&MessageContent::text(
+                "TRANSCRIPT + latest"
+            ))
+            .unwrap()
+        );
+    }
+
+    /// A fork whose source thread is gone (pruned from the Codex home) rebuilds
+    /// a fresh thread whose first turn carries the transcript.
+    #[test]
+    fn a_fork_of_a_missing_thread_rebuilds_and_the_first_turn_carries_the_transcript() {
+        let (client, requests) =
+            scripted_client(|request| match request["method"].as_str().unwrap() {
+                "thread/fork" => Err("no rollout found for thread id thread-parent".to_string()),
+                "thread/start" => Ok(json!({"result": {"thread": {"id": "thread-rebuilt"}}})),
+                "mcpServerStatus/list" => Ok(json!({"result": ready_status()})),
+                "turn/start" => Ok(json!({"result": {"turn": {"id": "turn-1"}}})),
+                other => panic!("unexpected {other}"),
+            });
+        let host = host(empty_result);
+        let mut launched = CodexAppServer
+            .open(
+                &host,
+                spec(
+                    SessionStart::Fork {
+                        session_id: "session-2".to_string(),
+                        source_backend_id: "thread-parent".to_string(),
+                    },
+                    dedicated(client),
+                    NativeGoal::Leave,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            launched.facts.backend_session_id.as_deref(),
+            Some("thread-rebuilt")
+        );
+        launched
+            .control
+            .open_turn(&MessageContent::text("latest"))
+            .unwrap();
+        assert_eq!(
+            methods(&requests),
+            [
+                "thread/fork",
                 "thread/start",
                 "mcpServerStatus/list",
                 "turn/start"

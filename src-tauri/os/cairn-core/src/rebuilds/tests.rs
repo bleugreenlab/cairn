@@ -67,6 +67,62 @@ async fn two_boots_and_live_append_are_idempotent() {
     );
 }
 
+/// A finished rebuild's bun copy goes once its journal holds the outcome, and
+/// only that file: the rest of the directory and the journal are evidence. A
+/// rebuild still in flight keeps the bun it is running from.
+#[tokio::test]
+async fn a_finished_rebuild_releases_its_bun_copy_and_keeps_its_evidence() {
+    let dir = root();
+    let db = db().await;
+    let evidence = ["spec.json", "rebuild.js", "build.log", "actor.log"];
+    for id in ["finished", "in-flight"] {
+        let staged = dir.path().join(id);
+        fs::create_dir(&staged).unwrap();
+        for name in evidence.iter().chain([&ACTOR_RUNTIME]) {
+            fs::write(staged.join(name), id).unwrap();
+        }
+    }
+    let outcome = json!({"event":"outcome","rebuild":"finished","at":"2026-11-07T13:01:00Z","type":"outcome","outcome":"rolled_back","summary":"rolled back"});
+    write_events(dir.path(), "finished", &[phase("finished", "e1"), outcome]);
+    write_events(dir.path(), "in-flight", &[phase("in-flight", "e1")]);
+
+    for _ in 0..2 {
+        ingest_once(&db, dir.path(), ActorState::Loaded)
+            .await
+            .unwrap();
+        assert!(!dir.path().join("finished").join(ACTOR_RUNTIME).exists());
+        assert!(dir.path().join("in-flight").join(ACTOR_RUNTIME).is_file());
+        for id in ["finished", "in-flight"] {
+            assert!(dir.path().join(format!("{id}.jsonl")).is_file());
+            for name in evidence {
+                assert!(dir.path().join(id).join(name).is_file(), "{id}/{name}");
+            }
+        }
+    }
+    assert_eq!(
+        ledger::get(&db, "finished").await.unwrap().unwrap().status,
+        "rolled_back"
+    );
+}
+
+/// Only a regular file named `bun` is removed: a symlink there is not followed.
+#[tokio::test]
+async fn releasing_bun_never_follows_a_symlink() {
+    let dir = root();
+    let db = db().await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("bun");
+    fs::write(&target, "precious").unwrap();
+    fs::create_dir(dir.path().join("r1")).unwrap();
+    symlink(&target, dir.path().join("r1").join(ACTOR_RUNTIME)).unwrap();
+    let outcome = json!({"event":"outcome","rebuild":"r1","at":"2026-11-07T13:01:00Z","type":"outcome","outcome":"done","summary":"installed"});
+    write_events(dir.path(), "r1", &[outcome]);
+    ingest_once(&db, dir.path(), ActorState::Absent)
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "precious");
+}
+
 #[tokio::test]
 async fn conflicting_bytes_unknown_types_and_malformed_lines_are_faults() {
     let dir = root();

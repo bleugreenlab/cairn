@@ -1170,7 +1170,7 @@ fn the_inbound_guard_cannot_be_told_to_skip_its_check() {
 /// The log sink is the one crossing with no type to hold it: a `tracing` layer
 /// takes any `MakeWriter`, so a new layer — or a revert of one — opts out of
 /// redaction just by naming the raw writer, and nothing fails to compile. The
-/// rotated JSONL files and the runner service's `runner.err.log` are both
+/// rotated JSONL files and the runner service's `orch.err.log` are both
 /// durable, so an unscrubbed layer is a durable plaintext sink.
 ///
 /// Scope is every *layer construction*, not every `with_writer` call. Checking

@@ -104,9 +104,10 @@ struct CodexReasoningEffortEntry {
 }
 
 /// `command` without any credential it would inherit from this runner's
-/// environment (`cairn_common::auth::FORBIDDEN_LAUNCH_ENV`). Discovery spawns
-/// Codex itself, outside the session host, so it removes them itself.
-fn without_launch_credentials(mut command: Command) -> Command {
+/// environment (`cairn_common::auth::FORBIDDEN_LAUNCH_ENV`). Discovery and the
+/// home's retention pass spawn Codex themselves, outside the session host, so
+/// they remove them themselves.
+pub(super) fn without_launch_credentials(mut command: Command) -> Command {
     for name in cairn_common::auth::FORBIDDEN_LAUNCH_ENV {
         command.env_remove(name);
     }

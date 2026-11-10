@@ -431,13 +431,14 @@ impl AgentBackend for CodexBackend {
             config.system_prompt_dynamic_tail.as_deref(),
         );
 
-        // A resumed thread that is gone is rebuilt from Cairn's transcript; the
-        // first turn then carries that transcript before the latest message.
+        // A resumed or forked thread that is gone is rebuilt from Cairn's
+        // transcript; the first turn then carries that transcript before the
+        // latest message.
         let resume_fallback = {
             let run_db = run_db.clone();
-            let session_id = config.session_start.session_id().to_string();
+            let start = config.session_start.clone();
             let prompt = config.prompt.clone();
-            Box::new(move || build_resume_fallback_prompt(&run_db, &session_id, &prompt))
+            Box::new(move || build_resume_fallback_prompt(&run_db, &start, &prompt))
                 as Box<dyn FnMut() -> Option<String> + Send>
         };
         let spec = SessionSpec {

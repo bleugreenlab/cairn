@@ -1,5 +1,5 @@
-//! The history pack pass: writes a verified history pack for every execution
-//! resolved longer ago than the hot window, while the app runs.
+//! The history pack pass: resolved executions and whole closed thread-session
+//! ranges before their applied compaction boundary, while the app runs.
 //!
 //! It deletes nothing. Hot rows stay authoritative and `history_tier.evicted_at`
 //! stays null, so every reader keeps reading hot (see `HistoryReader`); the
@@ -50,6 +50,9 @@ use cairn_db::turso::params;
 
 use super::pacing::{acquire_gate, fold_if_due, FoldTally};
 use super::progress::{self, Progress};
+use crate::storage::history_pack::thread_range::{self, RangeCandidate};
+#[path = "pack_threads.rs"]
+mod threads;
 use crate::storage::content_store::ContentStore;
 use crate::storage::history_pack::catalog::{publish_to, PublishError, PublishFacts};
 use crate::storage::history_pack::write::{BuiltPack, HistoryPacker, PackBuildError, PackUnit};
@@ -93,7 +96,7 @@ pub struct PackBudget {
     pub floor_free_bytes: u64,
     /// ...and at least this percentage of its capacity.
     pub floor_free_pct: u64,
-    /// The most executions one pass packs. Unbounded in production; a
+    /// The most scopes (execution or thread range) one pass packs. Unbounded in production; a
     /// rehearsal sets it to measure a fixed sample.
     pub max_executions: usize,
 }
@@ -134,9 +137,24 @@ pub struct Passed {
     pub reason: String,
 }
 
+/// Work and elapsed budget charged to one candidate source.
+#[derive(Debug, Default, Clone)]
+pub struct SourceReport {
+    pub packed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub remaining: Option<usize>,
+    pub duration: Duration,
+}
+
 /// What one pass did.
 #[derive(Debug, Default, Clone)]
 pub struct PackReport {
+    pub executions: SourceReport,
+    pub threads: SourceReport,
+    /// Unevicted ranges examined for newly arrived or reopened work.
+    pub staleness_probes: usize,
+    pub stale_ranges: usize,
     pub packed: usize,
     pub pack_bytes: u64,
     /// The stored size of the packed executions' events, as read.
@@ -203,7 +221,7 @@ impl fmt::Display for PackReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} executions packed ({} packed vs {} hot, estimate {} at {} B/row, {} events), \
+            "{} scopes packed ({} packed vs {} hot, estimate {} at {} B/row, {} events), \
              {} skipped, {} failed in {} pages; catalog writes p50 {} ms, max {} ms; \
              gate wait {} ms (max {} ms), held max {} ms",
             self.packed,
@@ -242,6 +260,31 @@ impl fmt::Display for PackReport {
             },
             self.duration.as_secs_f64(),
         )?;
+        for (name, source) in [
+            ("executions", &self.executions),
+            ("thread ranges", &self.threads),
+        ] {
+            write!(
+                f,
+                "; {name}: {} packed, {} skipped, {} failed, remaining {}, budget {:.1} s",
+                source.packed,
+                source.skipped,
+                source.failed,
+                source
+                    .remaining
+                    .map_or("unknown".into(), |n| if n > REMAINING_PROBE {
+                        format!("more than {REMAINING_PROBE}")
+                    } else {
+                        n.to_string()
+                    }),
+                source.duration.as_secs_f64()
+            )?;
+        }
+        write!(
+            f,
+            "; staleness probes {}, invalidated {}",
+            self.staleness_probes, self.stale_ranges
+        )?;
         if !self.skipped.is_empty() {
             write!(f, "; skipped: {}", names(&self.skipped))?;
         }
@@ -264,8 +307,8 @@ static PASS_LOCKS: LazyLock<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex
 /// a row too large for a frame. Keyed by database and scope id, with the
 /// resolution the skip was for, so a later resolution is tried again. Kept for
 /// the life of the process: a restart tries each once more.
-static STANDING_SKIPS: LazyLock<std::sync::Mutex<HashMap<(u64, String), (i64, String)>>> =
-    LazyLock::new(Default::default);
+type StandingSkips = HashMap<(u64, String), (i64, String)>;
+static STANDING_SKIPS: LazyLock<std::sync::Mutex<StandingSkips>> = LazyLock::new(Default::default);
 
 fn pass_lock(db: &LocalDb) -> Arc<tokio::sync::Mutex<()>> {
     PASS_LOCKS
@@ -357,7 +400,20 @@ pub async fn run_pack_pass_at(
             }
         }
     }
-    report.remaining = probe_remaining(db, cutoff).await;
+    report.executions.remaining = probe_remaining(db, cutoff).await;
+    report.threads.remaining = threads::probe_remaining(
+        db,
+        cutoff,
+        budget,
+        report.bytes_per_row,
+        report.stopped.is_none(),
+    )
+    .await;
+    report.remaining = report
+        .executions
+        .remaining
+        .zip(report.threads.remaining)
+        .map(|(executions, threads)| executions.saturating_add(threads));
     report.duration = started.elapsed();
     report
 }
@@ -395,6 +451,8 @@ async fn bytes_per_row(db: &LocalDb, policy: PackPolicy) -> u64 {
     }
 }
 
+/// Executions lead, but may use only two thirds before threads get a turn.
+/// Once threads finish their walk, executions may spend the unused reservation.
 async fn walk(
     db: &LocalDb,
     store: &dyn ContentStore,
@@ -404,6 +462,64 @@ async fn walk(
     started: Instant,
     report: &mut PackReport,
 ) -> Result<(), Stop> {
+    if let Some(root) = store.local_root() {
+        check_floor(root, budget).await?;
+    }
+    let phase = Instant::now();
+    let result = walk_executions(
+        db,
+        store,
+        now,
+        cutoff,
+        budget,
+        started + execution_deadline(budget.pass_time),
+        report,
+    )
+    .await;
+    report.executions.duration += phase.elapsed();
+    let executions_done = result?;
+    let phase = Instant::now();
+    let result = threads::walk(db, store, now, cutoff, budget, started, report).await;
+    report.threads.duration += phase.elapsed();
+    let threads_done = result?;
+    let mut executions_done = executions_done;
+    if !executions_done && threads_done && started.elapsed() < budget.pass_time {
+        let phase = Instant::now();
+        let result = walk_executions(
+            db,
+            store,
+            now,
+            cutoff,
+            budget,
+            started + budget.pass_time,
+            report,
+        )
+        .await;
+        report.executions.duration += phase.elapsed();
+        executions_done = result?;
+    }
+    if !executions_done || !threads_done {
+        return Err(Stop::budget(format!(
+            "pass budget of {} s spent; both cursors resume next pass",
+            budget.pass_time.as_secs()
+        )));
+    }
+    Ok(())
+}
+
+fn execution_deadline(pass_time: Duration) -> Duration {
+    pass_time - pass_time / 3
+}
+
+async fn walk_executions(
+    db: &LocalDb,
+    store: &dyn ContentStore,
+    now: i64,
+    cutoff: i64,
+    budget: PackBudget,
+    deadline: Instant,
+    report: &mut PackReport,
+) -> Result<bool, Stop> {
     let saved = progress::load(db, progress::PACK)
         .await
         .map_err(|error| Stop::halt(format!("loading the pack cursor: {error}")))?;
@@ -420,22 +536,21 @@ async fn walk(
             .map_err(|error| Stop::halt(format!("loading pack candidates: {error}")))?;
         if page.is_empty() {
             // The end: start over next pass, so a skipped execution is retried.
-            return save_cursor(db, None).await;
+            save_cursor(db, None).await?;
+            return Ok(true);
         }
         for candidate in page {
-            if started.elapsed() >= budget.pass_time {
-                return Err(Stop::budget(format!(
-                    "pass budget of {} s spent; the next pass resumes after {}",
-                    budget.pass_time.as_secs(),
-                    after
-                        .as_ref()
-                        .map_or("the start", |done| done.execution_id.as_str())
-                )));
+            if Instant::now() >= deadline {
+                return Ok(false);
             }
             if let Some(root) = store.local_root() {
                 check_floor(root, budget).await?;
             }
+            let before = (report.packed, report.skipped.len(), report.failed.len());
             pack_candidate(db, store, now, budget, &candidate, report).await?;
+            report.executions.packed += report.packed - before.0;
+            report.executions.skipped += report.skipped.len() - before.1;
+            report.executions.failed += report.failed.len() - before.2;
             save_cursor(db, Some(&candidate)).await?;
             after = Some(candidate);
             tokio::task::yield_now().await;
@@ -465,9 +580,42 @@ async fn pack_candidate(
     candidate: &Candidate,
     report: &mut PackReport,
 ) -> Result<(), Stop> {
-    // An execution's scope id is its own id.
-    let execution_id = candidate.execution_id.clone();
-    if let Some(reason) = standing_skip(db, &execution_id, candidate.completed_at) {
+    pack_unit_candidate(
+        db,
+        store,
+        now,
+        budget,
+        &WorkUnit {
+            unit: PackUnit::Execution(candidate.execution_id.clone()),
+            resolved_at: candidate.completed_at,
+            thread: None,
+            label: format!("execution {}", candidate.execution_id),
+        },
+        report,
+    )
+    .await
+}
+
+struct WorkUnit {
+    unit: PackUnit,
+    resolved_at: i64,
+    thread: Option<RangeCandidate>,
+    label: String,
+}
+
+/// Both sources use the same gate, builder, publication and accounting.
+async fn pack_unit_candidate(
+    db: &LocalDb,
+    store: &dyn ContentStore,
+    now: i64,
+    budget: PackBudget,
+    work: &WorkUnit,
+    report: &mut PackReport,
+) -> Result<(), Stop> {
+    let execution_id = work.unit.scope().id;
+    let resolved_at = work.resolved_at;
+    let label = &work.label;
+    if let Some(reason) = standing_skip(db, &execution_id, resolved_at) {
         report.skipped.push(Passed {
             scope_id: execution_id,
             reason,
@@ -477,7 +625,7 @@ async fn pack_candidate(
     let mut gate_wait = Duration::ZERO;
     let permit = acquire_gate(&mut gate_wait).await.map_err(Stop::halt)?;
     let held_since = Instant::now();
-    let outcome = pack_execution(db, store, now, budget, candidate, report).await;
+    let outcome = pack_unit(db, store, now, budget, work, report).await;
     drop(permit);
     let held = held_since.elapsed();
     report.gate_wait += gate_wait;
@@ -489,7 +637,7 @@ async fn pack_candidate(
     match outcome {
         Ok(packed) => {
             log::info!(
-                "history pack: {execution_id} {} runs, {} events: {} packed vs {} hot (estimate {} at {} B/row) in {} ms, {} pages, gate wait {} ms, held {} ms",
+                "history pack: {label} {} runs, {} events: {} packed vs {} hot (estimate {} at {} B/row) in {} ms, {} pages, gate wait {} ms, held {} ms",
                 packed.runs,
                 packed.event_rows,
                 mib(packed.bytes),
@@ -516,9 +664,9 @@ async fn pack_candidate(
             Ok(())
         }
         Err(ExecutionError::Skip { reason, standing }) => {
-            log::info!("history pack: {execution_id} skipped: {reason}");
+            log::info!("history pack: {label} skipped: {reason}");
             if standing {
-                remember_skip(db, &execution_id, candidate.completed_at, &reason);
+                remember_skip(db, &execution_id, resolved_at, &reason);
             }
             report.skipped.push(Passed {
                 scope_id: execution_id,
@@ -527,7 +675,7 @@ async fn pack_candidate(
             Ok(())
         }
         Err(ExecutionError::Fail(reason)) => {
-            log::warn!("history pack: {execution_id} not packed: {reason}");
+            log::warn!("history pack: {label} not packed: {reason}");
             report.failed.push(Passed {
                 scope_id: execution_id,
                 reason,
@@ -551,32 +699,36 @@ struct Packed {
 
 /// Build, verify and catalog one execution's pack. Called holding the
 /// archival permit.
-async fn pack_execution(
+async fn pack_unit(
     db: &LocalDb,
     store: &dyn ContentStore,
     now: i64,
     budget: PackBudget,
-    candidate: &Candidate,
+    work: &WorkUnit,
     report: &mut PackReport,
 ) -> Result<Packed, ExecutionError> {
     let started = Instant::now();
-    let execution_id = candidate.execution_id.as_str();
-    if has_live_run(db, execution_id)
-        .await
-        .map_err(|error| ExecutionError::Halt(format!("checking for live runs: {error}")))?
-    {
-        return Err(ExecutionError::Skip {
-            reason: "a run is still live".into(),
-            standing: false,
-        });
+    let unit = &work.unit;
+    if let Some(candidate) = &work.thread {
+        validate_range(db, candidate, None).await?;
+    }
+    if let PackUnit::Execution(execution_id) = unit {
+        if has_live_run(db, execution_id)
+            .await
+            .map_err(|error| ExecutionError::Halt(format!("checking for live runs: {error}")))?
+        {
+            return Err(ExecutionError::Skip {
+                reason: "a run is still live".into(),
+                standing: false,
+            });
+        }
     }
     ensure_online(store).await?;
-    let unit = PackUnit::Execution(execution_id.to_string());
-    let mut packer = match HistoryPacker::start(db, &unit).await {
+    let mut packer = match HistoryPacker::start(db, unit).await {
         Ok(packer) => packer,
         Err(PackBuildError::NotFound(_)) => {
             return Err(ExecutionError::Skip {
-                reason: "its executions row is gone".into(),
+                reason: "its scope owner row is gone".into(),
                 standing: false,
             })
         }
@@ -625,6 +777,9 @@ async fn pack_execution(
     if bytes > budget.max_pack_bytes {
         return Err(oversize(budget, bytes, pages));
     }
+    if let Some(candidate) = &work.thread {
+        validate_range(db, candidate, Some(&built.manifest)).await?;
+    }
     let event_rows = built.stats.event_rows();
     let hot_estimate = event_rows.saturating_mul(report.bytes_per_row);
     let published = publish_to(
@@ -633,7 +788,7 @@ async fn pack_execution(
         &built,
         PublishFacts {
             hot_bytes_estimate: i64::try_from(hot_estimate).unwrap_or(i64::MAX),
-            resolved_at: candidate.completed_at,
+            resolved_at: work.resolved_at,
             packed_at: now,
         },
     )
@@ -654,6 +809,23 @@ async fn pack_execution(
         pages,
         took: started.elapsed(),
     })
+}
+
+async fn validate_range(
+    db: &LocalDb,
+    candidate: &RangeCandidate,
+    manifest: Option<&crate::storage::history_pack::Manifest>,
+) -> Result<(), ExecutionError> {
+    match thread_range::validate_candidate(db, candidate, manifest).await {
+        Ok(None) => Ok(()),
+        Ok(Some(reason)) => Err(ExecutionError::Skip {
+            reason,
+            standing: manifest.is_some(),
+        }),
+        Err(error) => Err(ExecutionError::Halt(format!(
+            "checking thread range closure: {error}"
+        ))),
+    }
 }
 
 fn oversize(budget: PackBudget, bytes: u64, pages: u64) -> ExecutionError {

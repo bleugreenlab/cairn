@@ -3422,7 +3422,7 @@ impl Orchestrator {
             let window_days =
                 crate::config::settings::load_archive_settings(&self.config_dir).hot_window_days();
             log::info!(
-                "history pack: on ({PACK_ENV}={pack_setting:?}), hot window {window_days} d, first pass in {}s, then every {}s",
+                "history pack: on ({PACK_ENV}={pack_setting:?}), scopes resolved executions and pre-compaction thread ranges, hot window {window_days} d, first pass in {}s, then every {}s",
                 PACK_FIRST_PASS_DELAY.as_secs(),
                 crate::archival::sweep::SWEEP_INTERVAL.as_secs()
             );

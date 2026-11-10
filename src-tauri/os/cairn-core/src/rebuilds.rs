@@ -27,6 +27,8 @@ const DIRECTORY_MODE: u32 = 0o700;
 const JOURNAL_MODE: u32 = 0o600;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// The private copy of bun the actor runs from, staged at `<root>/<id>/bun`.
+pub(crate) const ACTOR_RUNTIME: &str = "bun";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorState {
@@ -374,6 +376,12 @@ fn scan(root: &Path, uid: u32) -> Result<Vec<JournalRead>, IngestionFault> {
             Ok(bytes) => parse_journal(&bytes, id),
             Err(error) => (vec![], vec![error]),
         };
+        if entries
+            .iter()
+            .any(|(_, _, event)| event["type"] == "outcome")
+        {
+            release_actor_runtime(&directory, id);
+        }
         journals.push(JournalRead {
             id: id.into(),
             entries,
@@ -381,6 +389,54 @@ fn scan(root: &Path, uid: u32) -> Result<Vec<JournalRead>, IngestionFault> {
         });
     }
     Ok(journals)
+}
+
+/// Remove a finished rebuild's staged bun copy (~85 MiB). Once its journal
+/// holds an outcome the actor needs it no longer; everything else in `<id>/`
+/// (spec, script, build and actor logs) is the ledger's evidence and stays.
+/// The actor may still be exiting when its outcome lands, which is safe: an
+/// unlinked executable stays mapped until its process ends.
+///
+/// Reached through the checked root descriptor with no-follow opens, like every
+/// read here, and only a regular file is unlinked. Best-effort: a failure
+/// leaves the copy for the next pass.
+fn release_actor_runtime(directory: &File, id: &str) {
+    let (Ok(id_name), Ok(runtime)) = (CString::new(id), CString::new(ACTOR_RUNTIME)) else {
+        return;
+    };
+    // SAFETY: the root descriptor is checked and `id` is a validated basename.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            id_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        // No staged directory: a runner refusal, or a journal written by hand.
+        return;
+    }
+    // SAFETY: successful openat returned an owned descriptor.
+    let staged = unsafe { File::from_raw_fd(fd) };
+    // SAFETY: an all-zero `stat` is a valid out-parameter for fstatat.
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: both descriptors and the NUL-terminated name are live.
+    let found = unsafe {
+        libc::fstatat(
+            staged.as_raw_fd(),
+            runtime.as_ptr(),
+            &mut status,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0;
+    if !found || status.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return;
+    }
+    // SAFETY: as above; flag 0 unlinks a file, never a directory.
+    if unsafe { libc::unlinkat(staged.as_raw_fd(), runtime.as_ptr(), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(rebuild = id, %error, "could not remove a finished rebuild's bun copy");
+    }
 }
 
 /// One boot/live pass. The injected liveness observation is deliberately

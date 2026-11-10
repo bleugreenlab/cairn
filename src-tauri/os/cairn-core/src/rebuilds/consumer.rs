@@ -804,7 +804,7 @@ impl RebuildConsumer {
         })?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
-        let staged_bun = dir.join("bun");
+        let staged_bun = dir.join(super::ACTOR_RUNTIME);
         let staged_script = dir.join("rebuild.js");
         fs::copy(bun, &staged_bun).map_err(|error| format!("could not stage bun: {error}"))?;
         fs::set_permissions(&staged_bun, fs::Permissions::from_mode(0o700))

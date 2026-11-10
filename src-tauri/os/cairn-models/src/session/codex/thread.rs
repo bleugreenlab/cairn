@@ -8,7 +8,7 @@ use crate::wire::codex_app_server::goal::{
     parse_response, GoalClearResponse, GoalResponse, GoalStatus,
 };
 
-use crate::wire::codex_app_server::errors::is_missing_rollout_error;
+use crate::wire::codex_app_server::errors::is_missing_thread_error;
 use crate::wire::codex_app_server::thread::{
     ThreadLoadedListResponse, ThreadUnsubscribeResponse, ThreadUnsubscribeStatus,
 };
@@ -179,10 +179,10 @@ pub fn resume_thread(
     if clear_native_goal {
         match reconcile_goal(client, backend_id, None, true) {
             Ok(()) => {}
-            Err(error) if is_missing_rollout_error(&error, backend_id) => {
-                // A stale rollout has no live provider goal to contain. Let the
-                // ordinary resume path discover the stale id and rebuild from
-                // Cairn's transcript.
+            Err(error) if is_missing_thread_error(&error, backend_id) => {
+                // A thread Codex no longer has has no live provider goal to
+                // contain. Let the ordinary resume path discover the stale id
+                // and rebuild from Cairn's transcript.
             }
             Err(error) => return Err(error),
         }
@@ -379,6 +379,33 @@ mod tests {
             "tokenBudget": token_budget, "tokensUsed": 7, "timeUsedSeconds": 8,
             "createdAt": 1, "updatedAt": 2
         })
+    }
+
+    /// A thread pruned from the Codex home answers `thread/goal/get` with
+    /// "thread not found"; clearing its goal must not stop the resume from
+    /// reaching `thread/resume`, whose own refusal triggers the rebuild.
+    #[test]
+    fn clearing_the_goal_of_a_pruned_thread_still_asks_for_the_resume() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = AppServerClient::for_test_scripted(
+            vec![
+                Err("thread not found: thread-gone".to_string()),
+                Err("no rollout found for thread id thread-gone".to_string()),
+            ],
+            Arc::clone(&requests),
+        );
+        let error = resume_thread(
+            &client,
+            "thread-gone",
+            json!({"threadId": "thread-gone"}),
+            true,
+        )
+        .unwrap_err();
+        assert!(is_missing_thread_error(&error, "thread-gone"), "{error}");
+        assert_eq!(
+            request_methods(&requests),
+            ["thread/goal/get", "thread/resume"]
+        );
     }
 
     #[test]

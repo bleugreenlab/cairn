@@ -1,5 +1,6 @@
 use super::CODEX_BACKEND_NAME;
 use crate::backends::run_state::run_backend_db;
+use crate::backends::SessionStart;
 use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::sync::Arc;
@@ -11,13 +12,20 @@ const RESUME_FALLBACK_TRANSCRIPT_CHARS: usize = 24_000;
 // `base_instructions_from_segments` / `developer_instructions_from_segments`),
 // so sent bytes equal the persisted `system:prompt` segments by construction.
 
+/// The opening text for a thread rebuilt because Codex no longer has the one
+/// the session starts from: the transcript of the Cairn session that thread
+/// belonged to, then the latest message. A resume's thread is its own
+/// session's; a fork's is its parent session's, whose thread it forks.
 pub(super) fn build_resume_fallback_prompt(
     run_db: &Arc<LocalDb>,
-    stale_session_id: &str,
+    start: &SessionStart,
     latest_user_message: &str,
 ) -> Option<String> {
+    let stale_session_id = match start {
+        SessionStart::Fork { session_id, .. } => parent_session(run_db, session_id)?,
+        _ => start.session_id().to_string(),
+    };
     let db = run_db.clone();
-    let stale_session_id = stale_session_id.to_string();
     let event_rows: Vec<(String, i32, String, String)> =
         run_backend_db(CODEX_BACKEND_NAME, async move {
             db.read(|conn| {
@@ -64,6 +72,24 @@ pub(super) fn build_resume_fallback_prompt(
         &transcript,
         latest_user_message,
     ))
+}
+
+/// The session `session_id` continues from.
+fn parent_session(run_db: &Arc<LocalDb>, session_id: &str) -> Option<String> {
+    let db = run_db.clone();
+    let session_id = session_id.to_string();
+    run_backend_db(CODEX_BACKEND_NAME, async move {
+        db.query_opt(
+            "SELECT parent_session_id FROM sessions WHERE id = ?1",
+            params![session_id.as_str()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// Wrap a prior-session transcript and the latest reply into the fresh-thread
