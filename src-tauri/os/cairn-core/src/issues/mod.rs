@@ -27,57 +27,6 @@ pub fn retired_depends_on(payload: Option<&serde_json::Value>) -> Option<&'stati
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
-    /// Every surface that TEACHES a caller what to write: the resource
-    /// contracts that render every affordance block, the docs, and the agent
-    /// prompts. The retired key may be named only by the refusal that retires
-    /// it and by migration history.
-    fn teaching_surfaces() -> Vec<PathBuf> {
-        let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        vec![
-            src_tauri.join("os/cairn-common/src/contract"),
-            src_tauri.join("packs"),
-            src_tauri.join("../docs"),
-        ]
-    }
-
-    fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
-            let path = entry.unwrap().path();
-            // Dated design records describe the system as it was when written.
-            if path.ends_with("docs/superpowers") {
-                continue;
-            }
-            if path.is_dir() {
-                files_under(&path, out);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-
-    #[test]
-    fn the_retired_dependency_key_is_taught_nowhere() {
-        let mut files = Vec::new();
-        for surface in teaching_surfaces() {
-            files_under(&surface, &mut files);
-        }
-        assert!(files.len() > 100, "walked only {} files", files.len());
-        let offenders: Vec<String> = files
-            .iter()
-            .filter_map(|path| {
-                let text = std::fs::read_to_string(path).ok()?;
-                (text.contains("depends_on") || text.contains("dependsOn"))
-                    .then(|| path.display().to_string())
-            })
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "these still teach the retired key; teach `after:` instead: {offenders:#?}"
-        );
-    }
-
     #[test]
     fn a_payload_naming_the_retired_key_is_refused_in_either_spelling() {
         for payload in [

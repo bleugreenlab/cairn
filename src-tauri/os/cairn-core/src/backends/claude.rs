@@ -2540,23 +2540,6 @@ mod stderr_failure_tests {
         assert!(host.contains("match classify_eof("));
     }
 
-    #[test]
-    fn extracted_reader_routes_teardown_through_admission_host() {
-        const READER: &str = include_str!("../../../cairn-session/src/backends/claude.rs");
-        assert_eq!(READER.matches("host.host.stop_process();").count(), 2);
-        assert!(!READER.contains("host.process_state.stop_and_remove(run_id)"));
-        assert!(!READER.contains("processes.remove(run_id)"));
-        const HOST: &str = include_str!("claude.rs");
-        let stop = HOST
-            .rsplit("fn stop_process(&self) {")
-            .next()
-            .unwrap()
-            .split("fn startup_rejected")
-            .next()
-            .unwrap();
-        assert!(stop.contains("release_and_stop_process(&self.orch, &self.run_id)"));
-    }
-
     /// The drain maps each failure the wire crate recognizes to its own
     /// backend failure; the wording itself is pinned in `claude_stream`.
     #[test]

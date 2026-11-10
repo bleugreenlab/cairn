@@ -1326,6 +1326,7 @@ pub(crate) mod fixtures {
             paths.push(format!("src-tauri/{member}/Cargo.toml"));
         }
         for workspace_dir in ["web"].into_iter().map(PathBuf::from).chain(
+            // input-reads: packages/*/package.json, packages/*/tsconfig.json
             std::fs::read_dir(root.join("packages"))
                 .expect("packages/ exists")
                 .filter_map(Result::ok)

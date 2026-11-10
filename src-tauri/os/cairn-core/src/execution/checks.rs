@@ -17020,7 +17020,7 @@ cairn-common = { path = "../cairn-common" }
     }
 
     #[test]
-    fn repository_rust_checks_exclude_tauri_assets_and_cover_harness_inputs() {
+    fn repository_rust_tests_key_on_the_whole_workspace_and_cover_harness_inputs() {
         let config = include_str!("../../../../../.cairn/config.yaml");
         let (settings, _) = crate::config::project_settings::parse_project_settings(config)
             .expect("repository check config must parse");
@@ -17039,7 +17039,12 @@ cairn-common = { path = "../cairn-common" }
                 .collect::<Vec<_>>()
         };
 
-        assert!(applies("src-tauri/capabilities/default.json").is_empty());
+        // The app crate's tests `include_str!` its capability files, so a Tauri
+        // asset is a test input; clippy's lint key stays on sources.
+        assert_eq!(
+            applies("src-tauri/capabilities/default.json"),
+            vec!["rust-tests"]
+        );
         assert_eq!(
             applies("src-tauri/os/cairn-core/src/execution/checks.rs"),
             vec!["rust-lint", "rust-tests"]

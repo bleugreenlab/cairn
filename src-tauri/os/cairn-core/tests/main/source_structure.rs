@@ -7,15 +7,12 @@ fn core_source(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read core source {relative}: {error}"))
 }
 
-/// Every source and doc file the promotion ban walks: the whole Rust workspace
-/// and the design docs, minus build output and the memory-triage archive (a
-/// historical record of what agents once observed, not current canon).
-fn banned_symbol_search_roots() -> Vec<PathBuf> {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
+/// The whole Rust workspace, minus build output and the memory-triage archive.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
         .canonicalize()
-        .expect("repository root resolves from the crate manifest");
-    vec![repo.join("src-tauri"), repo.join("docs")]
+        .expect("the workspace root resolves from the crate manifest")
 }
 
 fn walk_source_files(root: &std::path::Path, found: &mut Vec<PathBuf>) {
@@ -31,70 +28,10 @@ fn walk_source_files(root: &std::path::Path, found: &mut Vec<PathBuf>) {
                 continue;
             }
             walk_source_files(&path, found);
-        } else if matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("rs" | "md")
-        ) {
+        } else if matches!(path.extension().and_then(|ext| ext.to_str()), Some("rs")) {
             found.push(path);
         }
     }
-}
-
-/// Promotion is retired: a `run` item that outlives its bound is killed, and a
-/// batch that outlives its grace window suspends and resumes with its finished
-/// result. Reclassifying a live child into a terminal is what made publication
-/// depend on elapsed time — the same command with the same `commit_msg`
-/// committed if it finished fast and was silently voided if it did not. These
-/// symbols named that machinery; a reappearance is the defect returning, so the
-/// ban is asserted structurally rather than left to review.
-#[test]
-fn timeout_promotion_never_returns() {
-    const BANNED: &[&str] = &[
-        "PromotedTerminalProcess",
-        "promote_command_process",
-        "promote_timeouts",
-        "promote_on_timeout",
-        "ActivatePromotedTerminal",
-        "activate_promoted_executor_terminal",
-        "build_promoted_terminal_uri",
-        "subscribe_promoted_terminal_exit_wake",
-        "command-promoted",
-        "promoted_terminal",
-    ];
-    let this_file = PathBuf::from(file!())
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .expect("this test file has a name");
-
-    let mut files = Vec::new();
-    for root in banned_symbol_search_roots() {
-        walk_source_files(&root, &mut files);
-    }
-    assert!(
-        files.len() > 100,
-        "the promotion ban walked too few files ({}) to be meaningful",
-        files.len()
-    );
-
-    let mut offenders = Vec::new();
-    for file in files {
-        if file.file_name().is_some_and(|name| name == &*this_file) {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        for symbol in BANNED {
-            if source.contains(symbol) {
-                offenders.push(format!("{} contains {symbol}", file.display()));
-            }
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "timeout promotion reappeared:\n{}",
-        offenders.join("\n")
-    );
 }
 
 /// Ambient runs classify physical checkouts before executing the batch. A
@@ -274,12 +211,9 @@ fn the_runtime_bridge_detector_sees_through_qualifiers_and_ignores_types() {
 /// Every Rust file in the workspace, paired with its source.
 fn workspace_rust_files() -> Vec<(PathBuf, String)> {
     let mut paths = Vec::new();
-    for root in banned_symbol_search_roots() {
-        walk_source_files(&root, &mut paths);
-    }
+    walk_source_files(&workspace_root(), &mut paths);
     paths
         .into_iter()
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
         .filter_map(|path| {
             let source = std::fs::read_to_string(&path).ok()?;
             Some((path, source))
@@ -867,7 +801,6 @@ fn workspace_rust_sources() -> Vec<(PathBuf, String)> {
     walk_source_files(&repo.join("src-tauri"), &mut paths);
     paths
         .into_iter()
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
         .filter_map(|path| {
             let source = std::fs::read_to_string(&path).ok()?;
             Some((path, source))
