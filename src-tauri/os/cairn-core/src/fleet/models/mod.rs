@@ -55,6 +55,7 @@ use crate::orchestrator::inference::load_inventory;
 use crate::orchestrator::inference_control::{
     self, deployment_phases, load_history, Heads, LoadRow, MachineReading, Need,
 };
+use crate::orchestrator::inference_generate::promotion::Gate;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 
@@ -402,13 +403,29 @@ async fn passed_book<'a>(
     Ok(book)
 }
 
-fn catalog_now(
+/// The pools detected now and what placement may acquire on them. A
+/// deployment of a generated profile no verification has promoted as it
+/// stands is refused here, by the same rule its start is refused by, so no
+/// request, pin, warm model or start by hand chooses it; only the claim of
+/// the verification the operator approved acquires one.
+async fn catalog_now(
+    db: &LocalDb,
     inventory: &Inventory,
     host: &dyn Host,
-) -> (Vec<Pool>, BTreeMap<DeploymentId, Acquirable>) {
+) -> Result<(Vec<Pool>, BTreeMap<DeploymentId, Acquirable>), String> {
     let pools = host.pools();
-    let catalog = rules::catalog(inventory, &pools, &host.roles());
-    (pools, catalog)
+    let mut catalog = rules::catalog(inventory, &pools, &host.roles());
+    let gate = Gate::load(db).await?;
+    for (id, acquirable) in catalog.iter_mut() {
+        let Some(deployment) = inventory.deployments.get(id) else {
+            continue;
+        };
+        if let Some(why) = gate.start_refusal(inventory, deployment) {
+            acquirable.pool = None;
+            acquirable.refused = Some(why);
+        }
+    }
+    Ok((pools, catalog))
 }
 
 /// One pass, holding the book.
@@ -425,7 +442,7 @@ async fn pass_locked(
     let requests = store::load_requests(db).await?;
     let stored_pins = store::load_pins(db).await?;
     let preferences = store::load_preferences(db).await?;
-    let (pools, catalog) = catalog_now(&inventory, host);
+    let (pools, catalog) = catalog_now(db, &inventory, host).await?;
     let readings = heads.readings();
     let attached: BTreeSet<String> = readings.keys().cloned().collect();
     let activity = Activity {
@@ -616,7 +633,7 @@ pub(crate) async fn request_with(
 ) -> Result<RequestHandle, String> {
     let mut book = passed_book(db, host, now).await?;
     let inventory = load_inventory(db).await?;
-    let (_, catalog) = catalog_now(&inventory, host);
+    let (_, catalog) = catalog_now(db, &inventory, host).await?;
     let deployment = choose_deployment(&catalog, &book.state.residents, model, verb, pool)?;
     let chosen = &catalog[&deployment];
     let pool = book
@@ -745,7 +762,7 @@ pub(crate) async fn pin_inner(
 ) -> Result<String, String> {
     let mut book = passed_book(db, host, now).await?;
     let inventory = load_inventory(db).await?;
-    let (_, catalog) = catalog_now(&inventory, host);
+    let (_, catalog) = catalog_now(db, &inventory, host).await?;
     let deployment = match &target {
         PinTarget::Model { name, pool } => {
             choose_deployment(&catalog, &book.state.residents, name, None, pool.as_ref())?
@@ -849,7 +866,7 @@ pub(crate) async fn release_with(
 ) -> Result<String, String> {
     let mut book = host.models().book.lock().await;
     let inventory = load_inventory(db).await?;
-    let (_, catalog) = catalog_now(&inventory, host);
+    let (_, catalog) = catalog_now(db, &inventory, host).await?;
     let pins = store::load_pins(db).await?;
     let matching: Vec<(&DeploymentId, &StoredPin)> = pins
         .iter()
@@ -930,7 +947,7 @@ pub(crate) async fn preference_with(
 ) -> Result<String, String> {
     let mut book = host.models().book.lock().await;
     let inventory = load_inventory(db).await?;
-    let (pools, catalog) = catalog_now(&inventory, host);
+    let (pools, catalog) = catalog_now(db, &inventory, host).await?;
     if !pools.iter().any(|p| &p.key == pool) {
         return Err(format!(
             "there is no pool {pool} now; cairn://inference/pools lists the pools placement detects"
@@ -1061,7 +1078,7 @@ pub(crate) async fn by_hand(
 ) -> Result<String, String> {
     let mut book = passed_book(db, host, now).await?;
     let inventory = load_inventory(db).await?;
-    let (_, catalog) = catalog_now(&inventory, host);
+    let (_, catalog) = catalog_now(db, &inventory, host).await?;
     let id = DeploymentId::from(id);
     let acquirable = catalog
         .get(&id)

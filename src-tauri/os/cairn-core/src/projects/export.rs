@@ -213,7 +213,11 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
     ),
     (
         "inference_generations",
-        "a profile generation on this runner's inference machines: its row names a workflow job and anchor issue, but the inference records and machines it generated for are this install's, which an export does not carry",
+        "a profile generation on this runner's inference machines: its private authorization ledger names a bound job and ordinary issue, but the inference records and machines it generated for are this install's, which an export does not carry",
+    ),
+    (
+        "inference_generation_runs",
+        "which of this runner's runs a profile generation holds to its scope: authority this install's own launches recorded about its own processes, which a destination neither runs nor may inherit",
     ),
     (
         "service_schedules",

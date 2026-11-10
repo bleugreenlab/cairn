@@ -335,6 +335,20 @@ pub trait AgentBackend: Send + Sync {
     /// Called after backend selection, before prompt building.
     fn resolve_tools(&self, agent_tools: &[String], agent_disallowed: &[String]) -> ResolvedTools;
 
+    /// Whether an agent session on this backend, with Cairn's server attached,
+    /// runs with every provider-native shell and file-edit tool removed, so
+    /// Cairn's verbs are its only reach into a machine. A launch whose scope
+    /// Cairn's resource gate alone enforces (a profile generation's agent)
+    /// refuses a backend that cannot show this. An allow-list is not removal:
+    /// a backend must prove the tools are absent, so the default refuses.
+    fn native_tools_removed(&self) -> Result<(), String> {
+        Err(format!(
+            "{} has not been shown to run an agent session without its native shell and \
+             file-edit tools",
+            self.name()
+        ))
+    }
+
     /// Start a new session. Spawns the process and event reader thread.
     /// Returns immediately — events flow through the Orchestrator's DB/emitter.
     /// Only [`launch::start_session`] can supply `admitted`, so every session

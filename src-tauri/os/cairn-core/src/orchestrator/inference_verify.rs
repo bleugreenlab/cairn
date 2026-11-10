@@ -46,8 +46,12 @@ use cairn_inference::{
 use cairn_models::types::catalog::VerbKind;
 use sha2::{Digest, Sha256};
 
-use super::inference::{load_inventory, write_inventory, Authoring, Removals};
+use super::inference::{
+    load_inventory, prepare_inventory_write, save_rows_in, write_inventory, Authoring, Removals,
+    RowChange, INVENTORY,
+};
 use super::inference_control::{load_history, load_states, rendered_head, SETTLE_MS};
+use super::inference_generate::promotion::{self, Admission, Binding, Gate};
 use crate::fleet::models::{self, store::load_pins, PinTarget};
 use crate::fleet::pools::{Pool, PoolKey};
 use crate::storage::{LocalDb, RowExt};
@@ -262,6 +266,9 @@ pub struct Planned {
     /// Who the deployment stays loaded for once it passes, when a load of its
     /// model started it; `None` unloads it after measuring.
     pub then_keep: Option<String>,
+    /// It is a generation draft revision's one claim, already running, that a
+    /// repeated start returned rather than starting another.
+    pub replayed: bool,
 }
 
 fn port_for(profile: &InferenceProfile) -> u16 {
@@ -271,7 +278,8 @@ fn port_for(profile: &InferenceProfile) -> u16 {
     }
 }
 
-/// The running row a verification claims its pool with.
+/// The running row a verification claims its pool with, the deployment rows
+/// it writes, and the generation state it binds, all written together.
 #[derive(Clone)]
 struct Claim {
     id: String,
@@ -282,15 +290,31 @@ struct Claim {
     machines_json: String,
     requested_by: String,
     started_at: i64,
+    changes: Vec<RowChange>,
+    binding: Option<Binding>,
 }
 
-/// Insert `claim`'s running row unless a verification is already running on its
-/// pool, whose id is returned instead, and trim the profile's history on the
-/// pool to [`KEPT`] rows. Two claims of one idle pool each read it idle under
-/// their own snapshot, so the read alone admits both; the partial unique index
-/// over running rows per pool makes the later commit conflict and re-run this
-/// closure, which then finds the earlier claim.
-async fn claim_pool(db: &LocalDb, claim: Claim) -> Result<Option<String>, String> {
+/// What claiming a pool came to.
+enum Claimed {
+    New,
+    /// Another verification runs on the pool.
+    Busy(String),
+    /// The draft revision's one claim was taken first; this is it.
+    Replay(String),
+    /// The generation is no longer bound as it was checked.
+    Unbound,
+}
+
+/// Insert `claim`'s running row and its deployment unless a verification is
+/// already running on its pool, and trim the profile's history on the pool to
+/// [`KEPT`] rows. A generation draft's claim also binds the generation's one
+/// verification of this revision, conditionally on its being still exactly
+/// as checked, in the same transaction; nothing is written when it is not.
+/// Two claims of one idle pool each read it idle under their own snapshot,
+/// so the read alone admits both; the partial unique index over running rows
+/// per pool makes the later commit conflict and re-run this closure, which
+/// then finds the earlier claim.
+async fn claim_pool(db: &LocalDb, claim: Claim) -> Result<Claimed, String> {
     db.write(move |conn| {
         let claim = claim.clone();
         Box::pin(async move {
@@ -302,9 +326,42 @@ async fn claim_pool(db: &LocalDb, claim: Claim) -> Result<Option<String>, String
                 )
                 .await?;
             if let Some(row) = running.next().await? {
-                return Ok(Some(row.text(0)?));
+                return Ok(Claimed::Busy(row.text(0)?));
             }
             drop(running);
+            if let Some(binding) = &claim.binding {
+                let bound = conn
+                    .execute(
+                        "UPDATE inference_generations SET verification_id = ?1
+                          WHERE id = ?2 AND state = 'running' AND draft_profile = ?3
+                            AND draft_revision = ?4 AND draft_digest = ?5
+                            AND approval_revision = ?4 AND approved_surface = ?6
+                            AND verification_id IS NULL",
+                        params![
+                            claim.id.clone(),
+                            binding.generation.clone(),
+                            binding.profile.clone(),
+                            binding.revision,
+                            binding.profile_digest.clone(),
+                            binding.surface_digest.clone()
+                        ],
+                    )
+                    .await?;
+                if bound == 0 {
+                    let mut current = conn
+                        .query(
+                            "SELECT verification_id FROM inference_generations WHERE id = ?1",
+                            params![binding.generation.clone()],
+                        )
+                        .await?;
+                    let existing = match current.next().await? {
+                        Some(row) => row.opt_text(0)?,
+                        None => None,
+                    };
+                    return Ok(existing.map_or(Claimed::Unbound, Claimed::Replay));
+                }
+            }
+            save_rows_in(conn, claim.changes.clone(), claim.started_at, None).await?;
             conn.execute(
                 "INSERT INTO inference_verifications
                    (id, profile_id, profile_digest, pool_id, deployment_id, machines_json,
@@ -331,16 +388,51 @@ async fn claim_pool(db: &LocalDb, claim: Claim) -> Result<Option<String>, String
                 params![claim.profile, claim.pool, KEPT],
             )
             .await?;
-            Ok(None)
+            Ok(Claimed::New)
         })
     })
     .await
     .map_err(|error| format!("write inference_verifications: {error}"))
 }
 
+/// The plan of a draft revision's claim that is already running, returned to
+/// a repeated start.
+fn replayed(
+    inventory: &Inventory,
+    claim: &VerificationRow,
+    network: &Network,
+) -> Result<Planned, String> {
+    let deployment = inventory
+        .deployments
+        .get(&DeploymentId::from(claim.deployment.as_str()))
+        .ok_or_else(|| {
+            format!(
+                "verification {} is running, and its deployment {} is gone",
+                claim.id, claim.deployment
+            )
+        })?;
+    let head = rendered_head(inventory, deployment, network)
+        .map_err(|problem| format!("verification {} is running: {problem}", claim.id))?;
+    Ok(Planned {
+        id: claim.id.clone(),
+        started_at: claim.started_at,
+        profile: InferenceProfileId::from(claim.profile.as_str()),
+        pool: PoolKey::from(claim.pool.as_str()),
+        deployment: deployment.id.clone(),
+        head,
+        then_keep: None,
+        replayed: true,
+    })
+}
+
 /// Refuse a verification that cannot start, write its deployment and its row,
-/// and return what to run. A machine it would use whose address is unknown is
-/// refused before anything is written.
+/// and return what to run. Every way a verification starts comes through
+/// here, so this is where a generation's draft is held to the operator's
+/// approval: the snapshot checked is the snapshot claimed and rendered, read
+/// and claimed under the inventory lock so nothing replaces it in between,
+/// and a refusal writes nothing. A machine it would use whose address is
+/// unknown is refused before anything is written. A repeated start of a draft
+/// revision whose one claim is running returns that claim.
 pub async fn begin(
     db: &LocalDb,
     profile_id: &str,
@@ -350,6 +442,7 @@ pub async fn begin(
     now: i64,
 ) -> Result<Planned, String> {
     let pool_id = &pool.key;
+    let held = INVENTORY.lock().await;
     let inventory = load_inventory(db).await?;
     let profile = inventory
         .profiles
@@ -371,6 +464,14 @@ pub async fn begin(
             pool.members.len()
         ));
     }
+    let binding = match Gate::load(db)
+        .await?
+        .verification_admission(&profile, pool_id.as_str())?
+    {
+        Admission::Ordinary => None,
+        Admission::Draft(binding) => Some(binding),
+        Admission::Replay(claim) => return replayed(&inventory, &claim, network),
+    };
     let id = uuid::Uuid::new_v4().to_string();
     for (pinned, stored) in load_pins(db).await? {
         let on_pool = inventory
@@ -410,12 +511,14 @@ pub async fn begin(
     };
     let mut records = Inventory::default();
     records.insert_deployment(deployment.clone());
-    write_inventory(
+    let (changes, _) = prepare_inventory_write(
         db,
+        &inventory,
         &Authoring::Patch {
             upsert: Some(records.to_yaml()),
             remove: Removals::default(),
         },
+        &held,
     )
     .await?;
     let claim = Claim {
@@ -430,12 +533,35 @@ pub async fn begin(
         .expect("machine names serialize"),
         requested_by: requested_by.to_string(),
         started_at: now,
+        changes,
+        binding,
     };
-    if let Some(running) = claim_pool(db, claim).await? {
-        return Err(format!(
-            "pool {pool_id} is already being verified (verification {running}); wait for it to finish"
-        ));
+    match claim_pool(db, claim).await? {
+        Claimed::New => {}
+        Claimed::Busy(running) => {
+            return Err(format!(
+                "pool {pool_id} is already being verified (verification {running}); wait for it to finish"
+            ))
+        }
+        Claimed::Replay(claimed) => {
+            let claim = load_verifications(db)
+                .await?
+                .into_iter()
+                .find(|row| row.id == claimed && row.outcome == "running")
+                .ok_or_else(|| {
+                    format!(
+                        "profile {profile_id} cannot be verified: this revision already had its one verification, {claimed}"
+                    )
+                })?;
+            return replayed(&load_inventory(db).await?, &claim, network);
+        }
+        Claimed::Unbound => {
+            return Err(format!(
+                "profile {profile_id} cannot be verified: its generation changed while the verification was being claimed; nothing was written"
+            ))
+        }
     }
+    drop(held);
     let head = match rendered_head(&inventory, &deployment, network) {
         Ok(head) => head,
         Err(problem) => {
@@ -454,6 +580,7 @@ pub async fn begin(
         deployment: deployment.id,
         head,
         then_keep: None,
+        replayed: false,
     })
 }
 
@@ -555,14 +682,35 @@ async fn keep(db: &LocalDb, act: &dyn Act, plan: &Planned, requester: &str) -> V
     }
 }
 
-/// Run one verification to its end.
+/// Run one verification to its end, then settle it: a pass of a generation
+/// draft revision's approved claim promotes that revision.
+///
+/// A generation's draft is never revised by its own verification: clamping its
+/// context would change the revision the operator approved and this claim is
+/// for. A draft whose context does not fit its cache fails, naming the cache
+/// it measured, so the generation can write a revision that fits.
 pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome, String> {
+    let generated = promotion::load_owned(db)
+        .await?
+        .contains_key(plan.profile.as_str());
     set_stage(db, &plan.id, Stage::Start).await?;
     if let Err(why) = act.pin(plan.deployment.to_string(), holder(&plan.id)).await {
         finish(db, &plan.id, false, Some(why.clone()), act.now_ms()).await?;
+        promotion::settled(db, &plan.id).await;
         return Ok(Outcome::Failed(why));
     }
-    let measured = measure(db, act, plan).await;
+    let mut measured = measure(db, act, plan).await;
+    if generated {
+        if let Ok(m) = &measured {
+            if let Some(kv) = m.kv.filter(|kv| m.context.is_some_and(|c| c > *kv)) {
+                record(db, &plan.id, m).await?;
+                measured = Err(format!(
+                    "it served, but its context of {} tokens is larger than the {kv}-token KV cache it measured; a generated draft is not revised by its verification, so it needs a revision whose context fits",
+                    m.context.unwrap_or_default()
+                ));
+            }
+        }
+    }
     let problems = match (&measured, &plan.then_keep) {
         (Ok(_), Some(requester)) => keep(db, act, plan, requester).await,
         _ => release(db, act, plan).await,
@@ -581,7 +729,7 @@ pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome,
             (Outcome::Passed, None)
         }
         Err(why) => match verify::kv_limit_from_failure(&why) {
-            Some(kv) if clamp_profile(db, &plan.profile, kv).await?.is_some() => (
+            Some(kv) if !generated && clamp_profile(db, &plan.profile, kv).await?.is_some() => (
                 Outcome::Clamped {
                     reason: why.clone(),
                     context: kv / 1024 * 1024,
@@ -604,6 +752,7 @@ pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome,
         act.now_ms(),
     )
     .await?;
+    promotion::settled(db, &plan.id).await;
     Ok(outcome)
 }
 
@@ -781,6 +930,7 @@ pub async fn recover(db: &LocalDb, act: &dyn Act) -> Result<Vec<String>, String>
         )
         .await?;
         let _ = act.unload(row.deployment.clone(), holder(&row.id)).await;
+        promotion::settled(db, &row.id).await;
         recovered.push(row.id.clone());
     }
     for (deployment, stored) in load_pins(db).await? {
@@ -862,6 +1012,16 @@ pub async fn verify_in_order(
                 )
                 .await
                 {
+                    Ok(plan) if plan.replayed => {
+                        results.push((
+                            plan.id.clone(),
+                            Outcome::Failed(format!(
+                                "verification {} of it is already running",
+                                plan.id
+                            )),
+                        ));
+                        break;
+                    }
                     Ok(plan) => plan,
                     Err(why) => {
                         results.push((String::new(), Outcome::Failed(why)));
@@ -1124,6 +1284,9 @@ pub async fn spawn(
         crate::fleet::unix_time_ms() as i64,
     )
     .await?;
+    if plan.replayed {
+        return Ok(plan);
+    }
     let planned = plan.clone();
     let live = Live::new(orch.clone())?;
     let requested_by = requested_by.to_string();
@@ -1155,6 +1318,8 @@ mod tests {
     use super::*;
     use crate::fleet::models::rules::Pin;
     use crate::fleet::models::store::{delete_pin, save_pin, StoredPin};
+    use crate::orchestrator::inference::{save_profile, WriteError};
+    use crate::orchestrator::inference_generate::{insert_generation, GenerationRow};
     use std::sync::Mutex;
 
     const PROFILE: &str = r#"
@@ -1219,6 +1384,8 @@ machines:
         pending: Mutex<Option<String>>,
         /// Placement refuses a request with this.
         refuse_request: Mutex<Option<String>>,
+        /// The KV cache the engine's metrics report, in tokens.
+        kv_tokens: Mutex<u64>,
     }
 
     impl<'a> Fake<'a> {
@@ -1231,6 +1398,7 @@ machines:
                 refuse_pin: Mutex::default(),
                 pending: Mutex::default(),
                 refuse_request: Mutex::default(),
+                kv_tokens: Mutex::new(100_000),
             }
         }
 
@@ -1353,11 +1521,14 @@ machines:
         }
 
         fn get(&self, url: String) -> Pending<'_, Option<String>> {
+            let kv = *self.kv_tokens.lock().unwrap();
             Box::pin(async move {
                 if url.ends_with("/v1/models") {
                     Some(r#"{"data":[{"id":"x","max_model_len":262144}]}"#.into())
                 } else if url.ends_with("/metrics") {
-                    Some("vllm:cache_config_info{kv_cache_size_tokens=\"100000\"} 1\n".into())
+                    Some(format!(
+                        "vllm:cache_config_info{{kv_cache_size_tokens=\"{kv}\"}} 1\n"
+                    ))
                 } else if url.ends_with("/version") {
                     Some(r#"{"version":"0.32.0"}"#.into())
                 } else {
@@ -1419,6 +1590,251 @@ machines:
             .await
             .unwrap();
         db
+    }
+
+    /// Make `profile` revision 1 of an open generation's draft on `box`,
+    /// approved by the operator or not. Its stored origin says nothing about
+    /// a generation: the ownership row alone governs it.
+    async fn own(db: &LocalDb, profile: &str, approved: bool) -> GenerationRow {
+        use crate::orchestrator::inference_generate::promotion::tests::{generation, owned};
+        let inventory = load_inventory(db).await.unwrap();
+        let row = owned(&inventory.profiles[&InferenceProfileId::from(profile)], 1);
+        db.execute(
+            "INSERT INTO inference_generated_profiles
+               (profile_id, generation_id, revision, profile_digest, surface_digest, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                row.profile.clone(),
+                row.generation.clone(),
+                row.revision,
+                row.profile_digest.clone(),
+                row.surface_digest.clone()
+            ],
+        )
+        .await
+        .unwrap();
+        let mut generation = generation(&row, None);
+        if !approved {
+            generation.approval_revision = None;
+            generation.approved_surface = None;
+        }
+        insert_generation(db, &generation).await.unwrap();
+        generation
+    }
+
+    async fn edit(db: &LocalDb, profile: &str, from: &str, to: &str) -> Result<String, WriteError> {
+        let yaml = crate::orchestrator::inference::profile_yaml(db, profile)
+            .await
+            .unwrap();
+        assert!(yaml.contains(from), "{yaml}");
+        save_profile(db, Some(profile), &yaml.replace(from, to)).await
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_draft_is_refused_by_every_start_of_its_verification_and_nothing_is_written(
+    ) {
+        let db = seeded("inference-verify-unapproved-draft").await;
+        own(&db, "embed", false).await;
+        let before = load_inventory(&db).await.unwrap();
+        let why = begin(&db, "embed", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap_err();
+        assert!(why.contains("has not approved"), "{why}");
+        // A load verifies its candidates in order through the same start.
+        let fake = Fake::new(&db);
+        let results = verify_in_order(
+            &db,
+            &fake,
+            vec!["embed".into()],
+            &solo(),
+            "operator",
+            false,
+            Some("operator"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&results[..], [(id, Outcome::Failed(why))] if id.is_empty() && why.contains("has not approved")),
+            "{results:?}"
+        );
+        assert_eq!(
+            load_inventory(&db).await.unwrap().deployments,
+            before.deployments,
+            "no deployment was written"
+        );
+        assert!(load_verifications(&db).await.unwrap().is_empty());
+        assert!(fake.calls().is_empty(), "nothing was pinned");
+        // Nor on another pool than its generation's, approved or not.
+        let db = seeded("inference-verify-other-pool").await;
+        own(&db, "embed", true).await;
+        let why = begin(
+            &db,
+            "embed",
+            &Pool::of_one("else"),
+            &Network::default(),
+            "operator",
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(why.contains("not else"), "{why}");
+        assert!(load_verifications(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_approved_draft_is_claimed_once_held_while_it_runs_and_promoted_only_by_its_pass() {
+        let db = seeded("inference-verify-approved-draft").await;
+        let generation = own(&db, "embed", true).await;
+        let plan = begin(&db, "embed", &solo(), &Network::default(), "agent", 1)
+            .await
+            .unwrap();
+        assert!(!plan.replayed);
+        let bound = crate::orchestrator::inference_generate::get_generation(&db, &generation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.verification_id.as_deref(), Some(plan.id.as_str()));
+        // A repeated start returns the one claim.
+        let again = begin(&db, "embed", &solo(), &Network::default(), "agent", 2)
+            .await
+            .unwrap();
+        assert!(again.replayed);
+        assert_eq!(again.id, plan.id);
+        assert_eq!(load_verifications(&db).await.unwrap().len(), 1);
+        // Neither the draft nor its claim's deployment changes while it runs.
+        let refused = edit(&db, "embed", "40960", "32768").await.unwrap_err();
+        assert!(String::from(refused).contains(&format!("verification {} is running", plan.id)));
+        let removed = crate::orchestrator::inference::delete_profile(&db, "embed").await;
+        assert!(removed.is_err());
+
+        let fake = Fake::new(&db);
+        *fake.kv_tokens.lock().unwrap() = 262_144;
+        assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
+        let owned = &promotion::load_owned(&db).await.unwrap()["embed"];
+        assert_eq!(owned.promoted.as_deref(), Some(plan.id.as_str()));
+        let gate = Gate::load(&db).await.unwrap();
+        assert!(!gate
+            .unpromoted_profiles(&load_inventory(&db).await.unwrap())
+            .contains("embed"));
+
+        // An edit loses the promotion for good: undoing it brings back the
+        // content, not the pass.
+        edit(&db, "embed", "40960", "32768").await.unwrap();
+        edit(&db, "embed", "32768", "40960").await.unwrap();
+        assert_eq!(
+            promotion::load_owned(&db).await.unwrap()["embed"].promoted,
+            None
+        );
+        let inventory = load_inventory(&db).await.unwrap();
+        assert!(Gate::load(&db)
+            .await
+            .unwrap()
+            .unpromoted_profiles(&inventory)
+            .contains("embed"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_verification_spends_its_revision() {
+        let db = seeded("inference-verify-draft-spent").await;
+        own(&db, "embed", true).await;
+        let plan = begin(&db, "embed", &solo(), &Network::default(), "agent", 1)
+            .await
+            .unwrap();
+        let fake = Fake::new(&db);
+        *fake.refuse_pin.lock().unwrap() = Some("no room".into());
+        assert!(matches!(
+            run(&db, &fake, &plan).await.unwrap(),
+            Outcome::Failed(_)
+        ));
+        assert_eq!(
+            promotion::load_owned(&db).await.unwrap()["embed"].promoted,
+            None
+        );
+        let why = begin(&db, "embed", &solo(), &Network::default(), "agent", 2)
+            .await
+            .unwrap_err();
+        assert!(
+            why.contains(&format!("already had its one verification, {}", plan.id)),
+            "{why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generated_draft_that_does_not_fit_its_cache_fails_and_is_not_rewritten() {
+        let db = seeded("inference-verify-draft-no-clamp").await;
+        own(&db, "chat", true).await;
+        let before =
+            load_inventory(&db).await.unwrap().profiles[&InferenceProfileId::from("chat")].clone();
+        let plan = begin(&db, "chat", &solo(), &Network::default(), "agent", 1)
+            .await
+            .unwrap();
+        let fake = Fake::new(&db);
+        let outcome = run(&db, &fake, &plan).await.unwrap();
+        assert!(
+            matches!(&outcome, Outcome::Failed(why) if why.contains("100000-token KV cache")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            load_inventory(&db).await.unwrap().profiles[&InferenceProfileId::from("chat")],
+            before,
+            "the approved revision is not clamped in place"
+        );
+        assert_eq!(
+            promotion::load_owned(&db).await.unwrap()["chat"].promoted,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_final_start_refuses_an_unpromoted_draft_and_starts_only_its_approved_claim() {
+        use crate::orchestrator::inference_control::tests::FakeHeads;
+        use crate::orchestrator::inference_control::{launch, load_states, request};
+        use cairn_inference::control::Request;
+
+        let db = seeded("inference-verify-final-start").await;
+        own(&db, "embed", true).await;
+        // A deployment of the draft written by hand, as a stale one would be.
+        write_inventory(
+            &db,
+            &Authoring::Patch {
+                upsert: Some(
+                    "deployments:\n  - {id: embed-box, profile: embed, machines: [box], head: box, apiPort: 8090, apiPath: /v1, healthPath: /v1/models}\n"
+                        .into(),
+                ),
+                remove: Removals::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let heads = FakeHeads::default();
+        heads.attach("box", 100, 0);
+        request(&db, &heads, "embed-box", Request::Start, 1)
+            .await
+            .unwrap();
+        launch(&db, &heads, &"embed-box".into(), 2).await.unwrap();
+        assert!(heads.starts().is_empty(), "nothing was sent");
+        let phase = &load_states(&db).await.unwrap()[&DeploymentId::from("embed-box")].phase;
+        assert!(
+            format!("{phase:?}").contains("no verification of it has passed"),
+            "{phase:?}"
+        );
+
+        // The approved claim's own deployment starts.
+        let plan = begin(&db, "embed", &solo(), &Network::default(), "agent", 3)
+            .await
+            .unwrap();
+        request(&db, &heads, plan.deployment.as_str(), Request::Start, 4)
+            .await
+            .unwrap();
+        launch(&db, &heads, &plan.deployment, 5).await.unwrap();
+        assert_eq!(heads.starts(), vec![plan.deployment.to_string()]);
+        // The stale one still does not, while the claim runs.
+        request(&db, &heads, "embed-box", Request::Start, 6)
+            .await
+            .unwrap();
+        launch(&db, &heads, &"embed-box".into(), 7).await.unwrap();
+        assert_eq!(heads.starts(), vec![plan.deployment.to_string()]);
     }
 
     #[tokio::test]
@@ -1818,6 +2234,8 @@ machines:
                 machines_json: r#"["box"]"#.into(),
                 requested_by: "operator".into(),
                 started_at: round,
+                changes: Vec::new(),
+                binding: None,
             });
             let admitted = std::thread::scope(|scope| {
                 let claimed: Vec<_> = claims
@@ -1826,7 +2244,10 @@ machines:
                         let (db, barrier, handle) = (&db, &barrier, runtime.handle().clone());
                         scope.spawn(move || {
                             barrier.wait();
-                            handle.block_on(claim_pool(db, claim)).unwrap().is_none()
+                            matches!(
+                                handle.block_on(claim_pool(db, claim)).unwrap(),
+                                Claimed::New
+                            )
                         })
                     })
                     .collect();

@@ -132,6 +132,21 @@ pub async fn dispatch_tool(
         );
     }
 
+    // An inference profile generation's agent is held to its own work by the
+    // same reasoning: judged on the pool-resolved run, from this host's own
+    // records of that run and its generation, before any handler.
+    if let Some(refusal) =
+        crate::orchestrator::inference_generate::scope::refuse(orch, request).await
+    {
+        return ObservedSafe::observe(
+            DispatchOutput {
+                content: refusal,
+                reminders: Vec::new(),
+            },
+            Crossing::FinalResponse,
+        );
+    }
+
     // Inbound crossing (CAIRN-3822). Placed after ownership fencing, which costs
     // no side effects either, and before everything that does: dedup bookkeeping,
     // continuation restoration, and every handler. Every authenticated dispatch

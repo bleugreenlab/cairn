@@ -78,6 +78,15 @@ pub enum ValidationError {
         profile: InferenceProfileId,
         placeholder: String,
     },
+    /// A container's env (`rank` `None`) or one rank's env reading a
+    /// secret-named variable that nothing fills in at container start. Names
+    /// the key and the reference, never the value.
+    UnresolvedSecret {
+        profile: InferenceProfileId,
+        key: String,
+        rank: Option<usize>,
+        reference: String,
+    },
     /// A container spanning machines without exactly one rank env per
     /// machine.
     RanksMismatch {
@@ -170,6 +179,29 @@ impl fmt::Display for ValidationError {
                 profile,
                 placeholder,
             } => write!(f, "profile {profile} uses unknown placeholder {{{placeholder}}}"),
+            Self::UnresolvedSecret {
+                profile,
+                key,
+                rank,
+                reference,
+            } => {
+                let at = rank.map(|rank| format!("rank {rank} ")).unwrap_or_default();
+                write!(
+                    f,
+                    "profile {profile} {at}env {key} reads ${{{reference}}}, a secret-named variable nothing fills in at container start: Cairn hands env to the container as written, so it would get that text where a credential should be. Remove the entry or give it a value that is not a secret"
+                )?;
+                let upper = reference.to_ascii_uppercase();
+                if upper.starts_with("HF_") || upper.contains("HUGGING") {
+                    write!(
+                        f,
+                        "; a profile that mounts the Hugging Face cache needs no token in the container, since Cairn fetches its pinned weights on the host with that machine's own token and runs the container offline (HF_HUB_OFFLINE=1)"
+                    )?;
+                }
+                write!(
+                    f,
+                    ". A secret the server itself needs at runtime has no supported store yet"
+                )
+            }
             Self::RanksMismatch {
                 profile,
                 ranks,

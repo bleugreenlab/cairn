@@ -401,7 +401,7 @@ fn backend_for(prepared: &PreparedJob) -> std::sync::Arc<dyn crate::backends::Ag
 
 /// The provider key `backend_for` resolves: the same key the usage pool and
 /// account surfaces are addressed by.
-fn backend_key_for(prepared: &PreparedJob) -> String {
+pub(super) fn backend_key_for(prepared: &PreparedJob) -> String {
     crate::backends::effective_backend_name(
         prepared
             .agent_config

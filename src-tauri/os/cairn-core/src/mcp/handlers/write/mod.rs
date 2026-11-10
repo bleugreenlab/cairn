@@ -1101,6 +1101,22 @@ async fn handle_write_attempt(
     // ledger itself before dispatching any effects.
     let write_call = replay::invoking_write_call(orch, request).await;
 
+    // A generated draft spends one of its generation's bounded attempts, so it
+    // applies only under this ledger's resource claim: a delivery that cannot
+    // name its own call, or that rides a file batch's ledger, could be a second
+    // delivery spending a second attempt.
+    let draft_item = payload
+        .changes
+        .iter()
+        .position(crate::orchestrator::inference_generate::scope::submits_draft);
+    if let Some(index) = draft_item.filter(|_| has_file_targets || write_call.is_none()) {
+        return deny_change(
+            &payload.changes,
+            index,
+            crate::orchestrator::inference_generate::scope::UNGUARDED_DRAFT.to_string(),
+        );
+    }
+
     // The logical coordinate and every anchor evaluation must belong to the
     // same writer epoch as publication. A locked write holds the store lock
     // from here to the seal. An optimistic one reads the head without it and
@@ -1642,7 +1658,15 @@ async fn handle_write_attempt(
                     atomic,
                 );
             }
-            replay::ResourceClaim::Unguarded => {}
+            replay::ResourceClaim::Unguarded => {
+                if let Some(index) = draft_item {
+                    return deny_change(
+                        &payload.changes,
+                        index,
+                        crate::orchestrator::inference_generate::scope::UNGUARDED_DRAFT.to_string(),
+                    );
+                }
+            }
         }
     }
     let mut applied: Vec<AppliedChange> = Vec::new();

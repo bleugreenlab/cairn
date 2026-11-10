@@ -622,14 +622,20 @@ fn is_workflow_child_run(orch: &Orchestrator, run_id: &str) -> bool {
 /// interrupting message, a model switch, closing an issue) go through
 /// [`stop_session`] and leave the operator's choice alone.
 pub fn operator_stop_run(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
-    if let Some(job_id) = job_id_for_run(orch, run_id) {
+    let job_id = job_id_for_run(orch, run_id);
+    if let Some(job_id) = &job_id {
         crate::execution::jobs::record_goal_intent(
             orch,
-            &job_id,
+            job_id,
             crate::execution::jobs::GoalIntent::Off,
         )?;
     }
-    stop_session(orch, run_id)
+    let stopped = stop_session(orch, run_id);
+    if let Some(job_id) = &job_id {
+        // The operator's stop also cancels a profile generation the job runs.
+        crate::orchestrator::inference_generate::after_operator_stop(orch, job_id);
+    }
+    stopped
 }
 
 /// The operator pressed Stop on a job. See [`operator_stop_run`].
@@ -641,7 +647,9 @@ pub fn operator_stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String
             crate::execution::jobs::GoalIntent::Off,
         )?;
     }
-    stop_job(orch, job_id)
+    let stopped = stop_job(orch, job_id);
+    crate::orchestrator::inference_generate::after_operator_stop(orch, job_id);
+    stopped
 }
 
 /// Stop a running backend session, cascading to child runs

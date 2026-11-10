@@ -38,6 +38,7 @@ use cairn_inference::{
 };
 
 use super::inference::load_inventory;
+use super::inference_generate::promotion::{self, Gate};
 use super::Orchestrator;
 use crate::fleet::inference::Preemption;
 use crate::fleet::models::room::{gpu_allocated_bytes, RunningBatch};
@@ -1193,6 +1194,13 @@ pub(crate) async fn refuse(
 
 /// Send a reserving start to its head: placement found every machine of its
 /// gang with the room it needs. A start that cannot be sent fails, naming why.
+///
+/// This is the one place a container start leaves Cairn, so it is where a
+/// generation-origin profile is held to its promotion
+/// ([`super::inference_generate::promotion::Gate::start_refusal`]), against the
+/// same inventory snapshot the start is rendered from: whatever route asked
+/// for the start, an unpromoted draft fails here, and so does a promotion
+/// that cannot be read.
 pub(crate) async fn launch(
     db: &LocalDb,
     heads: &dyn Heads,
@@ -1203,6 +1211,26 @@ pub(crate) async fn launch(
     let Some(deployment) = inventory.deployments.get(id) else {
         return Err(format!("there is no deployment {id}"));
     };
+    let refusal = match Gate::load(db).await {
+        Ok(gate) => gate.start_refusal(&inventory, deployment),
+        Err(why) => Some(format!(
+            "whether its profile may start could not be read: {why}"
+        )),
+    };
+    if let Some(reason) = refusal {
+        log::warn!("inference: refused to start {id}: {reason}");
+        apply(
+            db,
+            &inventory,
+            id,
+            Observation::NotSent { reason },
+            Matching::Any,
+            None,
+            now_ms,
+        )
+        .await?;
+        return Ok(());
+    }
     let plan = match Plan::of(&inventory, deployment, &heads.network()) {
         Ok(plan) => plan,
         Err(why) => {
@@ -1279,6 +1307,12 @@ pub async fn load_control_view(orch: &Orchestrator) -> Result<ControlView, Strin
 /// its head attaches, so a model left running is adopted.
 pub fn spawn_deployment_control(orch: Orchestrator) {
     tokio::spawn(async move {
+        // Before the first tick, so a profile generated before ownership was
+        // recorded, or a pass a stopped orch did not promote, is settled
+        // before anything weighs whether it may start.
+        if let Err(error) = promotion::reconcile(&orch.db.local).await {
+            log::warn!("inference: generated profiles could not be reconciled: {error}");
+        }
         let mut reports = orch.fleet.subscribe_deployment_reports();
         let mut probes = Probes::default();
         let mut ticks = tokio::time::interval(TICK);

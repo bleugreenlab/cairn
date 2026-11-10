@@ -1,0 +1,26 @@
+cairnVersion: 1
+name: Generate a profile
+description: One Inference Profiler agent generates an inference profile for a model on a pool
+trigger: manual
+system: true
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 240@90
+  config:
+    triggerType: manual
+    scope: issue
+- id: profiler-1
+  type: agent
+  name: Profiler
+  position: 240@260
+  config:
+    agent: inference-profiler
+edges:
+- from: trigger-1@control-out
+  to: profiler-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: profiler-1@context-in
+  type: context

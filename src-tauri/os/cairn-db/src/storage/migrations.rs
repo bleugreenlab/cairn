@@ -2676,6 +2676,26 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "inference_generations",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // Which inventory profiles a generation wrote and whether a verification
+    // pass promoted that exact revision (cairn/6093). It follows the profiles
+    // it guards, so it is host configuration rather than runner state.
+    (
+        "inference_generated_profiles",
+        TableScope::Private(PrivateReason::HostConfiguration),
+    ),
+    // Which of this runner's runs a generation holds to its scope (cairn/6093):
+    // authority this install's own launches recorded, which no replica supplies.
+    (
+        "inference_generation_runs",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // What a generation regenerating a profile in place captured of it at
+    // launch (cairn/6093): authority this install's own launch recorded about
+    // its own inventory.
+    (
+        "inference_generation_replacements",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // What this runner has commanded its inference machines to do (cairn/5660):
     // the phase of each deployment it acted on, and the loads it measured.
     (

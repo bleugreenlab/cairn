@@ -346,6 +346,25 @@ pub(crate) async fn preview_execution(
     project_id: &str,
 ) -> Result<Vec<StepPreview>, String> {
     let (snapshot, jobs) = load_snapshot_and_jobs(db, execution_id).await?;
+    preview_with_jobs(orch, &snapshot, &jobs, project_id)
+}
+
+/// Preview every agent step of a snapshot no execution holds yet: what each
+/// step's launch would select now.
+pub(crate) fn preview_snapshot(
+    orch: &Orchestrator,
+    snapshot: &ExecutionSnapshot,
+    project_id: &str,
+) -> Result<Vec<StepPreview>, String> {
+    preview_with_jobs(orch, snapshot, &HashMap::new(), project_id)
+}
+
+fn preview_with_jobs(
+    orch: &Orchestrator,
+    snapshot: &ExecutionSnapshot,
+    jobs: &HashMap<String, NodeJob>,
+    project_id: &str,
+) -> Result<Vec<StepPreview>, String> {
     let defaults = orch.effective_models(Some(project_id))?.default_models;
     let steps: Vec<StepInput> = snapshot
         .recipe

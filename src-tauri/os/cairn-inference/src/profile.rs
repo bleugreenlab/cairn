@@ -493,7 +493,76 @@ pub fn placeholders(text: &str) -> Vec<&str> {
     found
 }
 
+/// Whether `name` names a secret: any word (split at `_`) of `SECRET`,
+/// `PASSWORD`, `PASSWD`, `PASSPHRASE`, `CREDENTIAL(S)`, `APIKEY(S)` or `PAT`,
+/// or a last word of `TOKEN`, `KEY` or `KEYS` (`HF_TOKEN`, `VLLM_API_KEY`).
+/// `MAX_NUM_BATCHED_TOKENS` and `LONG_PREFILL_TOKEN_THRESHOLD` are counts, so
+/// `TOKENS` and a `TOKEN` before another word are not.
+pub fn is_secret_name(name: &str) -> bool {
+    const ANYWHERE: &[&str] = &[
+        "SECRET",
+        "SECRETS",
+        "PASSWORD",
+        "PASSWORDS",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "APIKEY",
+        "APIKEYS",
+        "PAT",
+    ];
+    let upper = name.to_ascii_uppercase();
+    let words: Vec<&str> = upper.split('_').filter(|w| !w.is_empty()).collect();
+    words.iter().any(|word| ANYWHERE.contains(word))
+        || words
+            .last()
+            .is_some_and(|last| matches!(*last, "TOKEN" | "KEY" | "KEYS"))
+}
+
+/// Every secret-named variable `value` reads in Compose's grammar (`$NAME`,
+/// `${NAME}`, `${NAME:-word}` and the other operators, nested words
+/// included), skipping the `$$` escape.
+///
+/// The renderer passes a container's env to the runtime as written and
+/// nothing at container start expands it, so such a reference in an env
+/// value is the reference's own text standing where a credential should be.
+/// Only env is read: a container's args are shell text its own shell may
+/// expand from its env, so `${HF_TOKEN}` there is deliberate.
+pub fn secret_references(value: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = value;
+    while let Some(at) = rest.find('$') {
+        let after = &rest[at + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            rest = tail;
+            continue;
+        }
+        let body = after.strip_prefix('{').unwrap_or(after);
+        let len = body
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(body.len());
+        let name = &body[..len];
+        if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && is_secret_name(name) {
+            found.push(name);
+        }
+        rest = after;
+    }
+    found
+}
+
 impl Container {
+    /// Every env value with its key and, for a rank's own env, its rank.
+    pub fn env_entries(&self) -> impl Iterator<Item = (Option<usize>, &str, &str)> {
+        self.env
+            .iter()
+            .map(|(key, value)| (None, key.as_str(), value.as_str()))
+            .chain(self.ranks.iter().enumerate().flat_map(|(rank, env)| {
+                env.iter()
+                    .map(move |(key, value)| (Some(rank), key.as_str(), value.as_str()))
+            }))
+    }
+
     /// Every string the renderer fills placeholders in.
     fn templated(&self) -> impl Iterator<Item = &str> {
         self.args
@@ -713,6 +782,16 @@ impl InferenceProfile {
                 placeholder,
             });
         }
+        for (rank, key, value) in container.env_entries() {
+            for reference in secret_references(value) {
+                problems.push(ValidationError::UnresolvedSecret {
+                    profile: profile(),
+                    key: key.to_string(),
+                    rank,
+                    reference: reference.to_string(),
+                });
+            }
+        }
         let machines = self.requirements.machines as usize;
         let ranks_fit = if machines > 1 {
             container.ranks.len() == machines
@@ -843,6 +922,112 @@ mod tests {
         assert_eq!(placeholders("{{port}}"), vec!["port"]);
         assert!(placeholders("--node-rank ${NODE_RANK} ${HEADLESS:+--headless} ${A}").is_empty());
         assert_eq!(placeholders("${A}{port}"), vec!["port"]);
+    }
+
+    #[test]
+    fn secret_names_are_tokens_keys_and_passwords_not_counts() {
+        for name in [
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "GITHUB_TOKEN",
+            "VLLM_API_KEY",
+            "DSPARK_API_KEYS",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "GITHUB_PAT",
+            "hf_token",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+        for name in [
+            "MAX_NUM_BATCHED_TOKENS",
+            "LONG_PREFILL_TOKEN_THRESHOLD",
+            "TP3_PATCH_DIR",
+            "VLLM_PORT",
+            "HF_HOME",
+            "DSPARK_REVISION",
+        ] {
+            assert!(!is_secret_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn secret_references_follow_compose_and_skip_escapes_and_other_names() {
+        assert_eq!(secret_references("${HF_TOKEN}"), vec!["HF_TOKEN"]);
+        assert_eq!(secret_references("$HF_TOKEN"), vec!["HF_TOKEN"]);
+        assert_eq!(
+            secret_references("Bearer ${VLLM_API_KEY:-${FALLBACK_TOKEN}}"),
+            vec!["VLLM_API_KEY", "FALLBACK_TOKEN"]
+        );
+        assert!(secret_references("$${HF_TOKEN} and $$HF_TOKEN").is_empty());
+        assert!(secret_references("${HF_HOME}/x $HOME cost $5 $").is_empty());
+        assert!(secret_references("${MAX_NUM_BATCHED_TOKENS}").is_empty());
+        assert!(secret_references("hf_literalvalue").is_empty());
+    }
+
+    #[test]
+    fn a_container_env_reading_a_secret_nothing_fills_is_refused_by_name_only() {
+        let mut engine = container(format!("ghcr.io/org/server@sha256:{SHA}"));
+        // Args are the container's own shell text, expanded from its env.
+        engine.args = vec![
+            "bash".into(),
+            "-c".into(),
+            "serve --key ${VLLM_API_KEY}".into(),
+        ];
+        engine.env.insert("HF_TOKEN".into(), "${HF_TOKEN}".into());
+        engine.env.insert("HF_HOME".into(), "$${HF_HOME}".into());
+        engine.ranks = vec![
+            BTreeMap::new(),
+            BTreeMap::from([("AUTH".to_string(), "Bearer $PEER_TOKEN".to_string())]),
+        ];
+        let mut gang = profile(Engine::Container(engine.clone()), vec![weight(SHA)]);
+        gang.requirements.machines = 2;
+        let problems = gang.problems();
+        assert_eq!(
+            problems,
+            vec![
+                ValidationError::UnresolvedSecret {
+                    profile: "r".into(),
+                    key: "HF_TOKEN".into(),
+                    rank: None,
+                    reference: "HF_TOKEN".into(),
+                },
+                ValidationError::UnresolvedSecret {
+                    profile: "r".into(),
+                    key: "AUTH".into(),
+                    rank: Some(1),
+                    reference: "PEER_TOKEN".into(),
+                },
+            ]
+        );
+        let said: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        assert!(
+            said[0].contains("env HF_TOKEN reads ${HF_TOKEN}"),
+            "{}",
+            said[0]
+        );
+        assert!(
+            said[0].contains("on the host with that machine's own token"),
+            "{}",
+            said[0]
+        );
+        assert!(
+            said[1].contains("rank 1 env AUTH reads ${PEER_TOKEN}"),
+            "{}",
+            said[1]
+        );
+        assert!(!said[1].contains("Hugging Face"), "{}", said[1]);
+        assert!(
+            !said[1].contains("Bearer"),
+            "the value is never said: {}",
+            said[1]
+        );
+        assert!(said.iter().all(|s| s.contains("no supported store")));
+
+        engine.env.remove("HF_TOKEN");
+        engine.ranks[1].insert("AUTH".into(), "none".into());
+        gang.engine = Engine::Container(engine);
+        assert_eq!(gang.problems(), vec![]);
     }
 
     #[test]

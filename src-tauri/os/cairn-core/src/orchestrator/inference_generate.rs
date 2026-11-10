@@ -1,29 +1,13 @@
-//! Generating a profile is an agent session (tenet 1364).
+//! Generating a profile is an ordinary, messageable issue session (tenet 1364).
 //!
-//! The operator names a model and a pool in Settings > Inference, and
-//! [`launch`] starts the shipped `inference-generate` workflow on them. Its
-//! script gathers the facts this module and its reads give it (the model's
-//! files, the pool's hardware, the fit arithmetic and the shipped templates as
-//! starting points), has a read-only agent research how the model is best run
-//! there, asks the operator the questions the agent found worth asking, has the
-//! agent write a profile and has verification measure it, revising within a
-//! bounded number of attempts. There is no other way Cairn generates a profile.
+//! The issue owns conversation and execution status. The private generation
+//! ledger owns its exact launch binding, candidate budget, draft revision,
+//! consent and cleanup. A candidate advances inventory and authority together.
+//! Only server-minted operator consent admits the exact revision to verification;
+//! only verification can promote it for ordinary loading.
 //!
-//! Every write the session makes is the script's, through two narrow doors
-//! only its own workflow node may use: [`write_generated`] writes its draft
-//! profile, stamped with the run that wrote it, and [`record_outcome`] ends
-//! the generation. Verification decides: a generation ends `verified` only
-//! with a passed verification of its draft on its pool, and any other ending
-//! removes the draft, so a generated profile in the inventory is one that
-//! loaded and was measured. Each generation is a row in
-//! `inference_generations`, which is what lets the operator come back to one.
-//!
-//! A machine's hardware comes from its executor's latest health: the GPU's
-//! vendor (its accelerator family), name and memory, the machine's memory and
-//! CPU architecture, read from the GPUs a model runs on (its discrete cards
-//! when it has any). A machine that reports no GPU has no known accelerator
-//! and is refused by name unless the generation states its hardware; nothing
-//! assumes one. The accelerator chooses the templates that serve the pool.
+//! Scope survives terminal state and session rotation. Legacy workflows are
+//! fenced and reconciled at upgrade, never converted into ordinary sessions.
 
 use std::collections::BTreeMap;
 
@@ -31,27 +15,38 @@ use cairn_common::executor_protocol::{
     model_gpus, ExecutorHealthSnapshot, GpuDevice, GpuMemory, GpuVendor, MachineMemory,
     MeasurementReading,
 };
-use cairn_common::identity::AppearanceTransport;
 use cairn_inference::fit::{self, Arch, HwMemory, MachineHw, PoolHw, Predicted};
 use cairn_inference::hf::{self, RepoFiles};
 use cairn_inference::{
-    AcceleratorFamily, Addresses, CitedSource, DeploymentId, Engine, InferenceProfile,
-    InferenceProfileId, Inventory, MachineName, Model, Network, OperatorAnswer, ProfileOrigin,
-    RecordSource,
+    AcceleratorFamily, Addresses, CitedSource, Engine, InferenceProfile, InferenceProfileId,
+    Inventory, MachineName, Model, Network, OperatorAnswer, ProfileOrigin, RecordSource,
 };
 use cairn_models::types::catalog::Modality;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::inference::{load_inventory, write_inventory, Authoring, Removals};
+use super::inference::{load_inventory, Authoring, Removals};
 use super::inference_models::{weight_sources, Hub};
-use super::inference_verify::VerificationRow;
 use super::Orchestrator;
 use crate::fleet::pools::Pool;
+
+pub(crate) mod scope;
 use crate::storage::{LocalDb, RowExt};
 
-/// The shipped workflow a generation runs.
-pub const WORKFLOW: &str = "inference-generate";
+mod approval;
+pub(crate) use approval::{
+    approval_answered, draft_replaced, request_approval, stamp_operator_answers,
+};
+pub use approval::{
+    approval_holds, approval_question, approve_payload, current_draft, unapproved_draft,
+    ApprovalOutcome, Draft, APPROVE, REJECT,
+};
+
+/// Revision-bound verification and promotion of generated profiles.
+pub mod promotion;
+
+/// Regenerating a generated profile in place.
+pub(crate) mod replacement;
 
 /// A generation still being worked on.
 pub const RUNNING: &str = "running";
@@ -96,8 +91,9 @@ pub(crate) fn resolve_pool(orch: &Orchestrator, pool: &str) -> Result<Pool, Stri
 
 const GIB: u64 = 1 << 30;
 
-/// A machine's hardware as the operator states it, for one whose executor
-/// cannot report it.
+/// A machine's hardware as an operator stated it on a generation recorded
+/// before every machine's hardware came from its executor's report. New
+/// generations state none; earlier ones are still read with what they stated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatedHardware {
@@ -157,7 +153,7 @@ fn hardware_from(
     })?;
     let state = |why: String| {
         format!(
-            "{name}'s accelerator is unknown: {why}; state its hardware: hardware: {{\"{name}\": {{family: nvidia|amd, memoryGib, unified, arch}}}}"
+            "{name}'s accelerator is unknown: {why}; attach {name}'s executor where it can read its GPU (NVML for NVIDIA, amdgpu for AMD) so it reports one, then try again"
         )
     };
     let devices = match gpus {
@@ -215,8 +211,9 @@ fn hardware_from(
     })
 }
 
-/// A detected pool's hardware: each machine's stated or reported, and whether
-/// every machine has a fast-link address.
+/// A detected pool's hardware: each machine's as its executor reports it, or
+/// as an earlier generation stated it, and whether every machine has a
+/// fast-link address.
 pub fn pool_hardware(
     pool: &Pool,
     snapshots: &BTreeMap<String, ExecutorHealthSnapshot>,
@@ -231,7 +228,7 @@ pub fn pool_hardware(
             None => match snapshots.get(member.machine.as_str()) {
                 Some(snapshot) => reported_hardware(&name, snapshot),
                 None => Err(format!(
-                    "{} is not attached, so its hardware is unknown; attach it or state its hardware",
+                    "{} is not attached, so its hardware is unknown; attach its executor so it reports its GPU, then try again",
                     member.machine
                 )),
             },
@@ -264,7 +261,8 @@ pub struct MachineFacts {
     pub usable_bytes: u64,
     pub arch: Arch,
     pub blackwell: bool,
-    /// Whether the operator stated this machine's hardware.
+    /// Whether this machine's hardware is what an earlier generation stated,
+    /// not its executor's report.
     pub stated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
@@ -482,6 +480,24 @@ pub struct GenerationRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue_id: Option<String>,
     pub job_id: String,
+    /// Historical workflows are fenced at upgrade; new launches use `agent`.
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    pub attempts: i64,
+    pub draft_revision: i64,
+    /// Canonical full-profile digest, not merely the runnable surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_prompt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_id: Option<String>,
+    pub cleanup_pending: bool,
     /// The workflow node running it: the provenance `run` of what it writes.
     pub node_uri: String,
     pub model: String,
@@ -516,7 +532,8 @@ impl GenerationRow {
 
 const COLUMNS: &str = "id, project_id, issue_id, job_id, node_uri, model, pool, state, \
      draft_profile, hardware_json, outcome_json, started_at, finished_at, draft_written_at, \
-     approved_surface";
+     approved_surface, mode, execution_id, attempts, draft_revision, draft_digest, \
+     approval_prompt_id, approval_run_id, approval_revision, verification_id, cleanup_pending";
 
 fn generation_of(row: &cairn_db::turso::Row) -> crate::storage::DbResult<GenerationRow> {
     Ok(GenerationRow {
@@ -540,6 +557,16 @@ fn generation_of(row: &cairn_db::turso::Row) -> crate::storage::DbResult<Generat
         finished_at: row.opt_i64(12)?,
         draft_written_at: row.opt_i64(13)?,
         approved_surface: row.opt_text(14)?,
+        mode: row.text(15)?,
+        execution_id: row.opt_text(16)?,
+        attempts: row.i64(17)?,
+        draft_revision: row.i64(18)?,
+        draft_digest: row.opt_text(19)?,
+        approval_prompt_id: row.opt_text(20)?,
+        approval_run_id: row.opt_text(21)?,
+        approval_revision: row.opt_i64(22)?,
+        verification_id: row.opt_text(23)?,
+        cleanup_pending: row.i64(24)? != 0,
     })
 }
 
@@ -580,7 +607,7 @@ pub async fn get_generation(db: &LocalDb, id: &str) -> Result<Option<GenerationR
     )
 }
 
-/// The open generation a workflow job runs, if it runs one.
+/// The open generation bound to a job, if it has one.
 pub async fn open_generation_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -596,97 +623,57 @@ pub async fn open_generation_for_job(
 
 pub async fn insert_generation(db: &LocalDb, row: &GenerationRow) -> Result<(), String> {
     let row = row.clone();
-    let hardware = serde_json::to_string(&row.hardware).map_err(|e| e.to_string())?;
-    let outcome = row.outcome.as_ref().map(Value::to_string);
     db.write(move |conn| {
         let row = row.clone();
-        let hardware = hardware.clone();
-        let outcome = outcome.clone();
-        Box::pin(async move {
-            conn.execute(
-                &format!(
-                    "INSERT INTO inference_generations ({COLUMNS}) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
-                ),
-                cairn_db::turso::params![
-                    row.id.as_str(),
-                    row.project_id.as_str(),
-                    row.issue_id.as_deref(),
-                    row.job_id.as_str(),
-                    row.node_uri.as_str(),
-                    row.model.as_str(),
-                    row.pool.as_str(),
-                    row.state.as_str(),
-                    row.draft_profile.as_deref(),
-                    hardware.as_str(),
-                    outcome.as_deref(),
-                    row.started_at,
-                    row.finished_at,
-                    row.draft_written_at,
-                    row.approved_surface.as_deref()
-                ],
-            )
-            .await?;
-            Ok(())
-        })
+        Box::pin(async move { insert_generation_in(conn, &row).await })
     })
     .await
     .map_err(|error| error.to_string())
 }
 
-async fn update(
-    db: &LocalDb,
-    sql: &'static str,
-    id: &str,
-    value: Option<String>,
-) -> Result<(), String> {
-    let id = id.to_string();
-    let now = super::inference::now_ms();
-    db.write(move |conn| {
-        let (id, value) = (id.clone(), value.clone());
-        Box::pin(async move {
-            conn.execute(
-                sql,
-                cairn_db::turso::params![id.as_str(), value.as_deref(), now],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
-}
-
-/// Record a newly written draft, stamping when it was written.
-async fn set_draft(db: &LocalDb, id: &str, profile: &str) -> Result<(), String> {
-    update(
-        db,
-        "UPDATE inference_generations SET draft_profile = ?2, draft_written_at = ?3 WHERE id = ?1",
-        id,
-        Some(profile.to_string()),
+/// [`insert_generation`] inside the caller's transaction.
+pub(crate) async fn insert_generation_in(
+    conn: &crate::storage::TrackedConnection,
+    row: &GenerationRow,
+) -> crate::storage::DbResult<()> {
+    let hardware = serde_json::to_string(&row.hardware)
+        .map_err(|error| crate::storage::DbError::Row(error.to_string()))?;
+    let outcome = row.outcome.as_ref().map(Value::to_string);
+    conn.execute(
+        &format!(
+            "INSERT INTO inference_generations ({COLUMNS}) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+        ),
+        cairn_db::turso::params![
+            row.id.as_str(),
+            row.project_id.as_str(),
+            row.issue_id.as_deref(),
+            row.job_id.as_str(),
+            row.node_uri.as_str(),
+            row.model.as_str(),
+            row.pool.as_str(),
+            row.state.as_str(),
+            row.draft_profile.as_deref(),
+            hardware.as_str(),
+            outcome.as_deref(),
+            row.started_at,
+            row.finished_at,
+            row.draft_written_at,
+            row.approved_surface.as_deref(),
+            row.mode.as_str(),
+            row.execution_id.as_deref(),
+            row.attempts,
+            row.draft_revision,
+            row.draft_digest.as_deref(),
+            row.approval_prompt_id.as_deref(),
+            row.approval_run_id.as_deref(),
+            row.approval_revision,
+            row.verification_id.as_deref(),
+            i64::from(row.cleanup_pending)
+        ],
     )
-    .await
-}
-
-/// Forget a draft that has left the inventory.
-async fn clear_draft(db: &LocalDb, id: &str) -> Result<(), String> {
-    update(
-        db,
-        "UPDATE inference_generations SET draft_profile = ?2 WHERE id = ?1 AND ?3 IS NOT NULL",
-        id,
-        None,
-    )
-    .await
-}
-
-async fn set_approved(db: &LocalDb, id: &str, digest: &str) -> Result<(), String> {
-    update(
-        db,
-        "UPDATE inference_generations SET approved_surface = ?2 WHERE id = ?1 AND ?3 IS NOT NULL",
-        id,
-        Some(digest.to_string()),
-    )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// What a container profile runs on its machines: everything that decides
@@ -698,6 +685,7 @@ pub fn runnable_surface(profile: &InferenceProfile) -> Option<Value> {
         return None;
     };
     Some(serde_json::json!({
+        "schema": 2,
         "weights": profile.model.weights,
         "configFiles": profile.model.config_files,
         "server": container.server,
@@ -717,63 +705,6 @@ pub fn runnable_surface(profile: &InferenceProfile) -> Option<Value> {
 pub fn surface_digest(surface: &Value) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(surface.to_string().as_bytes()))
-}
-
-fn draft_digest(inventory: &Inventory, draft: &str) -> Option<String> {
-    inventory
-        .profiles
-        .get(&InferenceProfileId::from(draft))
-        .and_then(runnable_surface)
-        .map(|surface| surface_digest(&surface))
-}
-
-/// Why `profile` may not be verified yet: it is an open generation's draft
-/// whose runnable surface the operator has not approved as it stands.
-pub async fn unapproved_draft(db: &LocalDb, profile: &str) -> Result<Option<String>, String> {
-    let open = select_generations(
-        db,
-        "WHERE draft_profile = ?1 AND state = 'running'",
-        Some(profile.to_string()),
-    )
-    .await?;
-    let Some(generation) = open.into_iter().next() else {
-        return Ok(None);
-    };
-    let inventory = load_inventory(db).await?;
-    let current = draft_digest(&inventory, profile);
-    Ok((current.is_none() || current != generation.approved_surface).then(|| {
-        format!(
-            "profile {profile} is generation {}'s draft, and the operator has not approved what it runs as it stands; its workflow asks before verifying it",
-            generation.id
-        )
-    }))
-}
-
-/// End an open generation. Answers whether this call ended it.
-async fn finish(
-    db: &LocalDb,
-    id: &str,
-    state: &str,
-    outcome: Option<&Value>,
-) -> Result<bool, String> {
-    let (id, state) = (id.to_string(), state.to_string());
-    let outcome = outcome.map(Value::to_string);
-    let now = super::inference::now_ms();
-    db.write(move |conn| {
-        let (id, state, outcome) = (id.clone(), state.clone(), outcome.clone());
-        Box::pin(async move {
-            let changed = conn
-                .execute(
-                    "UPDATE inference_generations SET state = ?2, outcome_json = ?3, finished_at = ?4 \
-                     WHERE id = ?1 AND state = 'running'",
-                    cairn_db::turso::params![id.as_str(), state.as_str(), outcome.as_deref(), now],
-                )
-                .await?;
-            Ok(changed > 0)
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
 }
 
 /// Why a generation cannot start, before anything is launched: the model is
@@ -806,99 +737,23 @@ pub fn preflight(
     Ok(hardware)
 }
 
-/// Start generating a profile for `model` on `pool`: the shipped workflow,
-/// launched standalone in `project_id` under an anchor issue, and its row.
-pub async fn launch(
-    orch: &Orchestrator,
-    project_id: &str,
-    model: &str,
-    pool: &str,
-    hardware: BTreeMap<String, StatedHardware>,
-) -> Result<GenerationRow, String> {
-    let inventory = load_inventory(&orch.db.local).await?;
-    let detected = resolve_pool(orch, pool)?;
-    let reported = pool_hardware(&detected, &executor_snapshots(orch), &hardware);
-    preflight(
-        &inventory,
-        &orch.fleet.network(),
-        model,
-        &detected,
-        reported,
-    )?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let mut args = serde_json::json!({
-        "generation": id,
-        "model": model,
-        "pool": detected.key.0,
-    });
-    if !hardware.is_empty() {
-        args["hardware"] = serde_json::to_value(&hardware).map_err(|e| e.to_string())?;
-    }
-    let launched = crate::execution::jobs::launch_standalone_workflow(
-        orch,
-        project_id,
-        WORKFLOW,
-        args,
-        Some(format!("Generate profile: {model} on {}", detected.key)),
-    )
-    .await?;
-    let row = GenerationRow {
-        id,
-        project_id: project_id.to_string(),
-        issue_id: Some(launched.issue_id.clone()),
-        job_id: launched.job_id.clone(),
-        node_uri: cairn_uri::build_node_uri(
-            &launched.project_key,
-            launched.issue_number,
-            launched.exec_seq,
-            &launched.node_segment,
-        ),
-        model: model.to_string(),
-        pool: detected.key.0.clone(),
-        state: RUNNING.to_string(),
-        draft_profile: None,
-        draft_written_at: None,
-        approved_surface: None,
-        hardware,
-        outcome: None,
-        started_at: super::inference::now_ms(),
-        finished_at: None,
-    };
-    insert_generation(&orch.db.local, &row).await?;
-    orch.notifier.emit_change("inference_generations");
-    Ok(row)
-}
+mod launch;
+pub(crate) use launch::admit_launch;
 
-/// Take a draft profile out of the inventory with the verification
-/// deployments that name it. Refused while one of them still holds its
-/// machines.
-pub async fn remove_draft(db: &LocalDb, profile: &str) -> Result<String, String> {
-    let inventory = load_inventory(db).await?;
-    let id = InferenceProfileId::from(profile);
-    if !inventory.profiles.contains_key(&id) {
-        return Ok(format!("profile {profile} is already gone"));
-    }
-    let deployments: Vec<DeploymentId> = inventory
-        .deployments
-        .values()
-        .filter(|deployment| deployment.profile == id)
-        .map(|deployment| deployment.id.clone())
-        .collect();
-    write_inventory(
-        db,
-        &Authoring::Patch {
-            upsert: None,
-            remove: Removals {
-                profiles: vec![id],
-                deployments,
-                ..Removals::default()
-            },
-        },
-    )
-    .await
-}
+mod lifecycle;
+pub use launch::{
+    issue_uri, launch, reconcile_starting, LaunchedGeneration, LAUNCH_FAILED, RECIPE, STARTING,
+};
+pub(crate) use lifecycle::{
+    after_job_ended, after_operator_stop, finalize_generation, issue_resolved,
+    verification_settled, withdraw_questions, RETIRED_WORKFLOW,
+};
+pub use lifecycle::{
+    cancel, reconcile_generations_on_startup, reconcile_on_startup, record_outcome, CANCELLED,
+    EXHAUSTED, FAILED, VERIFIED,
+};
 
-/// What the workflow appends to `cairn://inference/profiles` as `generated`.
+/// What the bound agent appends to `cairn://inference/profiles` as `generated`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GeneratedWrite {
@@ -912,7 +767,7 @@ struct GeneratedWrite {
     starting_template: Option<String>,
 }
 
-/// Write a generation's draft profile, for the generation's own workflow
+/// Write a generation's draft profile, for its bound ordinary agent
 /// node (`caller_home`, running `caller_job`). The profile's origin is
 /// stamped here, its `run` from the caller and never from the payload. Only a
 /// container profile of the generation's model is accepted, with no host
@@ -927,9 +782,72 @@ pub async fn write_generated(
     caller_job: &str,
     payload: &Value,
 ) -> Result<(String, Value), String> {
-    let generation = open_generation_for_job(db, caller_job)
+    let held = super::inference::INVENTORY.lock().await;
+    let mut generation = open_generation_for_job(db, caller_job)
         .await?
-        .ok_or("only the workflow of an open profile generation writes a generated profile; start one from Settings > Inference")?;
+        .ok_or("only the agent of an open profile generation writes a generated profile; start one from Settings > Inference")?;
+    if generation.mode != "agent"
+        || generation.node_uri != caller_home
+        || generation.execution_id.is_none()
+    {
+        return Err("only the generation's exact bound node writes its draft".into());
+    }
+    if let Some(draft) = &generation.draft_profile {
+        if super::inference_verify::load_verifications(db)
+            .await?
+            .iter()
+            .any(|row| row.profile == *draft && row.outcome == "running")
+        {
+            return Err(
+                "the draft is held by verification; wait for it to settle before replacing it"
+                    .into(),
+            );
+        }
+    }
+    let id = generation.id.clone();
+    let reserved = db
+        .write(move |conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "UPDATE inference_generations SET attempts = attempts + 1
+                 WHERE id = ?1 AND state = 'running' AND attempts < 3 RETURNING attempts",
+                        (id.as_str(),),
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.i64(0)).transpose()
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = match reserved {
+        Some(attempt) => {
+            generation.attempts = attempt;
+            write_generated_held(db, caller_home, &generation, payload, &held).await
+        }
+        None => Err(
+            "this generation has used its three candidate submissions; start a new generation"
+                .into(),
+        ),
+    };
+    // The final accepted candidate still gets its approval and verification.
+    // Only a failed submission (or a request beyond the budget) exhausts it.
+    if result.is_err() && (generation.attempts == 3 || reserved.is_none()) {
+        // The finalizer takes the inventory lock itself.
+        drop(held);
+        finalize_generation(db, &generation.id, EXHAUSTED, None).await?;
+    }
+    result
+}
+
+async fn write_generated_held(
+    db: &LocalDb,
+    caller_home: &str,
+    generation: &GenerationRow,
+    payload: &Value,
+    held: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<(String, Value), String> {
     let write: GeneratedWrite = serde_json::from_value(payload.clone()).map_err(|error| {
         format!("generated is {{profile, sources?, answers?, startingTemplate?}}: {error}")
     })?;
@@ -950,6 +868,9 @@ pub async fn write_generated(
             "this generation is for {}; the profile serves {}",
             generation.model, profile.model.name
         ));
+    }
+    if profile.requirements.memory.is_none() {
+        return Err("a generated profile states requirements.memory from the fit tool".into());
     }
     let Engine::Container(container) = &profile.engine else {
         return Err(format!(
@@ -983,8 +904,21 @@ pub async fn write_generated(
         .models
         .get(&generation.model)
         .ok_or_else(|| format!("model {} is no longer registered", generation.model))?;
+    let target = replacement::load(db, &generation.id).await?;
+    if let Some(target) = &target {
+        if profile.id.as_str() != target.profile_id {
+            return Err(format!(
+                "this generation replaces profile {}; every candidate must use that exact id",
+                target.profile_id
+            ));
+        }
+    }
     let previous = generation.draft_profile.as_deref();
-    if inventory.profiles.contains_key(&profile.id) && previous != Some(profile.id.as_str()) {
+    let replaces_target = previous.is_none() && target.is_some();
+    if inventory.profiles.contains_key(&profile.id)
+        && previous != Some(profile.id.as_str())
+        && !replaces_target
+    {
         return Err(format!(
             "profile {} exists already and is not this generation's draft; give the profile another id",
             profile.id
@@ -999,7 +933,9 @@ pub async fn write_generated(
         answers: write.answers,
     };
     let mut remove = Removals::default();
-    if let Some(previous) = previous.filter(|previous| *previous != profile.id.as_str()) {
+    if let Some(previous) =
+        previous.or_else(|| target.as_ref().map(|target| target.profile_id.as_str()))
+    {
         let previous = InferenceProfileId::from(previous);
         if inventory.profiles.contains_key(&previous) {
             remove.deployments = inventory
@@ -1008,22 +944,109 @@ pub async fn write_generated(
                 .filter(|deployment| deployment.profile == previous)
                 .map(|deployment| deployment.id.clone())
                 .collect();
-            remove.profiles.push(previous);
+            if previous != profile.id {
+                remove.profiles.push(previous);
+            }
         }
     }
     let mut records = Inventory::default();
     records.insert_profile(profile.clone());
-    let wrote = write_inventory(
+    let (changes, wrote) = super::inference::prepare_inventory_write_for_generation(
         db,
+        &inventory,
         &Authoring::Patch {
             upsert: Some(records.to_yaml()),
             remove,
         },
+        held,
+        Some(&generation.id),
     )
     .await?;
-    set_draft(db, &generation.id, profile.id.as_str()).await?;
     let surface = runnable_surface(&profile).unwrap_or(Value::Null);
     let digest = surface_digest(&surface);
+    let full_digest = super::inference_verify::digest(&profile);
+    let revision = generation.draft_revision + 1;
+    let at = super::inference::now_ms();
+    let (generation_id, profile_id, old_revision, attempts) = (
+        generation.id.clone(),
+        profile.id.to_string(),
+        generation.draft_revision,
+        generation.attempts,
+    );
+    let surface_hash = digest.clone();
+    db.write(move |conn| {
+        let (generation_id, profile_id, full_digest, surface_hash, changes) = (
+            generation_id.clone(), profile_id.clone(), full_digest.clone(), surface_hash.clone(), changes.clone(),
+        );
+        Box::pin(async move {
+            let replaces_target = replacement::validate_in(conn, &generation_id, &profile_id).await?;
+            let changed = conn.execute(
+                "UPDATE inference_generations SET draft_profile = ?2, draft_written_at = ?3,
+                 draft_revision = ?4, draft_digest = ?5, approved_surface = NULL,
+                 approval_revision = NULL, verification_id = NULL, cleanup_pending = 0
+                 WHERE id = ?1 AND state = 'running' AND draft_revision = ?6 AND attempts = ?7",
+                cairn_db::turso::params![
+                    generation_id.as_str(), profile_id.as_str(), at, revision,
+                    full_digest.as_str(), old_revision, attempts,
+                ],
+            ).await?;
+            if changed != 1 {
+                return Err(crate::storage::DbError::Row("generation changed while writing its draft".into()));
+            }
+            conn.execute(
+                "UPDATE inference_generated_profiles SET active = 0
+                 WHERE generation_id = ?1 AND profile_id != ?2",
+                (generation_id.as_str(), profile_id.as_str()),
+            ).await?;
+            let mut owners = conn.query(
+                "SELECT generation_id, active FROM inference_generated_profiles WHERE profile_id = ?1",
+                (profile_id.as_str(),),
+            ).await?;
+            let owner = owners.next().await?.map(|row| {
+                Ok::<_, crate::storage::DbError>((row.text(0)?, row.i64(1)? != 0))
+            }).transpose()?;
+            drop(owners);
+            if let Some((old_generation, active)) = owner.filter(|(owner, _)| owner != &generation_id && !replaces_target) {
+                let mut states = conn.query(
+                    "SELECT state FROM inference_generations WHERE id = ?1",
+                    (old_generation.as_str(),),
+                ).await?;
+                let terminal = states.next().await?.map(|row| row.text(0)).transpose()?
+                    .is_some_and(|state| state != RUNNING && state != STARTING);
+                drop(states);
+                let mut profiles = conn.query(
+                    "SELECT id FROM inference_profiles WHERE id = ?1",
+                    (profile_id.as_str(),),
+                ).await?;
+                let present = profiles.next().await?.is_some();
+                drop(profiles);
+                let mut claims = conn.query(
+                    "SELECT id FROM inference_verifications WHERE profile_id = ?1 AND outcome = 'running' LIMIT 1",
+                    (profile_id.as_str(),),
+                ).await?;
+                let running = claims.next().await?.is_some();
+                drop(claims);
+                if active || !terminal || present || running {
+                    return Err(crate::storage::DbError::Row("profile belongs to another generation".into()));
+                }
+            }
+            let owned = conn.execute(
+                "INSERT INTO inference_generated_profiles
+                 (profile_id, generation_id, revision, profile_digest, surface_digest, promoted_verification_id, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 1)
+                 ON CONFLICT(profile_id) DO UPDATE SET generation_id = excluded.generation_id,
+                 revision = excluded.revision, profile_digest = excluded.profile_digest,
+                 surface_digest = excluded.surface_digest, promoted_verification_id = NULL, active = 1",
+                cairn_db::turso::params![
+                    profile_id, generation_id.as_str(), revision, full_digest, surface_hash,
+                ],
+            ).await?;
+            if owned != 1 {
+                return Err(crate::storage::DbError::Row("profile belongs to another generation".into()));
+            }
+            super::inference::save_rows_in(conn, changes, at, Some(&generation_id)).await
+        })
+    }).await.map_err(|error| error.to_string())?;
     Ok((
         format!(
             "Wrote profile {id} as generation {generation}'s draft. Once the operator approves what it runs (surface {digest}), verify it: patch cairn://inference/profiles/{id} {{verify:{{pool:\"{pool}\"}}}}.\n{wrote}",
@@ -1034,6 +1057,8 @@ pub async fn write_generated(
         serde_json::json!({
             "profile": profile.id.as_str(),
             "generation": generation.id,
+            "revision": revision,
+            "attempt": generation.attempts,
             "surface": surface,
             "surfaceDigest": digest,
         }),
@@ -1061,493 +1086,23 @@ fn writable_cache_mount(profile: &Value) -> Option<String> {
         })
 }
 
-/// The question a generation's workflow asked the operator, as stored.
-pub struct AskedQuestion {
-    pub questions_json: String,
-    pub response: Option<String>,
-    /// The surface the recorded answer came through, from the answer ledger
-    /// every surface claims an answer in.
-    pub answered_on: Option<AppearanceTransport>,
-}
-
-/// The question at `uri` (`.../questions/q-N`) a job asked, from the
-/// database its rows live in.
-pub async fn asked_question(
-    orch: &Orchestrator,
-    job_id: &str,
-    uri: &str,
-) -> Result<Option<AskedQuestion>, String> {
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    asked_question_in(&db, job_id, uri).await
-}
-
-async fn asked_question_in(
-    db: &LocalDb,
-    job_id: &str,
-    uri: &str,
-) -> Result<Option<AskedQuestion>, String> {
-    let segment = uri
-        .rsplit_once("/questions/")
-        .map(|(_, segment)| segment.to_string())
-        .ok_or_else(|| format!("{uri} is not a question's URI"))?;
-    let job_id = job_id.to_string();
-    let asked = db
-        .read(move |conn| {
-            let (job_id, segment) = (job_id.clone(), segment.clone());
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT p.id, p.questions, p.response FROM prompts p \
-                         JOIN runs r ON p.run_id = r.id \
-                         WHERE r.job_id = ?1 AND p.uri_segment = ?2",
-                        (job_id.as_str(), segment.as_str()),
-                    )
-                    .await?;
-                Ok(match rows.next().await? {
-                    Some(row) => Some((row.text(0)?, row.text(1)?, row.opt_text(2)?)),
-                    None => None,
-                })
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let Some((prompt_id, questions_json, response)) = asked else {
-        return Ok(None);
-    };
-    let answered_on = match response {
-        Some(_) => crate::channels::ledger::resolution_for_action(
-            db,
-            &cairn_uri::canonicalize_uri_identity(&prompt_id),
-        )
-        .await?
-        .map(|winner| winner.resolution_provenance().map(|answer| answer.surface))
-        .transpose()?,
-        None => None,
-    };
-    Ok(Some(AskedQuestion {
-        questions_json,
-        response,
-        answered_on,
-    }))
-}
-
-/// Whether an answer through `surface` speaks for the operator: the same two
-/// verified surfaces that may grant authority (`docs/authorization.md`), an
-/// owner or admin signed in or the desktop app's own credential. An answer
-/// written to the question's resource, which any agent can do, does not.
-fn speaks_for_operator(surface: Option<AppearanceTransport>) -> bool {
-    matches!(
-        surface,
-        Some(
-            AppearanceTransport::AuthenticatedOperator | AppearanceTransport::AuthenticatedDesktop
-        )
-    )
-}
-
-/// The label an operator's approval of a draft's runnable surface chooses.
-pub const APPROVE: &str = "Approve";
-
-/// Record the operator's approval of a generation's draft, from its own
-/// workflow (`caller_job`): `question` is the question the workflow asked
-/// (`asked_question`), which must name the draft's current surface digest and
-/// be answered `Approve` by the operator ([`speaks_for_operator`]). Answers the
-/// approved digest.
-pub async fn approve(
-    db: &LocalDb,
-    caller_job: &str,
-    id: &str,
-    question: Option<AskedQuestion>,
-) -> Result<String, String> {
-    let generation = get_generation(db, id)
-        .await?
-        .ok_or_else(|| format!("there is no generation {id}"))?;
-    if generation.job_id != caller_job {
-        return Err("only the generation's own workflow records the operator's approval".into());
-    }
-    if !generation.is_open() {
-        return Err(format!(
-            "generation {id} has already ended {}",
-            generation.state
-        ));
-    }
-    let draft = generation
-        .draft_profile
-        .as_deref()
-        .ok_or("the generation has no draft to approve")?;
-    let digest = draft_digest(&load_inventory(db).await?, draft)
-        .ok_or_else(|| format!("the draft {draft} is no longer a container profile"))?;
-    let question = question.ok_or("that question was not asked by this generation")?;
-    if !question.questions_json.contains(&digest) {
-        return Err(format!(
-            "that question did not show the draft's runnable surface as it stands ({digest})"
-        ));
-    }
-    let questions: Vec<crate::models::question::Question> =
-        serde_json::from_str(&question.questions_json).unwrap_or_default();
-    let surface = question.answered_on;
-    let answer = question
-        .response
-        .map(|response| crate::models::question::PromptAnswers::decode_stored(&response))
-        .and_then(|stored| stored.into_answers(questions.len()).ok())
-        .and_then(|answers| {
-            answers
-                .answers()
-                .first()
-                .map(|answer| answer.answer.clone())
-        });
-    match answer.as_deref() {
-        Some(APPROVE) => {}
-        Some(other) => return Err(format!("the operator answered {other:?}, not {APPROVE}")),
-        None => return Err("the operator has not answered that question".into()),
-    }
-    if !speaks_for_operator(surface) {
-        return Err(match surface {
-            Some(surface) => format!(
-                "that question was answered through {surface:?}, which does not speak for the operator; only the operator's answer in the app approves a draft"
-            ),
-            None => "that answer has no record of who gave it; only the operator's answer in the app approves a draft".into(),
-        });
-    }
-    set_approved(db, id, &digest).await?;
-    Ok(digest)
-}
-
-/// The final outcomes a generation's workflow reports.
-const OUTCOMES: &[&str] = &["verified", "cannotRun", "gaveUp"];
-
-/// Whether `row` is a pass of `generation`'s current draft on its pool,
-/// started after the draft was last written.
-fn passes_draft(generation: &GenerationRow, row: &VerificationRow) -> bool {
-    generation.draft_profile.as_deref() == Some(row.profile.as_str())
-        && row.pool == generation.pool
-        && row.outcome == "passed"
-        && generation
-            .draft_written_at
-            .is_none_or(|written| row.started_at >= written)
-}
-
-/// Take a generation's draft out of the inventory and forget it, or say why
-/// it stays (a verification of it still holds its machines).
-async fn drop_draft(db: &LocalDb, generation: &GenerationRow) -> Option<String> {
-    let draft = generation.draft_profile.as_deref()?;
-    Some(match remove_draft(db, draft).await {
-        Ok(_) => match clear_draft(db, &generation.id).await {
-            Ok(()) => format!("Removed its draft profile {draft}."),
-            Err(why) => format!("Removed its draft profile {draft}, but not from its row: {why}"),
-        },
-        Err(why) => format!("Its draft profile {draft} stays until its verification ends: {why}"),
-    })
-}
-
-/// End a generation with the outcome its own workflow (`caller_job`)
-/// reports. `verified` names its verification, which must be a pass of the
-/// draft on the generation's pool that started after the draft was written;
-/// any other outcome removes the draft. Answers the summary and the ended
-/// row.
-pub async fn record_outcome(
-    db: &LocalDb,
-    caller_job: &str,
-    id: &str,
-    outcome: &Value,
-    verifications: &[VerificationRow],
-) -> Result<(String, GenerationRow), String> {
-    let generation = get_generation(db, id)
-        .await?
-        .ok_or_else(|| format!("there is no generation {id}"))?;
-    if generation.job_id != caller_job {
-        return Err("only the generation's own workflow reports its outcome".into());
-    }
-    if !generation.is_open() {
-        return Err(format!(
-            "generation {id} has already ended {}",
-            generation.state
-        ));
-    }
-    let state = outcome
-        .get("outcome")
-        .and_then(Value::as_str)
-        .filter(|state| OUTCOMES.contains(state))
-        .ok_or_else(|| format!("outcome.outcome is one of {}", OUTCOMES.join(", ")))?;
-    let mut said = Vec::new();
-    if state == "verified" {
-        let draft = generation.draft_profile.as_deref().ok_or(
-            "a generation is verified only once it has written a draft and it passed verification",
-        )?;
-        let named = outcome
-            .get("verification")
-            .and_then(Value::as_str)
-            .ok_or("a verified outcome names its verification (outcome.verification)")?;
-        let row = verifications
-            .iter()
-            .find(|row| row.id == named)
-            .ok_or_else(|| format!("there is no verification {named}"))?;
-        if !passes_draft(&generation, row) {
-            return Err(format!(
-                "verification {named} is not a pass of the current draft {draft} on pool {}; verification decides",
-                generation.pool
-            ));
-        }
-        said.push(format!("Generation {id} verified profile {draft}."));
-    } else {
-        said.push(format!("Generation {id} ended {state}."));
-        said.extend(drop_draft(db, &generation).await);
-    }
-    if !finish(db, id, state, Some(outcome)).await? {
-        return Err(format!("generation {id} ended while this was recorded"));
-    }
-    let ended = get_generation(db, id).await?.unwrap_or(generation);
-    Ok((said.join(" "), ended))
-}
-
-/// Stop a running generation: its workflow stops, a question it was waiting
-/// on is withdrawn, its draft is removed, and its anchor issue closes.
-pub async fn cancel(orch: &Orchestrator, id: &str) -> Result<String, String> {
-    let generation = get_generation(&orch.db.local, id)
-        .await?
-        .ok_or_else(|| format!("there is no generation {id}"))?;
-    if !generation.is_open() {
-        return Err(format!(
-            "generation {id} has already ended {}",
-            generation.state
-        ));
-    }
-    crate::orchestrator::lifecycle::stop_workflow(orch, &generation.job_id).await?;
-    withdraw_questions(orch, &generation.job_id).await;
-    let mut said = vec![format!("Cancelled generation {id}.")];
-    // A verification under way keeps its draft's deployment loaded, and the
-    // inventory refuses to remove it until that ends; `reconcile` removes it
-    // then.
-    said.extend(drop_draft(&orch.db.local, &generation).await);
-    finish(&orch.db.local, id, "cancelled", None).await?;
-    orch.notifier.emit_change("inference_generations");
-    close_anchor_when_done(orch, &generation);
-    Ok(said.join(" "))
-}
-
-/// Bring generations in line with their workflows: one whose workflow ended
-/// (`ended` holds each such job id) without reporting an outcome ends
-/// `failed`, and an ended generation that is not `verified` loses any draft
-/// still in the inventory, unless a pass of it on the pool was recorded, which
-/// keeps it as verification decided. A draft a verification still holds stays
-/// until the next pass. Answers the generations this call ended.
-pub async fn reconcile(
-    db: &LocalDb,
-    ended: &std::collections::BTreeSet<String>,
-    verifications: &[VerificationRow],
-) -> Result<Vec<GenerationRow>, String> {
-    let mut now_ended = Vec::new();
-    for generation in list_generations(db).await? {
-        let passed = verifications
-            .iter()
-            .any(|row| passes_draft(&generation, row));
-        if generation.is_open() {
-            if !ended.contains(&generation.job_id) {
-                continue;
-            }
-            let why = if passed {
-                "its workflow ended without reporting an outcome; its draft passed verification and stays"
-            } else {
-                "its workflow ended without reporting an outcome"
-            };
-            if !passed {
-                drop_draft(db, &generation).await;
-            }
-            let outcome = serde_json::json!({ "outcome": "failed", "why": why });
-            if finish(db, &generation.id, "failed", Some(&outcome)).await? {
-                now_ended.push(generation);
-            }
-        } else if generation.state != "verified" && generation.draft_profile.is_some() && !passed {
-            drop_draft(db, &generation).await;
-        }
-    }
-    Ok(now_ended)
-}
-
-/// [`reconcile`] against the live jobs, closing the anchor of each generation
-/// it ends.
-pub async fn reconcile_generations(orch: &Orchestrator) -> Result<(), String> {
-    let mut ended = std::collections::BTreeSet::new();
-    for generation in list_generations(&orch.db.local).await? {
-        let stale_draft = generation.state != "verified" && generation.draft_profile.is_some();
-        if !generation.is_open() && !stale_draft {
-            continue;
-        }
-        if matches!(
-            job_status(orch, &generation.job_id).await.as_deref(),
-            Some("complete" | "failed" | "cancelled")
-        ) {
-            ended.insert(generation.job_id);
-        }
-    }
-    let verifications = super::inference_verify::load_verifications(&orch.db.local).await?;
-    let now_ended = reconcile(&orch.db.local, &ended, &verifications).await?;
-    if !now_ended.is_empty() {
-        orch.notifier.emit_change("inference_generations");
-    }
-    for generation in &now_ended {
-        close_anchor_when_done(orch, generation);
-    }
-    Ok(())
-}
-
-/// Withdraw any question a stopped generation's workflow still waits on: its
-/// prompts carry no turn, so stopping the job does not withdraw them.
-async fn withdraw_questions(orch: &Orchestrator, job_id: &str) {
-    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
-        return;
-    };
-    let job_id = job_id.to_string();
-    let now = chrono::Utc::now().timestamp();
-    let result = db
-        .write(move |conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT p.id FROM prompts p JOIN runs r ON p.run_id = r.id \
-                         WHERE r.job_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                let mut ids = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    ids.push(row.text(0)?);
-                }
-                drop(rows);
-                for id in &ids {
-                    crate::mcp::handlers::planning::withdraw_prompt_conn(
-                        conn,
-                        id,
-                        crate::mcp::handlers::permission::WithdrawalCause::OperatorStop,
-                        now,
-                    )
-                    .await?;
-                }
-                Ok(ids)
-            })
-        })
-        .await;
-    match result {
-        Ok(ids) => {
-            for id in ids {
-                let change = crate::notify::prompt_db_change_for_id(&db, &id, "update").await;
-                let _ = orch.services.emitter.emit("db-change", change);
-            }
-        }
-        Err(error) => {
-            log::warn!("inference: withdrawing a cancelled generation's questions failed: {error}")
-        }
-    }
-}
-
-/// Close a generation's anchor issue once its workflow job has ended. Closing
-/// an issue closes its sessions, so it waits for the workflow to finish
-/// writing its output first.
-pub(crate) fn close_anchor_when_done(orch: &Orchestrator, generation: &GenerationRow) {
-    let Some(issue_id) = generation.issue_id.clone() else {
-        return;
-    };
-    let job_id = generation.job_id.clone();
-    let orch = orch.clone();
-    tokio::spawn(async move {
-        const POLL: std::time::Duration = std::time::Duration::from_secs(3);
-        const BOUND: u32 = 200;
-        for _ in 0..BOUND {
-            if job_ended(&orch, &job_id).await {
-                break;
-            }
-            tokio::time::sleep(POLL).await;
-        }
-        // This automatic cleanup deliberately stops any work left on the anchor.
-        // Use the same gate and lifecycle cascade as an explicit status update.
-        if let Err(error) = crate::issues::status::update_status(
-            &orch,
-            &issue_id,
-            "closed",
-            crate::issues::status::ResolutionActor::Agent,
-            crate::issues::status::Confirmation::Given,
-        )
-        .await
-        {
-            log::warn!("inference: closing a generation's anchor failed: {error}");
-        }
-    });
-}
-
-/// A job's status, read from the database its rows live in.
-async fn job_status(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
-        .await
-        .ok()?;
-    let job_id = job_id.to_string();
-    db.read(move |conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query("SELECT status FROM jobs WHERE id = ?1", (job_id.as_str(),))
-                .await?;
-            Ok(match rows.next().await? {
-                Some(row) => row.opt_text(0)?,
-                None => None,
-            })
-        })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-async fn job_ended(orch: &Orchestrator, job_id: &str) -> bool {
-    matches!(
-        job_status(orch, job_id).await.as_deref(),
-        Some("complete" | "failed" | "cancelled") | None
-    )
-}
-
-/// A question a generation's workflow waits on the operator to answer.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingQuestion {
-    pub prompt_id: String,
-    pub run_id: String,
-    pub uri: String,
-    pub questions: Value,
-}
-
-/// A generation as Settings > Inference and `cairn://inference/generations`
-/// show it: its row, the phase its workflow is in, the question it waits
-/// on, and its state as it stands (a workflow that ended without reporting an
-/// outcome reads `failed`).
+/// The domain record and issue link. Conversation, questions and execution
+/// progress belong to the ordinary issue, not to a second Settings projection.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationView {
     #[serde(flatten)]
     pub row: GenerationRow,
-    /// The state as it stands, which [`GenerationRow::state`] is unless the
-    /// workflow ended without an outcome.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub phase: Option<String>,
-    /// The workflow's latest log line.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_log: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_question: Option<PendingQuestion>,
-    /// The current draft surface, so a workflow with an older digest can ask again.
+    pub issue_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface_digest: Option<String>,
 }
 
-/// Every generation as it stands, newest first, reconciled with its workflow
-/// first.
 pub async fn generation_views(orch: &Orchestrator) -> Result<Vec<GenerationView>, String> {
-    if let Err(error) = reconcile_generations(orch).await {
-        log::warn!("inference: reconciling generations failed: {error}");
-    }
     let mut views = Vec::new();
     for row in list_generations(&orch.db.local).await? {
         views.push(generation_view(orch, row).await);
@@ -1556,83 +1111,45 @@ pub async fn generation_views(orch: &Orchestrator) -> Result<Vec<GenerationView>
 }
 
 pub async fn generation_view(orch: &Orchestrator, row: GenerationRow) -> GenerationView {
-    let mut view = GenerationView {
-        status: row.state.clone(),
-        row,
-        phase: None,
-        last_log: None,
-        pending_question: None,
-        surface: None,
-        surface_digest: None,
-    };
-    if !view.row.is_open() {
-        return view;
-    }
-    if let (Some(draft), Ok(inventory)) = (
-        view.row.draft_profile.as_deref(),
-        load_inventory(&orch.db.local).await,
-    ) {
-        view.surface = inventory
-            .profiles
-            .get(&InferenceProfileId::from(draft))
-            .and_then(runnable_surface);
-        view.surface_digest = view.surface.as_ref().map(surface_digest);
-    }
-    if job_ended(orch, &view.row.job_id).await {
-        view.status = "failed".into();
-    }
-    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, &view.row.job_id).await
-    else {
-        return view;
-    };
-    if let Ok(entries) = crate::workflow_progress::list_entries(&db, &view.row.job_id).await {
-        view.phase = entries
-            .iter()
-            .rev()
-            .find(|entry| entry.kind == "phase")
-            .map(|entry| entry.text.clone());
-        view.last_log = entries
-            .iter()
-            .rev()
-            .find(|entry| entry.kind != "phase")
-            .map(|entry| entry.text.clone());
-    }
-    let job_id = view.row.job_id.clone();
-    let pending = db
-        .read(move |conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT p.id, p.run_id, p.uri_segment, p.questions FROM prompts p \
-                         JOIN runs r ON p.run_id = r.id \
-                         WHERE r.job_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL \
-                         ORDER BY p.created_at DESC LIMIT 1",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                Ok(match rows.next().await? {
-                    Some(row) => Some((row.text(0)?, row.text(1)?, row.opt_text(2)?, row.text(3)?)),
-                    None => None,
-                })
-            })
-        })
+    let issue_uri = launch::issue_uri(orch, &row).await;
+    let surface = owned_draft_surface(&orch.db.local, &row)
         .await
         .ok()
         .flatten();
-    if let Some((prompt_id, run_id, segment, questions)) = pending {
-        view.pending_question = Some(PendingQuestion {
-            uri: format!(
-                "{}/questions/{}",
-                view.row.node_uri,
-                segment.unwrap_or_default()
-            ),
-            prompt_id,
-            run_id,
-            questions: serde_json::from_str(&questions).unwrap_or(Value::Null),
-        });
+    GenerationView {
+        status: row.state.clone(),
+        row,
+        issue_uri,
+        surface_digest: surface.as_ref().map(surface_digest),
+        surface,
     }
-    view
+}
+
+/// A historical generation must never display a later owner's runnable surface.
+async fn owned_draft_surface(
+    db: &LocalDb,
+    generation: &GenerationRow,
+) -> Result<Option<Value>, String> {
+    let Some(draft) = generation.draft_profile.as_deref() else {
+        return Ok(None);
+    };
+    let _held = super::inference::INVENTORY.lock().await;
+    let owner = db
+        .query_opt(
+            "SELECT generation_id FROM inference_generated_profiles WHERE profile_id = ?1",
+            (draft.to_string(),),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if owner.as_deref() != Some(generation.id.as_str()) {
+        return Ok(None);
+    }
+    Ok(load_inventory(db)
+        .await?
+        .profiles
+        .get(&InferenceProfileId::from(draft))
+        .and_then(runnable_surface))
 }
 
 #[cfg(test)]
@@ -1674,7 +1191,17 @@ mod tests {
             project_id: "p".into(),
             issue_id: None,
             job_id: job.into(),
-            node_uri: "cairn://p/prj/9/1/inference-generate".into(),
+            mode: "agent".into(),
+            execution_id: Some(format!("exec-{id}")),
+            attempts: 0,
+            draft_revision: 0,
+            draft_digest: None,
+            approval_prompt_id: None,
+            approval_run_id: None,
+            approval_revision: None,
+            verification_id: None,
+            cleanup_pending: false,
+            node_uri: "cairn://p/prj/9/1/wf".into(),
             model: "Qwen/Qwen3-Embedding-4B".into(),
             pool: "bbs".into(),
             state: RUNNING.into(),
@@ -1759,13 +1286,23 @@ requirements:
         let why = hardware_from(&fedora, "x86_64", &unread, &memory).unwrap_err();
         assert_eq!(
             why,
-            "fedora's accelerator is unknown: it has not reported its GPUs (NVML not loadable); state its hardware: hardware: {\"fedora\": {family: nvidia|amd, memoryGib, unified, arch}}"
+            "fedora's accelerator is unknown: it has not reported its GPUs (NVML not loadable); attach fedora's executor where it can read its GPU (NVML for NVIDIA, amdgpu for AMD) so it reports one, then try again"
         );
         let none = MeasurementReading::Measured { value: vec![] };
         let why = hardware_from(&fedora, "x86_64", &none, &memory).unwrap_err();
         assert!(
             why.starts_with("fedora's accelerator is unknown: it reports no GPU it can read;"),
             "{why}"
+        );
+        // Nothing Settings or the generating agent can send states hardware,
+        // so the refusal asks only for what the operator can do.
+        assert!(!why.contains("state"), "{why}");
+
+        let unattached =
+            pool_hardware(&Pool::of_one("fedora"), &BTreeMap::new(), &BTreeMap::new()).unwrap_err();
+        assert_eq!(
+            unattached,
+            "fedora is not attached, so its hardware is unknown; attach its executor so it reports its GPU, then try again"
         );
 
         let read = MeasurementReading::Measured {
@@ -1902,15 +1439,512 @@ requirements:
         assert!(!facts.machines[0].blackwell);
     }
 
+    const REPLACEMENT_HOME: &str = "cairn://p/prj/10/1/generator";
+
+    async fn replacement_fixture(db: &LocalDb) -> replacement::Target {
+        registered(db).await;
+        insert_generation(db, &generation("old", "old-job"))
+            .await
+            .unwrap();
+        write_generated(db, "cairn://p/prj/9/1/wf", "old-job", &write("a"))
+            .await
+            .unwrap();
+        // Seed the terminal owner's state; its saved profile is unpromoted.
+        db.execute(
+            "UPDATE inference_generations SET state = 'verified', finished_at = 2 WHERE id = 'old'",
+            (),
+        )
+        .await
+        .unwrap();
+        let mut edited =
+            load_inventory(db).await.unwrap().profiles[&InferenceProfileId::from("a")].clone();
+        let Engine::Container(container) = &mut edited.engine else {
+            panic!("container")
+        };
+        container.args.extend(["--ctx-size".into(), "4096".into()]);
+        super::super::inference::save_profile(
+            db,
+            Some("a"),
+            &serde_yaml::to_string(&edited).unwrap(),
+        )
+        .await
+        .unwrap();
+        let target = replacement::capture(db, "Qwen/Qwen3-Embedding-4B", "a")
+            .await
+            .unwrap();
+        let mut next = generation("new", "new-job");
+        next.node_uri = REPLACEMENT_HOME.into();
+        insert_generation(db, &next).await.unwrap();
+        let captured = target.clone();
+        db.write(move |conn| {
+            let captured = captured.clone();
+            Box::pin(async move { replacement::record_in(conn, "new", &captured).await })
+        })
+        .await
+        .unwrap();
+        target
+    }
+
+    async fn saved_body(db: &LocalDb) -> String {
+        db.query_opt(
+            "SELECT body_json FROM inference_profiles WHERE id = 'a'",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn a_generated_write_is_stamped_from_its_caller_and_only_its_workflow_writes_one() {
+    async fn a_replacement_claims_only_its_exact_target_at_the_first_accepted_write() {
+        let db = crate::storage::migrated_test_db("generation-replacement-door").await;
+        let target = replacement_fixture(&db).await;
+        assert_eq!(saved_body(&db).await, target.body);
+        let refusal = write_generated(&db, REPLACEMENT_HOME, "new-job", &write("another"))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("exact id"), "{refusal}");
+        assert_eq!(saved_body(&db).await, target.body);
+        assert!(get_generation(&db, "new")
+            .await
+            .unwrap()
+            .unwrap()
+            .draft_profile
+            .is_none());
+
+        let (_, data) = write_generated(&db, REPLACEMENT_HOME, "new-job", &write("a"))
+            .await
+            .unwrap();
+        let row = get_generation(&db, "new").await.unwrap().unwrap();
+        assert_eq!((row.attempts, row.draft_revision), (2, 1));
+        assert_eq!(row.draft_profile.as_deref(), Some("a"));
+        assert!(row.approved_surface.is_none());
+        assert!(row.approval_revision.is_none());
+        assert!(row.verification_id.is_none());
+        assert_eq!(data["profile"], "a");
+        let receipt = db
+            .query_opt(
+                "SELECT generation_id, revision, inventory_revision, promoted_verification_id
+             FROM inference_generated_profiles WHERE profile_id = 'a'",
+                (),
+                |row| Ok((row.text(0)?, row.i64(1)?, row.i64(2)?, row.opt_text(3)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt,
+            ("new".into(), 1, target.inventory_revision + 1, None)
+        );
+        let inventory = load_inventory(&db).await.unwrap();
+        assert!(promotion::Gate::load(&db)
+            .await
+            .unwrap()
+            .unpromoted_profiles(&inventory)
+            .contains("a"));
+        assert!(
+            matches!(&inventory.profiles[&InferenceProfileId::from("a")].origin,
+            ProfileOrigin::Generated { run: Some(run), .. } if run == REPLACEMENT_HOME)
+        );
+        assert!(
+            write_generated(&db, "cairn://p/prj/9/1/wf", "old-job", &write("a"))
+                .await
+                .is_err()
+        );
+        let old = get_generation(&db, "old").await.unwrap().unwrap();
+        assert_eq!((old.state.as_str(), old.attempts), (VERIFIED, 1));
+        assert!(owned_draft_surface(&db, &old).await.unwrap().is_none());
+        assert!(owned_draft_surface(&db, &row).await.unwrap().is_some());
+
+        finalize_generation(&db, "new", FAILED, None).await.unwrap();
+        assert!(!load_inventory(&db)
+            .await
+            .unwrap()
+            .profiles
+            .contains_key(&InferenceProfileId::from("a")));
+        assert_eq!(
+            replacement::load(&db, "new").await.unwrap().unwrap().body,
+            target.body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replacement_refuses_edit_and_undo_even_if_bytes_and_clock_match_its_capture() {
+        let db = crate::storage::migrated_test_db("generation-replacement-stale").await;
+        let target = replacement_fixture(&db).await;
+        let original =
+            load_inventory(&db).await.unwrap().profiles[&InferenceProfileId::from("a")].clone();
+        let mut edited = original.clone();
+        let Engine::Container(container) = &mut edited.engine else {
+            panic!("container")
+        };
+        container.args.push("--verbose".into());
+        for profile in [&edited, &original] {
+            super::super::inference::save_profile(
+                &db,
+                Some("a"),
+                &serde_yaml::to_string(profile).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE inference_profiles SET updated_at = ?1 WHERE id = 'a'",
+            (target.updated_at,),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved_body(&db).await, target.body);
+        let refusal = write_generated(&db, REPLACEMENT_HOME, "new-job", &write("a"))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("written again"), "{refusal}");
+        let row = get_generation(&db, "new").await.unwrap().unwrap();
+        assert_eq!((row.attempts, row.draft_revision), (1, 0));
+        assert!(row.draft_profile.is_none());
+        finalize_generation(&db, "new", CANCELLED, None)
+            .await
+            .unwrap();
+        assert_eq!(saved_body(&db).await, target.body);
+        let inventory = load_inventory(&db).await.unwrap();
+        assert!(promotion::Gate::load(&db)
+            .await
+            .unwrap()
+            .unpromoted_profiles(&inventory)
+            .contains("a"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_inventory_write_rolls_back_replacement_ownership_and_can_retry_its_capture()
+    {
+        let db = crate::storage::migrated_test_db("generation-replacement-rollback").await;
+        let target = replacement_fixture(&db).await;
+        db.execute(
+            "CREATE TRIGGER refuse_replacement BEFORE UPDATE ON inference_profiles
+             WHEN NEW.id = 'a' BEGIN SELECT RAISE(ABORT, 'replacement inventory refused'); END",
+            (),
+        )
+        .await
+        .unwrap();
+        let refusal = write_generated(&db, REPLACEMENT_HOME, "new-job", &write("a"))
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.contains("replacement inventory refused"),
+            "{refusal}"
+        );
+        assert_eq!(saved_body(&db).await, target.body);
+        let owner = db.query_opt(
+            "SELECT generation_id, inventory_revision FROM inference_generated_profiles WHERE profile_id = 'a'",
+            (), |row| Ok((row.text(0)?, row.i64(1)?)),
+        ).await.unwrap().unwrap();
+        assert_eq!(owner, ("old".into(), target.inventory_revision));
+        let row = get_generation(&db, "new").await.unwrap().unwrap();
+        assert_eq!((row.attempts, row.draft_revision), (1, 0));
+        assert!(row.draft_profile.is_none());
+        db.execute("DROP TRIGGER refuse_replacement", ())
+            .await
+            .unwrap();
+        write_generated(&db, REPLACEMENT_HOME, "new-job", &write("a"))
+            .await
+            .unwrap();
+        let row = get_generation(&db, "new").await.unwrap().unwrap();
+        assert_eq!((row.attempts, row.draft_revision), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_draft_id_refuses_import_but_a_fresh_import_is_startable() {
+        use crate::orchestrator::inference_import::{persist, Candidate};
+        let db = crate::storage::migrated_test_db("generation-reserved-import").await;
+        registered(&db).await;
+        insert_generation(&db, &generation("old", "old-job"))
+            .await
+            .unwrap();
+        write_generated(&db, "cairn://p/prj/9/1/wf", "old-job", &write("a"))
+            .await
+            .unwrap();
+        finalize_generation(&db, "old", FAILED, None).await.unwrap();
+        assert!(load_inventory(&db).await.unwrap().profiles.is_empty());
+        let mut profile: InferenceProfile =
+            serde_yaml::from_str(&profile_yaml("a", CONTAINER)).unwrap();
+        profile.origin = ProfileOrigin::Imported {
+            url: "https://github.com/example/server".into(),
+            commit: "abc".into(),
+            compose: "compose.yaml".into(),
+            service: "server".into(),
+        };
+        let candidate = |profile| Candidate {
+            spec: cairn_inference::import::ImportSpec::default(),
+            profile,
+            notes: vec![],
+            references: vec![],
+        };
+        let refused = persist(&db, candidate(profile.clone()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("reserved by generation old"), "{refused}");
+        assert!(refused.contains("a-new"), "{refused}");
+        assert!(load_inventory(&db).await.unwrap().profiles.is_empty());
+        profile.id = "a-new".into();
+        persist(&db, candidate(profile)).await.unwrap();
+        let inventory = load_inventory(&db).await.unwrap();
+        let deployment = serde_yaml::from_str(
+            "{id: fresh, profile: a-new, machines: [bbs], head: bbs, apiPort: 8090, apiPath: /v1, healthPath: /v1/models}"
+        ).unwrap();
+        let gate = promotion::Gate::load(&db).await.unwrap();
+        assert!(gate.start_refusal(&inventory, &deployment).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_generated_id_is_refused_inside_the_inventory_save_transaction() {
+        use crate::orchestrator::inference::{delete_profile, diff_rows, save_rows};
+        let db = crate::storage::migrated_test_db("generation-reserved-save").await;
+        registered(&db).await;
+        insert_generation(&db, &generation("old", "old-job"))
+            .await
+            .unwrap();
+        write_generated(&db, "cairn://p/prj/9/1/wf", "old-job", &write("a"))
+            .await
+            .unwrap();
+        delete_profile(&db, "a").await.unwrap();
+        let before = load_inventory(&db).await.unwrap();
+        let mut next = before.clone();
+        let mut profile: InferenceProfile =
+            serde_yaml::from_str(&profile_yaml("a", CONTAINER)).unwrap();
+        profile.origin = ProfileOrigin::Authored;
+        next.insert_profile(profile);
+        // Bypass preparation to prove the transactional writer is the guard.
+        let refused = save_rows(&db, diff_rows(&before, &next), 2)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("reserved by generation old"), "{refused}");
+        assert_eq!(load_inventory(&db).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_removed_profile_id_is_reusable_only_after_its_generation_ends() {
+        let db = crate::storage::migrated_test_db("generation-reuse-cleaned-id").await;
+        registered(&db).await;
+        let home = "cairn://p/prj/9/1/wf";
+        insert_generation(&db, &generation("old", "old-job"))
+            .await
+            .unwrap();
+        write_generated(&db, home, "old-job", &write("a"))
+            .await
+            .unwrap();
+        super::super::inference::delete_profile(&db, "a")
+            .await
+            .unwrap();
+        insert_generation(&db, &generation("new", "new-job"))
+            .await
+            .unwrap();
+        let refusal = write_generated(&db, home, "new-job", &write("a"))
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.contains("belongs to another generation"),
+            "{refusal}"
+        );
+        finalize_generation(&db, "old", CANCELLED, None)
+            .await
+            .unwrap();
+        write_generated(&db, home, "new-job", &write("a"))
+            .await
+            .unwrap();
+        let receipt = db.query_opt(
+            "SELECT generation_id, active, promoted_verification_id FROM inference_generated_profiles WHERE profile_id = 'a'",
+            (), |row| Ok((row.text(0)?, row.i64(1)?, row.opt_text(2)?)),
+        ).await.unwrap().unwrap();
+        assert_eq!(receipt, ("new".into(), 1, None));
+        let old = get_generation(&db, "old").await.unwrap().unwrap();
+        assert_eq!((old.state.as_str(), old.attempts), (CANCELLED, 1));
+        let new = get_generation(&db, "new").await.unwrap().unwrap();
+        assert_eq!((new.attempts, new.draft_revision), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn editing_and_undoing_a_draft_does_not_restore_approval() {
+        let db = crate::storage::migrated_test_db("generation-edit-undo-consent").await;
+        registered(&db).await;
+        insert_generation(&db, &generation("g", "job"))
+            .await
+            .unwrap();
+        let (_, data) = write_generated(&db, "cairn://p/prj/9/1/wf", "job", &write("a"))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE inference_generations SET approved_surface = ?1, approval_revision = 1,
+             approval_prompt_id = 'old-prompt', approval_run_id = 'old-run' WHERE id = 'g'",
+            (data["surfaceDigest"].as_str().unwrap(),),
+        )
+        .await
+        .unwrap();
+        let original =
+            load_inventory(&db).await.unwrap().profiles[&InferenceProfileId::from("a")].clone();
+        let mut edited = original.clone();
+        let Engine::Container(container) = &mut edited.engine else {
+            panic!("container")
+        };
+        container.args.extend(["--ctx-size".into(), "4096".into()]);
+        for profile in [&edited, &original] {
+            super::super::inference::save_profile(
+                &db,
+                Some("a"),
+                &serde_yaml::to_string(profile).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let row = get_generation(&db, "g").await.unwrap().unwrap();
+        assert!(row.approved_surface.is_none());
+        assert!(row.approval_revision.is_none());
+        assert_eq!(row.approval_prompt_id.as_deref(), Some("old-prompt"));
+        assert_eq!((row.attempts, row.draft_revision), (1, 1));
+        let revision = db.query_opt(
+            "SELECT inventory_revision FROM inference_generated_profiles WHERE profile_id = 'a'",
+            (), |row| row.i64(0),
+        ).await.unwrap().unwrap();
+        assert_eq!(
+            revision, 3,
+            "writing, editing and undoing each advance the inventory revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_workflows_cannot_submit_candidates_or_spend_attempts() {
+        let db = crate::storage::migrated_test_db("generation-legacy-write-refused").await;
+        let mut legacy = generation("legacy", "old-workflow");
+        legacy.mode = "workflow".into();
+        legacy.execution_id = None;
+        insert_generation(&db, &legacy).await.unwrap();
+        let refusal = write_generated(&db, &legacy.node_uri, &legacy.job_id, &write("a"))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("bound node"), "{refusal}");
+        assert_eq!(
+            get_generation(&db, "legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            0
+        );
+        assert!(load_inventory(&db).await.unwrap().profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_candidates_spend_the_budget_even_when_they_write_nothing() {
+        let db = crate::storage::migrated_test_db("generation-invalid-budget").await;
+        insert_generation(&db, &generation("g", "job"))
+            .await
+            .unwrap();
+        for attempt in 1..=3 {
+            assert!(write_generated(
+                &db,
+                "cairn://p/prj/9/1/wf",
+                "job",
+                &serde_json::json!({"profile": {}})
+            )
+            .await
+            .is_err());
+            let row = get_generation(&db, "g").await.unwrap().unwrap();
+            assert_eq!(row.attempts, attempt);
+            assert_eq!(row.draft_revision, 0);
+            assert_eq!(row.state, if attempt == 3 { "exhausted" } else { RUNNING });
+            assert!(load_inventory(&db).await.unwrap().profiles.is_empty());
+        }
+        assert!(write_generated(
+            &db,
+            "cairn://p/prj/9/1/wf",
+            "job",
+            &serde_json::json!({"profile": {}})
+        )
+        .await
+        .is_err());
+        assert_eq!(get_generation(&db, "g").await.unwrap().unwrap().attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_candidate_failures_cannot_overspend_three_attempts() {
+        let db = crate::storage::migrated_test_db("generation-concurrent-budget").await;
+        insert_generation(&db, &generation("g", "job"))
+            .await
+            .unwrap();
+        let invalid = serde_json::json!({"profile": {}});
+        let results = futures_util::future::join_all(
+            (0..8).map(|_| write_generated(&db, "cairn://p/prj/9/1/wf", "job", &invalid)),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_err));
+        let row = get_generation(&db, "g").await.unwrap().unwrap();
+        assert_eq!(row.attempts, 3);
+        assert_eq!(row.state, "exhausted");
+    }
+
+    #[tokio::test]
+    async fn the_third_accepted_candidate_keeps_its_approval_opportunity() {
+        let db = crate::storage::migrated_test_db("generation-third-candidate").await;
+        registered(&db).await;
+        let mut row = generation("g", "job");
+        row.mode = "agent".into();
+        row.execution_id = Some("execution".into());
+        let home = row.node_uri.clone();
+        insert_generation(&db, &row).await.unwrap();
+        let refusal = write_generated(&db, "wrong-node", "job", &write("a"))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("bound node"), "{refusal}");
+        assert_eq!(get_generation(&db, "g").await.unwrap().unwrap().attempts, 0);
+        for attempt in 1..=3 {
+            let (_, data) = write_generated(&db, &home, "job", &write("a"))
+                .await
+                .unwrap();
+            let row = get_generation(&db, "g").await.unwrap().unwrap();
+            assert_eq!((row.attempts, row.draft_revision), (attempt, attempt));
+            assert_eq!(row.state, RUNNING);
+            assert_eq!(data["revision"], attempt);
+            assert!(row.approved_surface.is_none());
+            assert!(row.approval_revision.is_none());
+            let inventory = load_inventory(&db).await.unwrap();
+            let profile = &inventory.profiles[&InferenceProfileId::from("a")];
+            assert_eq!(
+                row.draft_digest.as_deref(),
+                Some(super::super::inference_verify::digest(profile).as_str())
+            );
+            let receipt = db
+                .query_opt(
+                    "SELECT revision, profile_digest, active, promoted_verification_id
+                 FROM inference_generated_profiles WHERE profile_id = 'a'",
+                    (),
+                    |row| Ok((row.i64(0)?, row.text(1)?, row.i64(2)?, row.opt_text(3)?)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt, (attempt, row.draft_digest.unwrap(), 1, None));
+        }
+        let refusal = write_generated(&db, &home, "job", &write("a"))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("three candidate submissions"), "{refusal}");
+        assert_eq!(
+            get_generation(&db, "g").await.unwrap().unwrap().state,
+            "exhausted"
+        );
+        assert!(load_inventory(&db).await.unwrap().profiles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_generated_write_is_stamped_from_its_caller_and_only_its_agent_writes_one() {
         let db = crate::storage::migrated_test_db("inference-generate-write").await;
         registered(&db).await;
         let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-none", &write("a"))
             .await
             .unwrap_err();
         assert!(
-            refusal.starts_with("only the workflow of an open profile generation"),
+            refusal.starts_with("only the agent of an open profile generation"),
             "{refusal}"
         );
 
@@ -1981,7 +2015,9 @@ requirements:
         let shell = serde_json::json!({
             "profile": profile_yaml("c", "{kind: command, start: ./run.sh}"),
         });
-        let refusal = write_generated(&db, "h", "j-wf", &shell).await.unwrap_err();
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf", &shell)
+            .await
+            .unwrap_err();
         assert!(
             refusal.contains("a command engine is the operator's"),
             "{refusal}"
@@ -1990,7 +2026,7 @@ requirements:
         let tagged = serde_json::json!({
             "profile": profile_yaml("c", "{kind: container, image: \"ghcr.io/x:latest\", server: llamaCpp}"),
         });
-        let refusal = write_generated(&db, "h", "j-wf", &tagged)
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf", &tagged)
             .await
             .unwrap_err();
         assert!(refusal.contains("is not pinned by digest"), "{refusal}");
@@ -1998,132 +2034,19 @@ requirements:
         let mut other = generation("g0", "j-other");
         other.state = "verified".into();
         insert_generation(&db, &other).await.unwrap();
-        write_generated(&db, "h", "j-wf", &write("taken"))
+        write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf", &write("taken"))
             .await
             .unwrap();
         insert_generation(&db, &generation("g2", "j-wf2"))
             .await
             .unwrap();
-        let refusal = write_generated(&db, "h", "j-wf2", &write("taken"))
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf2", &write("taken"))
             .await
             .unwrap_err();
         assert!(
             refusal.contains("exists already and is not this generation's draft"),
             "{refusal}"
         );
-    }
-
-    /// A pass of `profile` on `pool`, started after any draft was written.
-    fn passed(profile: &str, pool: &str) -> VerificationRow {
-        passed_at("v", profile, pool, i64::MAX / 2)
-    }
-
-    fn passed_at(id: &str, profile: &str, pool: &str, started_at: i64) -> VerificationRow {
-        VerificationRow {
-            id: id.into(),
-            profile: profile.into(),
-            profile_digest: String::new(),
-            pool: pool.into(),
-            deployment: String::new(),
-            machines: vec![],
-            requested_by: String::new(),
-            started_at,
-            finished_at: Some(1),
-            outcome: "passed".into(),
-            stage: "done".into(),
-            reason: None,
-            load_ms: None,
-            footprint: None,
-            context_tokens: None,
-            kv_tokens: None,
-            ttft_ms: None,
-            decode_tps: None,
-            prefill_tps: None,
-            embed_tps: Some(1000.0),
-            engine_version: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn verification_decides_the_outcome_and_any_other_ending_removes_the_draft() {
-        let db = crate::storage::migrated_test_db("inference-generate-outcome").await;
-        registered(&db).await;
-        insert_generation(&db, &generation("g1", "j-wf"))
-            .await
-            .unwrap();
-        write_generated(&db, "h", "j-wf", &write("a"))
-            .await
-            .unwrap();
-        let verified = serde_json::json!({"outcome": "verified", "verification": "v"});
-
-        let refusal = record_outcome(&db, "j-intruder", "g1", &verified, &[])
-            .await
-            .unwrap_err();
-        assert!(
-            refusal.contains("only the generation's own workflow"),
-            "{refusal}"
-        );
-        let unnamed = serde_json::json!({"outcome": "verified"});
-        let refusal = record_outcome(&db, "j-wf", "g1", &unnamed, &[passed("a", "bbs")])
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("names its verification"), "{refusal}");
-        let refusal = record_outcome(&db, "j-wf", "g1", &verified, &[])
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("there is no verification v"), "{refusal}");
-        let refusal = record_outcome(&db, "j-wf", "g1", &verified, &[passed("a", "halo")])
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("verification decides"), "{refusal}");
-        // A pass of an earlier profile with the same id, before this draft
-        // was written, measured other content.
-        let refusal = record_outcome(
-            &db,
-            "j-wf",
-            "g1",
-            &verified,
-            &[passed_at("v", "a", "bbs", 0)],
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            refusal.contains("not a pass of the current draft"),
-            "{refusal}"
-        );
-        let (_, ended) = record_outcome(&db, "j-wf", "g1", &verified, &[passed("a", "bbs")])
-            .await
-            .unwrap();
-        assert_eq!(ended.state, "verified");
-        assert!(load_inventory(&db)
-            .await
-            .unwrap()
-            .profiles
-            .contains_key(&InferenceProfileId::from("a")));
-        let refusal = record_outcome(&db, "j-wf", "g1", &verified, &[passed("a", "bbs")])
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("already ended verified"), "{refusal}");
-
-        insert_generation(&db, &generation("g2", "j-wf2"))
-            .await
-            .unwrap();
-        write_generated(&db, "h", "j-wf2", &write("b"))
-            .await
-            .unwrap();
-        let gave_up = serde_json::json!({"outcome": "gaveUp", "why": "three attempts failed"});
-        let (said, ended) = record_outcome(&db, "j-wf2", "g2", &gave_up, &[])
-            .await
-            .unwrap();
-        assert_eq!(ended.state, "gaveUp");
-        assert!(said.contains("Removed its draft profile b"), "{said}");
-        assert!(!load_inventory(&db)
-            .await
-            .unwrap()
-            .profiles
-            .contains_key(&InferenceProfileId::from("b")));
-        assert_eq!(ended.outcome, Some(gave_up));
-        assert_eq!(ended.draft_profile, None, "the removed draft is forgotten");
     }
 
     #[tokio::test]
@@ -2134,7 +2057,7 @@ requirements:
             .await
             .unwrap();
         let devices = serde_json::json!({"profile": profile_yaml("d", "{kind: container, image: \"ghcr.io/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: llamaCpp, host: {devices: [/dev/nvme0n1]}}")});
-        let refusal = write_generated(&db, "h", "j-wf", &devices)
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf", &devices)
             .await
             .unwrap_err();
         assert!(
@@ -2142,13 +2065,15 @@ requirements:
             "{refusal}"
         );
         let files = serde_json::json!({"profile": profile_yaml("f", "{kind: container, image: \"ghcr.io/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: llamaCpp, files: {url: \"https://github.com/o/r\", commit: 0123456789abcdef0123456789abcdef01234567}}")});
-        let refusal = write_generated(&db, "h", "j-wf", &files).await.unwrap_err();
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf", &files)
+            .await
+            .unwrap_err();
         assert!(
             refusal.contains("checks out no source repository"),
             "{refusal}"
         );
         let writable = serde_json::json!({"profile": profile_yaml("w", "{kind: container, image: \"ghcr.io/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: llamaCpp, mounts: [{from: {kind: hfCache}, to: /models, readOnly: false}]}")});
-        let refusal = write_generated(&db, "h", "j-wf", &writable)
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-wf", &writable)
             .await
             .unwrap_err();
         assert!(
@@ -2156,329 +2081,12 @@ requirements:
             "{refusal}"
         );
         let unconfigured = serde_json::json!({"profile": profile_yaml("v", "{kind: container, image: \"ghcr.io/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: vllm, mounts: [{from: {kind: hfCache}, to: /root/.cache/huggingface}]}")});
-        let refusal = write_generated(&db, "h", "j-wf", &unconfigured)
+        insert_generation(&db, &generation("g-config", "j-config"))
+            .await
+            .unwrap();
+        let refusal = write_generated(&db, "cairn://p/prj/9/1/wf", "j-config", &unconfigured)
             .await
             .unwrap_err();
         assert!(refusal.contains("model.configFiles"), "{refusal}");
-    }
-
-    fn asked(digest: &str, answer: Option<&str>) -> AskedQuestion {
-        AskedQuestion {
-            questions_json: serde_json::json!([{
-                "question": format!("Run this draft on bbs? (surface {digest})"),
-                "header": "Approve",
-                "options": [{"label": "Approve", "description": ""}, {"label": "Reject", "description": ""}]
-            }])
-            .to_string(),
-            response: answer.map(|answer| serde_json::json!([{"index": 0, "answer": answer}]).to_string()),
-            answered_on: answer.map(|_| AppearanceTransport::AuthenticatedDesktop),
-        }
-    }
-
-    /// Seed `j-wf`'s question `q-N` showing `digest`, answered `Approve`
-    /// through `surface` the way every answer surface records it: a claim in
-    /// the answer ledger, then the stored response.
-    async fn answered_through(db: &LocalDb, n: u32, digest: &str, surface: AppearanceTransport) {
-        let asked = asked(digest, Some(APPROVE));
-        if n == 1 {
-            db.execute_batch(
-                "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1);
-                 INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                   VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
-                 INSERT INTO jobs (id, project_id, agent_config_id, status, uri_segment, created_at, updated_at)
-                   VALUES ('j-wf', 'p', 'inference-generate', 'running', 'workflow', 1, 1);
-                 INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
-                   VALUES ('r-wf', 'p', 'j-wf', 'running', 1, 1);",
-            )
-            .await
-            .unwrap();
-        }
-        let prompt = format!("prompt-{n}");
-        db.execute(
-            "INSERT INTO prompts (id, run_id, job_id, questions, uri_segment, response, created_at) \
-             VALUES (?1, 'r-wf', 'j-wf', ?2, ?3, ?4, 1)",
-            (
-                prompt.as_str(),
-                asked.questions_json.as_str(),
-                format!("q-{n}"),
-                asked.response.clone().unwrap(),
-            ),
-        )
-        .await
-        .unwrap();
-        let actor = (surface == AppearanceTransport::ResourcePatch)
-            .then_some("cairn://p/cairn/1/1/builder");
-        crate::channels::ledger::claim_ask_resolution(
-            db,
-            &prompt,
-            asked.response.as_deref().unwrap(),
-            surface,
-            None,
-            None,
-            actor,
-            "question",
-            &prompt,
-            1,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn only_the_operators_answer_in_the_app_approves_a_draft() {
-        let db = crate::storage::migrated_test_db("inference-generate-approver").await;
-        registered(&db).await;
-        insert_generation(&db, &generation("g1", "j-wf"))
-            .await
-            .unwrap();
-        let (_, data) = write_generated(&db, "h", "j-wf", &write("a"))
-            .await
-            .unwrap();
-        let digest = data["surfaceDigest"].as_str().unwrap().to_string();
-        let uri = |n: u32| format!("cairn://p/cairn/1/1/workflow/questions/q-{n}");
-
-        // A `questions/q-N` write is open to any agent, the workflow included,
-        // and answers through the resource surface.
-        for (n, surface) in [
-            (1, AppearanceTransport::ResourcePatch),
-            (2, AppearanceTransport::LocalInvoke),
-            (3, AppearanceTransport::NonOperatorInvoke),
-        ] {
-            answered_through(&db, n, &digest, surface).await;
-            let asked = asked_question_in(&db, "j-wf", &uri(n)).await.unwrap();
-            assert_eq!(asked.as_ref().unwrap().answered_on, Some(surface));
-            let refusal = approve(&db, "j-wf", "g1", asked).await.unwrap_err();
-            assert!(
-                refusal.contains("does not speak for the operator"),
-                "{refusal}"
-            );
-            assert!(unapproved_draft(&db, "a").await.unwrap().is_some());
-        }
-        let unrecorded = AskedQuestion {
-            answered_on: None,
-            ..asked(&digest, Some(APPROVE))
-        };
-        let refusal = approve(&db, "j-wf", "g1", Some(unrecorded))
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("no record of who gave it"), "{refusal}");
-
-        answered_through(&db, 4, &digest, AppearanceTransport::AuthenticatedDesktop).await;
-        let asked = asked_question_in(&db, "j-wf", &uri(4)).await.unwrap();
-        assert_eq!(approve(&db, "j-wf", "g1", asked).await.unwrap(), digest);
-        assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_draft_is_verified_only_once_the_operator_approved_what_it_runs_as_it_stands() {
-        let db = crate::storage::migrated_test_db("inference-generate-approve").await;
-        registered(&db).await;
-        insert_generation(&db, &generation("g1", "j-wf"))
-            .await
-            .unwrap();
-        let (_, data) = write_generated(&db, "h", "j-wf", &write("a"))
-            .await
-            .unwrap();
-        let digest = data["surfaceDigest"].as_str().unwrap().to_string();
-        assert_eq!(data["surface"]["image"], "ghcr.io/ggml-org/llama.cpp@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-        assert!(unapproved_draft(&db, "a").await.unwrap().is_some());
-        assert_eq!(unapproved_draft(&db, "not-a-draft").await.unwrap(), None);
-
-        let refusal = approve(&db, "j-intruder", "g1", Some(asked(&digest, Some(APPROVE))))
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("own workflow"), "{refusal}");
-        let refusal = approve(&db, "j-wf", "g1", Some(asked(&digest, None)))
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("has not answered"), "{refusal}");
-        let refusal = approve(&db, "j-wf", "g1", Some(asked(&digest, Some("Reject"))))
-            .await
-            .unwrap_err();
-        assert!(refusal.contains("not Approve"), "{refusal}");
-        let refusal = approve(&db, "j-wf", "g1", Some(asked("0000", Some(APPROVE))))
-            .await
-            .unwrap_err();
-        assert!(
-            refusal.contains("did not show the draft's runnable surface"),
-            "{refusal}"
-        );
-        let refusal = approve(&db, "j-wf", "g1", None).await.unwrap_err();
-        assert!(
-            refusal.contains("not asked by this generation"),
-            "{refusal}"
-        );
-
-        assert_eq!(
-            approve(&db, "j-wf", "g1", Some(asked(&digest, Some(APPROVE))))
-                .await
-                .unwrap(),
-            digest
-        );
-        assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None);
-
-        // A revision that runs something else needs approving again.
-        let changed = serde_json::json!({"profile": profile_yaml("a", "{kind: container, image: \"ghcr.io/ggml-org/llama.cpp@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", server: llamaCpp, args: [-m, \"{weights}\", --flash-attn]}")});
-        let (_, data) = write_generated(&db, "h", "j-wf", &changed).await.unwrap();
-        assert_ne!(data["surfaceDigest"].as_str().unwrap(), digest);
-        assert!(unapproved_draft(&db, "a").await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn weights_server_and_accelerator_changes_each_require_fresh_approval() {
-        let db = crate::storage::migrated_test_db("inference-generate-surface-fields").await;
-        registered(&db).await;
-        insert_generation(&db, &generation("g1", "j-wf"))
-            .await
-            .unwrap();
-        let baseline: InferenceProfile =
-            serde_yaml::from_str(&profile_yaml("a", CONTAINER)).unwrap();
-        let baseline = serde_json::to_value(baseline).unwrap();
-        let mut changes = Vec::new();
-        for field in ["repo", "revision", "path", "sha256"] {
-            let mut changed = baseline.clone();
-            changed["model"]["weights"][0][field] = match field {
-                "repo" => "other/weights".into(),
-                "revision" => "def".into(),
-                "path" => "other.gguf".into(),
-                _ => "f".repeat(64).into(),
-            };
-            changes.push((field, changed));
-        }
-        let mut server = baseline.clone();
-        server["engine"]["server"] = "vllm".into();
-        changes.push(("server", server));
-        let mut accelerator = baseline.clone();
-        accelerator["requirements"]["accelerator"] =
-            serde_json::json!({"family": "amd", "runtime": "rocm"});
-        changes.push(("accelerator", accelerator));
-
-        for (field, changed) in changes {
-            let (_, original) =
-                write_generated(&db, "h", "j-wf", &serde_json::json!({"profile": baseline}))
-                    .await
-                    .unwrap();
-            let old = original["surfaceDigest"].as_str().unwrap();
-            approve(&db, "j-wf", "g1", Some(asked(old, Some(APPROVE))))
-                .await
-                .unwrap();
-            assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None);
-            let (_, revised) =
-                write_generated(&db, "h", "j-wf", &serde_json::json!({"profile": changed}))
-                    .await
-                    .unwrap();
-            let fresh = revised["surfaceDigest"].as_str().unwrap();
-            assert_ne!(old, fresh, "{field}");
-            assert!(
-                unapproved_draft(&db, "a").await.unwrap().is_some(),
-                "{field}"
-            );
-            assert!(
-                approve(&db, "j-wf", "g1", Some(asked(old, Some(APPROVE))))
-                    .await
-                    .is_err(),
-                "{field}"
-            );
-            approve(&db, "j-wf", "g1", Some(asked(fresh, Some(APPROVE))))
-                .await
-                .unwrap();
-            assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None, "{field}");
-        }
-    }
-
-    #[tokio::test]
-    async fn an_open_draft_with_a_legacy_digest_requires_the_expanded_surface_approval() {
-        let db = crate::storage::migrated_test_db("inference-generate-old-surface").await;
-        registered(&db).await;
-        insert_generation(&db, &generation("g1", "j-wf"))
-            .await
-            .unwrap();
-        let (_, written) = write_generated(&db, "h", "j-wf", &write("a"))
-            .await
-            .unwrap();
-        let mut legacy = written["surface"].clone();
-        for field in ["weights", "server", "accelerator"] {
-            legacy.as_object_mut().unwrap().remove(field);
-        }
-        let legacy = surface_digest(&legacy);
-        set_approved(&db, "g1", &legacy).await.unwrap();
-        assert!(unapproved_draft(&db, "a").await.unwrap().is_some());
-        assert!(
-            approve(&db, "j-wf", "g1", Some(asked(&legacy, Some(APPROVE))))
-                .await
-                .is_err()
-        );
-        let current = written["surfaceDigest"].as_str().unwrap();
-        assert_ne!(legacy, current);
-        approve(&db, "j-wf", "g1", Some(asked(current, Some(APPROVE))))
-            .await
-            .unwrap();
-        assert_eq!(unapproved_draft(&db, "a").await.unwrap(), None);
-        assert!(get_generation(&db, "g1").await.unwrap().unwrap().is_open());
-    }
-
-    #[tokio::test]
-    async fn a_workflow_that_ends_without_an_outcome_fails_and_loses_its_unverified_draft() {
-        let db = crate::storage::migrated_test_db("inference-generate-reconcile").await;
-        registered(&db).await;
-        for (id, job, draft) in [("g1", "j-1", "a"), ("g2", "j-2", "b"), ("g3", "j-3", "c")] {
-            insert_generation(&db, &generation(id, job)).await.unwrap();
-            write_generated(&db, "h", job, &write(draft)).await.unwrap();
-        }
-        let ended: std::collections::BTreeSet<String> =
-            ["j-1".to_string(), "j-2".to_string()].into();
-        // g2's draft passed before its workflow died; g3's workflow still runs.
-        let verifications = [passed("b", "bbs")];
-        let now_ended = reconcile(&db, &ended, &verifications).await.unwrap();
-        let mut ended_ids: Vec<&str> = now_ended.iter().map(|g| g.id.as_str()).collect();
-        ended_ids.sort_unstable();
-        assert_eq!(ended_ids, vec!["g1", "g2"]);
-        let inventory = load_inventory(&db).await.unwrap();
-        assert!(!inventory
-            .profiles
-            .contains_key(&InferenceProfileId::from("a")));
-        assert!(
-            inventory
-                .profiles
-                .contains_key(&InferenceProfileId::from("b")),
-            "verification decided"
-        );
-        assert!(inventory
-            .profiles
-            .contains_key(&InferenceProfileId::from("c")));
-        let g1 = get_generation(&db, "g1").await.unwrap().unwrap();
-        assert_eq!((g1.state.as_str(), g1.draft_profile), ("failed", None));
-        assert!(get_generation(&db, "g3").await.unwrap().unwrap().is_open());
-        assert!(reconcile(&db, &ended, &verifications)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_draft_left_behind_by_a_cancel_is_removed_once_it_can_be() {
-        let db = crate::storage::migrated_test_db("inference-generate-leftover").await;
-        registered(&db).await;
-        insert_generation(&db, &generation("g1", "j-1"))
-            .await
-            .unwrap();
-        write_generated(&db, "h", "j-1", &write("a")).await.unwrap();
-        // A cancel during a verification ends the generation with its draft
-        // still held; the next reconcile removes it.
-        finish(&db, "g1", "cancelled", None).await.unwrap();
-        reconcile(&db, &Default::default(), &[]).await.unwrap();
-        assert!(!load_inventory(&db)
-            .await
-            .unwrap()
-            .profiles
-            .contains_key(&InferenceProfileId::from("a")));
-        assert_eq!(
-            get_generation(&db, "g1")
-                .await
-                .unwrap()
-                .unwrap()
-                .draft_profile,
-            None
-        );
     }
 }

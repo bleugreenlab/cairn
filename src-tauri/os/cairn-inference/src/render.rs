@@ -30,10 +30,11 @@ use std::fmt::Write as _;
 
 use crate::control::Refusal;
 use crate::deployment::Deployment;
+use crate::inventory::ValidationError;
 use crate::machine::MachineName;
 use crate::profile::{
-    placeholders, AcceleratorFamily, AcceleratorRuntime, Container, Engine, InferenceProfile,
-    MountSource, Server, WeightFile,
+    placeholders, secret_references, AcceleratorFamily, AcceleratorRuntime, Container, Engine,
+    InferenceProfile, MountSource, Server, WeightFile,
 };
 
 /// What the head runs for one deployment.
@@ -513,6 +514,23 @@ fn rank_script(
     }
     for (key, value) in &env {
         no_newline(profile, key)?;
+        // Validation refuses this too; a record written before it did must
+        // still not start a container holding a reference as its credential.
+        if let Some(reference) = secret_references(value).first() {
+            let from_rank = container
+                .ranks
+                .get(rank)
+                .is_some_and(|env| env.contains_key(key));
+            return Err(Refusal(
+                ValidationError::UnresolvedSecret {
+                    profile: profile.id.clone(),
+                    key: key.clone(),
+                    rank: from_rank.then_some(rank),
+                    reference: reference.to_string(),
+                }
+                .to_string(),
+            ));
+        }
         flags.extend(["-e".into(), quote(&format!("{key}={}", fill(value)?))]);
     }
     if cache {
@@ -1211,6 +1229,57 @@ mod tests {
             "if [ \"$rt\" = docker ]; then gpu=(--gpus all); else gpu=(--device nvidia.com/gpu=all); fi"
         ));
         assert!(rendered.start.contains("--security-opt label=disable"));
+    }
+
+    #[test]
+    fn an_env_reading_a_secret_nothing_fills_is_refused_not_passed_as_a_credential() {
+        let fedora = [MachineAt {
+            name: "fedora".into(),
+            address: None,
+            link: None,
+        }];
+        let mut profile = embedder();
+        if let Engine::Container(container) = &mut profile.engine {
+            container
+                .env
+                .insert("HF_TOKEN".into(), "${HF_TOKEN}".into());
+        }
+        let refusal = render(&profile, &deployment("embed", &["fedora"], 8090), &fedora)
+            .unwrap_err()
+            .0;
+        assert!(
+            refusal.contains("env HF_TOKEN reads ${HF_TOKEN}"),
+            "{refusal}"
+        );
+
+        let mut gang = dspark();
+        if let Engine::Container(container) = &mut gang.engine {
+            container.ranks[1].insert("PEER_TOKEN".into(), "$PEER_TOKEN".into());
+        }
+        let refusal = render(
+            &gang,
+            &deployment("d", &["bginf-sp1", "bginf-sp2"], 8888),
+            &sparks(),
+        )
+        .unwrap_err()
+        .0;
+        assert!(
+            refusal.contains("rank 1 env PEER_TOKEN reads ${PEER_TOKEN}"),
+            "{refusal}"
+        );
+
+        // Escaped and non-secret dollar text still renders, as written.
+        let mut literal = embedder();
+        if let Engine::Container(container) = &mut literal.engine {
+            container
+                .env
+                .insert("BANNER".into(), "$${HF_TOKEN} costs $5".into());
+            container.env.insert("HF_HOME".into(), "${HF_HOME}".into());
+        }
+        let start = render(&literal, &deployment("embed", &["fedora"], 8090), &fedora)
+            .unwrap()
+            .start;
+        assert!(start.contains("'BANNER=$${HF_TOKEN} costs $5'"), "{start}");
     }
 
     #[test]

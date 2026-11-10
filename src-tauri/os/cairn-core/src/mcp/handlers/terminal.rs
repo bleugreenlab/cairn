@@ -5262,7 +5262,7 @@ mod terminal_finalize_tests {
         residency.current_base_commit = tip;
         let mut old_process = cell.occupancy.processes.remove("main").unwrap();
         old_process.kind = ResidentProcessKind::WorkflowRuntime {
-            workflow: "inference-generate".into(),
+            workflow: "redispatch-fixture".into(),
         };
         if replace_existing {
             cell.occupancy
@@ -5401,7 +5401,7 @@ mod terminal_finalize_tests {
         let spawn_orch = orch.clone();
         let params = WorkflowSpawnParams {
             run_id: run_id.into(),
-            workflow_id: "inference-generate".into(),
+            workflow_id: "redispatch-fixture".into(),
             project_id: "p".into(),
             repository_path: checkout.path().into(),
             anchor_branch: "main".into(),

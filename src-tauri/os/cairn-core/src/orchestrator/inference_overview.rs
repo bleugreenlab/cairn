@@ -198,6 +198,9 @@ pub struct ModelProfile {
     /// Verified before, but only as it was before an edit: those
     /// verifications no longer count, and a load verifies it first.
     pub edited: bool,
+    /// A profile a generation owns, not promoted as it stands, that nothing
+    /// works on now: a fresh generation may regenerate it in place.
+    pub regenerable: bool,
     /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
 }
@@ -368,6 +371,11 @@ pub(crate) struct Sources<'a> {
     /// The profiles edited since they were verified: every verification of
     /// one ran against content it no longer has.
     pub edited: &'a BTreeSet<String>,
+    /// Generated profiles no verification has promoted as they stand: never
+    /// offered or loaded, whether or not a deployment of one is here.
+    pub unpromoted: &'a BTreeSet<String>,
+    /// Generated profiles a fresh generation may regenerate in place.
+    pub regenerable: &'a BTreeSet<String>,
     pub now: i64,
 }
 
@@ -694,6 +702,7 @@ impl Sources<'_> {
             self.family(pool),
         )
         .iter()
+        .filter(|id| !self.unpromoted.contains(id.as_str()))
         .filter_map(|id| self.inventory.profiles.get(id))
         .map(|profile| {
             let (_, per_machine) = Self::declared_size(profile);
@@ -736,6 +745,7 @@ impl Sources<'_> {
             .iter()
             .filter_map(|id| Some((id, self.model_of(id)?)))
             .filter(|(_, profile)| same_model(&profile.model.name, &group.name))
+            .filter(|(_, profile)| !self.unpromoted.contains(profile.id.as_str()))
             // A deployment of a profile edited since it was verified runs
             // content nothing has vouched for: a load verifies it first.
             .filter(|(_, profile)| !self.edited.contains(profile.id.as_str()))
@@ -1038,6 +1048,7 @@ impl Sources<'_> {
                             in_use: in_use.contains(profile.id.as_str()),
                             verifiable: matches!(profile.engine, Engine::Container(_)),
                             edited: self.edited.contains(profile.id.as_str()),
+                            regenerable: self.regenerable.contains(profile.id.as_str()),
                             fit: self.profile_fit(profile),
                         })
                         .collect(),
@@ -1119,6 +1130,9 @@ async fn with_sources<T>(
         super::inference_verify::load_verifications(db).await?,
         &records,
     );
+    let gate = super::inference_generate::promotion::Gate::load(db).await?;
+    let unpromoted = gate.unpromoted_profiles(&records);
+    let regenerable = gate.regenerable_profiles(&records);
     Ok(with(&Sources {
         inventory: &inventory,
         phases: &phases,
@@ -1129,6 +1143,8 @@ async fn with_sources<T>(
         measures: &measures,
         verifications: &verifications,
         edited: &stale,
+        unpromoted: &unpromoted,
+        regenerable: &regenerable,
         now: crate::fleet::unix_time_ms() as i64,
     }))
 }
@@ -1309,73 +1325,34 @@ pub async fn register_model(orch: &Orchestrator, repo: &str) -> Result<String, S
     super::inference_models::register(&orch.db.local, &hub, repo.trim(), None).await
 }
 
-/// A key an import needs that its files do not give.
+/// A started generation as the page needs it: its record's id and the
+/// ordinary issue it runs in, which the page opens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NeededKey {
-    /// Where it goes in the spec: `ranks`, `env.VLLM_PORT`, `hostPaths./tmp`.
-    pub key: String,
-    pub meaning: String,
+pub struct StartedGeneration {
+    pub generation_id: String,
+    pub issue_uri: String,
 }
 
-/// How an import from the page went: the profile written, or the keys the
-/// spec still lacks, which the page asks for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Imported {
-    pub message: String,
-    /// Empty once the profile is written.
-    pub needs: Vec<NeededKey>,
-}
-
-/// Import a profile from a compose service at a pinned commit, as
-/// `append cairn://inference/profiles {import}` does. A refusal that names
-/// keys is an answer, not an error: the page fills them and tries again.
-pub async fn import_profile(
-    orch: &Orchestrator,
-    spec: serde_json::Value,
-) -> Result<Imported, String> {
-    use super::inference_import::{import, ImportRefusal};
-    let spec: cairn_inference::import::ImportSpec = serde_json::from_value(spec)
-        .map_err(|error| format!("the import is not an import spec: {error}"))?;
-    let hub = super::inference_models::Web::new()?;
-    match import(&orch.db.local, &hub, &spec).await {
-        Ok(message) => Ok(Imported {
-            message,
-            needs: Vec::new(),
-        }),
-        Err(ImportRefusal::Compile(error)) if !error.missing.is_empty() => Ok(Imported {
-            message: error.to_string(),
-            needs: error
-                .missing
-                .into_iter()
-                .map(|missing| NeededKey {
-                    key: missing.key,
-                    meaning: missing.meaning,
-                })
-                .collect(),
-        }),
-        Err(refusal) => Err(refusal.to_string()),
-    }
-}
-
-/// Start generating a profile for `model` on `pool`: the agent session runs
-/// under an anchor issue in `project_id`. Answers the generation as the page
-/// shows it.
+/// Start generating a profile for `model` on `pool`: one agent on an ordinary
+/// issue filed in `project_id`, the project Settings has open. Every machine's
+/// hardware is its executor's report; a pool with a machine that reports none
+/// is refused here, before any issue is filed, naming the machine to attach.
+/// `replacement` names the existing profile the generation regenerates in
+/// place; only an operator's invoke reaches this.
 pub async fn start_generation(
     orch: &Orchestrator,
     project_id: &str,
     model: &str,
     pool: &str,
-    hardware: BTreeMap<String, super::inference_generate::StatedHardware>,
-) -> Result<super::inference_generate::GenerationView, String> {
-    let row = super::inference_generate::launch(orch, project_id, model, pool, hardware).await?;
-    Ok(super::inference_generate::generation_view(orch, row).await)
-}
-
-/// Cancel a running generation.
-pub async fn cancel_generation(orch: &Orchestrator, id: &str) -> Result<String, String> {
-    super::inference_generate::cancel(orch, id).await
+    replacement: Option<&str>,
+) -> Result<StartedGeneration, String> {
+    let launched =
+        super::inference_generate::launch(orch, project_id, model, pool, replacement).await?;
+    Ok(StartedGeneration {
+        generation_id: launched.generation.id,
+        issue_uri: launched.issue_uri,
+    })
 }
 
 /// One profile's record YAML, for its editor.
@@ -1702,6 +1679,8 @@ deployments:
         measures: BTreeMap<DeploymentId, EngineMeasure>,
         verifications: Vec<VerificationRow>,
         edited: BTreeSet<String>,
+        unpromoted: BTreeSet<String>,
+        regenerable: BTreeSet<String>,
     }
 
     impl World {
@@ -1716,6 +1695,8 @@ deployments:
                 measures: BTreeMap::new(),
                 verifications: Vec::new(),
                 edited: BTreeSet::new(),
+                unpromoted: BTreeSet::new(),
+                regenerable: BTreeSet::new(),
             }
         }
 
@@ -1734,6 +1715,8 @@ deployments:
                 measures: &self.measures,
                 verifications: &self.verifications,
                 edited: &self.edited,
+                unpromoted: &self.unpromoted,
+                regenerable: &self.regenerable,
                 now: 600_000,
             }
         }
@@ -2305,6 +2288,35 @@ profiles:
             (Some("no deployment here"), false)
         );
         assert_eq!(sources.load_verifies(&PoolKey::from("fedora"), QWEN), None);
+    }
+
+    #[test]
+    fn an_unpromoted_generated_profile_is_neither_offered_nor_loaded() {
+        let mut world = sparks_with_embed_container(10 * GIB);
+        world.unpromoted.insert("qwen3-embed-4b-gguf".into());
+        world.regenerable.insert("qwen3-embed-4b-gguf".into());
+        let overview = world.overview();
+        let regenerable: Vec<(&str, bool)> = overview
+            .models
+            .iter()
+            .flat_map(|model| &model.profiles)
+            .map(|profile| (profile.id.as_str(), profile.regenerable))
+            .collect();
+        assert!(regenerable.contains(&("qwen3-embed-4b-gguf", true)));
+        assert!(regenerable
+            .iter()
+            .all(|(id, regenerable)| *regenerable == (*id == "qwen3-embed-4b-gguf")));
+        let embed = pool(&overview, SPARKS)
+            .loadable
+            .iter()
+            .find(|l| l.model == EMBED)
+            .unwrap();
+        assert_ne!(embed.profile.as_deref(), Some("qwen3-embed-4b-gguf"));
+        assert!(!embed.verifies);
+        assert_eq!(
+            world.sources().load_verifies(&PoolKey::from(SPARKS), EMBED),
+            None
+        );
     }
 
     #[test]

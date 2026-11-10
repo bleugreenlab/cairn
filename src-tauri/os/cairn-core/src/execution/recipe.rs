@@ -187,9 +187,81 @@ pub(crate) async fn start_recipe_execution_and_advance(
     starter: Starter,
     place: QueuePlace,
 ) -> Result<Launched, String> {
+    start_and_advance(
+        orch,
+        None,
+        issue_id,
+        recipe_id,
+        project_id,
+        initiated_via,
+        branch_target,
+        continuity,
+        customization,
+        trigger_type,
+        intent,
+        after,
+        starter,
+        place,
+    )
+    .await
+}
+
+/// [`start_recipe_execution_and_advance`] under an execution id the caller
+/// minted ([`ids::mint_child`] of the issue), so a record the caller keeps
+/// elsewhere can name the execution before the execution exists, and the
+/// launch of every job it creates can be checked against that record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_recipe_execution_and_advance_as(
+    orch: &Orchestrator,
+    execution_id: String,
+    issue_id: &str,
+    recipe_id: Option<&str>,
+    project_id: &str,
+    initiated_via: Option<&str>,
+    trigger_type: TriggerType,
+    intent: LaunchIntent,
+    starter: Starter,
+) -> Result<Launched, String> {
+    start_and_advance(
+        orch,
+        Some(execution_id),
+        issue_id,
+        recipe_id,
+        project_id,
+        initiated_via,
+        None,
+        None,
+        None,
+        trigger_type,
+        intent,
+        &[],
+        starter,
+        QueuePlace::Tail,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_and_advance(
+    orch: &Orchestrator,
+    minted_id: Option<String>,
+    issue_id: &str,
+    recipe_id: Option<&str>,
+    project_id: &str,
+    initiated_via: Option<&str>,
+    branch_target: Option<BranchTarget>,
+    continuity: Option<Continuity>,
+    customization: Option<LaunchCustomization>,
+    trigger_type: TriggerType,
+    intent: LaunchIntent,
+    after: &[crate::routes::TriggerClause],
+    starter: Starter,
+    place: QueuePlace,
+) -> Result<Launched, String> {
     let gates = crate::execution::gates::authoring::canonical_predicates(after, "after")?;
     let launched = launch_recipe_execution(
         orch,
+        minted_id,
         issue_id,
         recipe_id,
         project_id,
@@ -280,6 +352,7 @@ pub async fn start_recipe_execution_impl(
 ) -> Result<Execution, String> {
     launch_recipe_execution(
         orch,
+        None,
         issue_id,
         recipe_id,
         project_id,
@@ -319,6 +392,7 @@ pub enum QueuePlace {
 #[allow(clippy::too_many_arguments)]
 async fn launch_recipe_execution(
     orch: &Orchestrator,
+    minted_id: Option<String>,
     issue_id: &str,
     recipe_id: Option<&str>,
     project_id: &str,
@@ -504,7 +578,7 @@ async fn launch_recipe_execution(
     let held = !gates.is_empty() || !caps.is_empty();
 
     // Phase 1: sequence, fence, cascade, and insert as one transaction.
-    let exec_id = ids::mint_child(issue_id);
+    let exec_id = minted_id.unwrap_or_else(|| ids::mint_child(issue_id));
     let launch = insert_issue_execution_atomic(
         db.clone(),
         orch.db.clone(),
@@ -573,6 +647,29 @@ async fn launch_recipe_execution(
         execution,
         held_by: caps,
     })
+}
+
+/// The snapshot a launch of `recipe_id` in `project_id` would freeze, with no
+/// customization: what a caller that must refuse before filing anything (a
+/// topology it cannot run) checks. The launch snapshots again, and a caller
+/// whose guarantee depends on the topology checks the stored one too.
+pub(crate) async fn snapshot_for_launch(
+    orch: &Orchestrator,
+    project_id: &str,
+    recipe_id: &str,
+) -> Result<ExecutionSnapshot, String> {
+    let db = resolve_owning_db_for_project(orch, project_id).await?;
+    let project_path = project_path_for_recipe(&db, project_id).await?;
+    let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
+    build_execution_snapshot_from_files(
+        orch,
+        Some(&project_path),
+        &recipe,
+        None,
+        project_id,
+        TriggerType::Manual,
+        None,
+    )
 }
 
 /// Start executing a recipe manually (no issue, just project).

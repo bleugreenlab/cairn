@@ -193,13 +193,13 @@ pub(crate) const INFERENCE_CONTRACT: ResourceContract = ResourceContract {
 const INFERENCE_IMPORT: KeySpec = KeySpec::new(
     "import",
     KeyType::Object,
-    "{url, commit, compose, service, model, envFiles?, env?, ranks?, hostPaths?, weights?, image?, id?}: compile a GitHub compose service at a pinned commit; a refusal lists every key the files cannot supply",
+    "{url, commit, compose, service, model, envFiles?, env?, ranks?, hostPaths?, weights?, image?, id?, preview?}: compile a GitHub compose service at a pinned commit; a refusal lists every key the files cannot supply. preview:true writes nothing and answers the candidate profile, its source commit and notes, with secret-named variables kept as ${NAME} references",
 );
 
 const INFERENCE_GENERATED: KeySpec = KeySpec::new(
     "generated",
     KeyType::Object,
-    "{profile, sources?[{url, title}], answers?[{question, answer}], startingTemplate?}: a profile generation's draft, written only by that generation's own workflow; a digest-pinned container profile of its model, its origin stamped from the writer",
+    "{profile, sources?[{url, title}], answers?[{question, answer}], startingTemplate?}: a profile generation's draft, written only by that generation's bound ordinary agent; a digest-pinned container profile of its model, its origin stamped from the writer",
 );
 
 const INFERENCE_VERIFY: KeySpec = KeySpec::new(
@@ -211,13 +211,13 @@ const INFERENCE_VERIFY: KeySpec = KeySpec::new(
 const INFERENCE_OUTCOME: KeySpec = KeySpec::new(
     "outcome",
     KeyType::Object,
-    "{outcome: verified|cannotRun|gaveUp, verification?, why?, measured?, sources?, attempts?}: how the generation ended, from its own workflow; verified names its verification, a pass of the current draft on its pool started after the draft was written, and any other ending removes the draft",
+    "{outcome: verified|cannotRun|gaveUp, verification?, why?, measured?, sources?, attempts?}: how the generation ended, from its bound ordinary agent; verified requires the server's exact revision-bound verification pass on its pool, regardless of caller-supplied proof, and any other ending removes the draft",
 );
 
 const INFERENCE_APPROVE: KeySpec = KeySpec::new(
     "approve",
     KeyType::Object,
-    "{question}: the generation's own question, naming its draft's runnable-surface digest, that the operator answered Approve; until then the draft is not verified",
+    "{} and nothing else: Cairn raises the operator's approval question itself, showing the draft's runnable surface and its sha256, and returns the same pending question when asked again; once the operator has answered, asking again records an Approve, which verifying that revision requires. Only the operator's own answer approves.",
 );
 
 const FORMAT_JSON: ProjectionSpec = ProjectionSpec {
@@ -429,7 +429,7 @@ pub(crate) const INFERENCE_GENERATIONS_CONTRACT: ResourceContract = ResourceCont
     kind: ResourceKind::InferenceGenerations,
     uri_template: "cairn://inference/generations",
     name: "Inference profile generations",
-    description: "Every profile generation, newest first: the model and pool, the workflow node running it, its state (running, verified, cannotRun, gaveUp, cancelled, or failed when its workflow ended without an outcome), the phase it is in, the question it waits on, its draft profile and how it ended. A generation is an agent session that researches how to run the model on the pool, asks the operator, writes a profile and has verification decide (tenet 1364); it is started from Settings > Inference.",
+    description: "Every profile generation, newest first: its ordinary issue, model and pool, bound agent, authorization state, candidate budget, draft revision, approval, terminal outcome and pending cleanup. Conversation, questions and execution progress belong to the ordinary issue. Generation starts from Settings > Inference; verification decides whether its draft is promoted.",
     read_projections: &[FORMAT_JSON],
     related: INFERENCE_BACK,
     cross_actions: NO_CROSS_ACTIONS,
@@ -440,7 +440,7 @@ pub(crate) const INFERENCE_GENERATION_CONTRACT: ResourceContract = ResourceContr
     kind: ResourceKind::InferenceGeneration,
     uri_template: "cairn://inference/generations/{id}",
     name: "Inference profile generation",
-    description: "One generation: its state, phase and latest log line, the question it waits on, its draft profile and whether the operator approved what it runs, the hardware stated for it and how it ended. Its own workflow patches it with the operator's approval of its draft, which verifying the draft requires, and with its outcome.",
+    description: "One generation's domain ledger: its ordinary issue and bound agent, state, model and pool, candidate budget, current draft revision and runnable surface, approval, outcome and pending cleanup. Its bound agent requests a server-rendered operator approval question or reports an outcome; conversation and execution progress remain on the ordinary issue.",
     read_projections: &[FORMAT_JSON],
     related: INFERENCE_BACK,
     cross_actions: NO_CROSS_ACTIONS,
@@ -448,7 +448,7 @@ pub(crate) const INFERENCE_GENERATION_CONTRACT: ResourceContract = ResourceContr
         mode: ChangeMode::Patch,
         required: &[],
         optional: &[INFERENCE_APPROVE, INFERENCE_OUTCOME],
-        label: "end the generation with its outcome, or record the operator's approval of its draft (its own workflow only)",
+        label: "end the generation with its outcome, or raise and then record the operator's approval of its draft (its own agent only)",
         example: r#"write({changes:[{target:"cairn://inference/generations/ID",mode:"patch",payload:{outcome:{outcome:"cannotRun",why:"..."}}}]})"#,
     }],
 };

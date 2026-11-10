@@ -66,6 +66,9 @@ pub struct QuestionsOutcome {
     pub answers: Option<Vec<QuestionAnswer>>,
     /// The question's own URI, for a non-blocking ask.
     pub uri: Option<String>,
+    /// The stored prompt's id, for a non-blocking ask: its exact identity,
+    /// for a caller that binds the question it raised.
+    pub prompt_id: Option<String>,
 }
 
 impl From<String> for QuestionsOutcome {
@@ -74,6 +77,7 @@ impl From<String> for QuestionsOutcome {
             text,
             answers: None,
             uri: None,
+            prompt_id: None,
         }
     }
 }
@@ -92,6 +96,7 @@ impl From<AnsweredPrompt> for QuestionsOutcome {
             text: answered.rendered,
             answers: Some(answered.answers.into_answers()),
             uri: None,
+            prompt_id: None,
         }
     }
 }
@@ -450,6 +455,7 @@ async fn ask_questions_owned(
             },
             answers: None,
             uri: question_uri,
+            prompt_id: Some(prompt_id),
         };
     }
 
@@ -1246,6 +1252,11 @@ async fn answer_prompt_id_impl(
         PromptRecord::Recorded(resume) => resume,
         PromptRecord::Withdrawn(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
     };
+    if !resume.duplicate {
+        // An operator's rejection of a generation's last candidate ends it
+        // here, at the answer, whatever its agent does next.
+        crate::orchestrator::inference_generate::approval_answered(orch, prompt_id).await;
+    }
 
     // Read after the commit and immediately before the broadcast, so an inline
     // budget expiring during the commit cannot leave an answer that believes a

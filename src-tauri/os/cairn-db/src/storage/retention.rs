@@ -530,6 +530,18 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "inference_generations",
         "one row per profile generation the operator started by hand from Settings > Inference",
     ),
+    keep(
+        "inference_generated_profiles",
+        "one row per inventory profile a generation ever wrote, so origin cannot be erased by rewriting the profile",
+    ),
+    keep(
+        "inference_generation_replacements",
+        "one row per generation that regenerates a profile in place, kept so its first accepted draft is checked against exactly what was captured",
+    ),
+    keep(
+        "inference_generation_runs",
+        "one row per run a generation scopes, kept so erasing the run, job or issue never releases a live process from its scope",
+    ),
     keep("ingress_endpoints", CONFIG),
     keep("account", IDENTITY),
     keep("anon_device", IDENTITY),

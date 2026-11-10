@@ -455,6 +455,14 @@ pub(crate) async fn resolve_terminal(
 
     settle_job_projection_for_issue(orch, owning_db, issue_id).await;
 
+    // A profile generation on the issue ends with it, keeping its draft only
+    // if verification already passed it.
+    if let Err(error) =
+        crate::orchestrator::inference_generate::issue_resolved(orch, issue_id).await
+    {
+        log::warn!("Ending the profile generations of resolved issue {issue_id} failed: {error}");
+    }
+
     if became_terminal {
         announce_resolution(orch, owning_db, issue_id).await;
     }

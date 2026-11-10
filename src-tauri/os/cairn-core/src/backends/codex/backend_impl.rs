@@ -266,6 +266,18 @@ impl AgentBackend for CodexBackend {
         }
     }
 
+    /// A Codex thread that carries Cairn's server keeps its native shell and
+    /// `apply_patch`: the allow-list above governs approval, not which tools
+    /// exist, and the only thread shape that drops them (`tool_free`: no
+    /// environment, every MCP server disabled) drops Cairn's server too.
+    fn native_tools_removed(&self) -> Result<(), String> {
+        Err(
+            "Codex keeps its native shell and apply_patch tools on every thread that carries \
+             Cairn's server; only a tool-free one-shot thread drops them"
+                .to_string(),
+        )
+    }
+
     fn start_session(
         &self,
         config: SessionConfig,

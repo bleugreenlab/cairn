@@ -1,8 +1,7 @@
-//! The profile generator's reads: the tools its agent and its workflow script
-//! read facts through (a model's files, a pool's hardware, the fit, the
-//! templates and a starting profile from one), and the generations
-//! themselves. Each answers markdown, and `?format=json` the same answer as
-//! data, which is what the workflow script parses.
+//! The generating agent's fact tools: model files, pool hardware, fit,
+//! templates and starting profiles, and the generation's domain record.
+//! Conversation and progress live on its ordinary issue. Each tool answers
+//! Markdown or the same facts as data with `?format=json`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -461,25 +460,26 @@ fn generation_section(out: &mut String, view: &GenerationView) {
     let row = &view.row;
     let _ = writeln!(
         out,
-        "## {}\n\n- model: {}\n- pool: {}\n- state: {}{}\n- run: {}",
+        "## {}\n\n- model: {}\n- pool: {}\n- state: {}\n- run: {}\n- candidate submissions: {}/3\n- draft revision: {}",
         row.id,
         row.model,
         row.pool,
         view.status,
-        view.phase
-            .as_deref()
-            .map(|phase| format!(" (phase {phase})"))
-            .unwrap_or_default(),
-        row.node_uri
+        row.node_uri,
+        row.attempts,
+        row.draft_revision,
     );
-    if let Some(log) = &view.last_log {
-        let _ = writeln!(out, "- latest: {log}");
+    if let Some(issue) = &view.issue_uri {
+        let _ = writeln!(out, "- issue: {issue}");
     }
-    if let Some(question) = &view.pending_question {
-        let _ = writeln!(out, "- waiting on the operator: {}", question.uri);
+    if row.cleanup_pending {
+        let _ = writeln!(out, "- draft cleanup: pending verification/lease release");
     }
     if let Some(draft) = &row.draft_profile {
-        let _ = writeln!(out, "- draft profile: cairn://inference/profiles/{draft}");
+        let _ = writeln!(
+            out,
+            "- recorded draft profile: cairn://inference/profiles/{draft}"
+        );
     }
     if !row.hardware.is_empty() {
         let _ = writeln!(

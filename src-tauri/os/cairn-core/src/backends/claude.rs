@@ -1485,6 +1485,15 @@ impl AgentBackend for ClaudeBackend {
         }
     }
 
+    /// Every launch passes `--tools ""`, the CLI's allowlist of built-ins
+    /// (`cairn_models::session::claude::args`), so no built-in shell or edit
+    /// tool is declared to the model, including one a later CLI adds; the
+    /// claude-contract suite pins it and an `init` that declares one anyway is
+    /// logged as a broken tool surface.
+    fn native_tools_removed(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn start_session(
         &self,
         config: SessionConfig,
@@ -3891,4 +3900,70 @@ fn flush_pending_assistant_before_suppress(
     cairn_session::backends::claude::flush_pending_assistant_before_suppress(
         &runtime, db, run_id, session_id, state, pending, usage,
     );
+}
+
+#[cfg(test)]
+mod native_tools_tests {
+    use super::*;
+    use cairn_models::interface::session::SessionStart;
+    use cairn_models::session::claude::args::{build_claude_args, ClaudeArgsConfig};
+
+    /// `native_tools_removed` answers Ok only because the args builder empties
+    /// the CLI's built-in allowlist on every launch. Every launch shape the
+    /// builder takes is asked here, so a shape that stops passing exactly one
+    /// `--tools ""` fails this test instead of silently admitting a generation
+    /// agent with native shell or edit tools.
+    #[test]
+    fn claudes_native_tools_claim_holds_for_every_launch_shape_the_builder_takes() {
+        assert!(ClaudeBackend.native_tools_removed().is_ok());
+        let starts = [
+            SessionStart::New {
+                session_id: "s".into(),
+            },
+            SessionStart::Resume {
+                session_id: "s".into(),
+                backend_id: "b".into(),
+            },
+            SessionStart::Fork {
+                session_id: "s".into(),
+                source_backend_id: "b".into(),
+            },
+        ];
+        for start in starts {
+            for flags in 0u8..16 {
+                let bit = |n: u8| flags & (1 << n) != 0;
+                let config = ClaudeArgsConfig {
+                    mcp_config: "{}".into(),
+                    skip_permissions: bit(0),
+                    model: Some("opus".into()),
+                    session_start: start.clone(),
+                    effort: Some("high".into()),
+                    allowed_tools: vec!["mcp__cairn__read".into()],
+                    disallowed_tools: if bit(1) {
+                        vec!["mcp__cairn__run".into()]
+                    } else {
+                        vec![]
+                    },
+                    system_prompt_file: None,
+                    settings_path: None,
+                    bidirectional: bit(2),
+                    json_schema: None,
+                    tool_free: bit(3),
+                };
+                let args = build_claude_args(&config);
+                let at: Vec<usize> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, arg)| *arg == "--tools")
+                    .map(|(index, _)| index)
+                    .collect();
+                assert_eq!(at.len(), 1, "{start:?} flags {flags}: {args:?}");
+                assert_eq!(
+                    args.get(at[0] + 1).map(String::as_str),
+                    Some(""),
+                    "{start:?} flags {flags}: {args:?}"
+                );
+            }
+        }
+    }
 }

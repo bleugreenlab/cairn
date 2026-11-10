@@ -539,11 +539,25 @@ fn start_ordinary_session(
 /// Start a prepared ordinary session, or queue it behind durable admission.
 /// Returns `true` when a process already holds the prompt and `false` while the
 /// launch waits in admission's queue.
+///
+/// A launch in an execution that hosts a profile generation is admitted by the
+/// generation first, before admission can queue or spawn it: that is where the
+/// generation binds its one agent's exact job and node, and refuses every
+/// other job and any backend that keeps native shell or edit tools.
 pub fn start_prepared_job_session(
     orch: &Orchestrator,
     mut prepared: PreparedJob,
     identity_override: Option<crate::identity::UserIdentity>,
 ) -> Result<bool, String> {
+    if let Some(execution_id) = prepared.execution_id.as_deref() {
+        let backend = ordinary_admission::backend_key_for(&prepared);
+        run_db_borrowed(crate::orchestrator::inference_generate::admit_launch(
+            orch,
+            execution_id,
+            &prepared.job_id,
+            &backend,
+        ))?;
+    }
     ordinary_admission::enqueue_or_start(orch, &mut prepared, identity_override)
 }
 
@@ -711,5 +725,4 @@ fn db_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
 
-#[cfg(test)]
 pub(crate) use inputs::is_long_running_node;

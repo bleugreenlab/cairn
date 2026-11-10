@@ -1,9 +1,9 @@
 //! The arithmetic and starting points a profile-generating agent works with
 //! (tenet 1364).
 //!
-//! There is one way Cairn generates a profile: an agent session (the
-//! `inference-generate` workflow) gathers the model's facts and the machines'
-//! hardware, researches how the model is best run there, asks the operator,
+//! There is one way Cairn generates a profile: an ordinary issue agent
+//! gathers the model's facts and the machines' hardware, researches how
+//! the model is best run there, asks the operator,
 //! writes a profile and has verification measure it. Nothing here chooses a
 //! profile. What it offers the agent, through `cairn://inference/fit` and
 //! `cairn://inference/templates`, is:

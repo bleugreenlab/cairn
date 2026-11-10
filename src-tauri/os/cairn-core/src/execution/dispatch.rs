@@ -32,6 +32,8 @@ pub fn process_trigger_event(orch: &Orchestrator, event: TriggerEvent) {
             issue_id,
             project_id,
         } => {
+            // A profile generation whose agent this job was ends with it.
+            crate::orchestrator::inference_generate::after_job_ended(orch, &job_id);
             process_job_ended(orch, &job_id, &status, execution_id, issue_id, &project_id);
         }
         TriggerEvent::SkillCalled {

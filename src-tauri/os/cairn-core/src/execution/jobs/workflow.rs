@@ -574,6 +574,14 @@ async fn respawn_workflow_run(
     owning: Arc<LocalDb>,
     row: &WorkflowRunRow,
 ) -> Result<bool, String> {
+    // Profile generation no longer runs as a workflow. Startup retires such
+    // runs; refusing here keeps one from respawning even when that could not run.
+    if row.workflow_id == crate::orchestrator::inference_generate::RETIRED_WORKFLOW {
+        return Err(format!(
+            "workflow run {} is a retired profile generation and is not restarted; start a new generation from Settings > Inference",
+            row.run_id
+        ));
+    }
     // Without a session id the turn cannot be rebuilt; leave the record for a
     // future pass rather than spawn a malformed run.
     let Some(session_id) = row.session_id.clone() else {

@@ -166,36 +166,82 @@ pub(crate) async fn save_rows(
 ) -> Result<(), String> {
     db.write(move |conn| {
         let changes = changes.clone();
-        Box::pin(async move {
-            for change in changes {
-                match change.body {
-                    Some(body) => {
-                        conn.execute(
-                            &format!(
-                                "INSERT INTO {} (id, source, body_json, created_at, updated_at)
-                                 VALUES (?1, ?2, ?3, ?4, ?4)
-                                 ON CONFLICT(id) DO UPDATE SET source = excluded.source,
-                                   body_json = excluded.body_json, updated_at = excluded.updated_at",
-                                change.table
-                            ),
-                            params![change.id, change.source, body, at],
-                        )
-                        .await?;
-                    }
-                    None => {
-                        conn.execute(
-                            &format!("DELETE FROM {} WHERE id = ?1", change.table),
-                            params![change.id],
-                        )
-                        .await?;
-                    }
-                }
-            }
-            Ok(())
-        })
+        Box::pin(async move { save_rows_in(conn, changes, at, None).await })
     })
     .await
     .map_err(|error| format!("write inference records: {error}"))
+}
+
+/// Persist validated inventory changes in the caller's private transaction,
+/// so domain authority can advance atomically with the records it authorizes.
+pub(crate) async fn save_rows_in(
+    conn: &crate::storage::TrackedConnection,
+    changes: Vec<RowChange>,
+    at: i64,
+    generation: Option<&str>,
+) -> crate::storage::DbResult<()> {
+    for change in changes {
+        if change.table == PROFILES {
+            if change.body.is_some() {
+                // Deletion must not launder a generated ID into ordinary inventory.
+                // Only the draft transaction that owns the ID may recreate it.
+                let mut rows = conn
+                    .query(
+                        "SELECT o.generation_id FROM inference_generated_profiles o
+                     LEFT JOIN inference_profiles p ON p.id = o.profile_id
+                     WHERE o.profile_id = ?1 AND p.id IS NULL",
+                        (change.id.as_str(),),
+                    )
+                    .await?;
+                let owner = rows.next().await?.map(|row| row.text(0)).transpose()?;
+                drop(rows);
+                if let Some(owner) = owner.filter(|owner| generation != Some(owner.as_str())) {
+                    return Err(crate::storage::DbError::Row(format!(
+                        "profile ID {} is reserved by generation {owner}, even after deletion; choose a fresh profile ID such as {}-new",
+                        change.id, change.id
+                    )));
+                }
+            }
+            // Preserve the stale prompt coordinate so the approval door can
+            // withdraw it, but never let an edit-and-undo restore consent.
+            conn.execute(
+                "UPDATE inference_generations SET approved_surface = NULL, approval_revision = NULL
+                 WHERE draft_profile = ?1 AND state = 'running'",
+                (change.id.as_str(),),
+            )
+            .await?;
+            conn.execute(
+                "UPDATE inference_generated_profiles SET promoted_verification_id = NULL,
+                 inventory_revision = inventory_revision + 1,
+                 active = CASE WHEN ?2 = 1 THEN 0 ELSE active END WHERE profile_id = ?1",
+                params![change.id.as_str(), i64::from(change.body.is_none())],
+            )
+            .await?;
+        }
+        match change.body {
+            Some(body) => {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {} (id, source, body_json, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?4)
+                         ON CONFLICT(id) DO UPDATE SET source = excluded.source,
+                           body_json = excluded.body_json, updated_at = excluded.updated_at",
+                        change.table
+                    ),
+                    params![change.id, change.source, body, at],
+                )
+                .await?;
+            }
+            None => {
+                conn.execute(
+                    &format!("DELETE FROM {} WHERE id = ?1", change.table),
+                    params![change.id],
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Make every record of `from` Cairn's own, keeping its id and contents, and
@@ -407,36 +453,83 @@ async fn write_checked(
     db: &LocalDb,
     authoring: impl FnOnce(&Inventory) -> Result<Authoring, Vec<Refusal>>,
 ) -> Result<String, WriteError> {
-    let _held = INVENTORY.lock().await;
+    let held = INVENTORY.lock().await;
     let current = load_inventory(db).await.map_err(WriteError::Failed)?;
-    let next = authoring(&current)
-        .and_then(|authoring| authored(&current, &authoring))
-        .map_err(WriteError::Refused)?;
+    let authoring = authoring(&current).map_err(WriteError::Refused)?;
+    let (changes, summary) = prepare_inventory_write(db, &current, &authoring, &held).await?;
+    save_rows(db, changes, now_ms())
+        .await
+        .map_err(WriteError::Failed)?;
+    Ok(summary)
+}
+
+/// Validate against the snapshot protected by the inventory lock without
+/// opening a nested write transaction. The caller may persist the returned
+/// changes together with its domain ledger in one transaction.
+pub(crate) async fn prepare_inventory_write(
+    db: &LocalDb,
+    current: &Inventory,
+    authoring: &Authoring,
+    held: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<(Vec<RowChange>, String), WriteError> {
+    prepare_inventory_write_for_generation(db, current, authoring, held, None).await
+}
+
+/// Only the generated-draft door may author generation provenance. All other
+/// writers use the ordinary preparation path, including imports and editors.
+pub(crate) async fn prepare_inventory_write_for_generation(
+    db: &LocalDb,
+    current: &Inventory,
+    authoring: &Authoring,
+    _held: &tokio::sync::MutexGuard<'_, ()>,
+    generation: Option<&str>,
+) -> Result<(Vec<RowChange>, String), WriteError> {
+    let next = authored(current, authoring).map_err(WriteError::Refused)?;
+    let protected =
+        super::inference_generate::promotion::inventory_refusals(db, current, &next, generation)
+            .await
+            .map_err(WriteError::Failed)?;
+    if !protected.is_empty() {
+        return Err(WriteError::Refused(
+            protected.into_iter().map(Refusal::Said).collect(),
+        ));
+    }
     let phases = super::inference_control::deployment_phases(db)
         .await
         .map_err(WriteError::Failed)?;
-    let running = running_refusals(&current, &next, &phases);
+    let running = running_refusals(current, &next, &phases);
     if !running.is_empty() {
         return Err(WriteError::Refused(
             running.into_iter().map(Refusal::Said).collect(),
         ));
     }
-    let report = Inventory::changes(&current, &next);
-    if !report.has_changes() {
-        return Ok("The inventory is unchanged.".to_string());
-    }
-    save_rows(db, diff_rows(&current, &next), now_ms())
-        .await
-        .map_err(WriteError::Failed)?;
-    Ok(format!(
-        "Wrote the inventory:\n- {}\nRead cairn://inference?format=yaml for the whole of it.",
-        report.lines().join("\n- ")
-    ))
+    let report = Inventory::changes(current, &next);
+    let summary = if !report.has_changes() {
+        "The inventory is unchanged.".to_string()
+    } else {
+        format!(
+            "Wrote the inventory:\n- {}\nRead cairn://inference?format=yaml for the whole of it.",
+            report.lines().join("\n- ")
+        )
+    };
+    Ok((diff_rows(current, &next), summary))
 }
 
 /// Write Cairn's own records, or refuse with every problem and write nothing.
 pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<String, String> {
     Ok(write_checked(db, |_| Ok(authoring.clone())).await?)
+}
+
+/// Write within an inventory epoch already held by a domain operation.
+pub(crate) async fn write_inventory_held(
+    db: &LocalDb,
+    authoring: &Authoring,
+    held: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<String, String> {
+    let current = load_inventory(db).await?;
+    let (changes, summary) = prepare_inventory_write(db, &current, authoring, held).await?;
+    save_rows(db, changes, now_ms()).await?;
+    Ok(summary)
 }
 
 /// One profile in Cairn's record format, as its editor shows it.
@@ -613,6 +706,35 @@ machines:
             );
         }
         sources
+    }
+
+    #[tokio::test]
+    async fn inventory_rows_roll_back_with_their_domain_transaction() {
+        let db = crate::storage::migrated_test_db("inventory-domain-rollback").await;
+        let held = INVENTORY.lock().await;
+        let current = load_inventory(&db).await.unwrap();
+        let (changes, _) = prepare_inventory_write(
+            &db,
+            &current,
+            &Authoring::Replace(adopted().to_yaml()),
+            &held,
+        )
+        .await
+        .unwrap();
+        assert!(!changes.is_empty());
+        let result: crate::storage::DbResult<()> = db
+            .write(move |conn| {
+                let changes = changes.clone();
+                Box::pin(async move {
+                    save_rows_in(conn, changes, 1, None).await?;
+                    Err(crate::storage::DbError::Row(
+                        "domain binding refused".into(),
+                    ))
+                })
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(load_inventory(&db).await.unwrap(), current);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
 use cairn_inference::fit::{dtype_label, profile_id};
 use cairn_inference::hf::{HfRepo, WeightFormat};
 use cairn_inference::import::{self, Files, ImportError, ImportSpec, Missing};
+use cairn_inference::profile::is_secret_name;
 use cairn_inference::{
     Engine, InferenceProfile, Inventory, Model, ModelRef, ProfileOrigin, RecordSource,
     Requirements, Server, WeightFile,
@@ -203,14 +204,47 @@ impl std::fmt::Display for ImportRefusal {
     }
 }
 
-/// Import `spec`: compile its service, pin its image and weights, and write
-/// the profile; or refuse with every key it needs.
-pub async fn import(
-    db: &LocalDb,
+/// How a compile treats a variable whose name says it holds a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Secrets {
+    /// As Compose does: its value comes from the spec, the env files or the
+    /// default. What an import writes.
+    Resolve,
+    /// Never resolved: wherever the spec or an env file gives it a value, or
+    /// the compose file reads it with no default, the compiler is handed the
+    /// literal `${NAME}`, so the candidate carries the named reference and no
+    /// value. What a preview shows.
+    Reference,
+}
+
+fn reference(name: &str) -> String {
+    format!("${{{name}}}")
+}
+
+/// A compose service compiled into a profile, with nothing written: the
+/// spec at its resolved commit, the profile, what the compile said of the
+/// compose file, and the secret-named variables kept as references.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    /// The spec as compiled: its commit the full sha the ref resolved to.
+    pub spec: ImportSpec,
+    pub profile: InferenceProfile,
+    pub notes: Vec<String>,
+    /// Every variable carried as `${NAME}`, by name. Empty under
+    /// [`Secrets::Resolve`].
+    pub references: Vec<String>,
+}
+
+/// Compile `spec` against the records in `inventory`: resolve its commit,
+/// read its files there, compile its service with the facet's parser, pin
+/// its image and weights. It holds no database, so it writes nothing; an
+/// import persists the result, a preview shows it.
+pub async fn resolve(
+    inventory: &Inventory,
     hub: &dyn Hub,
     spec: &ImportSpec,
-) -> Result<String, ImportRefusal> {
-    let inventory = load_inventory(db).await?;
+    secrets: Secrets,
+) -> Result<Candidate, ImportRefusal> {
     let model: Model = inventory.models.get(&spec.model).cloned().ok_or_else(|| {
         format!(
             "model {} is not registered; append it to cairn://inference/models first",
@@ -227,7 +261,57 @@ pub async fn import(
         let text = read_file(hub, &spec.url, &spec.commit, path).await?;
         files.env_files.push((path.clone(), text));
     }
-    let mut compiled = import::compile(&spec, &files).map_err(ImportRefusal::Compile)?;
+
+    // Under `Reference`, every secret-named variable with a value is handed
+    // to the compiler as its own reference. The spec's env wins over every
+    // env file and default, so no value of one reaches the compiled
+    // container; the values are kept only to prove that below.
+    let caller_spec = spec.clone();
+    let mut references = std::collections::BTreeSet::new();
+    let mut withheld: Vec<(String, String)> = Vec::new();
+    if secrets == Secrets::Reference {
+        let mut given = std::collections::BTreeMap::new();
+        for (_, text) in &files.env_files {
+            given.extend(import::parse_env_file(text));
+        }
+        given.extend(spec.env.clone());
+        for (name, value) in given {
+            if is_secret_name(&name) && !value.is_empty() && value != reference(&name) {
+                spec.env.insert(name.clone(), reference(&name));
+                references.insert(name.clone());
+                withheld.push((name, value));
+            }
+        }
+    }
+    let mut compiled = match import::compile(&spec, &files) {
+        // A secret the compose file reads with no default, and that nothing
+        // sets, is the reference itself rather than a key the spec lacks.
+        Err(error) if secrets == Secrets::Reference => {
+            let unset: Vec<String> = error
+                .missing
+                .iter()
+                .filter_map(|missing| missing.key.strip_prefix("env."))
+                .filter(|name| is_secret_name(name) && !spec.env.contains_key(*name))
+                .map(str::to_string)
+                .collect();
+            if unset.is_empty() {
+                return Err(ImportRefusal::Compile(error));
+            }
+            for name in unset {
+                spec.env.insert(name.clone(), reference(&name));
+                references.insert(name);
+            }
+            import::compile(&spec, &files)
+        }
+        compiled => compiled,
+    }
+    .map_err(ImportRefusal::Compile)?;
+    // The references were the compiler's input, not the caller's: the
+    // candidate's spec is the one asked for, at its resolved commit.
+    let spec = ImportSpec {
+        commit: spec.commit,
+        ..caller_spec
+    };
     if let Some(tagged) = compiled.unpinned_image.take() {
         compiled.container.image = pin_image(hub, &tagged).await.map_err(|why| {
             ImportRefusal::Compile(ImportError {
@@ -308,6 +392,44 @@ pub async fn import(
         },
         notes: None,
     };
+    let mut notes = compiled.notes;
+    notes.extend(references.iter().map(|name| {
+        format!(
+            "kept ${{{name}}} as a named reference: a preview never resolves or shows the value of a secret-named variable, and nothing resolves it at container start either, so the candidate is refused until that entry is removed or given a value that is not a secret (see its problems)"
+        )
+    }));
+    if !withheld.is_empty() {
+        let shown = format!(
+            "{}\n{}",
+            serde_json::to_string(&profile).unwrap_or_default(),
+            notes.join("\n")
+        );
+        if let Some((name, _)) = withheld
+            .iter()
+            .find(|(_, value)| value.len() >= 4 && shown.contains(value.as_str()))
+        {
+            return Err(ImportRefusal::Other(format!(
+                "the candidate would still carry the value given for {name}, a secret-named variable, through another variable or default, so the preview is refused rather than shown"
+            )));
+        }
+    }
+    Ok(Candidate {
+        spec,
+        profile,
+        notes,
+        references: references.into_iter().collect(),
+    })
+}
+
+/// Write `candidate` into the records and say what was written.
+pub async fn persist(db: &LocalDb, candidate: Candidate) -> Result<String, ImportRefusal> {
+    let Candidate {
+        spec,
+        profile,
+        notes,
+        ..
+    } = candidate;
+    let id = profile.id.clone();
     let mut records = Inventory::default();
     records.insert_profile(profile);
     let wrote = write_inventory(
@@ -322,9 +444,9 @@ pub async fn import(
         "Imported profile {id} from {} at {}, service {} of {}.\n{wrote}",
         spec.url, spec.commit, spec.service, spec.compose
     );
-    if !compiled.notes.is_empty() {
+    if !notes.is_empty() {
         said.push_str("\nFrom the compose file:\n- ");
-        said.push_str(&compiled.notes.join("\n- "));
+        said.push_str(&notes.join("\n- "));
     }
     said.push_str(&format!(
         "\nVerify it on a pool: patch cairn://inference/profiles/{id} {{verify:{{pool:\"<pool>\"}}}}"
@@ -332,11 +454,82 @@ pub async fn import(
     Ok(said)
 }
 
+/// Import `spec`: compile its service, pin its image and weights, and write
+/// the profile; or refuse with every key it needs.
+pub async fn import(
+    db: &LocalDb,
+    hub: &dyn Hub,
+    spec: &ImportSpec,
+) -> Result<String, ImportRefusal> {
+    let inventory = load_inventory(db).await?;
+    let candidate = resolve(&inventory, hub, spec, Secrets::Resolve).await?;
+    persist(db, candidate).await
+}
+
+/// Preview `spec`: compile it exactly as [`import`] does, with secret-named
+/// variables kept as `${NAME}` references, and write nothing. Answers the
+/// summary and `{preview, profile, source, notes, references, problems,
+/// replaces}`: the candidate as JSON, which a generation submits through its
+/// own `generated` door, citing the source commit.
+pub async fn preview(
+    db: &LocalDb,
+    hub: &dyn Hub,
+    spec: &ImportSpec,
+) -> Result<(String, serde_json::Value), ImportRefusal> {
+    let inventory = load_inventory(db).await?;
+    let candidate = resolve(&inventory, hub, spec, Secrets::Reference).await?;
+    let Candidate {
+        spec,
+        profile,
+        notes,
+        references,
+    } = candidate;
+    let id = profile.id.clone();
+    let replaces = inventory.profiles.contains_key(&id);
+    let problems: Vec<String> = profile.problems().iter().map(ToString::to_string).collect();
+    let mut records = Inventory::default();
+    records.insert_profile(profile.clone());
+    let mut said = format!(
+        "Preview of profile {id} from {} at {}, service {} of {}; nothing was written.",
+        spec.url, spec.commit, spec.service, spec.compose
+    );
+    if replaces {
+        said.push_str(&format!(
+            "\nA profile {id} is already recorded; importing this would replace it."
+        ));
+    }
+    if !notes.is_empty() {
+        said.push_str("\nFrom the compose file:\n- ");
+        said.push_str(&notes.join("\n- "));
+    }
+    if !problems.is_empty() {
+        said.push_str("\nAs a profile it has these problems:\n- ");
+        said.push_str(&problems.join("\n- "));
+    }
+    said.push_str(&format!("\nThe candidate:\n{}", records.to_yaml()));
+    let data = serde_json::json!({
+        "preview": true,
+        "profile": profile,
+        "source": {
+            "url": spec.url,
+            "commit": spec.commit,
+            "compose": spec.compose,
+            "service": spec.service,
+        },
+        "notes": notes,
+        "references": references,
+        "problems": problems,
+        "replaces": replaces,
+    });
+    Ok((said, data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::inference_models::tests::FakeHub;
     use super::super::inference_models::HUGGING_FACE;
     use super::*;
+    use crate::storage::RowExt;
     use std::collections::BTreeMap;
 
     const COMMIT: &str = "f3d76450e075d5f89698aed2e865655f0b7eeb1c";
@@ -490,6 +683,293 @@ mod tests {
             refusal.contains("Cairn imports only from GitHub"),
             "{refusal}"
         );
+    }
+
+    /// Every table's row count and the whole inventory: what a write of any
+    /// kind would change.
+    async fn snapshot(db: &LocalDb) -> (Vec<(String, i64)>, String) {
+        let tables = db
+            .query_all(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name".to_string(),
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let mut counts = Vec::new();
+        for table in tables {
+            let count = db
+                .query_one(format!("SELECT COUNT(*) FROM \"{table}\""), (), |row| {
+                    row.i64(0)
+                })
+                .await
+                .unwrap();
+            counts.push((table, count));
+        }
+        (counts, load_inventory(db).await.unwrap().to_yaml())
+    }
+
+    async fn registered(name: &str) -> (LocalDb, FakeHub) {
+        let db = crate::storage::migrated_test_db(name).await;
+        let hub = hub();
+        super::super::inference_models::register(
+            &db,
+            &hub,
+            "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            None,
+        )
+        .await
+        .unwrap();
+        (db, hub)
+    }
+
+    #[tokio::test]
+    async fn a_preview_answers_what_the_import_would_write_and_writes_nothing() {
+        let (db, hub) = registered("inference-import-preview").await;
+        let before = snapshot(&db).await;
+        let (said, data) = preview(&db, &hub, &spec()).await.unwrap();
+        assert_eq!(snapshot(&db).await, before, "a preview writes nothing");
+        assert!(
+            said.starts_with(&format!(
+                "Preview of profile deepseek-v4-flash-vision-exp-fp8-vllm-x2 from {REPO} at {COMMIT}"
+            )),
+            "{said}"
+        );
+        assert!(said.contains("nothing was written"), "{said}");
+        assert!(said.contains("dropped `restart`"), "{said}");
+        assert_eq!(data["preview"], true);
+        assert_eq!(
+            data["source"]["commit"], COMMIT,
+            "the ref resolved to its commit"
+        );
+        assert_eq!(data["source"]["url"], REPO);
+        assert_eq!(data["references"], serde_json::json!([]));
+        assert_eq!(data["replaces"], false);
+        assert_eq!(data["problems"], serde_json::json!([]));
+
+        import(&db, &hub, &spec()).await.unwrap();
+        let inventory = load_inventory(&db).await.unwrap();
+        let written = &inventory.profiles[&"deepseek-v4-flash-vision-exp-fp8-vllm-x2".into()];
+        assert_eq!(
+            data["profile"],
+            serde_json::to_value(written).unwrap(),
+            "with no secrets, the candidate is exactly the profile the import writes"
+        );
+        let (said, data) = preview(&db, &hub, &spec()).await.unwrap();
+        assert_eq!(data["replaces"], true);
+        assert!(said.contains("importing this would replace it"), "{said}");
+    }
+
+    /// The dspark service reading two secrets: `HF_TOKEN` with no default and
+    /// `GITHUB_TOKEN` with an empty one, the latter set by an env file.
+    fn secret_hub() -> FakeHub {
+        let mut hub = hub();
+        let raw =
+            "https://raw.githubusercontent.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark";
+        let compose = include_str!(
+            "../../../cairn-inference/tests/fixtures/import/docker-compose.dspark.yml"
+        )
+        .replace(
+            "      HF_HOME: /cache/huggingface\n",
+            "      HF_HOME: /cache/huggingface\n      HF_TOKEN: \"${HF_TOKEN}\"\n      GITHUB_TOKEN: \"${GITHUB_TOKEN:-}\"\n",
+        );
+        assert!(compose.contains("${HF_TOKEN}"));
+        hub.bodies
+            .insert(format!("{raw}/{COMMIT}/docker-compose.secret.yml"), compose);
+        hub.bodies.insert(
+            format!("{raw}/{COMMIT}/.env.secret"),
+            "GITHUB_TOKEN=ghp_filesecret456789\n".into(),
+        );
+        hub
+    }
+
+    fn secret_spec() -> ImportSpec {
+        ImportSpec {
+            compose: "docker-compose.secret.yml".into(),
+            env_files: vec![".env.dspark.example".into(), ".env.secret".into()],
+            ..spec()
+        }
+    }
+
+    fn container_env(profile: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+        let profile: InferenceProfile = serde_json::from_value(profile.clone()).unwrap();
+        let Engine::Container(container) = profile.engine else {
+            panic!("an import compiles a container");
+        };
+        container.env
+    }
+
+    #[tokio::test]
+    async fn a_preview_keeps_secrets_as_named_references_and_never_shows_their_values() {
+        let db = crate::storage::migrated_test_db("inference-import-preview-secrets").await;
+        let hub = secret_hub();
+        super::super::inference_models::register(
+            &db,
+            &hub,
+            "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An import still needs a secret the compose file reads unset...
+        let refusal = import(&db, &hub, &secret_spec()).await.unwrap_err();
+        let ImportRefusal::Compile(needs) = &refusal else {
+            panic!("{refusal}");
+        };
+        assert!(
+            needs.missing.iter().any(|m| m.key == "env.HF_TOKEN"),
+            "{refusal}"
+        );
+
+        // ...where a preview carries it, and the env file's, as references.
+        let before = snapshot(&db).await;
+        let (said, data) = preview(&db, &hub, &secret_spec()).await.unwrap();
+        assert_eq!(snapshot(&db).await, before, "a preview writes nothing");
+        let env = container_env(&data["profile"]);
+        assert_eq!(env["HF_TOKEN"], "${HF_TOKEN}");
+        assert_eq!(env["GITHUB_TOKEN"], "${GITHUB_TOKEN}");
+        assert_eq!(
+            data["references"],
+            serde_json::json!(["GITHUB_TOKEN", "HF_TOKEN"])
+        );
+        assert!(
+            said.contains("kept ${HF_TOKEN} as a named reference"),
+            "{said}"
+        );
+        assert!(
+            data["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("${GITHUB_TOKEN}")),
+            "{data}"
+        );
+        let shown = format!("{said}\n{data}");
+        assert!(!shown.contains("ghp_filesecret456789"), "{shown}");
+
+        // A secret the caller gives is not echoed either.
+        let given = {
+            let mut spec = secret_spec();
+            spec.env
+                .insert("HF_TOKEN".into(), "hf_specsecret123456".into());
+            spec
+        };
+        let (said, data) = preview(&db, &hub, &given).await.unwrap();
+        assert_eq!(snapshot(&db).await, before, "a preview writes nothing");
+        assert_eq!(container_env(&data["profile"])["HF_TOKEN"], "${HF_TOKEN}");
+        let shown = format!("{said}\n{data}");
+        assert!(!shown.contains("hf_specsecret123456"), "{shown}");
+        assert!(!shown.contains("ghp_filesecret456789"), "{shown}");
+
+        // The import itself interpolates as it always has.
+        import(&db, &hub, &given).await.unwrap();
+        let inventory = load_inventory(&db).await.unwrap();
+        let written = &inventory.profiles[&"deepseek-v4-flash-vision-exp-fp8-vllm-x2".into()];
+        let env = container_env(&serde_json::to_value(written).unwrap());
+        assert_eq!(env["HF_TOKEN"], "hf_specsecret123456");
+        assert_eq!(env["GITHUB_TOKEN"], "ghp_filesecret456789");
+    }
+
+    #[tokio::test]
+    async fn a_preview_that_would_carry_a_withheld_value_another_way_is_refused() {
+        let db = crate::storage::migrated_test_db("inference-import-preview-leak").await;
+        let hub = secret_hub();
+        super::super::inference_models::register(
+            &db,
+            &hub,
+            "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut spec = secret_spec();
+        spec.env
+            .insert("HF_TOKEN".into(), "hf_specsecret123456".into());
+        // The same value under a name that is not a secret's.
+        spec.env
+            .insert("HF_HUB_OFFLINE".into(), "hf_specsecret123456".into());
+        let before = snapshot(&db).await;
+        let refusal = preview(&db, &hub, &spec).await.unwrap_err().to_string();
+        assert_eq!(snapshot(&db).await, before);
+        assert!(
+            refusal.contains("the value given for HF_TOKEN"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("hf_specsecret123456"), "{refusal}");
+    }
+
+    #[tokio::test]
+    async fn a_previewed_reference_cannot_be_written_until_its_entry_is_dropped() {
+        let db = crate::storage::migrated_test_db("inference-import-preview-write").await;
+        let hub = secret_hub();
+        super::super::inference_models::register(
+            &db,
+            &hub,
+            "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut spec = secret_spec();
+        spec.env
+            .insert("HF_TOKEN".into(), "hf_specsecret123456".into());
+        let (said, data) = preview(&db, &hub, &spec).await.unwrap();
+        let problems: Vec<&str> = data["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("env HF_TOKEN reads ${HF_TOKEN}") && p.contains("on the host")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("env GITHUB_TOKEN reads ${GITHUB_TOKEN}")),
+            "{problems:?}"
+        );
+        assert!(
+            said.contains("the candidate is refused until that entry is removed"),
+            "{said}"
+        );
+
+        // The candidate as given is refused by the inventory's own
+        // validation, which every write door (the generated one included)
+        // runs, and the refusal names no value.
+        let profile: InferenceProfile = serde_json::from_value(data["profile"].clone()).unwrap();
+        let write = |profile: InferenceProfile| {
+            let mut records = Inventory::default();
+            records.insert_profile(profile);
+            Authoring::Patch {
+                upsert: Some(records.to_yaml()),
+                remove: Removals::default(),
+            }
+        };
+        let before = snapshot(&db).await;
+        let refusal = write_inventory(&db, &write(profile.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(snapshot(&db).await, before);
+        assert!(refusal.contains("reads ${HF_TOKEN}"), "{refusal}");
+        for value in ["hf_specsecret123456", "ghp_filesecret456789"] {
+            assert!(!refusal.contains(value), "{refusal}");
+            assert!(!format!("{said}\n{data}").contains(value));
+        }
+
+        // Without the secret entries it validates and writes.
+        let mut dropped = profile;
+        let Engine::Container(container) = &mut dropped.engine else {
+            unreachable!()
+        };
+        container.env.remove("HF_TOKEN");
+        container.env.remove("GITHUB_TOKEN");
+        assert_eq!(dropped.problems(), vec![]);
+        write_inventory(&db, &write(dropped)).await.unwrap();
     }
 
     #[tokio::test]

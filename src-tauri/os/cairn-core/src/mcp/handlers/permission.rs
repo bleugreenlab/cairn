@@ -104,6 +104,9 @@ pub enum WithdrawalCause {
     OperatorCompact,
     /// The operator stopped the job whose turn raised the ask.
     OperatorStop,
+    /// A newer ask replaced it: what it asked about changed before anyone
+    /// answered.
+    Superseded,
 }
 
 impl From<HandoffClosed> for WithdrawalCause {
@@ -132,6 +135,9 @@ impl WithdrawalCause {
                 "the operator compacted the session that raised it, which stopped that session"
             }
             Self::OperatorStop => "the operator stopped the work that raised it",
+            Self::Superseded => {
+                "what it asked about changed before it was answered, and a newer question replaced it"
+            }
         }
     }
 }
@@ -159,6 +165,7 @@ mod withdrawal_cause_tests {
             ("context_dropped", WithdrawalCause::ContextDropped),
             ("operator_compact", WithdrawalCause::OperatorCompact),
             ("operator_stop", WithdrawalCause::OperatorStop),
+            ("superseded", WithdrawalCause::Superseded),
         ] {
             let row = format!(r#"{{"withdrawn":{{"cause":"{stored}"}}}}"#);
             assert_eq!(withdrawn_cause(Some(&row)), Some(cause));
@@ -1762,7 +1769,7 @@ fn stored_winner_transport(
 
 /// The transports whose answer carries operator authority, which
 /// [`AnswerSurface::from_transport`] refuses to rebuild from a stored label.
-fn is_operator_transport(transport: AppearanceTransport) -> bool {
+pub(crate) fn is_operator_transport(transport: AppearanceTransport) -> bool {
     matches!(
         transport,
         AppearanceTransport::AuthenticatedOperator

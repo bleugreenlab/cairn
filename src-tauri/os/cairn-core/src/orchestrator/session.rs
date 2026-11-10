@@ -2429,6 +2429,23 @@ pub fn start_agent_session(
     // Windows it presents that bearer. Codex pools ephemeral calls in one
     // app-server that serves many runs, which carries a bearer of its own scoped
     // to that server's calls.
+    // A run on a profile generation's issue is marked in the private ledger
+    // before it gets any way to call back: this is the one funnel every agent
+    // process passes (`startup_readiness` pins that), and the bearer below is
+    // its first credential. A run on no generation's issue is marked nothing
+    // and behaves ordinarily; a ledger that cannot be written refuses the start.
+    {
+        let issue_ids: Vec<&str> = db_context.run_issue_id.iter().map(String::as_str).collect();
+        run_db_blocking(|| {
+            super::inference_generate::scope::mark_run(
+                &orch.db.local,
+                run_id,
+                db_context.job_id.as_deref(),
+                &issue_ids,
+            )
+        })
+        .map_err(|error| format!("run {run_id}: generation scope marker: {error}"))?;
+    }
     let mcp = crate::config::mcp_setup::runner_stdio_attachment(orch, Some(home_uri.as_str()));
     let mcp_bearer = Some(crate::mcp::run_bearer::bearer_for_attachment(
         orch, &mcp, run_id, &home_uri,

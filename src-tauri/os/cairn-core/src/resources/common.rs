@@ -1761,10 +1761,12 @@ mod tests {
         assert!(!profiles.contains("`generate("), "{profiles}");
         let generation = affordance_for_kind(ResourceKind::InferenceGeneration);
         assert!(
-            generation
-                .contains("record the operator's approval of its draft (its own workflow only)"),
+            generation.contains(
+                "raise and then record the operator's approval of its draft (its own agent only)"
+            ),
             "{generation}"
         );
+        assert!(!generation.contains("workflow"), "{generation}");
         let fit = affordance_for_kind(ResourceKind::InferenceFit);
         assert!(
             fit.contains("source") && fit.contains("generation"),
