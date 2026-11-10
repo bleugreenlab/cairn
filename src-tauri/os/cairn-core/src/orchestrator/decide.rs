@@ -383,6 +383,27 @@ impl Orchestrator {
         Ok(Some(cairn_config::allotment::model_ref(&record.chosen)))
     }
 
+    /// What a decision with no allotment of its own is refused or answered
+    /// under in `project_id`'s scope: the workspace's `decisionModel` and
+    /// every offer serving `decide`. Equal fingerprints refuse alike, so a
+    /// consumer that parked a refusal re-asks only once this changes.
+    pub(crate) fn decision_inputs(&self, project_id: Option<&str>) -> Result<String, String> {
+        let catalog = self.catalog(&ModelScope {
+            project_id: project_id.map(str::to_string),
+        })?;
+        let mut offers: Vec<String> = catalog
+            .offers_serving(VerbKind::Decide)
+            .into_iter()
+            .map(|offer| format!("{}/{}@{}", offer.provider, offer.model, offer.served.wire))
+            .collect();
+        offers.sort_unstable();
+        Ok(format!(
+            "decisionModel={:?}; decide={}",
+            self.get_settings().decision_model,
+            offers.join(",")
+        ))
+    }
+
     /// The offer a recipe's decision node would be answered by
     /// ([`Self::decision_target`]).
     pub(crate) fn node_decision_offer(
@@ -1713,5 +1734,39 @@ edges:
 
         // The saved recipe still loads, so it stays editable.
         assert!(orch.get_recipe(&saved.id, None).unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_decision_inputs_change_with_the_setting_and_the_catalog_and_only_then() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let bare = orch.decision_inputs(None).unwrap();
+        assert_eq!(
+            orch.decision_inputs(None).unwrap(),
+            bare,
+            "an unchanged configuration reads the same"
+        );
+
+        orch.store_settings_unchecked_for_test(UpdateSettings {
+            decision_model: Some(Some("typesafe/jev-1.14".into())),
+            ..Default::default()
+        });
+        let named = orch.decision_inputs(None).unwrap();
+        assert_ne!(named, bare, "the decisionModel setting is an input");
+
+        crate::backends::retention::fixtures::install_openrouter(&orch);
+        orch.seed_model_catalog_for_test(cairn_models::types::catalog::ProviderModelCatalog {
+            backend: "openrouter".into(),
+            models: crate::backends::openrouter::decode_decision_models(include_str!(
+                "../backends/openrouter/testdata/decisions_models.json"
+            ))
+            .unwrap(),
+            options: Vec::new(),
+            refreshed_at: Some(1_790_000_000),
+            error: None,
+        });
+        let listed = orch.decision_inputs(None).unwrap();
+        assert_ne!(listed, named, "the catalog's decide offers are an input");
+        assert!(listed.contains("openrouter/"), "{listed}");
+        assert_eq!(orch.decision_inputs(None).unwrap(), listed);
     }
 }

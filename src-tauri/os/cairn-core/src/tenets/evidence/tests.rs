@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use super::events::{self, NewEvent, PendingEvent};
 use super::wake::{self, decayed};
-use super::worker::{self, EvidenceDeps, Processed};
+use super::worker::{self, EvidenceDeps, Processed, RefusalInputs, RefusalSignal, RefusalWatch};
 use super::*;
 use crate::embeddings::{EmbedFailure as Outcome, Embedded, Purpose, VectorKey};
 use crate::issues::crud;
@@ -101,7 +101,18 @@ async fn add_event(db: &LocalDb, key: &str, owner: &str, text: &str) -> PendingE
         owner_device_id: event.owner_device_id,
         text: event.text,
         attempts: 0,
+        first_attempted_at: None,
     }
+}
+
+async fn evaluated_at(db: &LocalDb, id: &str) -> Option<i64> {
+    db.query_one(
+        "SELECT evaluated_at FROM tenet_evidence_events WHERE id = ?1",
+        (id.to_string(),),
+        |row| row.opt_i64(0),
+    )
+    .await
+    .unwrap()
 }
 
 async fn count(db: &LocalDb, sql: &str) -> i64 {
@@ -162,6 +173,8 @@ struct Fake {
     judge_advance: AtomicI64,
     /// Another runner whose sweep runs while the judge is out.
     during_judge: Mutex<Option<Arc<Fake>>>,
+    /// What the decision model setting and the catalog read as now.
+    inputs: Mutex<String>,
 }
 
 impl Fake {
@@ -180,7 +193,12 @@ impl Fake {
             emitter: CapturingEmitter::new(),
             judge_advance: AtomicI64::new(0),
             during_judge: Mutex::new(None),
+            inputs: Mutex::new("decisionModel=None; decide=".into()),
         }
+    }
+
+    fn set_inputs(&self, inputs: &str) {
+        *self.inputs.lock().unwrap() = inputs.into();
     }
 
     fn needle(mut self, needle: &str, vector: &[f32]) -> Self {
@@ -293,6 +311,9 @@ impl EvidenceDeps for Fake {
             answers: fake_answers(&decision.questions, &verdicts),
             usage: Default::default(),
         })
+    }
+    async fn decision_inputs(&self, _project_id: &str) -> Result<String, String> {
+        Ok(self.inputs.lock().unwrap().clone())
     }
     fn nudge(&self, job_id: &str) {
         self.nudges.lock().unwrap().push(job_id.into());
@@ -988,6 +1009,193 @@ async fn with_no_decision_capable_offer_the_event_is_skipped_with_the_refusal_un
     *fake.judge_failure.lock().unwrap() = None;
     fake.set_verdicts(json!([{"tenet": 1, "verdict": "supports", "probability": 0.9}]));
     assert_eq!(worker::drain_due(&fake).await, [Processed::Done(1)]);
+}
+
+#[tokio::test]
+async fn a_refusal_is_re_asked_when_the_decision_inputs_change_and_never_while_they_hold() {
+    let db = fixture("evidence-requeue-on-change.db").await;
+    approve(&db, 1, "t-design", "Rule").await;
+    let refused = add_event(&db, "1", A, "work").await;
+    let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.fail_judge(DecisionFailure::Unanswerable(REFUSAL.into()));
+    fake.set_inputs("decisionModel=Some(\"typesafe/jev-1.14\"); decide=");
+    let mut inputs = RefusalInputs::default();
+
+    // The pending event is judged under what this sweep records.
+    assert_eq!(inputs.requeue_changed(&fake).await, 0);
+    assert_eq!(
+        worker::drain_due(&fake).await,
+        [Processed::Unanswerable(REFUSAL.into())]
+    );
+
+    // While nothing changes, the refusal is never asked again.
+    for minute in 1..=3 {
+        fake.now.store(1_000 + minute * 60, Ordering::SeqCst);
+        assert_eq!(inputs.requeue_changed(&fake).await, 0);
+        assert!(worker::drain_due(&fake).await.is_empty());
+    }
+    assert_eq!(fake.judges().len(), 1);
+    assert_eq!(event_row(&db, &refused.id).await.0, "skipped");
+
+    // Another machine's view of the change re-queues none of this one's.
+    let other = fake.as_device(B);
+    let mut other_inputs = RefusalInputs::default();
+    other.set_inputs("anything");
+    assert_eq!(other_inputs.requeue_changed(&other).await, 0);
+    other.set_inputs("anything else");
+    assert_eq!(other_inputs.requeue_changed(&other).await, 0);
+
+    // The setting changes, still refused: re-asked once, then parked again.
+    fake.set_inputs("decisionModel=Some(\"openrouter/typesafe/jev-1.14\"); decide=");
+    assert_eq!(inputs.requeue_changed(&fake).await, 1);
+    assert_eq!(event_row(&db, &refused.id).await.0, "pending");
+    assert_eq!(
+        worker::drain_due(&fake).await,
+        [Processed::Unanswerable(REFUSAL.into())]
+    );
+    assert_eq!(inputs.requeue_changed(&fake).await, 0);
+    assert_eq!(fake.judges().len(), 2);
+
+    // The catalog gains a decide offer: re-asked and judged.
+    fake.set_inputs(
+        "decisionModel=Some(\"openrouter/typesafe/jev-1.14\"); decide=openrouter/typesafe/jev-1.14@system-one",
+    );
+    *fake.judge_failure.lock().unwrap() = None;
+    fake.set_verdicts(json!([{"tenet": 1, "verdict": "supports", "probability": 0.9}]));
+    assert_eq!(inputs.requeue_changed(&fake).await, 1);
+    assert_eq!(worker::drain_due(&fake).await, [Processed::Done(1)]);
+
+    // With nothing owed, a later change has nothing to re-queue.
+    fake.set_inputs("decisionModel=None; decide=");
+    assert_eq!(inputs.requeue_changed(&fake).await, 0);
+    assert_eq!(event_row(&db, &refused.id).await.0, "done");
+}
+
+#[tokio::test]
+async fn a_backfilled_refusal_keeps_its_first_attempt_time() {
+    let db = fixture("evidence-backfill-time.db").await;
+    approve(&db, 1, "t-design", "Rule").await;
+    let event = add_event(&db, "1", A, "work").await;
+    let fake = Fake::new(A, 1_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.fail_judge(DecisionFailure::Unanswerable(REFUSAL.into()));
+    assert_eq!(
+        worker::drain_due(&fake).await,
+        [Processed::Unanswerable(REFUSAL.into())]
+    );
+    assert_eq!(evaluated_at(&db, &event.id).await, Some(1_000));
+
+    // Re-queued and refused again two days on: still dated by the first try.
+    fake.now.store(1_000 + 2 * DAY, Ordering::SeqCst);
+    assert_eq!(worker::requeue_unanswerable(&fake).await, 1);
+    let [pending] = events::due_events(&db, A, fake.now(), 10)
+        .await
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(pending.first_attempted_at, Some(1_000));
+    assert_eq!(
+        worker::drain_due(&fake).await,
+        [Processed::Unanswerable(REFUSAL.into())]
+    );
+    assert_eq!(evaluated_at(&db, &event.id).await, Some(1_000));
+
+    // Judged six days on, once something answers.
+    fake.now.store(1_000 + 6 * DAY, Ordering::SeqCst);
+    assert_eq!(worker::requeue_unanswerable(&fake).await, 1);
+    *fake.judge_failure.lock().unwrap() = None;
+    fake.set_verdicts(json!([{"tenet": 1, "verdict": "contradicts", "probability": 0.9}]));
+    assert_eq!(worker::drain_due(&fake).await, [Processed::Done(1)]);
+    assert_eq!(evaluated_at(&db, &event.id).await, Some(1_000));
+    let [row] = stored_evidence(&db).await.try_into().unwrap();
+    assert_eq!(
+        row.6, 1_000,
+        "the backfilled evidence is dated by the first attempt, so a window read after the judge came back does not see it as new"
+    );
+
+    // Work concluded after the outage is dated when it is judged.
+    let fresh = add_event(&db, "2", A, "more work").await;
+    assert_eq!(worker::drain_due(&fake).await, [Processed::Done(1)]);
+    assert_eq!(evaluated_at(&db, &fresh.id).await, Some(1_000 + 6 * DAY));
+}
+
+fn refusals(refused: i64, judgeable: i64) -> events::RefusalCounts {
+    events::RefusalCounts {
+        refused,
+        judgeable,
+        latest: Some(REFUSAL.into()),
+    }
+}
+
+#[test]
+fn the_refusal_watch_raises_past_a_small_share_repeats_hourly_and_clears() {
+    let mut watch = RefusalWatch::default();
+    assert_eq!(
+        watch.observe(refusals(2, 2), 0),
+        None,
+        "a stray refusal or two is not a dark judge"
+    );
+    assert_eq!(
+        watch.observe(refusals(5, 100), 0),
+        None,
+        "5% refused is under the rate"
+    );
+
+    assert_eq!(
+        watch.observe(refusals(3, 3), 10),
+        Some(RefusalSignal::Raised(refusals(3, 3)))
+    );
+    assert_eq!(
+        watch.observe(refusals(9, 9), 10 + worker::REFUSAL_REPEAT_SECS - 1),
+        None,
+        "a raised watch does not repeat itself every sweep"
+    );
+    assert_eq!(
+        watch.observe(refusals(30, 30), 10 + worker::REFUSAL_REPEAT_SECS),
+        Some(RefusalSignal::Raised(refusals(30, 30)))
+    );
+
+    assert_eq!(
+        watch.observe(refusals(3, 100), 20_000),
+        Some(RefusalSignal::Cleared)
+    );
+    assert_eq!(watch.observe(refusals(3, 100), 20_060), None);
+    assert_eq!(
+        watch.observe(refusals(11, 100), 20_120),
+        Some(RefusalSignal::Raised(refusals(11, 100))),
+        "raised again at once after clearing"
+    );
+}
+
+#[tokio::test]
+async fn a_judge_refusing_every_event_raises_the_refusal_watch() {
+    let db = fixture("evidence-refusal-watch.db").await;
+    approve(&db, 1, "t-design", "Rule").await;
+    let fake = Fake::new(A, 100_000, &db).needle("", &[1.0, 0.0, 0.0, 0.0]);
+    fake.fail_judge(DecisionFailure::Unanswerable(REFUSAL.into()));
+    let mut watch = RefusalWatch::default();
+    for key in ["1", "2", "3"] {
+        add_event(&db, key, A, "work").await;
+    }
+    assert_eq!(watch.check(&fake).await, None, "nothing settled yet");
+
+    assert_eq!(worker::drain_due(&fake).await.len(), 3);
+    assert_eq!(
+        watch.check(&fake).await,
+        Some(RefusalSignal::Raised(refusals(3, 3)))
+    );
+    assert_eq!(
+        RefusalWatch::default().check(&fake.as_device(B)).await,
+        None,
+        "another machine's refusals are not this one's"
+    );
+
+    fake.now
+        .store(100_000 + worker::REFUSAL_WINDOW_SECS + 1, Ordering::SeqCst);
+    assert_eq!(
+        watch.check(&fake).await,
+        Some(RefusalSignal::Cleared),
+        "refusals older than the window no longer count"
+    );
 }
 
 #[tokio::test]

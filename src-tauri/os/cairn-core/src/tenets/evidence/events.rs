@@ -242,6 +242,11 @@ pub struct PendingEvent {
     pub owner_device_id: String,
     pub text: String,
     pub attempts: i64,
+    /// When an earlier attempt first settled it: set only on an event
+    /// re-queued after a refusal, which keeps that time through every later
+    /// settlement so a backfill is dated when the work was first judgeable,
+    /// not when the judge came back.
+    pub first_attempted_at: Option<i64>,
 }
 
 /// The pending events `device` owns whose retry time has come, oldest first.
@@ -252,7 +257,7 @@ pub async fn due_events(
     limit: usize,
 ) -> DbResult<Vec<PendingEvent>> {
     db.query_all(
-        "SELECT id, project_id, source_uri, owner_device_id, text, attempts
+        "SELECT id, project_id, source_uri, owner_device_id, text, attempts, evaluated_at
          FROM tenet_evidence_events
          WHERE owner_device_id = ?1 AND state = 'pending' AND next_attempt_at <= ?2
          ORDER BY created_at, id
@@ -266,6 +271,7 @@ pub async fn due_events(
                 owner_device_id: row.text(3)?,
                 text: row.text(4)?,
                 attempts: row.i64(5)?,
+                first_attempted_at: row.opt_i64(6)?,
             })
         },
     )
@@ -278,6 +284,9 @@ pub async fn due_events(
 /// decision, and is kept as `last_error`; a skip that needed no judgement
 /// clears it. So a skipped event carries `last_error` only when it was
 /// refused, which is what [`requeue_unanswerable_events`] selects on.
+///
+/// Every settlement keeps an `evaluated_at` the event already carries, the
+/// first attempt of a re-queued refusal ([`PendingEvent::first_attempted_at`]).
 pub async fn mark_skipped(
     db: &LocalDb,
     event: &PendingEvent,
@@ -286,7 +295,8 @@ pub async fn mark_skipped(
 ) -> DbResult<bool> {
     let changed = db
         .execute(
-            "UPDATE tenet_evidence_events SET state = 'skipped', evaluated_at = ?1, last_error = ?2
+            "UPDATE tenet_evidence_events
+             SET state = 'skipped', evaluated_at = COALESCE(evaluated_at, ?1), last_error = ?2
              WHERE id = ?3 AND state = 'pending' AND owner_device_id = ?4",
             params![
                 now,
@@ -300,17 +310,88 @@ pub async fn mark_skipped(
 }
 
 /// Return `device`'s events that were skipped because nothing could answer
-/// the decision to the queue, due at once. Reports how many.
-pub async fn requeue_unanswerable_events(db: &LocalDb, device: &str) -> DbResult<usize> {
+/// the decision to the queue, due at once, in `project_id` or in every
+/// project. Reports how many.
+///
+/// `evaluated_at` stays as the refusal set it: a pending row carrying one is
+/// a backfill, and its eventual settlement keeps that time.
+pub async fn requeue_unanswerable_events(
+    db: &LocalDb,
+    device: &str,
+    project_id: Option<&str>,
+) -> DbResult<usize> {
     let changed = db
         .execute(
             "UPDATE tenet_evidence_events
-             SET state = 'pending', next_attempt_at = 0, evaluated_at = NULL, last_error = NULL
-             WHERE owner_device_id = ?1 AND state = 'skipped' AND last_error IS NOT NULL",
-            params![device],
+             SET state = 'pending', next_attempt_at = 0, last_error = NULL
+             WHERE owner_device_id = ?1 AND state = 'skipped' AND last_error IS NOT NULL
+               AND (?2 IS NULL OR project_id = ?2)",
+            params![device, project_id],
         )
         .await?;
     Ok(changed as usize)
+}
+
+/// The projects in which `device` owes an evaluation or holds a refused
+/// event: the projects whose decision inputs matter to it now.
+pub async fn owed_projects(db: &LocalDb, device: &str) -> DbResult<Vec<String>> {
+    db.query_all(
+        "SELECT DISTINCT project_id FROM tenet_evidence_events
+         WHERE owner_device_id = ?1
+           AND (state = 'pending' OR (state = 'skipped' AND last_error IS NOT NULL))
+         ORDER BY project_id",
+        params![device],
+        |row| row.text(0),
+    )
+    .await
+}
+
+/// How `device`'s events settled since `since`, by the judge's reach.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RefusalCounts {
+    /// Skipped because nothing configured could answer the decision.
+    pub refused: i64,
+    /// Every event that got as far as needing a judgement: judged, refused,
+    /// or failed.
+    pub judgeable: i64,
+    /// The newest refusal's text, which names the fixes.
+    pub latest: Option<String>,
+}
+
+pub async fn refusal_counts(db: &LocalDb, device: &str, since: i64) -> DbResult<RefusalCounts> {
+    let (refused, judgeable) = db
+        .query_one(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN state = 'skipped' AND last_error IS NOT NULL
+                              THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN state IN ('done', 'failed')
+                                   OR (state = 'skipped' AND last_error IS NOT NULL)
+                              THEN 1 ELSE 0 END), 0)
+             FROM tenet_evidence_events
+             WHERE owner_device_id = ?1 AND evaluated_at >= ?2",
+            params![device, since],
+            |row| Ok((row.i64(0)?, row.i64(1)?)),
+        )
+        .await?;
+    let latest = if refused > 0 {
+        db.query_all(
+            "SELECT last_error FROM tenet_evidence_events
+             WHERE owner_device_id = ?1 AND evaluated_at >= ?2
+               AND state = 'skipped' AND last_error IS NOT NULL
+             ORDER BY evaluated_at DESC, id DESC LIMIT 1",
+            params![device, since],
+            |row| row.text(0),
+        )
+        .await?
+        .pop()
+    } else {
+        None
+    };
+    Ok(RefusalCounts {
+        refused,
+        judgeable,
+        latest,
+    })
 }
 
 /// Record one failed attempt: back off, or give up after [`MAX_ATTEMPTS`].
@@ -331,7 +412,8 @@ pub async fn mark_attempt_failed(
         .execute(
             "UPDATE tenet_evidence_events
              SET attempts = ?1, state = ?2, next_attempt_at = ?3, last_error = ?4,
-                 evaluated_at = CASE WHEN ?2 = 'failed' THEN ?5 ELSE evaluated_at END
+                 evaluated_at = CASE WHEN ?2 = 'failed' THEN COALESCE(evaluated_at, ?5)
+                                     ELSE evaluated_at END
              WHERE id = ?6 AND state = 'pending' AND owner_device_id = ?7",
             params![
                 attempts,

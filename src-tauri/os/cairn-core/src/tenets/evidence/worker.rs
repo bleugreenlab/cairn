@@ -6,21 +6,32 @@
 //!
 //! When nothing configured can answer a decision, an event is settled
 //! `skipped` with the refusal as its `last_error`, and the periodic sweep
-//! leaves it there: retrying cannot help until the catalog changes. Only the
-//! startup pass re-queues those events ([`requeue_unanswerable`]), so
-//! configuring a decision-capable offer and restarting re-evaluates them.
+//! leaves it there: retrying cannot help until what produced the refusal
+//! changes. The startup pass re-queues them all once ([`requeue_unanswerable`]),
+//! since a restart cannot know what they were refused under; after that each
+//! sweep re-queues a project's refusals only when its decision inputs (the
+//! `decisionModel` setting and the catalog's `decide` offers) differ from
+//! those its owed events were last seen under ([`RefusalInputs`]). A
+//! re-queued event keeps the time it was first settled, and its evidence is
+//! dated by it, so a backfill never reads as fresh work.
+//!
+//! A judge that refuses most of what it is asked is dark, not idle, so
+//! [`RefusalWatch`] warns while refusals pass a small share of judgeable
+//! events.
 //!
 //! An embedding outage is not the event's failure. While the shared embedding
 //! gate is paused or the provider is failing, an event is left exactly as it
 //! was and the next sweep tries again; only a refused request or a failed
 //! judgement spends one of its [`super::MAX_ATTEMPTS`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use super::events::{
-    due_events, mark_attempt_failed, mark_skipped, requeue_unanswerable_events, PendingEvent,
+    due_events, mark_attempt_failed, mark_skipped, owed_projects, refusal_counts,
+    requeue_unanswerable_events, PendingEvent, RefusalCounts,
 };
 use super::judge::{self, Sign};
 use super::vectors::{project_tenet_vectors, tenet_embed_text, vector_db};
@@ -34,6 +45,15 @@ use crate::tenets::{TenetFilter, TenetStatus, TenetView};
 
 /// How many due events one database yields per pass.
 const DRAIN_BATCH: usize = 20;
+
+/// How far back [`RefusalWatch`] counts settled events.
+pub const REFUSAL_WINDOW_SECS: i64 = 6 * 3600;
+/// Refusals in the window below which nothing is raised, whatever the share.
+pub const REFUSAL_MIN: i64 = 3;
+/// The share of judgeable events refused above which the watch raises.
+pub const REFUSAL_RATE: f64 = 0.1;
+/// How often a raised watch repeats its warning while it stays raised.
+pub const REFUSAL_REPEAT_SECS: i64 = 3600;
 
 /// Everything the worker reaches outside its own tables. Production wraps the
 /// orchestrator; tests record calls.
@@ -57,6 +77,9 @@ pub trait EvidenceDeps: Send + Sync {
         decision: &DecisionNode,
         input: &str,
     ) -> Result<Decision, DecisionFailure>;
+    /// A fingerprint of what [`Self::judge`] is refused or answered under in
+    /// `project_id`'s scope (`Orchestrator::decision_inputs`).
+    async fn decision_inputs(&self, project_id: &str) -> Result<String, String>;
     /// Wake a job that a message was just queued for.
     fn nudge(&self, job_id: &str);
     fn emitter(&self) -> &dyn EventEmitter;
@@ -101,6 +124,14 @@ impl EvidenceDeps for OrchestratorDeps {
             .await
     }
 
+    async fn decision_inputs(&self, project_id: &str) -> Result<String, String> {
+        let orch = self.orch.clone();
+        let project_id = project_id.to_string();
+        tokio::task::spawn_blocking(move || orch.decision_inputs(Some(&project_id)))
+            .await
+            .map_err(|error| format!("the decision inputs read failed: {error}"))?
+    }
+
     fn nudge(&self, job_id: &str) {
         if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
             &self.orch,
@@ -136,6 +167,8 @@ pub fn spawn(orch: Orchestrator) {
             device,
         };
         requeue_unanswerable(&deps).await;
+        let mut inputs = RefusalInputs::default();
+        let mut refusals = RefusalWatch::default();
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -143,7 +176,9 @@ pub fn spawn(orch: Orchestrator) {
                 _ = hint.notified() => {}
                 _ = interval.tick() => {}
             }
+            inputs.requeue_changed(&deps).await;
             drain_due(&deps).await;
+            refusals.check(&deps).await;
             super::wake::recheck_contradictions(&deps).await;
         }
     });
@@ -169,14 +204,14 @@ pub enum Processed {
 }
 
 /// Return every event this machine skipped for want of a decision-capable
-/// offer to the queue, in every database. Called once, at startup: a catalog
-/// change takes effect on restart, and the periodic sweep never re-asks a
-/// refusal it would only get again.
+/// offer to the queue, in every database. Called once, at startup, when what
+/// those refusals were produced under is unknown; afterwards
+/// [`RefusalInputs`] re-queues only on a change.
 pub async fn requeue_unanswerable(deps: &dyn EvidenceDeps) -> usize {
     let device = deps.this_device();
     let mut requeued = 0;
     for db in deps.dbs().await {
-        match requeue_unanswerable_events(&db, &device).await {
+        match requeue_unanswerable_events(&db, &device, None).await {
             Ok(count) => requeued += count,
             Err(error) => {
                 log::warn!("tenet evidence could not re-queue unanswerable events: {error}");
@@ -187,6 +222,154 @@ pub async fn requeue_unanswerable(deps: &dyn EvidenceDeps) -> usize {
         log::info!("tenet evidence re-queued {requeued} event(s) skipped for want of a decision-capable model");
     }
     requeued
+}
+
+/// The decision inputs each project's owed events were last seen under, so
+/// a refusal is re-asked only once the input that produced it has changed.
+#[derive(Debug, Default)]
+pub struct RefusalInputs {
+    seen: HashMap<String, String>,
+}
+
+impl RefusalInputs {
+    /// Re-queue the refused events of every project whose decision inputs
+    /// differ from those last seen, then record the current inputs of every
+    /// project with owed events, so the events about to be judged are judged
+    /// under what was recorded. A project seen for the first time is only
+    /// recorded. Reports how many events were re-queued.
+    pub async fn requeue_changed(&mut self, deps: &dyn EvidenceDeps) -> usize {
+        let device = deps.this_device();
+        let mut owed = Vec::new();
+        for db in deps.dbs().await {
+            match owed_projects(&db, &device).await {
+                Ok(projects) => owed.push((db, projects)),
+                Err(error) => {
+                    log::warn!("tenet evidence could not read the projects it owes: {error}");
+                }
+            }
+        }
+        let mut current: HashMap<String, String> = HashMap::new();
+        for project in owed.iter().flat_map(|(_, projects)| projects) {
+            if current.contains_key(project) {
+                continue;
+            }
+            match deps.decision_inputs(project).await {
+                Ok(inputs) => {
+                    current.insert(project.clone(), inputs);
+                }
+                Err(error) => {
+                    log::debug!(
+                        "tenet evidence could not read {project}'s decision inputs: {error}"
+                    );
+                    if let Some(seen) = self.seen.get(project) {
+                        current.insert(project.clone(), seen.clone());
+                    }
+                }
+            }
+        }
+        let changed: Vec<String> = current
+            .iter()
+            .filter(|(project, inputs)| self.seen.get(*project).is_some_and(|seen| seen != *inputs))
+            .map(|(project, _)| project.clone())
+            .collect();
+        let mut requeued = 0;
+        for (db, projects) in &owed {
+            for project in projects.iter().filter(|project| changed.contains(project)) {
+                match requeue_unanswerable_events(db, &device, Some(project)).await {
+                    Ok(count) => requeued += count,
+                    Err(error) => {
+                        log::warn!(
+                            "tenet evidence could not re-queue {project}'s refused events: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        if requeued > 0 {
+            log::info!(
+                "tenet evidence re-queued {requeued} refused event(s): the decision model or the model catalog changed"
+            );
+        }
+        self.seen = current;
+        requeued
+    }
+}
+
+/// What [`RefusalWatch`] reports.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefusalSignal {
+    /// Refusals pass [`REFUSAL_RATE`] of judgeable events in the window.
+    Raised(RefusalCounts),
+    /// They no longer do.
+    Cleared,
+}
+
+/// Notices the judge going dark: raised while, over the last
+/// [`REFUSAL_WINDOW_SECS`], at least [`REFUSAL_MIN`] events were refused and
+/// refusals are more than [`REFUSAL_RATE`] of the events that needed a
+/// judgement. It warns on raising and every [`REFUSAL_REPEAT_SECS`] after.
+/// The counts come from the events table, so a restart sees the same rate.
+#[derive(Debug, Default)]
+pub struct RefusalWatch {
+    raised: bool,
+    warned_at: Option<i64>,
+}
+
+impl RefusalWatch {
+    /// Apply the rule to one reading.
+    pub fn observe(&mut self, counts: RefusalCounts, now: i64) -> Option<RefusalSignal> {
+        let over = counts.refused >= REFUSAL_MIN
+            && counts.refused as f64 > REFUSAL_RATE * counts.judgeable as f64;
+        if !over {
+            self.warned_at = None;
+            return std::mem::take(&mut self.raised).then_some(RefusalSignal::Cleared);
+        }
+        self.raised = true;
+        if self
+            .warned_at
+            .is_some_and(|at| now - at < REFUSAL_REPEAT_SECS)
+        {
+            return None;
+        }
+        self.warned_at = Some(now);
+        Some(RefusalSignal::Raised(counts))
+    }
+
+    /// Read this machine's counts across every database, apply the rule, and
+    /// log what it signals.
+    pub async fn check(&mut self, deps: &dyn EvidenceDeps) -> Option<RefusalSignal> {
+        let device = deps.this_device();
+        let now = deps.now();
+        let mut total = RefusalCounts::default();
+        for db in deps.dbs().await {
+            match refusal_counts(&db, &device, now - REFUSAL_WINDOW_SECS).await {
+                Ok(counts) => {
+                    total.refused += counts.refused;
+                    total.judgeable += counts.judgeable;
+                    total.latest = total.latest.or(counts.latest);
+                }
+                Err(error) => {
+                    log::warn!("tenet evidence could not count its refusals: {error}");
+                    return None;
+                }
+            }
+        }
+        let signal = self.observe(total, now);
+        match &signal {
+            Some(RefusalSignal::Raised(counts)) => log::warn!(
+                "tenet evidence judge is dark: {} of {} judgeable event(s) in the last {} h were refused because nothing configured can answer the decision; they stay parked until the decision model or the catalog changes. Latest refusal: {}",
+                counts.refused,
+                counts.judgeable,
+                REFUSAL_WINDOW_SECS / 3600,
+                counts.latest.as_deref().unwrap_or("(none recorded)")
+            ),
+            Some(RefusalSignal::Cleared) => {
+                log::info!("tenet evidence judge answers again: refusals are back under the alert rate");
+            }
+            None => {}
+        }
+        signal
+    }
 }
 
 /// Evaluate every due event this machine owns, in every database.
@@ -211,9 +394,10 @@ pub async fn drain_due(deps: &dyn EvidenceDeps) -> Vec<Processed> {
 /// Evaluate one event and settle it.
 pub async fn process(deps: &dyn EvidenceDeps, db: &LocalDb, event: &PendingEvent) -> Processed {
     let evaluation = evaluate(deps, db, event).await;
-    // Read the clock only once the embedding and the judge have returned.
-    // Evidence is dated when it lands, so a contradiction that finishes after
-    // a wake fired is newer than that wake's edge and counts toward the next.
+    // Read the clock only once the embedding and the judge have returned, so
+    // evidence is dated when it lands; a re-queued refusal is dated by its
+    // first attempt instead (`store`). The wake counts rows, not time edges,
+    // so neither date decides which wake a contradiction counts toward.
     let now = deps.now();
     let settled = match evaluation {
         Ok(Evaluation::Skip(reason)) => match mark_skipped(db, event, now, None).await {
@@ -439,6 +623,9 @@ async fn evaluate(
 ///
 /// The first qualifying judgement of a tenet from a source stands: a reopened
 /// and re-closed issue only adds evidence for tenets not yet judged from it.
+///
+/// A backfilled event ([`PendingEvent::first_attempted_at`]) keeps its first
+/// attempt's time, on the event and on every row it stores.
 async fn store(
     db: &LocalDb,
     event: &PendingEvent,
@@ -446,6 +633,7 @@ async fn store(
     model: &str,
     now: i64,
 ) -> Result<Option<usize>, String> {
+    let evaluated_at = event.first_attempted_at.unwrap_or(now);
     let event = event.clone();
     let verdicts = verdicts.to_vec();
     let model = model.to_string();
@@ -459,7 +647,7 @@ async fn store(
                     "UPDATE tenet_evidence_events SET state = 'done', evaluated_at = ?1
                      WHERE id = ?2 AND state = 'pending' AND owner_device_id = ?3",
                     cairn_db::turso::params![
-                        now,
+                        evaluated_at,
                         event.id.as_str(),
                         event.owner_device_id.as_str()
                     ],
@@ -503,7 +691,7 @@ async fn store(
                             verdict.measured_by.as_str(),
                             model.as_str(),
                             event.owner_device_id.as_str(),
-                            now
+                            evaluated_at
                         ],
                     )
                     .await? as usize;
