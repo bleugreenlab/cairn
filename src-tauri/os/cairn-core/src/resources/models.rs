@@ -665,15 +665,16 @@ pub(crate) fn render_ladder(
 }
 
 /// `cairn://models/selection`: what an allotment would run on now.
-/// `preview` is handed the allotment as written (`None` for the workspace
-/// default) and the verb.
+/// `preview` is handed the allotment as written (`None` for what a node
+/// naming none runs on) and the verb.
 pub(crate) fn render_selection(
     params: &[QueryParam],
     preview: impl FnOnce(
         Option<Vec<String>>,
         VerbKind,
-    ) -> Result<crate::execution::model_selection::SelectionRecord, String>,
+    ) -> crate::orchestrator::model_selection::SelectionPreview,
 ) -> String {
+    use crate::orchestrator::model_selection::PreviewedAllotment;
     const URI: &str = "cairn://models/selection";
     if let Some(error) = unsupported(URI, params, &["models", "verb"]) {
         return error;
@@ -691,9 +692,16 @@ pub(crate) fn render_selection(
             .map(str::to_string)
             .collect()
     });
-    let asked = match &allotment {
-        Some(entries) => format!("[{}]", entries.join(", ")),
-        None => "The workspace's default allotment".to_string(),
+    let preview = preview(allotment, verb);
+    let asked = match &preview.asked {
+        PreviewedAllotment::Asked(entries) => format!("[{}]", entries.join(", ")),
+        PreviewedAllotment::WorkspaceDefault => "The workspace's default allotment".to_string(),
+        PreviewedAllotment::DecisionModel(model) => {
+            format!("The workspace's `decisionModel`, [{model}],")
+        }
+        PreviewedAllotment::BestDecisionOffer => {
+            "No `decisionModel` is set, so the catalog's best decision offer".to_string()
+        }
     };
     let mut out = String::from("# Model selection preview\n\n");
     let _ = writeln!(
@@ -701,13 +709,20 @@ pub(crate) fn render_selection(
         "{asked} for {}, if it launched now. A preview: nothing is stored, no constraint applies, and usage is what was last measured.\n",
         verb.as_str()
     );
-    let record = match preview(allotment, verb) {
+    let record = match preview.record {
         Ok(record) => record,
         Err(refusal) => {
             let _ = writeln!(out, "Refused: {refusal}");
+            if let PreviewedAllotment::DecisionModel(_) = preview.asked {
+                let _ = writeln!(
+                    out,
+                    "\nEvery decision node without its own models is refused until `decisionModel` names what an installed provider serves. The offers that serve decide now: `cairn://models/decide`."
+                );
+            }
             return out;
         }
     };
+    let best_offer = preview.asked == PreviewedAllotment::BestDecisionOffer;
     let _ = writeln!(out, "**{}**\n", record.provenance);
     let mut chosen = format!(
         "Chosen: `{}/{}`",
@@ -733,6 +748,10 @@ pub(crate) fn render_selection(
     let _ = writeln!(out, "{chosen}");
     for relaxation in &record.relaxations {
         let _ = writeln!(out, "Relaxed: {relaxation}");
+    }
+    if best_offer {
+        out.push_str("\nNo allotment is walked: every offer that serves decide, best first, is at `cairn://models/decide`.\n");
+        return out;
     }
     out.push_str("\n## Candidates\n\nIn supply order, then everything set aside.\n\n");
     for candidate in &record.candidates {
@@ -772,10 +791,33 @@ pub(crate) fn render_index() -> String {
 
 /// The decide door: what it takes, and every offer that could answer through
 /// it now.
-pub(crate) fn render_decide(facet: &dyn Models) -> String {
+pub(crate) fn render_decide(
+    facet: &dyn Models,
+    workspace_default: &crate::orchestrator::model_defaults::SettingStanding,
+) -> String {
     let mut out = String::from(
         "# Decide\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/decide\", payload:{args_json:{model, input, questions, provider?, requirements?}}}]})`. Each question is answered in order with the model's probability over every answer and how it was measured; a declined question comes back as a refusal. The model is never chosen for you.\n\nThe reply carries the call's `cost` and `costSource`: `provider` when the provider reported what it charged, `catalog` when it did not and the cost is the catalog's list price for the tokens it reported. `requirements: {zeroDataRetention: true}` admits only a deployment that keeps none of the input (an OpenRouter model with a zero-retention endpoint, the operator's own hardware, a private custom endpoint, or a provider declared in `zeroDataRetentionProviders`) and refuses anything else before it is sent; the workspace's OpenRouter zero-retention setting requires it of every OpenRouter call. The reply's `zeroDataRetention` says what required it and how it was kept.\n\n",
     );
+    match (&workspace_default.value, &workspace_default.refusal) {
+        (Some(model), None) => {
+            let _ = writeln!(
+                out,
+                "Workspace default: `{model}` (`decisionModel`), which a recipe or route decision node without its own models selects within; what it chooses now: `cairn://models/selection?verb=decide`.\n"
+            );
+        }
+        (Some(model), Some(refusal)) => {
+            let _ = writeln!(
+                out,
+                "Workspace default: `{model}` (`decisionModel`) does not resolve now: {refusal}. Every recipe or route decision node without its own models is refused until it names a model an installed provider serves for decide (Settings → Models).\n"
+            );
+        }
+        (None, _) => {
+            let _ = writeln!(
+                out,
+                "Workspace default: none (`decisionModel` is unset), so a recipe or route decision node without its own models takes the catalog's best decision offer.\n"
+            );
+        }
+    }
     let catalog = match facet.catalog(&ModelScope::workspace()) {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -848,7 +890,7 @@ pub(crate) fn render_embed(facet: &dyn Models) -> String {
 pub(crate) fn render_media(
     facet: &dyn Models,
     verb: VerbKind,
-    workspace_default: Option<&str>,
+    workspace_default: &crate::orchestrator::model_defaults::SettingStanding,
 ) -> String {
     let (title, uri, takes, setting, section) = match verb {
         VerbKind::Image => (
@@ -869,17 +911,20 @@ pub(crate) fn render_media(
     let mut out = format!(
         "# {title}\n\nInvoke with `run`, not `write`: `run({{commands:[{{target:\"{uri}\", payload:{{args_json:{{{takes}}}}}}}]}})`. What it makes is stored in the calling run's issue (or thread) and the reply names its address; read cairn://help or the affordances below for the full shape.\n\n"
     );
-    match workspace_default
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    {
-        Some(model) => {
+    match (&workspace_default.value, &workspace_default.refusal) {
+        (Some(model), None) => {
             let _ = writeln!(
                 out,
                 "Default: `{model}` (`{setting}`), used when a request names no model.\n"
             );
         }
-        None => {
+        (Some(model), Some(refusal)) => {
+            let _ = writeln!(
+                out,
+                "Default: `{model}` (`{setting}`) does not resolve now: {refusal}. A request that names no model is refused until it names one an installed provider serves (Settings → Models → {section}).\n"
+            );
+        }
+        (None, _) => {
             let _ = writeln!(
                 out,
                 "Default: none. A request that names no model is refused until `{setting}` is set (Settings → Models → {section}).\n"

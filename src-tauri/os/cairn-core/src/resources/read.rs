@@ -2245,7 +2245,12 @@ async fn render_resource_body(
         CairnResource::ModelsDecide => {
             match reject_query_params("cairn://models/decide", &params) {
                 Some(error) => error,
-                None => crate::resources::models::render_decide(orch),
+                None => crate::resources::models::render_decide(
+                    orch,
+                    &orch.model_setting_standing(
+                        crate::orchestrator::model_defaults::ModelSetting::Decision,
+                    ),
+                ),
             }
         }
         CairnResource::ModelsEmbed => match reject_query_params("cairn://models/embed", &params) {
@@ -2263,7 +2268,9 @@ async fn render_resource_body(
             None => crate::resources::models::render_media(
                 orch,
                 cairn_models::types::catalog::VerbKind::Image,
-                orch.get_settings().image_model.as_deref(),
+                &orch.model_setting_standing(
+                    crate::orchestrator::model_defaults::ModelSetting::Image,
+                ),
             ),
         },
         CairnResource::ModelsSpeak => match reject_query_params("cairn://models/speak", &params) {
@@ -2271,7 +2278,9 @@ async fn render_resource_body(
             None => crate::resources::models::render_media(
                 orch,
                 cairn_models::types::catalog::VerbKind::Speak,
-                orch.get_settings().speech_model.as_deref(),
+                &orch.model_setting_standing(
+                    crate::orchestrator::model_defaults::ModelSetting::Speech,
+                ),
             ),
         },
         CairnResource::ModelsAccounts => crate::resources::models::render_accounts(

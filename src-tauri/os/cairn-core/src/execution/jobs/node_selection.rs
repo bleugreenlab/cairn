@@ -707,6 +707,7 @@ pub(super) mod tests {
         .unwrap();
         let now = orch
             .preview_selection(Some("p"), Some(&["lg".to_string()]), VerbKind::Session)
+            .record
             .unwrap();
         assert_eq!(model_ref(&now.chosen), "claude/opus");
 

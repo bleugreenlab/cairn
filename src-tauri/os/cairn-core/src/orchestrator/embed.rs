@@ -1404,11 +1404,10 @@ pub(crate) mod tests {
         );
         assert!(!orch.history_consented(), "no account, no choice");
 
-        orch.update_settings(UpdateSettings {
+        orch.store_settings_unchecked_for_test(UpdateSettings {
             embedding_model: Some(Some(" ollama/nomic-embed-text ".into())),
             ..Default::default()
-        })
-        .unwrap();
+        });
         assert_eq!(
             orch.embedding_selection(),
             super::EmbedSelection {

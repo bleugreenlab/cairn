@@ -242,6 +242,7 @@ impl Orchestrator {
             )
         })?;
         let before = self.get_settings();
+        self.refuse_unserved_model_settings(&input, &before)?;
         let embedding_before = before.embedding_model;
         let current = settings::update_settings(&self.config_dir, input, &self.provider_names())?;
         if current.private_dedicated_process_capacity != before.private_dedicated_process_capacity {

@@ -31,6 +31,27 @@ use crate::execution::model_selection::{
 };
 use crate::models::{ModelSelection, PresetOptionValue};
 
+/// What a selection preview was asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewedAllotment {
+    /// The allotment the caller wrote.
+    Asked(Vec<String>),
+    /// The workspace's default allotment.
+    WorkspaceDefault,
+    /// The workspace's `decisionModel`, which decide selects within.
+    DecisionModel(String),
+    /// No `decisionModel` is set: decide takes the catalog's best offer.
+    BestDecisionOffer,
+}
+
+/// A selection preview: what was asked about, and what it chose or why it
+/// refused.
+#[derive(Debug, Clone)]
+pub struct SelectionPreview {
+    pub asked: PreviewedAllotment,
+    pub record: Result<SelectionRecord, String>,
+}
+
 /// The pools, bands and ladder as Settings → Models and
 /// `cairn://models/ladder` show them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -581,27 +602,84 @@ impl Orchestrator {
         Ok(references)
     }
 
-    /// What `allotment` (the workspace default when `None`) would select for
-    /// `verb` now. Nothing is stored and no constraint applies: a preview
-    /// asks about one node in isolation.
+    /// What `allotment` would select for `verb` now. Nothing is stored and no
+    /// constraint applies: a preview asks about one node in isolation.
+    ///
+    /// With no allotment it previews what a node naming none runs on: for
+    /// decide, the workspace's `decisionModel`, or the catalog's best decision
+    /// offer when that is unset (what [`Orchestrator::decision_target`]
+    /// leaves to the catalog); for any other verb, the workspace's default
+    /// allotment.
     pub fn preview_selection(
         &self,
         project_id: Option<&str>,
         allotment: Option<&[String]>,
         verb: VerbKind,
-    ) -> Result<SelectionRecord, String> {
-        let allotment = match allotment {
-            Some(raw) => parse_allotment(raw)?,
-            None => self.effective_models(project_id)?.default_models,
+    ) -> SelectionPreview {
+        let (asked, allotment) = match allotment {
+            Some(raw) => (
+                PreviewedAllotment::Asked(raw.to_vec()),
+                parse_allotment(raw),
+            ),
+            None if verb == VerbKind::Decide => match self
+                .get_settings()
+                .decision_model
+                .map(|model| model.trim().to_string())
+                .filter(|model| !model.is_empty())
+            {
+                Some(model) => {
+                    let entry = AllotmentEntry::parse(&model).map(|entry| vec![entry]);
+                    (PreviewedAllotment::DecisionModel(model), entry)
+                }
+                None => {
+                    return SelectionPreview {
+                        asked: PreviewedAllotment::BestDecisionOffer,
+                        record: self.best_decision_offer_record(project_id),
+                    }
+                }
+            },
+            None => (
+                PreviewedAllotment::WorkspaceDefault,
+                self.effective_models(project_id)
+                    .map(|models| models.default_models),
+            ),
         };
-        self.select_models(
-            project_id,
-            &allotment,
-            verb,
-            &ResolvedConstraints::default(),
-            SelectionSubject::default(),
-        )
-        .map_err(String::from)
+        let record = allotment.and_then(|allotment| {
+            self.select_models(
+                project_id,
+                &allotment,
+                verb,
+                &ResolvedConstraints::default(),
+                SelectionSubject::default(),
+            )
+            .map_err(String::from)
+        });
+        SelectionPreview { asked, record }
+    }
+
+    /// The catalog's best decision offer, as the record a pin to it stores.
+    fn best_decision_offer_record(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<SelectionRecord, String> {
+        use cairn_models::interface::OfferQuery;
+        let catalog = self.catalog(&ModelScope {
+            project_id: project_id.map(str::to_string),
+        })?;
+        let offer = catalog
+            .offer_for(OfferQuery::new(VerbKind::Decide))
+            .map_err(|refusal| refusal.to_string())?;
+        let models = self.effective_models_in(project_id, &catalog)?;
+        let chosen = cairn_config::allotment::parse_model_ref(&format!(
+            "{}/{}",
+            offer.provider, offer.model
+        ))?;
+        let mut record = crate::execution::model_selection::pinned(&models, &catalog, &chosen);
+        record.provenance = format!(
+            "no `decisionModel` is set, so decide takes the catalog's best decision offer, {}",
+            model_ref(&chosen)
+        );
+        Ok(record)
     }
 
     /// Choose the model `allotment` runs `verb` on in `project_id`, now.
@@ -1012,7 +1090,11 @@ mod tests {
                 .identity_note
                 .is_some());
             assert!(record.provenance.contains(&note));
-            assert!(render_selection(&[], |_, _| Ok(record.clone())).contains(&note));
+            assert!(render_selection(&[], |_, _| SelectionPreview {
+                asked: PreviewedAllotment::WorkspaceDefault,
+                record: Ok(record.clone()),
+            })
+            .contains(&note));
             let pinned =
                 crate::execution::model_selection::pinned(&models, &catalog, &record.chosen);
             assert_eq!(
@@ -1452,9 +1534,13 @@ mod tests {
                     Some(&["sm".to_string(), "md".to_string(), "lg".to_string()][..])
                 );
                 assert_eq!(verb, VerbKind::Session);
-                let raw: Vec<String> = allotment.unwrap();
-                let raw: Vec<&str> = raw.iter().map(String::as_str).collect();
-                run(&raw, &ResolvedConstraints::default(), &windows).map_err(String::from)
+                let asked: Vec<String> = allotment.unwrap();
+                let raw: Vec<&str> = asked.iter().map(String::as_str).collect();
+                SelectionPreview {
+                    record: run(&raw, &ResolvedConstraints::default(), &windows)
+                        .map_err(String::from),
+                    asked: PreviewedAllotment::Asked(asked),
+                }
             },
         );
         assert!(text.contains("[sm, md, lg] for session"), "{text}");
@@ -1473,8 +1559,15 @@ mod tests {
                 allotment, None,
                 "no `models` asks for the workspace default"
             );
-            Err("nothing to run".to_string())
+            SelectionPreview {
+                asked: PreviewedAllotment::WorkspaceDefault,
+                record: Err("nothing to run".to_string()),
+            }
         });
+        assert!(
+            refused.contains("The workspace's default allotment for session"),
+            "{refused}"
+        );
         assert!(refused.contains("Refused: nothing to run"), "{refused}");
         let verb = render_selection(
             &cairn_common::query::parse_query_params("verb=image").unwrap(),
@@ -1625,6 +1718,7 @@ mod tests {
 
         let refusal = orch
             .preview_selection(None, Some(&["xl".to_string()]), VerbKind::Session)
+            .record
             .unwrap_err();
         assert!(refusal.contains("'xl' is not a pool"), "{refusal}");
     }

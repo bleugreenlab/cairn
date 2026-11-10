@@ -1391,7 +1391,7 @@ pub(crate) mod tests {
         let (orch, server, key) = workspace_with_chat_server_keyed().await;
         // A workspace default exists, and the door still does not use it.
         orch.update_settings(UpdateSettings {
-            decision_model: Some(Some("qwen3".into())),
+            decision_model: Some(Some(format!("{key}/qwen3"))),
             ..Default::default()
         })
         .unwrap();
@@ -1555,7 +1555,11 @@ edges:
         };
         let options = ["yes".to_string(), "no".to_string()];
         let naming_qwen = decision_recipe_naming(&options, Some(&format!("{key}/qwen3")));
-        set_default(Some("not-served"));
+        // A default saving would refuse, as one stranded since it was saved.
+        orch.store_settings_unchecked_for_test(UpdateSettings {
+            decision_model: Some(Some("not-served".into())),
+            ..Default::default()
+        });
 
         // A node naming no model asks for the workspace default.
         let [report] = orch

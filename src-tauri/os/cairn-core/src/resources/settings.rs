@@ -366,14 +366,13 @@ mod tests {
         assert!(unset.contains("- speechModel: unset (a request naming no model is refused)"));
         assert!(unset.contains("- embeddingModel: unset (`cairn/cohere-embed-v4`)"));
 
-        orch.update_settings(UpdateSettings {
+        orch.store_settings_unchecked_for_test(UpdateSettings {
             decision_model: Some(Some("sm".into())),
             image_model: Some(Some("codex/gpt-image-2".into())),
             speech_model: Some(Some("local-tts".into())),
             embedding_model: Some(Some("ollama/nomic-embed-text".into())),
             ..Default::default()
-        })
-        .unwrap();
+        });
         let set = super::read_settings(&orch).await;
         for line in [
             "- decisionModel: `sm`",
