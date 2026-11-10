@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use axum::Router;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientInfo, ProgressNotificationParam, ProtocolVersion,
-    RequestMetaObject,
+    CallToolRequestParams, CallToolResult, ClientConfig, ProgressNotificationParam,
+    ProtocolVersion, RequestMetaObject,
 };
 use rmcp::service::{MaybeSendFuture, NotificationContext, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -33,8 +33,8 @@ const RUN: &str = "run-parity";
 struct VersionedClient(ProtocolVersion);
 
 impl ClientHandler for VersionedClient {
-    fn get_info(&self) -> ClientInfo {
-        let mut info = ClientInfo::default();
+    fn get_info(&self) -> ClientConfig {
+        let mut info = ClientConfig::default();
         info.protocol_version = self.0.clone();
         info
     }
@@ -592,8 +592,8 @@ async fn a_held_stdio_call_without_a_progress_token_hears_no_heartbeat() {
 struct ProgressClient(tokio::sync::mpsc::UnboundedSender<ProgressNotificationParam>);
 
 impl ClientHandler for ProgressClient {
-    fn get_info(&self) -> ClientInfo {
-        let mut info = ClientInfo::default();
+    fn get_info(&self) -> ClientConfig {
+        let mut info = ClientConfig::default();
         info.protocol_version = ProtocolVersion::V_2025_11_25;
         info
     }

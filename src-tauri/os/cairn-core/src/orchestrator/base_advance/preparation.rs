@@ -2144,16 +2144,27 @@ impl Context<'_> {
                     &format!("automatic preparation of {branch}"),
                 )
             {
-                return Err(PreparationRefusal::Cooldown {
+                let cooldown = PreparationRefusal::Cooldown {
                     fingerprint: quarantine.fingerprint.clone(),
                     retry_at: quarantine.retry_at(),
-                });
+                };
+                drop(guard);
+                return self
+                    .with_catch_up_pending(
+                        merge_mode,
+                        &relationship,
+                        &coordinate,
+                        attempt,
+                        recovered_export,
+                        Err(cooldown),
+                    )
+                    .await;
             }
         }
         // An ordinary resolution commit proceeds under its recorded session;
         // an explicit replay request is asking for the catch-up itself.
         if request.purpose == PreparationPurpose::OwnerCommit && !request.explicit_replay {
-            let (returned, bound) = self.bound_session(guard, &coordinate).await?;
+            let (returned, bound) = self.bound_session(guard, &coordinate, false).await?;
             if let Some(bound) = bound {
                 let (returned, tree) = self.tree_of(returned, &coordinate.head).await?;
                 drop(returned);
@@ -2228,8 +2239,18 @@ impl Context<'_> {
                     let cached = self.merge_quarantine_payload().await?;
                     if let Ok(cached) = serde_json::from_str::<CachedMergeConflict>(&cached) {
                         drop(guard);
+                        let conflict = self
+                            .conflicted(&relationship, &coordinate, cached.diagnostic(), true)
+                            .await;
                         return self
-                            .conflicted(&relationship, &coordinate, cached.diagnostic())
+                            .with_catch_up_pending(
+                                merge_mode,
+                                &relationship,
+                                &coordinate,
+                                attempt,
+                                recovered_export,
+                                conflict,
+                            )
                             .await;
                     }
                     return Err(PreparationRefusal::Repository(cached));
@@ -2346,7 +2367,17 @@ impl Context<'_> {
                 return Err(PreparationRefusal::Repository(error));
             }
             Err(crate::jj::AdvanceComputeError::TimedOut) => {
-                return self.timed_out(&relationship, &coordinate).await;
+                let timed_out = self.timed_out(&relationship, &coordinate).await;
+                return self
+                    .with_catch_up_pending(
+                        merge_mode,
+                        &relationship,
+                        &coordinate,
+                        attempt,
+                        recovered_export,
+                        timed_out,
+                    )
+                    .await;
             }
             Err(crate::jj::AdvanceComputeError::AmbiguousOwnership { commit }) => {
                 return Err(PreparationRefusal::AmbiguousOwnership {
@@ -2376,17 +2407,39 @@ impl Context<'_> {
             }
             Err(crate::jj::AdvanceComputeError::Conflict(diagnostic)) => {
                 let diagnostic = *diagnostic;
+                let mut assess_basis = true;
                 if !merge_mode && !declared_applied {
                     match self.declared_plan(&coordinate, &diagnostic).await? {
                         DeclaredOutcome::Plan(edits) => return Ok(Attempt::Declared(edits)),
+                        // The plan only saves the owner a resolution; failing to
+                        // prove one in time leaves an ordinary conflict, never a
+                        // stranded commit. The session-basis assessment would
+                        // re-read the basis this probe just ran out of time on,
+                        // so the reopened session keeps the earlier basis.
                         DeclaredOutcome::TimedOut => {
-                            return self.timed_out(&relationship, &coordinate).await;
+                            log::warn!(
+                                "declared merge plan for `{branch}` timed out at {}:{}; \
+                                 recording the conflict with the earlier resolution basis",
+                                coordinate.head,
+                                coordinate.base
+                            );
+                            assess_basis = false;
                         }
                         DeclaredOutcome::None => {}
                     }
                 }
+                let conflict = self
+                    .conflicted(&relationship, &coordinate, diagnostic, assess_basis)
+                    .await;
                 return self
-                    .conflicted(&relationship, &coordinate, diagnostic)
+                    .with_catch_up_pending(
+                        merge_mode,
+                        &relationship,
+                        &coordinate,
+                        attempt,
+                        recovered_export,
+                        conflict,
+                    )
                     .await;
             }
         };
@@ -2772,11 +2825,14 @@ impl Context<'_> {
     /// for this project, store and exact base coordinate, with the head at or
     /// past the tip it was recorded at. A session recorded against an older
     /// base binds nothing; the commit then prepares, and a conflict reopens
-    /// the session at the current base.
+    /// the session at the current base. `any_base` drops only the exact-base
+    /// requirement, for a merge-mode commit whose catch-up stays pending (see
+    /// [`Self::with_catch_up_pending`]).
     async fn bound_session(
         &self,
         guard: JjStoreGuard,
         coordinate: &crate::jj::AdvanceCoordinate,
+        any_base: bool,
     ) -> Result<(JjStoreGuard, Option<BoundSession>), PreparationRefusal> {
         let Some(session) = load_active_session(self.db, &self.request.branch)
             .await
@@ -2791,7 +2847,7 @@ impl Context<'_> {
         if session.project_id != self.request.project_id
             || session.store_path != store_path
             || session.target_branch != coordinate.base_branch
-            || session.destination_commit != coordinate.base
+            || (!any_base && session.destination_commit != coordinate.base)
             || !session.version_is_current()
         {
             return Ok((guard, None));
@@ -2811,6 +2867,84 @@ impl Context<'_> {
         })
         .await?;
         Ok((guard, descends.then_some(bound)))
+    }
+
+    /// An owner's ordinary commit on a merge-mode branch whose catch-up could
+    /// not be installed: published on the branch's own head under its open
+    /// conflict session, with the catch-up merge left pending.
+    ///
+    /// In merge mode the catch-up is one extra merge commit on top of the
+    /// owner's history and never rewrites it, so the owner's commit does not
+    /// depend on the merge at all: holding it until the merge succeeds only
+    /// stops the owner (and every child merged into an integration branch)
+    /// while the base keeps moving. A refusal is kept when it is not about the
+    /// catch-up (a fence, a busy store, a moved branch), when this is not an
+    /// owner's ordinary commit, or when no open session the head descends from
+    /// records that the catch-up is outstanding; a merge-mode branch with no
+    /// session has nothing telling its owner the merge is pending. The
+    /// refusal's cooldown or session record stands as written, and the next
+    /// preparation retries the merge as before.
+    async fn with_catch_up_pending(
+        &self,
+        merge_mode: bool,
+        relationship: &BaseRelationship,
+        coordinate: &crate::jj::AdvanceCoordinate,
+        attempt: u32,
+        export: PreparedExport,
+        outcome: Result<Attempt, PreparationRefusal>,
+    ) -> Result<Attempt, PreparationRefusal> {
+        let refusal = match outcome {
+            Ok(attempt) => return Ok(attempt),
+            Err(refusal) => refusal,
+        };
+        let request = self.request;
+        let about_the_catch_up = match &refusal {
+            PreparationRefusal::Conflict(conflict) => {
+                matches!(conflict.record, ConflictRecord::Session { .. })
+            }
+            PreparationRefusal::TimedOut { .. } | PreparationRefusal::Cooldown { .. } => true,
+            _ => false,
+        };
+        if !merge_mode
+            || request.purpose != PreparationPurpose::OwnerCommit
+            || request.explicit_replay
+            || !about_the_catch_up
+        {
+            return Err(refusal);
+        }
+        let branch = request.branch.as_str();
+        let guard = self.lock("publish with the catch-up pending").await?;
+        if let Some(raced) = self.moved_since(relationship, coordinate).await? {
+            return Ok(Attempt::Raced(raced));
+        }
+        self.refuse_fenced(&guard, &[branch]).await?;
+        let (guard, bound) = self.bound_session(guard, coordinate, true).await?;
+        let Some(bound) = bound else {
+            return Err(refusal);
+        };
+        let (guard, tree) = self.tree_of(guard, &coordinate.head).await?;
+        drop(guard);
+        let pending = format!(
+            "`{branch}` catches up by merge: this commit lands on its head under conflict \
+             session {}, and the merge onto `{}` at {} is still pending ({refusal})",
+            bound.intent_id, coordinate.base_branch, coordinate.base
+        );
+        log::info!("catch-up[{branch}] owner commit published with the merge pending: {pending}");
+        Ok(Attempt::Prepared(Box::new(PreparedBranch {
+            project_id: request.project_id.clone(),
+            store: self.store.clone(),
+            branch: branch.to_string(),
+            head_before: coordinate.head.clone(),
+            head_after: coordinate.head.clone(),
+            tree,
+            relationship: relationship.clone(),
+            base_commit: coordinate.base.clone(),
+            advanced: false,
+            export,
+            attempts: attempt,
+            session: Some(bound),
+            warnings: vec![pending],
+        })))
     }
 
     async fn tree_of(
@@ -3790,21 +3924,25 @@ impl Context<'_> {
 
     /// The resolution basis a session reopened at `diagnostic` inherits from
     /// `previous`, assessed off-lock under the request's remaining budget.
-    /// `None` is a timeout. A non-time failure keeps the earlier basis: that
-    /// can only make a later replay refuse, never lose.
+    ///
+    /// Any failure, a timeout included, keeps the earlier basis. The
+    /// assessment only ever adds entries to it (`basis_after`), so the earlier
+    /// basis is a subset of the assessed one: it can make a later
+    /// take-committed-tip replay refuse a path, never lose one. A timeout must
+    /// not end the preparation: the assessment shells out per path and side
+    /// and can be irreducibly longer than any budget on a large store, and
+    /// refusing here strands the owner's commit at every base move.
     async fn bounded_inherited_basis(
         &self,
         coordinate: &crate::jj::AdvanceCoordinate,
         previous: Option<&crate::orchestrator::conflict_session::ConflictSession>,
         diagnostic: &crate::jj::ConflictDiagnostic,
-    ) -> Option<crate::orchestrator::conflict_session::ResolutionBasis> {
+    ) -> crate::orchestrator::conflict_session::ResolutionBasis {
         use crate::orchestrator::conflict_session::{bounded_store_assessment, AssessmentScope};
         let (Some(previous), Some(ours)) = (previous, diagnostic.ours.clone()) else {
-            return Some(
-                previous
-                    .map(|previous| previous.resolution_basis.clone())
-                    .unwrap_or_default(),
-            );
+            return previous
+                .map(|previous| previous.resolution_basis.clone())
+                .unwrap_or_default();
         };
         let (session, store) = (previous.clone(), self.store.clone());
         let assessed = bounded_store_assessment(
@@ -3819,8 +3957,7 @@ impl Context<'_> {
         )
         .await;
         match assessed {
-            Ok(basis) => Some(basis),
-            Err(error) if crate::jj::is_jj_timeout_error(&error) => None,
+            Ok(basis) => basis,
             Err(error) => {
                 log::warn!(
                     "conflict session for `{}`: could not tell which files changed since `{}` \
@@ -3828,18 +3965,21 @@ impl Context<'_> {
                     previous.bookmark,
                     previous.ours.as_deref().unwrap_or("?")
                 );
-                Some(previous.resolution_basis.clone())
+                previous.resolution_basis.clone()
             }
         }
     }
 
     /// Record a conflict only once the coordinates it describes are proved
-    /// current, under the lock.
+    /// current, under the lock. `assess_basis` false keeps the open session's
+    /// basis without reading it again, after a probe of the same basis has
+    /// already run out of time.
     async fn conflicted(
         &self,
         relationship: &BaseRelationship,
         coordinate: &crate::jj::AdvanceCoordinate,
         diagnostic: crate::jj::ConflictDiagnostic,
+        assess_basis: bool,
     ) -> Result<Attempt, PreparationRefusal> {
         let branch = self.request.branch.as_str();
         // An owner's session inherits a basis; assess it before the lock,
@@ -3848,13 +3988,15 @@ impl Context<'_> {
             let open = load_active_session(self.db, branch)
                 .await
                 .map_err(PreparationRefusal::Repository)?;
-            match self
-                .bounded_inherited_basis(coordinate, open.as_ref(), &diagnostic)
-                .await
-            {
-                Some(basis) => (open, basis),
-                None => return self.timed_out(relationship, coordinate).await,
-            }
+            let basis = if assess_basis {
+                self.bounded_inherited_basis(coordinate, open.as_ref(), &diagnostic)
+                    .await
+            } else {
+                open.as_ref()
+                    .map(|session| session.resolution_basis.clone())
+                    .unwrap_or_default()
+            };
+            (open, basis)
         } else {
             (None, Default::default())
         };

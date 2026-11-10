@@ -51,14 +51,14 @@ const SIBLING: &str = "agent/dormant";
 async fn resolved_conflict(h: &Harness) -> (String, String) {
     h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\nX\n");
     let d1 = h.advance_main("shared.txt", "original\nA\n");
-    let refusal = h
-        .prepare(PreparationPurpose::OwnerCommit)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(refusal, PreparationRefusal::Conflict(_)),
-        "the owner's commit records the conflict: {refusal}"
-    );
+    match h.prepare(PreparationPurpose::OwnerCommit).await {
+        Err(PreparationRefusal::Conflict(_)) => {}
+        // Merge mode: the commit publishes under the session it recorded,
+        // with the catch-up merge left pending.
+        Ok(prepared) if prepared.session.is_some() && !prepared.advanced => {}
+        Ok(_) => panic!("the owner's commit records the conflict, not an advance"),
+        Err(refusal) => panic!("the owner's commit records the conflict: {refusal}"),
+    }
     assert!(load_active_session(&h.db, BRANCH).await.unwrap().is_some());
     let resolved = h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\nA\nX\n");
     (d1, resolved)

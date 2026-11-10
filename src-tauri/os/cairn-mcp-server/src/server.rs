@@ -17,7 +17,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
         ErrorCode, ErrorData, Extensions, Implementation, ListToolsResult, PaginatedRequestParams,
         ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     },
     service::{MaybeSendFuture, RequestContext},
     tool, tool_router, RoleServer, ServerHandler,
@@ -500,7 +500,7 @@ impl ServerHandler for CairnMcpServer {
         )))
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let instructions = "Cairn MCP server for agent orchestration. Three batch verbs: \
              `read` (files, directories, cairn:// resources, and web targets, with per-target \
              `?query` scoping), `write` (ordered file and cairn:// resource mutations; \
@@ -509,7 +509,7 @@ impl ServerHandler for CairnMcpServer {
              cairn:// resource returns its affordances inline."
             .to_string();
 
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
@@ -641,15 +641,15 @@ mod tests {
     use super::*;
     use crate::test_support::{get_text, test_server, RecordingSink};
     use rmcp::{
-        model::ClientInfo, ClientHandler, ClientLifecycleMode, ClientServiceExt, ServiceExt,
+        model::ClientConfig, ClientHandler, ClientLifecycleMode, ClientServiceExt, ServiceExt,
     };
 
     #[derive(Clone)]
     struct LifecycleClient;
 
     impl ClientHandler for LifecycleClient {
-        fn get_info(&self) -> ClientInfo {
-            let mut info = ClientInfo::default();
+        fn get_info(&self) -> ClientConfig {
+            let mut info = ClientConfig::default();
             info.protocol_version = rmcp::model::ProtocolVersion::V_2025_11_25;
             info
         }

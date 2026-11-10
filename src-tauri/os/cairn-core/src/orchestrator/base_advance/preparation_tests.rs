@@ -2732,45 +2732,56 @@ fn the_preparer_reads_resolution_bases_only_through_the_bounded_offload() {
     }
 }
 
-/// cairn/6114 item 6 on the canonical preparer. A previous session's basis
-/// whose read outlasts the budget times out THIS branch's preparation, with a
-/// cooldown and nothing recorded over the previous session. Throughout the slow
-/// read the store lock is free, and another branch prepares to completion on
-/// the same single runtime thread, so neither a guard nor a runtime worker is
-/// held. The slow read is reaped.
-///
-/// On an owner's conflict the first reader of that basis is the declared-merge
-/// assessment (`replay_baseline_at` at the head, which is the new `ours`). Its
-/// timeout ends the preparation, so the session-basis assessment never repeats
-/// the read.
+/// A jj wrapper whose content reads at one armed commit sleep past any
+/// budget: the specimen's per-call store cost (cairn/6752 measured about 3 s
+/// per `jj file show`, so an assessment over 137 paths needs about 20 min).
+/// Returns the wrapper, the arming file and the file each slow read's pid is
+/// appended to.
 #[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-#[serial_test::serial(jj)]
-async fn a_slow_inherited_basis_times_out_its_branch_alone_off_the_lock_and_the_runtime() {
+fn slow_reads_wrapper(tools: &Path, real: &str) -> (PathBuf, PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
 
-    let Some(real) = crate::jj::tests::jj_bin() else {
-        return;
-    };
-    let tools = tempfile::tempdir().unwrap();
-    let wrapper = tools.path().join("jj-slow-basis");
-    let armed = tools.path().join("armed");
-    let reads = tools.path().join("reads");
+    let wrapper = tools.join("jj-slow-basis");
+    let armed = tools.join("armed");
+    let reads = tools.join("reads");
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    // Once armed with a commit, every content read at that commit sleeps
-    // past the budget.
     std::fs::write(
         &wrapper,
         format!(
             "#!/bin/sh\nif test -s {armed}; then\n  slow=$(cat {armed})\n  case \" $* \" in\n    *' file show '*\" -r $slow \"*)\n      echo $$ >> {reads}\n      exec sleep 30\n      ;;\n  esac\nfi\nexec {real} \"$@\"\n",
             armed = quote(&armed.to_string_lossy()),
             reads = quote(&reads.to_string_lossy()),
-            real = quote(&real),
+            real = quote(real),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (wrapper, armed, reads)
+}
+
+/// cairn/6114 item 6 and cairn/6752 part 2 on the canonical preparer. A
+/// previous session's basis whose read outlasts the budget never ends the
+/// branch's preparation in a cooldown: the conflict at the new base is
+/// recorded as usual and the reopened session keeps the earlier basis.
+/// Throughout the slow read the store lock is free, and another branch
+/// prepares to completion on the same single runtime thread, so neither a
+/// guard nor a runtime worker is held. The slow read is reaped.
+///
+/// On an owner's conflict the first reader of that basis is the declared-merge
+/// probe (`replay_baseline_at` at the head, which is the new `ours`). Its
+/// timeout is only a missing optimisation, so preparation degrades to the
+/// ordinary conflict, and the session-basis assessment does not repeat the read.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(jj)]
+async fn a_timed_out_declared_plan_probe_records_the_conflict_without_a_cooldown() {
+    use std::time::{Duration, Instant};
+
+    let Some(real) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let tools = tempfile::tempdir().unwrap();
+    let (wrapper, armed, reads) = slow_reads_wrapper(tools.path(), &real);
     let h = harness(wrapper.to_str().unwrap(), "prep_slow_basis").await;
 
     let own = h.commit(&h.branch_ws, BRANCH, "shared.txt", "mine\n");
@@ -2804,25 +2815,11 @@ async fn a_slow_inherited_basis_times_out_its_branch_alone_off_the_lock_and_the_
     // The base moves again: the owner's next commit conflicts afresh, and its
     // new session must inherit from the first, whose sides it re-reads.
     let second = h.advance_main("shared.txt", "theirs two\n");
-    // Whatever the first conflict delivered to the owner, the timeout adds
-    // nothing: counted against this baseline, not a wake kind.
-    let owner_pushes = || async {
-        h.db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT CAST(COUNT(*) AS TEXT) FROM attention_pushes WHERE recipient = ?1",
-                        (JOB,),
-                    )
-                    .await?;
-                let row = rows.next().await?.expect("a count row");
-                row.text(0)
-            })
-        })
+    let earlier_basis = load_active_session(&h.db, BRANCH)
         .await
         .unwrap()
-    };
-    let pushed_before = owner_pushes().await;
+        .expect("the first session")
+        .resolution_basis;
     std::fs::write(&armed, &first).unwrap();
     let read_pids = || {
         std::fs::read_to_string(&reads)
@@ -2881,16 +2878,24 @@ async fn a_slow_inherited_basis_times_out_its_branch_alone_off_the_lock_and_the_
     eprintln!("preparation with a slow inherited basis: {elapsed:?}");
 
     let refusal = refusal.unwrap_err();
-    let PreparationRefusal::TimedOut {
-        head, base_commit, ..
-    } = &refusal
-    else {
-        panic!("a slow basis is this branch's timeout: {refusal}");
+    let PreparationRefusal::Conflict(conflict) = &refusal else {
+        panic!("a slow declared-plan probe degrades to the ordinary conflict: {refusal}");
     };
     assert_eq!(
-        (head.as_str(), base_commit.as_str()),
+        (conflict.head.as_str(), conflict.base_commit.as_str()),
         (own.as_str(), second.as_str())
     );
+    let ConflictRecord::Session {
+        intent_id: reopened,
+        reopened: true,
+    } = &conflict.record
+    else {
+        panic!(
+            "the conflict reopens the owner's session: {:?}",
+            conflict.record
+        );
+    };
+    assert_ne!(reopened, &first_session);
     assert!(
         elapsed < DEFAULT_COMPUTE_BUDGET + Duration::from_secs(10),
         "bounded by the budget, not the 30 s read: {elapsed:?}"
@@ -2906,31 +2911,42 @@ async fn a_slow_inherited_basis_times_out_its_branch_alone_off_the_lock_and_the_
     }
     assert!(other.advanced);
     assert!(h.is_ancestor(&second, &other.head_after));
-    assert_eq!(h.tip(BRANCH), own, "the timed-out branch installed nothing");
+    assert_eq!(h.tip(BRANCH), own, "a conflict installs nothing");
 
-    let kept = load_active_session(&h.db, BRANCH)
+    let session = load_active_session(&h.db, BRANCH)
         .await
         .unwrap()
-        .expect("the previous session stays");
-    assert_eq!(kept.intent_id, first_session, "no session recorded over it");
-    assert_eq!(kept.destination_commit, first);
+        .expect("the session is reopened at the new base");
+    assert_eq!(&session.intent_id, reopened);
+    assert_eq!(session.destination_commit, second);
     assert_eq!(
-        owner_pushes().await,
-        pushed_before,
-        "a timeout delivers nothing to the owner"
+        session.resolution_basis, earlier_basis,
+        "the reopened session keeps the earlier basis"
     );
-    let cooldown = crate::orchestrator::base_advance::load_reconcile_quarantine(
+    let quarantine = crate::orchestrator::base_advance::load_reconcile_quarantine(
         &h.db, "proj-1", &h.store, BRANCH,
     )
     .await
-    .unwrap()
-    .expect("the timeout is cooled down");
-    assert_eq!(cooldown.failure_kind, crate::jj::RECONCILE_TIMEOUT);
-    assert_eq!(cooldown.fingerprint, format!("{own}:{second}"));
+    .unwrap();
+    let quarantined = quarantine.map(|row| row.failure_kind);
+    assert_ne!(
+        quarantined.as_deref(),
+        Some(crate::jj::RECONCILE_TIMEOUT),
+        "no timeout cooldown is recorded"
+    );
+    // The owner's next commit binds the reopened session and publishes.
+    let bound = h
+        .prepare(PreparationPurpose::OwnerCommit)
+        .await
+        .expect("the next commit binds the reopened session");
+    assert_eq!(
+        bound.session.map(|bound| bound.intent_id),
+        Some(reopened.clone())
+    );
     assert_eq!(
         read_pids().len(),
         1,
-        "one slow read: the timeout ended preparation before anything re-read the basis"
+        "one slow read: the session basis did not re-read what the probe timed out on"
     );
     // The slow assessment names its scope, the branch and how many paths it
     // read: what the production specimen could not.
@@ -2951,6 +2967,102 @@ async fn a_slow_inherited_basis_times_out_its_branch_alone_off_the_lock_and_the_
             .iter()
             .any(|line| line.starts_with("slow conflict session basis:")),
         "the session basis never re-ran the slow read: {named:?}"
+    );
+}
+
+/// cairn/6752 part 1, the cairn/4113 specimen in small. A merge-mode branch
+/// with an open catch-up session; the base moves; the owner commits. The
+/// catch-up merge itself is cheap, but the reopened session's inherited basis
+/// reads the earlier session's sides path by path, and on the specimen's store
+/// that read needs minutes against a 10 s budget. It used to time the
+/// preparation out, strand the commit in a hold and cool the coordinate down,
+/// so nothing published while the base kept moving. Now the slow read keeps
+/// the earlier basis, the conflict at the new base is recorded, and the
+/// owner's commit publishes on its own head with the merge pending.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_merge_mode_owner_commit_publishes_when_the_base_moves_and_its_basis_is_slow() {
+    use std::time::{Duration, Instant};
+
+    let Some(real) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let tools = tempfile::tempdir().unwrap();
+    let (wrapper, armed, reads) = slow_reads_wrapper(tools.path(), &real);
+    let h = harness(wrapper.to_str().unwrap(), "prep_merge_slow_basis").await;
+    let budget = Duration::from_secs(2);
+    let owner_commit = || {
+        let mut request = PreparationRequest::new(
+            "proj-1",
+            BRANCH,
+            Some(JOB.to_string()),
+            PreparationPurpose::OwnerCommit,
+        );
+        request.compute_budget = budget;
+        prepare_branch(&h.orch, request)
+    };
+
+    let own = h.commit(&h.branch_ws, BRANCH, "shared.txt", "mine\n");
+    h.enable_merge_mode().await;
+    let first = h.advance_main("shared.txt", "theirs one\n");
+    let opened = owner_commit()
+        .await
+        .expect("the first conflict publishes under the session it opens");
+    let first_session = opened.session.expect("bound to the opened session");
+    assert!(!opened.advanced);
+
+    // Main moves on, as it did for 4113 (fa13df6d -> c1d09b85).
+    let second = h.advance_main("shared.txt", "theirs two\n");
+    std::fs::write(&armed, &first).unwrap();
+    let started = Instant::now();
+    let pending = owner_commit()
+        .await
+        .expect("the owner's commit is not stranded by a slow basis");
+    let elapsed = started.elapsed();
+    assert!(
+        !std::fs::read_to_string(&reads)
+            .unwrap_or_default()
+            .is_empty(),
+        "the basis read really outlasted the budget"
+    );
+    assert!(
+        elapsed < budget * 3 + Duration::from_secs(5),
+        "bounded by the budget, not the 30 s read: {elapsed:?}"
+    );
+    assert!(!pending.advanced, "the catch-up merge stays pending");
+    assert_eq!(pending.head_after, own);
+    assert_eq!(pending.base_commit, second);
+    assert_eq!(h.tip(BRANCH), own);
+    let session = load_active_session(&h.db, BRANCH)
+        .await
+        .unwrap()
+        .expect("the conflict is recorded at the new base");
+    assert_eq!(session.destination_commit, second);
+    assert_ne!(session.intent_id, first_session.intent_id);
+    assert_eq!(
+        pending.session.map(|bound| bound.intent_id),
+        Some(session.intent_id.clone())
+    );
+    let quarantined = crate::orchestrator::base_advance::load_reconcile_quarantine(
+        &h.db, "proj-1", &h.store, BRANCH,
+    )
+    .await
+    .unwrap()
+    .map(|row| row.failure_kind);
+    assert_ne!(
+        quarantined.as_deref(),
+        Some(crate::jj::RECONCILE_TIMEOUT),
+        "no timeout cooldown holds the branch"
+    );
+
+    // Every later commit keeps publishing under that session.
+    let next = h.commit(&h.branch_ws, BRANCH, "own.txt", "more work\n");
+    let later = owner_commit().await.expect("the next commit publishes");
+    assert_eq!(later.head_after, next);
+    assert_eq!(
+        later.session.map(|bound| bound.intent_id),
+        Some(session.intent_id)
     );
 }
 
@@ -3260,16 +3372,40 @@ async fn merge_mode_conflict_retries_a_changed_destination_without_replaying_sou
     let own = h.commit(&h.branch_ws, BRANCH, "shared.txt", "mine\n");
     h.enable_merge_mode().await;
     let d1 = h.advance_main("shared.txt", "theirs\n");
-    let refusal = h
+    // The owner's own commit does not wait on its catch-up: the conflict is
+    // recorded, and the commit publishes under that session, unadvanced.
+    let pending = h
         .prepare(PreparationPurpose::OwnerCommit)
         .await
-        .unwrap_err();
-    assert!(
-        matches!(refusal, PreparationRefusal::Conflict(_)),
-        "{refusal}"
-    );
+        .expect("a merge-mode owner commit publishes with its catch-up pending");
+    assert!(!pending.advanced);
+    assert_eq!(pending.head_after, own);
+    assert_eq!(pending.base_commit, d1);
     let session = load_active_session(&h.db, BRANCH).await.unwrap().unwrap();
     assert_eq!(session.theirs.as_deref(), Some(d1.as_str()));
+    assert_eq!(
+        pending
+            .session
+            .as_ref()
+            .map(|bound| bound.intent_id.as_str()),
+        Some(session.intent_id.as_str())
+    );
+    assert!(
+        pending
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("still pending")),
+        "the owner is told the merge is pending: {:?}",
+        pending.warnings
+    );
+    assert_eq!(
+        h.prepare(PreparationPurpose::OwnerMerge)
+            .await
+            .err()
+            .map(|refusal| refusal.kind()),
+        Some("conflicts with base"),
+        "landing still needs the catch-up"
+    );
     assert_eq!(
         h.tip(BRANCH),
         own,
