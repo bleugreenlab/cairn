@@ -22,6 +22,14 @@
 //! `--branch main` baseline) carries none and gets the whole-tree verdict. A
 //! base whose finding set is not recorded still ships, naming what is missing,
 //! so the script reports no verdict instead of the whole tree's red.
+//!
+//! The lane's verdict is a function of that set, so its result key folds it
+//! (`ChangeBasis::Against::base_findings` in `execution::checks`): every
+//! caller resolves the set once, with [`lint_baseline_for`], and both keys and
+//! ships that one value. Two bases whose recorded sets differ, or a base whose
+//! set arrives after a run recorded its absence, never share a verdict. A run
+//! that ships no set keys exactly as it did before the set existed, which is
+//! what lets the lookup below name a base's own whole-tree row.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -72,26 +80,31 @@ pub(crate) struct LintBaselineSource<'a> {
     pub(crate) base_label: Option<&'a str>,
 }
 
-/// The `(variable, content)` pair to add to a check batch's transport, or
-/// `None` when no planned check subtracts its base or the base is the head.
+/// The base finding set a run of `checks` ships, or `None` when none of them
+/// subtracts its base or the base is the head. The one value both the run's
+/// transport ([`lint_baseline_env`]) and its result key read.
 ///
 /// Synchronous: it reads the object database, the tree, and the store, so
 /// async callers run it on the blocking pool.
-pub(crate) fn lint_baseline_env<'n>(
+pub(crate) fn lint_baseline_for<'n>(
     source: &LintBaselineSource<'_>,
     db: Arc<LocalDb>,
     project_id: &str,
-    planned: impl IntoIterator<Item = &'n str>,
-) -> Option<(String, String)> {
-    let check_name = planned
+    checks: impl IntoIterator<Item = &'n str>,
+) -> Option<LintBaselineTransport> {
+    let check_name = checks
         .into_iter()
         .find(|name| subtracts_base_findings(name))?;
     if source.base == source.head {
         return None;
     }
-    let transport = lint_baseline(source, db, project_id, check_name);
-    let content = serde_json::to_string(&transport).expect("the baseline transport serializes");
-    Some((LINT_BASELINE_CONTENT_ENV.to_string(), content))
+    Some(lint_baseline(source, db, project_id, check_name))
+}
+
+/// The `(variable, content)` pair a check batch carries for `transport`.
+pub(crate) fn lint_baseline_env(transport: &LintBaselineTransport) -> (String, String) {
+    let content = serde_json::to_string(transport).expect("the baseline transport serializes");
+    (LINT_BASELINE_CONTENT_ENV.to_string(), content)
 }
 
 fn short(commit: &str) -> &str {
@@ -146,10 +159,11 @@ pub(crate) fn lint_baseline(
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &contract.contract.extra_inputs, &snapshot);
-    // The base's row was recorded by whichever cadence ran it, against a change
-    // this lookup does not know. A base-subtracting check is not base-relative
-    // (its base enters through this transport, not its key), so its key never
-    // reads the change and the lookup can name it.
+    // The base's row was recorded by a run of the base itself, against a change
+    // this lookup does not know. A base-subtracting check is not base-relative,
+    // so its key never reads the change, and that run shipped no finding set,
+    // so its key folds none: the lookup names it with an unknown change, which
+    // folds neither.
     transport.input_hash = check_input_hash(
         check,
         inputs.for_check(check_name),

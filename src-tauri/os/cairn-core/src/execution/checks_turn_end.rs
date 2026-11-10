@@ -1514,7 +1514,6 @@ async fn run_turn_end_checks_inner(
 
     // 4. Compute changed files between immutable logical coordinates.
     let wave_base = base.clone();
-    let baseline_base = base.clone();
     let key_base = base.clone();
     // Every read below is addressed by the captured head and base alone, so it
     // runs pinned to an operation indexing them and can never settle a split
@@ -1611,7 +1610,10 @@ async fn run_turn_end_checks_inner(
     let planning_jj = jj.clone();
     let planning_repository = logical_repository.clone();
     let planning_commit = sealed_commit.clone();
-    let (plans, input_hashes, tree_hash, expected_toolchain) =
+    let planning_db = orch.db.local.clone();
+    let planning_project = coords.project_id.clone();
+    let planning_base_label = prepared.base_branch.clone();
+    let (plans, input_hashes, tree_hash, expected_toolchain, base_findings) =
         tokio::task::spawn_blocking(move || {
             // The entry listing feeds both the derived closures and the per-check
             // cache key below, so it is read once here.
@@ -1639,6 +1641,7 @@ async fn run_turn_end_checks_inner(
                     std::collections::HashMap::new(),
                     String::new(),
                     String::new(),
+                    None,
                 ));
             }
             // The same held probe `plan_checks` just made for these plans.
@@ -1654,6 +1657,21 @@ async fn run_turn_end_checks_inner(
                 &planning_repository,
                 &key_base,
             );
+            // The base finding set the lint lane ships (step 11), read once
+            // here because its key names it.
+            let base_findings = crate::execution::lint_baseline::lint_baseline_for(
+                &crate::execution::lint_baseline::LintBaselineSource {
+                    jj: &planning_jj,
+                    object_repository: &planning_repo,
+                    repository: &planning_repository,
+                    base: &key_base,
+                    head: &planning_commit,
+                    base_label: Some(&planning_base_label),
+                },
+                planning_db,
+                &planning_project,
+                planning_checks.keys().map(String::as_str),
+            );
             let input_hashes = check_input_hashes(
                 &planning_checks,
                 &inputs,
@@ -1662,9 +1680,16 @@ async fn run_turn_end_checks_inner(
                 crate::execution::checks::ChangeBasis::Against {
                     changed: &planning_changed,
                     base_entries: base_entries.as_deref(),
+                    base_findings: base_findings.as_ref(),
                 },
             );
-            Ok::<_, String>((plans, input_hashes, tree_hash, expected_toolchain))
+            Ok::<_, String>((
+                plans,
+                input_hashes,
+                tree_hash,
+                expected_toolchain,
+                base_findings,
+            ))
         })
         .await
         .map_err(|error| format!("turn-end check planning task failed: {error}"))??;
@@ -1919,38 +1944,15 @@ async fn run_turn_end_checks_inner(
     // The lint lane's base finding set does: it is how a branch's lint verdict
     // becomes a verdict about its diff (`execution::lint_baseline`).
     let mut extra_env = crate::execution::checks::check_transport_env(&changed, None);
-    let planned: Vec<String> = to_run.iter().map(|(plan, _)| plan.name.clone()).collect();
-    if planned
+    if to_run
         .iter()
-        .any(|name| crate::execution::lint_baseline::subtracts_base_findings(name))
+        .any(|(plan, _)| crate::execution::lint_baseline::subtracts_base_findings(&plan.name))
     {
-        let (baseline_jj, object_repository, repository, head, db, project, label) = (
-            jj.clone(),
-            repo_root.clone(),
-            logical_repository.clone(),
-            sealed_commit.clone(),
-            db.clone(),
-            coords.project_id.clone(),
-            Some(prepared.base_branch.clone()),
+        extra_env.extend(
+            base_findings
+                .as_ref()
+                .map(crate::execution::lint_baseline::lint_baseline_env),
         );
-        let baseline = tokio::task::spawn_blocking(move || {
-            crate::execution::lint_baseline::lint_baseline_env(
-                &crate::execution::lint_baseline::LintBaselineSource {
-                    jj: &baseline_jj,
-                    object_repository: &object_repository,
-                    repository: &repository,
-                    base: &baseline_base,
-                    head: &head,
-                    base_label: label.as_deref(),
-                },
-                db,
-                &project,
-                planned.iter().map(String::as_str),
-            )
-        })
-        .await
-        .map_err(|error| format!("turn-end lint baseline task failed: {error}"))?;
-        extra_env.extend(baseline);
     }
 
     // 12. Submit remaining misses as pure-verdict placement groups. Each group's

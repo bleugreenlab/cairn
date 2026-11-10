@@ -1748,10 +1748,28 @@ async fn statuses_at_range(
                     base,
                 )
             });
+            // A base-subtracting check is keyed by the base finding set it is
+            // shipped, so the projection reads the set the runners read.
+            let base_findings = base.as_ref().and_then(|base| {
+                crate::execution::lint_baseline::lint_baseline_for(
+                    &crate::execution::lint_baseline::LintBaselineSource {
+                        jj: &status_jj,
+                        object_repository: &project_root,
+                        repository: &logical_repository,
+                        base,
+                        head: &logical_head,
+                        base_label: None,
+                    },
+                    status_db.clone(),
+                    &status_project_id,
+                    checks.keys().map(String::as_str),
+                )
+            });
             let basis = match changed.as_deref() {
                 Some(changed) => ChangeBasis::Against {
                     changed,
                     base_entries: base_entries.as_deref(),
+                    base_findings: base_findings.as_ref(),
                 },
                 None => ChangeBasis::Unknown,
             };
@@ -5674,6 +5692,7 @@ mod complete_input_projection_tests {
         ChangeBasis::Against {
             changed,
             base_entries: None,
+            base_findings: None,
         }
     }
 
@@ -5848,6 +5867,7 @@ mod complete_input_projection_tests {
             ChangeBasis::Against {
                 changed: &authored,
                 base_entries: Some(&old_base),
+                base_findings: None,
             },
         );
         f.observe(&original, true, "protocol-v1");
@@ -5858,6 +5878,7 @@ mod complete_input_projection_tests {
                 ChangeBasis::Against {
                     changed: &authored,
                     base_entries,
+                    base_findings: None,
                 },
             );
             f.assert_absent(&current);
@@ -6247,6 +6268,7 @@ mod moved_wave_projection_tests {
             ChangeBasis::Against {
                 changed: &changed,
                 base_entries: None,
+                base_findings: None,
             },
         );
         OwnedHeadVerdictKeys {

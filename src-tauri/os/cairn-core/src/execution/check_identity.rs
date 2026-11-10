@@ -171,6 +171,7 @@ pub(crate) fn content_identity(
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
     change: Option<&str>,
+    base_findings: Option<&str>,
 ) -> CheckContentIdentity {
     let filtered_tree_hash = if selector.keys_on_whole_tree() {
         tree_hash.to_string()
@@ -227,6 +228,14 @@ pub(crate) fn content_identity(
         field(&mut hasher, "change");
         field(&mut hasher, change);
     }
+    // A base-subtracting verdict is what the tree adds over the base finding
+    // set it was shipped ([`base_findings_fingerprint`]), so that set is part
+    // of what it attests to. Trailing and only when a set ships, so a run of
+    // the base itself keeps the key its own row was recorded under.
+    if let Some(base_findings) = base_findings {
+        field(&mut hasher, "base-findings");
+        field(&mut hasher, base_findings);
+    }
 
     CheckContentIdentity {
         fingerprint: digest(hasher),
@@ -262,6 +271,32 @@ pub(crate) fn change_fingerprint(
             }
         }
         None => field(&mut hasher, "no-base-content"),
+    }
+    digest(hasher)
+}
+
+/// The fingerprint of the base finding set a base-subtracting check was
+/// shipped: the recorded fingerprints as a multiset, or `None` for a base
+/// whose set is not recorded, which the script answers with no verdict. An
+/// empty set is a clean base, a different question from an unrecorded one.
+///
+/// The set alone decides the verdict; where it came from (the base's label,
+/// commit and tree, the reason one is missing) only labels the report, so two
+/// bases that recorded the same set share a verdict.
+pub(crate) fn base_findings_fingerprint(fingerprints: Option<&[String]>) -> String {
+    let mut hasher = Sha256::new();
+    field(&mut hasher, "check-base-findings-v1");
+    match fingerprints {
+        Some(fingerprints) => {
+            let mut sorted: Vec<&String> = fingerprints.iter().collect();
+            sorted.sort();
+            field(&mut hasher, "recorded");
+            field(&mut hasher, &sorted.len().to_string());
+            for fingerprint in sorted {
+                field(&mut hasher, fingerprint);
+            }
+        }
+        None => field(&mut hasher, "unrecorded"),
     }
     digest(hasher)
 }
@@ -416,7 +451,15 @@ mod tests {
         let selector = crate::execution::inputs::InputSelector::from_globs(&["a/**".to_string()]);
         let entries = vec![("a/x".to_string(), "1".repeat(40))];
         let identity = |yaml: &str| {
-            content_identity(&command(yaml), &selector, Some(&entries), "tree", None).fingerprint
+            content_identity(
+                &command(yaml),
+                &selector,
+                Some(&entries),
+                "tree",
+                None,
+                None,
+            )
+            .fingerprint
         };
         let implicit = identity("command: bun run x\nimpact: [a/**]\n");
         let full = identity("command: bun run x\nimpact: [a/**]\ntree: full\n");

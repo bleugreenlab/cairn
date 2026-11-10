@@ -1776,6 +1776,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
         &attribution_target,
         attribution_commit.as_deref().unwrap_or(&attribution_target),
         check_name,
+        Some((db.clone(), project_id.clone())),
     )
     .await
     .map_err(|error| {
@@ -1866,14 +1867,13 @@ async fn base_relative_transport(
         target,
         target,
         check_name,
+        baseline_store,
     )
     .await?;
     let check_name = check_name.to_string();
-    tokio::task::spawn_blocking(move || {
-        base_relative_transport_for(&change, &check_name, baseline_store)
-    })
-    .await
-    .map_err(|error| format!("manual check transport task failed: {error}"))?
+    tokio::task::spawn_blocking(move || base_relative_transport_for(&change, &check_name))
+        .await
+        .map_err(|error| format!("manual check transport task failed: {error}"))?
 }
 
 /// The change a run of `head` is measured against: everything it changed since
@@ -1885,8 +1885,6 @@ pub(crate) struct BaseRelativeChange {
     jj: JjEnv,
     /// The logical repository `base` and `head` resolve in.
     repository: PathBuf,
-    /// The object database the base's checks contract is read from.
-    object_repository: PathBuf,
     base: String,
     head: String,
     target: String,
@@ -1894,6 +1892,9 @@ pub(crate) struct BaseRelativeChange {
     /// The base tree's listing, read only for a check Cairn ships base content
     /// to, whose key names the base blobs that content came from.
     base_entries: Option<Vec<(String, String)>>,
+    /// The base finding set a base-subtracting check is shipped, read once so
+    /// its key and its transport name the same set.
+    base_findings: Option<crate::execution::lint_baseline::LintBaselineTransport>,
 }
 
 impl std::fmt::Debug for BaseRelativeChange {
@@ -1913,6 +1914,7 @@ impl BaseRelativeChange {
         ChangeBasis::Against {
             changed: &self.changed,
             base_entries: self.base_entries.as_deref(),
+            base_findings: self.base_findings.as_ref(),
         }
     }
 }
@@ -1942,6 +1944,12 @@ pub(crate) fn immutable_read_jj(
 /// `target` labels the integration target; `target_revision` is what the fork
 /// point is computed from: the same name, or the exact commit a capture fixed so
 /// a target that moves after capture cannot change this run's base.
+///
+/// With `baseline_store` (the store and project the run records into), a check
+/// judged against its base's findings reads that base's recorded set here,
+/// before the run is keyed ([`crate::execution::lint_baseline`]).
+// Each argument is a distinct, already-resolved fact about this one run.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_base_relative_change(
     jj_binary_path: &str,
     config_dir: &Path,
@@ -1950,6 +1958,7 @@ async fn resolve_base_relative_change(
     target: &str,
     target_revision: &str,
     check_name: &str,
+    baseline_store: Option<(Arc<LocalDb>, String)>,
 ) -> Result<BaseRelativeChange, String> {
     let jj = crate::jj::environment(jj_binary_path, config_dir);
     let repository = {
@@ -1976,6 +1985,7 @@ async fn resolve_base_relative_change(
     let names_base_blobs = needs_executor_base_content(check_name);
     let target = target.to_string();
     let object_repository = project_repository.to_path_buf();
+    let check_name = check_name.to_string();
     tokio::task::spawn_blocking(move || {
         let changed = logical_changed_files(&jj, &repository, &base, &head).map_err(|error| {
             format!("the changed files of {base}..{head} could not be read: {error}")
@@ -1984,15 +1994,30 @@ async fn resolve_base_relative_change(
             .then(|| tree_entries(&jj, &repository, &base))
             .transpose()
             .map_err(|error| format!("the tree of base {base} could not be read: {error}"))?;
+        let base_findings = baseline_store.and_then(|(db, project_id)| {
+            crate::execution::lint_baseline::lint_baseline_for(
+                &crate::execution::lint_baseline::LintBaselineSource {
+                    jj: &jj,
+                    object_repository: &object_repository,
+                    repository: &repository,
+                    base: &base,
+                    head: &head,
+                    base_label: Some(&target),
+                },
+                db,
+                &project_id,
+                [check_name.as_str()],
+            )
+        });
         Ok(BaseRelativeChange {
             jj,
             repository,
-            object_repository,
             base,
             head,
             target,
             changed,
             base_entries,
+            base_findings,
         })
     })
     .await
@@ -2001,22 +2026,19 @@ async fn resolve_base_relative_change(
 
 /// The transport a run of one check ships for `change`: its changed files, and
 /// the executor-protocol base bundle or the lint baseline when the check is
-/// one that receives it.
+/// one that receives it. The baseline is the one `change` was keyed with.
 ///
-/// Synchronous: it reads the object database and the store.
+/// Synchronous: it reads the object database.
 fn base_relative_transport_for(
     change: &BaseRelativeChange,
     check_name: &str,
-    baseline_store: Option<(Arc<LocalDb>, String)>,
 ) -> Result<Vec<(String, String)>, String> {
     let BaseRelativeChange {
         jj,
         repository,
-        object_repository,
         base,
-        head,
-        target,
         changed,
+        base_findings,
         ..
     } = change;
     let base_content = needs_executor_base_content(check_name)
@@ -2024,22 +2046,11 @@ fn base_relative_transport_for(
         .transpose()
         .map_err(|error| format!("executor protocol base content from {base}: {error}"))?;
     let mut env = check_transport_env(changed, base_content);
-    if let Some((db, project_id)) = baseline_store {
-        let source = crate::execution::lint_baseline::LintBaselineSource {
-            jj,
-            object_repository,
-            repository,
-            base,
-            head,
-            base_label: Some(target),
-        };
-        env.extend(crate::execution::lint_baseline::lint_baseline_env(
-            &source,
-            db,
-            &project_id,
-            [check_name],
-        ));
-    }
+    env.extend(
+        base_findings
+            .as_ref()
+            .map(crate::execution::lint_baseline::lint_baseline_env),
+    );
     Ok(env)
 }
 
@@ -2528,8 +2539,7 @@ pub(crate) async fn execute_check_contract(
     let transport_env = {
         let change = contract.change;
         let name = check_name.to_string();
-        let store = Some((db.clone(), context.project_id.clone()));
-        tokio::task::spawn_blocking(move || base_relative_transport_for(&change, &name, store))
+        tokio::task::spawn_blocking(move || base_relative_transport_for(&change, &name))
             .await
             .map_err(|error| format!("manual check transport task failed: {error}"))
             .and_then(|transport| transport)
@@ -3047,7 +3057,8 @@ fn fix_is_attributed_to_declared_fixers(paths: &[String], fixers: &[&InputSelect
 /// The ordering proof covers the TREE only. A base-relative check ran after the
 /// fixers but was handed the change of the commit the wave was planned at, so
 /// it carries across a fold only when its key, which names that change, did
-/// not move.
+/// not move. A base-subtracting check is the same: it was handed the base
+/// finding set the wave was planned with, which its key names.
 fn verdict_survives_fix(
     fix_landed_on_tested_base: bool,
     executed: bool,
@@ -5455,7 +5466,8 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
         changed: &changed,
     };
     let planned: Vec<&str> = plans.iter().map(|plan| plan.name.as_str()).collect();
-    let transport = match write_wave_transport(&wave_change, &planned, db.clone(), &project_id) {
+    let base_findings = wave_base_findings(&wave_change, &planned, db.clone(), &project_id);
+    let transport = match write_wave_transport(&wave_change, &planned, base_findings.as_ref()) {
         Ok(transport) => transport,
         Err(error) => return Some(Err(error)),
     };
@@ -5463,6 +5475,7 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
     let basis = ChangeBasis::Against {
         changed: &changed,
         base_entries: base_entries.as_deref(),
+        base_findings: base_findings.as_ref(),
     };
     // The narrowing baseline is this JOB's last green run of each check, not the
     // project's most recent row of any status. Both qualifiers carry weight: a
@@ -5534,9 +5547,33 @@ struct WaveChange<'a> {
     changed: &'a [GraphFileChange],
 }
 
+/// The base finding set the write-cadence checks of `change.head` ship and key
+/// by, when one of them subtracts its base.
+fn wave_base_findings(
+    change: &WaveChange<'_>,
+    planned: &[&str],
+    db: Arc<LocalDb>,
+    project_id: &str,
+) -> Option<crate::execution::lint_baseline::LintBaselineTransport> {
+    crate::execution::lint_baseline::lint_baseline_for(
+        &crate::execution::lint_baseline::LintBaselineSource {
+            jj: change.jj,
+            object_repository: change.object_repository,
+            repository: change.repository,
+            base: change.base,
+            head: change.head,
+            base_label: None,
+        },
+        db,
+        project_id,
+        planned.iter().copied(),
+    )
+}
+
 /// The transport the write-cadence checks of `change.head` receive: its
 /// changed files, the executor-protocol base bundle when a planned check is
-/// shipped one, and the lint baseline when one subtracts its base.
+/// shipped one, and the lint baseline ([`wave_base_findings`]) when one
+/// subtracts its base.
 ///
 /// It describes the commit the checks run at and no other. A wave whose fix
 /// lands on a head that moved while it ran verifies at that newer head, so it
@@ -5546,8 +5583,7 @@ struct WaveChange<'a> {
 fn write_wave_transport(
     change: &WaveChange<'_>,
     planned: &[&str],
-    db: Arc<LocalDb>,
-    project_id: &str,
+    base_findings: Option<&crate::execution::lint_baseline::LintBaselineTransport>,
 ) -> Result<Vec<(String, String)>, String> {
     let base_content = if planned.iter().any(|name| needs_executor_base_content(name)) {
         Some(executor_base_content_bundle(
@@ -5560,19 +5596,7 @@ fn write_wave_transport(
         None
     };
     let mut transport = check_transport_env(change.changed, base_content);
-    transport.extend(crate::execution::lint_baseline::lint_baseline_env(
-        &crate::execution::lint_baseline::LintBaselineSource {
-            jj: change.jj,
-            object_repository: change.object_repository,
-            repository: change.repository,
-            base: change.base,
-            head: change.head,
-            base_label: None,
-        },
-        db,
-        project_id,
-        planned.iter().copied(),
-    ));
+    transport.extend(base_findings.map(crate::execution::lint_baseline::lint_baseline_env));
     Ok(transport)
 }
 
@@ -9362,25 +9386,23 @@ fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String> {
     // and every key and lane from here on is about it.
     let changed = logical_changed_files(&jj, &repository, &base, &head)
         .map_err(|error| format!("the changed files of {base}..{head} are unreadable: {error}"))?;
+    let planned: Vec<&str> = plans.iter().map(|plan| plan.name.as_str()).collect();
+    let wave_change = WaveChange {
+        jj: &jj,
+        repository: &repository,
+        object_repository: &object_repository,
+        base: &base,
+        head: &head,
+        changed: &changed,
+    };
+    let base_findings = wave_base_findings(&wave_change, &planned, db, &project_id);
+    let transport = write_wave_transport(&wave_change, &planned, base_findings.as_ref())?;
     let base_entries = key_base_entries(&checks, &jj, &repository, &base);
     let basis = ChangeBasis::Against {
         changed: &changed,
         base_entries: base_entries.as_deref(),
+        base_findings: base_findings.as_ref(),
     };
-    let planned: Vec<&str> = plans.iter().map(|plan| plan.name.as_str()).collect();
-    let transport = write_wave_transport(
-        &WaveChange {
-            jj: &jj,
-            repository: &repository,
-            object_repository: &object_repository,
-            base: &base,
-            head: &head,
-            changed: &changed,
-        },
-        &planned,
-        db,
-        &project_id,
-    )?;
     let mut rekeyed = Vec::with_capacity(plans.len());
     let mut invalidated = Vec::new();
     for (index, plan) in plans.into_iter().enumerate() {
@@ -9404,7 +9426,8 @@ fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String> {
             superseded.contains(&index),
             &keys_before[index],
             &key_after,
-            is_base_relative(&plan.name, check),
+            is_base_relative(&plan.name, check)
+                || crate::execution::lint_baseline::subtracts_base_findings(&plan.name),
         ) {
             rekeyed.push((plan, key_after));
             continue;
@@ -10614,6 +10637,10 @@ pub(crate) enum ChangeBasis<'a> {
         /// content to, whose key names the base blobs that content came from;
         /// `None` leaves such a check's key unformable.
         base_entries: Option<&'a [(String, String)]>,
+        /// The base finding set this evaluation ships a base-subtracting check
+        /// ([`crate::execution::lint_baseline::lint_baseline_for`]), which its
+        /// key folds; `None` exactly when none ships (the base is the head).
+        base_findings: Option<&'a crate::execution::lint_baseline::LintBaselineTransport>,
     },
     /// No base was resolved, so there is no change to name.
     Unknown,
@@ -10669,6 +10696,7 @@ fn change_identity(
     let ChangeBasis::Against {
         changed,
         base_entries,
+        ..
     } = change.basis
     else {
         return Some(unformable());
@@ -10703,6 +10731,29 @@ fn change_identity(
     ))
 }
 
+/// The base-findings component of a base-subtracting check's result key, or
+/// `None` for any other check and for a run that ships no base set.
+///
+/// The check is not base-relative: the change does not enter its key, and the
+/// base enters only as the finding set its command subtracts. So the key names
+/// that set and nothing else about the base, and a run with no base to
+/// subtract keys exactly as the base's own whole-tree run does.
+fn base_findings_identity(change: CheckChange<'_>) -> Option<String> {
+    if !crate::execution::lint_baseline::subtracts_base_findings(change.name) {
+        return None;
+    }
+    let ChangeBasis::Against {
+        base_findings: Some(transport),
+        ..
+    } = change.basis
+    else {
+        return None;
+    };
+    Some(crate::execution::check_identity::base_findings_fingerprint(
+        transport.fingerprints.as_deref(),
+    ))
+}
+
 /// The base tree's listing, when some configured check's key names base blobs
 /// ([`change_identity`]). `None` otherwise, and when the base cannot be listed,
 /// which leaves that check's key unformable rather than wrong.
@@ -10730,6 +10781,7 @@ fn check_command_identity(
     change: CheckChange<'_>,
 ) -> String {
     let (os, arch) = platform.split_once('-').unwrap_or((platform, "unknown"));
+    let base_findings = base_findings_identity(change);
     let change = change_identity(check, selector, change);
     let content = crate::execution::check_identity::content_identity(
         check,
@@ -10737,6 +10789,7 @@ fn check_command_identity(
         entries,
         tree_hash,
         change.as_deref(),
+        base_findings.as_deref(),
     );
     let environment = crate::execution::check_identity::environment_identity(
         crate::execution::check_identity::CheckEnvironmentInput {
@@ -13255,6 +13308,40 @@ async fn run_prospective_tree_checks(
     let platform = check_platform_identity();
     let toolchain = check_toolchain_identity();
     let base_entries = key_base_entries(&checks, &gate_jj, &gate_repository, base_commit_id);
+    // Read before keying: a base-subtracting lane's key names the set it ships.
+    let base_findings = if plans
+        .iter()
+        .any(|plan| crate::execution::lint_baseline::subtracts_base_findings(&plan.name))
+    {
+        let planned: Vec<String> = plans.iter().map(|plan| plan.name.clone()).collect();
+        let (jj, repository, base, head, db, project) = (
+            gate_jj.clone(),
+            gate_repository.clone(),
+            base_commit_id.to_string(),
+            commit_id.to_string(),
+            result_db.clone(),
+            project_id.to_string(),
+        );
+        tokio::task::spawn_blocking(move || {
+            crate::execution::lint_baseline::lint_baseline_for(
+                &crate::execution::lint_baseline::LintBaselineSource {
+                    jj: &jj,
+                    object_repository: &repository,
+                    repository: &repository,
+                    base: &base,
+                    head: &head,
+                    base_label: None,
+                },
+                db,
+                &project,
+                planned.iter().map(String::as_str),
+            )
+        })
+        .await
+        .map_err(|error| format!("lint baseline task failed: {error}"))?
+    } else {
+        None
+    };
     let keyed = key_review_tree_plans(
         plans,
         &checks,
@@ -13266,6 +13353,7 @@ async fn run_prospective_tree_checks(
         ChangeBasis::Against {
             changed,
             base_entries: base_entries.as_deref(),
+            base_findings: base_findings.as_ref(),
         },
     );
 
@@ -13293,38 +13381,11 @@ async fn run_prospective_tree_checks(
     // Carry attribution and comparison content in the request itself. Coordinator-local
     // temporary paths are unreadable when this pure-verdict check spills to a remote cell.
     let mut env = check_transport_env(attributed_changed, base_content);
-    let planned: Vec<String> = keyed.iter().map(|(plan, _)| plan.name.clone()).collect();
-    if planned
-        .iter()
-        .any(|name| crate::execution::lint_baseline::subtracts_base_findings(name))
-    {
-        let (jj, repository, base, head, db, project) = (
-            gate_jj.clone(),
-            gate_repository.clone(),
-            base_commit_id.to_string(),
-            commit_id.to_string(),
-            result_db.clone(),
-            project_id.to_string(),
-        );
-        let baseline = tokio::task::spawn_blocking(move || {
-            crate::execution::lint_baseline::lint_baseline_env(
-                &crate::execution::lint_baseline::LintBaselineSource {
-                    jj: &jj,
-                    object_repository: &repository,
-                    repository: &repository,
-                    base: &base,
-                    head: &head,
-                    base_label: None,
-                },
-                db,
-                &project,
-                planned.iter().map(String::as_str),
-            )
-        })
-        .await
-        .map_err(|error| format!("lint baseline task failed: {error}"))?;
-        env.extend(baseline);
-    }
+    env.extend(
+        base_findings
+            .as_ref()
+            .map(crate::execution::lint_baseline::lint_baseline_env),
+    );
     let timeouts: Vec<u32> = keyed
         .iter()
         .map(|(plan, _)| {
@@ -27521,6 +27582,152 @@ mod manual_transport_tests {
         );
     }
 
+    /// The key a branch lint run is reused and recorded under, and the baseline
+    /// its transport carries, from one resolved change.
+    async fn lint_lane(
+        bin: &str,
+        home: &Path,
+        repo: &Path,
+        head: &str,
+        target: &str,
+        db: Arc<LocalDb>,
+    ) -> (String, serde_json::Value) {
+        let change = resolve_base_relative_change(
+            bin,
+            home,
+            repo,
+            head,
+            target,
+            target,
+            "lint",
+            Some((db, "project-a".to_string())),
+        )
+        .await
+        .unwrap();
+        let lint: CheckCommand =
+            serde_yaml::from_str("command: bun run check:lint\nwhen: review\nimpact:\n- src/**\n")
+                .unwrap();
+        let key = check_input_hash(
+            &lint,
+            &InputSelector::from_globs(&["src/**".to_string()]),
+            None,
+            "head-tree",
+            CheckChange {
+                name: "lint",
+                basis: change.basis(),
+            },
+        );
+        let env = tokio::task::spawn_blocking(move || base_relative_transport_for(&change, "lint"))
+            .await
+            .unwrap()
+            .unwrap();
+        let baseline = serde_json::from_str(
+            value(
+                &env,
+                crate::execution::lint_baseline::LINT_BASELINE_CONTENT_ENV,
+            )
+            .expect("a branch lint lane carries its base"),
+        )
+        .unwrap();
+        (key, baseline)
+    }
+
+    fn record_lint_tree_findings(baseline: &serde_json::Value, findings: &[&str]) -> String {
+        let document = serde_json::json!({
+            "schemaVersion": 1, "parser": "eslint", "complete": true, "selection": "unknown",
+            "passed": 0, "failed": findings.len(), "skipped": 0, "failures": [],
+            "lintFindings": { "tree": findings }
+        });
+        format!(
+            "INSERT INTO check_result_cache(project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                 output_tail, duration_ms, ran_at, target_results_json)
+             VALUES ('project-a', '{tree}', '{input}', 'lint', 1, 0, '', 1, 1, '{document}');",
+            tree = baseline["tree"].as_str().unwrap(),
+            input = baseline["inputHash"].as_str().unwrap(),
+        )
+    }
+
+    /// cairn/6374: one head tree, measured against two bases, is two lint
+    /// questions once their recorded finding sets differ, and a base's set
+    /// arriving after a run recorded its absence is a new question too. The
+    /// key moves with exactly what the transport carries, so a lint row
+    /// recorded against one base's set is never reused for another.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_lint_lanes_key_moves_with_the_base_findings_it_carries() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping: jj not resolvable");
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path();
+        init_project(repo);
+        commit(
+            repo,
+            &[
+                (".cairn/config.yaml", LINT_CONFIG),
+                ("src/Nav.tsx", "Date.now();\n"),
+            ],
+            "main with a lint error",
+        );
+        git(repo, &["checkout", "-q", "-b", "agent/parent"]);
+        commit(repo, &[("src/Nav.tsx", "fixed\n")], "parent fixes it");
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        let head = commit(repo, &[("src/Queue.tsx", "Date.now();\n")], "child");
+
+        let db = Arc::new(crate::storage::migrated_test_db("lint-baseline-key.db").await);
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-a', 'default', 'Project A', 'PA', '/tmp/project-a', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let home = home.path();
+
+        // Neither base has recorded its set: both lanes report no verdict.
+        let (main_unrecorded, main_baseline) =
+            lint_lane(&bin, home, repo, &head, "main", db.clone()).await;
+        let (parent_unrecorded, parent_baseline) =
+            lint_lane(&bin, home, repo, &head, "agent/parent", db.clone()).await;
+        assert_eq!(main_baseline["fingerprints"], serde_json::Value::Null);
+        assert_ne!(main_baseline["tree"], parent_baseline["tree"]);
+
+        let finding = "eslint|react-hooks/purity|src/Queue.tsx|Error: Cannot call impure function during render";
+        db.execute_script(&record_lint_tree_findings(&main_baseline, &[finding]))
+            .await
+            .unwrap();
+        db.execute_script(&record_lint_tree_findings(&parent_baseline, &[]))
+            .await
+            .unwrap();
+
+        let (main_recorded, main_baseline) =
+            lint_lane(&bin, home, repo, &head, "main", db.clone()).await;
+        let (parent_recorded, parent_baseline) =
+            lint_lane(&bin, home, repo, &head, "agent/parent", db.clone()).await;
+        assert_eq!(main_baseline["fingerprints"], serde_json::json!([finding]));
+        assert_eq!(parent_baseline["fingerprints"], serde_json::json!([]));
+        assert_ne!(
+            main_recorded, parent_recorded,
+            "the finding is the base's own against main and the branch's against its parent"
+        );
+        assert_ne!(
+            main_unrecorded, main_recorded,
+            "a set that arrives later is a new question"
+        );
+        assert_ne!(
+            parent_unrecorded, parent_recorded,
+            "a clean base is not an unrecorded one"
+        );
+        assert_eq!(
+            lint_lane(&bin, home, repo, &head, "main", db.clone())
+                .await
+                .0,
+            main_recorded,
+            "the same base and set reuse"
+        );
+    }
+
     /// An integration target that does not resolve refuses the run; it never
     /// degrades to another base.
     #[tokio::test]
@@ -28037,6 +28244,7 @@ mod base_relative_key_tests {
         ChangeBasis::Against {
             changed,
             base_entries: None,
+            base_findings: None,
         }
     }
 
@@ -28145,6 +28353,7 @@ mod base_relative_key_tests {
                 ChangeBasis::Against {
                     changed: &changed,
                     base_entries: entries,
+                    base_findings: None,
                 },
             )
         };
@@ -28152,6 +28361,111 @@ mod base_relative_key_tests {
         assert_eq!(key_against(Some(&v40)), key_against(Some(&v40)));
         assert_ne!(key_against(Some(&v40)), key_against(Some(&v41)));
         assert_ne!(key_against(None), key_against(None));
+    }
+
+    /// cairn/6374: lint is not base-relative, but its command subtracts the
+    /// base finding set it is shipped, so its verdict at one tree differs by
+    /// base. Its key names that set: two bases with different recorded sets,
+    /// and a base whose set is unrecorded against one that recorded none, are
+    /// different questions. A run shipped no set keys as the base's own
+    /// whole-tree row does, which is the row the baseline lookup names.
+    #[test]
+    fn a_base_subtracting_key_names_the_finding_set_it_is_shipped() {
+        use crate::execution::lint_baseline::LintBaselineTransport;
+        let lint = check("command: bun run check:lint\nimpact: [src/**]\n");
+        let changed = [change("src/Queue.tsx")];
+        let shipped = |fingerprints: Option<&[&str]>| LintBaselineTransport {
+            base: "main".to_string(),
+            commit: "base-a".to_string(),
+            tree: "tree-a".to_string(),
+            input_hash: "input-a".to_string(),
+            fingerprints: fingerprints.map(|set| {
+                set.iter()
+                    .map(|fingerprint| fingerprint.to_string())
+                    .collect()
+            }),
+            missing: fingerprints
+                .is_none()
+                .then(|| "no recorded lint result".to_string()),
+        };
+        let key_shipping = |changed: &[GraphFileChange], set: Option<&LintBaselineTransport>| {
+            key(
+                "lint",
+                &lint,
+                ChangeBasis::Against {
+                    changed,
+                    base_entries: None,
+                    base_findings: set,
+                },
+            )
+        };
+        let base_a = shipped(Some(&["F"]));
+        let base_b = shipped(Some(&["G"]));
+        let clean = shipped(Some(&[]));
+        let unrecorded = shipped(None);
+
+        assert!(!is_base_relative("lint", &lint));
+        assert_ne!(
+            key_shipping(&changed, Some(&base_a)),
+            key_shipping(&changed, Some(&base_b)),
+            "F is the base's own error against A and the branch's against B"
+        );
+        assert_ne!(
+            key_shipping(&changed, Some(&unrecorded)),
+            key_shipping(&changed, Some(&clean)),
+            "an unrecorded base is no verdict; a clean one judges every finding"
+        );
+        for set in [&base_a, &clean, &unrecorded] {
+            assert_ne!(
+                key_shipping(&changed, Some(set)),
+                key_shipping(&changed, None),
+                "a shipped set is never the whole-tree question"
+            );
+        }
+        assert_eq!(
+            key_shipping(&changed, None),
+            key("lint", &lint, ChangeBasis::Unknown),
+            "shipping no set keys as the base's own row, which the lookup names"
+        );
+
+        // The set decides the verdict; where it was read from only labels the
+        // report, and lint does not read the change.
+        let relabeled = LintBaselineTransport {
+            base: "agent/parent".to_string(),
+            commit: "base-c".to_string(),
+            tree: "tree-c".to_string(),
+            input_hash: "input-c".to_string(),
+            ..shipped(Some(&["F"]))
+        };
+        assert_eq!(
+            key_shipping(&changed, Some(&base_a)),
+            key_shipping(&[change("src/Other.tsx")], Some(&relabeled)),
+        );
+        assert_eq!(
+            key_shipping(&changed, Some(&shipped(Some(&["F", "G"])))),
+            key_shipping(&changed, Some(&shipped(Some(&["G", "F"])))),
+            "a set, in any order"
+        );
+        assert_ne!(
+            key_shipping(&changed, Some(&shipped(Some(&["F"])))),
+            key_shipping(&changed, Some(&shipped(Some(&["F", "F"])))),
+            "identical findings in one file are counted, so the multiset is the set"
+        );
+
+        // A check that subtracts nothing never reads the set.
+        let fmt = check("command: cargo fmt --check\nimpact: [src/**]\n");
+        assert_eq!(
+            key(
+                "fmt",
+                &fmt,
+                ChangeBasis::Against {
+                    changed: &changed,
+                    base_entries: None,
+                    base_findings: Some(&base_a),
+                },
+            ),
+            key("fmt", &fmt, against(&changed)),
+        );
     }
 
     /// Every project check that reads the changed-file set as a statement about

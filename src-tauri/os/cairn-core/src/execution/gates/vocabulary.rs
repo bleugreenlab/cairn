@@ -1506,9 +1506,14 @@ async fn check_verdict_coordinate(
     // so the coordinate names the change the branch's own cadences measure: its
     // fork point with its integration target. One that cannot be resolved names
     // none, and no verdict answers it.
+    // A base-subtracting verdict is likewise keyed by the base finding set its
+    // lane was shipped, read from that same fork point; without one it has no
+    // key a branch lane records under.
+    let subtracts = crate::execution::lint_baseline::subtracts_base_findings(check_name);
     let mut changed = None;
     let mut base_entries = None;
-    if is_base_relative(check_name, check) {
+    let mut base_findings = None;
+    if is_base_relative(check_name, check) || subtracts {
         if let Ok(fork) =
             cairn_vcs::merge_base(&coordinate_repository, &commit, &integration_target).await
         {
@@ -1521,12 +1526,46 @@ async fn check_verdict_coordinate(
                 &coordinate_repository,
                 &fork.base,
             );
+            if subtracts {
+                let (jj, object_repository, repository, base, head, label, name, project) = (
+                    jj.clone(),
+                    repository.clone(),
+                    coordinate_repository.clone(),
+                    fork.base.clone(),
+                    commit.clone(),
+                    integration_target.clone(),
+                    check_name.to_string(),
+                    project_id.clone(),
+                );
+                let db = ctx.db_for_issue(issue_uri).await;
+                base_findings = tokio::task::spawn_blocking(move || {
+                    crate::execution::lint_baseline::lint_baseline_for(
+                        &crate::execution::lint_baseline::LintBaselineSource {
+                            jj: &jj,
+                            object_repository: &object_repository,
+                            repository: &repository,
+                            base: &base,
+                            head: &head,
+                            base_label: Some(&label),
+                        },
+                        db,
+                        &project,
+                        [name.as_str()],
+                    )
+                })
+                .await
+                .ok()?;
+            }
+        }
+        if subtracts && changed.is_none() {
+            return None;
         }
     }
     let basis = match changed.as_deref() {
         Some(changed) => ChangeBasis::Against {
             changed,
             base_entries: base_entries.as_deref(),
+            base_findings: base_findings.as_ref(),
         },
         None => ChangeBasis::Unknown,
     };
