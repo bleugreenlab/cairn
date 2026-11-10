@@ -98,6 +98,12 @@ async fn seed_branch_jobs(
         .unwrap();
 }
 
+/// The preparation compute budget every fixture landing and direct preparation
+/// carries. These tests drive real jj, which a loaded shared host can slow
+/// several times over; production's own bound is pinned by
+/// `a_landing_without_an_override_prepares_under_the_production_budget`.
+const FIXTURE_PREPARATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A project with a bare origin, an integration branch published there, and a
 /// child cut from `main` that edits `shared.rs`, wired so landings run end to
 /// end: an Orchestrator whose `config_dir` keys the store, the jobs and the
@@ -145,6 +151,7 @@ async fn setup_clean_merge(bin: &str) -> MergeFixture {
         );
         Orchestrator::builder(db_state, services, config_dir.clone())
             .jj_binary_path(bin.to_string())
+            .landing_preparation_budget(FIXTURE_PREPARATION_BUDGET)
             .build()
     };
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
@@ -233,6 +240,60 @@ async fn reserve_landing(fx: &MergeFixture) -> crate::orchestrator::BranchReserv
 }
 
 // ── Landing preparation: the exact source and target a landing binds ────────────────
+
+/// A landing whose orchestrator sets no budget of its own prepares under the
+/// automatic preparation bound, so widening the fixture's budget can never
+/// widen production's silently.
+#[tokio::test]
+async fn a_landing_without_an_override_prepares_under_the_production_budget() {
+    use crate::orchestrator::base_advance::preparation::DEFAULT_COMPUTE_BUDGET;
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let orch = {
+        use crate::db::DbState;
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(migrated_db().await), search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        Orchestrator::builder(db_state, services, config_dir).build()
+    };
+    let ctx = MergeMrContext {
+        mr: MrContext {
+            mr_id: "mr".to_string(),
+            pr_url: String::new(),
+            github_pr_number: None,
+            repo_path: String::new(),
+            job_id: "job-src".to_string(),
+            is_local: false,
+            project_id: "proj-1".to_string(),
+            issue_id: None,
+        },
+        issue_id: None,
+        default_branch: "main".to_string(),
+        project_id: "proj-1".to_string(),
+        target_branch: "agent/PROJ-1-coordinator-0".to_string(),
+        source_branch: "agent/PROJ-2-builder-0".to_string(),
+        title: "child PR".to_string(),
+        is_workspace: false,
+        has_triage_batch: false,
+    };
+
+    let request = landing_preparation_request(&orch, "job-src", &ctx);
+    assert_eq!(request.compute_budget, DEFAULT_COMPUTE_BUDGET);
+    assert_eq!(
+        request.compute_budget,
+        crate::jj::BACKGROUND_RECONCILE_BUDGET
+    );
+    assert_eq!(request.purpose, PreparationPurpose::OwnerMerge);
+    assert_eq!(
+        request.target_override.as_deref(),
+        Some(ctx.target_branch.as_str())
+    );
+    assert_ne!(
+        FIXTURE_PREPARATION_BUDGET, DEFAULT_COMPUTE_BUDGET,
+        "the fixture's budget is an override, not the production bound"
+    );
+}
 
 /// Seal `content` into `file` in the fixture workspace `name`, returning the
 /// new tip of `bookmark`.
@@ -2062,12 +2123,13 @@ async fn two_local_advances_over_a_dormant_child(fx: &MergeFixture) -> (String, 
         .unwrap();
     for (file, content) in [("hub.rs", "hub\n"), ("incoming.rs", "incoming\n")] {
         advance_main(fx, file, content);
-        let request = crate::orchestrator::base_advance::preparation::PreparationRequest::new(
+        let mut request = crate::orchestrator::base_advance::preparation::PreparationRequest::new(
             "proj-1".to_string(),
             fx.int.to_string(),
             Some("job-int".to_string()),
             crate::orchestrator::base_advance::preparation::PreparationPurpose::Check,
         );
+        request.compute_budget = FIXTURE_PREPARATION_BUDGET;
         let prepared =
             crate::orchestrator::base_advance::preparation::prepare_branch(&fx.orch, request)
                 .await
@@ -2638,6 +2700,7 @@ async fn a_conflicting_merge_wakes_its_owner_once_even_after_a_check_recorded_th
         Some("job-src".to_string()),
     );
     check.target_override = Some("main".to_string());
+    check.compute_budget = FIXTURE_PREPARATION_BUDGET;
     let checked =
         crate::orchestrator::base_advance::preparation::prepare_branch(&fx.orch, check).await;
     assert!(
@@ -2846,16 +2909,15 @@ async fn a_default_landing_beside_many_dormant_branches_moves_and_tells_none_of_
 
     // Only a branch that is demanded advances, and only it.
     let (demanded_job, demanded, demanded_tip) = dormant[0].clone();
-    let prepared = crate::orchestrator::base_advance::preparation::prepare_branch(
-        &fx.orch,
-        crate::orchestrator::base_advance::preparation::PreparationRequest::for_check(
-            "proj-1",
-            demanded.clone(),
-            Some(demanded_job),
-        ),
-    )
-    .await
-    .expect("a demanded dormant branch prepares onto the landed base");
+    let mut demand = crate::orchestrator::base_advance::preparation::PreparationRequest::for_check(
+        "proj-1",
+        demanded.clone(),
+        Some(demanded_job),
+    );
+    demand.compute_budget = FIXTURE_PREPARATION_BUDGET;
+    let prepared = crate::orchestrator::base_advance::preparation::prepare_branch(&fx.orch, demand)
+        .await
+        .expect("a demanded dormant branch prepares onto the landed base");
     assert!(prepared.advanced);
     assert_eq!(prepared.base_commit, landing);
     assert_ne!(

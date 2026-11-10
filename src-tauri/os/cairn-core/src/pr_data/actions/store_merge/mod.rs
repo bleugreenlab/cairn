@@ -60,6 +60,20 @@ pub(super) async fn prepare_landing_source(
     merge_context: &MergeMrContext,
     reservation: &std::sync::Arc<crate::orchestrator::BranchReservation>,
 ) -> Result<PreparedBranch, String> {
+    let mut request = landing_preparation_request(orch, job_id, merge_context);
+    request.reservation = Some(reservation.clone());
+    prepare_branch(orch, request)
+        .await
+        .map_err(|refusal| landing_preparation_refusal(merge_context, &refusal))
+}
+
+/// The owner's-merge preparation of a landing's source onto the target it
+/// lands on, under the orchestrator's landing preparation budget.
+fn landing_preparation_request(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_context: &MergeMrContext,
+) -> PreparationRequest {
     let mut request = PreparationRequest::new(
         merge_context.project_id.clone(),
         merge_context.source_branch.clone(),
@@ -67,10 +81,8 @@ pub(super) async fn prepare_landing_source(
         PreparationPurpose::OwnerMerge,
     );
     request.target_override = Some(merge_context.target_branch.clone());
-    request.reservation = Some(reservation.clone());
-    prepare_branch(orch, request)
-        .await
-        .map_err(|refusal| landing_preparation_refusal(merge_context, &refusal))
+    request.compute_budget = orch.landing_preparation_budget;
+    request
 }
 
 fn landing_preparation_refusal(

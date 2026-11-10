@@ -171,6 +171,7 @@ pub struct OrchestratorBuilder {
     team_attention_sender: Arc<dyn team_attention_push::TeamAttentionSender>,
     recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     artifact_revision_quiet: std::time::Duration,
+    landing_preparation_budget: std::time::Duration,
     boot_at: i64,
     startup_readiness: startup_readiness::StartupReadiness,
     library: crate::library::LibraryContext,
@@ -496,6 +497,8 @@ impl OrchestratorBuilder {
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
             recent_turn_end_check_requests,
             artifact_revision_quiet: crate::execution::artifact_revisions::DEFAULT_QUIET_PERIOD,
+            landing_preparation_budget:
+                crate::orchestrator::base_advance::preparation::DEFAULT_COMPUTE_BUDGET,
             boot_at: chrono::Utc::now().timestamp(),
             startup_readiness: startup_readiness::StartupReadiness::ready(),
             library: crate::library::LibraryContext::configured(),
@@ -517,6 +520,15 @@ impl OrchestratorBuilder {
     /// so the real write path delivers within the test.
     pub fn artifact_revision_quiet(mut self, quiet: std::time::Duration) -> Self {
         self.artifact_revision_quiet = quiet;
+        self
+    }
+
+    /// Override the compute budget a landing's preparation of its source gets.
+    /// Without it a landing keeps the automatic preparation bound; fixtures that
+    /// drive real jj on a shared host widen it so host load slows them rather
+    /// than failing them.
+    pub fn landing_preparation_budget(mut self, budget: std::time::Duration) -> Self {
+        self.landing_preparation_budget = budget;
         self
     }
 
@@ -876,6 +888,7 @@ impl OrchestratorBuilder {
             mcp_binary_path: self.mcp_binary_path,
             jj_binary_path: self.jj_binary_path,
             config_dir: self.config_dir,
+            landing_preparation_budget: self.landing_preparation_budget,
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
             boot_at: self.boot_at,
@@ -1699,6 +1712,10 @@ pub struct Orchestrator {
     pub jj_binary_path: String,
     /// Directory for writing MCP config files
     pub config_dir: PathBuf,
+    /// The compute budget every landing's preparation request carries
+    /// (`store_merge::prepare_landing_source`); the automatic preparation
+    /// bound unless the builder overrode it.
+    pub(crate) landing_preparation_budget: std::time::Duration,
     /// Job ids with an in-flight turn-end (`when:idle`/`when:review`) check run,
     /// each mapped to its cancellation handle. Single-flight guard so a rapid
     /// re-idle does not stack suites; the signal the PR-node / `/checks` render
