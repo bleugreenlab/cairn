@@ -1221,13 +1221,6 @@ async fn compute_node_check_statuses(
         .ok()
         .flatten();
     clock.lap("retirement");
-    let capture_plan = retired
-        .as_ref()
-        .and_then(|retired| retired.plan.clone())
-        .or_else(|| {
-            orch.turn_end_check_runtime_status(job_id)
-                .map(|status| status.plan)
-        });
     let (branch, statuses) = if let Some(retired) = retired {
         (
             "retired",
@@ -1250,26 +1243,6 @@ async fn compute_node_check_statuses(
     append_durability_notices(&mut statuses, durability);
     append_durability_notices(&mut statuses, Ok(orch.review_durability_errors(job_id)));
     clock.lap("durability");
-    let capture_plan = match capture_plan {
-        Some(plan) => Ok(Some(plan)),
-        None => latest_recorded_wave_plan(&db, job_id).await,
-    };
-    match capture_plan {
-        Ok(Some(plan)) => append_wave_capture_notices(&mut statuses, &plan),
-        Ok(None) => {}
-        Err(error) => {
-            for status in statuses
-                .iter_mut()
-                .filter(|status| status.when == CheckWhen::Review.as_str())
-            {
-                append_notice(
-                    status,
-                    &format!("Recorded review-wave capture unreadable: {error}"),
-                );
-            }
-        }
-    }
-    clock.lap("capture");
     clock.report(job_id, branch);
     Some(statuses)
 }
@@ -1312,72 +1285,13 @@ fn append_notice(status: &mut NodeCheckStatus, message: &str) {
     notice.push_str(message);
 }
 
-/// The recorded evaluation coordinate, never an assertion about the current
-/// lane. The logical result hash and the captured Git tree have different
-/// meanings and must never be substituted for one another.
-pub(crate) fn format_wave_capture(plan: &WavePlan) -> String {
-    fn coordinate(value: Option<&str>) -> String {
-        value
-            .filter(|value| !value.is_empty())
-            .map(|value| format!("`{value}`"))
-            .unwrap_or_else(|| "unknown".into())
-    }
-    let mut out = format!(
-        "Recorded review-wave capture (historical metadata, not current-verdict authority): judged head {}, logical tree {}, fork {}.",
-        coordinate(Some(&plan.head)), coordinate(Some(&plan.tree_hash)), coordinate(Some(&plan.base)),
-    );
-    let Some(capture) = &plan.capture else {
-        out.push_str(" Preparation capture unknown: head before, Git tree, exact target base and accepted-install warnings were not recorded.");
-        return out;
+/// Whether a wave for `job_id` ever recorded a plan. An unreadable record
+/// counts as one: it is still a wave the node had.
+pub(crate) async fn has_recorded_wave(orch: &Orchestrator, job_id: &str) -> bool {
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
+        return false;
     };
-    out.push_str(&format!(
-        " Authority {}; revision {}; head before {}; head after {}; Git tree {}; exact target {} at {}; advanced {}; attempts {}.",
-        coordinate(Some(&capture.authority)), coordinate(Some(&capture.revision)),
-        coordinate(capture.head_before.as_deref()), coordinate(Some(&capture.head_after)),
-        coordinate(capture.git_tree.as_deref()), coordinate(capture.base_branch.as_deref()),
-        coordinate(capture.base_commit.as_deref()), capture.advanced,
-        capture.attempts.map(|attempts| attempts.to_string()).unwrap_or_else(|| "unknown".into()),
-    ));
-    if capture.head_after != plan.head {
-        out.push_str(
-            " Capture head differs from the wave's judged head; provenance is inconsistent.",
-        );
-    }
-    if !capture.provenance.is_empty() {
-        out.push(' ');
-        out.push_str(&capture.provenance);
-    }
-    for warning in &capture.warnings {
-        out.push_str(" Accepted-install warning: ");
-        out.push_str(warning);
-    }
-    out
-}
-
-fn append_wave_capture_notices(statuses: &mut [NodeCheckStatus], plan: &WavePlan) {
-    let message = format_wave_capture(plan);
-    for status in statuses
-        .iter_mut()
-        .filter(|status| status.when == CheckWhen::Review.as_str())
-    {
-        append_notice(status, &message);
-    }
-}
-
-/// Context for resource headers, including a retired or rowless wave. A
-/// completed wave's context remains explicitly historical when the head moves.
-pub(crate) async fn recorded_wave_capture(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    if let Some(status) = orch.turn_end_check_runtime_status(job_id) {
-        return Some(format_wave_capture(&status.plan));
-    }
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
-        .await
-        .ok()?;
-    match latest_recorded_wave_plan(&db, job_id).await {
-        Ok(Some(plan)) => Some(format_wave_capture(&plan)),
-        Ok(None) => None,
-        Err(error) => Some(format!("Recorded review-wave capture unreadable: {error}")),
-    }
+    !matches!(latest_recorded_wave_plan(&db, job_id).await, Ok(None))
 }
 
 /// The projection while a wave is in flight.
@@ -6349,8 +6263,6 @@ mod moved_wave_projection_tests {
 mod capture_provenance_tests {
     use super::*;
     use crate::execution::checks::CheckCapture;
-    use crate::execution::checks_settlement::{classify, owes_a_review_wave, ChecksSnapshot};
-    use crate::messages::delivery::HeadTurn;
 
     fn plan() -> WavePlan {
         WavePlan {
@@ -6378,130 +6290,13 @@ mod capture_provenance_tests {
         }
     }
 
+    /// The capture survives its record exactly, so a forensic read of
+    /// `plan_json` sees what the wave captured.
     #[test]
-    fn recorded_capture_names_original_coordinates_and_accepted_install_warnings() {
+    fn recorded_capture_round_trips() {
         let plan = plan();
-        let before = serde_json::to_value(&plan).unwrap();
-        let text = format_wave_capture(&plan);
-        for fact in [
-            "judged head `judged-original-head`",
-            "logical tree `original-logical-hash`",
-            "fork `original-fork`",
-            "head before `before-preparation`",
-            "head after `judged-original-head`",
-            "Git tree `actual-git-tree-object`",
-            "exact target `integration-target` at `exact-target-commit`",
-            "advanced true",
-            "attempts 2",
-            "accepted capture provenance",
-            "Accepted-install warning: export recovery is pending",
-            "not current-verdict authority",
-        ] {
-            assert!(text.contains(fact), "missing {fact}: {text}");
-        }
-        assert_eq!(serde_json::to_value(&plan).unwrap(), before);
-    }
-
-    #[test]
-    fn legacy_capture_never_invents_head_before_or_git_tree_from_logical_hash() {
-        let mut plan = plan();
-        plan.capture = None;
-        let text = format_wave_capture(&plan);
-        assert!(text.contains("judged head `judged-original-head`"));
-        assert!(text.contains("logical tree `original-logical-hash`"));
-        assert!(text.contains("fork `original-fork`"));
-        assert!(text.contains("Preparation capture unknown"));
-        assert!(!text.contains("head before `judged-original-head`"));
-        assert!(!text.contains("Git tree `original-logical-hash`"));
-    }
-
-    #[test]
-    fn capture_notices_preserve_current_wait_state_and_existing_notice_facts() {
-        let mut pending = test_status("review", "gate", "review", NodeCheckState::Pending);
-        pending.notice = Some("newer attempt retained; log persistence failed".into());
-        let mut statuses = vec![
-            pending,
-            test_status("write", "gate", "write", NodeCheckState::Passed),
-        ];
-        append_wave_capture_notices(&mut statuses, &plan());
-        append_wave_capture_notices(&mut statuses, &plan());
-        let notice = statuses[0].notice.as_deref().unwrap();
-        assert!(notice.starts_with("newer attempt retained; log persistence failed"));
-        assert_eq!(notice.matches("Recorded review-wave capture").count(), 1);
-        assert!(notice.contains("export recovery is pending"));
-        assert_eq!(statuses[0].state, NodeCheckState::Pending);
-        assert_eq!(statuses[0].verified_on, None);
-        assert_eq!(statuses[0].cached, None);
-        assert_eq!(
-            statuses[1].notice, None,
-            "review history must not claim write-lane provenance"
-        );
-        let json = serde_json::to_value(&statuses[0]).unwrap();
-        assert!(json["notice"]
-            .as_str()
-            .unwrap()
-            .contains("actual-git-tree-object"));
-        assert_eq!(json["state"], "pending");
-        let snapshot = |in_flight| ChecksSnapshot {
-            settlement: classify(&statuses, HeadTurn::Idle, in_flight),
-            statuses: statuses.clone(),
-            terminal_reason: None,
-            retired: None,
-        };
-        assert_eq!(snapshot(true).verdict(), "moving");
-        let stopped = snapshot(false);
-        assert_eq!(stopped.verdict(), "incomplete");
-        assert!(owes_a_review_wave(&stopped));
-    }
-
-    #[test]
-    fn recorded_capture_round_trips_and_mismatch_is_visible_without_relabelling() {
-        let mut plan = plan();
-        plan.capture.as_mut().unwrap().head_after = "inconsistent-recorded-head".into();
         let decoded: WavePlan =
             serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
-        let text = format_wave_capture(&decoded);
-        assert!(text.contains("judged head `judged-original-head`"));
-        assert!(text.contains("head after `inconsistent-recorded-head`"));
-        assert!(text.contains("provenance is inconsistent"));
         assert_eq!(decoded, plan);
-    }
-
-    #[test]
-    fn capture_warnings_survive_terminal_annotation_shortcuts() {
-        for kind in [
-            Some(CheckFailureKind::NotPlaceable),
-            Some(CheckFailureKind::ConfigUnreadable),
-            None,
-        ] {
-            let mut status = test_status("review", "gate", "review", NodeCheckState::Failed);
-            status.failure_kind = kind.map(|kind| kind.as_str().to_string());
-            if kind.is_none() {
-                status.suppressed_after = Some(3);
-            }
-            append_wave_capture_notices(std::slice::from_mut(&mut status), &plan());
-            let text = format_status_annotation(&status).unwrap();
-            assert!(text.contains("export recovery is pending"), "{text}");
-            assert!(text.contains("judged-original-head"), "{text}");
-            assert_eq!(status.state, NodeCheckState::Failed);
-        }
-    }
-
-    #[test]
-    fn missing_exact_capture_fields_remain_unknown() {
-        let mut plan = plan();
-        let capture = plan.capture.as_mut().unwrap();
-        capture.authority = "exact".into();
-        capture.head_before = None;
-        capture.git_tree = None;
-        capture.base_branch = None;
-        capture.base_commit = None;
-        capture.attempts = None;
-        let text = format_wave_capture(&plan);
-        assert!(text.contains("head before unknown"));
-        assert!(text.contains("Git tree unknown"));
-        assert!(text.contains("exact target unknown at unknown"));
-        assert!(text.contains("attempts unknown"));
-        assert!(!text.contains("Git tree `original-logical-hash`"));
     }
 }

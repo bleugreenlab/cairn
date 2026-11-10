@@ -28157,8 +28157,8 @@ mod base_relative_key_tests {
     /// Every project check that reads the changed-file set as a statement about
     /// the change is base-relative: check:migrations judges what the change
     /// added, and the scoped findings wrappers (check-rust.ts, check-dead.ts)
-    /// gate only on findings in changed files. executor-protocol is by the base
-    /// content it is shipped.
+    /// gate only on findings in changed files, and check-fmt.ts formats only the
+    /// changed Rust files. executor-protocol is by the base content it is shipped.
     #[test]
     fn the_projects_change_reading_checks_are_base_relative() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cairn/config.yaml");
@@ -28168,14 +28168,14 @@ mod base_relative_key_tests {
             serde_yaml::from_value(config["checks"][name].clone())
                 .unwrap_or_else(|error| panic!("{name}: {error}"))
         };
-        for name in ["migrations", "rust-lint", "dead-code"] {
+        for name in ["migrations", "rust-lint", "dead-code", "rust-fmt"] {
             assert!(declared(name).base_relative, "{name} declares baseRelative");
         }
         assert!(is_base_relative(
             EXECUTOR_PROTOCOL_CHECK,
             &declared(EXECUTOR_PROTOCOL_CHECK)
         ));
-        assert!(!is_base_relative("rust-fmt", &declared("rust-fmt")));
+        assert!(!is_base_relative("lockfile", &declared("lockfile")));
     }
 
     /// The narrowing baseline's delta is diffed by path, so a rename since the

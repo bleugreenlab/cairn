@@ -2710,25 +2710,17 @@ pub(crate) async fn render_turn_end_checks_section(
     }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await;
     let live = orch.turn_end_check_runtime_status(job_id).is_some();
-    let capture = if live {
-        None
-    } else {
-        crate::execution::checks_status::recorded_wave_capture(orch, job_id).await
-    };
-    let progress = review_progress_header(orch, job_id).await;
+    let header = review_progress_header(orch, job_id).await;
     let Some(statuses) = statuses else {
-        if !live && capture.is_none() && orch.review_deferrals.unreviewed_for(job_id).is_none() {
+        if !live
+            && !crate::execution::checks_status::has_recorded_wave(orch, job_id).await
+            && orch.review_deferrals.unreviewed_for(job_id).is_none()
+        {
             return None;
         }
-        let header = match &capture {
-            Some(capture) => format!("{capture}\n\n{progress}"),
-            None => progress,
-        };
-        return Some(format!("\n### Systematic checks\n\n{header}\n\nCurrent lanes could not be read; this recorded capture supplies no current verdict.\n"));
-    };
-    let header = match capture {
-        Some(capture) => format!("{capture}\n\n{progress}"),
-        None => progress,
+        return Some(format!(
+            "\n### Systematic checks\n\n{header}\n\nCurrent lanes could not be read.\n"
+        ));
     };
     format_checks_section_under(
         Some(&header),
@@ -2748,7 +2740,7 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
     use crate::execution::checks_status::human_duration;
     let head = &status.plan.head[..status.plan.head.len().min(12)];
     let attempt = &status.attempt_id;
-    let mut header = match status.submitted_at_unix_ms {
+    match status.submitted_at_unix_ms {
         Some(at) => {
             let machine = status
                 .board
@@ -2783,12 +2775,7 @@ fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64
             "Review wave for `{head}`: planned {} ago, not yet submitted (attempt `{attempt}`)",
             human_duration(now.saturating_sub(status.planned_at_unix_ms))
         ),
-    };
-    header.push_str("\n\n");
-    header.push_str(&crate::execution::checks_status::format_wave_capture(
-        &status.plan,
-    ));
-    header
+    }
 }
 
 /// Use the lane projection's own dispatch facts, without conflating one placement
@@ -2978,10 +2965,6 @@ fn format_retired_checks_section(
         "This node was {outcome}. Its branch is retired, so these are the lanes recorded for \
          its last head, `{head}`, and nothing will run them again.\n\n"
     ));
-    if let Some(plan) = &retired.plan {
-        out.push_str(&crate::execution::checks_status::format_wave_capture(plan));
-        out.push_str("\n\n");
-    }
     match statuses {
         Some([]) => out.push_str("That head configured no checks.\n"),
         Some(statuses) => push_check_lines(&mut out, statuses, None),
@@ -6744,7 +6727,7 @@ pinBumps:
             reason.contains("2 of 14 lane(s) cancelled with no verdict (rust-lint, rust-tests)"),
             "{reason}"
         );
-        assert!(attempt_interrupted_by_restart(&state, Some(&reason)));
+        assert!(attempt_interrupted_by_restart(state, Some(&reason)));
 
         let (state, reason) = TurnEndDisposition::LanesCancelled {
             reason: lanes_cancelled_reason(&lanes[..1], 14, false),
@@ -6756,7 +6739,7 @@ pinBumps:
             reason.contains("1 of 14 lane(s) cancelled before a verdict (rust-lint: Cairn's runner is stopping)"),
             "{reason}"
         );
-        assert!(!attempt_interrupted_by_restart(&state, Some(&reason)));
+        assert!(!attempt_interrupted_by_restart(state, Some(&reason)));
 
         assert!(attempt_interrupted_by_restart(
             "failed",
@@ -6795,8 +6778,19 @@ mod capture_provenance_tests {
         )
     }
 
+    /// The capture is forensic record, kept in `plan_json`. No rendered
+    /// surface carries it: not the running header, not a retired section.
     #[test]
-    fn running_header_keeps_captured_coordinates_and_warning_before_submission() {
+    fn no_rendered_header_carries_the_capture() {
+        let capture_facts = [
+            "original-before-preparation",
+            "original-judged-head",
+            "original-logical-hash",
+            "original-git-tree",
+            "original-exact-base",
+            "accepted export recovery pending",
+            "review-wave capture",
+        ];
         for submitted in [None, Some(2)] {
             let status = crate::orchestrator::TurnEndCheckRuntimeStatus {
                 plan: plan(),
@@ -6807,19 +6801,10 @@ mod capture_provenance_tests {
                 submitted_at_unix_ms: submitted,
             };
             let header = wave_header(&status, 3);
-            assert!(header.contains("original-before-preparation"));
-            assert!(header.contains("judged head `original-judged-head`"));
-            assert!(header.contains("logical tree `original-logical-hash`"));
-            assert!(header.contains("Git tree `original-git-tree`"));
-            assert!(header.contains("exact target `main` at `original-exact-base`"));
-            assert!(header.contains("accepted export recovery pending"));
-            assert!(header.contains("not current-verdict authority"));
-            assert_eq!(status.plan.head, "original-judged-head");
+            for fact in capture_facts {
+                assert!(!header.contains(fact), "{fact} in: {header}");
+            }
         }
-    }
-
-    #[test]
-    fn retired_rowless_capture_keeps_original_tree_base_and_accepted_warning() {
         let retired = crate::execution::checks_status::RetiredNode {
             outcome: "merged".into(),
             plan: Some(plan()),
@@ -6827,36 +6812,9 @@ mod capture_provenance_tests {
         for statuses in [None, Some(&[][..])] {
             let text = format_retired_checks_section(&retired, statuses);
             assert!(text.contains("This node was merged"));
-            assert!(text.contains("judged head `original-judged-head`"));
-            assert!(text.contains("logical tree `original-logical-hash`"));
-            assert!(text.contains("fork `original-fork`"));
-            assert!(text.contains("Git tree `original-git-tree`"));
-            assert!(text.contains("original-exact-base"));
-            assert!(text.contains("accepted export recovery pending"));
+            for fact in capture_facts {
+                assert!(!text.contains(fact), "{fact} in: {text}");
+            }
         }
-    }
-
-    #[test]
-    fn settled_header_is_kept_without_lanes_and_legacy_capture_stays_unknown() {
-        let mut legacy = (*plan()).clone();
-        legacy.capture = None;
-        let header = crate::execution::checks_status::format_wave_capture(&legacy);
-        let text = format_checks_section_under(
-            Some(&header),
-            &[],
-            crate::execution::checks_status::WaveCadence::default(),
-        )
-        .unwrap();
-        assert!(text.contains("original-judged-head"));
-        assert!(text.contains("Preparation capture unknown"));
-        assert!(text.contains("No lanes are present"));
-        assert!(!text.contains("head before `original-judged-head`"));
-        assert!(!text.contains("Git tree `original-logical-hash`"));
-        assert!(format_checks_section_under(
-            None,
-            &[],
-            crate::execution::checks_status::WaveCadence::default(),
-        )
-        .is_none());
     }
 }
