@@ -1800,6 +1800,7 @@ impl JjStoreGuard {
             }
             BatchAdmission::Sealed(_) | BatchAdmission::None => None,
         };
+        let started = Instant::now();
         match crate::orchestrator::base_advance::inflight_run_batch_except(
             db, project_id, branch, None, exempt,
         )
@@ -1825,7 +1826,15 @@ impl JjStoreGuard {
         if !store.exists() {
             return Ok(permit);
         }
-        match preparation::settle_branch_acceptances(db, self, project_id, store, branch).await {
+        let batch_checked = started.elapsed();
+        let settled =
+            preparation::settle_branch_acceptances(db, self, project_id, store, branch).await;
+        log::debug!(
+            "branch write permit `{branch}`: in-flight batch check {} ms, acceptance settle {} ms",
+            batch_checked.as_millis(),
+            started.elapsed().saturating_sub(batch_checked).as_millis(),
+        );
+        match settled {
             Ok(None) => Ok(permit),
             Ok(Some(debt)) => Err(BranchAdmissionRefusal::Debt {
                 branch: branch.to_string(),

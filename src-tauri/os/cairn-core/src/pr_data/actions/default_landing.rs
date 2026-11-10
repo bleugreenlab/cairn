@@ -213,9 +213,14 @@ pub(super) async fn admit_landing_writers(
     reservation: &BranchReservation,
     merge_context: &MergeMrContext,
 ) -> Result<(), String> {
+    // Timed here, not at its callers, so every admission is attributed: the
+    // ones the build and the fold run are carved out of those phases.
+    let _admission = super::merge_metrics::time(super::merge_metrics::Phase::Admission);
+    let started = std::time::Instant::now();
     let store =
         crate::jj::project_store_dir(&orch.config_dir, Path::new(&merge_context.mr.repo_path));
     let fence_db = crate::orchestrator::base_advance::recovery_fence_db(orch, &store).await;
+    let fence_db_found = started.elapsed();
     crate::orchestrator::branch_recovery::refuse_if_fenced(
         &fence_db,
         &store,
@@ -226,10 +231,14 @@ pub(super) async fn admit_landing_writers(
         "Merging this pull request",
     )
     .await?;
+    let fence_checked = started.elapsed();
     let db = crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
         .await
         .map_err(|error| format!("the project's database is unavailable: {error}"))?;
+    let db_found = started.elapsed();
+    let mut permits = Vec::with_capacity(2);
     for branch in [&merge_context.source_branch, &merge_context.target_branch] {
+        let permit_started = std::time::Instant::now();
         guard
             .branch_write_permit(
                 &db,
@@ -239,7 +248,22 @@ pub(super) async fn admit_landing_writers(
                 crate::orchestrator::BatchAdmission::None,
             )
             .await?;
+        permits.push(format!(
+            "permit `{branch}` {} ms",
+            permit_started.elapsed().as_millis()
+        ));
     }
+    log::debug!(
+        "landing writer admission of `{}` into `{}` took {} ms: fence db {} ms, fence check {} \
+         ms, project db {} ms, {}",
+        merge_context.source_branch,
+        merge_context.target_branch,
+        started.elapsed().as_millis(),
+        fence_db_found.as_millis(),
+        (fence_checked - fence_db_found).as_millis(),
+        (db_found - fence_checked).as_millis(),
+        permits.join(", "),
+    );
     Ok(())
 }
 
@@ -349,11 +373,14 @@ async fn publish_released(
             // writers are admitted again under this guard: the lock was free
             // for the push. A refusal leaves the store unmoved; origin took the
             // landing regardless, and recovery records it.
+            let admission = super::merge_metrics::time(super::merge_metrics::Phase::Admission);
             let admitted = match reservation_covers(reservation, store, merge_context) {
                 Ok(()) => admit_landing_writers(orch, &guard, reservation, merge_context).await,
                 Err(error) => Err(error),
             };
+            drop(admission);
             let advanced = admitted.and_then(|()| {
+                let _install = super::merge_metrics::time(super::merge_metrics::Phase::Install);
                 guard.blocking_phase("install accepted landing", || {
                     advance_landing_bookmarks(
                         store,
@@ -373,15 +400,21 @@ async fn publish_released(
                 })
             });
             let repointed = match &advanced {
-                Ok(()) => repoint_landed_children(orch, merge_context, &guard)
-                    .await
-                    .err(),
+                Ok(()) => {
+                    let _recording =
+                        super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
+                    repoint_landed_children(orch, merge_context, &guard)
+                        .await
+                        .err()
+                }
                 Err(_) => None,
             };
             // Recording origin's value moves exactly the accepted refs' tracked
             // copies (no import), which the landing's own permits cover, so
             // another branch's reservation does not defer it.
             let recorded = advanced.and_then(|()| {
+                let _record =
+                    super::merge_metrics::time(super::merge_metrics::Phase::RecordPublication);
                 guard.blocking_phase("record landing publication", || {
                     crate::jj::in_place_blocking(|| {
                         crate::jj::record_leased_push(&store.jj, &store.path, &heads)
@@ -392,6 +425,8 @@ async fn publish_released(
             // holds exactly it: the confirmed publication is each managed
             // branch's claims reset point. Never on anything less.
             let checkpointed = if exact && recorded.is_ok() {
+                let _recording =
+                    super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
                 checkpoint_publication(
                     orch,
                     &guard,
@@ -750,6 +785,7 @@ pub(super) async fn land_on_default(
     let source = merge_context.source_branch.as_str();
     let target = merge_context.target_branch.as_str();
     let store = store_of(orch, merge_context);
+    let reserving = super::merge_metrics::time(super::merge_metrics::Phase::ReservationWait);
     // Held from preparation through publication: neither branch moves while
     // the store lock is free for the network push.
     let reservation = orch
@@ -766,6 +802,7 @@ pub(super) async fn land_on_default(
     // Shared with the preparation, which installs under it.
     let reservation = Arc::new(reservation);
     let _lease = object_lease(&store, merge_context)?;
+    drop(reserving);
     for attempt in 0..MAX_LANDING_ATTEMPTS {
         super::merge_metrics::landing_attempt();
         let prospect =
@@ -799,12 +836,14 @@ pub(super) async fn land_on_default(
         // The running build judges the configuration this exact merge result
         // puts on the default branch: unloadable is refused, set-aside checks
         // land with a notice.
+        let preflight = super::merge_metrics::time(super::merge_metrics::Phase::ConfigPreflight);
         let config_notice = super::config_preflight::preflight_landing_config(
             merge_context,
             &prospect.prepared.base_commit,
             &prospect.merge.commit_id,
         )
         .await?;
+        drop(preflight);
 
         let landed = {
             let wait = super::merge_metrics::time(super::merge_metrics::Phase::LockWait);
@@ -1043,6 +1082,7 @@ pub(super) async fn judge_origin_target(
         )
         .await;
     drop(wait);
+    let take = super::merge_metrics::time(super::merge_metrics::Phase::Take);
     // Under the lock, so a fence the previous holder recorded is seen. A fence
     // on the target or source, in any open database, refuses the take; every
     // other fenced bookmark is named so the import leaves it where its recorded
@@ -1089,6 +1129,7 @@ pub(super) async fn judge_origin_target(
         (guard, taken)
     })
     .await;
+    drop(take);
     // Reported here, on the landing's task: the worker cannot see the merge
     // attempt's collector.
     if !matches!(&joined, Ok((_, Ok(_)))) {
@@ -1321,6 +1362,8 @@ async fn land_if_unchanged(
     reservation: &BranchReservation,
     journal: &MergeAttemptJournal<'_>,
 ) -> Result<Option<Landed>, String> {
+    // The admission below is timed as its own phase, nested in this one.
+    let recheck = super::merge_metrics::time(super::merge_metrics::Phase::Recheck);
     reservation_covers(reservation, store, merge_context)?;
     if let Some(moved) = coordinate_moved(store, merge_context, &prospect.prepared) {
         log::info!("landing: {moved}; preparing again");
@@ -1368,6 +1411,7 @@ async fn land_if_unchanged(
         source: &source_head,
         tree: Some(&prospect.merge.tree_hash),
     };
+    drop(recheck);
     let fold = super::merge_metrics::time(super::merge_metrics::Phase::Fold);
     let commit = fold_validated_default(orch, merge_context, method, exact, &guard, reservation)
         .await
@@ -1378,9 +1422,12 @@ async fn land_if_unchanged(
         // and jj rebased everything descending from them, another branch cut
         // from the source included; so the fold is set aside and the landing
         // installed by compare-and-swap, exactly as an accepted remote one is.
+        let set_aside = super::merge_metrics::time(super::merge_metrics::Phase::SetAside);
         guard
             .undo_own_operations(&store.jj, &operation)
             .map_err(|error| format!("the folded landing could not be set aside: {error}"))?;
+        drop(set_aside);
+        let install = super::merge_metrics::time(super::merge_metrics::Phase::Install);
         guard.blocking_phase("install local landing", || {
             advance_landing_bookmarks(
                 store,
@@ -1398,6 +1445,8 @@ async fn land_if_unchanged(
                 ],
             )
         })?;
+        drop(install);
+        let _recording = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
         if let Err(error) = repoint_landed_children(orch, merge_context, &guard).await {
             log::warn!("landing: {error}");
         }
@@ -1410,6 +1459,7 @@ async fn land_if_unchanged(
     // The landing commit exists; pin it, then the store goes back to the
     // prepared target and source until origin accepts it.
     let repo_path = merge_context.mr.repo_path.as_str();
+    let set_aside = super::merge_metrics::time(super::merge_metrics::Phase::SetAside);
     pin_landing(repo_path, journal.attempt_id, &commit).map_err(&rollback)?;
     if let Err(error) = guard.undo_own_operations(&store.jj, &operation) {
         unpin_landing(repo_path, journal.attempt_id);
@@ -1417,6 +1467,7 @@ async fn land_if_unchanged(
             "the folded landing could not be set aside: {error}"
         ));
     }
+    drop(set_aside);
     let publication = Publication {
         target_branch: merge_context.target_branch.clone(),
         expected_old: prospect.prepared.base_commit.clone(),
@@ -1465,6 +1516,7 @@ pub(super) async fn publish_pinned(
     let source = merge_context.source_branch.as_str();
     let repo_path = merge_context.mr.repo_path.as_str();
     let commit = publication.landing_commit.clone();
+    let journaling = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
     let db = crate::execution::routing::owning_db_for_project(&orch.db, &merge_context.project_id)
         .await
         .map_err(|error| {
@@ -1500,6 +1552,7 @@ pub(super) async fn publish_pinned(
             }
         }
     };
+    drop(journaling);
     let (guard, publish) = publish_released(
         orch,
         store,
@@ -1510,6 +1563,8 @@ pub(super) async fn publish_pinned(
         refs,
     )
     .await;
+    // Releasing the pin and journaling a refused or unknown outcome.
+    let _settling = super::merge_metrics::time(super::merge_metrics::Phase::Bookkeeping);
     // From here the store already holds the outcome: nothing below rolls the
     // operation log back. Only an unknown outcome keeps the pin, for recovery.
     if !matches!(publish, Publish::Unknown(_)) {

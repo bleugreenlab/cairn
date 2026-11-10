@@ -9,7 +9,10 @@
 //! - the wake funnel (`messages::delivery`'s `nudge`) reports every wake request
 //!   with its outcome;
 //! - the landing times its own phases with [`time`], whose timer adds on drop,
-//!   so a phase that returns an error still records how long it ran.
+//!   so a phase that returns an error still records how long it ran. Timers
+//!   may nest: each instant belongs to the innermost open timer only, so a
+//!   step timed inside a wider phase (the writer admission inside a fold) is
+//!   carved out of it rather than counted twice.
 //!
 //! Outside an attempt's scope every hook is a no-op. The scope belongs to the
 //! task, so two merges running at once never share a collector, and nothing is
@@ -70,10 +73,11 @@ const LISTED_RESUME_JOBS: usize = 500;
 /// The most characters of a failure a record carries.
 const ERROR_CHARS: usize = 300;
 
-/// A timed part of a merge. Phases never nest, so their sum never exceeds the
-/// attempt's total; the remainder is reported as `unattributed_ms`: the merge
-/// gates and config preflight, the landing's reservation wait, the
-/// postcondition-free stretches between phases.
+/// A timed part of a merge. Each instant is attributed to at most one phase
+/// (the innermost open timer), so their sum never exceeds the attempt's total;
+/// the remainder is reported as `unattributed_ms`. On a default-branch landing
+/// that remainder is only the short stretches between named phases; on other
+/// routes (a child landing, the approval ceremony's human wait) it is larger.
 ///
 /// `total_ms` of a root record runs from the first statement of
 /// `merge_pr_for_job` (before its context resolution and commit barrier) to
@@ -100,12 +104,41 @@ pub(crate) enum Phase {
     /// Waiting for the store writer lock at the landing's own acquisitions.
     /// The preparer's waits are inside `Prepare`.
     LockWait,
-    /// The local fold of the validated landing, under the store lock.
+    /// The local fold of the validated landing, under the store lock, less
+    /// the writer admission it runs (`Admission`).
     Fold,
+    /// Everything before the landing starts: the merge context, the commit
+    /// barrier, the base-merge policy gate and its journal event.
+    Gates,
+    /// Waiting for the landing's reservation of its source and target, and
+    /// leasing the store's objects against maintenance.
+    ReservationWait,
+    /// The origin take of the landing target, from the store lock being
+    /// acquired to the take returning: the fence read, the target's write
+    /// permit and the fast-forward itself.
+    Take,
+    /// Judging the configuration the merge result would put on the default
+    /// branch.
+    ConfigPreflight,
+    /// Under the store lock before the fold: re-checking that the prepared
+    /// coordinate still holds, and binding identifiers when the landing binds.
+    Recheck,
+    /// Admitting the landing's writers of its source and target
+    /// (`admit_landing_writers`) at every call site, the ones inside the
+    /// build and the fold included.
+    Admission,
+    /// Pinning the folded landing and setting the fold aside, so the store
+    /// names the prepared target and source until the landing is installed.
+    SetAside,
+    /// Installing the landing in the store by compare-and-swap of the two
+    /// bookmarks, once origin accepted it (or locally).
+    Install,
+    /// Recording origin's new value in the store after an accepted push.
+    RecordPublication,
 }
 
 impl Phase {
-    const ALL: [Phase; 9] = [
+    const ALL: [Phase; 18] = [
         Phase::Fetch,
         Phase::Prepare,
         Phase::Build,
@@ -115,6 +148,15 @@ impl Phase {
         Phase::Settle,
         Phase::LockWait,
         Phase::Fold,
+        Phase::Gates,
+        Phase::ReservationWait,
+        Phase::Take,
+        Phase::ConfigPreflight,
+        Phase::Recheck,
+        Phase::Admission,
+        Phase::SetAside,
+        Phase::Install,
+        Phase::RecordPublication,
     ];
 
     fn key(self) -> &'static str {
@@ -128,6 +170,15 @@ impl Phase {
             Phase::Settle => "settle_ms",
             Phase::LockWait => "lock_wait_ms",
             Phase::Fold => "fold_ms",
+            Phase::Gates => "gates_ms",
+            Phase::ReservationWait => "reservation_wait_ms",
+            Phase::Take => "take_ms",
+            Phase::ConfigPreflight => "config_preflight_ms",
+            Phase::Recheck => "recheck_ms",
+            Phase::Admission => "admission_ms",
+            Phase::SetAside => "set_aside_ms",
+            Phase::Install => "install_ms",
+            Phase::RecordPublication => "record_publication_ms",
         }
     }
 
@@ -161,6 +212,9 @@ struct State {
     target: Option<String>,
     route: Option<&'static str>,
     phases: [Option<Duration>; Phase::ALL.len()],
+    /// The open phase timers, innermost last. Only the innermost accrues.
+    open: Vec<OpenPhase>,
+    next_timer: u64,
     landing_attempts: u32,
     source_preparations: u32,
     replays_issued: u32,
@@ -184,6 +238,14 @@ struct State {
 }
 
 #[derive(Debug)]
+struct OpenPhase {
+    timer: u64,
+    phase: Phase,
+    /// When this timer last became the innermost one.
+    since: Instant,
+}
+
+#[derive(Debug)]
 struct BookmarkWrite {
     branch: String,
     role: &'static str,
@@ -198,6 +260,40 @@ impl State {
     fn add_phase(&mut self, phase: Phase, elapsed: Duration) {
         let slot = &mut self.phases[phase.index()];
         *slot = Some(slot.unwrap_or_default() + elapsed);
+    }
+
+    /// Open a timer for `phase` at `now`, pausing the one it nests in.
+    fn open_phase(&mut self, phase: Phase, now: Instant) -> u64 {
+        if let Some(outer) = self.open.last_mut() {
+            let (outer_phase, ran) = (outer.phase, now.saturating_duration_since(outer.since));
+            outer.since = now;
+            self.add_phase(outer_phase, ran);
+        }
+        self.next_timer += 1;
+        self.open.push(OpenPhase {
+            timer: self.next_timer,
+            phase,
+            since: now,
+        });
+        self.next_timer
+    }
+
+    /// Close `timer` at `now`. The innermost timer is credited since it last
+    /// became innermost and the one it nested in resumes; a timer closed
+    /// while another is nested in it is credited nothing more, since that
+    /// stretch was the nested timer's.
+    fn close_phase(&mut self, timer: u64, now: Instant) {
+        let Some(at) = self.open.iter().rposition(|open| open.timer == timer) else {
+            return;
+        };
+        let closed = self.open.remove(at);
+        if at < self.open.len() {
+            return;
+        }
+        self.add_phase(closed.phase, now.saturating_duration_since(closed.since));
+        if let Some(outer) = self.open.last_mut() {
+            outer.since = now;
+        }
     }
 
     /// Which of the landing's own branches `branch` is, if the attempt knows.
@@ -362,6 +458,13 @@ impl MergeAttempt {
         })
     }
 
+    /// How long `phase` has accrued so far, below the record's millisecond
+    /// rounding.
+    #[cfg(test)]
+    pub(crate) fn phase_total(&self, phase: Phase) -> Option<Duration> {
+        self.with(|state| state.phases[phase.index()])
+    }
+
     /// Emit the root attempt's record once its result is known.
     pub(crate) fn finish(&self, result: &Result<String, String>) {
         emit(self.record(result.as_ref().map(|_| ()).map_err(String::as_str)));
@@ -476,27 +579,30 @@ pub(crate) fn landing_attempt() {
 
 /// A timer that adds its elapsed time to `phase` of the attempt in scope when
 /// dropped, including on an early error return. Bind it to a named variable
-/// (`let _publish = time(..)`): `let _ = time(..)` drops it at once.
+/// (`let _publish = time(..)`): `let _ = time(..)` drops it at once. A timer
+/// opened while another is open nests in it: the outer one is paused until the
+/// inner one closes. Open it on the attempt's own task, and never run two
+/// timed futures of one attempt concurrently: their time would be split
+/// between them by nesting order, never double-counted but misattributed.
 pub(crate) fn time(phase: Phase) -> PhaseTimer {
-    PhaseTimer {
-        attempt: current(),
-        phase,
-        started: Instant::now(),
-    }
+    let attempt = current();
+    let timer = attempt.as_ref().map_or(0, |attempt| {
+        attempt.with(|state| state.open_phase(phase, Instant::now()))
+    });
+    PhaseTimer { attempt, timer }
 }
 
 #[must_use = "a phase timer measures until it is dropped"]
 pub(crate) struct PhaseTimer {
     attempt: Option<Arc<MergeAttempt>>,
-    phase: Phase,
-    started: Instant,
+    timer: u64,
 }
 
 impl Drop for PhaseTimer {
     fn drop(&mut self) {
         if let Some(attempt) = self.attempt.take() {
-            let elapsed = self.started.elapsed();
-            attempt.with(|state| state.add_phase(self.phase, elapsed));
+            let now = Instant::now();
+            attempt.with(|state| state.close_phase(self.timer, now));
         }
     }
 }
@@ -704,6 +810,53 @@ mod tests {
         assert_eq!(record["prepare_ms"], 7);
         assert_eq!(record["last_preparation_refusal"], "conflict");
         assert_eq!(record["replays_issued"], 0);
+    }
+
+    /// A timer opened inside another carves its time out of the outer one,
+    /// so nested phases are never counted twice and the outer phase resumes
+    /// when the inner one closes.
+    #[tokio::test]
+    async fn a_nested_phase_is_carved_out_of_the_phase_it_runs_in() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut state = State::default();
+        let fold = state.open_phase(Phase::Fold, t0);
+        let admission = state.open_phase(Phase::Admission, t0 + ms(20));
+        state.close_phase(admission, t0 + ms(50));
+        state.close_phase(fold, t0 + ms(70));
+        assert_eq!(state.phases[Phase::Admission.index()], Some(ms(30)));
+        assert_eq!(
+            state.phases[Phase::Fold.index()],
+            Some(ms(40)),
+            "the fold keeps only its own time, not the admission's"
+        );
+
+        // An outer timer closed while an inner one is open is credited
+        // nothing for that stretch, and the inner one keeps accruing.
+        let outer = state.open_phase(Phase::Recheck, t0 + ms(100));
+        let inner = state.open_phase(Phase::Install, t0 + ms(105));
+        state.close_phase(outer, t0 + ms(115));
+        state.close_phase(inner, t0 + ms(125));
+        assert_eq!(state.phases[Phase::Recheck.index()], Some(ms(5)));
+        assert_eq!(state.phases[Phase::Install.index()], Some(ms(20)));
+        assert!(state.open.is_empty());
+
+        // Through the task-local hooks, the sum never exceeds the total.
+        let attempt = MergeAttempt::begin("job-1");
+        measured(Arc::clone(&attempt), async {
+            let _fold = time(Phase::Fold);
+            let _admission = time(Phase::Admission);
+            std::thread::sleep(ms(5));
+        })
+        .await;
+        assert!(attempt.phase_total(Phase::Admission).unwrap() >= ms(5));
+        let record = attempt.record(Ok(()));
+        let attributed: u64 = Phase::ALL
+            .iter()
+            .filter_map(|phase| record[phase.key()].as_u64())
+            .sum();
+        assert!(attributed <= record["total_ms"].as_u64().unwrap());
+        assert!(record["take_ms"].is_null(), "a phase never reached is null");
     }
 
     #[tokio::test]

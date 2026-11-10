@@ -676,6 +676,8 @@ async fn merge_pr_for_job_measured(
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
 ) -> Result<String, String> {
+    // Until the landing starts; a refusal before then ends it on return.
+    let gates = super::merge_metrics::time(super::merge_metrics::Phase::Gates);
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -693,7 +695,7 @@ async fn merge_pr_for_job_measured(
     )
     .await;
     barrier.refuse_merge()?;
-    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution, precondition)
+    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution, precondition, gates)
         .await
         .map(|reply| barrier.prefix(reply))
         .map_err(|error| barrier.prefix(error))
@@ -705,6 +707,7 @@ async fn merge_pr_for_job_past_barrier(
     merge_method: Option<String>,
     attribution: Option<super::PrResolutionAttribution>,
     precondition: Option<MergePrecondition>,
+    gates: super::merge_metrics::PhaseTimer,
 ) -> Result<String, String> {
     // Route to the owning database (team replica or private DB). The merge
     // request, its issue, and the producing job for a team execution all live in
@@ -893,6 +896,7 @@ async fn merge_pr_for_job_past_barrier(
             (true, false, true) => "origin-approval",
         },
     );
+    drop(gates);
     let (merged_commit, landed) = if merge_context.target_branch == resolved_default {
         // The default branch takes only a merge result prepared onto its
         // exact target, bound and validated there, and only if the source, the

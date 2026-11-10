@@ -666,6 +666,60 @@ async fn a_remote_landing_moves_the_store_only_after_origin_accepts_and_blocks_o
     );
 }
 
+/// Every stretch of a publishing landing is a named phase of its merge
+/// attempt: the origin take and the writer admission included, and what is
+/// left unattributed is only the short gaps between phases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(jj)]
+async fn a_publishing_landing_attributes_its_time_to_named_phases() {
+    use crate::pr_data::actions::merge_metrics::{self, MergeAttempt, Phase};
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let ctx = remote_default_context(&fx).await;
+    let attempt = MergeAttempt::begin("job-src");
+    let landed = merge_metrics::measured(Arc::clone(&attempt), async {
+        merge_metrics::identify("mr", None, &ctx.source_branch, &ctx.target_branch);
+        crate::pr_data::actions::default_landing::land_on_default(
+            &fx.orch, "job-src", &ctx, "squash", None, &JOURNAL,
+        )
+        .await
+    })
+    .await;
+    let landed = landed.expect("a clean remote landing lands");
+    assert!(landed.published.is_some(), "the landing published");
+
+    for phase in [
+        Phase::ReservationWait,
+        Phase::Fetch,
+        Phase::Take,
+        Phase::Build,
+        Phase::Validate,
+        Phase::ConfigPreflight,
+        Phase::Recheck,
+        Phase::Admission,
+        Phase::Fold,
+        Phase::SetAside,
+        Phase::Publish,
+        Phase::Install,
+        Phase::RecordPublication,
+        Phase::Bookkeeping,
+    ] {
+        let ran = attempt.phase_total(phase);
+        assert!(
+            ran.is_some_and(|ran| !ran.is_zero()),
+            "{phase:?} is attributed on a publishing landing: {ran:?}"
+        );
+    }
+    let record = attempt.record(Ok(()));
+    assert!(record["take_ms"].is_u64() && record["admission_ms"].is_u64());
+    let unattributed = record["unattributed_ms"].as_u64().unwrap();
+    assert!(
+        unattributed < 300,
+        "all but {unattributed} ms of {} ms are named: {record}",
+        record["total_ms"]
+    );
+}
+
 // ── Child landings onto an integration branch ─────────────────────────────────────────
 
 use crate::pr_data::actions::landing_record::PublicationShape;
