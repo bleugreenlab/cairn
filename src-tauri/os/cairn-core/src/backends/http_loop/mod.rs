@@ -51,9 +51,6 @@ use std::any::Any;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-#[cfg(test)]
-use cairn_models::turn::MAX_TOOL_ITERATIONS;
-
 pub(super) trait HttpUsageExt {
     fn token_counts(&self) -> TokenCounts;
 }

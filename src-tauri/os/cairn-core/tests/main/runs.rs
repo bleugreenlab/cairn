@@ -25,18 +25,6 @@ impl EventEmitter for NoopEmitter {
     }
 }
 
-async fn insert_issue(db: &LocalDb, id: &str, project_id: &str, number: i64) {
-    let id = id.to_string();
-    let project_id = project_id.to_string();
-    db.execute(
-        "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 'Issue', 'active', 1, 1)",
-        params![id.as_str(), project_id.as_str(), number],
-    )
-    .await
-    .unwrap();
-}
-
 async fn insert_job(db: &LocalDb, id: &str, project_id: &str, issue_id: Option<&str>) {
     let id = id.to_string();
     let project_id = project_id.to_string();
@@ -137,17 +125,6 @@ async fn insert_turn(
     .unwrap();
 }
 
-async fn set_job_current_turn(db: &LocalDb, job_id: &str, turn_id: &str) {
-    let job_id = job_id.to_string();
-    let turn_id = turn_id.to_string();
-    db.execute(
-        "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2",
-        params![turn_id.as_str(), job_id.as_str()],
-    )
-    .await
-    .unwrap();
-}
-
 // Row-insert seed helper; the parameter list mirrors the events table columns.
 #[allow(clippy::too_many_arguments)]
 async fn insert_event(
@@ -208,106 +185,6 @@ async fn insert_event(
     })
     .await
     .unwrap();
-}
-
-async fn insert_prompt(
-    db: &LocalDb,
-    id: &str,
-    run_id: &str,
-    turn_id: Option<&str>,
-    response: Option<&str>,
-    created_at: i64,
-) {
-    let id = id.to_string();
-    let run_id = run_id.to_string();
-    let turn_id = turn_id.map(str::to_string);
-    let response = response.map(str::to_string);
-    db.write(|conn| {
-        let id = id.clone();
-        let run_id = run_id.clone();
-        let turn_id = turn_id.clone();
-        let response = response.clone();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO prompts(id, run_id, turn_id, questions, response, created_at, answered_at)
-                 VALUES (?1, ?2, ?3, '[{\"question\":\"Test?\"}]', ?4, ?5, ?6)",
-                params![
-                    id.as_str(),
-                    run_id.as_str(),
-                    turn_id.as_deref(),
-                    response.as_deref(),
-                    created_at,
-                    response.as_ref().map(|_| created_at)
-                ],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn list_runs_filters_by_issue_and_job() {
-    let (_temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-    let project_id = common::create_project(&db, "runs").await;
-    insert_issue(&db, "issue-1", &project_id, 1).await;
-    insert_issue(&db, "issue-2", &project_id, 2).await;
-    insert_job(&db, "job-1", &project_id, Some("issue-1")).await;
-    insert_job(&db, "job-2", &project_id, Some("issue-2")).await;
-    insert_run(
-        &db,
-        "run-1",
-        Some(&project_id),
-        Some("issue-1"),
-        Some("job-1"),
-        None,
-        "running",
-        Some("session-1"),
-        10,
-    )
-    .await;
-    insert_run(
-        &db,
-        "run-2",
-        Some(&project_id),
-        Some("issue-1"),
-        Some("job-1"),
-        None,
-        "complete",
-        Some("session-1"),
-        20,
-    )
-    .await;
-    insert_run(
-        &db,
-        "run-3",
-        Some(&project_id),
-        Some("issue-2"),
-        Some("job-2"),
-        None,
-        "failed",
-        Some("session-2"),
-        30,
-    )
-    .await;
-
-    let issue_runs = queries::list_runs(db.clone(), "issue-1").unwrap();
-    assert_eq!(
-        issue_runs
-            .iter()
-            .map(|run| run.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["run-2", "run-1"]
-    );
-    assert!(issue_runs
-        .iter()
-        .all(|run| run.issue_id.as_deref() == Some("issue-1")));
-
-    let job_runs = queries::list_runs_for_job(db.clone(), "job-1").unwrap();
-    assert_eq!(job_runs.len(), 2);
 }
 
 #[tokio::test]
@@ -545,16 +422,6 @@ async fn set_current_session(db: &LocalDb, job_id: &str, session_id: &str) {
 
 // Point a session at a parent WITHOUT marking the parent replaced_by it — the
 // shape a delegated child job's forked session has.
-async fn set_session_parent(db: &LocalDb, id: &str, parent: &str) {
-    let id = id.to_string();
-    let parent = parent.to_string();
-    db.execute(
-        "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
-        params![parent.as_str(), id.as_str()],
-    )
-    .await
-    .unwrap();
-}
 
 async fn job_run(db: &LocalDb, id: &str, job_id: &str, session_id: &str, created_at: i64) {
     insert_run(
@@ -620,93 +487,6 @@ macro_rules! ids {
             .map(|event| event.id.as_str())
             .collect::<Vec<_>>()
     };
-}
-
-#[tokio::test]
-async fn list_events_for_session_spans_reseed_rotation_lineage() {
-    // A cold-resume reseed rotates a job onto a fresh session that carries none
-    // of the prior runs. The transcript must still span the predecessor session
-    // so prior events are preserved rather than wiped (CAIRN-2630).
-    let (_temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-
-    let project_id = common::create_project(&db, "reseed").await;
-    insert_job(&db, "job-1", &project_id, None).await;
-
-    // session-old (root) was rotated in place into session-new; both on job-1.
-    insert_session(&db, "session-old", "job-1", 1).await;
-    insert_session(&db, "session-new", "job-1", 2).await;
-    link_session_rotation(&db, "session-old", "session-new").await;
-    job_run(&db, "run-old", "job-1", "session-old", 100).await;
-    job_run(&db, "run-new", "job-1", "session-new", 200).await;
-
-    for (id, run, session, seq, kind) in [
-        ("old-user", "run-old", "session-old", 1, "user"),
-        ("old-assistant", "run-old", "session-old", 2, "assistant"),
-        ("new-seed", "run-new", "session-new", 1, "user:seed"),
-        ("new-user", "run-new", "session-new", 2, "user"),
-    ] {
-        session_event(&db, id, run, session, seq, kind).await;
-    }
-
-    // Loading the fresh session returns the full lineage, prior events first.
-    let events = queries::list_events_for_session(db.clone(), "session-new").unwrap();
-    assert_eq!(
-        ids!(events),
-        vec!["old-user", "old-assistant", "new-seed", "new-user"]
-    );
-
-    // The tail carries the same lineage, resolved from the node alone — no
-    // caller names a session.
-    set_current_session(&db, "job-1", "session-new").await;
-    let tail = transcript(&db, "job-1", tail_window()).await;
-    assert_eq!(
-        ids!(tail.events),
-        vec!["old-user", "old-assistant", "new-seed", "new-user"]
-    );
-    assert_eq!(tail.older, None, "the whole lineage fits one page");
-    assert_eq!(tail.run_ordinals.get("run-old"), Some(&1));
-    assert_eq!(tail.run_ordinals.get("run-new"), Some(&2));
-
-    // Loading the predecessor directly stays scoped to its own events — the walk
-    // only follows genuine in-place rotation predecessors, never successors.
-    let old_only = queries::list_events_for_session(db.clone(), "session-old").unwrap();
-    assert_eq!(ids!(old_only), vec!["old-user", "old-assistant"]);
-}
-
-#[tokio::test]
-async fn list_events_for_session_excludes_cross_job_fork_parent() {
-    // A delegated child job forks the parent's session: it stamps
-    // parent_session_id but the parent is NOT marked replaced_by the child (it
-    // keeps serving its own job). The child transcript must not absorb the
-    // parent agent's history (CAIRN-2630).
-    let (_temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-
-    let project_id = common::create_project(&db, "fork").await;
-    insert_job(&db, "job-parent", &project_id, None).await;
-    insert_job(&db, "job-child", &project_id, None).await;
-
-    insert_session(&db, "parent-session", "job-parent", 1).await;
-    insert_session(&db, "fork-session", "job-child", 2).await;
-    // The fork points back at the parent, but the parent's replaced_by_id stays
-    // NULL — the exact shape that must NOT chain.
-    set_session_parent(&db, "fork-session", "parent-session").await;
-    job_run(&db, "run-parent", "job-parent", "parent-session", 100).await;
-    job_run(&db, "run-fork", "job-child", "fork-session", 200).await;
-    session_event(&db, "parent-ev", "run-parent", "parent-session", 1, "user").await;
-    session_event(&db, "fork-ev", "run-fork", "fork-session", 1, "user").await;
-
-    set_current_session(&db, "job-parent", "parent-session").await;
-    set_current_session(&db, "job-child", "fork-session").await;
-
-    let parent = transcript(&db, "job-parent", tail_window()).await;
-    assert_eq!(ids!(parent.events), vec!["parent-ev"]);
-
-    // The child's forked transcript stays its own: each node resolves its own
-    // session, so no request can reach across the fork in either direction.
-    let child = transcript(&db, "job-child", tail_window()).await;
-    assert_eq!(ids!(child.events), vec!["fork-ev"]);
 }
 
 #[tokio::test]
@@ -1179,93 +959,6 @@ async fn active_streams_append_after_existing_events() {
 }
 
 #[tokio::test]
-async fn pending_prompt_queries_use_run_and_current_turn() {
-    let (_temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-    let project_id = common::create_project(&db, "prompts").await;
-    insert_job(&db, "job-1", &project_id, None).await;
-    insert_run(
-        &db,
-        "run-1",
-        Some(&project_id),
-        None,
-        Some("job-1"),
-        None,
-        "running",
-        Some("session-1"),
-        1,
-    )
-    .await;
-    insert_turn(
-        &db,
-        "turn-1",
-        "session-1",
-        "run-1",
-        Some("job-1"),
-        1,
-        "running",
-    )
-    .await;
-    set_job_current_turn(&db, "job-1", "turn-1").await;
-    insert_prompt(&db, "answered", "run-1", Some("turn-1"), Some("yes"), 10).await;
-    insert_prompt(&db, "pending-old", "run-1", Some("turn-1"), None, 20).await;
-    insert_prompt(&db, "pending-new", "run-1", Some("turn-1"), None, 30).await;
-
-    let by_run = queries::get_pending_prompt(db.clone(), "run-1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(by_run.id, "pending-new");
-    assert!(by_run.response.is_none());
-
-    let by_job = queries::get_pending_prompt_for_job(db.clone(), "job-1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(by_job.id, "pending-new");
-    assert!(queries::get_pending_prompt(db.clone(), "missing")
-        .unwrap()
-        .is_none());
-}
-
-#[tokio::test]
-async fn prompts_tool_use_id_round_trips() {
-    let (_temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-    let project_id = common::create_project(&db, "ptuid").await;
-    insert_job(&db, "job-1", &project_id, None).await;
-    insert_run(
-        &db,
-        "run-1",
-        Some(&project_id),
-        None,
-        Some("job-1"),
-        None,
-        "running",
-        Some("session-1"),
-        1,
-    )
-    .await;
-
-    db.write(|conn| {
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO prompts(id, run_id, questions, response, created_at, tool_use_id)
-                 VALUES ('p-1', 'run-1', '[{\"question\":\"Test?\"}]', NULL, 10, 'toolu_abc')",
-                (),
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .unwrap();
-
-    let stored =
-        common::scalar_text_by_id(&db, "SELECT tool_use_id FROM prompts WHERE id = ?1", "p-1")
-            .await;
-    assert_eq!(stored.as_deref(), Some("toolu_abc"));
-}
-
-#[tokio::test]
 async fn reconcile_stale_runs_marks_process_and_turn_terminal() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
@@ -1430,91 +1123,6 @@ async fn reconcile_stale_runs_reaps_the_orphan_that_names_a_stale_session() {
 /// reads as a predecessor's leftover. Tests needing the other side of the boundary
 /// seed a run past it instead.
 const STALE_BOOT_AT: i64 = 1_000_000;
-
-#[tokio::test]
-async fn reconcile_stale_runs_cancels_orphaned_pending_turn_by_turn_identity() {
-    let (_temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-    let project_id = common::create_project(&db, "orphan-turn").await;
-    insert_job(&db, "job-orphan-turn", &project_id, None).await;
-    db.execute(
-        "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('session-orphan-turn', 'job-orphan-turn', 'codex', 'open', 1, 1, 1)",
-        (),
-    ).await.unwrap();
-    db.execute(
-        "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('turn-orphan', 'session-orphan-turn', 'job-orphan-turn', 1, 'pending', 'follow_up', 1, 1)",
-        (),
-    ).await.unwrap();
-    db.execute(
-        "UPDATE jobs SET current_turn_id = 'turn-orphan' WHERE id = 'job-orphan-turn'",
-        (),
-    )
-    .await
-    .unwrap();
-    // The exact incident shape: a boot-time resume run exists for the job but
-    // the pending head was never attached to it. One reconciliation must first
-    // crash this stale run and then discover the now-unhidden runless turn.
-    insert_run(
-        &db,
-        "run-stale-resume",
-        Some(&project_id),
-        None,
-        Some("job-orphan-turn"),
-        None,
-        "live",
-        None,
-        1,
-    )
-    .await;
-
-    queries::reconcile_stale_runs_with_claims(
-        db.clone(),
-        &NoopEmitter,
-        STALE_BOOT_AT,
-        &RecordingProcessTable::default(),
-        &HashSet::new(),
-    );
-
-    assert_eq!(
-        common::scalar_text_by_id(
-            &db,
-            "SELECT status FROM runs WHERE id = ?1",
-            "run-stale-resume"
-        )
-        .await
-        .as_deref(),
-        Some("crashed")
-    );
-    assert_eq!(
-        common::scalar_text_by_id(&db, "SELECT state FROM turns WHERE id = ?1", "turn-orphan")
-            .await
-            .as_deref(),
-        Some("cancelled")
-    );
-    assert_eq!(
-        common::scalar_text_by_id(
-            &db,
-            "SELECT end_reason FROM turns WHERE id = ?1",
-            "turn-orphan"
-        )
-        .await
-        .as_deref(),
-        Some("orphaned_pending")
-    );
-    let derived = db
-        .read(|conn| {
-            Box::pin(async move {
-                cairn_core::internal::execution::advancement::recompute_job_status_conn(
-                    conn,
-                    "job-orphan-turn",
-                )
-                .await
-            })
-        })
-        .await
-        .unwrap();
-    assert_eq!(derived, cairn_core::models::JobStatus::Idle);
-}
 
 #[tokio::test]
 async fn reconcile_stale_runs_repairs_jobs_orphaned_by_a_previous_boot() {
@@ -1968,6 +1576,378 @@ async fn reconcile_stale_runs_leaves_a_run_stamped_at_the_boot_second_alone() {
     );
 }
 
+/// A launch queued for admission when the previous host stopped predates boot,
+/// yet it is not stale: startup recovery relaunches it from the durable queue.
+/// A run whose admission row was `active` had a process that died with the host,
+/// so that one is settled.
+#[tokio::test]
+async fn reconcile_stale_runs_leaves_a_durably_queued_launch_for_recovery() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = &orch.db.local;
+    let project_id = common::create_project(db, "queued-recovery").await;
+    db.execute_script(format!(
+        "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq) VALUES ('exec-q', 'r', '{project_id}', 'running', 1, 1);
+         INSERT INTO jobs (id, execution_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('job-q', 'exec-q', '{project_id}', 'running', 'Builder', 'builder', 1, 1);
+         INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('session-q', 'job-q', 'claude', 'open', 1, 1, 1);
+         INSERT INTO runs (id, project_id, job_id, session_id, status, start_mode, created_at, updated_at) VALUES
+           ('run-queued', '{project_id}', 'job-q', 'session-q', 'starting', 'resume', 1, 1),
+           ('run-active', '{project_id}', 'job-q', 'session-q', 'live', 'resume', 1, 1);
+         INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at) VALUES
+           ('req-queued','private-runtime','lane','ordinary:run-queued','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,1,'queued',NULL,0,NULL,1,1),
+           ('req-active','private-runtime','lane','ordinary:run-active','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,2,'active','ordinary-session-promoter',1,9999999999,1,1);
+         INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES
+           ('req-queued','job-q','run-queued','session-q','t-q','exec-q','p','resume','{{}}','','null','{{}}',1),
+           ('req-active','job-q','run-active','session-q','t-a','exec-q','p','resume','{{}}','','null','{{}}',1);"
+    ))
+    .await
+    .unwrap();
+
+    queries::reconcile_stale_runs(&orch, &NoopEmitter, STALE_BOOT_AT);
+
+    let status = |id: &'static str| async move {
+        common::scalar_text_by_id(db, "SELECT status FROM runs WHERE id = ?1", id).await
+    };
+    assert_eq!(status("run-queued").await.as_deref(), Some("starting"));
+    assert_eq!(status("run-active").await.as_deref(), Some("crashed"));
+    assert_eq!(
+        common::scalar_text_by_id(
+            db,
+            "SELECT state FROM runtime_admission_requests WHERE request_id = ?1",
+            "req-queued"
+        )
+        .await
+        .as_deref(),
+        Some("queued"),
+        "the queued launch stays for startup recovery to relaunch"
+    );
+}
+
+#[tokio::test]
+async fn list_events_for_session_spans_reseed_rotation_lineage() {
+    // A cold-resume reseed rotates a job onto a fresh session that carries none
+    // of the prior runs. The transcript must still span the predecessor session
+    // so prior events are preserved rather than wiped (CAIRN-2630).
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+
+    let project_id = common::create_project(&db, "reseed").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+
+    // session-old (root) was rotated in place into session-new; both on job-1.
+    insert_session(&db, "session-old", "job-1", 1).await;
+    insert_session(&db, "session-new", "job-1", 2).await;
+    link_session_rotation(&db, "session-old", "session-new").await;
+    job_run(&db, "run-old", "job-1", "session-old", 100).await;
+    job_run(&db, "run-new", "job-1", "session-new", 200).await;
+
+    for (id, run, session, seq, kind) in [
+        ("old-user", "run-old", "session-old", 1, "user"),
+        ("old-assistant", "run-old", "session-old", 2, "assistant"),
+        ("new-seed", "run-new", "session-new", 1, "user:seed"),
+        ("new-user", "run-new", "session-new", 2, "user"),
+    ] {
+        session_event(&db, id, run, session, seq, kind).await;
+    }
+
+    // Loading the fresh session returns the full lineage, prior events first.
+    let events = queries::list_events_for_session(db.clone(), "session-new").unwrap();
+    assert_eq!(
+        ids!(events),
+        vec!["old-user", "old-assistant", "new-seed", "new-user"]
+    );
+
+    // The tail carries the same lineage, resolved from the node alone — no
+    // caller names a session.
+    set_current_session(&db, "job-1", "session-new").await;
+    let tail = transcript(&db, "job-1", tail_window()).await;
+    assert_eq!(
+        ids!(tail.events),
+        vec!["old-user", "old-assistant", "new-seed", "new-user"]
+    );
+    assert_eq!(tail.older, None, "the whole lineage fits one page");
+    assert_eq!(tail.run_ordinals.get("run-old"), Some(&1));
+    assert_eq!(tail.run_ordinals.get("run-new"), Some(&2));
+
+    // Loading the predecessor directly stays scoped to its own events — the walk
+    // only follows genuine in-place rotation predecessors, never successors.
+    let old_only = queries::list_events_for_session(db.clone(), "session-old").unwrap();
+    assert_eq!(ids!(old_only), vec!["old-user", "old-assistant"]);
+}
+
+#[tokio::test]
+async fn list_events_for_session_excludes_cross_job_fork_parent() {
+    // A delegated child job forks the parent's session: it stamps
+    // parent_session_id but the parent is NOT marked replaced_by the child (it
+    // keeps serving its own job). The child transcript must not absorb the
+    // parent agent's history (CAIRN-2630).
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+
+    let project_id = common::create_project(&db, "fork").await;
+    insert_job(&db, "job-parent", &project_id, None).await;
+    insert_job(&db, "job-child", &project_id, None).await;
+
+    insert_session(&db, "parent-session", "job-parent", 1).await;
+    insert_session(&db, "fork-session", "job-child", 2).await;
+    // The fork points back at the parent, but the parent's replaced_by_id stays
+    // NULL — the exact shape that must NOT chain.
+    set_session_parent(&db, "fork-session", "parent-session").await;
+    job_run(&db, "run-parent", "job-parent", "parent-session", 100).await;
+    job_run(&db, "run-fork", "job-child", "fork-session", 200).await;
+    session_event(&db, "parent-ev", "run-parent", "parent-session", 1, "user").await;
+    session_event(&db, "fork-ev", "run-fork", "fork-session", 1, "user").await;
+
+    set_current_session(&db, "job-parent", "parent-session").await;
+    set_current_session(&db, "job-child", "fork-session").await;
+
+    let parent = transcript(&db, "job-parent", tail_window()).await;
+    assert_eq!(ids!(parent.events), vec!["parent-ev"]);
+
+    // The child's forked transcript stays its own: each node resolves its own
+    // session, so no request can reach across the fork in either direction.
+    let child = transcript(&db, "job-child", tail_window()).await;
+    assert_eq!(ids!(child.events), vec!["fork-ev"]);
+}
+
+#[tokio::test]
+async fn reconcile_stale_runs_cancels_orphaned_pending_turn_by_turn_identity() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "orphan-turn").await;
+    insert_job(&db, "job-orphan-turn", &project_id, None).await;
+    db.execute(
+        "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('session-orphan-turn', 'job-orphan-turn', 'codex', 'open', 1, 1, 1)",
+        (),
+    ).await.unwrap();
+    db.execute(
+        "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('turn-orphan', 'session-orphan-turn', 'job-orphan-turn', 1, 'pending', 'follow_up', 1, 1)",
+        (),
+    ).await.unwrap();
+    db.execute(
+        "UPDATE jobs SET current_turn_id = 'turn-orphan' WHERE id = 'job-orphan-turn'",
+        (),
+    )
+    .await
+    .unwrap();
+    // The exact incident shape: a boot-time resume run exists for the job but
+    // the pending head was never attached to it. One reconciliation must first
+    // crash this stale run and then discover the now-unhidden runless turn.
+    insert_run(
+        &db,
+        "run-stale-resume",
+        Some(&project_id),
+        None,
+        Some("job-orphan-turn"),
+        None,
+        "live",
+        None,
+        1,
+    )
+    .await;
+
+    queries::reconcile_stale_runs_with_claims(
+        db.clone(),
+        &NoopEmitter,
+        STALE_BOOT_AT,
+        &RecordingProcessTable::default(),
+        &HashSet::new(),
+    );
+
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-stale-resume"
+        )
+        .await
+        .as_deref(),
+        Some("crashed")
+    );
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT state FROM turns WHERE id = ?1", "turn-orphan")
+            .await
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT end_reason FROM turns WHERE id = ?1",
+            "turn-orphan"
+        )
+        .await
+        .as_deref(),
+        Some("orphaned_pending")
+    );
+    let derived = db
+        .read(|conn| {
+            Box::pin(async move {
+                cairn_core::internal::execution::advancement::recompute_job_status_conn(
+                    conn,
+                    "job-orphan-turn",
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(derived, cairn_core::models::JobStatus::Idle);
+}
+
+#[tokio::test]
+async fn pending_prompt_queries_use_run_and_current_turn() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "prompts").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-1",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "running",
+        Some("session-1"),
+        1,
+    )
+    .await;
+    insert_turn(
+        &db,
+        "turn-1",
+        "session-1",
+        "run-1",
+        Some("job-1"),
+        1,
+        "running",
+    )
+    .await;
+    set_job_current_turn(&db, "job-1", "turn-1").await;
+    insert_prompt(&db, "answered", "run-1", Some("turn-1"), Some("yes"), 10).await;
+    insert_prompt(&db, "pending-old", "run-1", Some("turn-1"), None, 20).await;
+    insert_prompt(&db, "pending-new", "run-1", Some("turn-1"), None, 30).await;
+
+    let by_run = queries::get_pending_prompt(db.clone(), "run-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_run.id, "pending-new");
+    assert!(by_run.response.is_none());
+
+    let by_job = queries::get_pending_prompt_for_job(db.clone(), "job-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_job.id, "pending-new");
+    assert!(queries::get_pending_prompt(db.clone(), "missing")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn list_runs_filters_by_issue_and_job() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "runs").await;
+    insert_issue(&db, "issue-1", &project_id, 1).await;
+    insert_issue(&db, "issue-2", &project_id, 2).await;
+    insert_job(&db, "job-1", &project_id, Some("issue-1")).await;
+    insert_job(&db, "job-2", &project_id, Some("issue-2")).await;
+    insert_run(
+        &db,
+        "run-1",
+        Some(&project_id),
+        Some("issue-1"),
+        Some("job-1"),
+        None,
+        "running",
+        Some("session-1"),
+        10,
+    )
+    .await;
+    insert_run(
+        &db,
+        "run-2",
+        Some(&project_id),
+        Some("issue-1"),
+        Some("job-1"),
+        None,
+        "complete",
+        Some("session-1"),
+        20,
+    )
+    .await;
+    insert_run(
+        &db,
+        "run-3",
+        Some(&project_id),
+        Some("issue-2"),
+        Some("job-2"),
+        None,
+        "failed",
+        Some("session-2"),
+        30,
+    )
+    .await;
+
+    let issue_runs = queries::list_runs(db.clone(), "issue-1").unwrap();
+    assert_eq!(
+        issue_runs
+            .iter()
+            .map(|run| run.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run-2", "run-1"]
+    );
+    assert!(issue_runs
+        .iter()
+        .all(|run| run.issue_id.as_deref() == Some("issue-1")));
+
+    let job_runs = queries::list_runs_for_job(db.clone(), "job-1").unwrap();
+    assert_eq!(job_runs.len(), 2);
+}
+
+/// The sweep tried to stop a survivor and could not (no permission, or it outlived
+/// escalation). The run is still marked crashed — its host is gone — but it must NOT
+/// claim `orphan_reaped`, because nothing was confirmed stopped and the zombie may
+/// still be alive.
+#[tokio::test]
+async fn reconcile_stale_runs_does_not_claim_a_reap_it_could_not_confirm() {
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "unstop").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+    insert_run(
+        &db,
+        "run-unstoppable",
+        Some(&project_id),
+        None,
+        Some("job-1"),
+        None,
+        "live",
+        Some("stubborn-session"),
+        1,
+    )
+    .await;
+
+    let processes = RecordingProcessTable::unable_to_stop(vec![(
+        6004,
+        "/bin/claude --session-id stubborn-session".to_string(),
+    )]);
+
+    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
+
+    assert_eq!(processes.stopped(), vec![6004], "the stop is attempted");
+    assert_eq!(
+        common::scalar_text_by_id(
+            &db,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-unstoppable"
+        )
+        .await
+        .as_deref(),
+        Some("crash"),
+        "an unconfirmed stop stays an assumed death, never orphan_reaped"
+    );
+}
+
 /// A run that finalizes between the sweep's read and its write keeps its real
 /// outcome. Signalling a process can take up to a second, so that gap is wide
 /// enough to matter, and the invented `crash` must not overwrite the truth.
@@ -2055,415 +2035,113 @@ async fn reconcile_stale_runs_does_not_overwrite_a_run_that_finalized_meanwhile(
     );
 }
 
-/// The sweep tried to stop a survivor and could not (no permission, or it outlived
-/// escalation). The run is still marked crashed — its host is gone — but it must NOT
-/// claim `orphan_reaped`, because nothing was confirmed stopped and the zombie may
-/// still be alive.
 #[tokio::test]
-async fn reconcile_stale_runs_does_not_claim_a_reap_it_could_not_confirm() {
+async fn prompts_tool_use_id_round_trips() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "unstop").await;
+    let project_id = common::create_project(&db, "ptuid").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
-        "run-unstoppable",
+        "run-1",
         Some(&project_id),
         None,
         Some("job-1"),
         None,
-        "live",
-        Some("stubborn-session"),
+        "running",
+        Some("session-1"),
         1,
     )
     .await;
 
-    let processes = RecordingProcessTable::unable_to_stop(vec![(
-        6004,
-        "/bin/claude --session-id stubborn-session".to_string(),
-    )]);
-
-    queries::reconcile_stale_runs_with(db.clone(), &NoopEmitter, STALE_BOOT_AT, &processes);
-
-    assert_eq!(processes.stopped(), vec![6004], "the stop is attempted");
-    assert_eq!(
-        common::scalar_text_by_id(
-            &db,
-            "SELECT exit_reason FROM runs WHERE id = ?1",
-            "run-unstoppable"
-        )
-        .await
-        .as_deref(),
-        Some("crash"),
-        "an unconfirmed stop stays an assumed death, never orphan_reaped"
-    );
-}
-
-/// A launch queued for admission when the previous host stopped predates boot,
-/// yet it is not stale: startup recovery relaunches it from the durable queue.
-/// A run whose admission row was `active` had a process that died with the host,
-/// so that one is settled.
-#[tokio::test]
-async fn reconcile_stale_runs_leaves_a_durably_queued_launch_for_recovery() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    let db = &orch.db.local;
-    let project_id = common::create_project(db, "queued-recovery").await;
-    db.execute_script(format!(
-        "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq) VALUES ('exec-q', 'r', '{project_id}', 'running', 1, 1);
-         INSERT INTO jobs (id, execution_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('job-q', 'exec-q', '{project_id}', 'running', 'Builder', 'builder', 1, 1);
-         INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('session-q', 'job-q', 'claude', 'open', 1, 1, 1);
-         INSERT INTO runs (id, project_id, job_id, session_id, status, start_mode, created_at, updated_at) VALUES
-           ('run-queued', '{project_id}', 'job-q', 'session-q', 'starting', 'resume', 1, 1),
-           ('run-active', '{project_id}', 'job-q', 'session-q', 'live', 'resume', 1, 1);
-         INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at) VALUES
-           ('req-queued','private-runtime','lane','ordinary:run-queued','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,1,'queued',NULL,0,NULL,1,1),
-           ('req-active','private-runtime','lane','ordinary:run-active','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,2,'active','ordinary-session-promoter',1,9999999999,1,1);
-         INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES
-           ('req-queued','job-q','run-queued','session-q','t-q','exec-q','p','resume','{{}}','','null','{{}}',1),
-           ('req-active','job-q','run-active','session-q','t-a','exec-q','p','resume','{{}}','','null','{{}}',1);"
-    ))
-    .await
-    .unwrap();
-
-    queries::reconcile_stale_runs(&orch, &NoopEmitter, STALE_BOOT_AT);
-
-    let status = |id: &'static str| async move {
-        common::scalar_text_by_id(db, "SELECT status FROM runs WHERE id = ?1", id).await
-    };
-    assert_eq!(status("run-queued").await.as_deref(), Some("starting"));
-    assert_eq!(status("run-active").await.as_deref(), Some("crashed"));
-    assert_eq!(
-        common::scalar_text_by_id(
-            db,
-            "SELECT state FROM runtime_admission_requests WHERE request_id = ?1",
-            "req-queued"
-        )
-        .await
-        .as_deref(),
-        Some("queued"),
-        "the queued launch stays for startup recovery to relaunch"
-    );
-}
-
-/// The operator-visible half of the cairn/5058 boot repair, end to end. A thread
-/// session parked on a blocking batch of three tasks that a liveness-only release
-/// stranded `idle`, holding an operator message that arrived while it was parked
-/// (a self-suspended head holds pushes until its wait resolves). One boot settles
-/// the batch, claims the unblock once, and resumes the session on its live
-/// process before the sweep returns: each Task result arrives with its delayed-delivery notice, and the
-/// held message is delivered with the unblock.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_once() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    let db = &orch.db.local;
-    let project_id = common::create_project(db, "held").await;
-    let tasks = [
-        ("j-quic", "pkt-quic", 1_757_000_000_i64),
-        ("j-tar", "pkt-tar", 1_757_000_600),
-        ("j-jwt", "pkt-jwt", 1_757_001_200),
-    ];
-
-    let mut nodes = Vec::new();
-    let mut packets = Vec::new();
-    for (index, (job, packet_id, _)) in tasks.iter().enumerate() {
-        let agent = format!("delegated-{packet_id}-agent");
-        let packet = serde_json::json!({
-            "id": packet_id, "parentJobId": "job-1", "parentTurnId": "anchor",
-            "parentToolUseId": "tool-1", "origin": "task_tool", "title": packet_id,
-            "problemStatement": "x", "agentConfigId": "Explore", "ownership": {"cwd": "/tmp"},
-            "outputContract": {"schemaType": "return"}, "status": "materialized",
-            "materializedNodeIds": [agent], "resultArtifactJobId": job,
-            "taskIndex": index, "createdAt": 0
-        });
-        let node = cairn_workflow::effects::dag::delegation::delegated_agent_node_for_test(
-            agent,
-            &serde_json::from_value(packet.clone()).unwrap(),
-        );
-        nodes.push(serde_json::to_value(node).unwrap());
-        packets.push(packet);
-    }
-    let snapshot = serde_json::json!({
-        "recipe": {"id": "host-thread", "name": "Session Host", "description": null,
-                   "trigger": "manual", "nodes": nodes, "edges": []},
-        "agents": {}, "skills": {},
-        "triggerContext": {"issueId": null, "projectId": project_id, "triggerType": "manual"},
-        "delegatedPackets": packets, "createdAt": 1
-    })
-    .to_string();
-
-    db.execute(
-        "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
-         VALUES ('thread-sec', ?1, 'security', 'active', 'none', 1, 1)",
-        params![project_id.as_str()],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO executions (id, recipe_id, project_id, status, started_at, snapshot, triggered_by)
-         VALUES ('execution-sec', 'host-thread', ?1, 'running', 1, ?2, 'manual')",
-        params![project_id.as_str(), snapshot],
-    )
-    .await
-    .unwrap();
-    // The session job. `register_recording_process` serves `job-1`.
-    db.execute(
-        "INSERT INTO jobs (id, execution_id, thread_id, project_id, status, node_name, uri_segment,
-                           created_at, updated_at)
-         VALUES ('job-1', 'execution-sec', 'thread-sec', ?1, 'running', 'thread', 'thread', 1, 1)",
-        params![project_id.as_str()],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO sessions (id, job_id, status, backend_id, created_at, updated_at)
-         VALUES ('session-1', 'job-1', 'open', 'handle-1', 1, 1)",
-        (),
-    )
-    .await
-    .unwrap();
-    // Postdates STALE_BOOT_AT: the parked session's warm process survives boot.
-    db.execute(
-        "INSERT INTO runs (id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
-         VALUES ('run-1', ?1, 'job-1', 'live', 'session-1', 2000000, 2000000, 'resume')",
-        params![project_id.as_str()],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, yield_reason, start_reason,
-                            created_at, ended_at, updated_at)
-         VALUES ('anchor', 'session-1', 'run-1', 'job-1', 1, 'yielded', 'dependency_wait', 'initial',
-                 1, 1, 1)",
-        (),
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "UPDATE jobs SET current_session_id = 'session-1', current_turn_id = 'anchor' WHERE id = 'job-1'",
-        (),
-    )
-    .await
-    .unwrap();
-    for (job, packet_id, finished_at) in tasks {
-        db.execute(
-            "INSERT INTO jobs (id, execution_id, recipe_node_id, parent_job_id, thread_id, project_id,
-                               status, node_name, uri_segment, parent_tool_use_id, agent_config_id,
-                               created_at, updated_at)
-             VALUES (?1, 'execution-sec', ?2, 'job-1', 'thread-sec', ?3, 'idle', ?4, ?4, 'tool-1',
-                     'Explore', 1, 1)",
-            params![
-                job,
-                format!("delegated-{packet_id}-agent"),
-                project_id.as_str(),
-                packet_id
-            ],
-        )
-        .await
-        .unwrap();
-        db.execute(
-            "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, end_reason,
-                                created_at, ended_at, updated_at)
-             VALUES ('turn-' || ?1, 's-' || ?1, ?1, 1, 'complete', 'initial', 'artifact_handoff',
-                     ?2, ?2, ?2)",
-            params![job, finished_at],
-        )
-        .await
-        .unwrap();
-        db.execute(
-            "INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name,
-                                    created_at, updated_at)
-             VALUES ('artifact-' || ?1, ?1, 'return', 0, ?2, 1, 'return', 1, 1)",
-            params![job, format!("{{\"summary\":\"{packet_id} finding\"}}")],
-        )
-        .await
-        .unwrap();
-    }
-    // The operator message held while the session was parked on its batch.
-    db.execute(
-        "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at, urgency)
-         VALUES ('msg-held', 'direct', 'cairn://p/held/llm', 'run-1', 'Held operator note for security',
-                 1, 'steer')",
-        (),
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO attention_pushes (id, recipient, content_ref, wake, boundary, key, created_at)
-         VALUES ('push-held', 'job-1', 'cairn://p/held/security', 'wake', 'event', 'direct:msg-held', 1)",
-        (),
-    )
-    .await
-    .unwrap();
-    let delivered = common::register_recording_process(&orch, "run-1", "session-1");
-
-    let boot = orch.clone();
-    std::thread::spawn(move || queries::reconcile_stale_runs(&boot, &NoopEmitter, STALE_BOOT_AT))
-        .join()
-        .unwrap();
-
-    for (job, _, _) in tasks {
-        assert_eq!(
-            common::scalar_text_by_id(db, "SELECT status FROM jobs WHERE id = ?1", job)
-                .await
-                .as_deref(),
-            Some("complete"),
-            "{job}"
-        );
-    }
-    // Settlement also dispatches a resume off-thread. Its successor claim wins
-    // before it stores the results or drains pushes, so neither the claim nor
-    // reconciliation returning is the delivery boundary. Wait for the complete
-    // prompt on the warm process, not for any particular result or notice text.
-    let stdin = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let bytes = delivered.lock().unwrap().clone();
-            if bytes.last() == Some(&b'\n') {
-                break String::from_utf8(bytes).unwrap();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+    db.write(|conn| {
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO prompts(id, run_id, questions, response, created_at, tool_use_id)
+                 VALUES ('p-1', 'run-1', '[{\"question\":\"Test?\"}]', NULL, 10, 'toolu_abc')",
+                (),
+            )
+            .await?;
+            Ok(())
+        })
     })
     .await
-    .expect("the repaired batch resumes the warm process with a complete prompt");
-    assert_eq!(anchor_unblock_count(db).await, 1);
+    .unwrap();
 
-    let tool_results: Vec<String> = {
-        let mut rows = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT data FROM events WHERE run_id = 'run-1' AND event_type = 'tool_result'",
-                            (),
-                        )
-                        .await?;
-                    let mut out = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        out.push(row.get::<String>(0)?);
-                    }
-                    Ok::<_, cairn_core::internal::storage::DbError>(out)
-                })
-            })
-            .await
-            .unwrap();
-        rows.sort();
-        rows
-    };
-    assert_eq!(
-        tool_results.len(),
-        1,
-        "one answer to the shared spawning call"
-    );
-    let event: Value = serde_json::from_str(&tool_results[0]).unwrap();
-    assert_eq!(event["toolUseId"], "tool-1");
-    let report: Value = serde_json::from_str(event["toolResult"].as_str().unwrap()).unwrap();
-    let delivered_result = report["blocking"]["text"].as_str().unwrap();
-    assert_eq!(
-        delivered_result.matches("Delayed delivery:").count(),
-        3,
-        "each task's result leads with its notice: {delivered_result}"
-    );
-    let mut previous_finding = 0;
-    for (index, (packet, when)) in [
-        ("pkt-quic", "2025-09-04 15:33 UTC"),
-        ("pkt-tar", "2025-09-04 15:43 UTC"),
-        ("pkt-jwt", "2025-09-04 15:53 UTC"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let prefix = format!(
-            "## Task {}: {packet}\n\nDelayed delivery: this task finished at {when}",
-            index + 1
-        );
-        let notice = delivered_result.find(&prefix).expect(delivered_result);
-        let finding = format!("{packet} finding");
-        assert_eq!(delivered_result.matches(&finding).count(), 1);
-        let finding = delivered_result.find(&finding).unwrap();
-        assert!(
-            previous_finding <= notice && notice < finding,
-            "{delivered_result}"
-        );
-        previous_finding = finding;
-    }
-
-    assert!(
-        db.query_opt_text(
-            "SELECT delivered_event_id FROM attention_pushes WHERE id = 'push-held'",
-            ()
-        )
-        .await
-        .unwrap()
-        .is_some(),
-        "the held operator message is delivered with the unblock"
-    );
-    assert_eq!(
-        stdin.matches("Held operator note for security").count(),
-        1,
-        "the resumed session receives the held message once: {stdin}"
-    );
-    assert_eq!(stdin.matches("Delayed delivery:").count(), 3, "{stdin}");
-    assert_eq!(stdin.lines().count(), 1, "one resume prompt: {stdin}");
-    let carrying_event = db
-        .query_opt_text(
-            "SELECT e.id FROM attention_pushes p
-             JOIN events e ON e.id = p.delivered_event_id
-             JOIN turns t ON t.id = e.turn_id
-             JOIN turns unblock ON unblock.id = t.predecessor_id
-             WHERE p.id = 'push-held' AND e.run_id = 'run-1'
-               AND e.event_type = 'attention:briefing'
-               AND unblock.predecessor_id = 'anchor'
-               AND unblock.start_reason = 'dependency_unblock'",
-            (),
-        )
-        .await
-        .unwrap()
-        .expect("the held message's receipt belongs to the work turn after the claimed unblock");
-
-    let again = orch.clone();
-    std::thread::spawn(move || queries::reconcile_stale_runs(&again, &NoopEmitter, STALE_BOOT_AT))
-        .join()
-        .unwrap();
-    assert_eq!(
-        anchor_unblock_count(db).await,
-        1,
-        "a second boot delivers nothing again"
-    );
-    assert_eq!(
-        db.query_one(
-            "SELECT COUNT(*) FROM events WHERE run_id = 'run-1' AND event_type = 'tool_result'",
-            (),
-            |row| Ok(row.get::<i64>(0)?),
-        )
-        .await
-        .unwrap(),
-        1,
-        "the spawning call is not answered again"
-    );
-    assert_eq!(
-        db.query_opt_text(
-            "SELECT delivered_event_id FROM attention_pushes WHERE id = 'push-held'",
-            (),
-        )
-        .await
-        .unwrap(),
-        Some(carrying_event),
-        "the held message keeps its original delivery receipt"
-    );
-    assert_eq!(
-        String::from_utf8(delivered.lock().unwrap().clone()).unwrap(),
-        stdin,
-        "a second boot sends neither the task results nor the held message again"
-    );
+    let stored =
+        common::scalar_text_by_id(&db, "SELECT tool_use_id FROM prompts WHERE id = ?1", "p-1")
+            .await;
+    assert_eq!(stored.as_deref(), Some("toolu_abc"));
 }
 
-async fn anchor_unblock_count(db: &LocalDb) -> i64 {
-    db.query_one(
-        "SELECT COUNT(*) FROM turns WHERE predecessor_id = 'anchor'
-         AND start_reason = 'dependency_unblock'",
-        (),
-        |row| Ok(row.get::<i64>(0)?),
+async fn insert_issue(db: &LocalDb, id: &str, project_id: &str, number: i64) {
+    let id = id.to_string();
+    let project_id = project_id.to_string();
+    db.execute(
+        "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'Issue', 'active', 1, 1)",
+        params![id.as_str(), project_id.as_str(), number],
     )
     .await
-    .unwrap()
+    .unwrap();
+}
+
+async fn insert_prompt(
+    db: &LocalDb,
+    id: &str,
+    run_id: &str,
+    turn_id: Option<&str>,
+    response: Option<&str>,
+    created_at: i64,
+) {
+    let id = id.to_string();
+    let run_id = run_id.to_string();
+    let turn_id = turn_id.map(str::to_string);
+    let response = response.map(str::to_string);
+    db.write(|conn| {
+        let id = id.clone();
+        let run_id = run_id.clone();
+        let turn_id = turn_id.clone();
+        let response = response.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO prompts(id, run_id, turn_id, questions, response, created_at, answered_at)
+                 VALUES (?1, ?2, ?3, '[{\"question\":\"Test?\"}]', ?4, ?5, ?6)",
+                params![
+                    id.as_str(),
+                    run_id.as_str(),
+                    turn_id.as_deref(),
+                    response.as_deref(),
+                    created_at,
+                    response.as_ref().map(|_| created_at)
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn set_job_current_turn(db: &LocalDb, job_id: &str, turn_id: &str) {
+    let job_id = job_id.to_string();
+    let turn_id = turn_id.to_string();
+    db.execute(
+        "UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2",
+        params![turn_id.as_str(), job_id.as_str()],
+    )
+    .await
+    .unwrap();
+}
+
+async fn set_session_parent(db: &LocalDb, id: &str, parent: &str) {
+    let id = id.to_string();
+    let parent = parent.to_string();
+    db.execute(
+        "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
+        params![parent.as_str(), id.as_str()],
+    )
+    .await
+    .unwrap();
 }

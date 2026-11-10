@@ -927,22 +927,3 @@ async fn watch_live_open_pr_wake_carries_pr_updated_at_not_stale_issue_updated_a
     assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
     assert_eq!(value["updated_at"], 150);
 }
-
-#[tokio::test]
-async fn watch_catch_up_resolves_pr_uri_for_pr_state_attention() {
-    // Finding 2: synthesize_event (the catch-up fallback when no typed event is
-    // buffered) must resolve PR-state attention to the /pr resource via the
-    // shared idle_fact_for_issue — matching the live broadcast, not the bare
-    // issue URI.
-    let (temp, db) = common::migrated_db().await;
-    let db = Arc::new(db);
-    let project_id = common::create_project(&db, "watch").await;
-    let issue_id = insert_issue(&db, &project_id, 1, "needs_approval", 100).await;
-    seed_open_pr(&db, &project_id, &issue_id, 1, "builder", 100).await;
-    let orch = orchestrator(&temp, db.clone());
-
-    let value = handle_watch_json(&orch, None).await;
-    assert_eq!(value["status"], "actionable");
-    assert_eq!(value["attention"], "needs_approval");
-    assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
-}

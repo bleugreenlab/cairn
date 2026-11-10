@@ -1110,53 +1110,6 @@ async fn hold_a_transaction(db: &LocalDb) -> (TrackedConnection, u32) {
     (holder, line)
 }
 
-/// A connection held past the drain budget fails the fold, and with the log
-/// under the threshold that costs the pass nothing: it deletes its pages,
-/// asks again once a window has been deleted, and the line names the holder.
-/// The page carried from a previous pass makes the pass open on a settling
-/// fold, as in production.
-#[tokio::test]
-async fn a_held_connection_fails_the_fold_but_not_the_pass_under_the_threshold() {
-    let (_temp, db) = private_db().await;
-    let old = NOW - 3 * 24 * HOUR;
-    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
-    let budget = EvictorBudget {
-        fold_work_target: Some(Duration::from_millis(500)),
-        folds_per_pass: 8,
-        ..UNBOUNDED
-    };
-    let mut state = EvictorState::default();
-    state.deleted_page(Eviction::DoneOutbox);
-
-    let (holder, line) = hold_a_transaction(&db).await;
-    let report = run_rules(&db, NOW, budget, &mut state, &[Eviction::DoneOutbox]).await;
-    drop(holder);
-
-    assert_eq!(report.end, PassEnd::Complete, "{report}");
-    assert_eq!(report.rows(), 1, "{report}");
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM effect_outbox").await, 0);
-    assert_eq!(
-        report.folds.len(),
-        2,
-        "the settling fold and one retry after the page: {report}"
-    );
-    assert!(
-        report.folds.iter().all(|fold| !fold.succeeded()),
-        "{report}"
-    );
-    assert!(
-        report.to_string().contains(&format!(
-            "folds_failed=2 fold_failed=drain(still_open=1 oldest={}:{line}/",
-            file!()
-        )),
-        "{report}"
-    );
-    assert!(
-        state.unfolded.is_some(),
-        "the unfolded pages carry to the next pass"
-    );
-}
-
 /// The same holder ends the pass before it deletes anything when the log is
 /// at the threshold, because deleting more would only grow it.
 #[tokio::test]

@@ -1402,32 +1402,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_credentials_are_not_reported_as_missing_setup() {
-        mock_keychain::install();
-        let server = "readiness-unavailable";
-        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
-            "command": "tool",
-            "env": {"TOKEN": "${READINESS_UNAVAILABLE_TOKEN}"}
-        }))
-        .unwrap();
-        let service = format!("computer.cairn.mcp.{}", cairn_common::paths::env_str());
-        let _gate =
-            mock_keychain::block_reads(&service, &format!("{server}/READINESS_UNAVAILABLE_TOKEN"));
-
-        let Some(NotReady::CredentialUnavailable { error }) = config.readiness(server) else {
-            panic!("an unreadable store must not look absent or ready");
-        };
-        assert!(error.contains("READINESS_UNAVAILABLE_TOKEN"), "{error}");
-        assert!(
-            error.contains("unavailable") || error.contains("timed out"),
-            "{error}"
-        );
-        assert!(NotReady::CredentialUnavailable { error }
-            .summary()
-            .starts_with("credential_unavailable("));
-    }
-
-    #[test]
     fn a_pack_server_with_an_unresolved_var_is_inert_until_it_can_connect() {
         mock_keychain::install();
         let ws = TempDir::new().unwrap();

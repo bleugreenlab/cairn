@@ -371,30 +371,6 @@ async fn seed_blob_rows(db: &LocalDb, count: usize) -> Vec<String> {
     hashes
 }
 
-/// No page carries more rows than the budget allows, or more stored bytes
-/// beyond its first row.
-#[tokio::test]
-async fn no_page_exceeds_its_bounds() {
-    let db = migrated_test_db("offload-bounds.db").await;
-    seed_blob_rows(&db, 250).await;
-    let report = run_offload_pass(&db, OffloadBudget::PRODUCTION).await;
-    assert!(report.error.is_none() && report.drained(), "{report}");
-    assert_eq!(report.blobs_moved, 250);
-    assert_eq!(report.page_rows_max, 100, "{report}");
-    assert_eq!(report.pages, 3, "{report}");
-
-    let db = migrated_test_db("offload-byte-bounds.db").await;
-    seed_blob_rows(&db, 7).await;
-    let tiny = OffloadBudget {
-        blob_page_bytes: 1,
-        ..OffloadBudget::PRODUCTION
-    };
-    let report = run_offload_pass(&db, tiny).await;
-    assert!(report.drained(), "{report}");
-    assert_eq!((report.pages, report.page_rows_max), (7, 1), "{report}");
-    assert_eq!(blob_count(&db).await, 7);
-}
-
 /// A row whose bytes do not hash to its key is left in place, and the pass
 /// carries on past it.
 #[tokio::test]

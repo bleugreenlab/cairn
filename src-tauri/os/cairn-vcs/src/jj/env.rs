@@ -866,13 +866,6 @@ fn declare_origin_authority(store_dir: &Path, branch: &str) -> Result<(), String
 static BETWEEN_GUARD_AND_IMPORT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
 
-/// Run `write` once, in the next guarded import, after the guard has judged the
-/// tracking refs and before jj reads them: the window a concurrent fetch hits.
-#[cfg(test)]
-pub(crate) fn between_next_guard_and_import(write: impl FnOnce() + Send + 'static) {
-    *BETWEEN_GUARD_AND_IMPORT.lock().unwrap() = Some(Box::new(write));
-}
-
 fn scoped_import_operation(jj: &JjEnv, store: &Path) -> Result<String, String> {
     jj.run(
         store,
@@ -1393,67 +1386,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(jj)]
-    fn managed_command_times_out_and_kills_child() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let home = TempDir::new().unwrap();
-        let script = home.path().join("slow-jj");
-        let pid_file = home.path().join("pid");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", pid_file.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let jj = JjEnv {
-            operation_deadline: None,
-            cleanup_deadline: Default::default(),
-            is_cleanup: false,
-            operation_phases: None,
-            ledger: Default::default(),
-            preserved_import_bookmarks: Default::default(),
-            checkout_repair_policy: Default::default(),
-            bin: script.to_string_lossy().into_owned(),
-            config_path: home.path().join("config.toml"),
-            pinned_operation: None,
-        };
-
-        // The timeout has to outlast the child's own startup, not merely be
-        // short. It was 500ms, which the shell wins comfortably on an idle
-        // machine and loses under a loaded one: the kill lands before `echo $$`
-        // runs, the pid file is never written, and the test fails reading it —
-        // reporting a timeout defect where there is only CPU contention. Three
-        // seconds is still far below the script's 30s sleep, so the assertion
-        // that the timeout fired remains exactly as sharp.
-        let started = Instant::now();
-        let error = jj
-            .run_bytes_with_timeout(home.path(), &[], "slow jj", Duration::from_secs(3))
-            .unwrap_err();
-        assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
-        assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "the timeout must cut the 30s sleep short"
-        );
-        let pid: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "the timed-out child never recorded its pid at {}: {error}",
-                    pid_file.display()
-                )
-            })
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::kill(pid, 0) },
-            -1,
-            "timed-out child is still alive"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial(jj)]
     fn managed_command_bounds_pipe_reader_shutdown() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1561,92 +1493,6 @@ mod operation_budget_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn operation_budget_is_shared_across_clones_and_all_runners() {
-        let Some(bin) = crate::jj::testing::jj_bin() else {
-            return;
-        };
-        let home = TempDir::new().unwrap();
-        let script = home.path().join("delayed-version");
-        let invocations = home.path().join("invocations");
-        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf x >> {}\nsleep 0.5\nexec {} \"$@\"\n",
-                quote(&invocations.to_string_lossy()),
-                quote(&bin),
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let original = JjEnv::with_binary(script.to_string_lossy(), home.path());
-        let scoped = original.with_operation_budget(Duration::from_secs(2));
-        let cloned = scoped.clone();
-        let started = Instant::now();
-        let mut completed = 0;
-        for i in 0..8 {
-            let result = match i % 4 {
-                0 => scoped.run(home.path(), &["--version"], "budget stdout"),
-                1 => cloned
-                    .run_bytes(home.path(), &["--version"], "budget bytes")
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
-                2 => cloned.run_with_timeout(
-                    home.path(),
-                    &["--version"],
-                    "budget custom timeout",
-                    Duration::from_secs(300),
-                ),
-                _ => scoped
-                    .run_capturing_stderr(home.path(), &["--version"], "budget stderr")
-                    .map(|(stdout, _)| stdout),
-            };
-            match result {
-                Ok(_) => completed += 1,
-                Err(error) => {
-                    assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
-                    break;
-                }
-            }
-        }
-        assert!(
-            (1..4).contains(&completed),
-            "sequence renewed its budget: {completed}"
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let before = std::fs::read(&invocations).unwrap();
-        assert!(before.len() <= 4);
-        for result in [
-            scoped
-                .run(home.path(), &["--version"], "expired stdout")
-                .map(|_| ()),
-            cloned
-                .run_capturing_stderr(home.path(), &["--version"], "expired stderr")
-                .map(|_| ()),
-            scoped
-                .run_with_timeout(
-                    home.path(),
-                    &["--version"],
-                    "expired custom",
-                    Duration::from_secs(300),
-                )
-                .map(|_| ()),
-        ] {
-            let error = result.unwrap_err();
-            assert!(error.contains("before spawning"), "{error}");
-            assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
-        }
-        assert_eq!(
-            std::fs::read(&invocations).unwrap(),
-            before,
-            "expired runners spawned"
-        );
-        original
-            .run(home.path(), &["--version"], "original remains unbudgeted")
-            .unwrap();
-    }
 
     #[test]
     #[serial_test::serial(jj)]

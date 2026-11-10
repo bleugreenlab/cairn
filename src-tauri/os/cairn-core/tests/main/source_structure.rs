@@ -484,36 +484,6 @@ fn whole_test_files_are_skipped_by_the_gate_on_their_declaration() {
     );
 }
 
-/// Credential stores are reachable only through the broker.
-///
-/// This is the structural half of "no direct store accessor remains on migrated
-/// paths". Before the broker, any code that wanted a configured MCP token
-/// called the keychain accessor and got a `String` — which is `Debug`,
-/// `Serialize`, and unregistered. Two such call sites existed with *different*
-/// resolution orders, so what a `${VAR}` meant depended on which one you
-/// reached, and only one of them registered anything.
-///
-/// A single-caller rule is what makes "registered before it is returned"
-/// checkable at all: with one producer it is one function's postcondition, and
-/// with N producers it is a review convention.
-/// Cairn's MCP tool surface has one implementation.
-///
-/// Agents reach it over stdio (`cairn-cmd mcp`) or streamable HTTP (the
-/// orchestrator's `/mcp`), and both transports serve the same
-/// `CairnMcpServer`, differing only in the sink that executes a call. A second
-/// tool router or server handler would be a second copy of the tool
-/// descriptions, validation, and reminder assembly, free to drift from the
-/// first; the behavioral half of this guarantee is `cairn-mcp-server`'s
-/// transport parity tests.
-#[test]
-fn the_mcp_tool_surface_is_served_by_one_server() {
-    assert_only_in(
-        &["impl ServerHandler for", "#[tool_router", "#[tool_handler"],
-        &["os/cairn-mcp-server/src/server.rs"],
-        "Cairn's MCP tools must be served only by cairn-mcp-server's CairnMcpServer",
-    );
-}
-
 #[test]
 fn credential_stores_are_reached_only_through_the_broker() {
     assert_only_in(

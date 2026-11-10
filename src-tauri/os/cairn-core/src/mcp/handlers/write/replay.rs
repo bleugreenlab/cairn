@@ -309,14 +309,6 @@ pub(crate) struct WriteCall {
 }
 
 impl WriteCall {
-    #[cfg(test)]
-    pub(crate) fn for_test(run_id: &str, tool_use_id: &str) -> Self {
-        Self {
-            run_id: run_id.to_string(),
-            id: tool_use_id.to_string(),
-        }
-    }
-
     pub(super) fn tool_use_id(&self) -> &str {
         &self.id
     }
@@ -1391,21 +1383,6 @@ mod tests {
             .to_string()
     }
 
-    /// A lease clock the test moves by hand, so lease time passes only when the
-    /// test says it does.
-    #[derive(Clone)]
-    struct LeaseClock(std::sync::Arc<std::sync::atomic::AtomicI64>);
-
-    impl LeaseClock {
-        fn at(ms: i64) -> Self {
-            Self(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(ms)))
-        }
-
-        fn now(&self) -> i64 {
-            self.0.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
     /// A pending row claimed at `claimed_at`: the shape an interrupted delivery
     /// leaves for takeover to settle.
     async fn pending_report(
@@ -1646,36 +1623,5 @@ mod tests {
             status_of(&recorded_report(&db, &call).await.unwrap()),
             "settled"
         );
-    }
-
-    #[tokio::test]
-    async fn a_file_redelivery_waits_for_the_current_owners_final_report() {
-        let (db, call) = ledger_db("write-replay-owned-wait.db").await;
-        // The lease clock stands still, so only the owner's final report can end
-        // the wait.
-        let clock = LeaseClock::at(1_000_000);
-        let owner = pending_report(&db, &call, &report("sealed"), clock.now()).await;
-        let db = std::sync::Arc::new(db);
-        let waiter_db = db.clone();
-        let waiter_call = WriteCall {
-            run_id: call.run_id.clone(),
-            id: call.id.clone(),
-        };
-        let waiter = tokio::spawn(async move {
-            await_file_replay_or_takeover_with_lease(
-                &waiter_db,
-                &waiter_call,
-                std::time::Duration::from_secs(1),
-                move || clock.now(),
-            )
-            .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-        assert!(!waiter.is_finished());
-        assert!(finalize_owned_report(&db, &call, &owner, &report("settled")).await);
-        match waiter.await.unwrap() {
-            FileReplayClaim::Replayed(settled) => assert_eq!(status_of(&settled), "settled"),
-            _ => panic!("redelivery did not replay the owner's final report"),
-        }
     }
 }

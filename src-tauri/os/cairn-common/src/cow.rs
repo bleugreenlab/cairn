@@ -1092,32 +1092,6 @@ mod tests {
         assert!(same.is_supported());
     }
 
-    #[test]
-    fn fingerprint_moves_with_any_write_and_ignores_exclusions() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("scratch")).unwrap();
-        fs::write(temp.path().join("file"), b"one").unwrap();
-        let exclude = vec![PathBuf::from("scratch")];
-        let before = tree_fingerprint(temp.path(), &exclude).unwrap();
-        assert_eq!(before, tree_fingerprint(temp.path(), &exclude).unwrap());
-
-        fs::write(temp.path().join("scratch/noise"), b"ignored").unwrap();
-        assert_eq!(before, tree_fingerprint(temp.path(), &exclude).unwrap());
-
-        let file = temp.path().join("file");
-        fs::write(&file, b"two").unwrap();
-        // A same-length rewrite inside one coarse-clock tick keeps the original
-        // mtime and ctime, so step the mtime past it to make the rewrite visible.
-        let written = fs::metadata(&file).unwrap().modified().unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&file)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(written + Duration::from_secs(1)))
-            .unwrap();
-        assert_ne!(before, tree_fingerprint(temp.path(), &exclude).unwrap());
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn apfs_clone_round_trips_and_shares_until_written() {

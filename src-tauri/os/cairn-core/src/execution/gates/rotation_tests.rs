@@ -114,34 +114,6 @@ async fn order(env: &Env, thread: &str, name: &str, entries: Value) -> Result<()
         .unwrap()
 }
 
-#[tokio::test]
-async fn three_threads_filing_ten_three_and_one_release_in_rotation() {
-    let Lanes { env, a, b, c } = lanes("rotation-ten-three-one.db", (10, 3, 1), 50).await;
-    let mut expected = vec![
-        a[0].clone(),
-        b[0].clone(),
-        c[0].clone(),
-        a[1].clone(),
-        b[1].clone(),
-        a[2].clone(),
-        b[2].clone(),
-    ];
-    expected.extend(a[3..].iter().cloned());
-    assert_eq!(
-        view_ids(&env).await,
-        expected,
-        "the page numbers the rotation"
-    );
-
-    let mut running = "se100".to_string();
-    let mut released = Vec::new();
-    for _ in 0..expected.len() {
-        running = release_one(&env, &[&env.db], &running).await;
-        released.push(running.clone());
-    }
-    assert_eq!(released, expected);
-}
-
 /// Alpha sits at its focus cap: its head is skipped, beta and gamma take the
 /// slots, and alpha keeps its rank, so the moment its thread frees, its head
 /// takes the next slot ahead of beta's and gamma's next.

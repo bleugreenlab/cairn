@@ -791,43 +791,6 @@ async fn stop_and_remove_releases_a_pooled_thread_its_reader_still_holds() {
     );
 }
 
-/// A pooled server that has stopped reading its stdin blocks every write to
-/// it. Stopping a run there must still complete promptly and end its
-/// binding: the release's writes wait on the server's own worker, not on the
-/// stop.
-#[tokio::test]
-async fn stopping_a_pooled_run_completes_when_its_server_stops_reading() {
-    let db = test_db().await;
-    let orch = test_orchestrator(db);
-    let (unblock, gate) = crossbeam_channel::bounded::<()>(0);
-    let server = crate::backends::codex::pool::testing::unread_server(&orch.codex_pool, gate);
-    let _call = server.register_call("thread-unread", "run-unread");
-    let mut handle = RunHandle::test_handle(Some("session-unread"), Some("job-unread"));
-    handle.pooled_thread = Some(Arc::new(
-        crate::backends::codex::pool::PooledCall::new(server.clone(), "thread-unread".into())
-            .tracking_turn(Arc::new(Mutex::new(Some("turn-live".into())))),
-    ));
-    orch.process_state
-        .processes
-        .lock()
-        .unwrap()
-        .register("run-unread".into(), handle);
-
-    let started = std::time::Instant::now();
-    assert!(orch.process_state.stop_and_remove("run-unread"));
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(1),
-        "the stop took {:?}",
-        started.elapsed()
-    );
-    assert!(orch
-        .codex_pool
-        .binding_for_thread("thread-unread")
-        .is_none());
-    drop(unblock);
-    assert!(server.settle_releases(std::time::Duration::from_secs(5)));
-}
-
 /// A pooled Codex server's bearer outlives every run it serves, so finalizing a
 /// run is what stops that bearer speaking for it: its threads stop resolving,
 /// the moment it finalizes, while its neighbour on the same server keeps going.

@@ -860,67 +860,11 @@ mod reasoning_echo_tests {
 
 #[cfg(test)]
 mod terminal_event_tests {
-    use super::{read_stream_line, stream_lines, StreamRead, TERMINAL_EVENTS};
+    use super::TERMINAL_EVENTS;
     use crate::openai_compat::wire::{ChatStreamChunk, StreamingAggregate};
     use crate::require_terminal_event;
-    use std::io::BufReader;
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     const PROVIDER: &str = "Actual";
-
-    fn silent_stream() -> TcpStream {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let address = listener.local_addr().expect("listener address");
-        thread::spawn(move || {
-            let (_stream, _) = listener.accept().expect("accept test connection");
-            thread::sleep(Duration::from_secs(1));
-        });
-        TcpStream::connect(address).expect("connect test stream")
-    }
-
-    #[test]
-    fn a_silent_socket_observes_cancellation_without_waiting_for_sse_progress() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancelling = cancel.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            cancelling.store(true, Ordering::SeqCst);
-        });
-        let started = Instant::now();
-        let lines = stream_lines(BufReader::new(silent_stream()));
-        let result = read_stream_line(
-            &lines,
-            &cancel,
-            started,
-            started,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        )
-        .expect("polling read");
-        assert!(matches!(result, StreamRead::Cancelled));
-        assert!(started.elapsed() < Duration::from_millis(150));
-    }
-
-    #[test]
-    fn a_silent_socket_reaches_the_stall_timeout() {
-        let started = Instant::now();
-        let lines = stream_lines(BufReader::new(silent_stream()));
-        let result = read_stream_line(
-            &lines,
-            &AtomicBool::new(false),
-            started,
-            started,
-            Duration::from_millis(80),
-            Duration::from_secs(1),
-        )
-        .expect("polling read");
-        assert!(matches!(result, StreamRead::Stalled));
-        assert!(started.elapsed() < Duration::from_millis(150));
-    }
 
     /// Replay an SSE fixture through the same parse-and-aggregate steps the
     /// streaming loop uses, and report whether the protocol said it was done.

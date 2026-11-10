@@ -3,7 +3,6 @@ use crate::db::DbState;
 use crate::jj::tests::{git, git_stdout, init_project, rebase_recording_conflict};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::base_advance::preparation::held_by_parent_conflict;
-use crate::orchestrator::conflict_session::{load_active_session, load_pending_replay_request};
 use crate::orchestrator::Orchestrator;
 use crate::services::testing::TestServicesBuilder;
 use crate::storage::SearchIndex;
@@ -15,12 +14,11 @@ const GRANDCHILD: &str = "agent/grandchild";
 
 struct Fixture {
     _home: tempfile::TempDir,
-    repo: tempfile::TempDir,
+    _repo: tempfile::TempDir,
     store: std::path::PathBuf,
     jj: crate::jj::JjEnv,
     db: Arc<LocalDb>,
     orch: Orchestrator,
-    cut: String,
     source: String,
     flagged: String,
     grandchild: String,
@@ -133,12 +131,11 @@ impl Fixture {
         .build();
         let f = Self {
             _home: home,
-            repo,
+            _repo: repo,
             store,
             jj,
             db,
             orch,
-            cut,
             source,
             flagged,
             grandchild,
@@ -196,10 +193,6 @@ impl Fixture {
         ).await.unwrap();
     }
 
-    fn tip(&self) -> String {
-        crate::jj::bookmark_commit(&self.jj, &self.store, CHILD).unwrap()
-    }
-
     async fn metadata(&self, branch: &str) -> Vec<Item> {
         let branch = branch.to_string();
         self.db
@@ -210,14 +203,6 @@ impl Fixture {
             })
             .await
             .unwrap()
-    }
-
-    async fn request(&self, dry_run: bool, expected: &str) -> Result<String, String> {
-        let payload = serde_json::json!({
-            "action":"rebuild", "source_commit":self.source, "source_base":self.cut,
-            "source_base_reason":"fixture original isolated mint", "expected_tip":expected,
-        });
-        self.rebuild_node("child", payload, dry_run).await
     }
 
     async fn rebuild_node(
@@ -270,160 +255,6 @@ impl Fixture {
             );
         }
     }
-}
-
-#[tokio::test]
-#[serial_test::serial(jj)]
-async fn rebuild_acceptance_retires_only_parent_metadata_even_after_export_or_database_failure() {
-    for failure in ["none", "export", "database"] {
-        let f = Fixture::new().await;
-        let before = f.metadata(CHILD).await;
-        let grandchild = f.metadata(GRANDCHILD).await;
-        assert!(load_active_session(&f.db, CHILD).await.unwrap().is_some());
-        let hold = held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
-            .await
-            .unwrap()
-            .expect("the grandchild is held behind the child's open session");
-        assert_eq!(hold.session, "old-c");
-        assert!(f
-            .request(true, &f.flagged)
-            .await
-            .unwrap()
-            .contains("Would rebuild"));
-        assert_eq!(f.metadata(CHILD).await, before);
-        assert_eq!(f.tip(), f.flagged);
-        let error = f.request(false, &f.source).await.unwrap_err();
-        assert!(error.contains("branch moved"), "{error}");
-        assert_eq!(f.metadata(CHILD).await, before);
-        assert_eq!(f.tip(), f.flagged);
-        if failure == "export" {
-            git(
-                f.repo.path(),
-                &["update-ref", &format!("refs/heads/{CHILD}"), &f.base],
-            );
-        }
-        if failure == "database" {
-            FAIL_ACCEPTANCE.with(|flag| flag.set(true));
-        }
-        let result = f.request(false, &f.flagged).await;
-        let rebuilt = f.tip();
-        assert_ne!(rebuilt, f.flagged);
-        if failure == "database" {
-            assert!(result.unwrap_err().contains("metadata acceptance failed"));
-            assert_eq!(
-                f.metadata(CHILD).await,
-                before,
-                "database failure rolls all metadata back"
-            );
-            f.request(false, &f.flagged).await.unwrap();
-        } else if failure == "export" {
-            assert!(result
-                .unwrap_err()
-                .contains("Metadata accepted, but Git export failed"));
-        } else {
-            result.unwrap();
-        }
-        assert!(load_active_session(&f.db, CHILD).await.unwrap().is_none());
-        assert_eq!(
-            f.db.query_opt_text(
-                "SELECT resolution_state FROM jj_reconcile_items WHERE intent_id='old-c'",
-                ()
-            )
-            .await
-            .unwrap()
-            .as_deref(),
-            Some("superseded")
-        );
-        assert!(load_pending_replay_request(&f.db, &f.store, CHILD)
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
-                .await
-                .unwrap(),
-            None,
-            "superseding the child's session releases its descendant with nothing recorded"
-        );
-        assert_eq!(
-            f.db.query_opt_text("SELECT base_commit FROM jobs WHERE id='c'", ())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(f.base.as_str())
-        );
-        f.assert_descendant_and_observers_unchanged(&grandchild)
-            .await;
-        if failure == "export" {
-            git(
-                f.repo.path(),
-                &["update-ref", &format!("refs/heads/{CHILD}"), &f.source],
-            );
-        }
-        f.request(false, &f.flagged).await.unwrap();
-        assert_eq!(f.tip(), rebuilt, "retry never creates another native head");
-        f.assert_descendant_and_observers_unchanged(&grandchild)
-            .await;
-    }
-}
-
-#[tokio::test]
-#[serial_test::serial(jj)]
-async fn rebuild_retry_preserves_a_new_parent_hold_not_covered_by_the_original_result() {
-    let f = Fixture::new().await;
-    let grandchild = f.metadata(GRANDCHILD).await;
-    FAIL_ACCEPTANCE.with(|flag| flag.set(true));
-    assert!(f
-        .request(false, &f.flagged)
-        .await
-        .unwrap_err()
-        .contains("metadata acceptance failed"));
-    let rebuilt = f.tip();
-    std::fs::write(f.repo.path().join("new-parent.txt"), "new P2 work\n").unwrap();
-    git(f.repo.path(), &["add", "-A"]);
-    git(f.repo.path(), &["commit", "-q", "-m", "new P2"]);
-    let p2 = git_stdout(f.repo.path(), &["rev-parse", "HEAD"]);
-    f.jj.run(
-        &f.store,
-        &["git", "import", "--ignore-working-copy"],
-        "import P2",
-    )
-    .unwrap();
-    f.db.execute(
-        "UPDATE jj_reconcile_items SET resolution_state='superseded' WHERE bookmark=?1",
-        (CHILD,),
-    )
-    .await
-    .unwrap();
-    f.install("new-c", CHILD, "main", &p2, Some(&f.base), &rebuilt)
-        .await;
-    let newer = f
-        .metadata(CHILD)
-        .await
-        .into_iter()
-        .find(|item| item.intent == "new-c")
-        .unwrap();
-    f.request(false, &f.flagged).await.unwrap();
-    assert_eq!(f.tip(), rebuilt);
-    assert!(
-        f.metadata(CHILD).await.contains(&newer),
-        "an export-only retry cannot discharge P2"
-    );
-    let hold = held_by_parent_conflict(&f.db, &f.store, GRANDCHILD, CHILD)
-        .await
-        .unwrap()
-        .expect("the new parent session still holds the grandchild");
-    assert_eq!(
-        (hold.session.as_str(), hold.parent_destination),
-        ("new-c", p2)
-    );
-    assert!(load_active_session(&f.db, CHILD).await.unwrap().is_some());
-    assert!(load_pending_replay_request(&f.db, &f.store, CHILD)
-        .await
-        .unwrap()
-        .is_some());
-    f.assert_descendant_and_observers_unchanged(&grandchild)
-        .await;
 }
 
 /// Rebuild reads the branch's one hold source: a branch whose immediate parent

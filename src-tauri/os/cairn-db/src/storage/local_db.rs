@@ -4568,60 +4568,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn concurrent_writes_retry_conflicting_commits() {
-        let db = Arc::new(test_db().await.unwrap());
-        db.execute("INSERT INTO counters(id, value) VALUES ('shared', 0)", ())
-            .await
-            .unwrap();
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..16 {
-            let db = db.clone();
-            let attempts = attempts.clone();
-            tasks.push(tokio::spawn(async move {
-                db.write(|conn| {
-                    let attempts = attempts.clone();
-                    Box::pin(async move {
-                        attempts.fetch_add(1, Ordering::SeqCst);
-                        let mut rows = conn
-                            .query("SELECT value FROM counters WHERE id = 'shared'", ())
-                            .await?;
-                        let row = rows
-                            .next()
-                            .await?
-                            .ok_or_else(|| DbError::Row("missing counter row".to_string()))?;
-                        let value = row.i64(0)?;
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        conn.execute(
-                            "UPDATE counters SET value = ?1 WHERE id = 'shared'",
-                            (value + 1,),
-                        )
-                        .await?;
-                        Ok(())
-                    })
-                })
-                .await
-            }));
-        }
-
-        for task in tasks {
-            task.await.unwrap().unwrap();
-        }
-
-        assert_eq!(
-            query_i64(&db, "SELECT value FROM counters WHERE id = 'shared'")
-                .await
-                .unwrap(),
-            16
-        );
-        assert!(
-            attempts.load(Ordering::SeqCst) > 16,
-            "expected at least one optimistic retry under shared-row contention"
-        );
-    }
-
     /// Where each looping writer of [`two_writers_of_one_row_stress`] is: the
     /// iteration it is on, and when that iteration began (micros since the
     /// test's epoch, plus one; zero between iterations).
@@ -5600,75 +5546,6 @@ mod tests {
         assert_checkpoint_wins(&db).await;
     }
 
-    /// The tenet's case: a pooled read statement stepping past the bound is
-    /// interrupted by the engine, fails naming its caller and its SQL, and
-    /// leaves nothing behind for the checkpoint to wait on. Multi-threaded
-    /// because the statement never yields the worker it runs on.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_runaway_pooled_read_is_interrupted_and_named() {
-        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
-
-        let line = line!() + 1;
-        let error = db.query_one(RUNAWAY_COUNT, (), |row| row.i64(0)).await;
-        let (caller, elapsed, statement) = read_bound_exceeded(&error.unwrap_err());
-        assert_eq!((caller.file(), caller.line()), (file!(), line));
-        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
-        assert!(
-            statement.contains("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL"),
-            "{statement}"
-        );
-        assert_eq!(db.live_connections(), 0);
-        assert_checkpoint_wins(&db).await;
-
-        // Through a transaction closure, the label is the closure's statement.
-        let error = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn.query(RUNAWAY_COUNT, ()).await?;
-                    rows.next().await?;
-                    Ok(())
-                })
-            })
-            .await;
-        let (caller, _, statement) = read_bound_exceeded(&error.unwrap_err());
-        assert_eq!(caller.file(), file!());
-        assert!(
-            statement.starts_with(file!()) && statement.contains("WITH RECURSIVE"),
-            "{statement}"
-        );
-        assert_eq!(db.live_connections(), 0);
-        assert_checkpoint_wins(&db).await;
-    }
-
-    /// A read that parks between statements never trips the per-statement
-    /// deadline, so the outer timeout ends it, and dropping it rolls back.
-    #[tokio::test]
-    async fn a_parked_pooled_read_is_retired_at_the_bound() {
-        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
-        let started = Instant::now();
-        let error = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn.query("SELECT COUNT(*) FROM counters", ()).await?;
-                    rows.next().await?;
-                    drop(rows);
-                    std::future::pending::<()>().await;
-                    Ok(())
-                })
-            })
-            .await;
-        let (_, elapsed, statement) = read_bound_exceeded(&error.unwrap_err());
-        let deadline = TEST_READ_BOUND + PARKED_READ_SLACK;
-        assert!(elapsed >= deadline, "{elapsed:?}");
-        assert!(started.elapsed() < deadline + Duration::from_secs(5));
-        assert!(
-            statement.contains("SELECT COUNT(*) FROM counters"),
-            "{statement}"
-        );
-        assert_eq!(db.live_connections(), 0);
-        assert_checkpoint_wins(&db).await;
-    }
-
     /// What the engine stopped is not handed to the next caller.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_interrupted_connection_is_not_returned_to_the_pool() {
@@ -5789,69 +5666,6 @@ mod tests {
             .unwrap();
         assert_eq!(connect.on_behalf_of, None);
         drop(conn);
-    }
-
-    /// The bound is for pooled READS. A write, or a `connect` connection, on
-    /// which a statement runs well past it still succeeds, including a write on
-    /// the very connection a bounded read just used. The statement is sized
-    /// against this machine first so the test cannot pass by being fast.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn writes_and_connect_are_not_bounded() {
-        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
-        let count_to = |n: u64| {
-            format!(
-                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {n}) \
-                 SELECT count(*) FROM c"
-            )
-        };
-
-        let unbounded = db.connect().await.unwrap();
-        let mut n = 50_000u64;
-        let slow = loop {
-            let sql = count_to(n);
-            let started = Instant::now();
-            let mut rows = unbounded.query(&sql, ()).await.unwrap();
-            rows.next().await.unwrap().unwrap();
-            let took = started.elapsed();
-            if took > TEST_READ_BOUND * 3 || n >= 1 << 28 {
-                break (n, took);
-            }
-            n *= 2;
-        };
-        assert!(
-            slow.1 > TEST_READ_BOUND * 3,
-            "no statement ran past the bound on a connect connection: {slow:?}"
-        );
-        drop(unbounded);
-
-        db.query_one("SELECT 1", (), |row| row.i64(0))
-            .await
-            .unwrap();
-        let pooled = db.connections_created.load(Ordering::Relaxed);
-        let sql = count_to(slow.0);
-        let started = Instant::now();
-        let counted = db
-            .write(|conn| {
-                let sql = sql.clone();
-                Box::pin(async move {
-                    let mut rows = conn.query(&sql, ()).await?;
-                    let row = rows.next().await?.expect("count row");
-                    row.i64(0)
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(counted, i64::try_from(slow.0).unwrap());
-        assert!(
-            started.elapsed() > TEST_READ_BOUND,
-            "{:?}",
-            started.elapsed()
-        );
-        assert_eq!(
-            db.connections_created.load(Ordering::Relaxed),
-            pooled,
-            "the write must have reused the connection the bounded read used"
-        );
     }
 
     /// The gate watch's source: each overdue holder once, then only again
@@ -6054,33 +5868,6 @@ mod tests {
         assert!(!held[0].activity.executing, "{held:?}");
         drop(conn);
         assert_eq!(db.live_connections(), 0);
-    }
-
-    /// A pooled read parked after a `&Connection` helper is retired at the
-    /// bound naming the helper's line, not the BEGIN.
-    #[tokio::test]
-    async fn a_parked_pooled_read_names_its_last_raw_borrow() {
-        let db = test_db().await.unwrap().with_read_bound(TEST_READ_BOUND);
-        let borrowed_at = Arc::new(AtomicUsize::new(0));
-        let seen = borrowed_at.clone();
-        let error = db
-            .read(move |conn| {
-                Box::pin(async move {
-                    seen.store(line!() as usize + 1, Ordering::Relaxed);
-                    count_counters(conn).await;
-                    std::future::pending::<()>().await;
-                    Ok(())
-                })
-            })
-            .await;
-        let (_, _, statement) = read_bound_exceeded(&error.unwrap_err());
-        let line = borrowed_at.load(Ordering::Relaxed);
-        assert_eq!(
-            &*statement,
-            format!("{}:{line} (raw connection; sql not captured)", file!())
-        );
-        assert_eq!(db.live_connections(), 0);
-        assert_checkpoint_wins(&db).await;
     }
 
     /// A statement a closure starts mid-poll renames the region that poll

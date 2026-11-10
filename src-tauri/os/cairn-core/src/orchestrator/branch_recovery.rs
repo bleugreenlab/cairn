@@ -1422,40 +1422,6 @@ pub(crate) fn render_for_page(record: &RecoveryRecord) -> String {
     )
 }
 
-/// Test controls for the repair rendezvous.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-
-    /// Restores the default allowance and removes the hook when dropped.
-    pub(crate) struct RepairPause;
-
-    impl Drop for RepairPause {
-        fn drop(&mut self) {
-            TEST_REPAIR_ALLOWANCE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
-            *TEST_REPAIR_HOOK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        }
-    }
-
-    /// Shorten the repair allowance and run `hook` in each repair worker once
-    /// it is admitted to write, before it writes anything.
-    pub(crate) fn pause_repairs_after_write_admission(
-        allowance: Duration,
-        hook: impl Fn() + Send + Sync + 'static,
-    ) -> RepairPause {
-        TEST_REPAIR_ALLOWANCE_MS.store(
-            allowance.as_millis() as u64,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        *TEST_REPAIR_HOOK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
-        RepairPause
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

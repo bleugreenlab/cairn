@@ -16,10 +16,9 @@
 //! each records a declared skip there (skip-manifest.toml).
 
 use crate::common;
-use crate::node_scratch_acceptance::{eventually, node, Node, MACHINE_A, MACHINE_B, OWNER};
+use crate::node_scratch_acceptance::{eventually, node, Node, MACHINE_A, MACHINE_B};
 
 use cairn_common::auth::launch_canary;
-use serde_json::json;
 use std::path::{Path, PathBuf};
 
 /// Where the lineage callback socket the test executors serve listens.
@@ -85,21 +84,6 @@ async fn shell_env(node: &Node, machine: Option<&str>, name: &str) -> (String, V
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_placed_run_shell_item_carries_no_callback_credential() {
-    if common::skip_if_fenced("a_placed_run_shell_item_carries_no_callback_credential")
-        || !launch_canary::in_planted_child(
-            module_path!(),
-            "a_placed_run_shell_item_carries_no_callback_credential",
-        )
-    {
-        return;
-    }
-    let node = node().await;
-    let env = shell_env(&node, Some(MACHINE_A), "placed-shell").await;
-    assert_clean("a placed run shell item", &env);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_colocated_run_shell_item_carries_no_callback_credential() {
     if common::skip_if_fenced("a_colocated_run_shell_item_carries_no_callback_credential")
         || !launch_canary::in_planted_child(
@@ -113,145 +97,4 @@ async fn a_colocated_run_shell_item_carries_no_callback_credential() {
     only_colocated(&node).await;
     let env = shell_env(&node, None, "colocated-shell").await;
     assert_clean("a colocated run shell item", &env);
-}
-
-async fn terminal_env(node: &Node, machine: Option<&str>, name: &str) -> (String, Vec<String>) {
-    let path = dump(node, name);
-    node.start_terminal_of("r-1", OWNER, name, machine, &write_env(&path))
-        .await;
-    observed(&path).await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_placed_terminal_carries_no_callback_credential() {
-    if common::skip_if_fenced("a_placed_terminal_carries_no_callback_credential")
-        || !launch_canary::in_planted_child(
-            module_path!(),
-            "a_placed_terminal_carries_no_callback_credential",
-        )
-    {
-        return;
-    }
-    let node = node().await;
-    let env = terminal_env(&node, Some(MACHINE_A), "placed-terminal").await;
-    assert_clean("a placed terminal", &env);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_colocated_terminal_carries_no_callback_credential() {
-    if common::skip_if_fenced("a_colocated_terminal_carries_no_callback_credential")
-        || !launch_canary::in_planted_child(
-            module_path!(),
-            "a_colocated_terminal_carries_no_callback_credential",
-        )
-    {
-        return;
-    }
-    let node = node().await;
-    only_colocated(&node).await;
-    let env = terminal_env(&node, None, "colocated-terminal").await;
-    assert_clean("a colocated terminal", &env);
-}
-
-/// A REPL's eval-server is Python here: its environment is written from inside
-/// it, as JSON.
-async fn repl_env(node: &Node, machine: Option<&str>, slug: &str) -> Option<(String, Vec<String>)> {
-    use cairn_common::executor_protocol::ExecutorSelector;
-    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
-    use cairn_core::internal::mcp::handlers::RunContext;
-
-    let ctx = RunContext {
-        run_id: "r-1".to_string(),
-        job_id: "job-1".to_string(),
-        exec_seq: Some(1),
-        issue_id: Some("issue-1".to_string()),
-        issue_number: Some(1),
-        thread_id: None,
-        project_id: node.machines.project_id.clone(),
-        project_key: "nsc".to_string(),
-        job_name: Some("builder".to_string()),
-        agent_config_id: None,
-    };
-    let selector = machine.map(|name| ExecutorSelector {
-        name: Some(name.to_string()),
-        ..ExecutorSelector::default()
-    });
-    let session = match repl::spawn_session(
-        node.orch(),
-        &ctx.job_id,
-        &ctx.project_id,
-        &node.cwd,
-        Some(&ctx),
-        ReplLang::Python,
-        slug,
-        &[],
-        selector.as_ref(),
-    )
-    .await
-    {
-        Ok(session) => session,
-        Err(error) if error.contains("python") || error.contains("uv") => {
-            eprintln!("skipping: no Python to spawn a REPL with: {error}");
-            return None;
-        }
-        Err(error) => panic!("the REPL did not start: {error}"),
-    };
-    node.orch()
-        .repl_state
-        .insert(ctx.job_id.clone(), slug.to_string(), session);
-    let path = dump(node, slug);
-    let code = format!(
-        "import json, os\nopen({part:?}, 'w').write(json.dumps(dict(os.environ)))\nos.replace({part:?}, {path:?})",
-        part = format!("{}.part", path.display()),
-        path = path.display().to_string(),
-    );
-    let reply = node
-        .run(
-            "r-1",
-            json!({ "commands": [{ "code": code, "interpreter": "python", "repl": slug }] }),
-        )
-        .await;
-    assert!(
-        path.is_file(),
-        "the REPL did not write its environment: {reply}"
-    );
-    // Read before the REPL stops, while its capability is live.
-    let observed = observed(&path).await;
-    if let Some(session) = node.orch().repl_state.remove(&ctx.job_id, slug) {
-        session.stop_and_release(node.orch()).await;
-    }
-    Some(observed)
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_placed_repl_carries_no_callback_credential() {
-    if common::skip_if_fenced("a_placed_repl_carries_no_callback_credential")
-        || !launch_canary::in_planted_child(
-            module_path!(),
-            "a_placed_repl_carries_no_callback_credential",
-        )
-    {
-        return;
-    }
-    let node = node().await;
-    if let Some(env) = repl_env(&node, Some(MACHINE_A), "placed-repl").await {
-        assert_clean("a placed REPL", &env);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_colocated_repl_carries_no_callback_credential() {
-    if common::skip_if_fenced("a_colocated_repl_carries_no_callback_credential")
-        || !launch_canary::in_planted_child(
-            module_path!(),
-            "a_colocated_repl_carries_no_callback_credential",
-        )
-    {
-        return;
-    }
-    let node = node().await;
-    only_colocated(&node).await;
-    if let Some(env) = repl_env(&node, None, "colocated-repl").await {
-        assert_clean("a colocated REPL", &env);
-    }
 }

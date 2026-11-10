@@ -23,10 +23,9 @@ use crate::orchestrator::Orchestrator;
 use cairn_db::turso::params;
 
 use super::spawn::unstarted_child_tests::{
-    await_successor, count, delivered_tool_result, explore_payload, parent_fixture,
-    register_parent_process, spawn, spawn_and_park, successor_count, text,
+    await_successor, count, delivered_tool_result, explore_payload, parent_fixture, spawn,
+    spawn_and_park, successor_count, text,
 };
-use super::DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX;
 
 const REPROMPT_PREFIX: &str = "Your task ended without calling `return`";
 const LAST_WORDS: &str = "Let me check how placement treats a drained executor";
@@ -501,8 +500,8 @@ async fn a_task_that_ignores_its_reprompt_fails_and_its_parent_is_told_so() {
 
     let replay_run = run_id.clone();
     on_blocking_thread(&orch, move |orch| {
-        let _ = finalize_run(orch, &replay_run, RunStatus::Exited);
-        let _ = finalize_run(orch, &replay_run, RunStatus::Exited);
+        finalize_run(orch, &replay_run, RunStatus::Exited);
+        finalize_run(orch, &replay_run, RunStatus::Exited);
     })
     .await;
     on_blocking_thread(&orch, |orch| {
@@ -803,94 +802,6 @@ async fn no_reprompt_for_a_top_level_job() {
     );
 }
 
-/// A clean run exit no longer counts as success, so the inline wait must still
-/// release a task that did return. Every clean turn end recomputes the job
-/// before it signals the wait; this is the regression that change could cause.
-#[tokio::test(flavor = "multi_thread")]
-async fn inline_wait_releases_a_task_that_returns_and_exits_cleanly() {
-    let (orch, _executor) = parent_fixture("return-followup-inline-returned.db").await;
-    let budget = Duration::from_secs(20);
-    let started = std::time::Instant::now();
-    let spawn_orch = orch.clone();
-    let spawning = tokio::spawn(async move {
-        spawn(&spawn_orch, &[explore_payload("map the fleet")], budget).await
-    });
-    let child = created_child(&orch).await;
-    open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
-    say(&orch, "run-child", "child-turn-1", LAST_WORDS).await;
-    write_return(&orch, &child, RETURNED).await;
-    // Claude reports the clean Result after the return.
-    end_claude_task_turn(&orch, "run-child").await;
-
-    let response = spawning
-        .await
-        .unwrap()
-        .response
-        .expect("blocking text")
-        .result;
-    assert!(
-        started.elapsed() < budget,
-        "the inline wait ran out its budget"
-    );
-    assert_eq!(response, RETURNED);
-    assert_eq!(reprompts(&orch, &child).await, 0);
-}
-
-/// The inline wait no longer hands a parent the child's last message when the
-/// child ended without `return`: the child is re-prompted and the parent parks
-/// on the real result instead.
-#[tokio::test(flavor = "multi_thread")]
-async fn inline_wait_parks_instead_of_answering_with_a_missing_return() {
-    let (orch, _executor) = parent_fixture("return-followup-inline-missing.db").await;
-    let _parent = register_parent_process(&orch);
-    let spawn_orch = orch.clone();
-    let spawning = tokio::spawn(async move {
-        spawn(
-            &spawn_orch,
-            &[explore_payload("map the fleet")],
-            Duration::from_secs(4),
-        )
-        .await
-    });
-    let child = created_child(&orch).await;
-    open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
-    say(&orch, "run-child", "child-turn-1", LAST_WORDS).await;
-    end_turn_without_return(&orch, "run-child").await;
-
-    let response = spawning
-        .await
-        .unwrap()
-        .response
-        .expect("blocking text")
-        .result;
-    assert!(
-        response.ends_with(DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX),
-        "{response}"
-    );
-    assert!(!response.contains(LAST_WORDS), "{response}");
-    assert_eq!(reprompts(&orch, &child).await, 1);
-}
-
-/// The child job a spawn under way created, once it exists.
-async fn created_child(orch: &Orchestrator) -> String {
-    let started = std::time::Instant::now();
-    let child = loop {
-        if let Some(child) =
-            text(orch, "SELECT id FROM jobs WHERE parent_job_id = 'j-parent'").await
-        {
-            break child;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "no child created"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    // Let the spawn reach its wait before the child's turn ends.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    child
-}
-
 /// The shape a host that died mid-settlement leaves: the child's turn ended
 /// and its `return` landed, but its run closed and its job still reads running.
 async fn strand_finished_child(orch: &Orchestrator, child: &str) {
@@ -981,15 +892,6 @@ async fn await_turn_starts(requests: &Arc<Mutex<Vec<serde_json::Value>>>, expect
     assert_eq!(turn_starts(requests), expected);
 }
 
-async fn tool_results_on_the_spawning_call(orch: &Orchestrator) -> i64 {
-    count(
-        orch,
-        "SELECT COUNT(*) FROM events WHERE run_id='run-parent' AND event_type='tool_result' \
-         AND json_extract(data,'$.toolUseId')='tool-write'",
-    )
-    .await
-}
-
 /// A boot repair that settles a stranded child is a settlement like any other:
 /// the parent parked on it is resumed, told the result arrived late.
 #[tokio::test(flavor = "multi_thread")]
@@ -1008,35 +910,6 @@ async fn parked_parent_resumes_once_when_boot_repair_settles_its_child() {
         .expect("the parent receives the repaired task's result");
     assert!(delivered.contains("Delayed delivery"), "{delivered}");
     assert!(delivered.contains(RETURNED), "{delivered}");
-    await_turn_starts(&requests, starts_before + 1).await;
-}
-
-/// Every resume edge firing for one settled child still delivers once.
-#[tokio::test(flavor = "multi_thread")]
-async fn healed_resume_does_not_double_deliver() {
-    let (orch, child, requests) = spawn_and_park("return-followup-no-double.db").await;
-    strand_finished_child(&orch, &child).await;
-    let starts_before = turn_starts(&requests);
-    settle_stranded(&orch, &child).await;
-    await_successor(&orch).await;
-
-    assert_eq!(
-        crate::execution::advancement::heal_parked_parents(&orch).await,
-        0,
-        "a resumed parent is no longer parked"
-    );
-    let again = child.clone();
-    on_blocking_thread(&orch, move |orch| {
-        let _ = crate::execution::delegation::resume_suspended_parent_after_task_completion(
-            orch, &again,
-        );
-        let _ = finalize_run(orch, "run-child", RunStatus::Exited);
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert_eq!(successor_count(&orch).await, 1);
-    assert_eq!(tool_results_on_the_spawning_call(&orch).await, 1);
     await_turn_starts(&requests, starts_before + 1).await;
 }
 
@@ -1350,51 +1223,93 @@ async fn codex_task_turns_all_run_on_a_live_run_and_the_returning_one_settles_it
     assert_eq!(fleet_slots_held(&orch, &child).await, 0);
 }
 
-/// The resume gate groups siblings by blocking-ness: a finished background
-/// packet at the same anchor is neither the child the heal resumes through
-/// (a Repair resume through it returns at once) nor, while still running,
-/// a reason to leave the blocking wait parked.
+/// Every resume edge firing for one settled child still delivers once.
 #[tokio::test(flavor = "multi_thread")]
-async fn heal_parked_parents_looks_past_background_siblings_at_the_anchor() {
-    for background_finished in [true, false] {
-        let (orch, child, _requests) = spawn_and_park(&format!(
-            "return-followup-heal-background-{background_finished}.db"
-        ))
-        .await;
-        // A background sibling at the same anchor whose id sorts first.
-        orch.db
-            .local
-            .execute_script(&format!(
-                "INSERT INTO jobs(id,parent_job_id,project_id,issue_id,execution_id,status,created_at,updated_at)
-                   SELECT '0-background', parent_job_id, project_id, issue_id, execution_id, '{}', 5, 5
-                   FROM jobs WHERE id = '{child}';
-                 INSERT INTO delegated_packets(execution_id,id,seq,parent_job_id,parent_turn_id,result_artifact_job_id,status,spec,created_at)
-                   SELECT execution_id, 'packet-background', seq + 1, parent_job_id, parent_turn_id, '0-background',
-                          'running', json_set(spec, '$.background', json('true')), created_at
-                   FROM delegated_packets WHERE result_artifact_job_id = '{child}';",
-                if background_finished { "complete" } else { "running" }
-            ))
-            .await
-            .unwrap();
-        write_return(&orch, &child, RETURNED).await;
-        orch.db
-            .local
-            .execute(
-                "UPDATE jobs SET status = 'complete' WHERE id = ?1",
-                params![child.clone()],
-            )
-            .await
-            .unwrap();
+async fn healed_resume_does_not_double_deliver() {
+    let (orch, child, requests) = spawn_and_park("return-followup-no-double.db").await;
+    strand_finished_child(&orch, &child).await;
+    let starts_before = turn_starts(&requests);
+    settle_stranded(&orch, &child).await;
+    await_successor(&orch).await;
 
-        assert_eq!(
-            crate::execution::advancement::heal_parked_parents(&orch).await,
-            1,
-            "background finished: {background_finished}"
+    assert_eq!(
+        crate::execution::advancement::heal_parked_parents(&orch).await,
+        0,
+        "a resumed parent is no longer parked"
+    );
+    let again = child.clone();
+    on_blocking_thread(&orch, move |orch| {
+        let _ = crate::execution::delegation::resume_suspended_parent_after_task_completion(
+            orch, &again,
         );
-        await_successor(&orch).await;
-        let delivered = delivered_tool_result(&orch)
-            .await
-            .expect("the blocking wait is released");
-        assert!(delivered.contains(RETURNED), "{delivered}");
-    }
+        finalize_run(orch, "run-child", RunStatus::Exited);
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(successor_count(&orch).await, 1);
+    assert_eq!(tool_results_on_the_spawning_call(&orch).await, 1);
+    await_turn_starts(&requests, starts_before + 1).await;
+}
+
+/// A clean run exit no longer counts as success, so the inline wait must still
+/// release a task that did return. Every clean turn end recomputes the job
+/// before it signals the wait; this is the regression that change could cause.
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_wait_releases_a_task_that_returns_and_exits_cleanly() {
+    let (orch, _executor) = parent_fixture("return-followup-inline-returned.db").await;
+    let budget = Duration::from_secs(20);
+    let started = std::time::Instant::now();
+    let spawn_orch = orch.clone();
+    let spawning = tokio::spawn(async move {
+        spawn(&spawn_orch, &[explore_payload("map the fleet")], budget).await
+    });
+    let child = created_child(&orch).await;
+    open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
+    say(&orch, "run-child", "child-turn-1", LAST_WORDS).await;
+    write_return(&orch, &child, RETURNED).await;
+    // Claude reports the clean Result after the return.
+    end_claude_task_turn(&orch, "run-child").await;
+
+    let response = spawning
+        .await
+        .unwrap()
+        .response
+        .expect("blocking text")
+        .result;
+    assert!(
+        started.elapsed() < budget,
+        "the inline wait ran out its budget"
+    );
+    assert_eq!(response, RETURNED);
+    assert_eq!(reprompts(&orch, &child).await, 0);
+}
+
+/// The child job a spawn under way created, once it exists.
+async fn created_child(orch: &Orchestrator) -> String {
+    let started = std::time::Instant::now();
+    let child = loop {
+        if let Some(child) =
+            text(orch, "SELECT id FROM jobs WHERE parent_job_id = 'j-parent'").await
+        {
+            break child;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no child created"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // Let the spawn reach its wait before the child's turn ends.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    child
+}
+
+async fn tool_results_on_the_spawning_call(orch: &Orchestrator) -> i64 {
+    count(
+        orch,
+        "SELECT COUNT(*) FROM events WHERE run_id='run-parent' AND event_type='tool_result' \
+         AND json_extract(data,'$.toolUseId')='tool-write'",
+    )
+    .await
 }

@@ -821,11 +821,6 @@ pub(crate) mod tests {
         pub(crate) fn calls(&self) -> usize {
             *self.calls.lock().unwrap()
         }
-
-        /// Hold every reply for `delay`, as a hung provider would.
-        pub(crate) fn hold_each_reply(&self, delay: Duration) {
-            *self.delay.lock().unwrap() = Some(delay);
-        }
     }
 
     impl Complete for Scripted {

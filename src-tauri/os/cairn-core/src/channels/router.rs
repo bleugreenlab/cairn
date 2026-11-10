@@ -6168,89 +6168,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unchanged_review_backlog_is_generation_bounded() {
-        let (orch, db) = route_test_orchestrator("review-generation-bounded.db").await;
-        db.execute_batch(
-            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
-             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
-             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-               VALUES('issue', 'p', 1, 'Review', 'active', 1, 1);
-             -- Complete rather than running: this test is about generation
-             -- bounding, and a LIVE recipient would correctly withhold the
-             -- notice as an ask an agent still holds (CAIRN-4732), leaving
-             -- nothing for the generation fence to bound.
-             INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
-               VALUES('reviewer', 'p', 'issue', 'complete', 1, 1);
-             INSERT INTO merge_requests
-               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
-               VALUES('mr', 'reviewer', 'p', 'issue', 'Review', 'feature', 'main', 'open', 1, 1);
-             INSERT INTO attention_pushes
-               (id, recipient, content_ref, wake, boundary, key, created_at)
-               VALUES('push', 'reviewer', 'cairn://p/cairn/1/1/reviewer/create-pr', 'wake', 'event',
-                      'review:cairn://p/cairn/1', 1);",
-        )
-        .await
-        .unwrap();
-        let provider = Arc::new(PresentProvider {
-            sends: Mutex::new(Vec::new()),
-            presence_checks: Mutex::new(0),
-            presence: Mutex::new(OperatorPresence::Away),
-        });
-        let router = ChannelRouter::new_for_provider(
-            orch,
-            provider,
-            "imessage",
-            "+15551234567".into(),
-            MessageClassPolicy {
-                question: false,
-                permission: false,
-                notify: true,
-            },
-            ChannelInboundCapabilities::default(),
-        );
-
-        let (first_work, first_live) = router.load_routed_gates(&db, "").await.unwrap();
-        let (pending_work, _) = router.load_routed_gates(&db, "").await.unwrap();
-        assert_eq!((first_work.len(), first_live.len()), (1, 1));
-        assert_eq!(
-            pending_work.len(),
-            1,
-            "unclaimed cached work cannot be stranded"
-        );
-        let delivery_key = first_work[0].delivery_key(router.provider_id, &router.destination);
-        router.claims.claim(&delivery_key);
-        let (idle_work, idle_live) = router.load_routed_gates(&db, "").await.unwrap();
-        assert!(
-            idle_work.is_empty(),
-            "a fenced unchanged generation performs no work"
-        );
-        assert_eq!(
-            idle_live.len(),
-            1,
-            "the cached live set still protects route fencing"
-        );
-
-        db.execute(
-            "UPDATE issues SET updated_at=updated_at+1 WHERE id='issue'",
-            (),
-        )
-        .await
-        .unwrap();
-        let (invalidated_work, _) = router.load_routed_gates(&db, "").await.unwrap();
-        let (settled_work, _) = router.load_routed_gates(&db, "").await.unwrap();
-        assert_eq!(
-            invalidated_work.len(),
-            1,
-            "one mutation causes one bounded refresh"
-        );
-        assert!(
-            settled_work.is_empty(),
-            "the refreshed generation settles immediately"
-        );
-    }
-
     // Operator presence is process-global, and a review gate is presence-aware:
     // a sibling test pinning presence Active would make this sweep defer its
     // delivery instead of sending it. Joining that serial group is what keeps
@@ -7943,59 +7860,6 @@ mod tests {
 
         assert!(ledger::list_follows(&db, CHANNEL).await.unwrap().is_empty());
         assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_session_relative_poll_binding_persists_its_canonical_thread_uri() {
-        let (orch, db) = route_test_orchestrator("channel-router-relative-binding.db").await;
-        let session = seed_threads_and_an_issue(&db).await;
-        let (router, _provider) = test_router(orch);
-        let options = FollowPollOptions {
-            labels: vec!["general".to_string()],
-            bindings: HashMap::from([("general".to_string(), "cairn:~/".to_string())]),
-        };
-        let record = ledger::OutboundRecord {
-            id: "relative-poll".to_string(),
-            channel: CHANNEL.to_string(),
-            kind: "question".to_string(),
-            binding_ref: format!("{FOLLOW_POLL_PREFIX}relative"),
-            conversation: "+15551234567".to_string(),
-            job_id: Some(session),
-            rendered_text: "Follow threads\n1. general".to_string(),
-            rendering: "poll".to_string(),
-            options_json: Some(serde_json::to_string(&options).unwrap()),
-            status: "sent".to_string(),
-            provider_guid: Some("poll-guid".to_string()),
-            caption_guid: None,
-            created_at: 1,
-            sent_at: Some(1),
-            resolved_at: None,
-            last_error: None,
-            attempts: 0,
-            next_attempt_at: None,
-            last_attempt_at: None,
-        };
-
-        assert_eq!(
-            router
-                .resolve_bound_target(&record, "cairn:~/task/example")
-                .await
-                .unwrap(),
-            "cairn://p/cairn/general/task/example"
-        );
-
-        router
-            .follow_poll_selection(&record, "general", &record.conversation)
-            .await
-            .unwrap();
-
-        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(follows.len(), 1);
-        assert_eq!(follows[0].uri, "cairn://p/cairn/general");
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/general")
-        );
     }
 
     /// `threads` offers threads and `issues` offers issues — each labelled and
@@ -10522,63 +10386,6 @@ mod tests {
         .unwrap();
     }
 
-    async fn issue_surface_rows(db: &LocalDb, target: &str) -> i64 {
-        db.query_opt_i64(
-            "SELECT COUNT(*) FROM discord_surface WHERE surface_kind = 'issue_thread' AND target_uri = ?1",
-            (target.to_string(),),
-        )
-        .await
-        .unwrap()
-        .unwrap_or(0)
-    }
-
-    /// The subject has no Discord thread yet: the route asks for one, waits with
-    /// no outbound row, and delivers there once the reconciler binds it.
-    #[tokio::test]
-    async fn undirected_discord_route_waits_for_its_subject_surface_then_delivers() {
-        let (orch, db) = route_test_orchestrator("route-undirected-discord-await.db").await;
-        seed_route_subject_issue(&db, 42, "active").await;
-        let (router, provider) = guild_discord_router(orch);
-        let submission = undirected_route_submission("awaits", "detailUri", "cairn://p/cairn/42");
-        let start = Instant::now();
-
-        for _ in 0..3 {
-            router
-                .submit_route(submission.clone(), OperatorPresence::Away, start)
-                .await
-                .unwrap();
-        }
-        assert!(provider.sends.lock().unwrap().is_empty());
-        assert_eq!(discord_route_row_count(&db).await, 0);
-        assert_eq!(issue_surface_rows(&db, "cairn://p/cairn/42").await, 1);
-        assert_eq!(router.held_routes.lock().unwrap().len(), 1);
-
-        // Still being created: the next sweep keeps waiting.
-        router
-            .retry_held_routes(OperatorPresence::Away, start + Duration::from_secs(5))
-            .await;
-        assert_eq!(router.held_routes.lock().unwrap().len(), 1);
-
-        bind_structural(&db, "discord:1/77", "cairn://p/cairn/42").await;
-        router
-            .retry_held_routes(OperatorPresence::Away, start + Duration::from_secs(10))
-            .await;
-
-        {
-            let sends = provider.sends.lock().unwrap();
-            assert_eq!(sends.len(), 1);
-            assert_eq!(sends[0].conversation, "discord:1/77");
-        }
-        assert!(router.held_routes.lock().unwrap().is_empty());
-        let outbound = ledger::get_by_binding(&db, "discord", "route", "route:route-test:awaits")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(outbound.conversation, "discord:1/77");
-        assert_eq!(outbound.status, "sent");
-        assert_eq!(route_firing_for(&db, "awaits").await.status, "fired");
-    }
-
     #[tokio::test]
     async fn undirected_discord_route_whose_surface_never_lands_records_a_failed_firing() {
         let (orch, db) = route_test_orchestrator("route-undirected-discord-timeout.db").await;
@@ -10605,33 +10412,6 @@ mod tests {
         assert_eq!(firing.status, "failed");
         let error = firing.error.unwrap_or_default();
         assert!(error.contains("was not ready within"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn undirected_discord_route_on_a_finished_issue_fails_without_a_surface() {
-        let (orch, db) = route_test_orchestrator("route-undirected-discord-closed.db").await;
-        seed_route_subject_issue(&db, 43, "closed").await;
-        let (router, provider) = guild_discord_router(orch);
-        router
-            .submit_route(
-                undirected_route_submission("closed", "detailUri", "cairn://p/cairn/43"),
-                OperatorPresence::Away,
-                Instant::now(),
-            )
-            .await
-            .unwrap();
-
-        assert!(provider.sends.lock().unwrap().is_empty());
-        assert!(router.held_routes.lock().unwrap().is_empty());
-        assert_eq!(issue_surface_rows(&db, "cairn://p/cairn/43").await, 0);
-        assert_eq!(discord_route_row_count(&db).await, 0);
-        let firing = route_firing_for(&db, "closed").await;
-        assert_eq!(firing.status, "failed");
-        let error = firing.error.unwrap_or_default();
-        assert!(
-            error.contains("Discord has no default conversation"),
-            "{error}"
-        );
     }
 
     /// A structural binding left behind in another guild is not this router's
@@ -11611,5 +11391,142 @@ mod tests {
             status[0].consuming_routes
         );
         assert!(status[0].detail.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_session_relative_poll_binding_persists_its_canonical_thread_uri() {
+        let (orch, db) = route_test_orchestrator("channel-router-relative-binding.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let (router, _provider) = test_router(orch);
+        let options = FollowPollOptions {
+            labels: vec!["general".to_string()],
+            bindings: HashMap::from([("general".to_string(), "cairn:~/".to_string())]),
+        };
+        let record = ledger::OutboundRecord {
+            id: "relative-poll".to_string(),
+            channel: CHANNEL.to_string(),
+            kind: "question".to_string(),
+            binding_ref: format!("{FOLLOW_POLL_PREFIX}relative"),
+            conversation: "+15551234567".to_string(),
+            job_id: Some(session),
+            rendered_text: "Follow threads\n1. general".to_string(),
+            rendering: "poll".to_string(),
+            options_json: Some(serde_json::to_string(&options).unwrap()),
+            status: "sent".to_string(),
+            provider_guid: Some("poll-guid".to_string()),
+            caption_guid: None,
+            created_at: 1,
+            sent_at: Some(1),
+            resolved_at: None,
+            last_error: None,
+            attempts: 0,
+            next_attempt_at: None,
+            last_attempt_at: None,
+        };
+
+        assert_eq!(
+            router
+                .resolve_bound_target(&record, "cairn:~/task/example")
+                .await
+                .unwrap(),
+            "cairn://p/cairn/general/task/example"
+        );
+
+        router
+            .follow_poll_selection(&record, "general", &record.conversation)
+            .await
+            .unwrap();
+
+        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
+        assert_eq!(follows.len(), 1);
+        assert_eq!(follows[0].uri, "cairn://p/cairn/general");
+        assert_eq!(
+            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
+            Some("cairn://p/cairn/general")
+        );
+    }
+
+    /// The subject has no Discord thread yet: the route asks for one, waits with
+    /// no outbound row, and delivers there once the reconciler binds it.
+    #[tokio::test]
+    async fn undirected_discord_route_waits_for_its_subject_surface_then_delivers() {
+        let (orch, db) = route_test_orchestrator("route-undirected-discord-await.db").await;
+        seed_route_subject_issue(&db, 42, "active").await;
+        let (router, provider) = guild_discord_router(orch);
+        let submission = undirected_route_submission("awaits", "detailUri", "cairn://p/cairn/42");
+        let start = Instant::now();
+
+        for _ in 0..3 {
+            router
+                .submit_route(submission.clone(), OperatorPresence::Away, start)
+                .await
+                .unwrap();
+        }
+        assert!(provider.sends.lock().unwrap().is_empty());
+        assert_eq!(discord_route_row_count(&db).await, 0);
+        assert_eq!(issue_surface_rows(&db, "cairn://p/cairn/42").await, 1);
+        assert_eq!(router.held_routes.lock().unwrap().len(), 1);
+
+        // Still being created: the next sweep keeps waiting.
+        router
+            .retry_held_routes(OperatorPresence::Away, start + Duration::from_secs(5))
+            .await;
+        assert_eq!(router.held_routes.lock().unwrap().len(), 1);
+
+        bind_structural(&db, "discord:1/77", "cairn://p/cairn/42").await;
+        router
+            .retry_held_routes(OperatorPresence::Away, start + Duration::from_secs(10))
+            .await;
+
+        {
+            let sends = provider.sends.lock().unwrap();
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].conversation, "discord:1/77");
+        }
+        assert!(router.held_routes.lock().unwrap().is_empty());
+        let outbound = ledger::get_by_binding(&db, "discord", "route", "route:route-test:awaits")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outbound.conversation, "discord:1/77");
+        assert_eq!(outbound.status, "sent");
+        assert_eq!(route_firing_for(&db, "awaits").await.status, "fired");
+    }
+
+    #[tokio::test]
+    async fn undirected_discord_route_on_a_finished_issue_fails_without_a_surface() {
+        let (orch, db) = route_test_orchestrator("route-undirected-discord-closed.db").await;
+        seed_route_subject_issue(&db, 43, "closed").await;
+        let (router, provider) = guild_discord_router(orch);
+        router
+            .submit_route(
+                undirected_route_submission("closed", "detailUri", "cairn://p/cairn/43"),
+                OperatorPresence::Away,
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(provider.sends.lock().unwrap().is_empty());
+        assert!(router.held_routes.lock().unwrap().is_empty());
+        assert_eq!(issue_surface_rows(&db, "cairn://p/cairn/43").await, 0);
+        assert_eq!(discord_route_row_count(&db).await, 0);
+        let firing = route_firing_for(&db, "closed").await;
+        assert_eq!(firing.status, "failed");
+        let error = firing.error.unwrap_or_default();
+        assert!(
+            error.contains("Discord has no default conversation"),
+            "{error}"
+        );
+    }
+
+    async fn issue_surface_rows(db: &LocalDb, target: &str) -> i64 {
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM discord_surface WHERE surface_kind = 'issue_thread' AND target_uri = ?1",
+            (target.to_string(),),
+        )
+        .await
+        .unwrap()
+        .unwrap_or(0)
     }
 }

@@ -353,18 +353,3 @@ pub async fn page_write(
     row_writes::journal(orch, &origin, &report, &gated).await;
     Ok(json!({ "result": raw, "reminders": [] }))
 }
-
-#[cfg(test)]
-pub(super) fn gate_for_test(
-    address: &PageAddress,
-    version: i32,
-    scopes: &[String],
-    changes: &[Value],
-) -> Result<Vec<String>, Vec<String>> {
-    gate_write_targets(address, version, scopes, changes).map(|gated| {
-        gated
-            .into_iter()
-            .filter_map(|change| change.target().map(str::to_string))
-            .collect()
-    })
-}

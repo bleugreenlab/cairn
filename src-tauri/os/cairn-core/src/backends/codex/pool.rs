@@ -62,23 +62,6 @@ pub(crate) mod testing {
         fn server_closed(&self, _server_id: &str) {}
     }
 
-    /// A server on `pools` that never reads its stdin: every write to it
-    /// blocks until `gate`'s sender is dropped.
-    pub(crate) fn unread_server(
-        pools: &Arc<CodexAppServerPool>,
-        gate: crossbeam_channel::Receiver<()>,
-    ) -> Arc<PooledAppServer> {
-        let client = AppServerClient::for_test_unread(gate);
-        pools
-            .ensure(&"identity-unread".to_string(), |_| {
-                Ok((
-                    Arc::new(client),
-                    Arc::new(QuietPoolHost) as Arc<dyn PoolHost>,
-                ))
-            })
-            .unwrap()
-    }
-
     /// A server on `pools`. Its notification stream stays open, and the server
     /// with it, while the returned sender lives.
     pub(crate) fn live_server(

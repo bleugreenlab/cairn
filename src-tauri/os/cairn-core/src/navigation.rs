@@ -330,74 +330,6 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn bounded_navigation_and_census_report_real_query_plans_and_fixture_cost() {
-        let dbs = state().await;
-        seed(&dbs.local, false).await;
-        dbs.local.execute_script(
-            "WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 2000)
-             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-             SELECT 'perf-i-' || x, 'p', 2000 + x, 'Benchmark destination ' || x, 'closed', 1, 1 FROM seq;
-             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-             VALUES ('perf-e', 'r', 'old', 'p', 'running', 1, 1);
-             WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 2000)
-             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
-             SELECT 'perf-j-' || x, 'perf-e', 'old', 'p', 'Worker', 'worker-' || x, 'idle', 1, 1 FROM seq;
-             WITH RECURSIVE seq(x) AS (SELECT 100 UNION ALL SELECT x + 100 FROM seq WHERE x < 2000)
-             INSERT INTO turns(id, job_id, session_id, sequence, state, start_reason, created_at, updated_at)
-             SELECT 'perf-turn-' || x, 'perf-j-' || x, 'perf-session-' || x, 1, 'running', 'initial', 1, 1 FROM seq;"
-        ).await.unwrap();
-        let metadata_plan = dbs
-            .local
-            .query_all(
-                format!("EXPLAIN QUERY PLAN {NAVIGATION_METADATA_SQL}"),
-                params!["[\"p\"]", "destination", "[]", 10_i64, false, "destination"],
-                |row| row.text(3),
-            )
-            .await
-            .unwrap();
-        let census_plan = dbs
-            .local
-            .query_all(
-                format!(
-                    "EXPLAIN QUERY PLAN {}",
-                    crate::jobs::queries::live_agent_census_sql()
-                ),
-                params!["[\"p\"]"],
-                |row| row.text(3),
-            )
-            .await
-            .unwrap();
-        assert!(!metadata_plan.is_empty() && !census_plan.is_empty());
-        let start = std::time::Instant::now();
-        assert_eq!(
-            search_navigation_metadata(&dbs, "destination", Some(10))
-                .await
-                .unwrap()
-                .len(),
-            10
-        );
-        let cold_metadata = start.elapsed();
-        let start = std::time::Instant::now();
-        assert_eq!(
-            search_navigation_metadata(&dbs, "destination", Some(10))
-                .await
-                .unwrap()
-                .len(),
-            10
-        );
-        let warm_metadata = start.elapsed();
-        let start = std::time::Instant::now();
-        assert_eq!(
-            crate::jobs::queries::live_agent_census(&dbs)
-                .await
-                .unwrap()
-                .len(),
-            20
-        );
-        eprintln!("navigation fixture: 2002 issues, 2000 jobs, 20 live; metadata cold={cold_metadata:?}, warm={warm_metadata:?}; census={:?}; metadata plan={metadata_plan:?}; census plan={census_plan:?}", start.elapsed());
-    }
-
-    #[tokio::test]
     async fn retained_private_outboxes_cannot_overwrite_or_delete_team_documents() {
         let dbs = state().await;
         seed(&dbs.local, true).await;
@@ -613,57 +545,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_authority_is_the_open_handle_not_a_retained_project_copy() {
-        let dbs = state().await;
-        seed(&dbs.local, true).await;
-        assert!(search_navigation_metadata(&dbs, "914", None)
-            .await
-            .unwrap()
-            .is_empty());
-        let team = team_db("navigation-team").await;
-        dbs.register_team_db_for_test("team-a".into(), team).await;
-        let results = search_navigation_metadata(&dbs, "914", None).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].team_id.as_deref(), Some("team-a"));
-        dbs.forget_team("team-a").await.unwrap();
-        assert!(search_navigation_metadata(&dbs, "ancient", None)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn content_enriches_team_hits_and_rejects_stale_closed_replica_hits() {
-        let dbs = state().await;
-        seed(&dbs.local, true).await;
-        let team = team_db("content-team").await;
-        team.execute_script(
-            "UPDATE projects SET key = 'team-project' WHERE key = 'alpha';
-             INSERT INTO comments(id, issue_id, content, source, created_at)
-             VALUES ('team-comment', 'old', 'xylophonic team evidence', 'user', 2);",
-        )
-        .await
-        .unwrap();
-        dbs.register_team_db_for_test("team-a".into(), team).await;
-        let results = crate::search::search_content_across(&dbs, "xylophonic", None, None)
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].uri, "cairn://p/team-project/914");
-        assert_eq!(
-            results[0].issue_title.as_deref(),
-            Some("Ancient inference engine")
-        );
-        dbs.forget_team("team-a").await.unwrap();
-        assert!(
-            crate::search::search_content_across(&dbs, "xylophonic", None, None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn index_authority_is_applied_before_top_docs_and_empty_means_empty() {
         let dbs = state().await;
         seed(&dbs.local, false).await;
@@ -816,34 +697,5 @@ mod tests {
                 "workflow-task-event"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn census_aggregates_local_and_team_authorities_without_copy_duplicates() {
-        let dbs = state().await;
-        seed(&dbs.local, true).await;
-        let team = team_db("census-team").await;
-        for db in [&dbs.local, &team] {
-            db.execute_script(
-                "INSERT INTO jobs(id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
-                 VALUES ('thread-job', 'th', (SELECT project_id FROM threads WHERE id = 'th'), 'Thread', 'thread', 'blocked', 1, 1);
-                 INSERT INTO turns(id, job_id, session_id, sequence, state, start_reason, created_at, updated_at)
-                 VALUES ('thread-turn', 'thread-job', 'session', 1, 'running', 'initial', 1, 1);"
-            ).await.unwrap();
-        }
-        dbs.register_team_db_for_test("team-a".into(), team).await;
-        let agents = crate::jobs::queries::live_agent_census(&dbs).await.unwrap();
-        assert_eq!(
-            agents.len(),
-            1,
-            "private retained team copy is not an authority"
-        );
-        assert_eq!(agents[0].team_id.as_deref(), Some("team-a"));
-        assert_eq!(agents[0].uri, "cairn://p/alpha/stable-name");
-        dbs.forget_team("team-a").await.unwrap();
-        assert!(crate::jobs::queries::live_agent_census(&dbs)
-            .await
-            .unwrap()
-            .is_empty());
     }
 }

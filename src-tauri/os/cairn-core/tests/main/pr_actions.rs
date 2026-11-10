@@ -98,18 +98,6 @@ fn provision_jj_merge(config_dir: &Path, repo: &Path) {
     jj::seal(&jj, &ws, "feature work", None).unwrap();
 }
 
-/// Like `provision_jj_merge`, but seals THREE commits on `feature` so a merge
-/// can be checked for squash (one commit lands) vs. real fold (all three land).
-fn provision_jj_merge_multi(config_dir: &Path, repo: &Path) {
-    let ws = config_dir.join("feature-ws");
-    common::provision_jj_workspace(config_dir, repo, &ws, "feature");
-    let jj = jj::environment("jj", config_dir);
-    for i in 1..=3 {
-        std::fs::write(ws.join(format!("change{i}.txt")), format!("change {i}\n")).unwrap();
-        jj::seal(&jj, &ws, &format!("feature work {i}"), None).unwrap();
-    }
-}
-
 /// Provision a jj store whose `feature` bookmark carries a RECORDED conflict on
 /// `shared.txt`: feature edits the file, `main` then advances with a conflicting
 /// edit to the same path, and feature is rebased onto the advanced main — the
@@ -256,49 +244,6 @@ fn jj_bookmark_commit(bin: &str, config_dir: &Path, repo: &Path, bookmark: &str)
         &format!("bookmarks(exact:{bookmark:?})"),
         "commit_id",
     )
-}
-
-/// Files present in the tree a bookmark resolves to in a project's shared store.
-fn jj_files(bin: &str, config_dir: &Path, repo: &Path, bookmark: &str) -> String {
-    let store = jj::project_store_dir(config_dir, repo);
-    let cfg = config_dir.join("jj").join("config.toml");
-    let out = Command::new(bin)
-        .args(["file", "list", "--ignore-working-copy", "-r", bookmark])
-        .current_dir(&store)
-        .env("JJ_CONFIG", &cfg)
-        .env("EDITOR", "true")
-        .env("JJ_EDITOR", "true")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "jj file list failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).to_string()
-}
-
-/// Number of commits in a revset in a project's shared store.
-fn jj_count(bin: &str, config_dir: &Path, repo: &Path, revset: &str) -> usize {
-    let out = jj_template(bin, config_dir, repo, revset, "\"x\\n\"");
-    out.lines().filter(|l| !l.trim().is_empty()).count()
-}
-
-/// Like `create_project`, but flags the project as a workspace so its PRs force
-/// the `merge` method (preserving individual commits) rather than squashing.
-async fn create_workspace_project(db: &LocalDb, key: &str, repo_path: &str) -> String {
-    let id = uuid::Uuid::new_v4().to_string();
-    let key = key.to_string();
-    let repo_path = repo_path.to_string();
-    let now = chrono::Utc::now().timestamp();
-    db.execute(
-        "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, is_workspace, created_at, updated_at)
-         VALUES (?1, 'default', 'Test Workspace', ?2, ?3, 'main', 1, ?4, ?4)",
-        params![id.as_str(), key.as_str(), repo_path.as_str(), now],
-    )
-    .await
-    .unwrap();
-    id
 }
 
 async fn orchestrator_with_http(db: LocalDb, http: MockHttpClient) -> (TempDir, Orchestrator) {
@@ -1192,33 +1137,6 @@ async fn reconcile_after_merge_for_action_run_owner_stores_files_under_parent_jo
     );
 }
 
-#[tokio::test]
-async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
-    let Some(_bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_marks_merged_and_resolves_issue: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = temp_jj_project();
-    let project = create_project(&db, "mg", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    // A recipe-backed producing job: standalone (execution-less) jobs were
-    // retired, so resolving the PR recomputes through the job's execution sweep.
-    insert_execution(&db, "exec-mg", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mg")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-
-    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
-    provision_jj_merge(&cfg.path().join("config"), repo.path());
-
-    let msg = actions::merge_pr_for_job(&orch, &job, None, None, None)
-        .await
-        .unwrap();
-    assert!(msg.contains("merged"));
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-    assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
-}
-
 const PIN_BUMP_CONFIG: &str = "checks:
   pin-tests:
     command: cargo nextest run pin
@@ -1262,135 +1180,6 @@ fn provision_pin_bump(bin: &str, config_dir: &Path) -> (TempDir, String) {
     jj::seal(&jj, &ws, "bump tool to 1.1.0", None).unwrap();
     let head = jj_bookmark_commit(bin, config_dir, repo.path(), "feature");
     (repo, head)
-}
-
-/// Record a verified nextest pass for `check` on `platform` at `commit`, the
-/// way a fresh observation lands: observation, verdict cache row, commit alias.
-async fn record_verified_verdict(
-    db: &LocalDb,
-    project_id: &str,
-    commit: &str,
-    check: &str,
-    platform: &str,
-) -> String {
-    let id = format!("obs-{check}-{platform}");
-    let environment = format!("env-{platform}");
-    let parsed = r#"{"parser":"nextest","complete":true,"selection":"full","passed":3,"failed":0,"skipped":0,"failures":[]}"#;
-    db.execute(
-        "INSERT INTO check_result_observations (
-            id, project_id, commit_sha, tree_hash, check_name, input_hash,
-            environment_fingerprint, exit_code, verdict, complete, reusable,
-            parser_version, result_schema_version, ran_at, duration_ms, cadence,
-            output_tail, verdict_platform
-         ) VALUES (?1, ?2, ?3, 'tree', ?4, 'input', ?5, 0, 'passed', 1, 1, 1, 1, 10, 10,
-                   'review', '', ?6)",
-        params![
-            id.as_str(),
-            project_id,
-            commit,
-            check,
-            environment.as_str(),
-            platform
-        ],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO check_result_cache (
-            project_id, tree_hash, input_hash, check_name, environment_fingerprint,
-            result_schema_version, source_observation_id, exit_code, passed, output_tail,
-            duration_ms, ran_at, target_results_json, verdict_platform
-         ) VALUES (?1, 'tree', 'input', ?2, ?3, 1, ?4, 0, 1, '', 10, 10, ?5, ?6)",
-        params![
-            project_id,
-            check,
-            environment.as_str(),
-            id.as_str(),
-            parsed,
-            platform
-        ],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "INSERT INTO check_result_commit_aliases (
-            project_id, commit_sha, check_name, environment_fingerprint,
-            result_schema_version, source_observation_id, tree_hash, input_hash,
-            disposition, evaluated_at
-         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, 'tree', 'input', 'fresh', 10)",
-        params![project_id, commit, check, environment.as_str(), id.as_str()],
-    )
-    .await
-    .unwrap();
-    id
-}
-
-/// A project whose `main` declares one review check with no impact, so it
-/// applies to every change, and `feature` sealed one commit ahead.
-fn provision_checked_change(bin: &str, config_dir: &Path) -> TempDir {
-    let repo = temp_jj_project();
-    std::fs::create_dir_all(repo.path().join(".cairn")).unwrap();
-    std::fs::write(
-        repo.path().join(".cairn/config.yaml"),
-        "checks:\n  unit:\n    command: cargo nextest run unit\n    when: review\n",
-    )
-    .unwrap();
-    for args in [
-        &["add", "-A"][..],
-        &["commit", "-q", "-m", "declare a check"],
-    ] {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(repo.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?}");
-    }
-    let ws = config_dir.join("feature-ws");
-    common::provision_jj_workspace(config_dir, repo.path(), &ws, "feature");
-    let jj = jj::environment(bin, config_dir);
-    std::fs::write(ws.join("change.txt"), "a change nobody checked\n").unwrap();
-    jj::seal(&jj, &ws, "an unchecked change", None).unwrap();
-    repo
-}
-
-/// The cairn/5167 shape, now one click: a head whose applicable check no lane
-/// ever judged lands on an ordinary merge, whoever asks for it, and is
-/// journaled as an ordinary landing. No landing gate reads verdicts.
-#[tokio::test]
-async fn a_head_without_a_verdict_lands_on_an_ordinary_merge() {
-    let bin =
-        common::jj_bin().expect("jj must be provisioned in the build slot or available on PATH");
-    let (_temp, db) = common::migrated_db().await;
-    let cfg = tempfile::tempdir().unwrap();
-    let repo = provision_checked_change(&bin, &cfg.path().join("config"));
-    let project = create_project(&db, "nvh", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    insert_execution(&db, "exec-nvh", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-nvh")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-    let orch = orchestrator_with_http_in(db, MockHttpClient::new(), &cfg).await;
-
-    let message = actions::merge_pr_for_job(
-        &orch,
-        &job,
-        None,
-        Some(actions::PrResolutionAttribution::agent(
-            "cairn://p/nvh/1/1/builder".into(),
-        )),
-        None,
-    )
-    .await
-    .expect("a head without verdicts lands");
-    assert!(message.contains("merged"), "{message}");
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-
-    let journal = merge_journal(&orch.db.local, &mr).await;
-    let landed = journal
-        .iter()
-        .find(|(sequence, state, _)| *sequence == 1 && state == "succeeded")
-        .expect("the landing is journaled");
-    assert_eq!(landed.2, None, "an ordinary landing records nothing more");
 }
 
 /// `(sequence, state, detail)` for every journal event of one merge request.
@@ -1471,53 +1260,6 @@ async fn pin_bump_merge_refuses_without_head_verdicts_and_journals_the_violation
         head,
         "nothing landed"
     );
-}
-
-/// With a verified verdict on every required platform at the head, the bump
-/// lands and the outcome event records the evidence it landed on.
-#[tokio::test]
-async fn pin_bump_merge_lands_a_verified_bump_and_records_its_evidence() {
-    let bin =
-        common::jj_bin().expect("jj must be provisioned in the build slot or available on PATH");
-    let (_temp, db) = common::migrated_db().await;
-    let cfg = tempfile::tempdir().unwrap();
-    let (repo, head) = provision_pin_bump(&bin, &cfg.path().join("config"));
-    let project = create_project(&db, "pbm", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    insert_execution(&db, "exec-pbm", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-pbm")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-    let mut observations = Vec::new();
-    for platform in ["linux", "macos"] {
-        observations
-            .push(record_verified_verdict(&db, &project, &head, "pin-tests", platform).await);
-    }
-    let orch = orchestrator_with_http_in(db, MockHttpClient::new(), &cfg).await;
-
-    let message = actions::merge_pr_for_job(
-        &orch,
-        &job,
-        None,
-        None,
-        Some(actions::MergePrecondition::PinBump),
-    )
-    .await
-    .unwrap();
-    assert!(message.contains("merged"), "{message}");
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-
-    let journal = merge_journal(&orch.db.local, &mr).await;
-    assert_eq!(journal.len(), 2, "{journal:?}");
-    assert_eq!((journal[1].0, journal[1].1.as_str()), (1, "succeeded"));
-    let detail = journal[1].2.clone().unwrap_or_default();
-    assert!(
-        detail.contains("pinBump: tool `tools/tool-pin.json` 1.0.0 -> 1.1.0"),
-        "{detail}"
-    );
-    assert!(detail.contains(&head), "{detail}");
-    for observation in &observations {
-        assert!(detail.contains(observation.as_str()), "{detail}");
-    }
 }
 
 /// A real remote PR landing on the default branch lands by the store fold,
@@ -1716,175 +1458,6 @@ fn seal_branch(config_dir: &Path, repo: &Path, branch: &str, files: &[(&str, &st
     jj::seal(&jj::environment("jj", config_dir), &ws, branch, None).unwrap();
 }
 
-fn file_at(bin: &str, config_dir: &Path, repo: &Path, revision: &str, path: &str) -> String {
-    let store = jj::project_store_dir(config_dir, repo);
-    String::from_utf8(
-        jj::file_show(&jj::environment(bin, config_dir), &store, revision, path).unwrap(),
-    )
-    .unwrap()
-}
-
-/// cairn/5222's acceptance: two branches cut from one tip each add a `NEXT`
-/// migration and a `/// Version NEXT` paragraph, and land back to back. Neither
-/// is renumbered by anyone but the landing: the first lands as migration 0002
-/// and protocol 8, the second, replayed onto the first, as 0003 and 9, with
-/// both paragraphs kept and every reference to a stem rewritten. Each landing
-/// is recorded in `landing_allocations` and on its issue.
-#[tokio::test]
-async fn two_next_branches_landing_back_to_back_take_consecutive_numbers() {
-    let Some(bin) = common::jj_bin() else {
-        eprintln!("skipping two_next_branches_landing_back_to_back_take_consecutive_numbers: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = binding_project();
-    let project = create_project(&db, "bind", repo.path().to_str().unwrap()).await;
-    let (issue_a, job_a, mr_a) = branch_merge_request(&db, &project, 1, "agent/alpha").await;
-    let (issue_b, job_b, mr_b) = branch_merge_request(&db, &project, 2, "agent/beta").await;
-
-    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
-    let config_dir = cfg.path().join("config");
-    let protocol = |name: &str, cairn: u32| {
-        format!(
-            "/// Version 7 adds the base.\n///\n/// Version NEXT (cairn/{cairn}) adds {name}.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 8;\n"
-        )
-    };
-    let alpha_protocol = protocol("alpha", 1);
-    let beta_protocol = protocol("beta", 2);
-    seal_branch(
-        &config_dir,
-        repo.path(),
-        "agent/alpha",
-        &[
-            (
-                "migrations/NEXT_alpha.sql",
-                "-- lineage: shared\nCREATE TABLE alpha (id INTEGER);\n",
-            ),
-            ("notes-alpha.md", "alpha adds NEXT_alpha.sql\n"),
-            ("protocol.rs", &alpha_protocol),
-        ],
-    );
-    seal_branch(
-        &config_dir,
-        repo.path(),
-        "agent/beta",
-        &[
-            (
-                "migrations/NEXT_beta.sql",
-                "-- lineage: shared\nCREATE TABLE beta (id INTEGER);\n",
-            ),
-            ("notes-beta.md", "beta adds NEXT_beta.sql\n"),
-            ("protocol.rs", &beta_protocol),
-        ],
-    );
-
-    actions::merge_pr_for_job(&orch, &job_a, None, None, None)
-        .await
-        .unwrap();
-    actions::merge_pr_for_job(&orch, &job_b, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(mr_status(&orch.db.local, &mr_a).await, "merged");
-    assert_eq!(mr_status(&orch.db.local, &mr_b).await, "merged");
-
-    let files = jj_files(&bin, &config_dir, repo.path(), "main");
-    for landed in [
-        "migrations/0001_base.sql",
-        "migrations/0002_alpha.sql",
-        "migrations/0003_beta.sql",
-    ] {
-        assert!(files.contains(landed), "{landed} on main: {files}");
-    }
-    assert!(!files.contains("NEXT_"), "nothing unbound lands: {files}");
-    assert_eq!(
-        file_at(&bin, &config_dir, repo.path(), "main", "notes-beta.md"),
-        "beta adds 0003_beta.sql\n"
-    );
-    assert_eq!(
-        file_at(&bin, &config_dir, repo.path(), "main", "protocol.rs"),
-        "/// Version 7 adds the base.\n///\n/// Version 8 (cairn/1) adds alpha.\n///\n/// Version 9 (cairn/2) adds beta.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 9;\n"
-    );
-
-    let allocations = orch
-        .db
-        .local
-        .query_all(
-            "SELECT kind, value, name, provisional, issue_id FROM landing_allocations
-             ORDER BY allocated_at, kind, value",
-            (),
-            |row| {
-                Ok((
-                    row.text(0)?,
-                    row.i64(1)?,
-                    row.text(2)?,
-                    row.text(3)?,
-                    row.text(4)?,
-                ))
-            },
-        )
-        .await
-        .unwrap();
-    let mut allocations: Vec<_> = allocations
-        .into_iter()
-        .map(|(kind, value, name, provisional, issue)| {
-            (kind, value, name, provisional, issue == issue_b)
-        })
-        .collect();
-    allocations.sort();
-    assert_eq!(
-        allocations,
-        vec![
-            (
-                "executor-protocol".into(),
-                8,
-                "Version 8".into(),
-                "Version NEXT".into(),
-                false
-            ),
-            (
-                "executor-protocol".into(),
-                9,
-                "Version 9".into(),
-                "Version NEXT".into(),
-                true
-            ),
-            (
-                "migration".into(),
-                2,
-                "0002_alpha".into(),
-                "NEXT_alpha".into(),
-                false
-            ),
-            (
-                "migration".into(),
-                3,
-                "0003_beta".into(),
-                "NEXT_beta".into(),
-                true
-            ),
-        ]
-    );
-    let comment = |issue: String| {
-        let db = orch.db.local.clone();
-        async move {
-            db.query_opt_text(
-                "SELECT content FROM comments WHERE issue_id = ?1 AND content LIKE 'Landed as %'",
-                params![issue],
-            )
-            .await
-            .unwrap()
-        }
-    };
-    assert_eq!(
-        comment(issue_a).await.as_deref(),
-        Some("Landed as migration 0002_alpha, executor-protocol 8.")
-    );
-    assert_eq!(
-        comment(issue_b).await.as_deref(),
-        Some("Landed as migration 0003_beta, executor-protocol 9.")
-    );
-}
-
 /// One change takes one version: a branch that heads two protocol versions is
 /// refused when it would land, and nothing moves.
 #[tokio::test]
@@ -1977,44 +1550,6 @@ async fn a_branch_quoting_a_provisional_version_is_refused_before_it_lands() {
         branch_before,
         "the prospective bind is undone"
     );
-}
-
-/// A jj-conflicted source must be refused BEFORE the fold, and the refusal must
-/// name the offending file and the resolve-at-base recovery path — not a bare
-/// "has a recorded conflict". The PR stays open (the gate fired pre-fold).
-#[tokio::test]
-async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
-    let Some(bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_refuses_conflicted_source_with_actionable_detail: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = temp_jj_project();
-    let project = create_project(&db, "mgc", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-
-    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
-    provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
-
-    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
-        .await
-        .expect_err("a conflicted source must be refused");
-    assert!(
-        err.contains("`feature` conflicts with base `main`"),
-        "names the conflict: {err}"
-    );
-    assert!(
-        err.contains("shared.txt"),
-        "names the conflicted file: {err}"
-    );
-    assert!(
-        err.contains("conflict session") && err.contains("cairn:~/rebase"),
-        "names the recovery path: {err}"
-    );
-    // The refusal fires at the gate, before the fold: the PR is not merged.
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
 }
 
 /// Pre-flight: the live PR section surfaces a conflicted history BEFORE a merge.
@@ -2253,144 +1788,6 @@ async fn render_live_pr_section_flags_a_pull_request_behind_its_branch() {
     assert_eq!(cached.as_deref(), Some("UNKNOWN"));
 }
 
-/// Regression guard for the post-jj-migration squash default: a PR branch with
-/// MULTIPLE sealed commits must land as exactly ONE squashed commit on the
-/// default branch — its only parent the pre-merge tip, its tree the source tree
-/// — not flood the branch with every per-change commit the agent sealed.
-#[tokio::test]
-async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
-    let Some(bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_squashes_multiple_commits_to_one: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = temp_jj_project();
-    let project = create_project(&db, "mgsq", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    // A recipe-backed producing job: standalone (execution-less) jobs were
-    // retired, so resolving the PR recomputes through the job's execution sweep.
-    insert_execution(&db, "exec-mgsq", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mgsq")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-
-    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
-    let config_dir = cfg.path().join("config");
-    provision_jj_merge_multi(&config_dir, repo.path());
-
-    // The default tip before the merge: the squashed commit's parent must equal it.
-    let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
-
-    // `None` selects the default `squash` shape.
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-
-    // Exactly one commit landed: the new default tip's only parent is `pre`.
-    let parents = jj_template(
-        &bin,
-        &config_dir,
-        repo.path(),
-        "main",
-        "parents.map(|c| c.commit_id()).join(\",\")",
-    );
-    assert_eq!(
-        parents, pre,
-        "the squashed commit's only parent is the pre-merge default tip"
-    );
-
-    // Its tree carries all three feature files (the full source tree) in one commit.
-    let files = jj_files(&bin, &config_dir, repo.path(), "main");
-    for i in 1..=3 {
-        assert!(
-            files.contains(&format!("change{i}.txt")),
-            "change{i}.txt present in the squashed tree: {files}"
-        );
-    }
-}
-
-/// Idempotence guard: re-running `merge_pr_for_job` after a successful squash
-/// merge (modeling a crash or partial failure that landed the store fold but
-/// left local resolution / the DB row to be retried) must NOT advance the
-/// default branch to a fresh empty squash commit. Each retry would otherwise add
-/// one empty commit, since the source already equals the default tip.
-#[tokio::test]
-async fn merge_pr_for_job_squash_retry_is_idempotent() {
-    let Some(bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_squash_retry_is_idempotent: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = temp_jj_project();
-    let project = create_project(&db, "mgrt", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    // A recipe-backed producing job: standalone (execution-less) jobs were
-    // retired, so resolving the PR recomputes through the job's execution sweep.
-    insert_execution(&db, "exec-mgrt", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mgrt")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-
-    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
-    let config_dir = cfg.path().join("config");
-    provision_jj_merge_multi(&config_dir, repo.path());
-
-    // First merge: squashes the three commits to one.
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-    let landed = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
-
-    // Retry the same merge. `resolve_merge_mr_context_for_job` loads the MR by id
-    // regardless of status, so this re-enters `store_merge_child`; the
-    // idempotence guard must keep the default tip put. The retry's later
-    // resolution may no-op or error on the already-merged node, but the store
-    // tip is settled before that point, so assert on it directly.
-    let _ = actions::merge_pr_for_job(&orch, &job, None, None, None).await;
-    let after_retry = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
-    assert_eq!(
-        landed, after_retry,
-        "a merge retry must not advance the default branch to a new empty squash commit"
-    );
-}
-
-/// A workspace PR forces the `merge` method, so the default-branch landing keeps
-/// the source's real per-commit history instead of squashing it.
-#[tokio::test]
-async fn merge_pr_for_job_workspace_keeps_real_commits() {
-    let Some(bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_workspace_keeps_real_commits: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = temp_jj_project();
-    let project = create_workspace_project(&db, "MGWS", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    // A recipe-backed producing job: standalone (execution-less) jobs were
-    // retired, so resolving the PR recomputes through the job's execution sweep.
-    insert_execution(&db, "exec-mgws", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mgws")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-
-    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
-    let config_dir = cfg.path().join("config");
-    provision_jj_merge_multi(&config_dir, repo.path());
-
-    let pre = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
-
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-
-    // All three real commits landed: counting commits in `pre..main` yields three.
-    let count = jj_count(&bin, &config_dir, repo.path(), &format!("{pre}..main"));
-    assert_eq!(
-        count, 3,
-        "the forced merge method lands all three real commits, not a squash"
-    );
-}
-
 // ----------------------------------------------------------------------------
 // DAG advancement after PR resolution
 //
@@ -2521,48 +1918,6 @@ async fn helper_is_idempotent_across_repeat_calls() {
 }
 
 #[tokio::test]
-async fn merge_pr_for_job_advances_producing_execution() {
-    let Some(_bin) = common::jj_bin() else {
-        eprintln!("skipping merge_pr_for_job_advances_producing_execution: jj not resolvable");
-        return;
-    };
-    let (_temp, db) = common::migrated_db().await;
-    let repo = temp_jj_project();
-    let project = create_project(&db, "mga", repo.path().to_str().unwrap()).await;
-    let issue = create_issue(&db, &project, 1).await;
-    insert_execution(&db, "exec-mga", &project, &issue).await;
-    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mga")).await;
-    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
-
-    let (cfg, orch, mut rx) = orchestrator_with_effect_channel(db, MockHttpClient::new()).await;
-    provision_jj_merge(&cfg.path().join("config"), repo.path());
-
-    actions::merge_pr_for_job(&orch, &job, None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
-
-    let effects = drain_effects(&mut rx);
-    let has_advance = effects.iter().any(|e| {
-        matches!(
-            e,
-            WorkflowEffect::AdvanceDag { execution_id, .. } if execution_id == "exec-mga"
-        )
-    });
-    assert!(
-        has_advance,
-        "in-app merge must enqueue AdvanceDag for the producing execution; got: {:?}",
-        effects
-    );
-
-    let entries = outbox_entries_for(&orch.db.local, "advance_dag", "exec-mga").await;
-    assert!(
-        !entries.is_empty(),
-        "in-app merge must persist an advance_dag outbox row"
-    );
-}
-
-#[tokio::test]
 async fn close_pr_for_job_advances_producing_execution() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
@@ -2653,5 +2008,47 @@ async fn team_pr_resolution_queues_private_replay_without_a_live_worker() {
         .await
         .unwrap(),
         0
+    );
+}
+
+#[tokio::test]
+async fn merge_pr_for_job_advances_producing_execution() {
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!("skipping merge_pr_for_job_advances_producing_execution: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    let project = create_project(&db, "mga", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-mga", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mga")).await;
+    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
+
+    let (cfg, orch, mut rx) = orchestrator_with_effect_channel(db, MockHttpClient::new()).await;
+    provision_jj_merge(&cfg.path().join("config"), repo.path());
+
+    actions::merge_pr_for_job(&orch, &job, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
+
+    let effects = drain_effects(&mut rx);
+    let has_advance = effects.iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEffect::AdvanceDag { execution_id, .. } if execution_id == "exec-mga"
+        )
+    });
+    assert!(
+        has_advance,
+        "in-app merge must enqueue AdvanceDag for the producing execution; got: {:?}",
+        effects
+    );
+
+    let entries = outbox_entries_for(&orch.db.local, "advance_dag", "exec-mga").await;
+    assert!(
+        !entries.is_empty(),
+        "in-app merge must persist an advance_dag outbox row"
     );
 }

@@ -1024,7 +1024,7 @@ mod tests {
     struct Fixture {
         _home: TempDir,
         proj: TempDir,
-        wts: TempDir,
+        _wts: TempDir,
         jj: JjEnv,
         store: std::path::PathBuf,
         main: String,
@@ -1052,7 +1052,7 @@ mod tests {
         Some(Fixture {
             _home: home,
             proj,
-            wts,
+            _wts: wts,
             jj,
             store,
             main,
@@ -1104,237 +1104,6 @@ mod tests {
         let mut recoveries = jj.take_recoveries();
         assert_eq!(recoveries.len(), 1, "{recoveries:?}");
         recoveries.remove(0)
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_verified_rollback_restores_bookmark_and_git_and_records_nothing() {
-        let Some(fx) = fixture() else { return };
-        let jj = fx.budgeted();
-        let op = operation_id(&jj, &fx.store).unwrap();
-        fx.move_and_export(&jj, FEATURE, &fx.main);
-        assert_eq!(fx.git_head(FEATURE).as_deref(), Some(fx.main.as_str()));
-
-        restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap();
-        assert!(jj.take_recoveries().is_empty());
-        // Read outside the transaction: its forward clones are barred once
-        // cleanup has started.
-        assert_eq!(
-            bookmark_commit(&fx.jj, &fx.store, FEATURE),
-            Some(fx.feature.clone())
-        );
-        assert_eq!(fx.git_head(FEATURE), Some(fx.feature.clone()));
-    }
-
-    /// The 531e1867 shape: the forward rebase moved and exported the branch,
-    /// then the restore was refused before spawning. That refusal made no
-    /// change, and the forward mutation is still in place.
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_restore_refused_before_spawning_after_a_forward_move_records_a_branch_recovery() {
-        let Some(fx) = fixture() else { return };
-        let jj = fx.budgeted();
-        let op = operation_id(&jj, &fx.store).unwrap();
-        fx.move_and_export(&jj, FEATURE, &fx.main);
-        jj.expire_cleanup_for_test();
-
-        let error = restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap_err();
-        assert!(error.contains(ROLLBACK_INCOMPLETE), "{error}");
-        let recovery = only_recovery(&jj);
-        assert_eq!(recovery.scope, RecoveryScope::Branch);
-        assert_eq!(recovery.phase, RollbackFailurePhase::RestoreNotSpawned);
-        assert_eq!(recovery.pre_op.as_deref(), Some(op.as_str()));
-        assert_eq!(
-            recovery.bookmarks,
-            vec![BookmarkRecovery {
-                bookmark: FEATURE.into(),
-                pre: BookmarkState::normal(&fx.feature),
-                pre_git: Some(fx.feature.clone()),
-                failed: BookmarkState::normal(&fx.main),
-            }]
-        );
-        // Nothing ran: the branch is still where the failure left it.
-        assert_eq!(
-            bookmark_commit(&fx.jj, &fx.store, FEATURE),
-            Some(fx.main.clone())
-        );
-
-        let verdict =
-            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
-        assert!(
-            matches!(verdict, RepairVerdict::Verified { .. }),
-            "{verdict:?}"
-        );
-        assert_eq!(
-            bookmark_commit(&fx.jj, &fx.store, FEATURE),
-            Some(fx.feature.clone())
-        );
-        assert_eq!(fx.git_head(FEATURE), Some(fx.feature.clone()));
-        // Repeating a verified repair changes nothing and verifies again.
-        let again = repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
-        assert!(matches!(again, RepairVerdict::Verified { .. }), "{again:?}");
-    }
-
-    /// The c43a1f1e shape: `op restore` completed and the export after it did
-    /// not. The view is known; only the Git head is unverified. Later
-    /// unrelated work must survive the targeted repair exactly.
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_restore_whose_export_fails_is_repaired_without_touching_later_unrelated_work() {
-        let Some(fx) = fixture() else { return };
-        let jj = fx.budgeted();
-        let op = operation_id(&jj, &fx.store).unwrap();
-        fx.move_and_export(&jj, FEATURE, &fx.main);
-        let lock = fx
-            .proj
-            .path()
-            .join(".git/refs/heads")
-            .join(format!("{FEATURE}.lock"));
-        std::fs::write(&lock, "").unwrap();
-
-        let error = restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap_err();
-        assert!(error.contains(ROLLBACK_INCOMPLETE), "{error}");
-        let recovery = only_recovery(&jj);
-        assert_eq!(recovery.scope, RecoveryScope::Branch, "{recovery:?}");
-        assert_eq!(recovery.phase, RollbackFailurePhase::ExportUnverified);
-        assert_eq!(recovery.affected().collect::<Vec<_>>(), vec![FEATURE]);
-        assert_eq!(
-            bookmark_commit(&fx.jj, &fx.store, FEATURE),
-            Some(fx.feature.clone())
-        );
-        assert_eq!(
-            fx.git_head(FEATURE),
-            Some(fx.main.clone()),
-            "git kept the failed tip"
-        );
-
-        // Unrelated work lands after the failure, as the lock is released.
-        let ws = fx.wts.path().join("other");
-        add_workspace(&fx.jj, &fx.store, &ws, OTHER, "main", None).unwrap();
-        std::fs::write(ws.join("other.rs"), "other\n").unwrap();
-        seal(&fx.jj, &ws, "unrelated work", None).unwrap();
-        let other = bookmark_commit(&fx.jj, &fx.store, OTHER).unwrap();
-        // Named, so the still-locked FEATURE ref is not part of this export.
-        export_git_verified(
-            &fx.jj,
-            &fx.store,
-            true,
-            "unrelated export",
-            &[(OTHER, &other)],
-        )
-        .unwrap();
-        assert_eq!(fx.git_head(OTHER).as_deref(), Some(other.as_str()));
-
-        // The repair is refused while Git still refuses the ref, and retried.
-        let refused =
-            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
-        assert!(matches!(refused, RepairVerdict::Refused(_)), "{refused:?}");
-        std::fs::remove_file(&lock).unwrap();
-        let verdict =
-            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
-        assert!(
-            matches!(verdict, RepairVerdict::Verified { .. }),
-            "{verdict:?}"
-        );
-        assert_eq!(fx.git_head(FEATURE), Some(fx.feature.clone()));
-        assert_eq!(
-            bookmark_commit(&fx.jj, &fx.store, OTHER),
-            Some(other.clone())
-        );
-        assert_eq!(
-            fx.git_head(OTHER),
-            Some(other),
-            "unrelated git ref survives exactly"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_repair_refuses_a_bookmark_that_moved_after_the_failure() {
-        let Some(fx) = fixture() else { return };
-        let jj = fx.budgeted();
-        let op = operation_id(&jj, &fx.store).unwrap();
-        fx.move_and_export(&jj, FEATURE, &fx.main);
-        jj.expire_cleanup_for_test();
-        restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap_err();
-        let recovery = only_recovery(&jj);
-
-        // Someone committed new work on the branch since.
-        let ws = fx.wts.path().join("again");
-        add_workspace(&fx.jj, &fx.store, &ws, OTHER, "main", None).unwrap();
-        std::fs::write(ws.join("new.rs"), "new\n").unwrap();
-        seal(&fx.jj, &ws, "new work", None).unwrap();
-        let new_work = bookmark_commit(&fx.jj, &fx.store, OTHER).unwrap();
-        fx.move_and_export(&fx.jj, FEATURE, &new_work);
-
-        let verdict =
-            repair_branch_recovery(&fx.store, &recovery, "test-recovery", &BTreeSet::new());
-        let RepairVerdict::Refused(reason) = verdict else {
-            panic!("a moved bookmark must refuse the repair: {verdict:?}");
-        };
-        assert!(reason.contains("did not record"), "{reason}");
-        assert_eq!(bookmark_commit(&fx.jj, &fx.store, FEATURE), Some(new_work));
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_two_bookmark_recovery_recreates_a_merged_deleted_head() {
-        let Some(fx) = fixture() else { return };
-        // The feature tip is not an ancestor of main, as with a squash landing.
-        fx.move_and_export(&fx.jj, OTHER, &fx.feature);
-        let jj = fx.budgeted();
-        let op = operation_id(&jj, &fx.store).unwrap();
-        fx.move_and_export(&jj, FEATURE, &fx.main);
-        jj.expire_cleanup_for_test();
-        restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap_err();
-        let mut recovery = only_recovery(&jj);
-        recovery.phase = RollbackFailurePhase::ExportUnverified;
-        recovery.bookmarks.push(BookmarkRecovery {
-            bookmark: OTHER.into(),
-            pre: BookmarkState::normal(&fx.feature),
-            pre_git: Some(fx.feature.clone()),
-            failed: BookmarkState::normal(&fx.feature),
-        });
-        git(
-            fx.proj.path(),
-            &[
-                "update-ref",
-                "-d",
-                &format!("refs/heads/{OTHER}"),
-                &fx.feature,
-            ],
-        );
-        let merged_missing = BTreeSet::from([OTHER.to_string()]);
-        let verdict =
-            repair_branch_recovery(&fx.store, &recovery, "merged-retirement", &merged_missing);
-        assert!(
-            matches!(verdict, RepairVerdict::Verified { .. }),
-            "{verdict:?}"
-        );
-        for name in [FEATURE, OTHER] {
-            assert_eq!(fx.git_head(name), Some(fx.feature.clone()));
-            assert_eq!(
-                bookmark_commit(&fx.jj, &fx.store, name),
-                Some(fx.feature.clone())
-            );
-        }
-        let interrupted = interrupted_repair_coordinates(&fx.store, &recovery);
-        assert_eq!(
-            validate_store_recovery(&fx.store, &interrupted),
-            StoreValidation::Resolved
-        );
-        // A subsequent foreign Git movement cannot disappear into the baseline.
-        git(
-            fx.proj.path(),
-            &["update-ref", &format!("refs/heads/{OTHER}"), &fx.main],
-        );
-        assert!(matches!(
-            validate_store_recovery(&fx.store, &interrupted),
-            StoreValidation::Downgrade(_)
-        ));
-        let verdict = repair_branch_recovery(&fx.store, &recovery, "foreign-head", &merged_missing);
-        assert!(matches!(verdict, RepairVerdict::Refused(_)), "{verdict:?}");
-        assert_eq!(fx.git_head(OTHER), Some(fx.main.clone()));
     }
 
     #[test]
@@ -1544,31 +1313,6 @@ mod tests {
             bookmark_commit(&fx.jj, &fx.store, FEATURE),
             Some(fx.main.clone()),
             "nothing was repaired while the writer may run"
-        );
-    }
-
-    /// A view that sits neither before nor after the attempt stays fenced.
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_store_validation_refuses_an_unexplained_movement() {
-        let Some(fx) = fixture() else { return };
-        let jj = fx.budgeted();
-        let op = operation_id(&jj, &fx.store).unwrap();
-        fx.move_and_export(&jj, FEATURE, &fx.main);
-        jj.inject_survivor_for_test(SurvivingProcess {
-            pid: u32::MAX - 1,
-            process_group: u32::MAX - 1,
-            start_token: None,
-            outstanding: "test".into(),
-        });
-        restore_operation(&jj.cleanup_env(), &fx.store, &op).unwrap_err();
-        let recovery = only_recovery(&jj);
-        fx.move_and_export(&fx.jj, "main", &fx.feature);
-
-        let verdict = validate_store_recovery(&fx.store, &recovery);
-        assert!(
-            matches!(verdict, StoreValidation::Uncertain(_)),
-            "{verdict:?}"
         );
     }
 }

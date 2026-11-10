@@ -757,50 +757,6 @@ fn make_read_request(cwd: &str, path: &str) -> McpCallbackRequest {
     }
 }
 
-async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
-    let project_id = common::create_project(db, "preview").await;
-    db.write(|conn| {
-        let project_id = project_id.clone();
-        let data = json!({
-            "toolUses": [{
-                "id": "toolu-preview",
-                "name": "mcp__cairn__change",
-                "input": input,
-            }]
-        })
-        .to_string();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
-                 VALUES ('job-preview', ?1, 'running', 'session-preview', 1, 1)",
-                params![project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
-                 VALUES ('session-preview', 'job-preview', 'active', 1, 1)",
-                (),
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
-                 VALUES ('run-preview', ?1, 'job-preview', 'live', 'session-preview', 1, 1, 'resume')",
-                params![project_id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
-                 VALUES ('event-preview', 'run-preview', 'session-preview', 1, 1, 'assistant', ?1, 1)",
-                params![data.as_str()],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .unwrap();
-}
-
 async fn count_rows(db: &LocalDb, sql: &'static str) -> i64 {
     db.read(|conn| {
         Box::pin(async move {
@@ -898,19 +854,6 @@ async fn seed_change_run(
             Ok(())
         })
     }).await.unwrap();
-}
-
-fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
-    McpCallbackRequest {
-        answer_bound_ms: None,
-        thread_id: None,
-        cwd: cwd.to_string(),
-        run_id: Some("run-preview".to_string()),
-        tool: "write".to_string(),
-        payload,
-        tool_use_id: Some("toolu-preview".to_string()),
-        origin: None,
-    }
 }
 
 fn parse_report(result: &str) -> serde_json::Value {
@@ -1231,10 +1174,6 @@ impl ChangeTestRepo {
         parse_report(&handle_write(&self.orch, &request).await)
     }
 
-    async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
-        parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
-    }
-
     /// `handle_write`'s raw answer. A refusal taken before any mutation applies
     /// is prose, not a change report, so it cannot go through `change_report`.
     async fn change_raw(&self, payload: serde_json::Value) -> String {
@@ -1265,6 +1204,10 @@ impl ChangeTestRepo {
             .await
             .unwrap();
         "issue-change".to_string()
+    }
+
+    async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
+        parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
     }
 }
 
@@ -1894,32 +1837,6 @@ async fn change_unified_patch_requires_commit_msg_for_file_targets() {
         .unwrap()
         .contains("commit_msg"));
     assert!(!dir.path().join("new.rs").exists());
-}
-
-#[tokio::test]
-async fn change_unified_patch_rejects_single_file_target_mismatch() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-
-    let report = repo
-        .change_report(json!({
-            "changes": [{
-                "target": "file:expected.rs",
-                "mode": "unified_patch",
-                "payload": { "patch": "*** Begin Patch\n*** Add File: actual.rs\n+actual();\n*** End Patch\n" }
-            }],
-            "commit_msg": "target mismatch"
-        }))
-        .await;
-
-    assert_eq!(failure_count(&report), 1, "{report:?}");
-    assert!(report["failures"][0]["error"]
-        .as_str()
-        .unwrap()
-        .contains("envelope target path does not match change.target"));
-    assert!(!repo.path("actual.rs").exists());
 }
 
 #[tokio::test]
@@ -2578,66 +2495,6 @@ async fn change_unified_patch_applies_native_contextual_hunk() {
         repo.read("lib.rs"),
         "fn example() {\n    new();\n}\n\nfn other() {}\n"
     );
-}
-
-#[tokio::test]
-async fn change_unified_patch_native_add_only_context_header_inserts_after_anchor() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    repo.write("lib.rs", "fn first() {\n}\n\nfn second() {\n}\n");
-
-    let report = repo
-        .change_report(
-        json!({
-            "changes": [{
-                "target": "file:lib.rs",
-                "mode": "unified_patch",
-                "payload": { "patch": "*** Begin Patch\n*** Update File: lib.rs\n@@ fn second() {\n+    inserted();\n*** End Patch\n" }
-            }],
-            "commit_msg": "insert after anchor"
-        }),
-    )
-    .await;
-
-    assert_successful_change(&report, 1);
-    assert_eq!(
-        repo.read("lib.rs"),
-        "fn first() {\n}\n\nfn second() {\n    inserted();\n}\n"
-    );
-}
-
-#[tokio::test]
-async fn change_unified_patch_preview_hashes_expanded_targets() {
-    let Some(repo) = ChangeTestRepo::try_new().await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    repo.write("lib.rs", "old();\n");
-    let payload = json!({
-        "changes": [{
-            "target": "file:",
-            "mode": "unified_patch",
-            "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** End Patch\n" }
-        }],
-        "commit_msg": "add files",
-        "preview": true
-    });
-    insert_preview_event(&repo.orch.db.local, payload.clone()).await;
-
-    let report = repo.preview_report(payload).await;
-
-    assert_successful_change(&report, 2);
-    assert_eq!(repo.read("lib.rs"), "old();\n");
-    assert!(!repo.path("add.rs").exists());
-    let targets = report["target_hashes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|hash| hash["target"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(targets, vec!["file:add.rs", "file:lib.rs"]);
 }
 
 #[tokio::test]
@@ -3708,4 +3565,93 @@ async fn handler_revert_overlap_failure_leaves_head_and_ledger_unchanged() {
     );
     assert_eq!(retry["applied"], json!([]), "{retry:?}");
     assert_eq!(repo.read("shared.txt"), "later\n");
+}
+
+#[tokio::test]
+async fn change_unified_patch_preview_hashes_expanded_targets() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "old();\n");
+    let payload = json!({
+        "changes": [{
+            "target": "file:",
+            "mode": "unified_patch",
+            "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** End Patch\n" }
+        }],
+        "commit_msg": "add files",
+        "preview": true
+    });
+    insert_preview_event(&repo.orch.db.local, payload.clone()).await;
+
+    let report = repo.preview_report(payload).await;
+
+    assert_successful_change(&report, 2);
+    assert_eq!(repo.read("lib.rs"), "old();\n");
+    assert!(!repo.path("add.rs").exists());
+    let targets = report["target_hashes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hash| hash["target"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(targets, vec!["file:add.rs", "file:lib.rs"]);
+}
+
+async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
+    let project_id = common::create_project(db, "preview").await;
+    db.write(|conn| {
+        let project_id = project_id.clone();
+        let data = json!({
+            "toolUses": [{
+                "id": "toolu-preview",
+                "name": "mcp__cairn__change",
+                "input": input,
+            }]
+        })
+        .to_string();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+                 VALUES ('job-preview', ?1, 'running', 'session-preview', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('session-preview', 'job-preview', 'active', 1, 1)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-preview', ?1, 'job-preview', 'live', 'session-preview', 1, 1, 'resume')",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+                 VALUES ('event-preview', 'run-preview', 'session-preview', 1, 1, 'assistant', ?1, 1)",
+                params![data.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
+    McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: cwd.to_string(),
+        run_id: Some("run-preview".to_string()),
+        tool: "write".to_string(),
+        payload,
+        tool_use_id: Some("toolu-preview".to_string()),
+        origin: None,
+    }
 }

@@ -938,19 +938,6 @@ async fn a_parents_deny_with_a_message_resumes_the_child_once_with_the_workaroun
     );
 }
 
-/// Acceptance 2: the same for every decision and scope.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_fence_answer_resumes_for_every_decision_and_scope() {
-    use cairn_core::internal::mcp::handlers::permission::{PermissionDecision, PermissionScope};
-    for (decision, scope) in [
-        (PermissionDecision::Deny, PermissionScope::Session),
-        (PermissionDecision::Allow, PermissionScope::Once),
-        (PermissionDecision::Allow, PermissionScope::Session),
-    ] {
-        assert_late_answer_resumes(decision, scope).await;
-    }
-}
-
 /// Acceptance 3, the specimen's shape: two permissions raised by one turn,
 /// answered back to back. The first drives the successor; the second finds it
 /// served and queues its result rather than minting or stranding a turn.
@@ -1408,4 +1395,17 @@ async fn external_stop_still_reaps_inline_commands() {
         0,
         "an external stop must reap the run's inline commands"
     );
+}
+
+/// Acceptance 2: the same for every decision and scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_fence_answer_resumes_for_every_decision_and_scope() {
+    use cairn_core::internal::mcp::handlers::permission::{PermissionDecision, PermissionScope};
+    for (decision, scope) in [
+        (PermissionDecision::Deny, PermissionScope::Session),
+        (PermissionDecision::Allow, PermissionScope::Once),
+        (PermissionDecision::Allow, PermissionScope::Session),
+    ] {
+        assert_late_answer_resumes(decision, scope).await;
+    }
 }

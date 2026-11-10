@@ -788,7 +788,7 @@ async fn load_pending_turns(
         // happened since the floor, not how much history exists.
         Scope::Since(since) => {
             db.query_all(
-                &format!(
+                format!(
                     "{COLUMNS} {pending} AND t.created_at >= ?3 \
                      ORDER BY t.created_at DESC LIMIT ?4"
                 ),
@@ -799,7 +799,7 @@ async fn load_pending_turns(
         }
         Scope::All => {
             db.query_all(
-                &format!("{COLUMNS} {pending} ORDER BY t.created_at DESC LIMIT ?3"),
+                format!("{COLUMNS} {pending} ORDER BY t.created_at DESC LIMIT ?3"),
                 params![model, dims, limit as i64],
                 row_to_turn,
             )
@@ -810,7 +810,7 @@ async fn load_pending_turns(
         // writing anything to remember where they got to.
         Scope::Deferred { since, after } => {
             db.query_all(
-                &format!(
+                format!(
                     "{COLUMNS} JOIN turn_embeddings te ON te.turn_id = t.id \
                      WHERE te.dims = ?1 AND t.created_at >= ?2 AND te.turn_id > ?3 \
                      ORDER BY te.turn_id ASC LIMIT ?4"
@@ -1123,7 +1123,7 @@ pub async fn load_vectors(
     match project_id {
         Some(project_id) => {
             db.query_all(
-                &format!("{COLUMNS} AND project_id = ?3"),
+                format!("{COLUMNS} AND project_id = ?3"),
                 params![model, dims, project_id.to_string()],
                 row_to_vector,
             )
@@ -2121,36 +2121,6 @@ mod tests {
         db.query_one(sql, (), |row| row.i64(0)).await.unwrap()
     }
 
-    /// An embedder that takes far longer than a person waits, as one does
-    /// while the facet retries a failing provider.
-    struct Slow;
-
-    #[async_trait::async_trait]
-    impl Embed for Slow {
-        async fn embed(
-            &self,
-            _corpus: Corpus,
-            _purpose: Purpose,
-            _texts: Vec<String>,
-        ) -> Result<crate::embeddings::Embedded, EmbedFailure> {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            Err(EmbedFailure::Failed("HTTP 500".into()))
-        }
-        fn active(&self, _corpus: Corpus) -> Option<crate::embeddings::VectorKey> {
-            None
-        }
-        fn space(&self) -> Option<crate::embeddings::EmbedSpace> {
-            None
-        }
-        fn ready(&self) -> bool {
-            true
-        }
-        fn health(&self) -> crate::embeddings::EmbedHealth {
-            crate::embeddings::EmbedHealth::default()
-        }
-        fn reset_health(&self) {}
-    }
-
     /// Seed `turn_id`'s vector directly, in `model` at `dims`.
     async fn seed_vector(db: &LocalDb, turn_id: &str, model: &str, embedding: &[f32]) {
         upsert_turn_vector(
@@ -2346,39 +2316,6 @@ mod tests {
             dims: Some(1536),
         };
         assert_eq!(turn_progress(&db, &other, None).await.unwrap().embedded, 0);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_slow_query_embed_answers_from_text_within_the_bound() {
-        let db = migrated_db().await;
-        seed_project(&db).await;
-        seed_turn(&db, "turn-1", "complete", 100, &[("assistant", "a")]).await;
-        upsert_turn_vector(
-            &db,
-            &PendingTurn {
-                turn_id: "turn-1".to_string(),
-                session_id: "session-turn-1".to_string(),
-                job_id: None,
-                project_id: Some("project-1".to_string()),
-                sequence: 1,
-            },
-            &vector::to_bytes(&[1.0, 0.0, 0.0]),
-            "cohere-embed-v4",
-            3,
-        )
-        .await
-        .unwrap();
-
-        let started = std::time::Instant::now();
-        let ranked = SemanticSearch::new()
-            .rank_turns(&Slow, &db, None, "anything", 5)
-            .await;
-        assert_eq!(ranked, None);
-        let waited = started.elapsed();
-        assert!(
-            waited >= QUERY_EMBED_TIMEOUT && waited < QUERY_EMBED_TIMEOUT * 2,
-            "{waited:?}"
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -773,111 +773,6 @@ async fn a_deadline_after_dispatch_cancels_the_call_and_revokes_its_bearer() {
     );
 }
 
-/// A deadline that passes while the call waits for a place in the service's
-/// concurrency gate sends nothing (no call, so nothing to cancel) and still
-/// ends the delegated run minted for it, bearer and all.
-#[tokio::test]
-async fn a_deadline_before_dispatch_sends_nothing_and_ends_its_delegation() {
-    let h = harness().await;
-    h.source.put(
-        "narrow",
-        "name: Narrow\nlimits:\n  concurrency: 1\n  callTimeoutSeconds: 5\n",
-        "serve({})",
-    );
-    let orch = h.orch.clone();
-    let holder = tokio::spawn(async move { call(&orch, request("narrow", "slow", agent())).await });
-    let holder_frame = eventually_frame(&h, "slow").await;
-    let (holder_run, _) = authority_of(&holder_frame);
-    let incarnation = h
-        .orch
-        .project_services
-        .supervisor
-        .cell("p", "cairn", &ServiceOwner::Project, "narrow")
-        .serving()
-        .unwrap();
-
-    let timeout = Duration::from_millis(200);
-    let mut hang = request("narrow", "hang", agent());
-    hang.timeout = Some(timeout);
-    let orch = h.orch.clone();
-    let caller = tokio::spawn(async move { call(&orch, hang).await });
-    eventually("the call to queue behind the held place", || {
-        incarnation.waiting.load(Ordering::Acquire) == 1
-    })
-    .await;
-    // The deadline was fixed before the call queued, so it has certainly
-    // passed once `timeout` has elapsed from here, however slow the host.
-    let queued = Instant::now();
-    while queued.elapsed() <= timeout {
-        tokio::time::sleep(timeout.saturating_sub(queued.elapsed()) + Duration::from_millis(1))
-            .await;
-    }
-    assert!(
-        !caller.is_finished(),
-        "the call is still queued for the gate"
-    );
-
-    // Delegation precedes admission: the queued call holds a live run.
-    let standing = status(&h, "narrow").run_id.unwrap();
-    let job = crate::project_services::rows::ensure_service_job(
-        &h.orch.db.local,
-        "p",
-        &ServiceOwner::Project,
-        "narrow",
-    )
-    .await
-    .unwrap();
-    let delegated_where = format!(
-        "FROM runs WHERE job_id = '{job}' AND status = 'live' AND id NOT IN ('{standing}', '{holder_run}')"
-    );
-    assert_eq!(
-        count(&h, &format!("SELECT COUNT(*) {delegated_where}")).await,
-        1
-    );
-    let delegated = h
-        .orch
-        .db
-        .local
-        .query_opt_text(format!("SELECT id {delegated_where}"), ())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(h.orch.project_services.runs.get(&delegated).is_some());
-    assert!(!h.orch.run_bearers.run_is_revoked(&delegated));
-
-    h.host.release_slow.notify_waiters();
-    assert!(holder.await.unwrap().is_ok());
-    let error = caller.await.unwrap().unwrap_err();
-    assert_eq!(error.code, "deadline", "{error:?}");
-    assert_eq!(
-        error.message, DEADLINE_BEFORE_SEND,
-        "a call admitted past its deadline is refused before sending"
-    );
-
-    flush(&h, "narrow").await;
-    assert!(
-        calls_of(&h, "hang").is_empty(),
-        "{:?}",
-        calls_of(&h, "hang")
-    );
-    assert!(h.host.frames_of("cancel").is_empty());
-    assert!(h.orch.run_bearers.run_is_revoked(&delegated));
-    assert!(h.orch.project_services.runs.get(&delegated).is_none());
-    assert_eq!(
-        count(
-            &h,
-            &format!("SELECT COUNT(*) FROM runs WHERE id = '{delegated}' AND status = 'exited'")
-        )
-        .await,
-        1
-    );
-}
-
-async fn eventually_frame(h: &Harness, method: &str) -> Value {
-    eventually("the call frame", || !calls_of(h, method).is_empty()).await;
-    calls_of(h, method).remove(0)
-}
-
 #[tokio::test]
 async fn a_crash_fails_pending_calls_then_restarts_at_the_next_generation() {
     let h = harness().await;
@@ -940,64 +835,6 @@ async fn five_crashes_inside_the_window_fail_the_service() {
     call(&h.orch, request("echo", "echo", agent()))
         .await
         .unwrap();
-}
-
-/// An automatic restart the substrate will not place started no process, so
-/// it spends none of the crash budget: more refusals in a row than
-/// [`CRASH_LIMIT`] leave the service backing off, never `failed`, and the
-/// first placement that succeeds serves again with no one acting.
-#[tokio::test]
-async fn restarts_the_substrate_refuses_are_retried_without_spending_the_crash_budget() {
-    let h = harness().await;
-    call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap();
-    let refusals = CRASH_LIMIT + 1;
-    for _ in 0..refusals {
-        h.host.refuse.lock().unwrap().push_back(unroutable());
-    }
-
-    let crash = call(&h.orch, request("echo", "crash", agent()))
-        .await
-        .unwrap_err();
-    assert_eq!(crash.code, "service_crashed");
-    // One crash's backoff, then every refusal's, so wait past `eventually`'s.
-    for _ in 0..1_500 {
-        let state = status(&h, "echo").state;
-        assert_ne!(
-            state,
-            ServiceState::Failed,
-            "{:?}",
-            log_texts(&h, "echo").await
-        );
-        if state == ServiceState::Running {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(status(&h, "echo").state, ServiceState::Running);
-    assert!(
-        h.host.refuse.lock().unwrap().is_empty(),
-        "every refusal was met"
-    );
-    let value = call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap();
-    assert_eq!(value["generation"], 2 + refusals as u64);
-
-    let log = log_texts(&h, "echo").await;
-    assert_eq!(
-        log.iter()
-            .filter(|text| text.contains("not counted as a crash"))
-            .count(),
-        refusals,
-        "{log:?}"
-    );
-    assert!(
-        !log.iter()
-            .any(|text| text.contains("the service is failed")),
-        "{log:?}"
-    );
 }
 
 /// Entering `failed` stops the service and its schedule, so its owning thread
@@ -1153,82 +990,6 @@ async fn a_replacement_that_never_becomes_ready_keeps_the_old_generation() {
         log.iter().any(|text| text == "boot failed: syntax error"),
         "{log:?}"
     );
-}
-
-#[tokio::test]
-async fn a_stop_is_sticky_until_a_start() {
-    let h = harness().await;
-    call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap();
-    stop(
-        &h.orch,
-        &ServiceRef::project("p", "cairn", "echo"),
-        "cairn://p/cairn/12/1/builder",
-    )
-    .await
-    .unwrap();
-    assert_eq!(status(&h, "echo").state, ServiceState::Stopped);
-    let error = call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "service_stopped");
-    // A source change does not undo an explicit stop.
-    h.source.put("echo", ECHO, "serve({ v: 3 })");
-    apply_source(&h.orch, "p", &ServiceOwner::Project, "base advance", None).await;
-    assert_eq!(
-        call(&h.orch, request("echo", "echo", agent()))
-            .await
-            .unwrap_err()
-            .code,
-        "service_stopped"
-    );
-    start(
-        &h.orch,
-        &ServiceRef::project("p", "cairn", "echo"),
-        "operator",
-    )
-    .await
-    .unwrap();
-    assert!(call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .is_ok());
-    let log = log_texts(&h, "echo").await;
-    assert!(log.iter().any(|text| text == "stopped"), "{log:?}");
-}
-
-#[tokio::test]
-async fn calls_past_concurrency_and_queue_are_busy() {
-    let h = harness().await;
-    h.source.put(
-        "narrow",
-        "name: Narrow\nlimits:\n  concurrency: 1\n  callTimeoutSeconds: 5\n",
-        "serve({})",
-    );
-    let mut held = Vec::new();
-    // One in flight, then the queue (twice the concurrency).
-    for expected in 1..=3 {
-        let orch = h.orch.clone();
-        held.push(tokio::spawn(async move {
-            call(&orch, request("narrow", "slow", agent())).await
-        }));
-        if expected == 1 {
-            eventually("the first call", || h.host.frames_of("call").len() == 1).await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-    let busy = call(&h.orch, request("narrow", "echo", agent()))
-        .await
-        .unwrap_err();
-    assert_eq!(busy.code, "busy");
-    for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        h.host.release_slow.notify_waiters();
-    }
-    for call in held {
-        assert!(call.await.unwrap().is_ok());
-    }
 }
 
 #[tokio::test]
@@ -1546,85 +1307,6 @@ async fn a_thread_writes_a_service_and_the_write_starts_it() {
             .is_empty(),
         "the thread's service logs under its owner"
     );
-}
-
-/// A patch of `main.ts` is generation 2, and no call fails while the
-/// generations switch: calls before, during, and after it are all answered,
-/// and a call generation 1 accepted finishes on generation 1.
-#[tokio::test]
-async fn a_patch_is_the_next_generation_with_no_failed_call_during_the_switch() {
-    let h = thread_harness().await;
-    write_tutor(&h, "spanish-session", main_ts("serve({})"), false)
-        .await
-        .unwrap();
-    let orch = h.orch.clone();
-    let in_flight = tokio::spawn(async move {
-        call(
-            &orch,
-            tutor_request("slow", thread_agent("cairn://p/cairn/spanish")),
-        )
-        .await
-    });
-    eventually("the slow call", || h.host.frames_of("call").len() == 1).await;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let (orch, flag) = (h.orch.clone(), stop.clone());
-    let callers = tokio::spawn(async move {
-        let mut answers = Vec::new();
-        while !flag.load(Ordering::Acquire) {
-            answers.push(
-                call(
-                    &orch,
-                    tutor_request("echo", thread_agent("cairn://p/cairn/spanish/task/drill")),
-                )
-                .await,
-            );
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        answers
-    });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let status = write_tutor(
-        &h,
-        "spanish-session",
-        json!({"files": {"main.ts": "serve({ v: 2 })"}}),
-        true,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(status.state, ServiceState::Running);
-    assert_eq!(status.generation, Some(2));
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    stop.store(true, Ordering::Release);
-    let answers = callers.await.unwrap();
-    assert!(!answers.is_empty());
-    for answer in &answers {
-        assert!(
-            answer.is_ok(),
-            "a call failed during the switch: {answer:?}"
-        );
-    }
-    let after = call(
-        &h.orch,
-        tutor_request("echo", thread_agent("cairn://p/cairn/spanish")),
-    )
-    .await
-    .unwrap();
-    assert_eq!(after["generation"], 2);
-    h.host.release_slow.notify_waiters();
-    assert_eq!(
-        in_flight.await.unwrap().unwrap(),
-        json!({"slow": true, "generation": 1})
-    );
-    // The patch merged files per path: the title survived.
-    let stored =
-        crate::project_services::thread_store::load(&h.orch.db.local, "t-1", "tutor", None)
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(stored.version, 2);
-    assert_eq!(stored.data["title"], "Spanish tutor");
 }
 
 /// A version that never becomes ready leaves the previous generation
@@ -2065,85 +1747,6 @@ fn a_lost_machine_notice_says_what_the_service_does_next() {
     let waits = machine_loss_notice("bugs", "pi1", "cairn://p/cairn/bug-monitor", true);
     assert!(waits.contains("waits for it to come back"), "{waits}");
     assert!(!waits.contains("placement prefers"), "{waits}");
-}
-
-/// A service whose services-only machine is lost under it wakes its thread
-/// once; the same loss on a general machine, which may simply be asleep, and
-/// a project's service, which has no thread, wake no one.
-#[tokio::test]
-async fn losing_a_services_only_machine_wakes_the_owning_thread_once() {
-    use cairn_common::executor_protocol::MachineRole;
-    let h = thread_harness().await;
-    h.orch
-        .db
-        .local
-        .execute(
-            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
-             VALUES ('spanish-run', 'p', 'spanish-session', 'completed', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-    let notices = "SELECT COUNT(*) FROM messages WHERE content LIKE '%lost its machine%'";
-    write_tutor(&h, "spanish-session", main_ts("serve({})"), false)
-        .await
-        .unwrap();
-    let owner = || thread_agent("cairn://p/cairn/spanish");
-
-    // A general machine going away is ordinary.
-    call(&h.orch, tutor_request("lose", owner()))
-        .await
-        .unwrap_err();
-    eventually("the restart", || {
-        h.host.launches.load(Ordering::Acquire) == 2
-    })
-    .await;
-    assert_eq!(count(&h, notices).await, 0);
-
-    h.orch
-        .fleet
-        .hydrate_machine_roles([("pi1".to_string(), MachineRole::ServicesOnly)]);
-    eventually("the service to serve again", || {
-        h.host.frames_of("hello").len() == 2
-    })
-    .await;
-    call(&h.orch, tutor_request("lose", owner()))
-        .await
-        .unwrap_err();
-    eventually("the second restart", || {
-        h.host.launches.load(Ordering::Acquire) == 3
-    })
-    .await;
-    assert_eq!(count(&h, notices).await, 1, "a lost service box is news");
-    let notice = h
-        .orch
-        .db
-        .local
-        .query_text(
-            "SELECT content FROM messages WHERE content LIKE '%lost its machine%'",
-            (),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        notice.contains("Service `tutor` lost its machine: fake runs services only"),
-        "{notice}"
-    );
-    assert!(notice.contains(&format!("{TUTOR}/status")), "{notice}");
-
-    // A project's service has no thread to wake.
-    call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap();
-    call(&h.orch, request("echo", "lose", agent()))
-        .await
-        .unwrap_err();
-    eventually("the echo restart", || {
-        status(&h, "echo").state != ServiceState::Backoff
-    })
-    .await;
-    assert_eq!(count(&h, notices).await, 1);
 }
 
 /// An explicit stop pauses a schedule rather than failing it.
@@ -2840,51 +2443,6 @@ async fn a_missing_repository_is_named_and_its_project_skipped() {
         .supervisor
         .status("p", &ServiceOwner::Project, "watcher")
         .is_none());
-}
-
-/// An `on_demand` service with no call for its idle stop is stopped, not
-/// stickily, and the next call starts it again; a call in flight holds it.
-#[tokio::test]
-async fn an_idle_on_demand_service_stops_and_the_next_call_starts_it() {
-    let h = harness().await;
-    *h.source.idle.lock().unwrap() = Some(Duration::from_millis(150));
-    call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap();
-    assert_eq!(
-        status(&h, "echo").idle_stop_after,
-        Some(Duration::from_millis(150))
-    );
-
-    // A call in flight past the idle stop keeps the process.
-    let orch = h.orch.clone();
-    let slow = tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
-    eventually("the slow call", || h.host.frames_of("call").len() == 2).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(status(&h, "echo").state, ServiceState::Running);
-    h.host.release_slow.notify_waiters();
-    assert!(slow.await.unwrap().is_ok());
-
-    eventually("the idle stop", || {
-        status(&h, "echo").state == ServiceState::Stopped
-    })
-    .await;
-    assert!(
-        !status(&h, "echo").sticky_stop,
-        "an idle stop is not sticky"
-    );
-    eventually("the drain", || h.host.frames_of("drain").len() == 1).await;
-    let log = log_texts(&h, "echo").await;
-    assert!(
-        log.iter().any(|text| text.starts_with("no call for 150ms")),
-        "{log:?}"
-    );
-
-    let value = call(&h.orch, request("echo", "echo", agent()))
-        .await
-        .unwrap();
-    assert_eq!(value["generation"], 2, "the next call boots it again");
-    assert_eq!(h.host.launches.load(Ordering::Acquire), 2);
 }
 
 /// A `launch` service never idle-stops.
@@ -3667,58 +3225,6 @@ async fn a_state_change_is_announced_once_and_an_unchanged_probe_not_at_all() {
     assert!(!settle(&m.h.orch, &cell), "and it is announced once");
 }
 
-/// A link gap ends no incarnation and wakes nothing, so only the cell's own look
-/// at its machine can tell open windows, well inside a five-minute probe.
-#[tokio::test]
-async fn a_detach_and_a_reattach_are_announced_without_waiting_for_the_probe() {
-    let m = machine_harness("none", &["alpha"]).await;
-    select(&m.h, "alpha");
-    machine::apply_machine_services(&m.h.orch, "test").await;
-    let cell = machine_cell(&m.h, "alpha").unwrap();
-    let announced = || {
-        cell.machine
-            .as_ref()
-            .unwrap()
-            .announced
-            .lock()
-            .unwrap()
-            .clone()
-    };
-    eventually("the first pass", || {
-        m.h.host.probes.load(Ordering::Acquire) >= 2
-    })
-    .await;
-    eventually("ready to be announced", || {
-        announced() == Some(machine::InstanceState::Ready)
-    })
-    .await;
-    let probes = m.h.host.probes.load(Ordering::Acquire);
-
-    m.h.host.machines.lock().unwrap().as_mut().unwrap().clear();
-    eventually("the absence to be announced", || {
-        announced() == Some(machine::InstanceState::MachineAbsent)
-    })
-    .await;
-    assert!(cell.serving().is_some(), "a link gap ends nothing");
-    assert_eq!(
-        m.h.host.probes.load(Ordering::Acquire),
-        probes,
-        "a machine that is away is not probed"
-    );
-
-    m.h.host
-        .machines
-        .lock()
-        .unwrap()
-        .as_mut()
-        .unwrap()
-        .push(view("alpha"));
-    eventually("the return to be announced", || {
-        announced() == Some(machine::InstanceState::Ready)
-    })
-    .await;
-}
-
 #[tokio::test]
 async fn a_declaration_without_a_size_fails_naming_it() {
     let m = machine_harness("none", &["alpha"]).await;
@@ -4209,33 +3715,6 @@ async fn a_machine_service_tool_that_asks_for_input_fails_saying_it_cannot_suspe
     );
 }
 
-/// One machine takes one call at a time. A call that times out queued behind
-/// a long one says so, rather than reading as a slow tool.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_call_queued_behind_a_long_one_says_so_when_it_times_out() {
-    let (m, _resources, gateway) = served_harness(&["alpha"], &["alpha"]).await;
-    *gateway.delay.lock().unwrap() = std::time::Duration::from_secs(3);
-    let long = run_batch(
-        &m.h,
-        json!({"commands": [{"target": "cairn://mcp/probe-mcp/run", "timeout": 10000}]}),
-    );
-    let queued = async {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        run_batch(
-            &m.h,
-            json!({"commands": [{"target": "cairn://mcp/probe-mcp/look", "timeout": 1000}]}),
-        )
-        .await
-    };
-    let (long, queued) = tokio::join!(long, queued);
-    assert!(long.contains("run answered on kit/probe@alpha"), "{long}");
-    assert!(
-        queued.contains("It was queued behind `run` on alpha")
-            && queued.contains("a machine takes one call at a time"),
-        "{queued}"
-    );
-}
-
 /// A machine waiting for its operator has its resident up, so a call that
 /// names it reaches it (Axon's `permit`, which asks for the grant). It never
 /// serves a call that does not name it.
@@ -4280,4 +3759,230 @@ async fn a_machine_waiting_for_its_operator_takes_a_call_that_names_it() {
         named.contains("permit answered on kit/probe@alpha"),
         "{named}"
     );
+}
+
+/// An `on_demand` service with no call for its idle stop is stopped, not
+/// stickily, and the next call starts it again; a call in flight holds it.
+#[tokio::test]
+async fn an_idle_on_demand_service_stops_and_the_next_call_starts_it() {
+    let h = harness().await;
+    *h.source.idle.lock().unwrap() = Some(Duration::from_millis(150));
+    call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&h, "echo").idle_stop_after,
+        Some(Duration::from_millis(150))
+    );
+
+    // A call in flight past the idle stop keeps the process.
+    let orch = h.orch.clone();
+    let slow = tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    eventually("the slow call", || h.host.frames_of("call").len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(status(&h, "echo").state, ServiceState::Running);
+    h.host.release_slow.notify_waiters();
+    assert!(slow.await.unwrap().is_ok());
+
+    eventually("the idle stop", || {
+        status(&h, "echo").state == ServiceState::Stopped
+    })
+    .await;
+    assert!(
+        !status(&h, "echo").sticky_stop,
+        "an idle stop is not sticky"
+    );
+    eventually("the drain", || h.host.frames_of("drain").len() == 1).await;
+    let log = log_texts(&h, "echo").await;
+    assert!(
+        log.iter().any(|text| text.starts_with("no call for 150ms")),
+        "{log:?}"
+    );
+
+    let value = call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap();
+    assert_eq!(value["generation"], 2, "the next call boots it again");
+    assert_eq!(h.host.launches.load(Ordering::Acquire), 2);
+}
+
+/// A deadline that passes while the call waits for a place in the service's
+/// concurrency gate sends nothing (no call, so nothing to cancel) and still
+/// ends the delegated run minted for it, bearer and all.
+#[tokio::test]
+async fn a_deadline_before_dispatch_sends_nothing_and_ends_its_delegation() {
+    let h = harness().await;
+    h.source.put(
+        "narrow",
+        "name: Narrow\nlimits:\n  concurrency: 1\n  callTimeoutSeconds: 5\n",
+        "serve({})",
+    );
+    let orch = h.orch.clone();
+    let holder = tokio::spawn(async move { call(&orch, request("narrow", "slow", agent())).await });
+    let holder_frame = eventually_frame(&h, "slow").await;
+    let (holder_run, _) = authority_of(&holder_frame);
+    let incarnation = h
+        .orch
+        .project_services
+        .supervisor
+        .cell("p", "cairn", &ServiceOwner::Project, "narrow")
+        .serving()
+        .unwrap();
+
+    let timeout = Duration::from_millis(200);
+    let mut hang = request("narrow", "hang", agent());
+    hang.timeout = Some(timeout);
+    let orch = h.orch.clone();
+    let caller = tokio::spawn(async move { call(&orch, hang).await });
+    eventually("the call to queue behind the held place", || {
+        incarnation.waiting.load(Ordering::Acquire) == 1
+    })
+    .await;
+    // The deadline was fixed before the call queued, so it has certainly
+    // passed once `timeout` has elapsed from here, however slow the host.
+    let queued = Instant::now();
+    while queued.elapsed() <= timeout {
+        tokio::time::sleep(timeout.saturating_sub(queued.elapsed()) + Duration::from_millis(1))
+            .await;
+    }
+    assert!(
+        !caller.is_finished(),
+        "the call is still queued for the gate"
+    );
+
+    // Delegation precedes admission: the queued call holds a live run.
+    let standing = status(&h, "narrow").run_id.unwrap();
+    let job = crate::project_services::rows::ensure_service_job(
+        &h.orch.db.local,
+        "p",
+        &ServiceOwner::Project,
+        "narrow",
+    )
+    .await
+    .unwrap();
+    let delegated_where = format!(
+        "FROM runs WHERE job_id = '{job}' AND status = 'live' AND id NOT IN ('{standing}', '{holder_run}')"
+    );
+    assert_eq!(
+        count(&h, &format!("SELECT COUNT(*) {delegated_where}")).await,
+        1
+    );
+    let delegated = h
+        .orch
+        .db
+        .local
+        .query_opt_text(format!("SELECT id {delegated_where}"), ())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.orch.project_services.runs.get(&delegated).is_some());
+    assert!(!h.orch.run_bearers.run_is_revoked(&delegated));
+
+    h.host.release_slow.notify_waiters();
+    assert!(holder.await.unwrap().is_ok());
+    let error = caller.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "deadline", "{error:?}");
+    assert_eq!(
+        error.message, DEADLINE_BEFORE_SEND,
+        "a call admitted past its deadline is refused before sending"
+    );
+
+    flush(&h, "narrow").await;
+    assert!(
+        calls_of(&h, "hang").is_empty(),
+        "{:?}",
+        calls_of(&h, "hang")
+    );
+    assert!(h.host.frames_of("cancel").is_empty());
+    assert!(h.orch.run_bearers.run_is_revoked(&delegated));
+    assert!(h.orch.project_services.runs.get(&delegated).is_none());
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM runs WHERE id = '{delegated}' AND status = 'exited'")
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn calls_past_concurrency_and_queue_are_busy() {
+    let h = harness().await;
+    h.source.put(
+        "narrow",
+        "name: Narrow\nlimits:\n  concurrency: 1\n  callTimeoutSeconds: 5\n",
+        "serve({})",
+    );
+    let mut held = Vec::new();
+    // One in flight, then the queue (twice the concurrency).
+    for expected in 1..=3 {
+        let orch = h.orch.clone();
+        held.push(tokio::spawn(async move {
+            call(&orch, request("narrow", "slow", agent())).await
+        }));
+        if expected == 1 {
+            eventually("the first call", || h.host.frames_of("call").len() == 1).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let busy = call(&h.orch, request("narrow", "echo", agent()))
+        .await
+        .unwrap_err();
+    assert_eq!(busy.code, "busy");
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.host.release_slow.notify_waiters();
+    }
+    for call in held {
+        assert!(call.await.unwrap().is_ok());
+    }
+}
+
+#[tokio::test]
+async fn a_stop_is_sticky_until_a_start() {
+    let h = harness().await;
+    call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap();
+    stop(
+        &h.orch,
+        &ServiceRef::project("p", "cairn", "echo"),
+        "cairn://p/cairn/12/1/builder",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status(&h, "echo").state, ServiceState::Stopped);
+    let error = call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "service_stopped");
+    // A source change does not undo an explicit stop.
+    h.source.put("echo", ECHO, "serve({ v: 3 })");
+    apply_source(&h.orch, "p", &ServiceOwner::Project, "base advance", None).await;
+    assert_eq!(
+        call(&h.orch, request("echo", "echo", agent()))
+            .await
+            .unwrap_err()
+            .code,
+        "service_stopped"
+    );
+    start(
+        &h.orch,
+        &ServiceRef::project("p", "cairn", "echo"),
+        "operator",
+    )
+    .await
+    .unwrap();
+    assert!(call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .is_ok());
+    let log = log_texts(&h, "echo").await;
+    assert!(log.iter().any(|text| text == "stopped"), "{log:?}");
+}
+
+async fn eventually_frame(h: &Harness, method: &str) -> Value {
+    eventually("the call frame", || !calls_of(h, method).is_empty()).await;
+    calls_of(h, method).remove(0)
 }

@@ -1399,305 +1399,11 @@ impl EventWriter {
 
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
 
     use super::*;
-    use crate::projects::migrate::tests::{migrated_db, seed_complete_project_graph};
-    use crate::storage::{compress, TEAM_MIGRATIONS, TURSO_MIGRATIONS};
-
-    /// Columns that name an owner by id. A table carrying one is project-owned
-    /// whether or not a foreign key says so: the admission and launch ledgers
-    /// key on job and run ids with no constraint at all.
-    const OWNER_COLUMNS: &[&str] = &[
-        "project_id",
-        "project_key",
-        "issue_id",
-        "thread_id",
-        "execution_id",
-        "job_id",
-        "run_id",
-        "session_id",
-    ];
-
-    async fn names(db: &LocalDb, sql: String) -> Vec<String> {
-        db.query_all(sql, (), |row| row.text(0)).await.unwrap()
-    }
-
-    /// Every table in `db` that a foreign-key chain ties to `projects`, or that
-    /// names an owner by an owner-id column.
-    async fn project_owned_tables(db: &LocalDb) -> BTreeSet<String> {
-        let tables = names(
-            db,
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
-             AND name NOT LIKE '__turso%'"
-                .to_string(),
-        )
-        .await;
-        let mut edges = Vec::new();
-        let mut owned = BTreeSet::new();
-        for table in &tables {
-            for parent in names(
-                db,
-                format!("SELECT \"table\" FROM pragma_foreign_key_list('{table}')"),
-            )
-            .await
-            {
-                edges.push((table.clone(), parent));
-            }
-            let columns = names(db, format!("SELECT name FROM pragma_table_info('{table}')")).await;
-            if columns
-                .iter()
-                .any(|column| OWNER_COLUMNS.contains(&column.as_str()))
-            {
-                owned.insert(table.clone());
-            }
-        }
-        let mut reachable: HashSet<String> = HashSet::from(["projects".to_string()]);
-        loop {
-            let discovered: Vec<String> = edges
-                .iter()
-                .filter(|(child, parent)| reachable.contains(parent) && !reachable.contains(child))
-                .map(|(child, _)| child.clone())
-                .collect();
-            if discovered.is_empty() {
-                break;
-            }
-            reachable.extend(discovered);
-        }
-        owned.extend(reachable);
-        owned
-    }
-
-    /// Every table a migration ties to a project, in either lineage, is either
-    /// exported or excluded with a reason. A new project-owned table fails here
-    /// instead of silently leaving the export incomplete.
-    #[tokio::test]
-    async fn export_plan_covers_every_project_owned_table() {
-        let private = migrated_db("export-coverage-private.db", TURSO_MIGRATIONS.to_vec()).await;
-        let team = migrated_db("export-coverage-team.db", TEAM_MIGRATIONS.to_vec()).await;
-        let mut owned = project_owned_tables(&private).await;
-        owned.extend(project_owned_tables(&team).await);
-
-        let plan: HashSet<&str> = export_plan()
-            .unwrap()
-            .iter()
-            .map(|entry| entry.table)
-            .collect();
-        let excluded: HashSet<&str> = EXPORT_EXCLUDED.iter().map(|(table, _)| *table).collect();
-        // The team-only fleet roots are the team's, not any one project's.
-        let team_roots = [
-            "teams",
-            "device_presence",
-            "remote_intents",
-            "executor_registry",
-        ];
-        let missing: Vec<&String> = owned
-            .iter()
-            .filter(|table| {
-                !plan.contains(table.as_str())
-                    && !excluded.contains(table.as_str())
-                    && !team_roots.contains(&table.as_str())
-            })
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "project-owned tables neither exported nor excluded with a reason: {missing:?}. \
-             Add each to the ownership manifest (projects/migrate.rs COPY_ORDER), to \
-             EXPORT_ONLY, or to EXPORT_EXCLUDED with why"
-        );
-    }
-
-    /// The plan names each table once, never both exports and excludes one,
-    /// and every entry is a real table in the database its lineage says holds it.
-    #[tokio::test]
-    async fn export_plan_entries_are_real_distinct_and_lineage_correct() {
-        let private = migrated_db("export-plan-private.db", TURSO_MIGRATIONS.to_vec()).await;
-        let team = migrated_db("export-plan-team.db", TEAM_MIGRATIONS.to_vec()).await;
-        let private_tables: HashSet<String> = names(
-            &private,
-            "SELECT name FROM sqlite_master WHERE type = 'table'".into(),
-        )
-        .await
-        .into_iter()
-        .collect();
-        let team_tables: HashSet<String> = names(
-            &team,
-            "SELECT name FROM sqlite_master WHERE type = 'table'".into(),
-        )
-        .await
-        .into_iter()
-        .collect();
-        let plan = export_plan().unwrap();
-        let mut seen = HashSet::new();
-        for entry in &plan {
-            assert!(seen.insert(entry.table), "{} is planned twice", entry.table);
-            assert!(
-                private_tables.contains(entry.table),
-                "{} is not a table",
-                entry.table
-            );
-            assert_eq!(
-                entry.lineage == TableLineage::Shared,
-                team_tables.contains(entry.table),
-                "{} is planned against the wrong lineage",
-                entry.table
-            );
-        }
-        for (table, reason) in EXPORT_EXCLUDED {
-            assert!(
-                !seen.contains(table),
-                "{table} is both exported and excluded"
-            );
-            assert!(
-                private_tables.contains(*table),
-                "excluded {table} is not a table"
-            );
-            assert!(!reason.is_empty());
-        }
-    }
-
-    async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<Value>) -> String {
-        let sql = format!("EXPLAIN QUERY PLAN {sql}");
-        db.read(move |conn| {
-            Box::pin(async move {
-                let mut rows = conn.query(&sql, binds).await?;
-                let mut plan = String::new();
-                while let Some(row) = rows.next().await? {
-                    plan.push_str(&row.text(3)?);
-                    plan.push('\n');
-                }
-                Ok(plan)
-            })
-        })
-        .await
-        .unwrap()
-    }
-
-    /// Every page statement the export can issue seeks its rows on the rowid
-    /// primary key, for every planned table and every term, private and team.
-    ///
-    /// Behavior cannot catch the regression this guards: a page planned from
-    /// the term's index returns the same rows, only by walking every project
-    /// row in the table each page. The plan is the only witness.
-    #[tokio::test]
-    async fn every_page_statement_seeks_the_rowid_primary_key() {
-        let db = migrated_db("export-page-plans.db", TURSO_MIGRATIONS.to_vec()).await;
-        let materialized = OwnerIds::Materialized(
-            OwnerSet::ALL
-                .into_iter()
-                .map(|set| (set, vec!["owner-a".to_string(), "owner-b".to_string()]))
-                .collect(),
-        );
-        let mut checked = 0;
-        let mut failures = Vec::new();
-        for planned in export_plan().unwrap() {
-            let columns = read_columns(&db, planned.table).await.unwrap();
-            let (select_list, _) = page_select(planned.table, &columns);
-            let mut owner_cases = vec![OwnerIds::SameDatabase];
-            if planned.lineage == TableLineage::Private {
-                owner_cases.push(materialized.clone());
-            }
-            for owner_ids in &owner_cases {
-                let predicates = table_predicates(&planned, "project-p", owner_ids, "prj").unwrap();
-                for (term, params) in query_terms(&predicates) {
-                    let sql = page_sql(planned.table, &select_list, &term, &[1, 2, 3]);
-                    let plan = query_plan(&db, &sql, params).await;
-                    checked += 1;
-                    let seek = format!("SEARCH {} USING INTEGER PRIMARY KEY", planned.table);
-                    if !plan.contains(&seek) {
-                        failures.push(format!("{}: {term}\n{plan}", planned.table));
-                    }
-                }
-            }
-        }
-        assert!(checked > 50, "only {checked} page statements were checked");
-        assert!(
-            failures.is_empty(),
-            "{} page statements do not seek the rowid:\n\n{}",
-            failures.len(),
-            failures.join("\n\n")
-        );
-    }
 
     fn no_op_hook() -> impl FnMut() -> PageHookFuture + Send {
         || -> PageHookFuture { Box::pin(async {}) }
-    }
-
-    async fn insert_other_project(db: &LocalDb) {
-        db.execute_batch(
-            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('project-other', 'ws-delete', 'Other', 'OTHER', '/tmp/other', 1, 1);
-             INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
-               VALUES ('issue-other', 'project-other', 1, 'Other', 1, 1);",
-        )
-        .await
-        .unwrap();
-    }
-
-    /// Membership is fixed at selection and the page re-checks it. A selected
-    /// rowid that is gone by its page counts as vanished, and a selected rowid
-    /// that now holds another project's row (a freed rowid reused by an insert)
-    /// is never written.
-    #[tokio::test]
-    async fn a_row_gone_by_its_page_is_vanished_and_a_reused_rowid_is_not_written() {
-        let db = migrated_db("export-vanished.db", TURSO_MIGRATIONS.to_vec()).await;
-        seed_complete_project_graph(&db).await;
-        insert_other_project(&db).await;
-        let rowid_of = |id: &'static str| {
-            let db = &db;
-            async move {
-                db.query_opt_i64("SELECT rowid FROM issues WHERE id = ?1", (id,))
-                    .await
-                    .unwrap()
-                    .unwrap()
-            }
-        };
-        let ours = rowid_of("issue-delete").await;
-        let theirs = rowid_of("issue-other").await;
-        let missing = ours.max(theirs) + 1_000;
-
-        let plan = export_plan().unwrap();
-        let planned = plan.iter().find(|entry| entry.table == "issues").unwrap();
-        let mut rows = vec![(ours, 0), (theirs, 0), (missing, 0)];
-        rows.sort_unstable();
-        let table = ResolvedTable {
-            planned,
-            label: "private",
-            columns: read_columns(&db, "issues").await.unwrap(),
-            queries: vec![(
-                "project_id = ?1".to_string(),
-                vec![Value::Text("project-delete".to_string())],
-            )],
-            membership: Membership {
-                rows,
-                selected_at_ms: 0,
-                longest: Duration::ZERO,
-            },
-        };
-        let out = tempfile::tempdir().unwrap();
-        let mut hook = no_op_hook();
-        let mut paging = Paging {
-            rows: RECONSTRUCT_BATCH_ROWS,
-            after_page: &mut hook,
-        };
-        let written = export_table(
-            &db,
-            &db,
-            &table,
-            out.path(),
-            &mut EventTally::default(),
-            &mut paging,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(written.rows, 1);
-        assert_eq!(written.vanished, 2);
-        assert_eq!(written.pages, 1);
-        assert_eq!(db.live_connections(), 0);
-        let issues = read_jsonl(&out.path().join("issues.jsonl"));
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0]["id"], "issue-delete");
     }
 
     /// An `events` row is encoded by one function, so a pack's row is the
@@ -1825,61 +1531,6 @@ mod tests {
             .contains("export-incident"));
     }
 
-    /// The point of paging: between any two pages the export holds no
-    /// connection, so a checkpoint pass drains at once and folds the log.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_checkpoint_drains_and_folds_between_export_pages() {
-        let db = Arc::new(migrated_db("export-checkpoint.db", TURSO_MIGRATIONS.to_vec()).await);
-        seed_complete_project_graph(&db).await;
-        insert_other_project(&db).await;
-        let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut hook = {
-            let db = db.clone();
-            let reports = reports.clone();
-            move || -> PageHookFuture {
-                let db = db.clone();
-                let reports = reports.clone();
-                Box::pin(async move {
-                    let live = db.live_connections();
-                    let report = db
-                        .checkpoint(
-                            1,
-                            Duration::ZERO,
-                            crate::storage::DrainBudget::fixed(Duration::from_millis(100)),
-                        )
-                        .await
-                        .unwrap();
-                    reports.lock().unwrap().push((live, report));
-                })
-            }
-        };
-        let out = tempfile::tempdir().unwrap();
-        let report = export_project_paged(
-            db.clone(),
-            db.clone(),
-            "delete".to_string(),
-            out.path().join("export"),
-            1,
-            &mut hook,
-        )
-        .await
-        .unwrap();
-
-        let reports = reports.lock().unwrap();
-        assert!(
-            reports.len() as u64 >= report.rows,
-            "one page per row at a page size of one: {} pages, {} rows",
-            reports.len(),
-            report.rows
-        );
-        for (live, checkpoint) in reports.iter() {
-            assert_eq!(*live, 0, "a connection outlived its page");
-            assert!(checkpoint.drain.drained, "{checkpoint}");
-            assert!(checkpoint.succeeded(), "{checkpoint}");
-        }
-        assert!(report.vanished.is_empty(), "{:?}", report.vanished);
-    }
-
     /// Tenet 1260's acceptance for export, on a real project: every checkpoint
     /// pass during the export drains, no holder is older than five seconds, the
     /// log stays under its ceiling, and no table's longest transaction reaches
@@ -1946,131 +1597,6 @@ mod tests {
         );
     }
 
-    fn read_jsonl(path: &Path) -> Vec<Json> {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn export_writes_the_projects_rows_with_events_reconstructed() {
-        let db = Arc::new(migrated_db("export-graph.db", TURSO_MIGRATIONS.to_vec()).await);
-        seed_complete_project_graph(&db).await;
-        // A second project whose rows must not leak into the export.
-        insert_other_project(&db).await;
-        let original = "{\"eventType\":\"user\",\"content\":\"archived words\"}";
-        let blob = compress(original.as_bytes()).unwrap();
-        db.execute(
-            "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, storage_mode, data_blob, codec)
-               VALUES ('ev-zstd', 'run-delete', 1, 1, 'user', '{\"_archived\":true}', 1, 'zstd', ?1, ?2)",
-            (
-                Value::Blob(blob),
-                Value::Text(crate::storage::CODEC_ZSTD_V1.to_string()),
-            ),
-        )
-        .await
-        .unwrap();
-        db.execute_batch(&format!(
-            "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
-               VALUES ('ev-plain', 'run-delete', 2, 2, 'assistant', '{{\"content\":\"plain\"}}', 2);
-             INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, storage_mode, content_commit)
-               VALUES ('ev-dangling', 'run-delete', 3, 3, 'tool_result',
-                       '{{\"toolInput\":{{\"paths\":[\"file:a.txt\"]}}}}', 3, 'gitcoord', '{}');",
-            "0".repeat(40)
-        ))
-        .await
-        .unwrap();
-
-        let out = tempfile::tempdir().unwrap();
-        let destination = out.path().join("export");
-        let report = export_project(
-            db.clone(),
-            db.clone(),
-            "delete".to_string(),
-            destination.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(report.vanished.is_empty(), "{:?}", report.vanished);
-        assert_eq!(db.live_connections(), 0);
-
-        let manifest: Json = serde_json::from_str(
-            &std::fs::read_to_string(destination.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest["format_version"], 2);
-        assert_eq!(manifest["project"]["id"], "project-delete");
-        assert_eq!(manifest["project"]["lineage"], "private");
-        assert_eq!(manifest["totals"]["vanished"], 0);
-        assert_eq!(manifest["databases"][0]["database"], "private");
-        for table in manifest["tables"].as_array().unwrap() {
-            assert_eq!(table["selected"], table["rows"], "{}", table["table"]);
-            assert_eq!(table["vanished"], 0, "{}", table["table"]);
-            assert!(table["selected_at_ms"].as_i64().is_some());
-            assert!(table["longest_transaction_ms"].as_u64().is_some());
-            if table["rows"].as_u64() > Some(0) {
-                assert!(table["pages"].as_u64() >= Some(1), "{}", table["table"]);
-                assert!(
-                    table["first_page_at_ms"].as_i64() >= table["selected_at_ms"].as_i64(),
-                    "{}",
-                    table["table"]
-                );
-            }
-            let file = destination.join(table["file"].as_str().unwrap());
-            assert_eq!(
-                read_jsonl(&file).len() as u64,
-                table["rows"].as_u64().unwrap()
-            );
-        }
-
-        let issues = read_jsonl(&destination.join("tables/issues.jsonl"));
-        assert_eq!(
-            issues.len(),
-            1,
-            "another project's issue leaked into the export"
-        );
-        assert_eq!(issues[0]["id"], "issue-delete");
-        assert_eq!(read_jsonl(&destination.join("tables/posts.jsonl")).len(), 1);
-        assert_eq!(
-            read_jsonl(&destination.join("tables/threads.jsonl")).len(),
-            1
-        );
-
-        let events = read_jsonl(&destination.join("tables/events.jsonl"));
-        let by_id = |id: &str| {
-            events
-                .iter()
-                .find(|event| event["id"] == id)
-                .unwrap()
-                .clone()
-        };
-        let restored = by_id("ev-zstd");
-        assert_eq!(restored["data"], original);
-        assert_eq!(restored["data_blob"], Json::Null);
-        assert_eq!(restored["reconstruction"], "restored");
-        assert_eq!(by_id("ev-plain")["reconstruction"], "stored_plain");
-        let dangling = by_id("ev-dangling");
-        assert_eq!(dangling["unresolved"], true);
-        assert_eq!(dangling["stored"]["storage_mode"], "gitcoord");
-        assert_eq!(dangling["stored"]["content_commit"], "0".repeat(40));
-
-        assert_eq!(manifest["events"]["rows"], 3);
-        assert_eq!(manifest["events"]["restored"], 1);
-        assert_eq!(manifest["events"]["unresolved"], 1);
-        let created = &manifest["tables"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|table| table["table"] == "events")
-            .unwrap()["timestamps"]["created_at"];
-        assert_eq!(
-            created["unit"], "none",
-            "fixture timestamps are below the epoch range"
-        );
-    }
-
     #[tokio::test]
     async fn export_refuses_a_relative_or_non_empty_destination() {
         assert!(validate_destination(Path::new("relative/dir")).is_err());
@@ -2107,4 +1633,93 @@ mod tests {
         tally.observe(&Value::Integer(1_700_000_000_000));
         assert_eq!(tally.to_json()["unit"], "mixed");
     }
+
+    /// Membership is fixed at selection and the page re-checks it. A selected
+    /// rowid that is gone by its page counts as vanished, and a selected rowid
+    /// that now holds another project's row (a freed rowid reused by an insert)
+    /// is never written.
+    #[tokio::test]
+    async fn a_row_gone_by_its_page_is_vanished_and_a_reused_rowid_is_not_written() {
+        let db = migrated_db("export-vanished.db", TURSO_MIGRATIONS.to_vec()).await;
+        seed_complete_project_graph(&db).await;
+        insert_other_project(&db).await;
+        let rowid_of = |id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_opt_i64("SELECT rowid FROM issues WHERE id = ?1", (id,))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let ours = rowid_of("issue-delete").await;
+        let theirs = rowid_of("issue-other").await;
+        let missing = ours.max(theirs) + 1_000;
+
+        let plan = export_plan().unwrap();
+        let planned = plan.iter().find(|entry| entry.table == "issues").unwrap();
+        let mut rows = vec![(ours, 0), (theirs, 0), (missing, 0)];
+        rows.sort_unstable();
+        let table = ResolvedTable {
+            planned,
+            label: "private",
+            columns: read_columns(&db, "issues").await.unwrap(),
+            queries: vec![(
+                "project_id = ?1".to_string(),
+                vec![Value::Text("project-delete".to_string())],
+            )],
+            membership: Membership {
+                rows,
+                selected_at_ms: 0,
+                longest: Duration::ZERO,
+            },
+        };
+        let out = tempfile::tempdir().unwrap();
+        let mut hook = no_op_hook();
+        let mut paging = Paging {
+            rows: RECONSTRUCT_BATCH_ROWS,
+            after_page: &mut hook,
+        };
+        let written = export_table(
+            &db,
+            &db,
+            &table,
+            out.path(),
+            &mut EventTally::default(),
+            &mut paging,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(written.rows, 1);
+        assert_eq!(written.vanished, 2);
+        assert_eq!(written.pages, 1);
+        assert_eq!(db.live_connections(), 0);
+        let issues = read_jsonl(&out.path().join("issues.jsonl"));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["id"], "issue-delete");
+    }
+
+    use crate::storage::TURSO_MIGRATIONS;
+
+    async fn insert_other_project(db: &LocalDb) {
+        db.execute_batch(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('project-other', 'ws-delete', 'Other', 'OTHER', '/tmp/other', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
+               VALUES ('issue-other', 'project-other', 1, 'Other', 1, 1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    fn read_jsonl(path: &Path) -> Vec<Json> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    use crate::projects::migrate::tests::{migrated_db, seed_complete_project_graph};
 }

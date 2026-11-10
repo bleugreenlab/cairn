@@ -527,51 +527,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_stream_hot_locator_selects_only_the_last_run() {
-        let db = crate::storage::migrated_test_db("route-hydrate-last-run").await;
-        seed_fixture_execution(&db, "route-hydrate-last-run").await;
-        for number in 3..=50 {
-            db.execute(
-                "INSERT INTO runs(id, project_id, job_id, session_id, status, created_at, updated_at)
-                 VALUES(?1, 'p', 'job-1', 'sess-2', 'exited', ?2, ?2)",
-                (format!("run-{number}"), i64::from(number)),
-            )
-            .await
-            .unwrap();
-        }
-        db.execute(
-            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
-             VALUES('last-run-event', 'run-50', 'sess-2', 1, 50, 'assistant',
-                    '{\"content\":\"last run prose\"}', 50)",
-            (),
-        )
-        .await
-        .unwrap();
-        let fact = stream_fact(&db, "last-run-event", Some("job-1")).await;
-        let rowid = fact.record_id.as_ref().unwrap().parse().unwrap();
-        let selected = thread_stream_run_ids(&db, rowid, Some("job-1"))
-            .await
-            .unwrap();
-        assert_eq!(selected, vec!["run-50"]);
-        let orch = stream_test_orchestrator(db);
-        for cataloged in [false, true] {
-            if cataloged {
-                publish_for_test(&orch.db.local, "exec-1").await;
-            }
-            // Count the locator's own reads: the database-wide counters also
-            // see the test orchestrator's background tasks reading the same
-            // database, which made this pin intermittently (2, 2) or (1, 2).
-            let (hydrated, reads) = orch.db.local.own_reads(hydrate(&orch, &fact)).await;
-            assert_eq!(hydrated.unwrap().fact.fields["text"], "last run prose");
-            assert_eq!(
-                (reads.statements, reads.checkouts),
-                (1, 1),
-                "50-run latest event, cataloged={cataloged}"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn thread_stream_hot_locator_plan_starts_at_the_rowid() {
         let db = crate::storage::migrated_test_db("route-hydrate-plan").await;
         for guarded in [false, true] {

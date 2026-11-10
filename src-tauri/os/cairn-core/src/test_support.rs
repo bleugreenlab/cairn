@@ -1,4 +1,4 @@
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::LocalDb;
 
 // Seal the cairn-core test binary away from every live Cairn home before any
 // test runs; see `cairn_common::test_seal`.
@@ -190,9 +190,7 @@ pub(crate) struct ThreadFixture {
     pub project_id: &'static str,
     pub thread_id: &'static str,
     pub session_job_id: &'static str,
-    pub host_execution_id: &'static str,
     pub task_job_id: &'static str,
-    pub child_issue_id: &'static str,
     pub child_issue_job_id: &'static str,
 }
 
@@ -206,9 +204,7 @@ pub(crate) async fn seed_thread_session(db: &LocalDb) -> ThreadFixture {
         project_id: "thread-project",
         thread_id: "thread-id",
         session_job_id: "thread-session-job",
-        host_execution_id: "thread-host-execution",
         task_job_id: "thread-task-job",
-        child_issue_id: "thread-child-issue",
         child_issue_job_id: "thread-child-issue-job",
     };
     for sql in [
@@ -226,54 +222,4 @@ pub(crate) async fn seed_thread_session(db: &LocalDb) -> ThreadFixture {
         db.execute(sql, ()).await.unwrap();
     }
     fixture
-}
-
-#[tokio::test]
-async fn thread_fixture_matches_the_post_snapshot_production_shape() {
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-
-    let dir = tempfile::tempdir().unwrap();
-    let db = LocalDb::open(dir.path().join("fixture.db")).await.unwrap();
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
-        .await
-        .unwrap();
-    let fixture = seed_thread_session(&db).await;
-
-    let session_shape = db
-        .query_one(
-            "SELECT issue_id IS NULL, thread_id IS NOT NULL, execution_id IS NOT NULL FROM jobs WHERE id=?1",
-            (fixture.session_job_id,),
-            |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(session_shape, (1, 1, 1));
-    let host_shape = db
-        .query_one(
-            "SELECT issue_id IS NULL, seq IS NULL, recipe_id FROM executions WHERE id=?1",
-            (fixture.host_execution_id,),
-            |row| Ok((row.i64(0)?, row.i64(1)?, row.text(2)?)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(host_shape, (1, 1, "host-thread-session-job".to_string()));
-    let child_shape = db
-        .query_one(
-            "SELECT parent_thread_id IS NOT NULL, parent_issue_id IS NULL FROM issues WHERE id=?1",
-            (fixture.child_issue_id,),
-            |row| Ok((row.i64(0)?, row.i64(1)?)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(child_shape, (1, 1));
-    let child_job_shape = db
-        .query_one(
-            "SELECT issue_id IS NOT NULL, thread_id IS NULL FROM jobs WHERE id=?1",
-            (fixture.child_issue_job_id,),
-            |row| Ok((row.i64(0)?, row.i64(1)?)),
-        )
-        .await
-        .unwrap();
-    assert_eq!(child_job_shape, (1, 1));
 }

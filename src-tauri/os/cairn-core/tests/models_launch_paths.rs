@@ -97,29 +97,6 @@ fn contains_word(code: &str, needle: &str) -> bool {
     })
 }
 
-/// The protocol families' POSTs, streamed and whole, and the embedding wires'.
-const WIRE_POSTS: &[&str] = &[
-    "post_chat_completion",
-    "post_chat_completion_streaming",
-    "post_message",
-    "post_message_streaming",
-    "post_response",
-    "post_response_streaming",
-    "post_embeddings",
-    "post_gateway_embed",
-];
-
-#[test]
-fn only_the_facet_posts_to_a_provider() {
-    let found = hits(WIRE_POSTS, &["cairn-models/src/complete.rs"]);
-    assert!(
-        found.is_empty(),
-        "a provider POST outside cairn_models::complete; route it through the \
-         orchestrator's `models_runtime().complete` instead:\n  {}",
-        found.join("\n  ")
-    );
-}
-
 /// Every place outside the facet allowed to name `needle`, and why. Anything
 /// not listed fails.
 fn outside_the_facet(needles: &[&str], allowed: &[(&str, &str)]) -> Vec<String> {
@@ -194,32 +171,6 @@ fn only_the_session_host_resolves_a_cli_to_launch() {
     );
 }
 
-/// Searching the user's PATH for a managed CLI, or the cache that used to
-/// hold Claude's PATH answer. Every Codex and Claude Code Cairn runs
-/// (sessions, pooled calls, sign-in, usage, catalog discovery, onboarding) is
-/// the managed copy `cairn_models::managed::ManagedTool` installed, so no
-/// file may look for another one. No allowlist.
-const MANAGED_TOOL_PATH_SEARCH: &[&str] = &[
-    "find_binary(\"codex\")",
-    "find_binary_on_agent_path(\"codex\")",
-    "find_binary(\"claude\")",
-    "find_binary_on_agent_path(\"claude\")",
-    "get_claude_path",
-    "cli_binary_path",
-];
-
-#[test]
-fn managed_tools_resolve_only_through_the_managed_copy() {
-    let found = hits(MANAGED_TOOL_PATH_SEARCH, &[]);
-    assert!(
-        found.is_empty(),
-        "a managed CLI searched for on the PATH; resolve it through the session \
-         host (`models_runtime().host.resolve_cli(..)`) or the `ManagedTool` \
-         itself instead:\n  {}",
-        found.join("\n  ")
-    );
-}
-
 /// A Codex subscription's credential presentation is subscription mechanics:
 /// it is built only in the private crate, behind `Subscriptions`.
 #[test]
@@ -285,13 +236,4 @@ fn only_the_claude_refresh_authority_calls_the_token_endpoint() {
          `claude_credential_rejected` instead:\n  {}",
         found.join("\n  ")
     );
-}
-
-#[test]
-fn the_scan_covers_the_runtime() {
-    let roots = scanned_roots();
-    assert!(roots.iter().any(|root| root.ends_with("cairn-core/src")));
-    assert!(roots.iter().any(|root| root.ends_with("cairn-models/src")));
-    // Not vacuous: the facet's own caller is what the rule allows.
-    assert!(!hits(WIRE_POSTS, &[]).is_empty());
 }

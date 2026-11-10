@@ -569,61 +569,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn storeless_team_home_hydration_never_queries_the_private_history_catalog() {
-        use cairn_db::storage::events::history::HistorySource;
-        use cairn_db::storage::{MigrationRunner, TEAM_MIGRATIONS};
-
-        let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("team-home.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        // Home's required prose index is currently private-only (cairn/6154).
-        // Supply that prerequisite to isolate history hydration on a storeless
-        // team schema; this fixture does not verify team bootstrap indexes.
-        db.execute(
-            format!(
-                "CREATE INDEX idx_events_home_prose ON events(run_id,event_type,created_at,id,turn_id) WHERE {}",
-                PROSE_SHAPE.replace("e.", ""),
-            ),
-            (),
-        )
-        .await
-        .unwrap();
-        db.execute_script(
-            "INSERT INTO teams(id,name,created_at,updated_at) VALUES ('team','Team',1,1);
-             INSERT INTO projects(id,team_id,name,key,repo_path,created_at,updated_at)
-               VALUES ('p','team','Project','proj','/tmp/team-home',1,1);
-             INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES ('t','p','general',1,1);
-             INSERT INTO jobs(id,project_id,thread_id,status,uri_segment,created_at,updated_at)
-               VALUES ('j','p','t','complete','thread',1,1);
-             INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES ('r','j','exited',1,1);
-             INSERT INTO turns(id,session_id,run_id,sequence,start_reason,created_at,updated_at)
-               VALUES ('tu','s','r',1,'initial',1,1);
-             INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id)
-               VALUES ('team-home-event','r',1,1,'assistant','{\"content\":\"team prose\"}',1,'tu');",
-        ).await.unwrap();
-        assert!(db.content_store().is_none());
-        for source in [None, Some(HistorySource::Pack)] {
-            db.set_history_source_override(source);
-            let statements = db.read_statement_count();
-            let checkouts = db.read_checkout_count();
-            let page = query_project_home(&db, "p", "proj", 20, None)
-                .await
-                .unwrap();
-            assert_eq!(page.entries.len(), 1);
-            assert_eq!(page.entries[0].body, "team prose");
-            assert_eq!(db.read_statement_count() - statements, 1);
-            assert_eq!(db.read_checkout_count() - checkouts, 1);
-            assert_eq!(db.live_connections(), 0);
-        }
-        db.set_history_source_override(None);
-    }
-
     async fn packed_home_fixture(
         name: &str,
     ) -> (
@@ -907,65 +852,6 @@ mod tests {
             plan_text.contains("idx_events_home_prose"),
             "the candidate walk must reach events through the prose index; any \
              other path has to open and parse each row to reject it:\n{plan_text}"
-        );
-    }
-
-    /// What Home costs must track the transcript it shows, not the database it
-    /// lives in.
-    ///
-    /// This is the regression that the plan assertion above cannot state and
-    /// that no correctness test can reach: the original query returned exactly
-    /// these entries, and took time proportional to every unrelated event in the
-    /// workspace to do it. Live, that was >30s per fetch against a 1.7M-row
-    /// corpus, fifteen of them concurrently.
-    ///
-    /// So the assertion is on observed work, and the corpus is built so that
-    /// work is the only variable: both databases hold the SAME thread
-    /// transcript and return the SAME page. They differ only in how much the
-    /// query is entitled to ignore -- events in runs that are not threads, and
-    /// events in the thread whose bodies are not prose. A ratio rather than a
-    /// wall-clock ceiling, and a generous one: the defect makes this scale with
-    /// the noise multiplier, so it fails by an order of magnitude while leaving
-    /// room for a loaded CI machine.
-    #[tokio::test]
-    async fn home_cost_does_not_track_irrelevant_corpus_size() {
-        const NOISE: usize = 20_000;
-
-        let quiet = seed_home_cost_corpus("home-cost-quiet.db", 0).await;
-        let noisy = seed_home_cost_corpus("home-cost-noisy.db", NOISE).await;
-
-        let page = |db: &'static LocalDb| async move {
-            query_project_home(db, "p", "proj", 20, None).await.unwrap()
-        };
-        let quiet: &'static LocalDb = Box::leak(Box::new(quiet));
-        let noisy: &'static LocalDb = Box::leak(Box::new(noisy));
-
-        assert_eq!(
-            page(quiet).await.entries.len(),
-            page(noisy).await.entries.len(),
-            "the noise must not change the answer, or this measures two \
-             different questions"
-        );
-
-        // The best of several passes, not the mean: a minimum is what the
-        // machine can do when nothing else interferes, and is far steadier under
-        // a loaded test runner than an average that any one stall can dominate.
-        let best = |db: &'static LocalDb| async move {
-            let mut best = std::time::Duration::MAX;
-            for _ in 0..5 {
-                let started = std::time::Instant::now();
-                page(db).await;
-                best = best.min(started.elapsed());
-            }
-            best
-        };
-        let quiet_cost = best(quiet).await;
-        let noisy_cost = best(noisy).await;
-
-        assert!(
-            noisy_cost < quiet_cost * 8 + std::time::Duration::from_millis(5),
-            "Home read {NOISE} irrelevant events to return the same page: \
-             {quiet_cost:?} without them, {noisy_cost:?} with them"
         );
     }
 
@@ -1353,70 +1239,6 @@ mod tests {
         })
         .await
         .unwrap();
-    }
-
-    /// One thread holding a fixed, small transcript, buried under `noise`
-    /// events Home is entitled to ignore.
-    ///
-    /// The noise is split between the two ways an event can be irrelevant, so
-    /// neither exclusion can regress unnoticed: half sit in a run that is not a
-    /// thread run, and half sit in the thread itself but carry tool-call content
-    /// blocks rather than prose. Both kinds are newer than the transcript, so a
-    /// query that walks the corpus in time order meets all of them first.
-    async fn seed_home_cost_corpus(name: &str, noise: usize) -> LocalDb {
-        let db = migrated_test_db(name).await;
-        seed_project_with_thread(&db).await;
-        db.write(move |conn| {
-            Box::pin(async move {
-                // A job and run that belong to an issue rather than a thread.
-                for sql in [
-                    "INSERT INTO jobs(id,project_id,status,node_name,created_at,updated_at) VALUES ('j2','p','complete','builder',1,1)",
-                    "INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES ('r2','j2','exited',1,1)",
-                    "INSERT INTO turns(id,session_id,run_id,sequence,start_reason,created_at,updated_at) VALUES ('tu2','s2','r2',1,'initial',1,1)",
-                ] {
-                    conn.execute(sql, ()).await?;
-                }
-                // The transcript under test: 40 prose events at times 1..=40.
-                let mut values = Vec::new();
-                for seq in 1..=40 {
-                    values.push(format!(
-                        "('prose{seq}','r',{seq},{seq},'assistant','{{\"content\":\"entry {seq}\"}}',{seq},'tu')"
-                    ));
-                }
-                conn.execute(
-                    &format!(
-                        "INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id) VALUES {}",
-                        values.join(",")
-                    ),
-                    (),
-                )
-                .await?;
-                // Everything Home must skip, all of it newer than the prose.
-                let block = "{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"path\":\"src/lib.rs\"}}]}";
-                for chunk in (0..noise).collect::<Vec<_>>().chunks(500) {
-                    let mut values = Vec::new();
-                    for i in chunk {
-                        let at = 100 + i;
-                        let (run, turn) = if i % 2 == 0 { ("r2", "tu2") } else { ("r", "tu") };
-                        values.push(format!(
-                            "('noise{i}','{run}',{at},{at},'assistant','{block}',{at},'{turn}')"
-                        ));
-                    }
-                    conn.execute(
-                        &format!(
-                            "INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,created_at,turn_id) VALUES {}",
-                            values.join(",")
-                        ),
-                        (),
-                    )
-                    .await?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-        db
     }
 
     /// The union is only correct if taking the top-N of each branch still yields

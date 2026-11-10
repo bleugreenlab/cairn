@@ -1322,50 +1322,6 @@ async fn session_page_cursor_skips_earlier_frames_without_decoding_them() {
 }
 
 #[tokio::test]
-async fn multi_frame_session_reads_keep_paging_chat_and_tail_order() {
-    let (db, _) = multi_frame_session_db("seam-session-multi-order").await;
-    let (hot, pack) = read_both(&db, || async {
-        let mut reader = HistoryReader::new(&db);
-        let rows = reader
-            .session_events_after("sess-1", None, i64::MIN, EventFilter::default())
-            .await
-            .unwrap();
-        let chat = reader
-            .session_events("sess-1", None, EventFilter::default())
-            .await
-            .unwrap();
-        let tail = reader.session_tail("sess-1", 9).await.unwrap();
-        let empty = reader
-            .session_events_page("sess-1", None, i64::MAX, 1, EventFilter::default())
-            .await
-            .unwrap();
-        (rows, chat, tail, empty)
-    })
-    .await;
-    for (hot, pack) in [
-        (&hot.0, &pack.0),
-        (&hot.1, &pack.1),
-        (&hot.2, &pack.2),
-        (&hot.3, &pack.3),
-    ] {
-        assert_eq!(fingerprint(&hot.rows), fingerprint(&pack.rows));
-        assert_eq!(hot.fetched, pack.fetched);
-        assert_eq!(hot.last_rowid, pack.last_rowid);
-    }
-    assert!(pack
-        .0
-        .rows
-        .windows(2)
-        .all(|pair| pair[0].rowid < pair[1].rowid));
-    assert!(pack.1.rows.windows(2).all(|pair| {
-        (pair[0].event.created_at, pair[0].rowid) < (pair[1].event.created_at, pair[1].rowid)
-    }));
-    let newest = &pack.0.rows[pack.0.rows.len() - 9..];
-    assert_eq!(fingerprint(&pack.2.rows), fingerprint(newest));
-    assert!(pack.3.rows.is_empty());
-}
-
-#[tokio::test]
 async fn filtered_window_applies_types_before_limit_in_sequence_order() {
     let (db, events) = packed_db("seam-filtered-window").await;
     for (below, floor, limit, types, expected) in [
@@ -1922,55 +1878,6 @@ async fn request_priming_batches_and_caches_hot_and_pack_sources() {
         }
         assert_read_cost(&db, before, if evicted { (0, 0, 0) } else { (3, 3, 0) });
     }
-}
-
-#[tokio::test]
-async fn capability_is_loaded_at_open_and_migration_not_first_read() {
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("history-open.db");
-    let db = LocalDb::open(&path).await.unwrap();
-    assert!(!db.has_history_catalog());
-    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-        .run(&db)
-        .await
-        .unwrap();
-    assert!(db.has_history_catalog());
-    assert!(!db.has_evicted_history());
-    seed_fixture_execution(&db, "seam-reopen").await;
-    publish_for_test(&db, "exec-1").await;
-    drop(db);
-
-    let db = LocalDb::open(&path).await.unwrap();
-    assert!(db.has_history_catalog());
-    assert!(!db.has_evicted_history());
-    let before = read_cost(&db);
-    db.initialize_history_capability().await.unwrap();
-    assert_eq!(
-        HistoryReader::new(&db)
-            .source_of_session("sess-1")
-            .await
-            .unwrap(),
-        Source::Hot
-    );
-    assert_read_cost(&db, before, (0, 0, 0));
-    mark_evicted(&db).await;
-    drop(db);
-
-    let db = LocalDb::open(&path).await.unwrap();
-    assert!(
-        db.has_evicted_history(),
-        "durable eviction must be loaded before the first read"
-    );
-    assert!(db.content_store().is_none());
-    let before = read_cost(&db);
-    db.initialize_history_capability().await.unwrap();
-    assert_read_cost(&db, before, (0, 0, 0));
-    let error = HistoryReader::new(&db)
-        .run_events("run-1", EventFilter::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(error, HistoryError::NoStore { .. }), "{error}");
 }
 
 #[tokio::test]

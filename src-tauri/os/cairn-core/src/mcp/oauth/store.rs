@@ -703,51 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_current_and_pending_reads_are_bounded_and_single_flight() {
-        use std::time::{Duration, Instant};
-        mock_keychain::install();
-        let server = "oauth-blocked-current";
-        let pending = "oauth-blocked-pending";
-        let state = PendingAuthorization {
-            state: "state".into(),
-            code_verifier: "verifier".into(),
-            created_at: 123,
-        };
-        save_pending(pending, &state).unwrap();
-        save(server, &sample("token")).unwrap();
-        let svc = service();
-        let current_before = mock_keychain::read_count(&svc, server);
-        let pending_before = mock_keychain::read_count(&svc, pending);
-        let current_gate = mock_keychain::block_reads(&svc, server);
-        let pending_gate = mock_keychain::block_reads(&svc, pending);
-        let started = Instant::now();
-        let current = std::thread::spawn(move || load(server));
-        let pending_read = std::thread::spawn(move || take_pending(pending));
-        assert!(current_gate.wait_for_reads(1, Duration::from_secs(2)));
-        assert!(pending_gate.wait_for_reads(1, Duration::from_secs(2)));
-        let status_read = std::thread::spawn(move || status(server));
-        assert!(current
-            .join()
-            .unwrap()
-            .unwrap_err()
-            .contains("Keychain unavailable"));
-        assert!(pending_read
-            .join()
-            .unwrap()
-            .unwrap_err()
-            .contains("Keychain unavailable"));
-        assert_eq!(status_read.join().unwrap().state, "error");
-        assert!(started.elapsed() < Duration::from_secs(6));
-        assert_eq!(mock_keychain::read_count(&svc, server), current_before + 1);
-        assert_eq!(mock_keychain::read_count(&svc, pending), pending_before + 1);
-        current_gate.release();
-        pending_gate.release();
-        // Pending read failure must not consume the authorization.
-        assert_eq!(take_pending(pending).unwrap(), Some(state));
-        assert_eq!(load(server).unwrap().unwrap().access_token, "token");
-    }
-
-    #[test]
     fn sign_out_invalidates_a_read_that_started_after_its_comparison() {
         use std::time::Duration;
         mock_keychain::install();

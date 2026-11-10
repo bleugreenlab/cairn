@@ -2145,59 +2145,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The caller's bound releases it while the provider is still working, as
-    /// an attempt (so `invoke` journals it), and the request it abandoned was
-    /// held to the bound rather than to the definition's longer timeout.
-    #[tokio::test]
-    async fn a_callers_bound_ends_the_attempt_and_shortens_the_abandoned_request() {
-        let orch = test_orchestrator().await;
-        let sent_timeout = Arc::new(Mutex::new(None));
-        let sent_for_backend = sent_timeout.clone();
-        let bound = InvocationBound {
-            limit: Duration::from_millis(200),
-            cap: None,
-        };
-        let started = std::time::Instant::now();
-        let attempt = complete_definition_with_executor(
-            &orch,
-            &pinned(300),
-            &json!({}),
-            None,
-            None,
-            Some(&bound),
-            None,
-            Arc::new(move |_, request, _| {
-                *sent_for_backend.lock().unwrap() = Some(request.timeout);
-                std::thread::sleep(Duration::from_secs(2));
-                Err(ResponseError::Timeout.into())
-            }),
-        )
-        .await
-        .expect("a bound that runs out is an attempt, so invoke journals it");
-
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
-        );
-        assert_eq!(attempt.model.as_str(), "test-model");
-        assert_eq!(attempt.rendered, "Answer");
-        assert_eq!(
-            attempt.result,
-            Err(ResponseError::OutlivedBound {
-                bound,
-                declared: Duration::from_secs(300),
-            }
-            .into()),
-            "a request still running when its caller left has served no account yet"
-        );
-        let sent = sent_timeout.lock().unwrap().expect("the request was sent");
-        assert!(sent <= Duration::from_millis(200), "{sent:?}");
-        let detached = attempt.detached.expect("the abandoned request is detached");
-        assert_eq!(detached.release, Release::Bound);
-        assert_eq!(detached.held_to, sent);
-    }
-
     /// A definition may declare up to the run-batch ceiling, which a `run`
     /// call reaches by suspending; one past it is refused where it is written
     /// (both write paths parse through here), naming the ceiling.

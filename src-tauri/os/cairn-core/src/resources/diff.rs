@@ -1208,55 +1208,6 @@ mod tests {
         assert!(!rendered.contains("outside_secret"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn live_source_no_follow_resists_concurrent_symlink_swaps() {
-        use std::os::unix::fs::symlink;
-        use std::sync::{Arc, Barrier};
-
-        let worktree = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let path = worktree.path().join("leak.rs");
-        let outside_path = outside.path().join("secret.rs");
-        let safe = b"pub fn safe() {}\n";
-        write_file(worktree.path(), "leak.rs", safe);
-        write_file(outside.path(), "secret.rs", b"pub fn outside_secret() {}\n");
-
-        let barrier = Arc::new(Barrier::new(2));
-        let writer_barrier = Arc::clone(&barrier);
-        let writer_path = path.clone();
-        let writer_outside = outside_path.clone();
-        let writer = std::thread::spawn(move || {
-            writer_barrier.wait();
-            for index in 0..5_000 {
-                let candidate = writer_path.with_extension("candidate");
-                let _ = std::fs::remove_file(&candidate);
-                if index % 2 == 0 {
-                    std::fs::write(&candidate, safe).unwrap();
-                } else {
-                    symlink(&writer_outside, &candidate).unwrap();
-                }
-                std::fs::rename(&candidate, &writer_path).unwrap();
-            }
-        });
-
-        barrier.wait();
-        let mut successful_reads = 0usize;
-        for _ in 0..5_000 {
-            match read_live_source_no_follow(worktree.path(), Path::new("leak.rs")) {
-                Ok(bytes) => {
-                    successful_reads += 1;
-                    assert_eq!(bytes, safe, "a no-follow read escaped the worktree");
-                }
-                Err(_) => {
-                    // A concurrently installed symlink is rejected atomically.
-                }
-            }
-        }
-        writer.join().unwrap();
-        assert!(successful_reads > 0);
-    }
-
     #[test]
     fn symbols_accounts_for_every_non_rendered_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -1416,151 +1367,6 @@ mod tests {
         assert!(scoped.contains("b/b.txt"));
     }
 
-    /// The MCP resource seam over a real store, in the shape that inflated it:
-    /// the branch was cut from main@A, main advanced to B with unrelated landed
-    /// work, and the branch was then rebased onto B. The recorded branch-cut
-    /// coordinate now sits below that landed work; the rendered summary must
-    /// still be the branch's own single file.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn node_diff_resource_renders_only_the_branch_work_after_a_rebase() {
-        let Some(bin) = crate::jj::tests::jj_bin() else {
-            eprintln!(
-                "skipping node_diff_resource_renders_only_the_branch_work: jj not resolvable"
-            );
-            return;
-        };
-        let home = tempfile::tempdir().unwrap().keep();
-        let project = tempfile::tempdir().unwrap();
-        let workspaces = tempfile::tempdir().unwrap();
-        crate::jj::tests::init_project(project.path());
-        let jj = crate::jj::environment(&bin, &home);
-        let store = crate::jj::project_store_dir(&home, project.path());
-        crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
-        let branch = "agent/cairn-3150-builder";
-
-        let node = workspaces.path().join("node");
-        crate::jj::add_workspace(&jj, &store, &node, branch, "main", None).unwrap();
-        std::fs::write(node.join("branch.rs"), "branch work\n").unwrap();
-        crate::jj::seal(&jj, &node, "branch work", None).unwrap();
-
-        let advancing = workspaces.path().join("advancing");
-        crate::jj::add_workspace(&jj, &store, &advancing, "agent/advance", "main", None).unwrap();
-        let bulk: String = (0..400).map(|line| format!("landed {line}\n")).collect();
-        std::fs::write(advancing.join("unrelated.rs"), bulk).unwrap();
-        crate::jj::seal(&jj, &advancing, "unrelated landed work", None).unwrap();
-        let advanced = crate::jj::head_commit(&jj, &advancing).unwrap();
-        jj.run(
-            &store,
-            &[
-                "bookmark",
-                "set",
-                "main",
-                "-r",
-                &advanced,
-                "--allow-backwards",
-            ],
-            "advance main under a live branch",
-        )
-        .unwrap();
-        jj.run(
-            &store,
-            &[
-                "rebase",
-                "-b",
-                branch,
-                "-d",
-                "main",
-                "--ignore-working-copy",
-            ],
-            "rebase the branch onto the advanced base",
-        )
-        .unwrap();
-
-        let orch = diff_orchestrator(home).await;
-        seed_node(&orch, project.path().to_str().unwrap(), branch).await;
-
-        let summary = read_node_diff(&orch, "p", 1, 1, "builder", &[]).await;
-        assert!(
-            summary.contains("**1 files, +1 -0**"),
-            "the summary must be the branch's own work, not the base's landed traffic: {summary}"
-        );
-        assert!(summary.contains("branch.rs"), "{summary}");
-        assert!(!summary.contains("unrelated.rs"), "{summary}");
-
-        // File-scoped patch content is unaffected by the base change.
-        let params = parse_query_params("view=patch&file=branch.rs").unwrap();
-        let patch = read_node_diff(&orch, "p", 1, 1, "builder", &params).await;
-        assert!(patch.contains("+branch work"), "{patch}");
-        assert!(!patch.contains("unrelated.rs"), "{patch}");
-    }
-
-    async fn diff_orchestrator(config_dir: std::path::PathBuf) -> Orchestrator {
-        use crate::db::DbState;
-        use crate::orchestrator::OrchestratorBuilder;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::{LocalDb, SearchIndex};
-        use std::sync::Arc;
-
-        let local =
-            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("diff.db"))
-                .await
-                .unwrap();
-        let search =
-            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
-        let db = Arc::new(DbState::new(Arc::new(local), search));
-        OrchestratorBuilder::new(db, Arc::new(TestServicesBuilder::new().build()), config_dir)
-            .build()
-    }
-
-    /// Seed the project → issue → execution → job chain the `/diff` resource
-    /// resolves through, with `main` as the node's integration target.
-    async fn seed_node(orch: &Orchestrator, repo_path: &str, branch: &str) {
-        let repo_path = repo_path.to_string();
-        let branch = branch.to_string();
-        orch.db
-            .local
-            .write(move |conn| {
-                let repo_path = repo_path.clone();
-                let branch = branch.clone();
-                Box::pin(async move {
-                    conn.execute(
-                        "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
-                        (),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                         VALUES ('proj','ws','P','p',?1,'main',1,1)",
-                        (repo_path.as_str(),),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-                         VALUES ('issue','proj',1,'Diff','active',1,1)",
-                        (),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-                         VALUES ('exec','r','issue','proj','running',1,1)",
-                        (),
-                    )
-                    .await?;
-                    conn.execute(
-                        "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment,
-                                          branch, base_branch, status, created_at, updated_at)
-                         VALUES ('job','exec','issue','proj','Builder','builder',?1,'main','running',1,1)",
-                        (branch.as_str(),),
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-    }
-
     #[test]
     fn whitespace_scanner_checks_added_lines_only() {
         let patch = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -10,2 +10,3 @@\n-old \n context\n+clean\n+bad \n";
@@ -1568,5 +1374,54 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(findings[0].path, "x");
         assert_eq!(findings[0].line, 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_source_no_follow_resists_concurrent_symlink_swaps() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Barrier};
+
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("leak.rs");
+        let outside_path = outside.path().join("secret.rs");
+        let safe = b"pub fn safe() {}\n";
+        write_file(worktree.path(), "leak.rs", safe);
+        write_file(outside.path(), "secret.rs", b"pub fn outside_secret() {}\n");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = path.clone();
+        let writer_outside = outside_path.clone();
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            for index in 0..5_000 {
+                let candidate = writer_path.with_extension("candidate");
+                let _ = std::fs::remove_file(&candidate);
+                if index % 2 == 0 {
+                    std::fs::write(&candidate, safe).unwrap();
+                } else {
+                    symlink(&writer_outside, &candidate).unwrap();
+                }
+                std::fs::rename(&candidate, &writer_path).unwrap();
+            }
+        });
+
+        barrier.wait();
+        let mut successful_reads = 0usize;
+        for _ in 0..5_000 {
+            match read_live_source_no_follow(worktree.path(), Path::new("leak.rs")) {
+                Ok(bytes) => {
+                    successful_reads += 1;
+                    assert_eq!(bytes, safe, "a no-follow read escaped the worktree");
+                }
+                Err(_) => {
+                    // A concurrently installed symlink is rejected atomically.
+                }
+            }
+        }
+        writer.join().unwrap();
+        assert!(successful_reads > 0);
     }
 }

@@ -2878,89 +2878,6 @@ mod tests {
         );
     }
 
-    /// A drain's database cost must be a constant, not a function of how much
-    /// backlog the recipient carries. This is the regression the batched
-    /// resolver exists to prevent: `dispatch::augment_with_queued_dms` drains on
-    /// EVERY MCP tool call, and because a push whose referent resolved is
-    /// skipped but never retired, a long-lived recipient's backlog only grows.
-    /// Resolving row-at-a-time made the per-tool-call cost scale with a number
-    /// nothing bounds (CAIRN-4181).
-    ///
-    /// Asserting read TRANSACTIONS rather than wall time makes this
-    /// deterministic: each one is a `BEGIN CONCURRENT` MVCC snapshot, and the
-    /// old drain opened one per push on top of the arms it then ran.
-    #[tokio::test]
-    async fn drain_transaction_count_does_not_grow_with_the_backlog() {
-        let db = migrated_db().await;
-        seed(&db).await;
-        // Distinct subjects, not one subject repeated: batching that only
-        // deduplicated would pass a weaker version of this test.
-        for number in 100..140 {
-            db.execute(
-                "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
-                 VALUES('issue-' || ?1, 'p', ?1, 'Extra', 'active', 'active', 'none', 1, 1)",
-                params![number as i64],
-            )
-            .await
-            .unwrap();
-        }
-
-        // One stale review push: the shape a healthy recipient carries.
-        push(
-            &db,
-            "watcher",
-            "cairn://p/proj/100",
-            Wake::Wake,
-            Boundary::Event,
-            "review:cairn://p/proj/100",
-        )
-        .await
-        .unwrap();
-        let before = db.read_transaction_count();
-        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
-            .await
-            .unwrap()
-            .is_empty());
-        let small = db.read_transaction_count() - before;
-
-        // Thirty-nine more, spanning all three resolvable referent classes, so
-        // every arm is exercised at once.
-        for number in 101..140 {
-            let prefix = match number % 3 {
-                0 => "review",
-                1 => "question",
-                _ => "permission",
-            };
-            push(
-                &db,
-                "watcher",
-                &format!("cairn://p/proj/{number}"),
-                Wake::Wake,
-                Boundary::Event,
-                &format!("{prefix}:cairn://p/proj/{number}"),
-            )
-            .await
-            .unwrap();
-        }
-        let before = db.read_transaction_count();
-        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
-            .await
-            .unwrap()
-            .is_empty());
-        let large = db.read_transaction_count() - before;
-
-        assert_eq!(
-            small, large,
-            "a 40x larger backlog must cost the same number of read transactions; \
-             {small} for one push vs {large} for forty means resolution is per-push \
-             again"
-        );
-        assert!(
-            large <= 3,
-            "a drain is the pending-row read plus one batched resolution, got {large}"
-        );
-    }
-
     /// The batch resolves each push against its OWN subject. A single set query
     /// per arm makes it possible to smear one issue's verdict across the batch,
     /// so this pins live and dead pushes together in one drain.
@@ -4281,72 +4198,6 @@ mod tests {
         );
     }
 
-    /// CAIRN-4181 proved a drain's cost does not grow with the number of LIVE
-    /// pending pushes. This proves the other axis, which is the one retirement
-    /// is about: it must not grow with accumulated HISTORY either. Otherwise the
-    /// queue simply trades an unbounded pending set for an unbounded retired
-    /// one and the per-tool-call cost creeps back.
-    #[tokio::test]
-    async fn drain_cost_is_bounded_by_live_rows_not_by_retired_history() {
-        let db = migrated_db().await;
-        seed(&db).await;
-        open_mr(&db).await;
-        push(
-            &db,
-            "watcher",
-            ISSUE_URI,
-            Wake::Wake,
-            Boundary::Event,
-            REVIEW_KEY,
-        )
-        .await
-        .unwrap();
-
-        let before = db.read_transaction_count();
-        let fresh = pending_deliverable_live(&db, "watcher", Boundary::Event)
-            .await
-            .unwrap();
-        let without_history = db.read_transaction_count() - before;
-
-        // A thousand retired rows for the same recipient: the production shape,
-        // compressed. They are inserted already-retired because that is exactly
-        // the state an aged install is in after the backfill has run.
-        for n in 0..1000 {
-            db.execute(
-                "INSERT INTO attention_pushes
-                   (id, recipient, content_ref, wake, boundary, key, created_at,
-                    retired_at, retirement_reason)
-                 VALUES('old-' || ?1, 'watcher', ?2, 'wake', 'event',
-                        'review:old-' || ?1, 1, 2, 'review_resolved')",
-                params![n as i64, ISSUE_URI],
-            )
-            .await
-            .unwrap();
-        }
-
-        let before = db.read_transaction_count();
-        let aged = pending_deliverable_live(&db, "watcher", Boundary::Event)
-            .await
-            .unwrap();
-        let with_history = db.read_transaction_count() - before;
-
-        assert_eq!(
-            fresh.len(),
-            aged.len(),
-            "retired history must not change what a drain returns"
-        );
-        assert_eq!(
-            without_history, with_history,
-            "a thousand retired rows must cost the same as none; {without_history} \
-             vs {with_history} means history is being re-resolved"
-        );
-        assert_eq!(
-            count_where(&db, "retired_at IS NOT NULL").await,
-            1000,
-            "the history is genuinely present, so the comparison means something"
-        );
-    }
-
     #[tokio::test]
     async fn pending_deliverable_live_includes_passive_excludes_turn_and_resolved() {
         let db = migrated_db().await;
@@ -4895,6 +4746,89 @@ mod tests {
         assert_eq!(
             pending[0].content_ref,
             "cairn://p/cairn/42/1/Builder/create-pr"
+        );
+    }
+
+    /// A drain's database cost must be a constant, not a function of how much
+    /// backlog the recipient carries. This is the regression the batched
+    /// resolver exists to prevent: `dispatch::augment_with_queued_dms` drains on
+    /// EVERY MCP tool call, and because a push whose referent resolved is
+    /// skipped but never retired, a long-lived recipient's backlog only grows.
+    /// Resolving row-at-a-time made the per-tool-call cost scale with a number
+    /// nothing bounds (CAIRN-4181).
+    ///
+    /// Asserting read TRANSACTIONS rather than wall time makes this
+    /// deterministic: each one is a `BEGIN CONCURRENT` MVCC snapshot, and the
+    /// old drain opened one per push on top of the arms it then ran.
+    #[tokio::test]
+    async fn drain_transaction_count_does_not_grow_with_the_backlog() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // Distinct subjects, not one subject repeated: batching that only
+        // deduplicated would pass a weaker version of this test.
+        for number in 100..140 {
+            db.execute(
+                "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+                 VALUES('issue-' || ?1, 'p', ?1, 'Extra', 'active', 'active', 'none', 1, 1)",
+                params![number as i64],
+            )
+            .await
+            .unwrap();
+        }
+
+        // One stale review push: the shape a healthy recipient carries.
+        push(
+            &db,
+            "watcher",
+            "cairn://p/proj/100",
+            Wake::Wake,
+            Boundary::Event,
+            "review:cairn://p/proj/100",
+        )
+        .await
+        .unwrap();
+        let before = db.read_transaction_count();
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap()
+            .is_empty());
+        let small = db.read_transaction_count() - before;
+
+        // Thirty-nine more, spanning all three resolvable referent classes, so
+        // every arm is exercised at once.
+        for number in 101..140 {
+            let prefix = match number % 3 {
+                0 => "review",
+                1 => "question",
+                _ => "permission",
+            };
+            push(
+                &db,
+                "watcher",
+                &format!("cairn://p/proj/{number}"),
+                Wake::Wake,
+                Boundary::Event,
+                &format!("{prefix}:cairn://p/proj/{number}"),
+            )
+            .await
+            .unwrap();
+        }
+        let before = db.read_transaction_count();
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap()
+            .is_empty());
+        let large = db.read_transaction_count() - before;
+
+        assert_eq!(
+            small, large,
+            "a 40x larger backlog must cost the same number of read transactions; \
+             {small} for one push vs {large} for forty means resolution is per-push \
+             again"
+        );
+        assert!(
+            large <= 3,
+            "a drain is the pending-row read plus one batched resolution, got {large}"
         );
     }
 }

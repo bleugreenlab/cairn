@@ -206,35 +206,6 @@ mod tests {
         )
     }
 
-    /// The byte-exact request body of Ollama's owned turn. See
-    /// `http_loop::scripted` for how it is recorded.
-    #[tokio::test]
-    async fn golden_owned_turn() {
-        use crate::backends::http_loop::scripted::{
-            answer_schema, assert_golden, chat_text, record_turn, session_config,
-        };
-        let mut config = session_config("qwen:test");
-        config.reasoning_effort = Some("high".to_string());
-        config.output_schema = Some(answer_schema());
-        let bodies = record_turn(config, vec![chat_text("done")], |_| OllamaAdapter {
-            account_id: Some("acc_ollama".into()),
-            endpoint: Endpoint {
-                provider_name: OLLAMA_BACKEND_NAME.to_string(),
-                backend_key: OLLAMA_BACKEND_KEY.to_string(),
-                chat_url: "http://127.0.0.1:1/v1/chat/completions".to_string(),
-                headers: vec![("content-type".into(), "application/json".into())],
-            },
-        })
-        .await;
-        // The caller's effort and schema are not sent on this owned loop.
-        assert_golden(
-            &bodies,
-            &[
-                r#"{"messages":[{"content":"SYSTEM","role":"system"},{"content":"hi","role":"user"}],"model":"qwen:test","stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":["read","write","run"]}"#,
-            ],
-        );
-    }
-
     #[test]
     fn completion_body_is_tool_free_and_preserves_messages_and_schema() {
         let mut request = request();

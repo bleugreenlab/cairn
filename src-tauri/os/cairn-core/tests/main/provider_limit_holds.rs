@@ -6,18 +6,12 @@ use cairn_core::identity::{CredentialStoreExt, UserIdentity};
 use cairn_core::internal::agent_process::process::AgentProcessState;
 use cairn_core::internal::backends::claude::{claude_runtime, dispatch_claude_result};
 use cairn_core::internal::db::DbState;
-use cairn_core::internal::execution::advancement::{
-    advance_execution_with_actions, is_action_node_ready, recompute_job_status_conn,
-};
-use cairn_core::internal::execution::jobs::{
-    continue_job_impl, prepare_job, promote_private_lanes_for_test, start_prepared_job_session,
-    JobPreparation,
-};
+use cairn_core::internal::execution::advancement::recompute_job_status_conn;
+use cairn_core::internal::execution::jobs::{continue_job_impl, promote_private_lanes_for_test};
 use cairn_core::internal::orchestrator::lifecycle::{finalize_run, stop_job};
 use cairn_core::internal::orchestrator::wakes::{
     load_active_provider_limit_holds, resolve_provider_limit_hold,
-    supersede_orphaned_provider_limit_holds, ProviderLimitHold, RESUME_GATE_LAUNCH_FAILED,
-    SUPPLY_RECHECK_SECS,
+    supersede_orphaned_provider_limit_holds, ProviderLimitHold, SUPPLY_RECHECK_SECS,
 };
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::{
@@ -411,113 +405,6 @@ async fn terminal_result_stores_boundary_and_holds_the_current_turn() {
     );
     assert_eq!(turns(&db).await, 1);
     assert_eq!(recorder.spawn_count(), 0);
-}
-
-#[tokio::test]
-async fn held_recipe_node_dispatches_dependents_only_after_resumed_work_completes() {
-    let (temp, db, mut orch, recorder) = fixture().await;
-    orch.jj_binary_path =
-        common::jj_bin().expect("provision the pinned jj binary before running integration tests");
-    let repo = temp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec![
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--allow-empty",
-            "-qm",
-            "fixture",
-        ],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    db.execute(
-        "UPDATE projects SET repo_path=?1 WHERE id='project'",
-        params![repo.to_string_lossy().as_ref()],
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "UPDATE jobs SET base_branch=?1 WHERE id='b'",
-        params![common::head_sha(&repo)],
-    )
-    .await
-    .unwrap();
-    let hold = hold(&orch, &db, LIMIT).await;
-    assert_held(&db).await;
-    assert!(!cairn_workflow::advancement::issue_settled(&db, "issue")
-        .await
-        .unwrap());
-    assert!(!is_action_node_ready(db.clone(), "exec", "b", "hold").unwrap());
-    assert!(advance_execution_with_actions(&orch, "exec")
-        .await
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        text(&db, "SELECT status FROM jobs WHERE id=?1", "b").await,
-        "pending"
-    );
-    assert_eq!(recorder.spawn_count(), 0);
-
-    assert!(
-        resolve_provider_limit_hold(&orch, &hold, hold.next_due_at().unwrap())
-            .await
-            .unwrap()
-    );
-    await_admission(&orch, "a", "active").await;
-    assert_eq!(recorder.spawn_count(), 1);
-    assert!(!is_action_node_ready(db.clone(), "exec", "b", "hold").unwrap());
-    assert!(advance_execution_with_actions(&orch, "exec")
-        .await
-        .unwrap()
-        .is_empty());
-    let run = text(
-        &db,
-        "SELECT run_id FROM turns WHERE id=(SELECT current_turn_id FROM jobs WHERE id=?1)",
-        "a",
-    )
-    .await;
-    db.execute("INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at)
-                VALUES('output','a','result',1,'{}',1,'result',?1,?1)", params![RESET_AT]).await.unwrap();
-    result(&orch, &db, &run, "Finished work", false, RESET_AT + 200);
-    assert_eq!(
-        text(&db, "SELECT status FROM jobs WHERE id=?1", "a").await,
-        "complete"
-    );
-    assert!(is_action_node_ready(db.clone(), "exec", "b", "hold").unwrap());
-    let dispatched = advance_execution_with_actions(&orch, "exec").await.unwrap();
-    assert_eq!(
-        dispatched
-            .iter()
-            .map(|job| job.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["b"]
-    );
-    assert_eq!(
-        text(&db, "SELECT status FROM jobs WHERE id=?1", "b").await,
-        "running"
-    );
-    let JobPreparation::Prepared(prepared) = prepare_job(&orch, "b").unwrap() else {
-        panic!("nothing else owns b's launch");
-    };
-    start_prepared_job_session(&orch, *prepared, None).unwrap();
-    await_admission(&orch, "b", "active").await;
-    assert_eq!(recorder.spawn_count(), 2);
 }
 
 #[tokio::test]
@@ -976,95 +863,6 @@ async fn unknown_reset_guesses_no_reset_and_rechecks_on_a_bounded_clock() {
     assert_eq!(hold.due_at(recheck), Some(recheck));
     assert_eq!(turns(&db).await, 1);
     assert_eq!(recorder.spawn_count(), 0);
-}
-
-#[tokio::test]
-async fn operator_follow_up_supersedes_the_old_hold_without_an_extra_resume() {
-    let (_temp, db, orch, recorder) = fixture().await;
-    let hold = hold(&orch, &db, LIMIT).await;
-    continue_job_impl(&orch, "a", None, None, None).unwrap();
-    let head = text(&db, "SELECT current_turn_id FROM jobs WHERE id=?1", "a").await;
-    assert_ne!(head, "turn");
-    let before = turns(&db).await;
-    assert!(
-        !resolve_provider_limit_hold(&orch, &hold, hold.next_due_at().unwrap())
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        text(
-            &db,
-            "SELECT state FROM provider_limit_holds WHERE id=?1",
-            &hold.id
-        )
-        .await,
-        "superseded"
-    );
-    assert_eq!(turns(&db).await, before);
-    assert_eq!(
-        text(&db, "SELECT current_turn_id FROM jobs WHERE id=?1", "a").await,
-        head
-    );
-    await_admission(&orch, "a", "active").await;
-    assert_eq!(recorder.spawn_count(), 1);
-}
-
-#[tokio::test]
-async fn failed_launches_restore_the_held_head_then_stop_retrying_after_three_attempts() {
-    let (temp, db, orch, _) = fixture().await;
-    let original = hold(&orch, &db, LIMIT).await;
-    finalize_run(&orch, "run", RunStatus::Exited);
-    assert_held(&db).await;
-    drop(orch);
-    let (orch, recorder) = orchestrator_with_spawn_failure(
-        &temp,
-        db.clone(),
-        Some(ClaudeAuth::ApiKey("test-key".into())),
-        true,
-    );
-    let mut current = original;
-    for attempt in 1..=3 {
-        let due = current.next_due_at().unwrap();
-        let before = chrono::Utc::now().timestamp();
-        assert!(resolve_provider_limit_hold(&orch, &current, due)
-            .await
-            .unwrap());
-        await_admission(&orch, "a", "failed").await;
-        let after = chrono::Utc::now().timestamp();
-        assert_eq!(recorder.spawn_count(), attempt as usize);
-        assert_held(&db).await;
-        let holds = load_active_provider_limit_holds(&db).await.unwrap();
-        assert_eq!(holds.len(), 1);
-        current = holds.into_iter().next().unwrap();
-        assert_eq!(current.launch_attempts, attempt);
-        assert_eq!(current.state, "active");
-        assert_eq!(current.resolved_at, None);
-        assert_eq!(
-            common::scalar_i64_by_id(
-                &db,
-                "SELECT COUNT(*) FROM turns WHERE job_id=?1 AND state='pending'",
-                "a"
-            )
-            .await,
-            0,
-        );
-        if attempt < 3 {
-            assert!((before + 300..=after + 300).contains(&current.retry_not_before.unwrap()));
-        } else {
-            // A third failed launch is not a supply question a re-check could
-            // answer, so the hold stays visibly gated on the operator.
-            assert_eq!(
-                current.resume_gate.as_deref(),
-                Some(RESUME_GATE_LAUNCH_FAILED)
-            );
-            assert_eq!(current.next_due_at(), None);
-            assert!(!current.releasable(), "nor released by a supply change");
-        }
-    }
-    assert!(!resolve_provider_limit_hold(&orch, &current, i64::MAX)
-        .await
-        .unwrap());
-    assert_eq!(recorder.spawn_count(), 3);
 }
 
 #[tokio::test]

@@ -1608,52 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_root_never_becomes_socket_resolvable() {
-        let roots = [
-            PathBuf::from("/tmp"),
-            PathBuf::from("/home/tester"),
-            PathBuf::from("/home/tester/.cairn/scratch"),
-            PathBuf::from("/run"),
-        ];
-        for shared in [
-            "/tmp",
-            "/",
-            "/home",
-            "/home/tester",
-            "/home/tester/.cairn",
-            "/home/tester/.cairn/scratch",
-            "/run",
-            "relative/dir",
-        ] {
-            assert!(
-                is_shared_socket_root_in(Path::new(shared), &roots),
-                "{shared} must be refused"
-            );
-        }
-        // A directory beneath a shared root is the job's own: a cell scratch
-        // under the scratch root, or a test's tempdir under /tmp.
-        for own in [
-            "/home/tester/.cairn/scratch/job-1",
-            "/tmp/cell-abc",
-            "/home/tester/.cairn-exec/build-slots/x/.authority/slot-1/scratch",
-        ] {
-            assert!(
-                !is_shared_socket_root_in(Path::new(own), &roots),
-                "{own} is a job directory"
-            );
-        }
-
-        // And the live entry point refuses the real temp root.
-        let mut policy = SandboxPolicy::for_run(Path::new("/work/wt"), &[], vec![]);
-        policy.allow_job_sockets_in(&std::env::temp_dir());
-        policy.allow_job_sockets_in(&cairn_common::scratch::scratch_root());
-        assert_eq!(
-            policy.socket_resolvable_paths(),
-            vec![PathBuf::from("/work/wt")]
-        );
-    }
-
-    #[test]
     fn for_run_grant_is_writable_and_read_reallowed() {
         let wt = PathBuf::from("/work/wt");
         let deny = vec![PathBuf::from("/home/x/.aws"), PathBuf::from("/secret/data")];
@@ -2132,5 +2086,51 @@ mod tests {
             .writable_extra
             .contains(&PathBuf::from("sudo rm -rf /")));
         assert!(policy.deny_read.contains(&PathBuf::from("/home/x/.aws")));
+    }
+
+    #[test]
+    fn a_shared_root_never_becomes_socket_resolvable() {
+        let roots = [
+            PathBuf::from("/tmp"),
+            PathBuf::from("/home/tester"),
+            PathBuf::from("/home/tester/.cairn/scratch"),
+            PathBuf::from("/run"),
+        ];
+        for shared in [
+            "/tmp",
+            "/",
+            "/home",
+            "/home/tester",
+            "/home/tester/.cairn",
+            "/home/tester/.cairn/scratch",
+            "/run",
+            "relative/dir",
+        ] {
+            assert!(
+                is_shared_socket_root_in(Path::new(shared), &roots),
+                "{shared} must be refused"
+            );
+        }
+        // A directory beneath a shared root is the job's own: a cell scratch
+        // under the scratch root, or a test's tempdir under /tmp.
+        for own in [
+            "/home/tester/.cairn/scratch/job-1",
+            "/tmp/cell-abc",
+            "/home/tester/.cairn-exec/build-slots/x/.authority/slot-1/scratch",
+        ] {
+            assert!(
+                !is_shared_socket_root_in(Path::new(own), &roots),
+                "{own} is a job directory"
+            );
+        }
+
+        // And the live entry point refuses the real temp root.
+        let mut policy = SandboxPolicy::for_run(Path::new("/work/wt"), &[], vec![]);
+        policy.allow_job_sockets_in(&std::env::temp_dir());
+        policy.allow_job_sockets_in(&cairn_common::scratch::scratch_root());
+        assert_eq!(
+            policy.socket_resolvable_paths(),
+            vec![PathBuf::from("/work/wt")]
+        );
     }
 }

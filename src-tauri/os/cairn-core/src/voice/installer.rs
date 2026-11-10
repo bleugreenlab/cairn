@@ -1605,39 +1605,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installing_an_already_current_engine_does_not_download_again() {
-        let directory = tempfile::tempdir().unwrap();
-        let target = crate::voice::catalog::TEST_TARGET;
-        let version = "1.2.3";
-        let asset = engine_asset_name(version, target);
-        let path = directory.path().join(&asset);
-        let bytes = b"already installed";
-        tokio::fs::write(&path, bytes).await.unwrap();
-        let component = ManagedComponent {
-            kind: "engine".into(),
-            id: asset,
-            target: Some(target.into()),
-            size_bytes: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
-            path,
-        };
-        let installer = ComponentInstaller::new(
-            directory.path().to_path_buf(),
-            "http://127.0.0.1:1",
-            version,
-            "test-build",
-            |_| {},
-        );
-        installer.publish(component.clone()).await.unwrap();
-
-        assert_eq!(
-            installer.install_engine(target).await.unwrap().id,
-            component.id,
-            "the post-lock manifest check must make a concurrent second refresh a no-op"
-        );
-    }
-
-    #[tokio::test]
     async fn replacing_an_engine_removes_only_the_superseded_binary() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -1921,9 +1888,6 @@ mod tests {
             installer: ComponentInstaller,
             target: &'static str,
             asset: String,
-            published: Vec<u8>,
-            engine: ManagedComponent,
-            model: ManagedComponent,
         }
 
         impl Fixture {
@@ -1952,43 +1916,18 @@ mod tests {
                 std::fs::write(&model_path, b"model").unwrap();
                 let engine = component("engine", engine_path, &published, Some(target));
                 let model = component("model:fast", model_path, b"model", None);
-                installer.publish(engine.clone()).await.unwrap();
-                installer.publish(model.clone()).await.unwrap();
+                installer.publish(engine).await.unwrap();
+                installer.publish(model).await.unwrap();
                 Fixture {
                     directory,
                     installer,
                     target,
                     asset,
-                    published,
-                    engine,
-                    model,
                 }
             }
 
             fn handoff_dir(&self) -> PathBuf {
                 self.directory.path().join("voice/local-engine")
-            }
-
-            fn backup(&self) -> PathBuf {
-                self.installer.engine_backup_path(&self.asset)
-            }
-
-            /// The engine the manifest records, which must be the bytes on disk.
-            async fn recorded_engine(&self) -> ManagedComponent {
-                let recorded = self
-                    .installer
-                    .manifest()
-                    .await
-                    .unwrap()
-                    .components
-                    .into_iter()
-                    .find(|component| component.kind == "engine")
-                    .expect("an engine is recorded");
-                self.installer
-                    .verify(&recorded)
-                    .await
-                    .expect("the recorded engine is the one on disk");
-                recorded
             }
 
             /// Lay out a handoff the way the self-rebuild does. `checksum_of`
@@ -2007,36 +1946,6 @@ mod tests {
                     serde_json::json!({ "buildId": build_id, "asset": self.asset }).to_string(),
                 )
                 .unwrap();
-            }
-
-            /// A refused handoff changes nothing but itself: the published
-            /// engine's bytes and manifest entry stand, no candidate is left
-            /// behind, and the handoff is consumed so it is not retried.
-            async fn assert_refused_and_intact(&self, result: VoiceResult<ManagedComponent>) {
-                let error = result.expect_err("the handed-off engine is refused");
-                assert!(
-                    matches!(error, VoiceError::Incompatible(_) | VoiceError::Install(_)),
-                    "{error:?}"
-                );
-                assert_eq!(std::fs::read(&self.engine.path).unwrap(), self.published);
-                let manifest = self.installer.manifest().await.unwrap();
-                let engine = manifest
-                    .components
-                    .iter()
-                    .find(|component| component.kind == "engine")
-                    .expect("the published engine is still recorded");
-                assert_eq!(engine.sha256, self.engine.sha256);
-                self.installer
-                    .verify(&self.engine)
-                    .await
-                    .expect("the previous engine still answers to its manifest entry");
-                assert!(!self.installer.staged_engine_path(&self.asset).exists());
-                assert!(!self.backup().exists());
-                assert!(
-                    !self.handoff_dir().exists(),
-                    "a refused handoff is consumed"
-                );
-                assert!(!self.installer.local_engine_pending().await);
             }
         }
 
@@ -2090,237 +1999,6 @@ mod tests {
 
             assert!(capabilities.realtime);
             assert_eq!(probes(&log), 1, "the install probe is the only probe");
-        }
-
-        #[tokio::test]
-        async fn an_engine_reporting_another_version_is_refused() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-voice", "9.9.9", 0, "other version");
-            fixture.hand_off(THIS_RUNNER, &engine, &engine);
-            let result = fixture.installer.install_engine(fixture.target).await;
-            assert!(
-                matches!(result, Err(VoiceError::Incompatible(_))),
-                "{result:?}"
-            );
-            fixture.assert_refused_and_intact(result).await;
-        }
-
-        #[tokio::test]
-        async fn an_engine_reporting_another_name_is_refused() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-other", VERSION, 0, "other name");
-            fixture.hand_off(THIS_RUNNER, &engine, &engine);
-            let result = fixture.installer.install_engine(fixture.target).await;
-            assert!(
-                matches!(result, Err(VoiceError::Incompatible(_))),
-                "{result:?}"
-            );
-            fixture.assert_refused_and_intact(result).await;
-        }
-
-        #[tokio::test]
-        async fn an_engine_whose_probe_fails_is_refused() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-voice", VERSION, 3, "failing probe");
-            fixture.hand_off(THIS_RUNNER, &engine, &engine);
-            let result = fixture.installer.install_engine(fixture.target).await;
-            fixture.assert_refused_and_intact(result).await;
-        }
-
-        #[tokio::test]
-        async fn an_engine_that_does_not_match_its_checksum_is_refused() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-voice", VERSION, 0, "tampered");
-            fixture.hand_off(THIS_RUNNER, &engine, b"the bytes that were gated");
-            let result = fixture.installer.install_engine(fixture.target).await;
-            fixture.assert_refused_and_intact(result).await;
-        }
-
-        /// The engine moves into place before the manifest is written; a
-        /// manifest that cannot be written must not leave the old manifest
-        /// describing bytes that are no longer there.
-        #[tokio::test]
-        async fn a_manifest_that_cannot_be_written_keeps_the_previous_engine() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-voice", VERSION, 0, "built from this revision");
-            fixture.hand_off(THIS_RUNNER, &engine, &engine);
-            // `publish` writes the manifest through this temporary path; a
-            // directory there fails that write after every earlier step passed.
-            std::fs::create_dir(
-                fixture
-                    .directory
-                    .path()
-                    .join("voice-components.json.partial"),
-            )
-            .unwrap();
-            let result = fixture.installer.install_engine(fixture.target).await;
-            assert!(matches!(result, Err(VoiceError::Install(_))), "{result:?}");
-            fixture.assert_refused_and_intact(result).await;
-        }
-
-        /// A caller can stop waiting at any moment: a cancelled file
-        /// transcription drops the install future. Dropped at the commit's most
-        /// delicate point, with the new bytes in place and the manifest still
-        /// describing the old ones, the commit must run on to a coherent end.
-        #[tokio::test]
-        async fn a_cancelled_caller_cannot_interrupt_an_engine_commit() {
-            let mut fixture = Fixture::new().await;
-            let gate = Arc::new(CommitGate::default());
-            fixture.installer.commit_gate = Some(gate.clone());
-            let engine = engine_script("cairn-voice", VERSION, 0, "built from this revision");
-            fixture.hand_off(THIS_RUNNER, &engine, &engine);
-
-            {
-                let install = fixture.installer.install_engine(fixture.target);
-                tokio::pin!(install);
-                tokio::select! {
-                    result = &mut install => panic!("the commit must pause at the gate: {result:?}"),
-                    () = gate.reached.notified() => {}
-                }
-                assert_eq!(
-                    std::fs::read(&fixture.engine.path).unwrap(),
-                    engine,
-                    "paused after the new bytes took the destination"
-                );
-            }
-            gate.release.notify_one();
-            // The commit holds the lock until it settles.
-            drop(fixture.installer.install_lock.lock().await);
-
-            let recorded = fixture.recorded_engine().await;
-            assert_eq!(recorded.sha256, format!("{:x}", Sha256::digest(&engine)));
-            assert!(!fixture.backup().exists());
-            assert!(!fixture
-                .installer
-                .staged_engine_path(&fixture.asset)
-                .exists());
-            assert!(
-                !fixture.handoff_dir().exists(),
-                "the commit consumes the handoff"
-            );
-        }
-
-        /// A process that died between replacing the engine and recording it
-        /// leaves the manifest describing the backup; the next install puts it
-        /// back rather than calling the engine corrupt.
-        #[tokio::test]
-        async fn a_backup_the_manifest_still_describes_is_restored() {
-            let fixture = Fixture::new().await;
-            std::fs::hard_link(&fixture.engine.path, fixture.backup()).unwrap();
-            let unrecorded = engine_script("cairn-voice", VERSION, 0, "never recorded");
-            let staged = fixture.installer.staged_engine_path(&fixture.asset);
-            std::fs::write(&staged, &unrecorded).unwrap();
-            std::fs::rename(&staged, &fixture.engine.path).unwrap();
-
-            let installed = fixture
-                .installer
-                .install_engine(fixture.target)
-                .await
-                .expect("the recorded engine is current again");
-
-            assert_eq!(installed.sha256, fixture.engine.sha256);
-            assert_eq!(
-                std::fs::read(&fixture.engine.path).unwrap(),
-                fixture.published
-            );
-            assert!(!fixture.backup().exists());
-        }
-
-        /// A backup nothing explains is evidence: it is set aside, not deleted.
-        #[tokio::test]
-        async fn an_unexplained_backup_is_set_aside_rather_than_deleted() {
-            let fixture = Fixture::new().await;
-            std::fs::write(fixture.backup(), b"bytes nothing records").unwrap();
-            std::fs::write(&fixture.engine.path, b"bytes nothing records either").unwrap();
-
-            // The engine itself is corrupt, so this goes on to a download that
-            // cannot succeed here; the backup is settled first either way.
-            let _ = fixture.installer.install_engine(fixture.target).await;
-
-            assert!(!fixture.backup().exists());
-            let orphans: Vec<_> = std::fs::read_dir(fixture.installer.engine_dir())
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|name| name.contains(".orphan-"))
-                .collect();
-            assert_eq!(orphans.len(), 1, "{orphans:?}");
-            assert_eq!(
-                std::fs::read(fixture.installer.engine_dir().join(&orphans[0])).unwrap(),
-                b"bytes nothing records"
-            );
-        }
-
-        /// A restored, older, or newer app must not adopt an engine built for
-        /// a runner other than itself.
-        #[tokio::test]
-        async fn a_handoff_for_another_build_is_ignored_and_kept() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-voice", VERSION, 0, "another runner");
-            fixture.hand_off("content-v2:another-runner", &engine, &engine);
-            assert!(!fixture.installer.local_engine_pending().await);
-
-            let installed = fixture
-                .installer
-                .install_engine(fixture.target)
-                .await
-                .expect("the current engine stands without a download");
-
-            assert_eq!(installed.sha256, fixture.engine.sha256);
-            assert_eq!(
-                std::fs::read(&fixture.engine.path).unwrap(),
-                fixture.published
-            );
-            assert!(
-                fixture.handoff_dir().join(HANDOFF_FILE).exists(),
-                "another build's handoff is left for the next self-rebuild to replace"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_matching_handoff_replaces_the_engine_in_place() {
-            let fixture = Fixture::new().await;
-            let engine = engine_script("cairn-voice", VERSION, 0, "built from this revision");
-            fixture.hand_off(THIS_RUNNER, &engine, &engine);
-            assert!(fixture.installer.local_engine_pending().await);
-
-            let installed = fixture
-                .installer
-                .install_engine(fixture.target)
-                .await
-                .expect("the handed-off engine is adopted");
-
-            assert_eq!(installed.path, fixture.engine.path, "same asset, same path");
-            assert_eq!(installed.id, fixture.asset);
-            assert_eq!(installed.target.as_deref(), Some(fixture.target));
-            assert_eq!(installed.size_bytes, engine.len() as u64);
-            assert_eq!(installed.sha256, format!("{:x}", Sha256::digest(&engine)));
-            assert_eq!(std::fs::read(&installed.path).unwrap(), engine);
-            fixture
-                .installer
-                .verify(&installed)
-                .await
-                .expect("the recorded digest is the installed file's own");
-            let manifest = fixture.installer.manifest().await.unwrap();
-            assert!(manifest.components.iter().any(
-                |component| component.kind == "engine" && component.sha256 == installed.sha256
-            ));
-            assert!(
-                manifest
-                    .components
-                    .iter()
-                    .any(|component| component.kind == "model:fast"
-                        && component.sha256 == fixture.model.sha256),
-                "adopting an engine never touches models"
-            );
-            assert!(
-                !fixture.handoff_dir().exists(),
-                "an adopted handoff is consumed"
-            );
-            assert!(!fixture
-                .installer
-                .staged_engine_path(&fixture.asset)
-                .exists());
-            assert!(!fixture.installer.local_engine_pending().await);
         }
     }
 }

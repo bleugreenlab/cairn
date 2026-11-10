@@ -553,29 +553,6 @@ pub(crate) fn scripted_active_stdin_for_test(
     (Box::new(stdin), requests, current_turn_id)
 }
 
-#[cfg(test)]
-pub(crate) fn failing_interrupt_stdin_for_test(
-    thread_id: &str,
-    provider_turn_id: &str,
-) -> Box<dyn crate::agent_process::process::SessionControl> {
-    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let client = std::sync::Arc::new(
-        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
-            vec![Err("fixture interrupt transport failure".to_string())],
-            requests,
-        ),
-    );
-    Box::new(cairn_models::session::codex::CodexControl::new(
-        client,
-        thread_id.to_string(),
-        "/tmp/project".to_string(),
-        None,
-        None,
-        None,
-        std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string()))),
-    ))
-}
-
 /// A real app-server process whose provider goal stays `active`, as it does
 /// across a `turn/interrupt` that Cairn did not pair with a pause.
 ///

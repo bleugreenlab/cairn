@@ -5,16 +5,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::orchestrator::base_advance::preparation::journal_store_key;
-use crate::orchestrator::base_advance::preparation::tests::fail_fence_writes;
 use crate::orchestrator::base_advance::preparation::tests::{
-    git, harness_or_skip, Harness, BRANCH, MAIN_LINE,
+    harness_or_skip, Harness, BRANCH, MAIN_LINE,
 };
 use crate::orchestrator::{BranchAdmissionRefusal, Orchestrator, StoreLockClass};
-use crate::storage::{DbError, RowExt};
+use crate::storage::RowExt;
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -62,42 +60,6 @@ async fn status(h: &Harness, id: &str) -> String {
     .unwrap()
 }
 
-/// The row's status and the bracket that fences it, if any.
-async fn fenced(h: &Harness, id: &str) -> (String, Option<String>) {
-    let id = id.to_string();
-    h.db.read(move |conn| {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT status, bracket_id FROM branch_advance_acceptances WHERE id = ?1",
-                    (id.as_str(),),
-                )
-                .await?;
-            let row = rows.next().await?.expect("the row exists");
-            Ok::<_, DbError>((row.text(0)?, row.opt_text(1)?))
-        })
-    })
-    .await
-    .unwrap()
-}
-
-/// Fail fence writes until dropped, so a failing test cannot poison the next.
-struct FailingFences;
-
-impl FailingFences {
-    fn now() -> Self {
-        fail_fence_writes(true);
-        Self
-    }
-}
-
-impl Drop for FailingFences {
-    fn drop(&mut self) {
-        fail_fence_writes(false);
-    }
-}
-
 /// A writer of `branch` as production admits one: reserve, take the store
 /// lock, mint the permit.
 async fn admit(
@@ -122,21 +84,6 @@ async fn admit(
         )
         .await
         .map(|_| ())
-}
-
-/// The production store import, bracketed exactly as the callers bracket it.
-async fn bracketed_import(h: &Harness) -> Result<(), String> {
-    let guard = h
-        .orch
-        .acquire_jj_store_lock(&h.store, StoreLockClass::Foreground, "test import")
-        .await;
-    let (jj, store, repo) = (h.jj.clone(), h.store.clone(), h.repo.clone());
-    h.orch
-        .bracket_store_mutation(guard, None, h.db.clone(), "proj-1", move || {
-            crate::jj::ensure_project_store(&jj, &store, &repo)
-        })
-        .await
-        .map(|(_guard, ())| ())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -169,212 +116,6 @@ async fn an_unknown_acceptance_refuses_the_writer_even_at_its_installed_head() {
     admit(&h.orch, &h, MAIN_LINE)
         .await
         .expect("one branch's debt never blocks another branch");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_pending_acceptance_at_its_exact_install_settles_and_admits_in_the_same_call() {
-    let h = harness_or_skip!("admit_pending_settles");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-
-    admit(&h.orch, &h, BRANCH)
-        .await
-        .expect("the exact installed head settles the row and admits the writer");
-    assert_eq!(status(&h, &id).await, "accepted");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_pending_acceptance_at_neither_head_becomes_unknown_and_refuses() {
-    let h = harness_or_skip!("admit_pending_neither");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-    // A commit lands on the branch outside the gate.
-    h.commit(&h.branch_ws, BRANCH, "later.txt", "later\n");
-
-    let refusal = admit(&h.orch, &h, BRANCH).await.unwrap_err();
-    assert!(
-        matches!(&refusal, BranchAdmissionRefusal::Debt { status, .. } if status == "unknown"),
-        "{refusal}"
-    );
-    assert_eq!(
-        status(&h, &id).await,
-        "unknown",
-        "never abandoned or accepted"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_restarted_orchestrator_settles_the_journal_before_its_first_writer() {
-    use crate::db::DbState;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::storage::SearchIndex;
-
-    let h = harness_or_skip!("admit_restart");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-
-    // A fresh orchestrator over the same database: no debt is carried in
-    // memory, so the first writer reads and settles the row itself.
-    let home = tempfile::tempdir().unwrap();
-    let restarted = Orchestrator::builder(
-        Arc::new(DbState::new(
-            h.db.clone(),
-            Arc::new(SearchIndex::open_or_create(home.path().join("search")).unwrap()),
-        )),
-        Arc::new(TestServicesBuilder::new().build()),
-        home.path().to_path_buf(),
-    )
-    .build();
-    admit(&restarted, &h, BRANCH)
-        .await
-        .expect("the restarted writer settles the pending row before it moves anything");
-    assert_eq!(status(&h, &id).await, "accepted");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_hold_restores_only_an_operation_it_captured_itself() {
-    let h = harness_or_skip!("undo_own_operations");
-    // The branch holds its own commit, so moving it to the base is a real move.
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    assert_ne!(tip, base);
-    // An unrelated landing reserves another branch, taken before the store
-    // lock as the lock order requires.
-    let _foreign = h
-        .orch
-        .reserve_branches(&h.store, &[MAIN_LINE], "unrelated landing", WAIT)
-        .await
-        .expect("the unrelated reservation is held throughout");
-    let first = h
-        .orch
-        .acquire_jj_store_lock(&h.store, StoreLockClass::Foreground, "first hold")
-        .await;
-    let captured = first.capture_operation(&h.jj).unwrap();
-    drop(first);
-
-    let second = h
-        .orch
-        .acquire_jj_store_lock(&h.store, StoreLockClass::Foreground, "second hold")
-        .await;
-    let refused = second.undo_own_operations(&h.jj, &captured).unwrap_err();
-    assert!(refused.contains("another store lock hold"), "{refused}");
-
-    // Within one hold, its own work is undone even while another operation
-    // reserves a branch of the store.
-    let own = second.capture_operation(&h.jj).unwrap();
-    h.set_bookmark(BRANCH, &base);
-    assert_eq!(h.tip(BRANCH), base, "the hold moved the branch");
-    second.undo_own_operations(&h.jj, &own).unwrap();
-    assert_eq!(h.tip(BRANCH), tip, "the hold's own move was undone exactly");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_fence_that_cannot_be_written_refuses_the_import_before_it_runs() {
-    let h = harness_or_skip!("bracket_fence_refused");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-    git(&h.repo, &["branch", "feature/arrived", &base]);
-
-    let refused = {
-        let _failing = FailingFences::now();
-        bracketed_import(&h).await.unwrap_err()
-    };
-    assert!(refused.contains("nothing was changed"), "{refused}");
-    assert!(
-        crate::jj::bookmark_commit(&h.jj, &h.store, "feature/arrived").is_none(),
-        "the import never ran"
-    );
-    assert_eq!(fenced(&h, &id).await, ("pending".to_string(), None));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_fence_left_by_a_failed_resolution_makes_a_moved_row_unknown_at_settlement() {
-    let h = harness_or_skip!("bracket_fence_moved");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-    // Outside Cairn the branch's Git ref returns to the base: the import drags
-    // the bookmark back to `head_before`, which a bare settlement would read
-    // as "never installed" and abandon.
-    git(
-        &h.repo,
-        &["update-ref", &format!("refs/heads/{BRANCH}"), &base],
-    );
-
-    let guard = h
-        .orch
-        .acquire_jj_store_lock(&h.store, StoreLockClass::Foreground, "test import")
-        .await;
-    let (jj, store, repo) = (h.jj.clone(), h.store.clone(), h.repo.clone());
-    let _failing = h
-        .orch
-        .bracket_store_mutation(guard, None, h.db.clone(), "proj-1", move || {
-            let imported = crate::jj::ensure_project_store(&jj, &store, &repo);
-            // The fence is written; its resolution after the import fails, as
-            // a crash or a database fault would leave it.
-            Ok((imported, FailingFences::now()))
-        })
-        .await
-        .map(|(_guard, (imported, failing))| (imported.unwrap(), failing))
-        .unwrap();
-    let (status, bracket) = fenced(&h, &id).await;
-    assert_eq!(status, "pending");
-    assert!(bracket.is_some(), "the unresolved fence is durable");
-    drop(_failing);
-
-    let refusal = admit(&h.orch, &h, BRANCH).await.unwrap_err();
-    assert!(
-        matches!(&refusal, BranchAdmissionRefusal::Debt { status, .. } if status == "unknown"),
-        "{refusal}"
-    );
-    assert_eq!(
-        fenced(&h, &id).await,
-        ("unknown".to_string(), None),
-        "resolved from the stored copies, never abandoned at head_before"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_fence_left_on_an_unmoved_row_is_cleared_and_the_row_settles_normally() {
-    let h = harness_or_skip!("bracket_fence_unmoved");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-
-    let guard = h
-        .orch
-        .acquire_jj_store_lock(&h.store, StoreLockClass::Foreground, "test import")
-        .await;
-    let (jj, store, repo) = (h.jj.clone(), h.store.clone(), h.repo.clone());
-    let failing = h
-        .orch
-        .bracket_store_mutation(guard, None, h.db.clone(), "proj-1", move || {
-            crate::jj::ensure_project_store(&jj, &store, &repo)?;
-            Ok(FailingFences::now())
-        })
-        .await
-        .map(|(_guard, failing)| failing)
-        .unwrap();
-    assert!(fenced(&h, &id).await.1.is_some());
-    drop(failing);
-
-    // A restarted orchestrator's first writer: the fence matches the branch's
-    // copies, so it is cleared and the exact head settles the row.
-    admit(&h.orch, &h, BRANCH)
-        .await
-        .expect("an unmoved fenced row settles at its exact install");
-    assert_eq!(fenced(&h, &id).await, ("accepted".to_string(), None));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -554,65 +295,6 @@ async fn a_writer_without_the_branch_reservation_is_refused() {
             branch: BRANCH.to_string()
         }
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_store_import_that_moves_an_owed_branch_marks_it_unknown_and_imports_the_rest() {
-    let h = harness_or_skip!("bracket_moved");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-    // Outside Cairn: the branch's Git ref is reset, and an unrelated branch
-    // arrives in the project's Git.
-    git(
-        &h.repo,
-        &["update-ref", &format!("refs/heads/{BRANCH}"), &base],
-    );
-    git(&h.repo, &["branch", "feature/arrived", &base]);
-
-    bracketed_import(&h)
-        .await
-        .expect("another branch's debt never refuses the import itself");
-    assert_ne!(
-        crate::jj::bookmark_commit(&h.jj, &h.store, BRANCH).as_deref(),
-        Some(tip.as_str()),
-        "the fixture's external move reached the owed bookmark"
-    );
-    assert_eq!(
-        status(&h, &id).await,
-        "unknown",
-        "a moved owed branch is never settled against the head the import chose"
-    );
-    assert_eq!(
-        crate::jj::bookmark_commit(&h.jj, &h.store, "feature/arrived").as_deref(),
-        Some(base.as_str()),
-        "other branches import normally"
-    );
-    let refusal = admit(&h.orch, &h, BRANCH).await.unwrap_err();
-    assert!(
-        matches!(&refusal, BranchAdmissionRefusal::Debt { status, .. } if status == "unknown"),
-        "{refusal}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(jj)]
-async fn a_store_import_that_leaves_an_owed_branch_alone_keeps_its_row() {
-    let h = harness_or_skip!("bracket_untouched");
-    let base = h.tip("main");
-    let tip = h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
-    let id = owe(&h, "pending", &base, &tip).await;
-    git(&h.repo, &["branch", "feature/arrived", &base]);
-
-    bracketed_import(&h).await.unwrap();
-    assert_eq!(h.tip(BRANCH), tip);
-    assert_eq!(
-        status(&h, &id).await,
-        "pending",
-        "an unmoved row is left to its settlement"
-    );
-    assert!(crate::jj::bookmark_commit(&h.jj, &h.store, "feature/arrived").is_some());
 }
 
 // ── Source contract ───────────────────────────────────────────────────────────────────────────

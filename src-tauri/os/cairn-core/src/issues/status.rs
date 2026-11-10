@@ -1015,76 +1015,6 @@ mod tests {
         .build()
     }
 
-    /// The ordering the publication authority depends on. A publisher holds the
-    /// project store lock and has passed its authority check; a resolution that
-    /// arrives now must queue behind it rather than record itself, and the
-    /// publisher's next check after the release is refused. No timeout lets the
-    /// resolution through while the hold lasts.
-    #[tokio::test]
-    async fn a_resolution_waits_for_a_publication_holding_the_store_lock() {
-        use crate::mcp::handlers::branch::{publication_authority_in, PublicationAuthority};
-        let orch = orch_with_queued_job().await;
-        let store =
-            crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new("/tmp/proj"));
-        let publisher = orch
-            .acquire_jj_store_lock(
-                &store,
-                crate::orchestrator::StoreLockClass::Foreground,
-                "publisher past its authority check",
-            )
-            .await;
-        assert_eq!(
-            publication_authority_in(&orch.db.local, "job-queued", None, None).await,
-            PublicationAuthority::Authorized
-        );
-
-        let resolver = orch.clone();
-        let resolving = tokio::spawn(async move {
-            let db = resolver.db.local.clone();
-            resolve_terminal(
-                &resolver,
-                &db,
-                "issue-1",
-                Resolution::Merged,
-                StopFailure::Escalates,
-            )
-            .await
-        });
-        let mut queued = false;
-        for _ in 0..10_000 {
-            tokio::task::yield_now().await;
-            queued = orch.store_lock_status(&store).is_some_and(|status| {
-                status
-                    .waiters
-                    .iter()
-                    .any(|waiter| waiter.operation.starts_with("terminal resolution"))
-            });
-            if queued {
-                break;
-            }
-        }
-        assert!(queued, "the resolution queues on the store lock");
-        let status = orch
-            .db
-            .local
-            .query_opt_text("SELECT status FROM issues WHERE id = 'issue-1'", ())
-            .await
-            .unwrap();
-        assert_ne!(
-            status.as_deref(),
-            Some("merged"),
-            "nothing is recorded while the publication holds the lock"
-        );
-        assert!(!resolving.is_finished());
-
-        drop(publisher);
-        resolving.await.unwrap().unwrap();
-        assert!(matches!(
-            publication_authority_in(&orch.db.local, "job-queued", None, None).await,
-            PublicationAuthority::Retired(_)
-        ));
-    }
-
     /// A failed project lookup is not evidence that there is no store: it is
     /// retried, and only a lookup that keeps failing refuses, before anything is
     /// recorded. A lookup that fails once and then succeeds takes the hold.
@@ -1357,6 +1287,76 @@ mod tests {
             Some("active"),
             "the issue stays open when its work could not be stopped"
         );
+    }
+
+    /// The ordering the publication authority depends on. A publisher holds the
+    /// project store lock and has passed its authority check; a resolution that
+    /// arrives now must queue behind it rather than record itself, and the
+    /// publisher's next check after the release is refused. No timeout lets the
+    /// resolution through while the hold lasts.
+    #[tokio::test]
+    async fn a_resolution_waits_for_a_publication_holding_the_store_lock() {
+        use crate::mcp::handlers::branch::{publication_authority_in, PublicationAuthority};
+        let orch = orch_with_queued_job().await;
+        let store =
+            crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new("/tmp/proj"));
+        let publisher = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Foreground,
+                "publisher past its authority check",
+            )
+            .await;
+        assert_eq!(
+            publication_authority_in(&orch.db.local, "job-queued", None, None).await,
+            PublicationAuthority::Authorized
+        );
+
+        let resolver = orch.clone();
+        let resolving = tokio::spawn(async move {
+            let db = resolver.db.local.clone();
+            resolve_terminal(
+                &resolver,
+                &db,
+                "issue-1",
+                Resolution::Merged,
+                StopFailure::Escalates,
+            )
+            .await
+        });
+        let mut queued = false;
+        for _ in 0..10_000 {
+            tokio::task::yield_now().await;
+            queued = orch.store_lock_status(&store).is_some_and(|status| {
+                status
+                    .waiters
+                    .iter()
+                    .any(|waiter| waiter.operation.starts_with("terminal resolution"))
+            });
+            if queued {
+                break;
+            }
+        }
+        assert!(queued, "the resolution queues on the store lock");
+        let status = orch
+            .db
+            .local
+            .query_opt_text("SELECT status FROM issues WHERE id = 'issue-1'", ())
+            .await
+            .unwrap();
+        assert_ne!(
+            status.as_deref(),
+            Some("merged"),
+            "nothing is recorded while the publication holds the lock"
+        );
+        assert!(!resolving.is_finished());
+
+        drop(publisher);
+        resolving.await.unwrap().unwrap();
+        assert!(matches!(
+            publication_authority_in(&orch.db.local, "job-queued", None, None).await,
+            PublicationAuthority::Retired(_)
+        ));
     }
 }
 

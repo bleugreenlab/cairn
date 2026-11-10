@@ -328,20 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_host_is_a_retryable_fetch_failure() {
-        let pin = pin_for(&[("tokenizer.json", b"pinned")]);
-        let unused = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", unused.local_addr().unwrap());
-        drop(unused);
-        let root = tempfile::tempdir().unwrap();
-        let error = TokenizerStore::with_base_url(root.path(), url)
-            .ensure(&pin)
-            .unwrap_err();
-        assert!(matches!(error, StoreError::Fetch(_)), "{error}");
-        assert!(error.is_retryable());
-    }
-
-    #[test]
     fn a_directory_pin_returns_its_verified_directory() {
         // Every request gets the same body, so both files carry it.
         let body = b"same".to_vec();

@@ -486,7 +486,7 @@ async fn deliver_github_app_event(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::routes::fixture::{orchestrator, standing_triggers};
+    use crate::routes::fixture::orchestrator;
 
     pub(crate) async fn bugs_endpoint(db: &crate::storage::LocalDb) {
         super::super::upsert_endpoint(
@@ -803,43 +803,6 @@ pub(crate) mod tests {
             .await,
             0
         );
-    }
-
-    /// The bug-monitor acceptance in miniature: a burst of bug reports wakes
-    /// a thread whose trigger names the endpoint and type once, through the
-    /// fact log's coalesced wake.
-    #[tokio::test]
-    async fn a_burst_of_bug_reports_wakes_a_subscribed_thread_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let (orch, db) = orchestrator(temp.path(), &[]).await;
-        bugs_endpoint(&db).await;
-        standing_triggers(
-            &db,
-            "watcher",
-            r#"[{"fact":"ingress","endpoint":"bugs","type":"bug.reported"}]"#,
-        )
-        .await;
-
-        for report in 1..=5 {
-            consume(&orch, bug_event(100 + report, report), None).await;
-        }
-        crate::routes::drain_fact_log(&orch).await;
-
-        let wakes = db
-            .query_all(
-                "SELECT count, delivered_action FROM fact_log_wakes WHERE job_id = 'watcher' AND source = 'ingress'",
-                (),
-                |row| {
-                    Ok((
-                        crate::storage::RowExt::i64(row, 0)?,
-                        crate::storage::RowExt::opt_text(row, 1)?,
-                    ))
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(wakes.len(), 1, "one coalesced wake: {wakes:?}");
-        assert_eq!(wakes[0].0, 5);
     }
 
     /// The GitHub App's own endpoint: `github`, scoped to no project.

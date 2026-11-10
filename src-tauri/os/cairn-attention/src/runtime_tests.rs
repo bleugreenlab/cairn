@@ -279,6 +279,7 @@ async fn failed_push_insert_rolls_back_host_session_work_message_and_schedule_cu
     );
     assert_eq!(*host.nudges.lock().unwrap(), 0);
 }
+
 #[tokio::test]
 async fn delivery_stamp_and_read_cursor_roll_back_together_on_private_and_team_schemas() {
     for team in [false, true] {

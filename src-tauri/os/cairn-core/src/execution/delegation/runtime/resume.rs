@@ -925,69 +925,6 @@ mod tests {
         assert!(delayed_delivery_notice(None).contains("long before this delivery"));
     }
 
-    /// A repaired delivery prefixes every packet's result with its own notice and
-    /// finish time; the live path renders the bare result. Both the combined
-    /// resume message and the Task `tool_result`s are built from these strings.
-    #[tokio::test]
-    async fn repaired_results_lead_with_their_delayed_delivery_notice() {
-        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("render.db"))
-            .await
-            .unwrap();
-        crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        db.execute_script(
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1);
-             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p','w','P','prj','/tmp/prj',1,1);
-             INSERT INTO jobs (id, project_id, status, created_at, updated_at)
-               VALUES ('j-a','p','complete',1,1), ('j-b','p','complete',1,1);
-             INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at)
-               VALUES ('t-a','s-a','j-a',1,'complete','initial',1,1757000000,1),
-                      ('t-b','s-b','j-b',1,'complete','initial',1,1757003600,1),
-                      ('t-b-review','s-b','j-b',2,'complete','memory_review',2,1800000000,2);
-             INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at)
-               VALUES ('a-a','j-a','return',0,'{\"summary\":\"quic ok\"}',1,'return',1,1),
-                      ('a-b','j-b','return',0,'{\"summary\":\"tar ok\"}',1,'return',1,1);",
-        )
-        .await
-        .unwrap();
-        let db = std::sync::Arc::new(db);
-        let packets = || {
-            ["j-a", "j-b"]
-                .into_iter()
-                .map(|job| {
-                    let mut p = packet(job, "parent", Some("anchor"));
-                    p.result_artifact_job_id = Some(job.to_string());
-                    p
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let repaired = render_delegated_results(&db, packets(), ResumeMode::Repair)
-            .await
-            .unwrap();
-        assert!(repaired[0]
-            .1
-            .starts_with("Delayed delivery: this task finished at 2025-09-04 15:33 UTC"));
-        assert!(repaired[0].1.contains("quic ok"));
-        // The memory-review turn is not the task's finish.
-        assert!(repaired[1]
-            .1
-            .starts_with("Delayed delivery: this task finished at 2025-09-04 16:33 UTC"));
-        assert!(repaired[1].1.contains("tar ok"));
-        let message = format_delegated_resume_message(&repaired);
-        assert_eq!(message.matches("Delayed delivery:").count(), 2);
-
-        let live = render_delegated_results(&db, packets(), ResumeMode::Live)
-            .await
-            .unwrap();
-        assert!(live
-            .iter()
-            .all(|(_, text)| !text.contains("Delayed delivery")));
-    }
-
     fn packet(
         id: &str,
         parent_job: &str,

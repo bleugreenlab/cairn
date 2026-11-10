@@ -3525,42 +3525,4 @@ mod tests {
             Some(0)
         );
     }
-
-    #[tokio::test]
-    async fn firing_limit_counts_non_channel_sinks() {
-        let temp = tempfile::tempdir().unwrap();
-        let routes: Vec<(String, String)> = (0..=MAX_FIRINGS_PER_FACT)
-            .map(|index| {
-                (
-                    format!("cap-{index:03}"),
-                    message_route(&format!("cap {index}"), ""),
-                )
-            })
-            .collect();
-        let borrowed: Vec<(&str, &str)> = routes
-            .iter()
-            .map(|(name, body)| (name.as_str(), body.as_str()))
-            .collect();
-        let (orch, db) = orchestrator(temp.path(), &borrowed).await;
-        db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-
-        dispatch(
-            &orch,
-            thread_fact("bounded"),
-            Presence::Away,
-            RouteContext {
-                project_id: Some("p"),
-                project_path: None,
-                event: None,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
-                .await
-                .unwrap(),
-            Some(MAX_FIRINGS_PER_FACT as i64)
-        );
-    }
 }

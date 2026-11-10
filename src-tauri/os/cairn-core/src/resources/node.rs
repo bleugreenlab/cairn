@@ -4492,71 +4492,6 @@ mod history_parity_tests {
         .unwrap();
     }
 
-    fn json_format() -> Vec<QueryParam> {
-        vec![QueryParam {
-            key: "format".to_string(),
-            value: "json".to_string(),
-        }]
-    }
-
-    /// Every transcript resource of the fixture node and its task, rendered.
-    async fn every_resource(db: &LocalDb) -> Vec<(&'static str, String)> {
-        let (key, number, exec) = ("proj", 7, 1);
-        let json = json_format();
-        vec![
-            (
-                "chat",
-                read_node_chat(db, key, number, exec, "builder", &[]).await,
-            ),
-            (
-                "chat/raw",
-                read_node_chat_raw(db, key, number, exec, "builder", &[]).await,
-            ),
-            (
-                "chat/raw json",
-                read_node_chat_raw(db, key, number, exec, "builder", &json).await,
-            ),
-            (
-                "chat/turn/1",
-                read_node_chat_turn(db, key, number, exec, "builder", 1).await,
-            ),
-            (
-                "chat/1/2 assistant",
-                read_node_chat_event(db, key, number, exec, "builder", 1, 2).await,
-            ),
-            // A tool result that does not carry its tool's name, so this also
-            // reads the run's assistant events to resolve it.
-            (
-                "chat/1/4 tool result",
-                read_node_chat_event(db, key, number, exec, "builder", 1, 4).await,
-            ),
-            (
-                "chat/1/99 missing",
-                read_node_chat_event(db, key, number, exec, "builder", 1, 99).await,
-            ),
-            (
-                "task chat",
-                read_task_chat(db, key, number, exec, "builder", "review", &[]).await,
-            ),
-            (
-                "task chat/raw",
-                read_task_chat_raw(db, key, number, exec, "builder", "review", &[]).await,
-            ),
-            (
-                "task chat/raw json",
-                read_task_chat_raw(db, key, number, exec, "builder", "review", &json).await,
-            ),
-            (
-                "task chat/turn/1",
-                read_task_chat_turn(db, key, number, exec, "builder", "review", 1).await,
-            ),
-            (
-                "task chat/1/2",
-                read_task_chat_event(db, key, number, exec, "builder", "review", 1, 2).await,
-            ),
-        ]
-    }
-
     #[tokio::test]
     async fn turn_session_runlists_keep_job_indexed_plans() {
         let db = crate::storage::migrated_test_db("node-session-runlist-plans").await;
@@ -4670,6 +4605,71 @@ mod history_parity_tests {
         evict_all(&db).await;
         let evicted = every_resource(&db).await;
         assert_eq!(hot, evicted);
+    }
+
+    /// Every transcript resource of the fixture node and its task, rendered.
+    async fn every_resource(db: &LocalDb) -> Vec<(&'static str, String)> {
+        let (key, number, exec) = ("proj", 7, 1);
+        let json = json_format();
+        vec![
+            (
+                "chat",
+                read_node_chat(db, key, number, exec, "builder", &[]).await,
+            ),
+            (
+                "chat/raw",
+                read_node_chat_raw(db, key, number, exec, "builder", &[]).await,
+            ),
+            (
+                "chat/raw json",
+                read_node_chat_raw(db, key, number, exec, "builder", &json).await,
+            ),
+            (
+                "chat/turn/1",
+                read_node_chat_turn(db, key, number, exec, "builder", 1).await,
+            ),
+            (
+                "chat/1/2 assistant",
+                read_node_chat_event(db, key, number, exec, "builder", 1, 2).await,
+            ),
+            // A tool result that does not carry its tool's name, so this also
+            // reads the run's assistant events to resolve it.
+            (
+                "chat/1/4 tool result",
+                read_node_chat_event(db, key, number, exec, "builder", 1, 4).await,
+            ),
+            (
+                "chat/1/99 missing",
+                read_node_chat_event(db, key, number, exec, "builder", 1, 99).await,
+            ),
+            (
+                "task chat",
+                read_task_chat(db, key, number, exec, "builder", "review", &[]).await,
+            ),
+            (
+                "task chat/raw",
+                read_task_chat_raw(db, key, number, exec, "builder", "review", &[]).await,
+            ),
+            (
+                "task chat/raw json",
+                read_task_chat_raw(db, key, number, exec, "builder", "review", &json).await,
+            ),
+            (
+                "task chat/turn/1",
+                read_task_chat_turn(db, key, number, exec, "builder", "review", 1).await,
+            ),
+            (
+                "task chat/1/2",
+                read_task_chat_event(db, key, number, exec, "builder", "review", 1, 2).await,
+            ),
+        ]
+    }
+
+    fn json_format() -> Vec<QueryParam> {
+        vec![QueryParam {
+            key: "format".to_string(),
+            value: "json".to_string(),
+        }]
     }
 }
 

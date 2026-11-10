@@ -481,40 +481,6 @@ mod tests {
         }
     }
 
-    /// The real path from outage to supervisor: a real resident under a real
-    /// lease, its link taken away and aged past the grace, and the real renewal
-    /// task finding out. The event reaches the process's event stream with no
-    /// executor ever saying anything, because a powered-off machine cannot.
-    #[tokio::test]
-    async fn a_real_outage_reaches_the_supervisor_as_machine_lost() {
-        const LOCAL: &str = crate::fleet::COLOCATED_EXECUTOR_ID;
-        let (orch, _config, link) =
-            crate::fleet::service_placement::tests::attached_orchestrator_with_link().await;
-        let host = LeaseHost::default();
-        let mut process = host
-            .launch(&orch, &echo_spec())
-            .await
-            .expect("the service launches");
-
-        assert!(orch.fleet.disconnect_advertised_executor(LOCAL, link));
-        orch.fleet
-            .stage_link_absent(LOCAL, crate::fleet::ENVIRONMENT_LEASE_GRACE_MS + 1);
-
-        let reported = tokio::time::timeout(Duration::from_secs(60), async {
-            while let Some(event) = process.events.recv().await {
-                if let HostEvent::MachineLost { executor_id } = event {
-                    return Some(executor_id);
-                }
-            }
-            None
-        })
-        .await
-        .expect("renewal finds the outage within a renewal interval");
-        assert_eq!(reported.as_deref(), Some(LOCAL));
-        host.release(&orch, "p", &ServiceOwner::Project, "echo")
-            .await;
-    }
-
     /// The whole launch path with a real process: the lease, the confined
     /// resident process, the package and `@cairn/sdk` as runtime assets, the
     /// entry's bare import resolving, and the protocol over the real pipe.

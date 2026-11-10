@@ -847,59 +847,6 @@ mod tests {
         assert!(ensure(&db, &card).await.is_err());
     }
 
-    fn take_derived_jobs() -> Vec<String> {
-        DERIVED_JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()))
-    }
-
-    #[tokio::test]
-    async fn discovery_derives_only_for_jobs_without_a_card() {
-        let db = seeded_reconcile_db("state-card-discovery-skip.db").await;
-        // Three more bound issues whose finished jobs already have cards, each
-        // with a check row a derivation would have read.
-        let mut script = String::new();
-        for n in 8..11 {
-            script.push_str(&format!(
-                "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i{n}','p',{n},'Card','active',1,1);
-                 INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e{n}','build','i{n}','p','completed',1,1);
-                 INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,node_name,started_at,completed_at,created_at,updated_at) VALUES('j{n}','e{n}','i{n}','p','complete','builder','Builder',1,2,1,1);
-                 INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id,target_results_json) VALUES('p','t{n}','in{n}','typecheck',0,1,'',1,1,'j{n}','{{\"parser\":\"tsc\",\"passed\":0,\"failed\":0,\"skipped\":0,\"failures\":[]}}');
-                 INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,followed_at,selected_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}','structural',7,1,1);
-                 INSERT INTO channel_state_card(provider,conversation,subject_uri,target_uri,project_key,job_id,status,created_at,updated_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}/1/builder','cairn://p/cairn/{n}','cairn','j{n}','settled',1,1);"
-            ));
-        }
-        db.execute_script(&script).await.unwrap();
-        let provider = RecordingProvider::default();
-        take_derived_jobs();
-
-        reconcile_discord_cards(&db, &db, &provider, 10)
-            .await
-            .unwrap();
-        assert_eq!(
-            take_derived_jobs(),
-            ["j", "j"],
-            "only the uncarded job is derived: once to create its card, once by the due pass that posts it"
-        );
-        let cards = db
-            .query_all(
-                "SELECT job_id FROM channel_state_card ORDER BY job_id",
-                (),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(cards, ["j", "j10", "j8", "j9"]);
-        assert_eq!(*provider.posts.lock().unwrap(), 1);
-
-        reconcile_discord_cards(&db, &db, &provider, 20)
-            .await
-            .unwrap();
-        assert_eq!(
-            take_derived_jobs(),
-            ["j"],
-            "once carded, a live job is derived only by the due pass"
-        );
-    }
-
     /// The card reads verdict fields projected in SQL; the board reads the full
     /// parse. Both must classify every shape of result identically.
     #[tokio::test]
@@ -1091,5 +1038,58 @@ mod tests {
             })
             .collect();
         assert_eq!(card_checks, expected);
+    }
+
+    #[tokio::test]
+    async fn discovery_derives_only_for_jobs_without_a_card() {
+        let db = seeded_reconcile_db("state-card-discovery-skip.db").await;
+        // Three more bound issues whose finished jobs already have cards, each
+        // with a check row a derivation would have read.
+        let mut script = String::new();
+        for n in 8..11 {
+            script.push_str(&format!(
+                "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i{n}','p',{n},'Card','active',1,1);
+                 INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e{n}','build','i{n}','p','completed',1,1);
+                 INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,node_name,started_at,completed_at,created_at,updated_at) VALUES('j{n}','e{n}','i{n}','p','complete','builder','Builder',1,2,1,1);
+                 INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id,target_results_json) VALUES('p','t{n}','in{n}','typecheck',0,1,'',1,1,'j{n}','{{\"parser\":\"tsc\",\"passed\":0,\"failed\":0,\"skipped\":0,\"failures\":[]}}');
+                 INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,followed_at,selected_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}','structural',7,1,1);
+                 INSERT INTO channel_state_card(provider,conversation,subject_uri,target_uri,project_key,job_id,status,created_at,updated_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}/1/builder','cairn://p/cairn/{n}','cairn','j{n}','settled',1,1);"
+            ));
+        }
+        db.execute_script(&script).await.unwrap();
+        let provider = RecordingProvider::default();
+        take_derived_jobs();
+
+        reconcile_discord_cards(&db, &db, &provider, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            take_derived_jobs(),
+            ["j", "j"],
+            "only the uncarded job is derived: once to create its card, once by the due pass that posts it"
+        );
+        let cards = db
+            .query_all(
+                "SELECT job_id FROM channel_state_card ORDER BY job_id",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cards, ["j", "j10", "j8", "j9"]);
+        assert_eq!(*provider.posts.lock().unwrap(), 1);
+
+        reconcile_discord_cards(&db, &db, &provider, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            take_derived_jobs(),
+            ["j"],
+            "once carded, a live job is derived only by the due pass"
+        );
+    }
+
+    fn take_derived_jobs() -> Vec<String> {
+        DERIVED_JOBS.with(|jobs| std::mem::take(&mut *jobs.borrow_mut()))
     }
 }

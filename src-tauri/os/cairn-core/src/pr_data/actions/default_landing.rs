@@ -549,18 +549,6 @@ pub(in crate::pr_data::actions) mod origin_take_barrier {
         HOOKS.get_or_init(Default::default)
     }
 
-    /// Run `hook` inside each origin take of the store at `store`.
-    pub(in crate::pr_data::actions) fn set(store: &Path, hook: impl FnMut() + Send + 'static) {
-        hooks()
-            .lock()
-            .unwrap()
-            .insert(store.to_path_buf(), Box::new(hook));
-    }
-
-    pub(in crate::pr_data::actions) fn clear(store: &Path) {
-        hooks().lock().unwrap().remove(store);
-    }
-
     pub(super) fn reached(store: &Path) {
         let hook = hooks().lock().unwrap().remove(store);
         if let Some(mut hook) = hook {

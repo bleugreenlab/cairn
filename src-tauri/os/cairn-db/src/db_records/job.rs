@@ -327,11 +327,6 @@ mod jobs_base_commit_sql_reach {
     ///   record onto a delegated child alongside its branch; core retains the
     ///   host integration fixture for that copy.
     /// - `storage/migrations.rs` — schema lineage and its fixtures.
-    /// - `diff.rs` — a test fixture that seeds a deliberately stale record to
-    ///   prove the live derivation ignores it.
-    /// - `orchestrator/base_advance/preparation_tests.rs` — reads the record back
-    ///   to prove an accepted install wrote the destination it anchored the
-    ///   branch on; the assertion is about the archive, not a coordinate.
     /// - `resources/mutations/dispatch/rebase/acceptance.rs` — compares the
     ///   captured archival anchor before recording the accepted native rebuild's
     ///   base; the store, not this column, proves the accepted head and base.
@@ -343,7 +338,6 @@ mod jobs_base_commit_sql_reach {
     /// - `mcp/handlers/run/held.rs` — fixtures seed jobs and held-publication
     ///   archival bases in one SQL batch; the latter is not a live job coordinate.
     const SANCTIONED_SQL_SITES: &[&str] = &[
-        "os/cairn-core/src/diff.rs",
         "os/cairn-core/src/effects/dag/delegation.rs",
         "os/cairn-workflow/src/advancement/job_creation.rs",
         "os/cairn-workflow/src/effects/dag/delegation.rs",
@@ -353,7 +347,6 @@ mod jobs_base_commit_sql_reach {
         "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance.rs",
         "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance/tests.rs",
         "os/cairn-core/src/orchestrator/base_advance.rs",
-        "os/cairn-core/src/orchestrator/base_advance/preparation_tests.rs",
         "os/cairn-db/src/storage/migrations.rs",
     ];
 

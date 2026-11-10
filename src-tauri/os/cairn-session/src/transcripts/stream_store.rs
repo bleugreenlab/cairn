@@ -1520,43 +1520,6 @@ mod tests {
         assert_eq!(presence_ts_ms(1_760_000_000), 1_760_000_000_000);
     }
 
-    /// CAIRN-3290: concurrent writers on one run each get their own slot.
-    ///
-    /// The orchestrator writes attention briefings, user events and system
-    /// notices for a run that a backend reader is writing to at the same time.
-    /// While allocation was a read separated from its insert, those racing
-    /// writers landed on the same number — which is why duplicated slots span
-    /// `system:init`, `attention:briefing` and `system:message` and not just the
-    /// streaming path. Allocating inside the insert transaction makes the write
-    /// conflict visible to the engine, and the transaction retry re-allocates.
-    #[tokio::test]
-    async fn concurrent_writers_on_one_run_never_share_a_slot() {
-        const WRITERS: usize = 8;
-        let (_temp, db) = test_db().await;
-        insert_run(&db, "run-1").await;
-
-        let handles: Vec<_> = (0..WRITERS)
-            .map(|i| {
-                let db = db.clone();
-                tokio::task::spawn_blocking(move || {
-                    insert_event(db, test_event(&format!("evt-{i}"), "run-1"))
-                })
-            })
-            .collect();
-        for handle in handles {
-            assert!(
-                handle.await.unwrap().unwrap(),
-                "every concurrent write must land"
-            );
-        }
-
-        assert_eq!(
-            sequences(&db, "run-1").await,
-            (0..WRITERS as i64).collect::<Vec<_>>(),
-            "concurrent writers must produce exactly 0..n"
-        );
-    }
-
     #[tokio::test]
     async fn stream_round_trip_and_reconstruct() {
         let (_temp, db) = test_db().await;

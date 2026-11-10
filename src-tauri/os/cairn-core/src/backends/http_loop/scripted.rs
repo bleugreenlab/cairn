@@ -32,7 +32,6 @@ use cairn_models::interface::complete::{
 use cairn_models::turn::TurnExit;
 use cairn_models::wire::anthropic_messages::wire::MessagesResponse;
 use cairn_models::wire::openai_compat::wire::ChatResponse;
-use cairn_models::wire::openai_responses::wire::{ResponseEnvelope, ResponsesResponse};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -191,15 +190,6 @@ pub(in crate::backends) fn session_config(model: &str) -> SessionConfig {
     }
 }
 
-/// The schema the structured-output goldens ask for.
-pub(in crate::backends) fn answer_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {"answer": {"type": "string"}},
-        "required": ["answer"]
-    })
-}
-
 /// Run one turn of the adapter `make_adapter` builds, answered by `replies`,
 /// and return every request body it sent, serialized.
 ///
@@ -289,24 +279,6 @@ pub(in crate::backends) fn chat_text(text: &str) -> CompletionReply {
     CompletionReply::Chat(response)
 }
 
-/// A chat-completions generation calling [`UNKNOWN_TOOL`] once per id. A turn
-/// that makes many generations should give each its own ids, as a provider
-/// does: transcript persistence matches results to calls by id, and a reused
-/// id makes every later round slower.
-pub(in crate::backends) fn chat_tool_calls_with_ids(
-    ids: impl Iterator<Item = String>,
-) -> CompletionReply {
-    let calls: Vec<Value> = ids
-        .map(|id| json!({"id": id, "type": "function", "function": {"name": UNKNOWN_TOOL, "arguments": "{}"}}))
-        .collect();
-    let response: ChatResponse = serde_json::from_value(json!({
-        "choices": [{"message": {"role": "assistant", "content": null, "tool_calls": calls}}],
-        "finish_reason": "tool_calls",
-    }))
-    .unwrap();
-    CompletionReply::Chat(response)
-}
-
 /// An Anthropic Messages answer.
 pub(in crate::backends) fn messages_text(text: &str) -> CompletionReply {
     let response: MessagesResponse = serde_json::from_value(json!({
@@ -328,28 +300,6 @@ pub(in crate::backends) fn messages_tool_uses(count: usize) -> CompletionReply {
     }))
     .unwrap();
     CompletionReply::Messages(response)
-}
-
-/// An OpenAI Responses answer.
-pub(in crate::backends) fn responses_text(text: &str) -> CompletionReply {
-    responses(json!([{
-        "type": "message", "role": "assistant",
-        "content": [{"type": "output_text", "text": text}],
-    }]))
-}
-
-/// An OpenAI Responses generation making `count` calls to [`UNKNOWN_TOOL`].
-pub(in crate::backends) fn responses_function_calls(count: usize) -> CompletionReply {
-    let calls: Vec<Value> = call_ids(count)
-        .map(|id| json!({"type": "function_call", "call_id": id, "name": UNKNOWN_TOOL, "arguments": "{}"}))
-        .collect();
-    responses(Value::Array(calls))
-}
-
-fn responses(output: Value) -> CompletionReply {
-    let envelope: ResponseEnvelope =
-        serde_json::from_value(json!({"status": "completed", "output": output})).unwrap();
-    CompletionReply::Responses(ResponsesResponse::from_envelope(envelope))
 }
 
 #[test]

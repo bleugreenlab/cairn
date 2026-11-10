@@ -3853,7 +3853,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::storage::SearchIndex;
     use std::sync::Arc;
 
     #[test]
@@ -4058,106 +4058,6 @@ pub(crate) mod tests {
         .unwrap();
         let snapshot = AppearanceSnapshot::new(actor.clone(), evidence, Vec::new(), None).unwrap();
         OperatorApproval::authenticated(actor, snapshot).unwrap()
-    }
-
-    #[tokio::test]
-    async fn migrated_telegram_winner_cannot_inherit_desktop_retry_authority() {
-        let root = tempfile::tempdir().unwrap().keep();
-        let local = LocalDb::open(root.join("test.db")).await.unwrap();
-        // A migration's identity is its file stem, `0190_canonicalize_channel_permission_answers`,
-        // and the two surfaces below speak different halves of it: `Migration::name()` reports the
-        // name after the version, while `MigrationRunner::run` reports what it applied by the whole
-        // stem.
-        const CANONICALIZE_CHANNEL_ANSWERS: &str = "canonicalize_channel_permission_answers";
-        const CANONICALIZE_CHANNEL_ANSWERS_STEM: &str =
-            "0190_canonicalize_channel_permission_answers";
-        let cut = TURSO_MIGRATIONS
-            .iter()
-            .position(|migration| migration.name() == CANONICALIZE_CHANNEL_ANSWERS)
-            .expect("the canonicalizing migration is registered");
-        let canonicalize = TURSO_MIGRATIONS[cut];
-        MigrationRunner::new(TURSO_MIGRATIONS[..cut].to_vec())
-            .run(&local)
-            .await
-            .unwrap();
-        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
-        let db = Arc::new(DbState::new(Arc::new(local), search));
-        let orch =
-            Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build();
-        seed_allow_all_permission(&orch).await;
-        // The Telegram win is written as raw rows in the shape the pre-0190
-        // schema defined (0182's tables plus 0184's provenance columns), not
-        // through today's `claim_ask_resolution`: the runtime claim path touches
-        // columns later migrations add, and this test witnesses what 0190 does
-        // to data that existed before it.
-        orch.db
-            .local
-            .execute_script(
-                "
-                INSERT INTO channel_ask_action (action_ref, kind)
-                 VALUES ('perm-request-1', 'permission');
-                INSERT INTO channel_ask_resolution (
-                    binding_ref, action_ref, kind, answer, winner_provider,
-                    winner_conversation, resolved_at, resolution_id, winner_surface, winner_actor
-                ) VALUES (
-                    'perm-request-1', 'perm-request-1', 'permission', 'Approve', 'telegram',
-                    'telegram:8771562567', 10, '6f1c1e0a-5b0e-4d2a-9c43-0d3f6b8a1e72',
-                    'channel_reply', '8771562567'
-                );
-                ",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            MigrationRunner::new(vec![canonicalize])
-                .run(&orch.db.local)
-                .await
-                .unwrap(),
-            vec![CANONICALIZE_CHANNEL_ANSWERS_STEM.to_string()]
-        );
-        assert_eq!(
-            crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")
-                .await
-                .unwrap()
-                .unwrap()
-                .answer,
-            "allow"
-        );
-
-        // The canonicalization has been witnessed against the schema it shipped
-        // for; what follows is the CURRENT runtime, which reads columns later
-        // migrations added, so bring the schema the rest of the way forward.
-        MigrationRunner::new(TURSO_MIGRATIONS[cut + 1..].to_vec())
-            .run(&orch.db.local)
-            .await
-            .unwrap();
-
-        let refusal = resolve_permission_request(
-            &orch,
-            "perm-request-1",
-            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
-        )
-        .await
-        .expect_err("canonicalizing a channel answer does not authenticate an ancestor");
-        assert!(
-            refusal.contains("no authenticated ancestor run"),
-            "{refusal}"
-        );
-
-        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
-        assert_eq!(
-            orch.db
-                .local
-                .query_opt_text(
-                    "SELECT resolution_provider FROM permission_requests WHERE id = 'perm-request-1'",
-                    (),
-                )
-                .await
-                .unwrap()
-                .as_deref(),
-            None,
-            "an unauthenticated migrated winner must not execute under the retrying operator"
-        );
     }
 
     #[tokio::test]

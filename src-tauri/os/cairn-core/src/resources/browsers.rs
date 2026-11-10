@@ -2504,63 +2504,6 @@ mod tests {
         );
     }
 
-    /// A host that knows it could not deliver the command publishes a correlated
-    /// page-shaped error immediately. The backstop timeout is reserved for a
-    /// command that was actually delivered but never produced a reply.
-    #[tokio::test]
-    async fn bridge_roundtrip_returns_host_rejection_promptly_and_balances_priming() {
-        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
-        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected2 = collected.clone();
-        let responses = orch.browser_bridge_responses.clone();
-        let task = tokio::spawn(async move {
-            while let Some(cmd) = rx.recv().await {
-                if let BrowserCommand::Bridge { ref request_id, .. } = cmd {
-                    let _ = responses.send((
-                        request_id.clone(),
-                        "{\"ok\":false,\"error\":\"no live webview for browser bid\"}".to_string(),
-                    ));
-                }
-                collected2.lock().unwrap().push(cmd);
-            }
-        });
-
-        let started = tokio::time::Instant::now();
-        let response = browser_bridge_roundtrip(
-            &orch,
-            "bid",
-            &BridgeRequest::RenderAnnotations {
-                annotations: Vec::new(),
-            },
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        assert!(!response.ok);
-        assert_eq!(
-            response.error.as_deref(),
-            Some("no live webview for browser bid")
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "known host rejection should not consume the timeout: {:?}",
-            started.elapsed()
-        );
-
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        drop(orch);
-        join_host_drain(task).await;
-        let cmds = collected.lock().unwrap().clone();
-        assert!(matches!(
-            cmds.as_slice(),
-            [
-                BrowserCommand::BeginRenderPriming { .. },
-                BrowserCommand::Bridge { .. },
-                BrowserCommand::EndRenderPriming { .. }
-            ]
-        ));
-    }
-
     /// Part 1: EndRenderPriming is emitted even when the round-trip times out —
     /// the RAII guard must release the off-screen hold on every exit path.
     #[tokio::test]

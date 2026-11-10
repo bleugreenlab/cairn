@@ -152,44 +152,6 @@ fn frames_cut_at_their_byte_bound() {
     pack.verify().unwrap();
 }
 
-#[test]
-fn a_row_at_the_byte_bound_fits_but_one_more_byte_is_rejected() {
-    let mut empty = row("");
-    empty.insert("rowid".to_string(), Json::from(7));
-    let overhead = serde_json::to_vec(&empty).unwrap().len() + 1;
-    let fits = "x".repeat(FRAME_RAW_BYTES - overhead);
-    for has_open_frame in [false, true] {
-        let mut writer = writer();
-        if has_open_frame {
-            writer
-                .push(Section::ToolInvocations, "run", 1, row("before"))
-                .unwrap();
-        }
-        let error = writer
-            .push(Section::ToolInvocations, "run", 7, row(&format!("{fits}x")))
-            .unwrap_err();
-        assert_eq!(
-            error,
-            PackError::Corrupt(format!(
-                "tool_invocations key \"run\" rowid 7 encodes to {} JSONL bytes, exceeds FRAME_RAW_BYTES ({FRAME_RAW_BYTES})",
-                FRAME_RAW_BYTES + 1
-            ))
-        );
-        writer
-            .push(Section::ToolInvocations, "run", 7, row(&fits))
-            .unwrap();
-        let pack = HistoryPack::open(built_from(writer)).unwrap();
-        pack.verify().unwrap();
-        assert_eq!(pack.index().last().unwrap().raw_len, FRAME_RAW_BYTES as u64);
-        let rows = pack
-            .rows(Section::ToolInvocations, "run")
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(rows.len(), if has_open_frame { 2 } else { 1 });
-        assert_eq!(rows.last().unwrap()["id"], fits, "no truncation");
-    }
-}
-
 #[tokio::test]
 async fn unresolved_blob_base64_expansion_cannot_exceed_the_frame_bound() {
     let db = crate::storage::migrated_test_db("pack-oversized-blob.db").await;

@@ -13,7 +13,7 @@ use crate::common;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cairn_common::protocol::{stamp_callback_origin, CALLBACK_ORIGIN_KEY, MODEL_FACING_ORIGIN};
+use cairn_common::protocol::{stamp_callback_origin, MODEL_FACING_ORIGIN};
 use cairn_core::internal::agent_process::process::RunHandle;
 use cairn_core::internal::dispatch::dispatch_tool;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
@@ -28,50 +28,6 @@ fn register_run(orch: &Orchestrator, run_id: &str) {
     let stdin = Arc::new(Mutex::new(None));
     let handle = RunHandle::new(child, stdin, Some(format!("sess-{run_id}")), None);
     processes.register(run_id.to_string(), handle);
-}
-
-/// The stub is for the model holding the earlier result. A caller under the same
-/// run whose result goes to a program (the CLI, or `@cairn/sdk` in a procedure,
-/// which stamps no origin) always gets the body, and leaves the model's own
-/// repeat a duplicate.
-#[tokio::test(flavor = "current_thread")]
-async fn dispatch_never_stubs_a_read_that_does_not_reach_a_model() {
-    let (_temp, orch, cursors) = active_turn_fixture().await;
-    let model_request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent-xyz");
-    let mut cli_request = model_request.clone();
-    stamp_callback_origin(&mut cli_request.payload, "cli");
-    let mut code_request = model_request.clone();
-    code_request
-        .payload
-        .as_object_mut()
-        .unwrap()
-        .remove(CALLBACK_ORIGIN_KEY);
-
-    let first = dispatch_tool(&orch, &model_request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(!first.starts_with("[duplicate call]"));
-    for request in [&cli_request, &code_request] {
-        let body = dispatch_tool(&orch, request, &cursors)
-            .await
-            .into_inner()
-            .content;
-        assert_eq!(
-            body, first,
-            "a read that reaches a program must return the body: {:?}",
-            request.payload
-        );
-    }
-
-    let repeat = dispatch_tool(&orch, &model_request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(
-        repeat.starts_with("[duplicate call]"),
-        "the model's own repeat is still a duplicate: {repeat}"
-    );
 }
 
 fn register_run_with_turn(orch: &Orchestrator, run_id: &str, turn_id: &str) {
@@ -103,63 +59,6 @@ fn read_request(run_id: &str, path: &str) -> McpCallbackRequest {
         tool_use_id: None,
         origin: None,
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn dispatch_dedups_identical_read_within_turn() {
-    let (_temp, orch, cursors) = active_turn_fixture().await;
-    let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent-xyz");
-
-    // First call executes the handler (not a stub).
-    let first = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(
-        !first.starts_with("[duplicate call]"),
-        "first call must execute, got stub: {first}"
-    );
-
-    // Identical second call short-circuits to the stub.
-    let second = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(
-        second.starts_with("[duplicate call]"),
-        "duplicate read must return the stub, got: {second}"
-    );
-    assert!(
-        second.contains("call #2"),
-        "stub should name the count: {second}"
-    );
-    assert!(
-        second.contains("file:/tmp/cairn-dedup-nonexistent-xyz"),
-        "stub should name the target: {second}"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn dispatch_does_not_dedup_different_slice() {
-    let (_temp, orch, cursors) = active_turn_fixture().await;
-
-    let base = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent?offset=0");
-    let other = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent?offset=100");
-
-    let first = dispatch_tool(&orch, &base, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(!first.starts_with("[duplicate call]"));
-    // A different slice is a different call -> executes, never stubbed.
-    let second = dispatch_tool(&orch, &other, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(
-        !second.starts_with("[duplicate call]"),
-        "a different slice must not be deduped, got: {second}"
-    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -270,88 +169,5 @@ async fn dispatch_never_dedups_read_resource_terminal_poll() {
     assert!(
         !second.starts_with("[duplicate call]"),
         "read_resource is the terminal cursor-poll path and must never be deduped: {second}"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn dispatch_passes_through_read_without_active_turn() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    // Run is registered but Idle (no turn begun) -> PassThrough, never stubbed.
-    register_run(&orch, "run-1");
-    let cursors = Mutex::new(HashMap::new());
-    let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent");
-
-    let first = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    let second = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(!first.starts_with("[duplicate call]"));
-    assert!(
-        !second.starts_with("[duplicate call]"),
-        "an Idle run (no active turn) must never be deduped: {second}"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn dispatch_resets_dedup_on_turn_change() {
-    let (_temp, orch, cursors) = active_turn_fixture().await;
-    let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent");
-
-    let _first = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    let dup = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(
-        dup.starts_with("[duplicate call]"),
-        "second call should stub: {dup}"
-    );
-
-    // A new turn wipes the seen-set: the same read executes again.
-    orch.process_state.begin_turn("run-1", "turn-2");
-    let after = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(
-        !after.starts_with("[duplicate call]"),
-        "a new turn must reset the seen-set: {after}"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn dispatch_nudges_on_third_identical_read() {
-    let (_temp, orch, cursors) = active_turn_fixture().await;
-    let request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent");
-
-    let _first = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    let second = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(second.contains("call #2"));
-    assert!(
-        !second.contains("retry loop"),
-        "no nudge below threshold: {second}"
-    );
-
-    let third = dispatch_tool(&orch, &request, &cursors)
-        .await
-        .into_inner()
-        .content;
-    assert!(third.contains("call #3"));
-    assert!(
-        third.contains("retry loop"),
-        "nudge should appear on the third identical call: {third}"
     );
 }

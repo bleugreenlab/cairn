@@ -5201,11 +5201,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_tick_selects_only_the_due_continuations_from_a_history() {
-        tick_cost(2_000, 50, 3).await;
-    }
-
     /// The full-size measurement quoted on cairn/5866. Run explicitly:
     /// `bun run test:rust -p cairn-core --lib mcp::handlers::durable_suspend::tests::tick_cost_against_a_long_history -- --ignored --nocapture`.
     #[tokio::test]
@@ -6222,45 +6217,6 @@ mod tests {
         assert_eq!(tool_result_count(&orch).await, 1);
         let correlation = orch.db.local.query_one("SELECT run_id,json_extract(data,'$.toolUseId') FROM events WHERE event_type='tool_result'", (), |r| Ok((r.text(0)?, r.text(1)?))).await.unwrap();
         assert_eq!(correlation, ("run-1".into(), "tool-1".into()));
-    }
-
-    #[tokio::test]
-    async fn mcp_task_working_input_and_terminal_outcomes_are_driven_without_an_executor() {
-        let (orch, mut record, _) = durable_env().await;
-        let gateway = Arc::new(FakeMcpGateway::default());
-        gateway.task_outcomes.lock().unwrap().extend([
-            Ok(McpTaskOutcome::Working {
-                poll_interval_ms: Some(1),
-            }),
-            Ok(McpTaskOutcome::InputRequired {
-                input_requests: serde_json::json!([{"id":"choice"}]),
-            }),
-            Ok(McpTaskOutcome::Complete(McpToolCallResult::from_text(
-                "task done",
-            ))),
-        ]);
-        assert!(orch.set_mcp_gateway(gateway.clone()).is_ok());
-        let mut state = mcp_state();
-        super::super::mcp_continuation::set_task(
-            &mut state,
-            "task-1".into(),
-            1,
-            chrono::Utc::now().timestamp_millis() - 100,
-            Some(30_000),
-        );
-        record.condition = Condition::McpContinuation { state };
-        record.deadline = None;
-        insert(&orch.db.local, &record).await.unwrap();
-
-        let driver = tokio::spawn(drive_mcp_until_terminal(
-            orch.clone(),
-            orch.db.local.clone(),
-            record,
-        ));
-        answer_latest_prompt(&orch, serde_json::json!({"choice":"a"})).await;
-        let result = driver.await.unwrap();
-        assert!(result.contains("task done"), "{result}");
-        assert_eq!(gateway.updates.lock().unwrap()[0].0, "task-1");
     }
 
     #[tokio::test]
@@ -8902,5 +8858,44 @@ mod tests {
         assert!(hold.render().contains("`run: cargo test`"));
         assert_eq!(active_wait_count(&orch).await, 2);
         assert!(wait_resolved_turns(&orch).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_task_working_input_and_terminal_outcomes_are_driven_without_an_executor() {
+        let (orch, mut record, _) = durable_env().await;
+        let gateway = Arc::new(FakeMcpGateway::default());
+        gateway.task_outcomes.lock().unwrap().extend([
+            Ok(McpTaskOutcome::Working {
+                poll_interval_ms: Some(1),
+            }),
+            Ok(McpTaskOutcome::InputRequired {
+                input_requests: serde_json::json!([{"id":"choice"}]),
+            }),
+            Ok(McpTaskOutcome::Complete(McpToolCallResult::from_text(
+                "task done",
+            ))),
+        ]);
+        assert!(orch.set_mcp_gateway(gateway.clone()).is_ok());
+        let mut state = mcp_state();
+        super::super::mcp_continuation::set_task(
+            &mut state,
+            "task-1".into(),
+            1,
+            chrono::Utc::now().timestamp_millis() - 100,
+            Some(30_000),
+        );
+        record.condition = Condition::McpContinuation { state };
+        record.deadline = None;
+        insert(&orch.db.local, &record).await.unwrap();
+
+        let driver = tokio::spawn(drive_mcp_until_terminal(
+            orch.clone(),
+            orch.db.local.clone(),
+            record,
+        ));
+        answer_latest_prompt(&orch, serde_json::json!({"choice":"a"})).await;
+        let result = driver.await.unwrap();
+        assert!(result.contains("task done"), "{result}");
+        assert_eq!(gateway.updates.lock().unwrap()[0].0, "task-1");
     }
 }

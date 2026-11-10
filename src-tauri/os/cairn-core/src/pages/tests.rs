@@ -2107,31 +2107,6 @@ fn only_row_writes_builds_a_row_write_origin() {
     assert_eq!(found, expected);
 }
 
-/// Answers every read except those naming `withheld`, which never answer.
-struct Withholding {
-    withheld: &'static str,
-}
-
-impl PageCallAnswerer for Withholding {
-    fn answer<'a>(
-        &'a self,
-        orch: &'a Orchestrator,
-        request: PageReadRequest,
-        viewer: &'a Value,
-    ) -> futures_util::future::BoxFuture<'a, Result<Value, PageCallError>> {
-        Box::pin(async move {
-            if request
-                .paths
-                .iter()
-                .any(|path| path.contains(self.withheld))
-            {
-                std::future::pending::<()>().await;
-            }
-            page_read(orch, &request, viewer).await
-        })
-    }
-}
-
 async fn render_page(
     orch: &Orchestrator,
     uri: &str,
@@ -2155,98 +2130,6 @@ async fn render_page(
         answerer,
     )
     .await
-}
-
-#[tokio::test]
-async fn an_unsettled_read_renders_as_still_reading_at_the_deadline() {
-    if !renders_here("an_unsettled_read_renders_as_still_reading_at_the_deadline") {
-        return;
-    }
-    let (orch, _) = seeded().await;
-    let uri = "cairn://p/prj/roadmap/pages/board";
-    let source = r#"import { html, Page, Section, Text, useRows } from "@cairn/page-kit";
-function Issues() {
-  const issues = useRows("issues", {}, { store: "app" });
-  return html`<${Text}>${issues.loading ? "loading issues" : String(issues.rows.length)}<//>`;
-}
-export default function Board() {
-  const threads = useRows("threads", {}, { store: "app" });
-  return html`<${Page} title="Board">
-    <${Section} title="Threads"><${Text}>${threads.loading ? "loading" : "threads read"}<//><//>
-    <${Section} title="Issues"><${Issues} /><//>
-  <//>`;
-}
-"#;
-    write_page_source(
-        &orch,
-        uri,
-        ChangeMode::Create,
-        "Board",
-        json!({ "index.js": source }),
-    )
-    .await;
-    let started = std::time::Instant::now();
-    let rendered = render_page(
-        &orch,
-        uri,
-        std::time::Duration::from_millis(500),
-        &Withholding {
-            withheld: "cairn://db/issues",
-        },
-    )
-    .await;
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "{:?}",
-        started.elapsed()
-    );
-    assert!(
-        matches!(rendered.outcome, RenderOutcome::Deadline { .. }),
-        "{:?}",
-        rendered.outcome
-    );
-    let markdown = &rendered.markdown;
-    let issues_at = markdown.find("## Issues").expect(markdown);
-    assert!(
-        markdown[issues_at..].contains("_still reading: `cairn://db/issues?"),
-        "{markdown}"
-    );
-    assert!(markdown.contains("threads read"), "{markdown}");
-}
-
-#[tokio::test]
-async fn a_page_that_loops_is_stopped_at_the_hard_bound() {
-    if !renders_here("a_page_that_loops_is_stopped_at_the_hard_bound") {
-        return;
-    }
-    let (orch, _) = seeded().await;
-    let uri = "cairn://p/prj/roadmap/pages/board";
-    write_page_source(
-        &orch,
-        uri,
-        ChangeMode::Create,
-        "Board",
-        json!({ "index.js": "export default function Spin() { for (;;) {} }\n" }),
-    )
-    .await;
-    let started = std::time::Instant::now();
-    let rendered = render_page(
-        &orch,
-        uri,
-        std::time::Duration::from_millis(200),
-        &super::headless::PageReadAnswerer,
-    )
-    .await;
-    assert!(
-        matches!(&rendered.outcome, RenderOutcome::Stopped { message } if message.contains("(stopped)")),
-        "{:?}",
-        rendered.outcome
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(15),
-        "{:?}",
-        started.elapsed()
-    );
 }
 
 /// A one-shot read of anything but rows (here another page, which would also

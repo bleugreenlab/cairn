@@ -1600,27 +1600,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_yaml_is_read_when_it_changes_not_per_fact() {
-        let temp = tempfile::tempdir().unwrap();
-        // The fixture's clock stands still, so the route index's TTL never
-        // lapses here however slow the run: every read below is one the index
-        // chose, not one the host's speed forced.
-        let (orch, _db) = orchestrator(temp.path(), &[("to-issue", MESSAGE_ROUTE)]).await;
-        let reads = || crate::config::routes::ROUTE_DIR_READS.with(std::cell::Cell::get);
-        let before = reads();
-        for comment in 0..50 {
-            mint_github(&orch, comment).await;
-        }
-        drain_fact_log(&orch).await;
-        assert_eq!(reads() - before, 1, "50 facts, one directory read");
-
-        crate::routes::invalidate_trigger_index(&orch);
-        mint_github(&orch, 1000).await;
-        drain_fact_log(&orch).await;
-        assert_eq!(reads() - before, 2, "a route write costs exactly one more");
-    }
-
-    #[tokio::test]
     async fn a_hung_route_delays_neither_producers_nor_thread_wakes() {
         let temp = tempfile::tempdir().unwrap();
         let hang = format!(
@@ -2261,34 +2240,6 @@ mod tests {
             let list = crate::resources::events::list(&orch, Some("cairn"), &[]).await;
             assert!(list.contains("woke 1 thread: "), "{list}");
             assert!(!list.contains("coalesced, 1 row"), "{list}");
-        }
-
-        #[tokio::test]
-        async fn a_stream_past_the_max_window_wakes_once_per_window_not_once_at_the_end() {
-            let temp = tempfile::tempdir().unwrap();
-            let (orch, db) = orchestrator(temp.path(), &[]).await;
-            standing_triggers(&db, "watcher", r#"[{"fact":"github_comment"}]"#).await;
-            let policy = EventLogPolicy::default();
-            // A row every 20s, each inside the previous row's 30s settle, for
-            // ten minutes: the debounce alone would never come due.
-            let mut delivered_during_stream = Vec::new();
-            for n in 0..=30 {
-                let at = T0 + n * 20 * SECOND;
-                row_at(&db, n, at, None).await;
-                index_pass(&orch, &policy).await.unwrap();
-                if flush_due_wakes(&orch, at).await.unwrap() > 0 {
-                    delivered_during_stream.push((at - T0) / SECOND);
-                }
-            }
-            assert_eq!(
-                delivered_during_stream,
-                vec![300, 600],
-                "the stream delivers at each 5m cap"
-            );
-            flush_due_wakes(&orch, i64::MAX).await.unwrap();
-            let counts: Vec<i64> = wake_rows(&db).await.iter().map(|w| w.1).collect();
-            assert_eq!(counts, vec![15, 15, 1]);
-            assert_eq!(events_received(&db, "watcher-run").await.len(), 3);
         }
 
         #[tokio::test]

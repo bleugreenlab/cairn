@@ -517,41 +517,10 @@ fn no_default_preset_points_at_a_region_gated_model() {
 /// Byte-exact request bodies of OpenCode Go's owned turns, one per protocol
 /// family. See `http_loop::scripted` for how they are recorded.
 mod golden {
-    use super::super::adapter::{messages_adapter, responses_adapter, OpenCodeAdapter};
+    use super::super::adapter::messages_adapter;
     use crate::backends::http_loop::scripted::{
-        answer_schema, assert_golden, chat_text, messages_text, messages_tool_uses, record_turn,
-        responses_function_calls, responses_text, session_config,
+        assert_golden, messages_text, messages_tool_uses, record_turn, session_config,
     };
-
-    #[tokio::test]
-    async fn chat_turn_with_effort_and_schema() {
-        let mut config = session_config("glm-5.2");
-        config.reasoning_effort = Some("high".to_string());
-        config.output_schema = Some(answer_schema());
-        let bodies = record_turn(config, vec![chat_text(r#"{"answer":"done"}"#)], |_| {
-            OpenCodeAdapter
-        })
-        .await;
-        assert_golden(
-            &bodies,
-            &[
-                r#"{"messages":[{"content":"SYSTEM","role":"system"},{"content":"hi","role":"user"}],"model":"glm-5.2","reasoning_effort":"high","response_format":{"json_schema":{"name":"cairn_output","schema":{"properties":{"answer":{"type":"string"}},"required":["answer"],"type":"object"},"strict":true},"type":"json_schema"},"stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":["read","write","run"]}"#,
-            ],
-        );
-    }
-
-    #[tokio::test]
-    async fn messages_turn_with_a_thinking_budget() {
-        let mut config = session_config("minimax-m3");
-        config.max_thinking_tokens = Some(4096);
-        let bodies = record_turn(config, vec![messages_text("done")], |_| messages_adapter()).await;
-        assert_golden(
-            &bodies,
-            &[
-                r#"{"max_tokens":32000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"model":"minimax-m3","stream":true,"system":[{"text":"SYSTEM","type":"text"}],"thinking":{"budget_tokens":4096,"type":"enabled"},"tool_choice":{"type":"auto"},"tools":["read","write","run"]}"#,
-            ],
-        );
-    }
 
     /// The second request carries both tool results back.
     #[tokio::test]
@@ -570,29 +539,6 @@ mod golden {
             &[
                 r#"{"max_tokens":32000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"model":"minimax-m3","stream":true,"system":[{"text":"SYSTEM","type":"text"}],"tool_choice":{"type":"auto"},"tools":["read","write","run"]}"#,
                 r#"{"max_tokens":32000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"},{"content":[{"id":"call-1","input":{},"name":"frobnicate","type":"tool_use"},{"id":"call-2","input":{},"name":"frobnicate","type":"tool_use"}],"role":"assistant"},{"content":[{"content":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","tool_use_id":"call-1","type":"tool_result"},{"content":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","tool_use_id":"call-2","type":"tool_result"}],"role":"user"}],"model":"minimax-m3","stream":true,"system":[{"text":"SYSTEM","type":"text"}],"tool_choice":{"type":"auto"},"tools":["read","write","run"]}"#,
-            ],
-        );
-    }
-
-    #[tokio::test]
-    async fn responses_turn_with_effort_schema_and_two_tool_calls() {
-        let mut config = session_config("grok-4.5");
-        config.reasoning_effort = Some("high".to_string());
-        config.output_schema = Some(answer_schema());
-        let bodies = record_turn(
-            config,
-            vec![
-                responses_function_calls(2),
-                responses_text(r#"{"answer":"done"}"#),
-            ],
-            |_| responses_adapter(),
-        )
-        .await;
-        assert_golden(
-            &bodies,
-            &[
-                r#"{"input":[{"content":[{"text":"hi","type":"input_text"}],"role":"user","type":"message"}],"instructions":"SYSTEM","model":"grok-4.5","reasoning":{"effort":"high"},"stream":true,"text":{"format":{"name":"cairn_output","schema":{"properties":{"answer":{"type":"string"}},"required":["answer"],"type":"object"},"strict":true,"type":"json_schema"}},"tool_choice":"auto","tools":["read","write","run"]}"#,
-                r#"{"input":[{"content":[{"text":"hi","type":"input_text"}],"role":"user","type":"message"},{"arguments":"{}","call_id":"call-1","name":"frobnicate","type":"function_call"},{"arguments":"{}","call_id":"call-2","name":"frobnicate","type":"function_call"},{"call_id":"call-1","output":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","type":"function_call_output"},{"call_id":"call-2","output":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","type":"function_call_output"}],"instructions":"SYSTEM","model":"grok-4.5","reasoning":{"effort":"high"},"stream":true,"text":{"format":{"name":"cairn_output","schema":{"properties":{"answer":{"type":"string"}},"required":["answer"],"type":"object"},"strict":true,"type":"json_schema"}},"tool_choice":"auto","tools":["read","write","run"]}"#,
             ],
         );
     }

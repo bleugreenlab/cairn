@@ -33,15 +33,6 @@ pub(crate) fn amend_description(read: Result<String, String>) -> (String, Option
     }
 }
 
-#[cfg(test)]
-pub(crate) fn sealed_commit_is_lost(
-    jj: &JjEnv,
-    ws: &Path,
-    pre_dirty: bool,
-) -> Result<bool, String> {
-    sealed_commit_probe(jj, ws, pre_dirty).map(|(_, lost)| lost)
-}
-
 /// The change id of `@` (stable across the working copy's content amendments).
 pub fn snapshot_change_id(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     jj.run(

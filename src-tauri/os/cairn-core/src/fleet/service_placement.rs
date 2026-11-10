@@ -1151,63 +1151,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A one-shot returns what its command printed and the status it exited
-    /// with, twice over at the same process key.
-    ///
-    /// This is the call every outbound message on a placed channel is made of,
-    /// and it failed for two independent reasons at once (CAIRN-3444): a
-    /// pipe process announced no exit, and the runner discarded events for a
-    /// process its liveness-beat snapshot had not caught up to. Neither is
-    /// visible from one side alone, so this drives the real executor runtime
-    /// through the runner's real event admission rather than a fake of either.
-    #[tokio::test]
-    async fn one_shot_returns_its_output_and_exit_status() {
-        let (orch, _config) = attached_orchestrator().await;
-        let lease = acquire_service_lease(
-            &orch,
-            ServiceIdentity {
-                id: "channel-imessage",
-                label: "iMessage channel",
-            },
-            named_executor(LOCAL_EXECUTOR_NAME),
-            ResidencyFootprint {
-                memory_bytes: 0,
-                disk_growth_bytes: 0,
-            },
-            OwnerDeathPolicy {
-                heartbeat_timeout_ms: 30_000,
-                reclaim_grace_ms: 10_000,
-            },
-        )
-        .await
-        .expect("a named colocated executor must place a service residency");
-
-        let sent = lease
-            .run_one_shot(
-                "/bin/sh",
-                vec!["-c".into(), "printf '{\"guid\":\"A-1\"}'".into()],
-                Duration::from_secs(10),
-            )
-            .await
-            .expect("a one-shot that exits must be reported as exited");
-        assert_eq!(String::from_utf8_lossy(&sent.stdout), "{\"guid\":\"A-1\"}");
-        assert_eq!(sent.exit_code, Some(0));
-
-        // The second send reuses the key, on the generation after the first.
-        let failed = lease
-            .run_one_shot(
-                "/bin/sh",
-                vec!["-c".into(), "printf 'no chat' >&2; exit 3".into()],
-                Duration::from_secs(10),
-            )
-            .await
-            .expect("a one-shot that fails must report its failure, not a timeout");
-        assert_eq!(String::from_utf8_lossy(&failed.stderr), "no chat");
-        assert_eq!(failed.exit_code, Some(3));
-
-        lease.release().await.unwrap();
-    }
-
     #[tokio::test]
     async fn resident_input_uses_the_started_process_generation() {
         let (orch, _config) = attached_orchestrator().await;

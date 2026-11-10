@@ -109,21 +109,6 @@ async fn new_artifact_has_null_seen_at() {
 }
 
 #[tokio::test]
-async fn mark_seen_sets_timestamp() {
-    let (_temp, db, _job_id) = artifact_fixture().await;
-
-    let before = queries::get(&db, "art-1").await.unwrap();
-    assert!(before.seen_at.is_none());
-
-    queries::mark_seen(&db, "art-1").await.unwrap();
-
-    let after = queries::get(&db, "art-1").await.unwrap();
-    let ts = after.seen_at.expect("seen_at should be set");
-    let now = chrono::Utc::now().timestamp();
-    assert!((now - ts).abs() < 10);
-}
-
-#[tokio::test]
 async fn mark_seen_at_sets_exact_timestamp() {
     let (_temp, db, _job_id) = artifact_fixture().await;
 
@@ -188,4 +173,19 @@ async fn list_for_issue_returns_latest_artifact_per_issue_job() {
     let artifacts = queries::list_for_issue(&db, "issue-1").await.unwrap();
     assert_eq!(artifacts.len(), 1);
     assert_eq!(artifacts[0].id, "art-2");
+}
+
+#[tokio::test]
+async fn mark_seen_sets_timestamp() {
+    let (_temp, db, _job_id) = artifact_fixture().await;
+
+    let before = queries::get(&db, "art-1").await.unwrap();
+    assert!(before.seen_at.is_none());
+
+    queries::mark_seen(&db, "art-1").await.unwrap();
+
+    let after = queries::get(&db, "art-1").await.unwrap();
+    let ts = after.seen_at.expect("seen_at should be set");
+    let now = chrono::Utc::now().timestamp();
+    assert!((now - ts).abs() < 10);
 }

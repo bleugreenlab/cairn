@@ -1274,6 +1274,63 @@ pub(crate) mod tests {
         assert_eq!(embedder.active(Corpus::Resources), None);
     }
 
+    #[test]
+    fn an_unset_selection_names_the_gateway_offer() {
+        assert_eq!(
+            super::default_embedding_selection(),
+            "cairn/cohere-embed-v4"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_selection_is_the_setting_and_choosing_one_is_consent() {
+        use crate::models::UpdateSettings;
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        assert_eq!(
+            orch.embedding_selection(),
+            super::EmbedSelection {
+                value: "cairn/cohere-embed-v4".into(),
+                explicit: false,
+            }
+        );
+        assert!(!orch.history_consented(), "no account, no choice");
+
+        orch.store_settings_unchecked_for_test(UpdateSettings {
+            embedding_model: Some(Some(" ollama/nomic-embed-text ".into())),
+            ..Default::default()
+        });
+        assert_eq!(
+            orch.embedding_selection(),
+            super::EmbedSelection {
+                value: "ollama/nomic-embed-text".into(),
+                explicit: true,
+            }
+        );
+        assert!(orch.history_consented());
+
+        orch.update_settings(UpdateSettings {
+            embedding_model: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!orch.embedding_selection().explicit);
+        assert!(!orch.history_consented());
+    }
+
+    #[test]
+    fn the_gateway_offers_cohere_v4_at_its_fixed_width() {
+        let provider = super::cairn_gateway_provider();
+        assert_eq!(provider.descriptor.key, CAIRN_GATEWAY_KEY);
+        let served = provider.serves_for("cohere-embed-v4");
+        assert_eq!(
+            served,
+            vec![ServedVerb {
+                verb: Verb::Embed(EmbeddingCapabilities::cairn_gateway()),
+                wire: Wire::CairnEmbed,
+            }]
+        );
+    }
+
     /// The 10-22 outage's lesson, pinned: an install whose vectors were all
     /// made by the gateway upgrades without re-embedding anything. The space
     /// is taken from the real path (the gateway's catalog offer, resolved for
@@ -1381,62 +1438,5 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(counts().await, (2, 1, 1), "nothing re-embeds");
-    }
-
-    #[test]
-    fn an_unset_selection_names_the_gateway_offer() {
-        assert_eq!(
-            super::default_embedding_selection(),
-            "cairn/cohere-embed-v4"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_selection_is_the_setting_and_choosing_one_is_consent() {
-        use crate::models::UpdateSettings;
-        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
-        assert_eq!(
-            orch.embedding_selection(),
-            super::EmbedSelection {
-                value: "cairn/cohere-embed-v4".into(),
-                explicit: false,
-            }
-        );
-        assert!(!orch.history_consented(), "no account, no choice");
-
-        orch.store_settings_unchecked_for_test(UpdateSettings {
-            embedding_model: Some(Some(" ollama/nomic-embed-text ".into())),
-            ..Default::default()
-        });
-        assert_eq!(
-            orch.embedding_selection(),
-            super::EmbedSelection {
-                value: "ollama/nomic-embed-text".into(),
-                explicit: true,
-            }
-        );
-        assert!(orch.history_consented());
-
-        orch.update_settings(UpdateSettings {
-            embedding_model: Some(None),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(!orch.embedding_selection().explicit);
-        assert!(!orch.history_consented());
-    }
-
-    #[test]
-    fn the_gateway_offers_cohere_v4_at_its_fixed_width() {
-        let provider = super::cairn_gateway_provider();
-        assert_eq!(provider.descriptor.key, CAIRN_GATEWAY_KEY);
-        let served = provider.serves_for("cohere-embed-v4");
-        assert_eq!(
-            served,
-            vec![ServedVerb {
-                verb: Verb::Embed(EmbeddingCapabilities::cairn_gateway()),
-                wire: Wire::CairnEmbed,
-            }]
-        );
     }
 }

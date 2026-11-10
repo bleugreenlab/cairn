@@ -99,8 +99,4 @@ pub(crate) use packed_refs::{
 
 // Referenced only by the jj test suite (unused in non-test builds).
 #[cfg(test)]
-pub(crate) use reconcile::restore_bookmark;
-#[cfg(test)]
-pub(crate) use seal::sealed_commit_is_lost;
-#[cfg(test)]
 pub(crate) use worktree::{parse_grep_z, parse_ls_tree};

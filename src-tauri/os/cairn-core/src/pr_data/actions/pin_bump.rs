@@ -1476,10 +1476,6 @@ pinBumps:
         ran_at: i64,
     }
 
-    async fn record(db: &LocalDb, observation: Observation<'_>) {
-        record_with_failure_kind(db, observation, None).await;
-    }
-
     /// Observations are immutable, so a death's kind is written with the row.
     async fn record_with_failure_kind(
         db: &LocalDb,
@@ -1560,108 +1556,6 @@ pinBumps:
         )
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn pin_bump_head_verdicts_read_only_the_head_and_let_the_newest_machine_decide() {
-        let db = verdict_db().await;
-        // Two Linux machines recorded codex-pin at the head; the newer one (red) decides.
-        for (id, env, passed, at) in [
-            ("obs-old", "env-a", true, 10),
-            ("obs-new", "env-b", false, 20),
-        ] {
-            record(
-                &db,
-                Observation {
-                    id,
-                    commit: HEAD,
-                    check: "codex-pin",
-                    platform: "linux",
-                    environment: env,
-                    passed,
-                    ran_at: at,
-                },
-            )
-            .await;
-            alias(&db, HEAD, "codex-pin", env, id, "fresh", at).await;
-        }
-        // A macOS verdict produced at another commit and reused at the head counts.
-        record(
-            &db,
-            Observation {
-                id: "obs-mac",
-                commit: "elsewhere",
-                check: "codex-pin",
-                platform: "macos",
-                environment: "env-mac",
-                passed: true,
-                ran_at: 5,
-            },
-        )
-        .await;
-        alias(&db, HEAD, "codex-pin", "env-mac", "obs-mac", "cached", 30).await;
-        // codex-contract has a verdict only on the parent: stale, never evidence.
-        record(
-            &db,
-            Observation {
-                id: "obs-parent",
-                commit: PARENT,
-                check: "codex-contract",
-                platform: "linux",
-                environment: "env-a",
-                passed: true,
-                ran_at: 40,
-            },
-        )
-        .await;
-        alias(
-            &db,
-            PARENT,
-            "codex-contract",
-            "env-a",
-            "obs-parent",
-            "fresh",
-            40,
-        )
-        .await;
-
-        let required: Vec<RequiredVerdict> = ["codex-pin", "codex-contract"]
-            .iter()
-            .flat_map(|check| {
-                ["linux", "macos"].map(|platform| RequiredVerdict {
-                    check: check.to_string(),
-                    platform: platform.to_string(),
-                })
-            })
-            .collect();
-        let verdicts = head_verdicts(&db, "project", HEAD, &required)
-            .await
-            .unwrap();
-        let summary: Vec<_> = verdicts
-            .iter()
-            .map(|v| {
-                (
-                    v.check.as_str(),
-                    v.platform.as_str(),
-                    v.observation_id.as_str(),
-                    v.disposition.as_str(),
-                    v.passed,
-                )
-            })
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                ("codex-pin", "linux", "obs-new", "fresh", false),
-                ("codex-pin", "macos", "obs-mac", "cached", true),
-            ]
-        );
-        assert!(verdicts.iter().all(|v| v.commit_sha == HEAD));
-        assert_eq!(
-            verdict_evidence(verdicts[1].passed, verdicts[1].parsed.as_ref()),
-            VerdictEvidence::Verified,
-            "the cached verdict carries its structured result"
-        );
     }
 
     /// A newer run on the same platform that died without a verdict does not

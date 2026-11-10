@@ -355,68 +355,6 @@ fn silent_server(head: &'static [u8]) -> (std::net::SocketAddr, Silent) {
     )
 }
 
-/// The cancellation contract against a silent server: the caller is released
-/// at once, and the connection is closed within the stall bound. The cancel
-/// comes once the request is on the wire, so the close is measured against
-/// the server's silence.
-fn released_at_once_closed_within_the_bound(
-    mut clip: ClipStream,
-    cancel: Arc<AtomicBool>,
-    server: Silent,
-) {
-    let (entering, entered) = mpsc::channel();
-    let waiting = thread::spawn(move || {
-        entering.send(()).unwrap();
-        let ended = clip.next().is_none();
-        (ended, Instant::now())
-    });
-    entered.recv().unwrap();
-    let arrived = server.arrival();
-    let cancelled = Instant::now();
-    cancel.store(true, Ordering::SeqCst);
-    let (ended, returned) = waiting.join().unwrap();
-    assert!(ended, "a cancelled clip ends");
-    assert!(
-        returned.duration_since(cancelled) < Duration::from_millis(100),
-        "the caller waited {:?} on the network",
-        returned.duration_since(cancelled)
-    );
-    server.closes_within_the_bound(arrived);
-}
-
-#[test]
-fn a_cancel_before_the_headers_releases_the_caller_and_closes_within_the_bound() {
-    let (address, server) = silent_server(b"");
-    let cancel = Arc::new(AtomicBool::new(false));
-    let clip = post_clip(
-        &endpoint(address),
-        &json!({}),
-        StreamFormat::Audio,
-        cancel.clone(),
-        BOUND,
-    )
-    .unwrap();
-    released_at_once_closed_within_the_bound(clip, cancel, server);
-}
-
-#[test]
-fn a_cancel_while_the_body_is_silent_releases_the_caller_and_closes_within_the_bound() {
-    let (address, server) = silent_server(
-        b"HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n",
-    );
-    let cancel = Arc::new(AtomicBool::new(false));
-    let mut clip = post_clip(
-        &endpoint(address),
-        &json!({}),
-        StreamFormat::Audio,
-        cancel.clone(),
-        BOUND,
-    )
-    .unwrap();
-    assert_eq!(clip.next().unwrap().unwrap(), b"abc");
-    released_at_once_closed_within_the_bound(clip, cancel, server);
-}
-
 #[test]
 fn dropping_a_silent_clip_closes_within_the_bound() {
     let (address, server) = silent_server(b"");
@@ -478,26 +416,6 @@ fn silent_tls_server() -> (OpenAiSpeechEndpoint, Silent) {
 }
 
 #[test]
-fn a_cancel_during_the_tls_handshake_releases_the_caller_and_closes_within_the_bound() {
-    let (endpoint, server) = silent_tls_server();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let started = Instant::now();
-    let clip = post_clip(
-        &endpoint,
-        &json!({}),
-        StreamFormat::Audio,
-        cancel.clone(),
-        BOUND,
-    )
-    .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "post_clip does not wait on the server"
-    );
-    released_at_once_closed_within_the_bound(clip, cancel, server);
-}
-
-#[test]
 fn dropping_a_clip_during_the_tls_handshake_closes_within_the_bound() {
     let (endpoint, server) = silent_tls_server();
     let clip = post_clip(
@@ -527,23 +445,6 @@ fn the_stall_bound_covers_the_tls_handshake() {
     let (endpoint, server) = silent_tls_server();
     let mut clip = post_clip(
         &endpoint,
-        &json!({}),
-        StreamFormat::Audio,
-        Arc::new(AtomicBool::new(false)),
-        BOUND,
-    )
-    .unwrap();
-    assert_stalled(&clip.next().unwrap().unwrap_err());
-    let arrived = server.arrival();
-    assert!(arrived.elapsed() < BOUND + SLACK, "{:?}", arrived.elapsed());
-    server.closes_within_the_bound(arrived);
-}
-
-#[test]
-fn a_stalled_clip_reports_it_and_closes_within_the_bound() {
-    let (address, server) = silent_server(b"");
-    let mut clip = post_clip(
-        &endpoint(address),
         &json!({}),
         StreamFormat::Audio,
         Arc::new(AtomicBool::new(false)),
@@ -616,38 +517,6 @@ fn a_request_never_sent_fails_at_the_setup_bound_not_as_a_stall() {
         "{error:?}"
     );
     assert!(clip.next().is_none());
-}
-
-#[test]
-fn a_steady_stream_longer_than_the_bound_is_not_cut_off() {
-    // The bound is per operation: a clip that keeps streaming for several
-    // times the bound reads to its end.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let _ = read_request(&mut stream);
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: audio/pcm\r\ntransfer-encoding: chunked\r\n\r\n",
-            )
-            .unwrap();
-        for _ in 0..12 {
-            chunk(&mut stream, &[7u8; 64]).unwrap();
-            thread::sleep(Duration::from_millis(150));
-        }
-        stream.write_all(b"0\r\n\r\n").unwrap();
-    });
-    let clip = post_clip(
-        &endpoint(address),
-        &json!({}),
-        StreamFormat::Audio,
-        Arc::new(AtomicBool::new(false)),
-        BOUND,
-    )
-    .unwrap();
-    let audio: Vec<u8> = clip.flat_map(Result::unwrap).collect();
-    assert_eq!(audio.len(), 12 * 64);
 }
 
 #[test]

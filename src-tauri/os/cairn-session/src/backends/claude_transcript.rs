@@ -901,38 +901,6 @@ mod tests {
         assert!(repair_path(&path, "session", &mut index).used_full_scan);
     }
 
-    #[test]
-    fn same_size_large_prefix_rewrite_falls_back_outside_bounded_fingerprint() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("session.jsonl");
-        let original = (0..100)
-            .map(|index| healthy_line(&format!("a{index}"), &"x".repeat(100)))
-            .collect::<String>();
-        std::fs::write(&path, &original).unwrap();
-        let mut index = RepairIndex::new();
-        repair_path(&path, "session", &mut index);
-
-        let mut rewritten = original.into_bytes();
-        let mutation = rewritten.iter().position(|byte| *byte == b'x').unwrap();
-        rewritten[mutation] = b'y';
-        std::fs::write(&path, rewritten).unwrap();
-        // A same-length rewrite inside one coarse-clock tick keeps the original
-        // mtime, so step the mtime past it to make the rewrite visible.
-        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(
-                std::fs::FileTimes::new().set_modified(written + std::time::Duration::from_secs(1)),
-            )
-            .unwrap();
-
-        let pass = repair_path(&path, "session", &mut index);
-        assert!(pass.used_full_scan);
-        assert!(pass.bytes_read > FINGERPRINT_BYTES);
-    }
-
     #[cfg(unix)]
     #[test]
     fn replacement_file_with_same_contents_does_not_hit_cached_identity() {

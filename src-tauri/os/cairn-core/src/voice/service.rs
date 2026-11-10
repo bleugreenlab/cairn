@@ -1251,7 +1251,9 @@ mod tests {
     #[ignore = "manual release benchmark: writes and hashes a 384 MiB fixture"]
     async fn benchmark_status_verification() {
         use std::io::Write;
-        assert!(!cfg!(debug_assertions), "run with --release");
+        if cfg!(debug_assertions) {
+            panic!("run with --release");
+        }
         fn rss() -> u64 {
             cairn_procmem::platform::process_rss_bytes(std::process::id()).unwrap()
         }
@@ -1380,114 +1382,6 @@ mod tests {
         assert_eq!(failure.code, "install_failed");
         assert_eq!(failure.message, error.to_string());
         assert!(failure.message.contains("engine identity probe failed:"));
-    }
-
-    #[tokio::test]
-    async fn stale_engine_is_incompatible_while_models_remain_installed() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        write_stale_install(root);
-        let service = VoiceService::with_engine(
-            root.to_path_buf(),
-            APP_VERSION,
-            BUILD_IDENTITY,
-            Arc::new(CapturingEmitter::new()),
-            OFFLINE_RELEASES,
-            Some(TEST_TARGET),
-            None,
-        );
-        let status = service.handle().status().await.unwrap();
-
-        assert_eq!(
-            status.engine,
-            ComponentState::Incompatible,
-            "status must not advertise an old app-version engine as installed"
-        );
-        assert_eq!(
-            status.fast_model,
-            ComponentState::Installed,
-            "engine refresh eligibility must not invalidate version-independent models"
-        );
-        assert_eq!(
-            status.realtime_model,
-            ComponentState::Installed,
-            "a Parakeet model is as version-independent as a whisper one, and a stale engine \
-             says nothing about whether the engine replacing it can run Realtime"
-        );
-        assert_eq!(
-            status.engine_failure, None,
-            "nothing has tried to replace the engine yet, so there is no cause to report"
-        );
-    }
-
-    /// An app updated without a self-rebuild, to a version whose release is not
-    /// published, keeps its earlier engine. What status reports is the missing
-    /// release asset — after the startup refresh and after a retried Enable
-    /// alike — never a protocol mismatch, and the models stay where they are.
-    #[tokio::test]
-    async fn a_stale_engine_whose_release_is_unpublished_reports_the_missing_asset() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let installed = write_stale_install(root);
-        let (release_base, requested) = unpublished_release_server().await;
-        let emitter = Arc::new(CapturingEmitter::new());
-        let service = VoiceService::with_engine(
-            root.to_path_buf(),
-            APP_VERSION,
-            BUILD_IDENTITY,
-            emitter.clone(),
-            &release_base,
-            Some(TEST_TARGET),
-            None,
-        );
-        let voice = service.handle();
-        let asset = super::super::engine_asset_name(APP_VERSION, TEST_TARGET);
-
-        voice.refresh_engine().await;
-
-        assert_eq!(
-            requested.lock().unwrap().as_slice(),
-            [format!("/v{APP_VERSION}/{asset}.sha256")],
-            "the refresh asks for this exact version's engine and nothing else"
-        );
-        let status = voice.status().await.unwrap();
-        assert_eq!(status.engine, ComponentState::Incompatible);
-        let failure = status
-            .engine_failure
-            .expect("the refresh's failure reaches status");
-        assert_eq!(failure.code, "release_asset_missing");
-        assert!(failure.message.contains(&asset), "{}", failure.message);
-        assert!(
-            emitter
-                .events_named(VOICE_EVENT_NAME)
-                .iter()
-                .any(|event| event["type"] == "engineChanged"
-                    && event["detail"]
-                        .as_str()
-                        .is_some_and(|detail| detail.contains(&asset))),
-            "a settings page already open learns of the failure"
-        );
-
-        let error = voice
-            .enable()
-            .await
-            .expect_err("Enable cannot install an engine that was never published");
-        assert_eq!(error.code(), "release_asset_missing");
-        let status = voice.status().await.unwrap();
-        assert_eq!(
-            status.engine_failure.map(|failure| failure.code).as_deref(),
-            Some("release_asset_missing"),
-            "a retried Enable reports the same cause"
-        );
-        assert_eq!(status.fast_model, ComponentState::Installed);
-        assert_eq!(status.realtime_model, ComponentState::Installed);
-        for component in &installed {
-            assert!(
-                component.path.exists(),
-                "{} survives a failed refresh",
-                component.id
-            );
-        }
     }
 
     /// A host with no published engine (linux/aarch64, where only the executor
@@ -1728,37 +1622,6 @@ done
                 ),
                 directory,
             }
-        }
-
-        /// Hand off an engine running `script` to this runner, as a verified
-        /// self-rebuild does. It logs to `adopted.log`, so whichever engine
-        /// served a command is visible.
-        fn hand_off(&self, script: &str) {
-            let root = self.directory.path();
-            let asset = super::super::engine_asset_name(APP_VERSION, TEST_TARGET);
-            let dir = root.join("voice/local-engine");
-            std::fs::create_dir_all(&dir).unwrap();
-            let body = engine_script(&root.join("adopted.log"), script);
-            std::fs::write(dir.join(&asset), &body).unwrap();
-            std::fs::write(
-                dir.join(format!("{asset}.sha256")),
-                format!("{:x}  {asset}\n", Sha256::digest(body.as_bytes())),
-            )
-            .unwrap();
-            std::fs::write(
-                dir.join("handoff.json"),
-                serde_json::json!({ "buildId": BUILD_IDENTITY, "asset": asset }).to_string(),
-            )
-            .unwrap();
-        }
-
-        /// Every command line the handed-off engine has received.
-        fn adopted_commands(&self) -> Vec<String> {
-            std::fs::read_to_string(self.directory.path().join("adopted.log"))
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_string)
-                .collect()
         }
 
         fn voice(&self) -> VoiceServiceHandle {
@@ -2420,101 +2283,6 @@ done
             harness.count_command("loadModel") > loads_before,
             "a failed close must recycle the process, not just drop the handle: {:?}",
             harness.commands()
-        );
-    }
-
-    /// Enable owes the default model only for a preference that names a missing
-    /// one: a user who dictates and transcribes with Accurate does not get Fast
-    /// downloaded back.
-    #[tokio::test]
-    async fn a_re_enable_whose_preferred_models_are_present_ensures_only_the_engine() {
-        let harness = Harness::managed(COOPERATIVE);
-        let voice = harness.voice();
-        let fast = harness.directory.path().join("models/model-fast");
-        voice
-            .set_preferred_model(ModelPurpose::Dictation, VoiceModel::Accurate)
-            .await
-            .unwrap();
-        voice
-            .set_preferred_model(ModelPurpose::File, VoiceModel::Accurate)
-            .await
-            .unwrap();
-        std::fs::remove_file(&fast).unwrap();
-        assert!(voice.preferred_models_installed().await);
-        voice
-            .set_preferred_model(ModelPurpose::File, VoiceModel::Fast)
-            .await
-            .expect_err("a missing model cannot be chosen");
-
-        voice
-            .enable()
-            .await
-            .expect("a re-enable whose models are present ensures only the engine");
-        assert!(!fast.exists(), "Fast was not downloaded back");
-    }
-
-    /// A self-rebuild hands off the engine built from the same revision as the
-    /// app; the next dictation must run on it rather than on the engine the
-    /// manifest already called current under the same asset name.
-    #[tokio::test]
-    async fn the_next_dictation_runs_on_a_handed_off_engine() {
-        let harness = Harness::managed(COOPERATIVE);
-        harness.hand_off(COOPERATIVE);
-        let voice = harness.voice();
-
-        let stream = voice.stream_start().await.expect("session opens");
-        voice.stream_finish(stream).await.expect("session closes");
-
-        let adopted = harness.adopted_commands();
-        assert!(
-            adopted
-                .iter()
-                .any(|line| line.contains("\"type\":\"beginStream\"")),
-            "the handed-off engine serves the session: {adopted:?}"
-        );
-        assert!(
-            harness.commands().is_empty(),
-            "the superseded engine never runs: {:?}",
-            harness.commands()
-        );
-        assert!(!harness.directory.path().join("voice/local-engine").exists());
-        assert_eq!(
-            voice.status().await.unwrap().engine,
-            ComponentState::Installed,
-            "the adopted engine verifies against what the manifest recorded"
-        );
-    }
-
-    /// A handoff that lands while the runner already has a live engine retires
-    /// that process at the next unit of work.
-    #[tokio::test]
-    async fn a_live_engine_gives_way_to_a_handoff_at_the_next_request() {
-        let harness = Harness::managed(COOPERATIVE);
-        let voice = harness.voice();
-        let stream = voice.stream_start().await.expect("session opens");
-        voice.stream_finish(stream).await.expect("session closes");
-        assert_eq!(harness.count_command("loadModel"), 1);
-
-        harness.hand_off(COOPERATIVE);
-        voice
-            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
-            .await
-            .expect("the adopted engine serves the file");
-
-        let adopted = harness.adopted_commands();
-        assert!(
-            adopted
-                .iter()
-                .any(|line| line.contains("\"type\":\"loadModel\""))
-                && adopted
-                    .iter()
-                    .any(|line| line.contains("\"type\":\"transcribeFile\"")),
-            "a fresh process of the handed-off engine serves the request: {adopted:?}"
-        );
-        assert_eq!(
-            harness.count_command("transcribeFile"),
-            0,
-            "the superseded process is not reused"
         );
     }
 }

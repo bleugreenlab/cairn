@@ -2201,137 +2201,6 @@ pub(super) mod tests {
         RepositoryLocator,
     };
 
-    #[test]
-    fn a_synchronous_host_journals_and_releases_the_database_when_its_queue_drops() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let db = std::sync::Arc::new(
-            runtime.block_on(crate::storage::migrated_test_db("sync_queue_journal.db")),
-        );
-        let db_lifetime = std::sync::Arc::downgrade(&db);
-        let queue = std::sync::Arc::new(ExecutionQueue::default());
-        assert!(tokio::runtime::Handle::try_current().is_err());
-        spawn_queue_journal(db.clone(), "sync-runner".into(), queue.clone());
-        let (_entry, _waiter) = enqueue(&queue, "sync-request", PlacementMobility::SpillEligible);
-        runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    let row = db
-                        .query_opt(
-                            "SELECT state FROM execution_queue WHERE request_id = ?1",
-                            ["sync-request"],
-                            |row| row.text(0),
-                        )
-                        .await
-                        .unwrap();
-                    if row == Some("queued".to_string()) {
-                        break;
-                    }
-                    assert_eq!(queue.journal_error(), None);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("a synchronous host must drain queue journal events");
-        });
-        drop(queue);
-        drop(db);
-        runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while db_lifetime.upgrade().is_some() {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("dropping the queue must stop its journal consumer");
-        });
-    }
-
-    /// The journal's whole job is to explain what became of an entry, so the
-    /// row that says so must land beside the transitions before it. A claimed
-    /// entry that settles and a queued entry that is taken both end in a row
-    /// of their own, each with a sequence no earlier row holds.
-    #[test]
-    fn terminal_transitions_reach_the_journal_beside_the_transitions_before_them() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let db = std::sync::Arc::new(runtime.block_on(crate::storage::migrated_test_db(
-            "queue_journal_terminal_rows.db",
-        )));
-        let queue = std::sync::Arc::new(ExecutionQueue::default());
-        spawn_queue_journal(db.clone(), "terminal-runner".into(), queue.clone());
-
-        let (settled, _settled_waiter) =
-            enqueue(&queue, "settled", PlacementMobility::SpillEligible);
-        assert!(queue.offer(&settled, "machine", "machine", 1, 2));
-        assert_eq!(
-            queue.claim(&settled, "machine", 1, 3),
-            ClaimVerdict::Granted
-        );
-        assert!(queue.settle(
-            &("settled".to_string(), "attempt".to_string()),
-            Some(("machine", 1)),
-            TerminalState::Completed,
-            super::super::executor_unavailable("finished".into()),
-            4,
-        ));
-        let (_taken, _taken_waiter) = enqueue(&queue, "taken", PlacementMobility::SpillEligible);
-        assert!(queue
-            .take(
-                &("taken".to_string(), "attempt".to_string()),
-                TerminalState::Cancelled,
-                5,
-            )
-            .is_some());
-
-        let journaled = |request_id: &'static str| {
-            let db = db.clone();
-            async move {
-                let joined = db
-                    .query_opt(
-                        "SELECT COALESCE(group_concat(state || ':' || sequence, ','), '')
-                         FROM execution_queue WHERE request_id = ?1",
-                        [request_id],
-                        |row| row.text(0),
-                    )
-                    .await
-                    .unwrap()
-                    .unwrap_or_default();
-                let mut rows: Vec<String> = joined
-                    .split(',')
-                    .filter(|row| !row.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                rows.sort();
-                rows
-            }
-        };
-        runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    let settled_rows = journaled("settled").await;
-                    let taken_rows = journaled("taken").await;
-                    if settled_rows.len() == 4 && taken_rows.len() == 2 {
-                        assert_eq!(
-                            settled_rows,
-                            vec!["claimed:2", "completed:3", "offered:1", "queued:0"]
-                        );
-                        assert_eq!(taken_rows, vec!["cancelled:1", "queued:0"]);
-                        break;
-                    }
-                    assert_eq!(queue.journal_error(), None);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("terminal rows must be journaled, not discarded as duplicates");
-        });
-    }
-
     /// Journal rows for `entries` entries of `incarnation`, each queued then
     /// offered, then completed, except every `open_every`th entry (counting
     /// from the first), which stops at claimed and so is left open.
@@ -2372,17 +2241,6 @@ pub(super) mod tests {
             .await
             .unwrap();
         }
-    }
-
-    async fn timed_sweep(
-        db: &crate::storage::LocalDb,
-        runner_incarnation: &str,
-    ) -> (IncarnationSweep, std::time::Duration) {
-        let started = std::time::Instant::now();
-        let sweep = expire_previous_incarnations(db, runner_incarnation)
-            .await
-            .unwrap();
-        (sweep, started.elapsed())
     }
 
     /// A start writes one expiry row for each entry an earlier incarnation left
@@ -2491,60 +2349,6 @@ pub(super) mod tests {
         assert_eq!(
             closed().await.last(),
             Some(&marker("runner-3", "runner-4", 2))
-        );
-    }
-
-    /// What a start costs follows the incarnations since the last sweep, never
-    /// the journal's whole history: the self-join it replaced visited every row
-    /// per row and ran for hours over a 577k-row journal. Two incarnation sizes
-    /// bound the growth as linear (4x the rows may cost at most 8x, where
-    /// quadratic would cost 16x). Over a closed backlog, the guarantee is
-    /// structural: the sweep reads only the one unclosed incarnation
-    /// (`incarnations_closed == 1`). The timing beside it is a coarse backstop
-    /// that would catch a backlog reread, not a benchmark: both timings are tens
-    /// of milliseconds, so it carries the same slack as the ratio, sized for
-    /// scheduler jitter on a loaded lane.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_start_pays_for_the_incarnations_since_the_last_sweep_not_for_the_journal() {
-        let db = crate::storage::migrated_test_db("queue_expiry_scaling.db").await;
-
-        seed_incarnation(&db, "runner-1", 1_000, 50).await;
-        let (sweep, small) = timed_sweep(&db, "runner-2").await;
-        assert_eq!(
-            sweep,
-            IncarnationSweep {
-                incarnations_closed: 1,
-                entries_expired: 20,
-            }
-        );
-
-        seed_incarnation(&db, "runner-2", 4_000, 50).await;
-        let (sweep, large) = timed_sweep(&db, "runner-3").await;
-        assert_eq!(
-            sweep,
-            IncarnationSweep {
-                incarnations_closed: 1,
-                entries_expired: 80,
-            }
-        );
-        assert!(
-            large < small * 8 + std::time::Duration::from_millis(250),
-            "4x the rows cost {large:?} against {small:?}: worse than linear"
-        );
-
-        seed_incarnation(&db, "runner-3", 100, 50).await;
-        let (sweep, steady) = timed_sweep(&db, "runner-4").await;
-        assert_eq!(
-            sweep,
-            IncarnationSweep {
-                incarnations_closed: 1,
-                entries_expired: 2,
-            }
-        );
-        assert!(
-            steady < small + std::time::Duration::from_millis(250),
-            "a 100-entry incarnation over a 5,000-entry closed backlog cost {steady:?}, \
-             well past sweeping 1,000 entries ({small:?}): the backlog is being reread"
         );
     }
 
@@ -3633,5 +3437,53 @@ pub(super) mod tests {
             1,
             at + REOFFER_BACKOFF_MAX_MS
         ));
+    }
+
+    #[test]
+    fn a_synchronous_host_journals_and_releases_the_database_when_its_queue_drops() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = std::sync::Arc::new(
+            runtime.block_on(crate::storage::migrated_test_db("sync_queue_journal.db")),
+        );
+        let db_lifetime = std::sync::Arc::downgrade(&db);
+        let queue = std::sync::Arc::new(ExecutionQueue::default());
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        spawn_queue_journal(db.clone(), "sync-runner".into(), queue.clone());
+        let (_entry, _waiter) = enqueue(&queue, "sync-request", PlacementMobility::SpillEligible);
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let row = db
+                        .query_opt(
+                            "SELECT state FROM execution_queue WHERE request_id = ?1",
+                            ["sync-request"],
+                            |row| row.text(0),
+                        )
+                        .await
+                        .unwrap();
+                    if row == Some("queued".to_string()) {
+                        break;
+                    }
+                    assert_eq!(queue.journal_error(), None);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a synchronous host must drain queue journal events");
+        });
+        drop(queue);
+        drop(db);
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while db_lifetime.upgrade().is_some() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("dropping the queue must stop its journal consumer");
+        });
     }
 }

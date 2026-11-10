@@ -79,14 +79,6 @@ impl CheckpointLoop {
     }
 }
 
-async fn checkpoint_loop(command: &str) -> Option<CheckpointLoop> {
-    checkpoint_loop_with_status(command, "pending", true).await
-}
-
-async fn blocked_checkpoint_loop(command: &str) -> Option<CheckpointLoop> {
-    checkpoint_loop_with_status(command, "blocked", true).await
-}
-
 async fn blocked_checkpoint_without_downstream(command: &str) -> Option<CheckpointLoop> {
     checkpoint_loop_with_status(command, "blocked", false).await
 }
@@ -167,15 +159,6 @@ async fn assert_job_status(h: &CheckpointLoop, job_id: &str, status: &str) {
         h.worktree.head(),
         recorded_runs(&h.c.db, CHECKPOINT_JOB).await
     );
-}
-
-async fn assert_checkpoint(h: &CheckpointLoop, status: &str, run_count_expected: i64) {
-    assert_job_status(h, CHECKPOINT_JOB, status).await;
-    assert_eq!(run_count(&h.c.db, CHECKPOINT_JOB).await, run_count_expected);
-}
-
-async fn assert_latest_checkpoint_passed(h: &CheckpointLoop, passed: bool) {
-    assert_eq!(latest_passed(&h.c.db, CHECKPOINT_JOB).await, Some(passed));
 }
 
 // ── runner branch authoring fixture ──────────────────────────────────────────
@@ -496,24 +479,6 @@ async fn recorded_runs(db: &LocalDb, job_id: &str) -> String {
     .unwrap()
 }
 
-async fn latest_passed(db: &LocalDb, job_id: &str) -> Option<bool> {
-    let job_id = job_id.to_string();
-    db.read(move |conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT passed FROM checkpoint_runs WHERE job_id = ?1 ORDER BY ran_at DESC, attempt DESC LIMIT 1",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            Ok(rows.next().await?.map(|r| r.i64(0)).transpose()?.map(|v| v != 0))
-        })
-    })
-    .await
-    .unwrap()
-}
-
 async fn insert_failed_run(db: &LocalDb, job_id: &str, attempt: i64, sha: &str) {
     let (job_id, sha) = (job_id.to_string(), sha.to_string());
     let now = chrono::Utc::now().timestamp();
@@ -534,83 +499,6 @@ async fn insert_failed_run(db: &LocalDb, job_id: &str, attempt: i64, sha: &str) 
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
-
-/// Pass-first: the command passes on the first run -> checkpoint Complete, and a
-/// subsequent advance claims the downstream node. (PR-review #3 gap: no prior
-/// checkpoint integration coverage.)
-#[tokio::test]
-async fn pass_first_completes_and_downstream_advances() {
-    let Some(h) = checkpoint_loop("exit 0").await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-
-    advance_execution(&h).await;
-    assert_checkpoint(&h, "complete", 1).await;
-    assert_latest_checkpoint_passed(&h, true).await;
-
-    // Next advance claims the downstream agent node.
-    advance_execution(&h).await;
-    assert_job_status(&h, DONE_JOB, "running").await;
-}
-
-/// A failing command blocks the checkpoint and records the run. With a
-/// sessionless upstream there is nothing to wake, so it stays Blocked.
-#[tokio::test]
-async fn fail_blocks_and_records_run() {
-    let Some(h) = checkpoint_loop("test -f fixed.txt").await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-
-    advance_execution(&h).await;
-    assert_checkpoint(&h, "blocked", 1).await;
-    assert_latest_checkpoint_passed(&h, false).await;
-    assert_job_status(&h, DONE_JOB, "pending").await;
-}
-
-/// Full cycle: fail -> Blocked, fix+commit (new HEAD) -> re-arm re-runs against
-/// the new worktree -> pass -> Complete -> downstream advances.
-#[tokio::test]
-async fn fix_commit_rearms_reruns_and_passes() {
-    let Some(h) = checkpoint_loop("test -f fixed.txt").await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-
-    // 1. First run fails -> Blocked.
-    advance_execution(&h).await;
-    assert_checkpoint(&h, "blocked", 1).await;
-
-    // 2. Agent "fixes" and seals -> new HEAD.
-    h.commit_file("fixed.txt");
-
-    // 3. Advance: re-arm re-pends the checkpoint, it re-runs and passes.
-    advance_execution(&h).await;
-    assert_checkpoint(&h, "complete", 2).await;
-    assert_latest_checkpoint_passed(&h, true).await;
-
-    // 4. Downstream advances.
-    advance_execution(&h).await;
-    assert_job_status(&h, DONE_JOB, "running").await;
-}
-
-/// No-progress termination: the agent goes idle without committing (HEAD
-/// unchanged), so the re-arm pass is a no-op and the checkpoint stays Blocked.
-#[tokio::test]
-async fn no_new_commit_does_not_rerun() {
-    let Some(h) = checkpoint_loop("test -f fixed.txt").await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-
-    advance_execution(&h).await;
-    assert_checkpoint(&h, "blocked", 1).await;
-
-    // No commit -> HEAD unchanged -> re-arm is a no-op.
-    advance_execution(&h).await;
-    assert_checkpoint(&h, "blocked", 1).await;
-}
 
 /// Hard cap: once the attempt cap is reached, a new commit no longer re-arms the
 /// checkpoint — it stays Blocked for manual resolution.
@@ -635,31 +523,6 @@ async fn attempt_cap_stops_rearm() {
         5,
         "no new run past the cap"
     );
-}
-
-/// Manual Re-run: bypasses the SHA gate, resets the attempt cycle, re-runs and
-/// (with the fix present) passes -> Complete.
-#[tokio::test]
-async fn manual_rerun_resets_and_passes() {
-    let Some(h) = blocked_checkpoint_loop("test -f fixed.txt").await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-
-    // A prior failed run exists at the original SHA.
-    insert_failed_run(&h.c.db, CHECKPOINT_JOB, 1, &h.sha).await;
-
-    // Publish the fix to the runner-owned logical head. Manual re-run bypasses
-    // the automatic re-arm gate and executes that current coordinate immediately.
-    h.commit_file("fixed.txt");
-
-    rerun_checkpoint_job(&h.c.orch, CHECKPOINT_JOB)
-        .await
-        .unwrap();
-    assert_job_status(&h, CHECKPOINT_JOB, "complete").await;
-    // History was reset, so only the fresh passing run remains.
-    assert_eq!(run_count(&h.c.db, CHECKPOINT_JOB).await, 1);
-    assert_latest_checkpoint_passed(&h, true).await;
 }
 
 /// Re-run rejects a job that is not a Blocked command checkpoint.

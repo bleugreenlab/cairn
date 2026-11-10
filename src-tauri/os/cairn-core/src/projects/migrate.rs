@@ -33,20 +33,6 @@ pub enum MoveProjectGateFailure {
     },
 }
 
-#[cfg(all(test, feature = "test-utils"))]
-pub(crate) async fn sweep_project_channel_surfaces(
-    private_db: &LocalDb,
-    project_key: &str,
-) -> Result<(), DbError> {
-    let project_key = cairn_uri::canonical_project(project_key);
-    private_db
-        .write(|conn| {
-            let project_key = project_key.clone();
-            Box::pin(async move { sweep_channel_surfaces(conn, project_key.as_str()).await })
-        })
-        .await
-}
-
 async fn sweep_channel_surfaces(
     conn: &cairn_db::storage::TrackedConnection,
     project_key: &str,
@@ -1473,27 +1459,15 @@ pub(super) mod tests {
     };
 
     use async_trait::async_trait;
-    use cairn_common::ids::rekey_to_team;
+
     use tempfile::tempdir;
 
     use super::*;
     use crate::channels::discord::{DiscordApi, DiscordGuildPermissions, DiscordRemoteChannel};
     use crate::channels::discord_surfaces::DiscordSurfaceReconciler;
     use crate::storage::{
-        MigrationRunner, SearchIndex, TableScope, TABLE_SCOPES, TEAM_MIGRATIONS, TURSO_MIGRATIONS,
+        MigrationRunner, SearchIndex, TableScope, TABLE_SCOPES, TURSO_MIGRATIONS,
     };
-
-    struct FixedClock;
-
-    impl Clock for FixedClock {
-        fn now(&self) -> i64 {
-            1_704_067_200
-        }
-
-        fn now_u64(&self) -> u64 {
-            1_704_067_200
-        }
-    }
 
     pub(in crate::projects) async fn migrated_db(
         name: &str,
@@ -1504,19 +1478,6 @@ pub(super) mod tests {
         let db = LocalDb::open(path).await.unwrap();
         MigrationRunner::new(migrations).run(&db).await.unwrap();
         db
-    }
-
-    async fn project_fk_tables(db: &LocalDb) -> Vec<String> {
-        let mut tables = db
-            .query_all(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE '%REFERENCES projects%'",
-                (),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap();
-        tables.sort();
-        tables
     }
 
     #[derive(Default)]
@@ -1811,107 +1772,6 @@ pub(super) mod tests {
         .unwrap();
     }
 
-    async fn assert_project_graph_seeded(db: &LocalDb, tables: &[String]) {
-        for table in tables {
-            let sql = format!("SELECT COUNT(*) FROM {table} WHERE project_id = 'project-delete'");
-            let count = db.query_opt_i64(sql, ()).await.unwrap().unwrap();
-            assert!(count > 0, "fixture did not seed {table}");
-        }
-    }
-
-    async fn assert_project_graph_gone(db: &LocalDb, tables: &[String]) {
-        assert!(db
-            .query_opt_text("SELECT id FROM projects WHERE id = 'project-delete'", ())
-            .await
-            .unwrap()
-            .is_none());
-        for table in tables {
-            let sql = format!("SELECT COUNT(*) FROM {table} WHERE project_id = 'project-delete'");
-            let count = db.query_opt_i64(sql, ()).await.unwrap().unwrap();
-            assert_eq!(count, 0, "{table} retained a project reference");
-        }
-        for table in [
-            "check_test_results",
-            "check_deferred_tests",
-            "codex_watchdog_leases",
-            "codex_watchdog_lifecycle",
-            "comments",
-            "feed_cursors",
-            "jj_reconcile_items",
-            "pack_catalog_references",
-            "post_comments",
-            "thread_read_positions",
-            "wake_conditions",
-            "wake_schedules",
-        ] {
-            let count = db
-                .query_opt_i64(format!("SELECT COUNT(*) FROM {table}"), ())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(count, 0, "{table} retained project-owned rows");
-        }
-    }
-
-    #[tokio::test]
-    async fn sweep_manifest_covers_every_table_referencing_projects() {
-        let db = migrated_db("project-sweep-coverage.db", TURSO_MIGRATIONS.to_vec()).await;
-        let schema_tables = project_fk_tables(&db).await;
-        let mut manifest_tables = COPY_ORDER
-            .iter()
-            .map(|spec| spec.table.to_string())
-            .collect::<Vec<_>>();
-        manifest_tables.sort();
-        let missing = schema_tables
-            .iter()
-            .filter(|table| !manifest_tables.contains(table))
-            .collect::<Vec<_>>();
-        assert!(
-            missing.is_empty(),
-            "project sweep manifest misses {missing:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn channel_key_manifest_covers_private_project_key_columns() {
-        let db = migrated_db("channel-key-coverage.db", TURSO_MIGRATIONS.to_vec()).await;
-        let private_tables = TABLE_SCOPES
-            .iter()
-            .filter_map(|(table, scope)| matches!(scope, TableScope::Private(_)).then_some(*table));
-        let manifest_tables = CHANNEL_KEY_ADDRESSED
-            .iter()
-            .map(|spec| spec.table)
-            .collect::<HashSet<_>>();
-
-        let mut key_addressed = Vec::new();
-        for table in private_tables {
-            let columns = db
-                .query_all(format!("PRAGMA table_info({table})"), (), |row| row.text(1))
-                .await
-                .unwrap();
-            if columns.iter().any(|column| column == "project_key") {
-                key_addressed.push(table);
-                assert!(
-                    table == "project_routes" || manifest_tables.contains(table),
-                    "private table {table} has project_key but is absent from the channel sweep"
-                );
-            }
-        }
-        key_addressed.sort_unstable();
-        assert_eq!(
-            key_addressed,
-            [
-                "ambient_routing_feedback",
-                "channel_state_card",
-                "discord_surface",
-                "project_library_trust",
-                "project_routes"
-            ]
-        );
-        // `project_routes` is intentionally swept by the routing path because
-        // local and team deletion have different route-removal transactions.
-    }
-
     #[test]
     fn channel_key_manifest_lists_uri_addressed_tables_explicitly() {
         // The schema cannot distinguish a project URI in `target_uri` from any
@@ -1923,181 +1783,6 @@ pub(super) mod tests {
                 "{table} addresses projects by target URI but is absent from the channel sweep"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn sweep_manifest_covers_transitive_non_cascade_dependencies() {
-        let db = migrated_db("project-sweep-transitive.db", TURSO_MIGRATIONS.to_vec()).await;
-        let tables = db
-            .query_all(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-                (),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap();
-        let mut edges = Vec::new();
-        for child in &tables {
-            let child_name = child.clone();
-            let child_edges = db
-                .query_all(
-                    format!("PRAGMA foreign_key_list({child})"),
-                    (),
-                    move |row| {
-                        Ok((
-                            child_name.clone(),
-                            row.text(2)?,
-                            row.text(6)?.to_ascii_uppercase(),
-                        ))
-                    },
-                )
-                .await
-                .unwrap();
-            edges.extend(child_edges);
-        }
-
-        let explicit = COPY_ORDER
-            .iter()
-            .map(|spec| spec.table)
-            .collect::<HashSet<_>>();
-        let mut reachable = HashSet::from(["projects".to_string()]);
-        loop {
-            let discovered = edges
-                .iter()
-                .filter(|(child, parent, _)| {
-                    reachable.contains(parent) && !reachable.contains(child)
-                })
-                .map(|(child, _, _)| child.clone())
-                .collect::<Vec<_>>();
-            if discovered.is_empty() {
-                break;
-            }
-            reachable.extend(discovered);
-        }
-        for (child, parent, on_delete) in &edges {
-            if !reachable.contains(parent) {
-                continue;
-            }
-            assert!(
-                explicit.contains(child.as_str()) || on_delete == "CASCADE",
-                "{child} reaches project-owned {parent} through {on_delete}, but is not in the sweep manifest"
-            );
-        }
-    }
-
-    /// The tables a predicate reads through `FROM <table>`, including a
-    /// `DELETE FROM` target.
-    fn tables_named_by(sql: &str) -> Vec<String> {
-        let mut named = Vec::new();
-        let mut rest = sql;
-        while let Some(at) = rest.find("FROM ") {
-            rest = &rest[at + "FROM ".len()..];
-            let table: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !table.is_empty() {
-                named.push(table);
-            }
-        }
-        named
-    }
-
-    /// The manifest's lineage claims are the schema's, and no statement the
-    /// sweep issues crosses a lineage boundary.
-    ///
-    /// Everything here is derived: the classification from `TABLE_SCOPES`, the
-    /// truth it is checked against from a real team-lineage database, and the
-    /// statements from the manifest itself. Adding an entry whose scope is
-    /// undeclared, or whose predicate reaches into the other lineage, fails here
-    /// rather than at a customer's `no such table`.
-    #[tokio::test]
-    async fn sweep_statements_are_issued_only_to_the_lineage_that_holds_them() {
-        let team = migrated_db("sweep-lineage.db", TEAM_MIGRATIONS.to_vec()).await;
-        let team_tables = team
-            .query_all(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-                (),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .collect::<HashSet<String>>();
-
-        for spec in COPY_ORDER {
-            let lineage = spec
-                .lineage()
-                .unwrap_or_else(|error| panic!("{}: {error}", spec.table));
-            assert_eq!(
-                lineage == TableLineage::Shared,
-                team_tables.contains(spec.table),
-                "`{}` is declared {lineage:?} in TABLE_SCOPES but the team lineage \
-                 {} it",
-                spec.table,
-                if team_tables.contains(spec.table) {
-                    "has"
-                } else {
-                    "lacks"
-                }
-            );
-
-            let read = match spec.sweep {
-                SweepPredicate::Direct(sql) => tables_named_by(sql),
-                SweepPredicate::Owned(clauses) => clauses
-                    .iter()
-                    .flat_map(|clause| tables_named_by(clause.sql))
-                    .collect(),
-            };
-            for table in read {
-                assert_eq!(
-                    table_lineage(&table).unwrap(),
-                    lineage,
-                    "`{}` is {lineage:?} but subqueries `{table}`, which lives in the \
-                     other lineage; for a team project the two are different \
-                     databases and the subquery would silently match nothing",
-                    spec.table
-                );
-            }
-        }
-
-        // The team path's private half runs against the per-install database.
-        // Every statement it would issue must name only tables that database has.
-        let owner_ids = OwnerIds::Materialized(
-            OwnerSet::ALL
-                .iter()
-                .map(|set| (*set, vec!["owned-id".to_string()]))
-                .collect(),
-        );
-        for spec in COPY_ORDER {
-            if spec.lineage().unwrap() != TableLineage::Private {
-                continue;
-            }
-            for (sql, _) in spec.private_statements("project", &owner_ids).unwrap() {
-                for table in tables_named_by(&sql) {
-                    assert_eq!(
-                        table_lineage(&table).unwrap(),
-                        TableLineage::Private,
-                        "the team path would issue `{sql}`, naming shared table \
-                         `{table}`, against the private database"
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn delete_db_sweeps_complete_project_graph() {
-        let db = migrated_db("project-delete-complete.db", TURSO_MIGRATIONS.to_vec()).await;
-        seed_complete_project_graph(&db).await;
-        let tables = project_fk_tables(&db).await;
-        assert_project_graph_seeded(&db, &tables).await;
-
-        crate::projects::crud::delete_db(&db, "project-delete")
-            .await
-            .unwrap();
-
-        assert_project_graph_gone(&db, &tables).await;
     }
 
     #[tokio::test]
@@ -2169,162 +1854,6 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn failed_channel_sweep_leaves_local_delete_re_runnable() {
-        let db = Arc::new(
-            migrated_db("project-delete-channel-retry.db", TURSO_MIGRATIONS.to_vec()).await,
-        );
-        seed_complete_project_graph(&db).await;
-        seed_key_addressed_channel_state(&db, "delete").await;
-        let state_card_ddl = db
-            .query_opt_text(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'channel_state_card'",
-                (),
-            )
-            .await
-            .unwrap()
-            .expect("the private lineage has a channel_state_card table");
-        exclusive_ddl(&db, "DROP TABLE channel_state_card").await;
-
-        let search = Arc::new(SearchIndex::open_or_create(tempdir().unwrap().keep()).unwrap());
-        let dbs = DbState::new(db.clone(), search);
-        let error = crate::projects::crud::delete_routed(&dbs, "project-delete")
-            .await
-            .expect_err("the missing channel table must fail the private sweep");
-        assert!(
-            error.to_string().contains("channel_state_card"),
-            "unexpected failure: {error}"
-        );
-        assert_eq!(
-            count(
-                &db,
-                "SELECT COUNT(*) FROM projects WHERE id = 'project-delete'"
-            )
-            .await,
-            1,
-            "the project must survive so deletion remains retryable"
-        );
-        assert!(
-            count_rows(&db, "discord_surface").await > 0,
-            "the encompassing local transaction must roll back"
-        );
-
-        exclusive_ddl(&db, &state_card_ddl).await;
-        crate::projects::crud::delete_routed(&dbs, "project-delete")
-            .await
-            .expect("re-running delete finishes the channel sweep");
-
-        assert_eq!(count(&db, "SELECT COUNT(*) FROM projects").await, 0);
-        assert_eq!(count_rows(&db, "discord_surface").await, 0);
-        assert_eq!(count_rows(&db, "channel_conversation_binding").await, 0);
-    }
-
-    #[tokio::test]
-    async fn channel_surface_sweep_uses_the_private_database_for_team_projects() {
-        let db = migrated_db(
-            "team-project-private-channels.db",
-            TURSO_MIGRATIONS.to_vec(),
-        )
-        .await;
-        seed_key_addressed_channel_state(&db, "mixedcase").await;
-        db.execute(
-            "INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, followed_at)
-             VALUES ('discord', 'discord:1/999', 'cairn://p/mixedcase_/1', 'structural', 7, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-        db.execute(
-            "INSERT INTO channel_inbound(id, channel, sender, text, received_at, conversation, target_uri, binding_kind)
-             VALUES ('inbound-neighbour', 'discord', 'operator', 'hi', 1, 'discord:1/998', 'cairn://p/mixedcase_', 'ambient')",
-            (),
-        )
-        .await
-        .unwrap();
-
-        db.execute(
-            "INSERT INTO ambient_routing_feedback(project_key, event_id, outcome, addresses_from, event_at, swept_at)
-             VALUES ('mixedcase_', 9, 'refused', 'firings', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-
-        sweep_project_channel_surfaces(&db, "MixedCase")
-            .await
-            .unwrap();
-
-        assert_eq!(count_rows(&db, "discord_surface").await, 0);
-        assert_eq!(count_rows(&db, "channel_state_card").await, 0);
-        assert_eq!(
-            db.query_text("SELECT project_key FROM ambient_routing_feedback", ())
-                .await
-                .unwrap(),
-            Some("mixedcase_".to_string()),
-            "a project's sweep must leave a neighbouring key's label set"
-        );
-        assert_eq!(count_rows(&db, "channel_conversation_binding").await, 1);
-        assert_eq!(
-            db.query_text("SELECT id FROM channel_inbound", ())
-                .await
-                .unwrap(),
-            Some("inbound-neighbour".to_string()),
-            "a project's sweep must leave a neighbouring key's admitted messages"
-        );
-        assert_eq!(
-            db.query_text("SELECT target_uri FROM channel_conversation_binding", ())
-                .await
-                .unwrap(),
-            Some("cairn://p/mixedcase_/1".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn move_source_sweep_removes_private_project_rows() {
-        let db = migrated_db("project-move-source-sweep.db", TURSO_MIGRATIONS.to_vec()).await;
-        seed_complete_project_graph(&db).await;
-        let tables = project_fk_tables(&db).await;
-        assert_project_graph_seeded(&db, &tables).await;
-
-        sweep_source(&db, "project-delete").await.unwrap();
-
-        assert_project_graph_gone(&db, &tables).await;
-    }
-
-    #[tokio::test]
-    async fn export_includes_complete_project_incident_graph() {
-        let db =
-            Arc::new(migrated_db("project-export-incidents.db", TURSO_MIGRATIONS.to_vec()).await);
-        seed_complete_project_graph(&db).await;
-        let out = tempdir().unwrap();
-        let destination = out.path().join("export");
-        let report = crate::projects::export::export_project(
-            db.clone(),
-            db,
-            "delete".to_string(),
-            destination.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(report.vanished.is_empty(), "{:?}", report.vanished);
-
-        for table in [
-            "main_incident_budget",
-            "main_incidents",
-            "main_incident_evidence",
-            "main_incident_sources",
-        ] {
-            let content =
-                std::fs::read_to_string(destination.join(format!("tables/{table}.jsonl"))).unwrap();
-            let rows: Vec<serde_json::Value> = content
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            assert_eq!(rows.len(), 1, "{table} must export its seeded incident row");
-            assert_eq!(rows[0]["project_id"], "project-delete", "{table}");
-        }
-    }
-
-    #[tokio::test]
     async fn turso_enforces_declared_foreign_key_delete_actions() {
         let db = migrated_db(
             "project-delete-fk-enforcement.db",
@@ -2372,1445 +1901,36 @@ pub(super) mod tests {
         );
     }
 
-    /// A team project split across two databases, produced the way production
-    /// produces it, and the ids each half is left addressing.
-    struct TeamProjectFixture {
-        dbs: DbState,
-        local: Arc<LocalDb>,
-        team: Arc<LocalDb>,
-        project_id: String,
-    }
-
-    /// Turso refuses DDL inside the concurrent write transaction `execute` uses.
-    async fn exclusive_ddl(db: &LocalDb, sql: &str) {
-        let sql = sql.to_string();
-        db.exclusive(|conn| {
-            let sql = sql.clone();
-            Box::pin(async move {
-                conn.execute(&sql, ()).await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    /// Build a team project the way `move_project_to_team` does, then seed the
-    /// private rows that a team project actually accumulates on this host.
-    ///
-    /// Private tables with cross-lineage foreign keys cannot hold team-project
-    /// rows on this host because their parents live in the replica. The channel
-    /// ledger and the untyped wake/feed tables deliberately carry no such foreign
-    /// keys, so they can address team-side ids while remaining in the private
-    /// database; key-addressed Discord state likewise stays private.
-    async fn team_project_fixture(name: &str) -> TeamProjectFixture {
-        // A team id is guarded to `[A-Za-z0-9]`, so no hyphen here.
-        let team_id = "teamsweep";
-        let project_id = "11111111-1111-4111-8111-111111111111";
-        let issue_id = "22222222-2222-4222-8222-222222222222";
-        let execution_id = "33333333-3333-4333-8333-333333333333";
-        let job_id = "44444444-4444-4444-8444-444444444444";
-        let run_id = "55555555-5555-4555-8555-555555555555";
-
-        let local =
-            Arc::new(migrated_db(&format!("{name}-local.db"), TURSO_MIGRATIONS.to_vec()).await);
-        let team =
-            Arc::new(migrated_db(&format!("{name}-team.db"), TEAM_MIGRATIONS.to_vec()).await);
-        team.execute(
-            "INSERT INTO teams(id, name, created_at, updated_at) VALUES (?1, 'Sweep', 1, 1)",
-            (team_id,),
-        )
-        .await
-        .unwrap();
-        local
-            .execute(
-                "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
-                 VALUES (?1, 'Sweep', 'http://localhost', '/tmp/team.db', 1)",
-                (team_id,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO workspaces(id, name, created_at, updated_at)
-                 VALUES ('workspace-1', 'Workspace', 1, 1)",
-                (),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES (?1, 'workspace-1', 'Sweep Project', 'SWEEP', '/tmp/sweep', 1, 1)",
-                (project_id,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-                 VALUES (?1, ?2, 1, 'Issue', 'closed', 1, 1)",
-                (issue_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-                 VALUES (?1, 'recipe', ?2, ?3, 'completed', 1, 1)",
-                (execution_id, issue_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO jobs(id, execution_id, issue_id, project_id, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'complete', 1, 1)",
-                (job_id, execution_id, issue_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'completed', 1, 1)",
-                (run_id, issue_id, project_id, job_id),
-            )
-            .await
-            .unwrap();
-
-        let search_dir = tempdir().unwrap();
-        let dbs = DbState::new(
-            local.clone(),
-            Arc::new(SearchIndex::open_or_create(search_dir.keep()).unwrap()),
-        );
-        dbs.insert_team_db_for_test(team_id, team.clone()).await;
-        move_project_to_team(&dbs, &FixedClock, project_id, team_id, &HashSet::new())
-            .await
-            .unwrap();
-
-        let team_project_id = rekey_to_team(project_id, team_id).unwrap();
-        let team_job_id = rekey_to_team(job_id, team_id).unwrap();
-        let team_run_id = rekey_to_team(run_id, team_id).unwrap();
-        let team_prompt_id =
-            rekey_to_team("77777777-7777-4777-8777-777777777777", team_id).unwrap();
-        let team_permission_id =
-            rekey_to_team("88888888-8888-4888-8888-888888888888", team_id).unwrap();
-        // A thread created after the move: it is minted into the team lineage,
-        // which is where a team project's threads live.
-        let team_thread_id =
-            rekey_to_team("66666666-6666-4666-8666-666666666666", team_id).unwrap();
-        team.execute(
-            "INSERT INTO threads(id, project_id, name, created_at, updated_at)
-             VALUES (?1, ?2, 'thread', 1, 1)",
-            (team_thread_id.clone(), team_project_id.clone()),
-        )
-        .await
-        .unwrap();
-
-        local
-            .execute(
-                "INSERT INTO wake_schedules(id, home_kind, home_id, every_ms, anchor_at, reason, created_by)
-                 VALUES ('schedule-team', 'thread', ?1, 1000, 1, 'reason', 'user')",
-                (team_thread_id.clone(),),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO wake_conditions(id, home_kind, home_id, sql, reason, created_by)
-                 VALUES ('condition-team', 'thread', ?1, 'SELECT 1', 'reason', 'user')",
-                (team_thread_id.clone(),),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO feed_cursors(home_kind, home_id) VALUES ('thread', ?1)",
-                (team_thread_id.clone(),),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO feed_cursors(home_kind, home_id) VALUES ('job', ?1)",
-                (team_job_id.clone(),),
-            )
-            .await
-            .unwrap();
-        team.execute(
-            "INSERT INTO prompts(id, run_id, questions, job_id, created_at)
-                 VALUES (?1, ?2, '[]', ?3, 1)",
-            (
-                team_prompt_id.clone(),
-                team_run_id.clone(),
-                team_job_id.clone(),
-            ),
-        )
-        .await
-        .unwrap();
-        team
-            .execute(
-                "INSERT INTO permission_requests(id, run_id, tool_use_id, tool_name, tool_input, status, created_at)
-                 VALUES (?1, ?2, 'tool', 'write', '{}', 'pending', 1)",
-                (team_permission_id.clone(), team_run_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO channel_outbound(id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at)
-                 VALUES ('outbound-team', 'discord', 'question', ?1, 'discord:1/103', ?2, 'Question?', 'text', 'pending', 1)",
-                (format!("{team_prompt_id}:0"), team_job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO channel_ask_action(action_ref, kind) VALUES (?1, 'question'), (?2, 'permission')",
-                (team_prompt_id.clone(), team_permission_id.clone()),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO channel_ask_resolution(binding_ref, action_ref, kind, answer, winner_provider, winner_conversation, resolved_at)
-                 VALUES (?1, ?2, 'question', 'yes', 'discord', 'discord:1/103', 1),
-                        (?3, ?3, 'permission', 'allow', 'discord', 'discord:1/103', 1)",
-                (
-                    format!("{team_prompt_id}:0"),
-                    team_prompt_id,
-                    team_permission_id,
-                ),
-            )
-            .await
-            .unwrap();
-        seed_key_addressed_channel_state(&local, "sweep").await;
-
-        TeamProjectFixture {
-            dbs,
-            local,
-            team,
-            project_id: team_project_id,
-        }
-    }
-
-    const ARCHIVE_TEAM: &str = "teamarchive";
-    const ARCHIVE_PROJECT: &str = "aaaaaaaa-1111-4111-8111-111111111111";
-    const ARCHIVE_EXECUTION: &str = "aaaaaaaa-3333-4333-8333-333333333333";
-    const ARCHIVE_JOB: &str = "aaaaaaaa-4444-4444-8444-444444444444";
-    const ARCHIVE_RUN: &str = "aaaaaaaa-5555-4555-8555-555555555555";
-
-    /// A private project with one execution archived the way teardown archives
-    /// it (a range pack and a blobbed system prompt, both in the private file
-    /// archive), its branch then deleted and collected, and a team replica
-    /// whose store is `team_store`.
-    async fn archived_project_fixture(
-        name: &str,
-        team_store: Arc<dyn crate::storage::ContentStore>,
-    ) -> (
-        crate::archival::rewrite::testsupport::Fixture,
-        DbState,
-        Arc<LocalDb>,
-        Arc<LocalDb>,
-    ) {
-        use crate::archival::rewrite::testsupport::*;
-        let fx = build_fixture();
-        let local = Arc::new(crate::storage::migrated_test_db(&format!("{name}-local.db")).await);
-        let mut team = migrated_db(&format!("{name}-team.db"), TEAM_MIGRATIONS.to_vec()).await;
-        team.set_team_context(
-            crate::storage::TeamReplicaContext {
-                team_id: ARCHIVE_TEAM.into(),
-                private_db: Some(local.clone()),
-            },
-            team_store,
-        );
-        let team = Arc::new(team);
-        team.execute(
-            "INSERT INTO teams(id, name, created_at, updated_at) VALUES (?1, 'Archive', 1, 1)",
-            (ARCHIVE_TEAM,),
-        )
-        .await
-        .unwrap();
-        register_archived_file_renderer_for_test();
-        local
-            .execute_script(format!(
-                "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
-                   VALUES ('{ARCHIVE_TEAM}', 'Archive', 'http://localhost', '/tmp/team.db', 1);
-                 INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws', 'W', 1, 1);
-                 INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                   VALUES ('{ARCHIVE_PROJECT}', 'ws', 'Archived', 'ARCHIVED', '{repo}', 'main', 1, 1);
-                 INSERT INTO executions(id, recipe_id, project_id, status, started_at, seq)
-                   VALUES ('{ARCHIVE_EXECUTION}', 'r', '{ARCHIVE_PROJECT}', 'completed', 1, 1);
-                 INSERT INTO jobs(id, execution_id, project_id, status, branch, created_at, updated_at)
-                   VALUES ('{ARCHIVE_JOB}', '{ARCHIVE_EXECUTION}', '{ARCHIVE_PROJECT}', 'complete', 'work', 1, 1);
-                 INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
-                   VALUES ('{ARCHIVE_RUN}', '{ARCHIVE_JOB}', '{ARCHIVE_PROJECT}', 'exited', 1, 1);",
-                repo = fx.repo.display()
-            ))
-            .await
-            .unwrap();
-        let (prompt, _) = system_prompt(&[
-            ("backend_base", &"BACKEND-BASE ".repeat(300)),
-            ("cairn", &"CAIRN-PROMPT ".repeat(200)),
-            ("dynamic", "\n\ncwd=/work"),
-        ]);
-        insert_event(&local, "sp", ARCHIVE_RUN, 0, 0, "system:prompt", &prompt).await;
-        insert_event(
-            &local,
-            "a-w1",
-            ARCHIVE_RUN,
-            1,
-            1,
-            "assistant",
-            &assistant_write("w1"),
-        )
-        .await;
-        let w1 = short(&fx.repo, &fx.w1);
-        insert_event(
-            &local,
-            "e-w1",
-            ARCHIVE_RUN,
-            2,
-            2,
-            "tool_result",
-            &write_result("w1", &w1),
-        )
-        .await;
-        let stored = rendered(&[("file:a.txt", b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n")]);
-        let read = assistant_read("r1", &["file:a.txt"]);
-        insert_event(&local, "a-r1", ARCHIVE_RUN, 3, 3, "assistant", &read).await;
-        insert_event(
-            &local,
-            "e-r1",
-            ARCHIVE_RUN,
-            4,
-            4,
-            "tool_result",
-            &read_result("r1", &stored),
-        )
-        .await;
-        let summary = crate::archival::archive_execution(
-            &local,
-            crate::archival::ArchiveTarget {
-                execution_id: ARCHIVE_EXECUTION.into(),
-                ranges: vec![branch_range(&fx.repo, "work")],
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!((summary.gitcoord_read, summary.system_prompt), (1, 1));
-        git(&fx.repo, &["checkout", "-q", "main"]);
-        git(&fx.repo, &["branch", "-D", "-q", "work"]);
-        git(&fx.repo, &["reflog", "expire", "--expire=now", "--all"]);
-        git(&fx.repo, &["gc", "-q", "--prune=now"]);
-
-        let search_dir = tempdir().unwrap();
-        let dbs = DbState::new(
-            local.clone(),
-            Arc::new(SearchIndex::open_or_create(search_dir.keep()).unwrap()),
-        );
-        dbs.insert_team_db_for_test(ARCHIVE_TEAM, team.clone())
-            .await;
-        (fx, dbs, local, team)
-    }
-
-    fn register_archived_file_renderer_for_test() {
-        crate::mcp::handlers::read::register_archived_file_renderer();
-    }
-
-    async fn run_events(db: &LocalDb, run_id: &str) -> Vec<crate::models::Event> {
-        use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
-        db.query_all(
-            format!("SELECT {EVENT_COLUMNS} FROM events WHERE run_id = ?1 ORDER BY sequence"),
-            (run_id.to_string(),),
-            event_from_row,
-        )
-        .await
-        .unwrap()
-    }
-
-    /// After the move, the team copy reads the archived execution exactly as
-    /// the private database did: its pointer rows name objects the move put
-    /// into the team store.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_moved_project_reads_its_archived_history_from_the_team_store() {
-        let team_store = crate::storage::InMemoryContentStore::new();
-        let (fx, dbs, local, team) =
-            archived_project_fixture("move-archive", Arc::new(team_store.clone())).await;
-        let expected: Vec<String> =
-            crate::storage::reconstruct_events(&local, run_events(&local, ARCHIVE_RUN).await)
-                .await
-                .into_iter()
-                .map(|event| event.data)
-                .collect();
-        assert!(expected
-            .iter()
-            .all(|data| !data.contains(crate::storage::events::reconstruct::STUB_PREFIX)));
-        let expected_diff = crate::diff::node_base_tip_diff(
-            &local,
-            ARCHIVE_JOB,
-            "",
-            std::path::Path::new("/nonexistent"),
-        )
-        .await
-        .unwrap()
-        .map(|diff| format!("{diff:?}"));
-        assert!(expected_diff.is_some());
-
-        move_project_to_team(
-            &dbs,
-            &FixedClock,
-            ARCHIVE_PROJECT,
-            ARCHIVE_TEAM,
-            &HashSet::new(),
-        )
-        .await
-        .unwrap();
-        assert!(!team_store.is_empty().await, "the pack and segments moved");
-        // What the team route reconcile records for this host's checkout.
-        local
-            .execute(
-                "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = 'archived'",
-                (fx.repo.display().to_string(),),
-            )
-            .await
-            .unwrap();
-
-        let team_run = rekey_to_team(ARCHIVE_RUN, ARCHIVE_TEAM).unwrap();
-        let team_job = rekey_to_team(ARCHIVE_JOB, ARCHIVE_TEAM).unwrap();
-        let moved: Vec<String> =
-            crate::storage::reconstruct_events(&team, run_events(&team, &team_run).await)
-                .await
-                .into_iter()
-                .map(|event| event.data)
-                .collect();
-        assert_eq!(moved, expected);
-        let moved_diff = crate::diff::node_base_tip_diff(
-            &team,
-            &team_job,
-            "",
-            std::path::Path::new("/nonexistent"),
-        )
-        .await
-        .unwrap()
-        .map(|diff| format!("{diff:?}"));
-        assert_eq!(moved_diff.is_some(), expected_diff.is_some());
-    }
-
-    /// An archive that cannot supply the project's bytes refuses the move, so
-    /// no pointer row reaches the team copy.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_offline_archive_refuses_the_move() {
-        let (_fx, dbs, local, team) = archived_project_fixture(
-            "move-archive-offline",
-            Arc::new(crate::storage::InMemoryContentStore::new()),
-        )
-        .await;
-        let root = local.path().with_extension("archive");
-        std::fs::rename(&root, root.with_extension("away")).unwrap();
-
-        let error = move_project_to_team(
-            &dbs,
-            &FixedClock,
-            ARCHIVE_PROJECT,
-            ARCHIVE_TEAM,
-            &HashSet::new(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                MoveProjectError::Gate(MoveProjectGateFailure::ArchiveUnavailable { detail })
-                    if detail.contains("archive offline")
-            ),
-            "{error}"
-        );
-        assert!(error.to_string().contains("ArchiveUnavailable:"));
-        assert_eq!(count(&team, "SELECT COUNT(*) FROM projects").await, 0);
-        assert_eq!(
-            count(&local, "SELECT COUNT(*) FROM execution_history").await,
-            1
-        );
-    }
-
-    async fn count(db: &LocalDb, sql: &str) -> i64 {
-        db.query_opt_i64(sql.to_string(), ())
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    async fn private_row_count(fixture: &TeamProjectFixture) -> i64 {
-        count(&fixture.local, "SELECT COUNT(*) FROM wake_schedules").await
-            + count(&fixture.local, "SELECT COUNT(*) FROM wake_conditions").await
-            + count(&fixture.local, "SELECT COUNT(*) FROM feed_cursors").await
-    }
-
-    /// Deleting a team project removes its rows from BOTH databases.
-    ///
-    /// Before the split this failed outright: the sweep ran the whole manifest
-    /// against the team replica, which has no `wake_schedules` table, so delete
-    /// died on `no such table` and left every row in place.
-    #[tokio::test]
-    async fn delete_routed_sweeps_a_team_project_across_both_databases() {
-        let fixture = team_project_fixture("team-delete").await;
-        assert_eq!(
-            private_row_count(&fixture).await,
-            4,
-            "fixture did not seed the private rows a team project accumulates"
-        );
-        assert!(count(&fixture.team, "SELECT COUNT(*) FROM jobs").await > 0);
-        for table in [
-            "discord_surface",
-            "channel_state_card",
-            "channel_conversation_binding",
-            "channel_inbound",
-            "channel_outbound",
-            "channel_ask_action",
-            "channel_ask_resolution",
-            "ambient_routing_feedback",
-        ] {
-            assert!(
-                count_rows(&fixture.local, table).await > 0,
-                "fixture did not seed {table}"
-            );
-        }
-
-        crate::projects::crud::delete_routed(&fixture.dbs, &fixture.project_id)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            private_row_count(&fixture).await,
-            0,
-            "private rows addressed through team-side ids survived the delete"
-        );
-        for table in [
-            "discord_surface",
-            "channel_state_card",
-            "channel_conversation_binding",
-            "channel_inbound",
-            "channel_outbound",
-            "channel_ask_action",
-            "channel_ask_resolution",
-            "ambient_routing_feedback",
-        ] {
-            assert_eq!(
-                count_rows(&fixture.local, table).await,
-                0,
-                "{table} retained team-project rows"
-            );
-        }
-        for table in [
-            "projects",
-            "issues",
-            "executions",
-            "jobs",
-            "runs",
-            "threads",
-        ] {
-            assert_eq!(
-                count(&fixture.team, &format!("SELECT COUNT(*) FROM {table}")).await,
-                0,
-                "{table} retained rows in the team replica"
-            );
-        }
-        assert!(
-            fixture
-                .local
-                .query_opt_text("SELECT project_key FROM project_routes", ())
-                .await
-                .unwrap()
-                .is_none(),
-            "the durable route outlived the project"
-        );
-    }
-
-    /// The two halves commit independently, so the order has to be the one whose
-    /// partial failure a re-run can finish. Private first: when the shared half
-    /// fails, the project row, its route, and the owner id sets are all still
-    /// there, so delete can simply be run again.
-    #[tokio::test]
-    async fn a_failed_shared_half_leaves_a_team_delete_re_runnable() {
-        let fixture = team_project_fixture("team-delete-partial").await;
-        // Its indexes too: the re-run's cascade has to seek as the real table does.
-        let todos_ddl = fixture
-            .team
-            .query_all(
-                "SELECT sql FROM sqlite_master WHERE tbl_name = 'todos' AND sql IS NOT NULL
-                 ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",
-                (),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap();
-        assert!(!todos_ddl.is_empty(), "the team lineage has a todos table");
-        exclusive_ddl(&fixture.team, "DROP TABLE todos").await;
-
-        let error = crate::projects::crud::delete_routed(&fixture.dbs, &fixture.project_id)
-            .await
-            .expect_err("the shared half must fail with todos missing");
-        assert!(
-            error.to_string().contains("todos"),
-            "unexpected failure: {error}"
-        );
-        assert_eq!(
-            private_row_count(&fixture).await,
-            0,
-            "the private half runs first and commits on its own"
-        );
-        assert!(
-            count(&fixture.team, "SELECT COUNT(*) FROM projects").await > 0,
-            "the project row must survive so the re-run can find it"
-        );
-        assert!(
-            fixture
-                .local
-                .query_opt_text("SELECT project_key FROM project_routes", ())
-                .await
-                .unwrap()
-                .is_some(),
-            "the route must survive so the key is not released early"
-        );
-
-        for ddl in &todos_ddl {
-            exclusive_ddl(&fixture.team, ddl).await;
-        }
-        crate::projects::crud::delete_routed(&fixture.dbs, &fixture.project_id)
-            .await
-            .expect("re-running delete finishes the half that failed");
-
-        assert_eq!(private_row_count(&fixture).await, 0);
-        assert_eq!(
-            count(&fixture.team, "SELECT COUNT(*) FROM projects").await,
-            0
-        );
-        assert!(fixture
-            .local
-            .query_opt_text("SELECT project_key FROM project_routes", ())
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn move_project_to_team_backfills_forward_self_references() {
-        let team_id = "team-move-test";
-        let project_id = "11111111-1111-4111-8111-111111111111";
-        let issue_id = "22222222-2222-4222-8222-222222222222";
-        let child_issue_id = "33333333-3333-4333-8333-333333333333";
-        let execution_id = "44444444-4444-4444-8444-444444444444";
-        let job_id = "55555555-5555-4555-8555-555555555555";
-        let run_id = "66666666-6666-4666-8666-666666666666";
-        let first_session_id = "77777777-7777-4777-8777-777777777777";
-        let resumed_session_id = "88888888-8888-4888-8888-888888888888";
-        let first_turn_id = "99999999-9999-4999-8999-999999999999";
-        let current_turn_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let artifact_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-        let artifact_version_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-        let check_attempt_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-        let thread_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
-        let branch_job_id = "00000000-0000-4000-8000-000000000001";
-
-        let local = Arc::new(migrated_db("move-local.db", TURSO_MIGRATIONS.to_vec()).await);
-        let team = Arc::new(migrated_db("move-team.db", TEAM_MIGRATIONS.to_vec()).await);
-        team.execute(
-            "INSERT INTO teams(id, name, created_at, updated_at)
-             VALUES (?1, 'Move Test Team', 1, 1)",
-            (team_id,),
-        )
-        .await
-        .unwrap();
-
-        local
-            .execute(
-                "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
-                 VALUES (?1, 'Move Test Team', 'http://localhost', '/tmp/team.db', 1)",
-                (team_id,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO workspaces(id, name, created_at, updated_at)
-                 VALUES ('workspace-1', 'Workspace', 1, 1)",
-                (),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES (?1, 'workspace-1', 'Move Project', 'MOVE', '/tmp/move', 1, 1)",
-                (project_id,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-                 VALUES (?1, ?2, 1, 'Parent', 'closed', 1, 1)",
-                (issue_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO issues(id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
-                 VALUES (?1, ?2, 2, 'Child', 'closed', ?3, 1, 1)",
-                (child_issue_id, project_id, issue_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, completed_at, seq)
-                 VALUES (?1, 'recipe', ?2, ?3, 'completed', 1, 2, 1)",
-                (execution_id, issue_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO jobs(id, execution_id, issue_id, project_id, status, created_at, updated_at, completed_at)
-                 VALUES (?1, ?2, ?3, ?4, 'complete', 1, 2, 3)",
-                (job_id, execution_id, issue_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "UPDATE issues SET parent_job_id = ?1 WHERE id = ?2",
-                (job_id, child_issue_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO threads(id, project_id, name, created_at, updated_at)
-                 VALUES (?1, ?2, 'branch-thread', 1, 1)",
-                (thread_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, branch, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'complete', 'branch-7', 'agent/branch-thread/7', 1, 1)",
-                (branch_job_id, thread_id, project_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO runs(id, issue_id, project_id, job_id, status, session_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'completed', 'bare-session-id', 1, 2)",
-                (run_id, issue_id, project_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, 'complete', 1, 1)",
-                (first_turn_id, first_session_id, run_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO turns(id, session_id, run_id, job_id, sequence, predecessor_id, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 2, ?5, 'complete', 2, 2)",
-                (current_turn_id, resumed_session_id, run_id, job_id, first_turn_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
-                 VALUES (?1, ?2, 'codex', 'closed', 1, 1, 2)",
-                (first_session_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO sessions(id, job_id, backend, status, parent_session_id, sequence, created_at, updated_at)
-                 VALUES (?1, ?2, 'codex', 'closed', ?3, 2, 2, 3)",
-                (resumed_session_id, job_id, first_session_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "UPDATE sessions SET replaced_by_id = ?1 WHERE id = ?2",
-                (resumed_session_id, first_session_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "UPDATE jobs SET current_turn_id = ?1, resume_session_id = ?2 WHERE id = ?3",
-                (current_turn_id, resumed_session_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO turn_end_check_attempts(id, job_id, state, created_at, updated_at)
-                 VALUES (?1, ?2, 'settled', 1, 2)",
-                (check_attempt_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "UPDATE jobs SET turn_end_check_attempt_id = ?1 WHERE id = ?2",
-                (check_attempt_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
-                 VALUES (?1, ?2, 'plan', '{}', 1, 1)",
-                (artifact_id, job_id),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO artifacts(id, job_id, artifact_type, data, parent_version_id, created_at, updated_at)
-                 VALUES (?1, ?2, 'plan', '{}', ?3, 2, 2)",
-                (artifact_version_id, job_id, artifact_id),
-            )
-            .await
-            .unwrap();
-        seed_key_addressed_channel_state(&local, "move").await;
-
-        let search_dir = tempdir().unwrap();
-        let dbs = DbState::new(
-            local.clone(),
-            Arc::new(SearchIndex::open_or_create(search_dir.path()).unwrap()),
-        );
-        dbs.insert_team_db_for_test(team_id, team.clone()).await;
-
-        move_project_to_team(&dbs, &FixedClock, project_id, team_id, &HashSet::new())
-            .await
-            .unwrap();
-
-        let team_project_id = rekey_to_team(project_id, team_id).unwrap();
-        let team_job_id = rekey_to_team(job_id, team_id).unwrap();
-        let team_first_session_id = rekey_to_team(first_session_id, team_id).unwrap();
-        let team_resumed_session_id = rekey_to_team(resumed_session_id, team_id).unwrap();
-        let team_first_turn_id = rekey_to_team(first_turn_id, team_id).unwrap();
-        let team_current_turn_id = rekey_to_team(current_turn_id, team_id).unwrap();
-        let team_artifact_id = rekey_to_team(artifact_id, team_id).unwrap();
-        let team_artifact_version_id = rekey_to_team(artifact_version_id, team_id).unwrap();
-        let team_child_issue_id = rekey_to_team(child_issue_id, team_id).unwrap();
-        let team_check_attempt_id = rekey_to_team(check_attempt_id, team_id).unwrap();
-        let team_branch_job_id = rekey_to_team(branch_job_id, team_id).unwrap();
-        // A retired thread branch's job moves as the thread task it now is.
-        assert_eq!(
-            crate::jobs::queries::home_uri_for_job(&team, &team_branch_job_id)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("cairn://p/move/branch-thread/task/branch-7")
-        );
-        assert_eq!(count(&local, "SELECT COUNT(*) FROM threads").await, 0);
-
-        assert_eq!(
-            team.query_text(
-                "SELECT team_id FROM projects WHERE id = ?1",
-                (team_project_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_id.to_string())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT current_turn_id FROM jobs WHERE id = ?1",
-                (team_job_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_current_turn_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT resume_session_id FROM jobs WHERE id = ?1",
-                (team_job_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_resumed_session_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT turn_end_check_attempt_id FROM jobs WHERE id = ?1",
-                (team_job_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_check_attempt_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT job_id FROM turn_end_check_attempts WHERE id = ?1",
-                (team_check_attempt_id,)
-            )
-            .await
-            .unwrap(),
-            Some(team_job_id)
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT replaced_by_id FROM sessions WHERE id = ?1",
-                (team_first_session_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_resumed_session_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT parent_session_id FROM sessions WHERE id = ?1",
-                (team_resumed_session_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_first_session_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT predecessor_id FROM turns WHERE id = ?1",
-                (team_current_turn_id.clone(),)
-            )
-            .await
-            .unwrap(),
-            Some(team_first_turn_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT parent_version_id FROM artifacts WHERE id = ?1",
-                (team_artifact_version_id,)
-            )
-            .await
-            .unwrap(),
-            Some(team_artifact_id.clone())
-        );
-        assert_eq!(
-            team.query_text(
-                "SELECT parent_job_id FROM issues WHERE id = ?1",
-                (team_child_issue_id,)
-            )
-            .await
-            .unwrap(),
-            Some(rekey_to_team(job_id, team_id).unwrap())
-        );
-        assert_eq!(
-            local
-                .query_opt_text("SELECT id FROM projects WHERE id = ?1", (project_id,))
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            local
-                .query_text(
-                    "SELECT team_id FROM project_routes WHERE project_key = 'move'",
-                    ()
-                )
-                .await
-                .unwrap(),
-            Some(team_id.to_string())
-        );
-        for table in [
-            "discord_surface",
-            "channel_state_card",
-            "channel_conversation_binding",
-            "ambient_routing_feedback",
-        ] {
-            assert!(
-                count_rows(&local, table).await > 0,
-                "moving a project must preserve private channel state in {table}"
-            );
-        }
-    }
-
-    /// A child genuinely filed by an issue node, whose filer answers its prompts
-    /// before the project moves to a team. The move rebuilds the issue graph in
-    /// another database under rekeyed ids, and it does not carry the filing
-    /// edge's answering authority across: the former parent is still an
-    /// authenticated agent of the moved project, yet its deny and its allow
-    /// (within a crossing grant it holds) are both refused and journaled, and
-    /// the prompt stays pending and unattributed.
-    /// How the revocation arrives is deliberately not pinned here. The operator
-    /// half is blocked by the inherited team claim-ledger outage (cairn/6489),
-    /// not by answer authority, and is outside this pin.
-    #[tokio::test]
-    async fn a_moved_childs_parent_is_still_its_ancestor_after_the_move() {
-        use crate::mcp::handlers::permission::{
-            resolve_permission_request, AnswerSurface, PermissionAnswer, PermissionDecision,
-        };
-        use crate::mcp::handlers::write::handle_write;
-        use crate::mcp::types::McpCallbackRequest;
-        use serde_json::json;
-
-        const TEAM: &str = "teamanswer";
-        let project_id = "a1a1a1a1-1111-4111-8111-111111111111";
-        let parent_issue = "a1a1a1a1-2222-4222-8222-222222222222";
-        let parent_exec = "a1a1a1a1-3333-4333-8333-333333333333";
-        let parent_job = "a1a1a1a1-4444-4444-8444-444444444444";
-        let parent_session = "a1a1a1a1-5555-4555-8555-555555555555";
-        let parent_run = "a1a1a1a1-6666-4666-8666-666666666666";
-        let child_exec = "a1a1a1a1-7777-4777-8777-777777777777";
-        let child_job = "a1a1a1a1-8888-4888-8888-888888888888";
-        let child_session = "a1a1a1a1-9999-4999-8999-999999999999";
-        let child_run = "a1a1a1a1-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let prompts = [
-            ("a1a1a1a1-bbbb-4bbb-8bbb-bbbbbbbbbbb1", "perm-a"),
-            ("a1a1a1a1-bbbb-4bbb-8bbb-bbbbbbbbbbb2", "perm-b"),
-            ("a1a1a1a1-bbbb-4bbb-8bbb-bbbbbbbbbbb3", "perm-c"),
-        ];
-
-        // An `ask` fence: only an exact session grant lets an ancestor allow.
-        let snapshot = |issue_id: &str| {
-            let snapshot: crate::models::ExecutionSnapshot = serde_json::from_value(json!({
-                "recipe": {"id": "recipe-1", "name": "Moved answer", "trigger": "manual", "nodes": [], "edges": []},
-                "agents": {"permission-agent": {
-                    "id": "permission-agent", "name": "Permission agent", "description": "",
-                    "prompt": "", "tools": [], "models": [], "fence": "ask"
-                }},
-                "skills": {},
-                "triggerContext": {"projectId": project_id, "issueId": issue_id, "triggerType": "manual"},
-                "createdAt": 1
-            }))
-            .unwrap();
-            snapshot.to_json().unwrap()
-        };
-        let crossing = json!({
-            "kind": "shell_path_crossing",
-            "verb": "read",
-            "descriptor": "/etc/hosts",
-            "summary": "the sandbox refused a write to /etc/hosts",
-            "request": {
-                "cwd": "/wt", "run_id": child_run, "tool": "read",
-                "payload": {"path": "file:/etc/hosts"}, "tool_use_id": "toolu-perm"
-            }
-        })
-        .to_string();
-
-        /// A running `builder` node on `issue_id`: execution, job, session, run.
-        async fn seed_builder(
-            db: &LocalDb,
-            project_id: &str,
-            issue_id: &str,
-            [exec, job, session, run]: [&str; 4],
-            snapshot: String,
-        ) {
-            db.execute(
-                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot, triggered_by)
-                 VALUES (?1, 'recipe-1', ?2, ?3, 'running', 1, 1, ?4, 'manual')",
-                (exec, issue_id, project_id, snapshot),
-            )
-            .await
-            .unwrap();
-            db.execute(
-                "INSERT INTO jobs(id, execution_id, issue_id, project_id, agent_config_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'permission-agent', 'builder', 'running', ?5, 'builder', 1, 1)",
-                (job, exec, issue_id, project_id, session),
-            )
-            .await
-            .unwrap();
-            db.execute(
-                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
-                 VALUES (?1, ?2, 'active', 1, 1)",
-                (session, job),
-            )
-            .await
-            .unwrap();
-            db.execute(
-                "INSERT INTO runs(id, project_id, issue_id, job_id, status, session_id, created_at, updated_at, start_mode)
-                 VALUES (?1, ?2, ?3, ?4, 'live', ?5, 1, 1, 'resume')",
-                (run, project_id, issue_id, job, session),
-            )
-            .await
-            .unwrap();
-        }
-
-        let local = Arc::new(migrated_db("answer-move-local.db", TURSO_MIGRATIONS.to_vec()).await);
-        let team = Arc::new(migrated_db("answer-move-team.db", TEAM_MIGRATIONS.to_vec()).await);
-        team.execute(
-            "INSERT INTO teams(id, name, created_at, updated_at) VALUES (?1, 'Answer', 1, 1)",
-            (TEAM,),
-        )
-        .await
-        .unwrap();
-        local
-            .execute(
-                "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
-                 VALUES (?1, 'Answer', 'http://localhost', '/tmp/team.db', 1)",
-                (TEAM,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO workspaces(id, name, created_at, updated_at)
-                 VALUES ('workspace-1', 'Workspace', 1, 1)",
-                (),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
-                 VALUES (?1, 'workspace-1', 'Answer Move', 'pmove', '/tmp/pmove', 3, 1, 1)",
-                (project_id,),
-            )
-            .await
-            .unwrap();
-        local
-            .execute(
-                "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
-                 VALUES (?1, ?2, 2, 'Filing parent', 'active', 'idle', 1, 1)",
-                (parent_issue, project_id),
-            )
-            .await
-            .unwrap();
-        seed_builder(
-            &local,
-            project_id,
-            parent_issue,
-            [parent_exec, parent_job, parent_session, parent_run],
-            snapshot(parent_issue),
-        )
-        .await;
-
-        let config = tempdir().unwrap();
-        let dbs = Arc::new(DbState::new(
-            local.clone(),
-            Arc::new(SearchIndex::open_or_create(config.path().join("search")).unwrap()),
-        ));
-        dbs.insert_team_db_for_test(TEAM, team.clone()).await;
-        let orch = crate::orchestrator::Orchestrator::builder(
-            dbs,
-            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
-            config.path().join("config"),
-        )
-        .build();
-        // The filer holds the crossing grant throughout, so a refused allow is
-        // about lineage, never about a missing effect grant.
-        orch.session_allowed_crossings
-            .lock()
-            .unwrap()
-            .insert("/etc/hosts".to_string());
-        async fn write_as(
-            orch: &crate::orchestrator::Orchestrator,
-            run_id: &str,
-            change: serde_json::Value,
-        ) -> String {
-            handle_write(
-                orch,
-                &McpCallbackRequest {
-                    answer_bound_ms: None,
-                    thread_id: None,
-                    cwd: String::new(),
-                    run_id: Some(run_id.to_string()),
-                    tool: "write".to_string(),
-                    payload: json!({ "changes": [change] }),
-                    tool_use_id: None,
-                    origin: None,
-                },
-            )
-            .await
-        }
-
-        // The parent's own run files the child through the real issues append,
-        // which records the authenticated filing job as creator proof.
-        let filed = write_as(
-            &orch,
-            parent_run,
-            json!({"target": "cairn://p/pmove/issues", "mode": "append",
-                   "payload": {"title": "Filed child", "parent": "cairn://p/pmove/2"}}),
-        )
-        .await;
-        assert!(filed.contains("Created issue pmove/"), "{filed}");
-        let (child_issue, child_number) = local
-            .query_one(
-                "SELECT id, number FROM issues WHERE title = 'Filed child'",
-                (),
-                |row| Ok((row.text(0)?, row.i64(1)?)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            local
-                .query_one(
-                    "SELECT parent_issue_id, parent_job_id FROM issues WHERE id = ?1",
-                    (child_issue.clone(),),
-                    |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
-                )
-                .await
-                .unwrap(),
-            (Some(parent_issue.to_string()), Some(parent_job.to_string())),
-            "the child is filed under its parent with the filer's creator proof"
-        );
-        seed_builder(
-            &local,
-            project_id,
-            &child_issue,
-            [child_exec, child_job, child_session, child_run],
-            snapshot(&child_issue),
-        )
-        .await;
-        for (id, segment) in prompts {
-            local
-                .execute(
-                    "INSERT INTO permission_requests(id, run_id, job_id, tool_use_id, tool_name, tool_input, status, created_at, uri_segment)
-                     VALUES (?1, ?2, ?3, ?4, 'read', ?5, 'pending', 1, ?6)",
-                    (id, child_run, child_job, format!("toolu-{segment}"), crossing.clone(), segment),
-                )
-                .await
-                .unwrap();
-        }
-        let prompt_target = |segment: &str| {
-            format!("cairn://p/pmove/{child_number}/1/builder/permissions/{segment}")
-        };
-        let answer = |segment: &str, decision: &str| json!({"target": prompt_target(segment), "mode": "patch", "payload": {"decision": decision}});
-
-        // Before the move the parent answers both ways.
-        for ((id, segment), decision, status) in [
-            (prompts[0], "deny", "denied"),
-            (prompts[1], "allow", "allowed"),
-        ] {
-            let result = write_as(&orch, parent_run, answer(segment, decision)).await;
-            assert!(
-                result.contains(&format!("Answered permission {segment}")),
-                "pre-move {decision}: {result}"
-            );
-            assert_eq!(
-                local
-                    .query_opt_text(
-                        "SELECT status FROM permission_requests WHERE id = ?1",
-                        (id,)
-                    )
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some(status)
-            );
-        }
-
-        move_project_to_team(&orch.db, &FixedClock, project_id, TEAM, &HashSet::new())
-            .await
-            .unwrap();
-
-        let moved_parent_run = rekey_to_team(parent_run, TEAM).unwrap();
-        let moved_parent_job = rekey_to_team(parent_job, TEAM).unwrap();
-        let moved_prompt = rekey_to_team(prompts[2].0, TEAM).unwrap();
-        // The former parent survives the move as a real agent of the moved
-        // project, under its rekeyed identity.
-        assert_eq!(
-            crate::jobs::queries::home_uri_for_job(&team, &moved_parent_job)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("cairn://p/pmove/2/1/builder")
-        );
-
-        // The answer is built exactly as the permission resource patch builds
-        // it, from the former parent's authenticated rekeyed run, and handed to
-        // the canonical resolver by request id. The node-coordinate lookup in
-        // front of that resolver reads only the private database, so it cannot
-        // address a team project's prompt by URI.
-        // The child's parent edge moved with it, so the rekeyed parent is still
-        // its ancestor: the ancestry check passes. Past it, the first-answer
-        // claim on a team database currently fails on the missing
-        // `channel_ask_action` table (cairn/6489); once that is fixed the
-        // answer is accepted outright.
-        let agent = crate::mcp::handlers::run_context::authenticated_agent_for_run(
-            &orch.db,
-            &moved_parent_run,
-        )
-        .await
-        .expect("the parent authenticates as its moved run");
-        let (actor, appearance) = agent.appearance(chrono::Utc::now().timestamp()).unwrap();
-        let agent_answer =
-            PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch)
-                .with_authenticated_appearance(actor, appearance)
-                .unwrap();
-        let result = resolve_permission_request(&orch, &moved_prompt, agent_answer)
-            .await
-            .map(|_| "accepted".to_string())
-            .unwrap_or_else(|refusal| refusal);
-        assert!(
-            result == "accepted" || result.contains("channel_ask_action"),
-            "post-move: the parent must pass the ancestry check: {result}"
-        );
-        assert_eq!(
-            count(
-                &local,
-                &format!(
-                    "SELECT COUNT(*) FROM authorization_events
-                     WHERE request_uri = '{moved_prompt}' AND reason = 'permission_answer_authority'
-                       AND outcome = 'forbidden'"
-                ),
-            )
-            .await,
-            0,
-            "post-move: no lineage refusal is journaled"
-        );
-    }
-
     // === Quiesce-gate (`blocking_work`) tests ===
 
-    /// A migrated local db seeded with one project (`proj`, key `GATE`).
-    async fn gate_db() -> LocalDb {
-        let db = migrated_db("gate-local.db", TURSO_MIGRATIONS.to_vec()).await;
-        db.execute(
-            "INSERT INTO workspaces(id, name, created_at, updated_at)
-             VALUES ('ws', 'Workspace', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-        db.execute(
-            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj', 'ws', 'Gate', 'GATE', '/tmp/gate', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-        db
-    }
-
-    async fn insert_issue(db: &LocalDb, id: &str, number: i64, status: &str) {
-        db.execute(
-            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
-             VALUES (?1, 'proj', ?2, 'Issue', ?3, 1, 1)",
-            (id.to_string(), number, status.to_string()),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn insert_job(db: &LocalDb, id: &str, issue_id: &str, status: &str, node_name: &str) {
-        db.execute(
-            "INSERT INTO jobs(id, issue_id, project_id, status, node_name, created_at, updated_at)
-             VALUES (?1, ?2, 'proj', ?3, ?4, 1, 1)",
-            (
-                id.to_string(),
-                issue_id.to_string(),
-                status.to_string(),
-                node_name.to_string(),
-            ),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn insert_execution(db: &LocalDb, id: &str, issue_id: &str) {
-        db.execute(
-            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-             VALUES (?1, 'recipe', ?2, 'proj', 'running', 1, 1)",
-            (id.to_string(), issue_id.to_string()),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn insert_advance_outbox(db: &LocalDb, id: &str, execution_id: &str, state: &str) {
-        db.execute(
-            "INSERT INTO effect_outbox(id, kind, dedupe_key, state, created_at, updated_at)
-             VALUES (?1, 'advance_dag', ?2, ?3, 1, 1)",
-            (id.to_string(), execution_id.to_string(), state.to_string()),
-        )
-        .await
-        .unwrap();
-    }
-
-    fn live_set(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|id| id.to_string()).collect()
-    }
-
-    #[tokio::test]
-    async fn gate_passes_on_inert_nonterminal_rows() {
-        // The reported regression: every job row is non-terminal (running /
-        // pending / blocked) but the work is entirely inert — no live process,
-        // no queued advance. A `running` row parked on a resumable wait and a
-        // never-started recipe node are a designed steady state, so the move
-        // must pass regardless of how many such rows exist.
-        let db = gate_db().await;
-        insert_issue(&db, "iss", 1, "merged").await;
-        insert_job(&db, "job-running", "iss", "running", "builder").await;
-        insert_job(&db, "job-pending", "iss", "pending", "planner").await;
-        insert_job(&db, "job-blocked", "iss", "blocked", "reviewer").await;
-
-        let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
+    #[test]
+    fn notquiesced_display_names_the_blocking_work() {
+        // The gate failure renders a self-contained, user-facing sentence that
+        // keeps the `NotQuiesced` token (matched by the frontend) and lists the
+        // blocking work.
+        let failure = MoveProjectGateFailure::NotQuiesced {
+            blocking_jobs: vec![
+                BlockingJob {
+                    id: "job-live".to_string(),
+                    status: "running".to_string(),
+                    issue_number: Some(12),
+                    node_name: Some("builder".to_string()),
+                },
+                BlockingJob {
+                    id: "exec-abc12345def".to_string(),
+                    status: ADVANCING_STATUS.to_string(),
+                    issue_number: None,
+                    node_name: None,
+                },
+            ],
+        };
+        let rendered = failure.to_string();
+        assert!(rendered.starts_with("NotQuiesced:"), "got {rendered}");
+        assert!(rendered.contains("issue #12 · builder"), "got {rendered}");
         assert!(
-            blocking.is_empty(),
-            "inert non-terminal rows must not block, got {blocking:?}"
+            rendered.contains("job exec-abc (advancing)"),
+            "got {rendered}"
         );
-    }
-
-    #[tokio::test]
-    async fn gate_blocks_on_live_process_and_names_it() {
-        // A live in-memory process on one job blocks the move; the surfaced
-        // BlockingJob names that job (issue number + node) so the user can act.
-        // The other running job with no live process does not block.
-        let db = gate_db().await;
-        insert_issue(&db, "iss", 7, "active").await;
-        insert_job(&db, "job-live", "iss", "running", "builder").await;
-        insert_job(&db, "job-idle", "iss", "running", "planner").await;
-
-        let blocking = blocking_work(&db, "proj", &live_set(&["job-live"]))
-            .await
-            .unwrap();
-        assert_eq!(blocking.len(), 1);
-        assert_eq!(blocking[0].id, "job-live");
-        assert_eq!(blocking[0].issue_number, Some(7));
-        assert_eq!(blocking[0].node_name.as_deref(), Some("builder"));
-    }
-
-    #[tokio::test]
-    async fn gate_ignores_live_process_outside_project() {
-        // A live job id that does not belong to the project being moved never
-        // blocks it — liveness is scoped to the project graph, not global.
-        let db = gate_db().await;
-        insert_issue(&db, "iss", 1, "merged").await;
-        insert_job(&db, "job-mine", "iss", "running", "builder").await;
-
-        let blocking = blocking_work(&db, "proj", &live_set(&["job-elsewhere"]))
-            .await
-            .unwrap();
-        assert!(blocking.is_empty(), "got {blocking:?}");
-    }
-
-    #[tokio::test]
-    async fn gate_blocks_on_pr_publish_until_settled() {
-        let db = gate_db().await;
-        insert_issue(&db, "iss", 3, "active").await;
-        insert_execution(&db, "exec", "iss").await;
-        db.execute("INSERT INTO effect_outbox(id,kind,dedupe_key,payload_json,state,created_at,updated_at) VALUES('pr-intent','pr_publish','attempt','{\"execution_id\":\"exec\"}','pending',1,1)",()).await.unwrap();
-        let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
-        assert_eq!(blocking.len(), 1);
-        assert_eq!(blocking[0].id, "exec");
-        db.execute(
-            "UPDATE effect_outbox SET state='done' WHERE id='pr-intent'",
-            (),
-        )
-        .await
-        .unwrap();
-        assert!(blocking_work(&db, "proj", &HashSet::new())
-            .await
-            .unwrap()
-            .is_empty());
     }
 
     #[tokio::test]
@@ -3845,27 +1965,16 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn main_incident_sources_block_project_move_until_drained() {
+    async fn gate_blocks_on_pr_publish_until_settled() {
         let db = gate_db().await;
-        db.execute(
-            "INSERT INTO main_incident_sources(project_id,event_key,check_name,platform,created_at)
-             VALUES ('proj','source','rust','linux',1)",
-            (),
-        )
-        .await
-        .unwrap();
+        insert_issue(&db, "iss", 3, "active").await;
+        insert_execution(&db, "exec", "iss").await;
+        db.execute("INSERT INTO effect_outbox(id,kind,dedupe_key,payload_json,state,created_at,updated_at) VALUES('pr-intent','pr_publish','attempt','{\"execution_id\":\"exec\"}','pending',1,1)",()).await.unwrap();
         let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
         assert_eq!(blocking.len(), 1);
-        assert_eq!(blocking[0].status, INCIDENT_SOURCES_STATUS);
-        assert!(blocking[0]
-            .label()
-            .contains("1 pending main incident source"));
-        assert!(blocking_work(&db, "unrelated", &HashSet::new())
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(blocking[0].id, "exec");
         db.execute(
-            "UPDATE main_incident_sources SET processed_at=2 WHERE event_key='source'",
+            "UPDATE effect_outbox SET state='done' WHERE id='pr-intent'",
             (),
         )
         .await
@@ -3876,33 +1985,131 @@ pub(super) mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn notquiesced_display_names_the_blocking_work() {
-        // The gate failure renders a self-contained, user-facing sentence that
-        // keeps the `NotQuiesced` token (matched by the frontend) and lists the
-        // blocking work.
-        let failure = MoveProjectGateFailure::NotQuiesced {
-            blocking_jobs: vec![
-                BlockingJob {
-                    id: "job-live".to_string(),
-                    status: "running".to_string(),
-                    issue_number: Some(12),
-                    node_name: Some("builder".to_string()),
-                },
-                BlockingJob {
-                    id: "exec-abc12345def".to_string(),
-                    status: ADVANCING_STATUS.to_string(),
-                    issue_number: None,
-                    node_name: None,
-                },
-            ],
-        };
-        let rendered = failure.to_string();
-        assert!(rendered.starts_with("NotQuiesced:"), "got {rendered}");
-        assert!(rendered.contains("issue #12 · builder"), "got {rendered}");
-        assert!(
-            rendered.contains("job exec-abc (advancing)"),
-            "got {rendered}"
+    #[tokio::test]
+    async fn gate_blocks_on_live_process_and_names_it() {
+        // A live in-memory process on one job blocks the move; the surfaced
+        // BlockingJob names that job (issue number + node) so the user can act.
+        // The other running job with no live process does not block.
+        let db = gate_db().await;
+        insert_issue(&db, "iss", 7, "active").await;
+        insert_job(&db, "job-live", "iss", "running", "builder").await;
+        insert_job(&db, "job-idle", "iss", "running", "planner").await;
+
+        let blocking = blocking_work(&db, "proj", &live_set(&["job-live"]))
+            .await
+            .unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].id, "job-live");
+        assert_eq!(blocking[0].issue_number, Some(7));
+        assert_eq!(blocking[0].node_name.as_deref(), Some("builder"));
+    }
+
+    #[tokio::test]
+    async fn channel_key_manifest_covers_private_project_key_columns() {
+        let db = migrated_db("channel-key-coverage.db", TURSO_MIGRATIONS.to_vec()).await;
+        let private_tables = TABLE_SCOPES
+            .iter()
+            .filter_map(|(table, scope)| matches!(scope, TableScope::Private(_)).then_some(*table));
+        let manifest_tables = CHANNEL_KEY_ADDRESSED
+            .iter()
+            .map(|spec| spec.table)
+            .collect::<HashSet<_>>();
+
+        let mut key_addressed = Vec::new();
+        for table in private_tables {
+            let columns = db
+                .query_all(format!("PRAGMA table_info({table})"), (), |row| row.text(1))
+                .await
+                .unwrap();
+            if columns.iter().any(|column| column == "project_key") {
+                key_addressed.push(table);
+                assert!(
+                    table == "project_routes" || manifest_tables.contains(table),
+                    "private table {table} has project_key but is absent from the channel sweep"
+                );
+            }
+        }
+        key_addressed.sort_unstable();
+        assert_eq!(
+            key_addressed,
+            [
+                "ambient_routing_feedback",
+                "channel_state_card",
+                "discord_surface",
+                "project_library_trust",
+                "project_routes"
+            ]
         );
+        // `project_routes` is intentionally swept by the routing path because
+        // local and team deletion have different route-removal transactions.
+    }
+
+    /// A migrated local db seeded with one project (`proj`, key `GATE`).
+    async fn gate_db() -> LocalDb {
+        let db = migrated_db("gate-local.db", TURSO_MIGRATIONS.to_vec()).await;
+        db.execute(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES ('ws', 'Workspace', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj', 'ws', 'Gate', 'GATE', '/tmp/gate', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn insert_advance_outbox(db: &LocalDb, id: &str, execution_id: &str, state: &str) {
+        db.execute(
+            "INSERT INTO effect_outbox(id, kind, dedupe_key, state, created_at, updated_at)
+             VALUES (?1, 'advance_dag', ?2, ?3, 1, 1)",
+            (id.to_string(), execution_id.to_string(), state.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_execution(db: &LocalDb, id: &str, issue_id: &str) {
+        db.execute(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES (?1, 'recipe', ?2, 'proj', 'running', 1, 1)",
+            (id.to_string(), issue_id.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_issue(db: &LocalDb, id: &str, number: i64, status: &str) {
+        db.execute(
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES (?1, 'proj', ?2, 'Issue', ?3, 1, 1)",
+            (id.to_string(), number, status.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_job(db: &LocalDb, id: &str, issue_id: &str, status: &str, node_name: &str) {
+        db.execute(
+            "INSERT INTO jobs(id, issue_id, project_id, status, node_name, created_at, updated_at)
+             VALUES (?1, ?2, 'proj', ?3, ?4, 1, 1)",
+            (
+                id.to_string(),
+                issue_id.to_string(),
+                status.to_string(),
+                node_name.to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn live_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
     }
 }

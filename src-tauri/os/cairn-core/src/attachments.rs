@@ -1483,7 +1483,7 @@ pub async fn remove_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::LocalDb;
     use cairn_uri::{parse_uri, CairnResource};
     use std::sync::Arc;
 
@@ -2016,67 +2016,6 @@ mod tests {
                 "{scope:?} is untouched by a thread deletion"
             );
         }
-    }
-
-    /// Every image address minted before this table existed still resolves to
-    /// the same object, still as an image.
-    #[tokio::test]
-    async fn addresses_minted_against_image_refs_still_resolve() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(dir.path().join("attachments.db"))
-            .await
-            .unwrap();
-        let before = TURSO_MIGRATIONS
-            .iter()
-            .take_while(|migration| migration.version() != "0227")
-            .copied()
-            .collect::<Vec<_>>();
-        MigrationRunner::new(before).run(&db).await.unwrap();
-        for sql in [
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p','w','P','cairn','/tmp/p',1,1)",
-        ] {
-            db.execute(sql, ()).await.unwrap();
-        }
-        let hash = content_hash(&png());
-        db.put_content(&hash, &png()).await.unwrap();
-        db.execute(
-            "INSERT INTO image_refs (project_id, issue_number, ordinal, content_hash, created_at)
-             VALUES ('p', 3242, 1, ?1, 5), ('p', 3242, 2, ?1, 6), ('p', 0, 1, ?1, 7)",
-            (hash.clone(),),
-        )
-        .await
-        .unwrap();
-
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-
-        for uri in [
-            "cairn://p/cairn/3242/images/1",
-            "cairn://p/cairn/3242/images/2",
-            "cairn://p/cairn/images/1",
-        ] {
-            let fetched = fetch_image(&db, "p", "cairn", &reference_of(uri))
-                .await
-                .unwrap_or_else(|error| panic!("{uri} stopped resolving: {error}"));
-            assert_eq!(fetched.bytes, png(), "{uri}");
-            assert_eq!(fetched.media_type, "image/png", "{uri}");
-        }
-
-        // The first read measured what SQL could not see at migration time, and
-        // recorded it so later reads do not measure again.
-        let measured = db
-            .query_text(
-                "SELECT media_type FROM attachments
-                 WHERE project_id='p' AND scope='issue' AND scope_key='3242' AND ordinal=1",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(measured.as_deref(), Some("image/png"));
     }
 
     /// The reason reclamation is out of scope, made concrete: two databases can

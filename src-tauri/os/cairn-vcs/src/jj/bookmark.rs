@@ -8,11 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 static FAIL_NEXT_LOCAL_BOOKMARKS_AT: AtomicBool = AtomicBool::new(false);
 
-#[cfg(test)]
-pub(crate) fn fail_next_local_bookmarks_at() {
-    FAIL_NEXT_LOCAL_BOOKMARKS_AT.store(true, Ordering::SeqCst);
-}
-
 /// Query only candidate bookmark names in one structured jj invocation. An
 /// empty candidate set is resolved without spawning jj.
 pub fn query_local_bookmarks(

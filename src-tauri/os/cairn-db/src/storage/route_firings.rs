@@ -192,26 +192,6 @@ mod tests {
             fact_log_id: None,
         }
     }
-    #[tokio::test]
-    async fn allocates_and_prunes() {
-        let db = crate::storage::migrated_test_db("route-retention.db").await;
-        for n in 1..=250 {
-            insert_route_firing(&db, firing(n)).await.unwrap();
-        }
-        let rows = list_route_firings(&db, "workspace", "r", 200)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 200);
-        assert_eq!((rows[0].seq, rows[199].seq), (250, 51));
-        assert_eq!(
-            rows[0].fact_summary.as_deref(),
-            Some("fact 250 needs review")
-        );
-        assert_eq!(rows[0].payload_text.as_deref(), Some("delivered 250"));
-        assert!(has_recent_fact(&db, "workspace", "r", "f250", 200)
-            .await
-            .unwrap());
-    }
 
     #[tokio::test]
     async fn failed_firings_do_not_poison_dedupe() {

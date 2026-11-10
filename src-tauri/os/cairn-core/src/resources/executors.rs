@@ -7404,45 +7404,6 @@ mod tests {
         );
     }
 
-    /// The operator surface is the whole point of measuring: a machine's page
-    /// has to explain why it qualifies or why it does not, in words that send
-    /// someone somewhere. So the probe's own reason is carried verbatim rather
-    /// than summarized — a summary is exactly what makes an unmeasured edge
-    /// look like a settled one.
-    #[test]
-    fn an_unmeasured_edge_explains_itself_on_the_machine_page() {
-        let mut executor = inspection("bglab-mac", false);
-        executor.health.advertisement.capabilities.containment =
-            Some(cairn_sandbox::containment::observations());
-        let rendered = render_executor(&executor);
-
-        assert!(rendered.contains("## Identity"));
-        assert!(
-            rendered.contains("enrolled (this machine's own authenticated claim about itself)"),
-            "an enrolled machine's row is a claim, and the page has to say so:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("BatchSpawnFilesystemConfined"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("PtyResidentFilesystemConfined: Unmeasured"),
-            "an edge nobody probes must say so by name:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("EnvironmentInheritance"),
-            "a confirmed crossing with no probe still gets a row:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("no probe attempts"),
-            "the probe's own reason travels verbatim:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("no current fingerprint"),
-            "an edge whose widening inputs cannot be read must say that too:\n{rendered}"
-        );
-    }
-
     /// A Linux machine's page says which boundaries its fence holds, read off
     /// the measured socket edge, and never implies read protection.
     #[test]

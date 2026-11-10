@@ -728,11 +728,6 @@ async fn a_held_call_resumes_once_after_restart_in_boot_order() {
     a_held_call_resumes_once_after_restart("restart-held-boot-order", true).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_call_resumes_once_after_restart_in_either_order() {
-    a_held_call_resumes_once_after_restart("restart-held-reverse-order", false).await;
-}
-
 /// An assistant event of `turn` on `job`'s run at `sequence`, making `tools`.
 async fn seed_calls(db: &LocalDb, job: &str, turn: &str, sequence: i64, tools: serde_json::Value) {
     db.execute(

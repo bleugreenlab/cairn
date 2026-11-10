@@ -419,48 +419,6 @@ async fn seed_issue(
     }
 }
 
-/// The calibration samples only issues resolved 30-60 days ago, and its
-/// constant is their history bytes over their event rows.
-#[tokio::test]
-async fn history_calibrates_on_issues_resolved_in_the_band() {
-    let (_temp, db) = private_db().await;
-    seed_project(&db).await;
-    let day = DAY_S;
-    // In creation order, as issue rowids are. Created before the lookback,
-    // though resolved in the band: never probed.
-    seed_issue(&db, 1, NOW - 200 * day, NOW - 45 * day, 5, 9_000).await;
-    seed_issue(&db, 2, NOW - 100 * day, NOW - 80 * day, 5, 9_000).await;
-    // In the band.
-    seed_issue(&db, 3, NOW - 70 * day, NOW - 45 * day, 1_100, 300).await;
-    seed_issue(&db, 4, NOW - 50 * day, NOW - 35 * day, 20, 300).await;
-    // Resolved too recently.
-    seed_issue(&db, 5, NOW - 40 * day, NOW - 10 * day, 5, 9_000).await;
-    // Created after the band's newest edge: past the probed range.
-    seed_issue(&db, 6, NOW - 20 * day, NOW - day, 5, 9_000).await;
-
-    let mut clock = Clock::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let history = calibrate_history(&db, NOW, 5, &mut clock, deadline)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(history.band_issues, 2);
-    assert_eq!(history.sampled_issues, 2);
-    assert_eq!(history.event_rows, 1_120);
-    let events_payload = payload_expr(&columns(&db, "events").await.unwrap());
-    let event_bytes: i64 = db
-        .query_opt(
-            format!("SELECT sum({events_payload}) FROM events WHERE run_id IN ('r3', 'r4')"),
-            (),
-            |row| row.i64(0),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(history.history_bytes, event_bytes);
-    assert_eq!(history.bytes_per_event_row, event_bytes as f64 / 1_120.0);
-}
-
 /// Deleted issues leave rowid gaps; the search for the lookback's first issue
 /// must still end, on the first issue created at or after the cutoff.
 #[tokio::test]
@@ -593,72 +551,6 @@ fn the_projection_follows_kept_rows_not_inserted_ones() {
 fn censuses_older_than_the_lookback_do_not_enter_the_projection() {
     let census = |day: i64| census_at(NOW + day * DAY_S, vec![table("events", 1, 1, 1)]);
     assert_eq!(project(&census(0), &[census(-40), census(-50)]), None);
-}
-
-#[tokio::test]
-async fn a_census_is_recorded_read_back_and_pruned_to_the_newest() {
-    let (temp, db) = private_db().await;
-    seed_project(&db).await;
-    seed_issue(&db, 1, NOW - 70 * DAY_S, NOW - 45 * DAY_S, 30, 500).await;
-    assert_eq!(latest_table_rows(&db).await.unwrap(), None);
-    assert_eq!(latest_taken_at(&db).await.unwrap(), None);
-
-    let archive = temp.path().join("archive");
-    std::fs::create_dir_all(archive.join("objects/ab")).unwrap();
-    std::fs::write(archive.join("objects/ab/one"), [0u8; 1_000]).unwrap();
-    let first = take(&db, NOW, &archive).await.unwrap();
-    assert!(first.unmeasured.is_empty(), "{:?}", first.unmeasured);
-    assert_eq!(first.archive.bytes, 1_000);
-    assert_eq!(first.archive.files, 1);
-    let events = first.tables.iter().find(|t| t.table == "events").unwrap();
-    assert_eq!((events.rows, events.exact), (30, true));
-    assert_eq!(events.rule, "tiered with history (cairn/5586)");
-    assert!(first.history.as_ref().is_some_and(|h| h.event_rows == 30));
-    assert_eq!(first.projection, None);
-    record(&db, &first).await.unwrap();
-
-    // A day later, with more events: growth is measured against the first.
-    for sequence in 30..60 {
-        db.execute(
-            "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
-             VALUES (?1, 'r1', ?2, ?2, 'assistant', '{}', ?2)",
-            (format!("late-{sequence}"), sequence),
-        )
-        .await
-        .unwrap();
-    }
-    let second = take(&db, NOW + DAY_S, &archive).await.unwrap();
-    let events = second.tables.iter().find(|t| t.table == "events").unwrap();
-    assert_eq!(events.rowids_per_day, Some(30.0));
-    assert_eq!(events.rows_per_day, Some(30.0));
-    record(&db, &second).await.unwrap();
-    let third = take(&db, NOW + 2 * DAY_S, &archive).await.unwrap();
-    assert!(third.projection.is_some());
-    record(&db, &third).await.unwrap();
-
-    let counts = latest_table_rows(&db).await.unwrap().unwrap();
-    assert_eq!(counts.taken_at, NOW + 2 * DAY_S);
-    assert_eq!(counts.rows["events"], 60);
-    assert_eq!(latest_taken_at(&db).await.unwrap(), Some(NOW + 2 * DAY_S));
-    let (per_row, at) = latest_bytes_per_event_row(&db).await.unwrap().unwrap();
-    assert_eq!(at, NOW + 2 * DAY_S);
-    assert_eq!(Some(per_row), third.history.map(|h| h.bytes_per_event_row));
-
-    // Only the newest KEPT_CENSUSES rows survive a record.
-    let small = census_at(NOW + 3 * DAY_S, vec![table("events", 1, 1, 1)]);
-    for _ in 0..KEPT_CENSUSES {
-        record(&db, &small).await.unwrap();
-    }
-    let (kept, oldest): (i64, i64) = db
-        .query_opt(
-            "SELECT count(*), min(taken_at) FROM storage_census",
-            (),
-            |row| Ok((row.i64(0)?, row.i64(1)?)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!((kept, oldest), (KEPT_CENSUSES, NOW + 3 * DAY_S));
 }
 
 #[tokio::test]

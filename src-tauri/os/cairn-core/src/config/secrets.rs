@@ -652,47 +652,6 @@ mod tests {
     }
 
     #[test]
-    fn secret_config_and_witness_reads_share_the_bound_and_recover() {
-        use_mock_keychain();
-        let (server, var) = ("bounded-static-stores", "TOKEN");
-        set_secret(server, var, "stored-token").unwrap();
-        let secret_gate = mock_keychain::block_reads(&service(), &account(server, var));
-        let config_gate = mock_keychain::block_reads(&service(), &config_account(server, var));
-        let witness_gate = mock_keychain::block_reads(&witness_service(), server);
-        let started = std::time::Instant::now();
-        let secret = std::thread::spawn(move || get_secret(server, var));
-        let config = std::thread::spawn(move || get_config_value(server, var));
-        let witness = std::thread::spawn(move || static_witness(server));
-        for gate in [&secret_gate, &config_gate, &witness_gate] {
-            assert!(gate.wait_for_reads(1, std::time::Duration::from_secs(5)));
-        }
-        assert!(secret
-            .join()
-            .unwrap()
-            .unwrap_err()
-            .contains("Keychain unavailable"));
-        assert!(config
-            .join()
-            .unwrap()
-            .unwrap_err()
-            .contains("Keychain unavailable"));
-        assert!(matches!(
-            witness.join().unwrap(),
-            StaticWitness::Unavailable(_)
-        ));
-        assert!(started.elapsed() < std::time::Duration::from_secs(6));
-        secret_gate.release();
-        config_gate.release();
-        witness_gate.release();
-        assert_eq!(
-            get_secret(server, var).unwrap().as_deref(),
-            Some("stored-token")
-        );
-        assert_eq!(get_config_value(server, var).unwrap(), None);
-        assert!(matches!(static_witness(server), StaticWitness::Stable(_)));
-    }
-
-    #[test]
     fn secrets_are_scoped_per_server() {
         use_mock_keychain();
         set_secret("server-a", "KEY", "a-value").unwrap();

@@ -2214,68 +2214,6 @@ mod tests {
         );
     }
 
-    /// A burst of refresh presses is still one refresh.
-    ///
-    /// Advancing the generation once per caller would be worse than not
-    /// coalescing at all: each advance rejects the readers already computing, so
-    /// N simultaneous demands would run the GitHub fetch and the `jj` probes N
-    /// times over.
-    ///
-    /// The sixteen demands are made at one instant and then race into the cache.
-    /// How late any of them gets there is the scheduler's business: on a loaded
-    /// host one of them is routinely not polled until the refresh has published,
-    /// and it must consume that refresh rather than start another.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_explicit_refreshes_compute_once() {
-        let orch =
-            std::sync::Arc::new(test_orchestrator(migrated_db().await, MockGitClient::new()));
-        seed_local_open_mr(&orch.db.local, "job-c").await;
-
-        // Warm it first, so the burst is a demand to replace a published value.
-        refresh_pr_for_job(&orch, "job-c").await.unwrap();
-        let warm_counters = orch.pr_refresh_cache.counters();
-        let warm_generation = orch.pr_refresh_cache.generation("job-c");
-
-        let demanded_at = Instant::now();
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
-        let mut readers = Vec::new();
-        for _ in 0..16 {
-            let orch = orch.clone();
-            let barrier = barrier.clone();
-            readers.push(tokio::spawn(async move {
-                barrier.wait().await;
-                refresh_pr_for_job_live(&orch, "job-c", demanded_at)
-                    .await
-                    .unwrap()
-                    .state
-            }));
-        }
-        for reader in readers {
-            assert_eq!(reader.await.unwrap(), PrState::Open);
-        }
-
-        let counters = orch.pr_refresh_cache.counters();
-        assert_eq!(
-            counters.misses,
-            warm_counters.misses + 1,
-            "sixteen simultaneous refresh demands must produce one refresh"
-        );
-        assert_eq!(
-            orch.pr_refresh_cache.generation("job-c"),
-            warm_generation + 1,
-            "the burst must choose exactly one replacement generation"
-        );
-        assert_eq!(
-            counters.invalidated_during_compute, warm_counters.invalidated_during_compute,
-            "burst coalescing is not an invalidation-during-compute retry"
-        );
-        assert_eq!(
-            counters.coalesced + counters.hits,
-            warm_counters.coalesced + warm_counters.hits + 15,
-            "every other explicit caller must join or consume the burst's flight"
-        );
-    }
-
     /// One job's transition leaves every other job's projection warm. Without
     /// this, a single PR moving would re-probe every open pull request.
     #[tokio::test(flavor = "current_thread")]

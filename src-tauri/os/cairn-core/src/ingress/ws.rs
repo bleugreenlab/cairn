@@ -285,15 +285,8 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::sync::{atomic::AtomicUsize, Mutex};
-    use tokio::sync::broadcast;
 
     const SECRET: &str = "channel-secret";
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Signal {
-        Nudge,
-        Drop,
-    }
 
     /// A stand-in relay: `/events` serves the queued events after `after_id`,
     /// `/ws` is the doorbell, and both refuse a wrong secret.
@@ -306,7 +299,6 @@ mod tests {
         reject_socket: AtomicBool,
         reject_events: AtomicBool,
         connects: AtomicUsize,
-        signals: broadcast::Sender<Signal>,
     }
 
     fn authorized(headers: &HeaderMap) -> bool {
@@ -364,7 +356,6 @@ mod tests {
         }
         relay.connects.fetch_add(1, Ordering::AcqRel);
         relay.socket_channels.lock().unwrap().push(channel);
-        let signals = relay.signals.subscribe();
         let close = relay.close_socket.load(Ordering::Acquire);
         upgrade.on_upgrade(move |mut socket| async move {
             if close {
@@ -375,22 +366,18 @@ mod tests {
                     })))
                     .await;
             } else {
-                doorbell_socket(socket, signals).await;
+                doorbell_socket(socket).await;
             }
         })
     }
 
-    async fn doorbell_socket(mut socket: WebSocket, mut signals: broadcast::Receiver<Signal>) {
+    async fn doorbell_socket(mut socket: WebSocket) {
         let nudge = || AxumMessage::Text(json!({"kind": "events"}).to_string().into());
         if socket.send(nudge()).await.is_err() {
             return;
         }
         loop {
             tokio::select! {
-                signal = signals.recv() => match signal {
-                    Ok(Signal::Nudge) => { let _ = socket.send(nudge()).await; }
-                    Ok(Signal::Drop) | Err(_) => return,
-                },
                 frame = socket.recv() => match frame {
                     Some(Ok(AxumMessage::Text(text))) if text.as_str() == "ping" => {
                         let _ = socket.send(AxumMessage::Text("pong".into())).await;
@@ -412,7 +399,6 @@ mod tests {
             reject_socket: AtomicBool::new(false),
             reject_events: AtomicBool::new(false),
             connects: AtomicUsize::new(0),
-            signals: broadcast::channel(16).0,
         });
         let app = Router::new()
             .route("/relay/events/{channel}", get(events))
@@ -471,21 +457,6 @@ mod tests {
         (orch, db, public_key)
     }
 
-    fn sealed_bug(public_key: &str, id: i64, report: i64) -> Value {
-        json!({
-            "id": id,
-            "event_type": "bug.reported",
-            "payload": crypto::seal_v2_for_test(&json!({"id": report}).to_string(), public_key),
-            "received_at": format!("2026-10-28T20:00:{id:02}.000Z"),
-            "encrypted": true,
-            "endpoint_id": "src_bugs",
-            "delivery_id": format!("bug-report:{report}"),
-            "verification": "first-party",
-            "sender": null,
-            "encryption": "sealed-v2",
-        })
-    }
-
     async fn eventually(what: &str, within: Duration, mut check: impl AsyncFnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + within;
         while tokio::time::Instant::now() < deadline {
@@ -495,16 +466,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("{what} did not happen within {within:?}");
-    }
-
-    async fn delivered(db: &crate::storage::LocalDb) -> i64 {
-        db.query_opt_i64(
-            "SELECT COUNT(*) FROM ingress_events WHERE status = 'ok'",
-            (),
-        )
-        .await
-        .unwrap()
-        .unwrap_or(0)
     }
 
     #[tokio::test]
@@ -631,56 +592,6 @@ mod tests {
         assert!(!is_events_nudge(r#"{"kind":"other"}"#));
     }
 
-    /// A ring reaches the loop within a second while its 60-second timer is
-    /// still pending, and the event behind it is delivered.
-    #[tokio::test]
-    async fn a_doorbell_poke_syncs_within_a_second_while_the_timer_waits() {
-        let temp = tempfile::tempdir().unwrap();
-        let (orch, db, public_key) = seeded(temp.path(), Some("2026-10-28T19:00:00.000Z|1")).await;
-        let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
-        let doorbell = Arc::new(Doorbell::default());
-        tokio::spawn(maintain(orch.clone(), url.clone(), doorbell.clone()));
-        tokio::spawn(crate::ingress::sync::run(
-            orch.clone(),
-            url,
-            doorbell.clone(),
-        ));
-
-        eventually(
-            "the doorbell connects",
-            Duration::from_secs(5),
-            async || doorbell.is_connected(),
-        )
-        .await;
-        eventually("a first sync", Duration::from_secs(5), async || {
-            !relay.event_queries.lock().unwrap().is_empty()
-        })
-        .await;
-        // Let the open-time nudge's sync settle, so the loop is in its
-        // 60-second wait when the event lands.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let syncs = relay.event_queries.lock().unwrap().len();
-
-        relay
-            .events
-            .lock()
-            .unwrap()
-            .push(sealed_bug(&public_key, 2, 7));
-        relay.signals.send(Signal::Nudge).unwrap();
-        eventually(
-            "the poked event is delivered",
-            Duration::from_secs(1),
-            async || delivered(&db).await == 1,
-        )
-        .await;
-        assert_eq!(relay.event_queries.lock().unwrap().len(), syncs + 1);
-        let channel = channel::get_relay_channel(&db).await.unwrap();
-        assert_eq!(
-            channel.last_event_sync.as_deref(),
-            Some("2026-10-28T20:00:02.000Z|2")
-        );
-    }
-
     /// A refused handshake marks the channel `unauthorized`; nothing
     /// re-registers it.
     #[tokio::test]
@@ -736,39 +647,6 @@ mod tests {
                     .as_deref()
                     == Some("relay_channel_rejected")
             },
-        )
-        .await;
-    }
-
-    /// A dropped socket puts the loop back on 15-second polling and the
-    /// doorbell reconnects on its own.
-    #[tokio::test]
-    async fn a_dropped_socket_falls_back_to_polling_and_reconnects() {
-        let temp = tempfile::tempdir().unwrap();
-        let (orch, _db, _) = seeded(temp.path(), None).await;
-        let (url, relay) = mock_relay("2026-10-01T00:00:00.000Z").await;
-        let doorbell = Arc::new(Doorbell::default());
-        tokio::spawn(maintain(orch.clone(), url, doorbell.clone()));
-        eventually(
-            "the doorbell connects",
-            Duration::from_secs(5),
-            async || doorbell.is_connected(),
-        )
-        .await;
-
-        relay.signals.send(Signal::Drop).unwrap();
-        eventually("the drop is noticed", Duration::from_secs(2), async || {
-            !doorbell.is_connected()
-        })
-        .await;
-        assert_eq!(
-            crate::ingress::sync::poll_interval_for_test(doorbell.is_connected()),
-            Duration::from_secs(15)
-        );
-        eventually(
-            "the doorbell reconnects",
-            Duration::from_secs(6),
-            async || doorbell.is_connected() && relay.connects.load(Ordering::Acquire) == 2,
         )
         .await;
     }

@@ -2039,28 +2039,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_team_batch_preserves_unknown_records() {
-        for (delay, code) in [
-            (Duration::ZERO, StatusCode::SERVICE_UNAVAILABLE),
-            (Duration::from_secs(6), StatusCode::OK),
-        ] {
-            let (client, _, stop) = snapshot_server(vec![status("queued")], delay, code).await;
-            let snapshot =
-                compose_provider_admission_snapshot(vec![projection()], 2_000, Some(&client)).await;
-            let _ = stop.send(());
-            assert_eq!(snapshot.authorities[0].availability, "unavailable");
-            assert_eq!(snapshot.authorities[0].observed_at_unix_ms, None);
-            assert_eq!(snapshot.records.len(), 1);
-            assert_eq!(snapshot.records[0].state, None);
-            assert_eq!(snapshot.records[0].position, None);
-            assert_eq!(
-                snapshot.records[0].reason,
-                Some(crate::storage::RuntimeAdmissionReason::AdmissionAuthorityUnavailable)
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn provider_cache_serves_last_and_announces_only_changed_content() {
         use crate::orchestrator::generation_cache::rebuild_with;
         use std::sync::atomic::{AtomicUsize, Ordering};

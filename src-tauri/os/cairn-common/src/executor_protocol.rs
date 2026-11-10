@@ -5669,6 +5669,11 @@ pub struct LearnedResourceEstimate {
 /// yet records the `Unknown` sync cost and absent distance every peer already
 /// reads. What a runner gets wrong talking to an older executor: nothing.
 ///
+/// cairn/6770 does not move the number. It deletes tests, and the test-only
+/// fixtures and mocks they alone used, from executor-compiled and runner
+/// files; no production frame, variant, field or behaviour changes. What a
+/// runner gets wrong talking to an older executor: nothing.
+///
 /// cairn/5457 does not move the number. No frame, variant or field changes.
 /// The runner now also reads the `ProcessItemStarted` and
 /// `ProcessItemCompleted` callbacks of an agent's run batch, which every

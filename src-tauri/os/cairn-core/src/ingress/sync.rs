@@ -37,11 +37,6 @@ fn poll_interval(doorbell_connected: bool) -> Duration {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn poll_interval_for_test(doorbell_connected: bool) -> Duration {
-    poll_interval(doorbell_connected)
-}
-
 #[derive(Debug, Deserialize)]
 struct RelayResponse {
     events: Vec<RelayEvent>,

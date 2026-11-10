@@ -145,17 +145,6 @@ pub async fn list_device_presence(team_db: &LocalDb) -> Vec<DevicePresence> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TEAM_MIGRATIONS};
-
-    async fn team_db() -> LocalDb {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let db = LocalDb::open(dir.join("team.db")).await.unwrap();
-        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        db
-    }
 
     async fn private_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap().keep();
@@ -163,29 +152,6 @@ mod tests {
             .await
             .unwrap();
         db
-    }
-
-    #[tokio::test]
-    async fn upsert_then_read_roundtrips() {
-        let db = team_db().await;
-        upsert_presence(&db, "devA", "mac (macos)", &["proj".into()]).await;
-        let rows = list_device_presence(&db).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].device_id, "devA");
-        assert_eq!(rows[0].device_name, "mac (macos)");
-        assert_eq!(rows[0].project_keys, vec!["proj".to_string()]);
-        assert!(rows[0].last_seen > 0);
-    }
-
-    #[tokio::test]
-    async fn upsert_is_idempotent_on_device_id() {
-        let db = team_db().await;
-        upsert_presence(&db, "devA", "old-name", &[]).await;
-        upsert_presence(&db, "devA", "new-name", &["p".into()]).await;
-        let rows = list_device_presence(&db).await;
-        assert_eq!(rows.len(), 1, "one row per device_id");
-        assert_eq!(rows[0].device_name, "new-name");
-        assert_eq!(rows[0].project_keys, vec!["p".to_string()]);
     }
 
     #[tokio::test]

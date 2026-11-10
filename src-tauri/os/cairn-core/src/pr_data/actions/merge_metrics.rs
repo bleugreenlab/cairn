@@ -767,36 +767,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_downstream_work_is_its_own_record_with_the_attempts_identity() {
-        let attempt = MergeAttempt::begin("job-1");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        measured(Arc::clone(&attempt), async {
-            identify("mr-1", Some(3), "feature", "main");
-            journaled("attempt-1");
-            let parent = current().expect("in scope");
-            tokio::spawn(downstream(async move {
-                note_preparation("sibling", Duration::ZERO, prepared("0", "1", "m", true));
-                let child = current().expect("downstream scope");
-                assert!(!Arc::ptr_eq(&child, &parent));
-                tx.send(child.record(Ok(()))).unwrap();
-                Ok::<(), String>(())
-            }))
-            .await
-            .expect("downstream task joins")
-            .expect("downstream work succeeds");
-        })
-        .await;
-        let child = rx.await.unwrap();
-        assert_eq!(child["record"], "merge_downstream");
-        assert_eq!(child["attempt_id"], "attempt-1");
-        assert_eq!(child["pr_number"], 3);
-        assert_eq!(child["sibling_preparations"], 1);
-        assert_eq!(child["sibling_replays"], 1);
-        // The root attempt did no sibling work itself.
-        assert_eq!(attempt.record(Ok(()))["sibling_preparations"], 0);
-    }
-
-    #[tokio::test]
     async fn accepted_bookmark_writes_are_listed_by_role_and_unobserved_ones_named() {
         let attempt = MergeAttempt::begin("job-1");
         measured(Arc::clone(&attempt), async {

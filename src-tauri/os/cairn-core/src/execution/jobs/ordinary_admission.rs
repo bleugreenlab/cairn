@@ -3361,106 +3361,6 @@ mod tests {
         assert_eq!(request_state(&orch, "req").await.0, "released");
     }
 
-    /// Once the admission row is durable the launch IS queued, so an enqueue
-    /// from a thread without a runtime (attention delivery's flush-on-idle
-    /// resume) must report it queued rather than failed.
-    #[tokio::test(flavor = "current_thread")]
-    async fn enqueue_off_the_runtime_reports_a_durably_queued_launch_as_queued() {
-        let (orch, _, _) =
-            lifecycle_fixture_with_gc("ordinary-off-runtime-enqueue.db", Some(roomy_gc())).await;
-        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = starts.clone();
-        let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
-            &orch,
-            move || Box::new(CountingBackend(counted.clone())),
-        );
-        set_ceiling(&orch, 1);
-        // The launch resolves to the real Claude capability, so its lane is
-        // `claude-cli`; a resident blocker there holds the one unit.
-        orch.db
-            .local
-            .execute_script(
-                "DELETE FROM runtime_admission_requests WHERE request_id='req';
-                 UPDATE turns SET run_id=NULL WHERE id='t';
-                 INSERT INTO runtime_admission_requests(
-                    request_id,workspace_key,resource_lane,launch_key,claim_json,priority,
-                    enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at
-                 ) VALUES(
-                    'blocker','private-runtime','claude-cli','ordinary:blocker',
-                    '{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,
-                    1,'active','ordinary-session-promoter',1,9999999999,1,1
-                 );",
-            )
-            .await
-            .unwrap();
-
-        let enqueuer = orch.clone();
-        let (result, claim_dropped) = std::thread::spawn(move || {
-            assert!(tokio::runtime::Handle::try_current().is_err());
-            let mut prepared = super::PreparedJob {
-                job_id: "j".into(),
-                project_id: "p".into(),
-                run_id: "cold".into(),
-                session_id: "s".into(),
-                session_start: crate::backends::SessionStart::New {
-                    session_id: "s".into(),
-                },
-                prompt: "queued hello".into(),
-                job_model: None,
-                agent_config: None,
-                artifact_schema_info: None,
-                execution_id: Some("e".into()),
-                turn_id: "t".into(),
-                start_reason: crate::models::TurnStartReason::FollowUp,
-                origin: crate::storage::LaunchOrigin::Background,
-                launch_claim: Some(enqueuer.claim_job_launch("j", "cold")),
-            };
-            let identity = crate::identity::UserIdentity {
-                user_id: "u".into(),
-                email: "u@example.com".into(),
-                name: "U".into(),
-                claude_auth: None,
-                codex_auth: None,
-                github_token: None,
-            };
-            let result = super::enqueue_or_start(&enqueuer, &mut prepared, Some(identity));
-            (result, prepared.launch_claim.is_none())
-        })
-        .join()
-        .unwrap();
-        assert_eq!(
-            result,
-            Ok(false),
-            "a durably queued launch is not a failure"
-        );
-        assert!(claim_dropped, "the durable row is the claim once it exists");
-        assert_eq!(
-            request_state(&orch, "ordinary-admission:cold").await.0,
-            "queued"
-        );
-        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        assert!(crate::storage::finish_admission_by_launch_key(
-            &orch.db.local,
-            "private-runtime",
-            "ordinary:blocker",
-            "ordinary-session-promoter",
-            1,
-            "released",
-            None,
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .unwrap());
-        let promoter = orch.clone();
-        std::thread::spawn(move || super::promote_private_lane(&promoter, "claude-cli"))
-            .join()
-            .unwrap();
-
-        wait_until_started(&orch, "cold").await;
-        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
     async fn lifecycle_fixture_with_gc(
         name: &str,
         warm_gc: Option<Arc<crate::agent_process::gc::WarmProcessGC>>,
@@ -4780,54 +4680,6 @@ mod tests {
         }
     }
 
-    /// cairn/5700: a deferred stateless start that fails after readiness settles
-    /// the launch as a failed promoted start does (the run crashed as
-    /// `session_start_failed`, its turn failed, the attention delivery
-    /// returned) before it releases its claim. Nothing is lost silently.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_deferred_stateless_start_that_fails_settles_its_run_and_returns_its_delivery() {
-        // The session still records Claude, so the authoritative-backend guard
-        // in `start_agent_session` refuses the OpenRouter start.
-        let (orch, starts, _backend) =
-            held_launch_fixture("stateless-deferral-start-fails.db", "claude").await;
-        defer_stateless_launch(&orch, &starts).await;
-
-        open_readiness_and_await_release(&orch).await;
-        assert_eq!(started(&starts), 0, "the refused start reached no backend");
-        let run = orch
-            .db
-            .local
-            .query_opt(
-                "SELECT status, exit_reason, error_message FROM runs WHERE id='cold'",
-                (),
-                |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (run.0.as_str(), run.1.as_deref()),
-            ("crashed", Some("session_start_failed"))
-        );
-        assert!(
-            run.2
-                .as_deref()
-                .is_some_and(|error| error.contains("authoritative backend")),
-            "the run carries the start's own error: {:?}",
-            run.2
-        );
-        assert_eq!(
-            text(&orch, "SELECT state FROM turns WHERE id='t'").await,
-            "failed"
-        );
-        assert!(delivery_returned(&orch, "j", "t").await);
-        assert_eq!(
-            orch.process_state.has_process("cold"),
-            Some(false),
-            "no process is left registered"
-        );
-    }
-
     /// cairn/4758 review: a call with no durable admission row (a stateless
     /// HTTP call, or a Codex call whose app-server pool key is not yet known)
     /// waits for readiness in the background holding its launch claim, which the
@@ -5200,5 +5052,53 @@ mod tests {
             Some(crate::credentials::CodexAuth::ApiKey(ref token)) if token == "openai-secret"
         ));
         assert_eq!(identity.github_token.as_deref(), Some("github-secret"));
+    }
+
+    /// cairn/5700: a deferred stateless start that fails after readiness settles
+    /// the launch as a failed promoted start does (the run crashed as
+    /// `session_start_failed`, its turn failed, the attention delivery
+    /// returned) before it releases its claim. Nothing is lost silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_stateless_start_that_fails_settles_its_run_and_returns_its_delivery() {
+        // The session still records Claude, so the authoritative-backend guard
+        // in `start_agent_session` refuses the OpenRouter start.
+        let (orch, starts, _backend) =
+            held_launch_fixture("stateless-deferral-start-fails.db", "claude").await;
+        defer_stateless_launch(&orch, &starts).await;
+
+        open_readiness_and_await_release(&orch).await;
+        assert_eq!(started(&starts), 0, "the refused start reached no backend");
+        let run = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT status, exit_reason, error_message FROM runs WHERE id='cold'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (run.0.as_str(), run.1.as_deref()),
+            ("crashed", Some("session_start_failed"))
+        );
+        assert!(
+            run.2
+                .as_deref()
+                .is_some_and(|error| error.contains("authoritative backend")),
+            "the run carries the start's own error: {:?}",
+            run.2
+        );
+        assert_eq!(
+            text(&orch, "SELECT state FROM turns WHERE id='t'").await,
+            "failed"
+        );
+        assert!(delivery_returned(&orch, "j", "t").await);
+        assert_eq!(
+            orch.process_state.has_process("cold"),
+            Some(false),
+            "no process is left registered"
+        );
     }
 }

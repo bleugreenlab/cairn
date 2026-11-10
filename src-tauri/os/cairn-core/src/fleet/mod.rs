@@ -7189,11 +7189,6 @@ impl Fleet {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn coalesced_leader_in_flight_for_test(&self, identity: &RequestIdentity) -> bool {
-        self.coalesced_leaders.lock().unwrap().contains(identity)
-    }
-
     /// Where one request's own execution stands, read by the identity it was
     /// queued under: `(request_id, attempt_id)`. A write-check batch is never
     /// coalesced, so it is read here directly rather than through a subscriber.
@@ -22852,65 +22847,6 @@ mod tests {
         assert!(matches!(gate, PurposeGate::Clear));
     }
 
-    /// The specimen itself: the only machine that could serve a lane declined
-    /// it, so the lane waits in placement for that machine's next posted state,
-    /// which may never come. Retiring it ends it there, at once, with no
-    /// offer outstanding to withdraw, and its question owes nothing.
-    #[tokio::test]
-    async fn retiring_work_no_machine_will_claim_ends_it_at_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = Arc::new(test_orchestrator(temp.path()).await);
-        let request = provenance_request();
-        let old: RequestIdentity = (request.request_id.clone(), request.attempt_id.clone());
-        orch.fleet
-            .purposes
-            .lock()
-            .unwrap()
-            .admit(debt_key(), old.clone(), 10);
-        let (generation, submitting, mut machine, offered) = offered_and_held(&orch).await;
-        orch.fleet.handle_executor_message(
-            COLOCATED_EXECUTOR_ID,
-            generation,
-            ExecutorMessage::Decline {
-                entry_id: offered.clone(),
-                reason: DeclineReason::Pressure,
-                detail: Some("no room for it".into()),
-                disk: None,
-            },
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(150), next_work_frame(&mut machine))
-                .await
-                .is_err(),
-            "a declined lane waits for the machine's next posted state"
-        );
-        assert!(orch.fleet.queue.state_of(&offered).is_some());
-        assert!(!submitting.is_finished(), "the lane waits for a machine");
-
-        orch.fleet.retire_item(&old, CancelCause::Superseded);
-
-        let executed = tokio::time::timeout(Duration::from_secs(5), submitting)
-            .await
-            .expect("retired work no machine can claim ends without one")
-            .unwrap();
-        assert!(
-            matches!(executed.outcome, CellOutcome::Cancelled { .. }),
-            "{:?}",
-            executed.outcome
-        );
-        assert!(executed.abandoned_grant.is_none(), "nothing was granted");
-        assert_eq!(orch.fleet.queue.len(), 0);
-        while let Ok(frame) = machine.try_recv() {
-            assert!(
-                !matches!(frame, ExecutorMessage::Lost { .. }),
-                "a declined offer is not outstanding, so nothing is withdrawn from the machine"
-            );
-        }
-        orch.fleet
-            .settle_leader_purpose(&old, executed.abandoned_grant);
-        assert!(!orch.fleet.purpose_owes(&debt_key()));
-    }
-
     /// Work retired while it is still being prepared is never queued at all.
     #[tokio::test]
     async fn work_retired_before_it_is_queued_never_enters_the_queue() {
@@ -23386,36 +23322,6 @@ mod tests {
         assert!(pool
             .authorize_mcp_relay("executor-1", 7, "context", &relay_request(Some("run-1")))
             .is_err());
-    }
-
-    /// More objects than both pipe buffers hold, so the walk only finishes if
-    /// `cat-file`'s answers are drained while `rev-list` is still listing.
-    #[test]
-    fn object_size_walk_streams_a_clone_sized_object_list() {
-        let repo = tempfile::tempdir().unwrap();
-        init_repo(repo.path());
-        let files = 20_000_u64;
-        for index in 0..files {
-            write_file(
-                repo.path(),
-                &format!("d{}/f{index:05}.txt", index % 100),
-                format!("{index:07}\n").as_bytes(),
-            );
-        }
-        let commit = commit_all(repo.path(), "base");
-        let repository = repo.path().to_str().unwrap();
-        let total = pricing::missing_reachable_object_bytes(repository, &commit, &[]).unwrap();
-        // Every blob is eight bytes; the commit and trees add the rest.
-        assert!(total > files * 8, "{total}");
-        assert_eq!(
-            pricing::missing_reachable_object_bytes(
-                repository,
-                &commit,
-                std::slice::from_ref(&commit)
-            )
-            .unwrap(),
-            0
-        );
     }
 
     /// The acceptance case for the whole issue: a command that outlives the
@@ -24861,25 +24767,6 @@ mod tests {
             reason.contains("predates containment reporting"),
             "{reason}"
         );
-    }
-
-    /// The no-composition rule at the placement boundary: a machine that has
-    /// genuinely measured its batch seam has still said nothing about its
-    /// pseudoterminal, and the refusal names which edge is missing.
-    #[test]
-    fn a_measured_batch_seam_does_not_place_a_terminal_workload() {
-        use cairn_common::executor_protocol::EdgeId;
-        let observations = cairn_sandbox::containment::observations();
-        let capabilities = containment_capabilities(Some(observations));
-
-        let terminal = ExecutorSelector {
-            containment: Some(batch_envelope(EdgeId::PtyResidentFilesystemConfined)),
-            ..ExecutorSelector::default()
-        };
-        let reason = containment_deficiency(&capabilities, &terminal)
-            .expect("no probe measures the pseudoterminal seam yet");
-        assert!(reason.contains("PtyResidentFilesystem"), "{reason}");
-        assert!(reason.contains("no probe attempts"), "{reason}");
     }
 
     /// A parallel batch runs as many items at once as it was charged for, so it
@@ -28393,26 +28280,6 @@ mod tests {
         assert_eq!(placed.selected.executor_id, "fedora");
     }
 
-    /// cairn/4931 specimen B, as placement sees it: a ~12 GiB home whose
-    /// reservation cap is exactly the 8,282,086,656 bytes it once reported as a
-    /// cargo test's requirement, a measured demand above that cap, and a second
-    /// machine with room. `other_budget` sizes the second machine.
-    async fn ceiling_fleet(
-        db_name: &str,
-        other_budget: u64,
-        other_cpu: f64,
-        other_available: u64,
-    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
-        ceiling_fleet_with(
-            db_name,
-            Some(other_budget),
-            true,
-            other_cpu,
-            other_available,
-        )
-        .await
-    }
-
     /// [`ceiling_fleet`], where the second machine may state no budget and may
     /// never have run the command itself (cold, so it borrows the fleet's).
     async fn ceiling_fleet_with(
@@ -29193,167 +29060,6 @@ mod tests {
         request
     }
 
-    /// The home is healthy for everything it can hold, and this is not one of
-    /// those things. Queueing the batch there runs it into the home's memory
-    /// limit, so it is refused at once, naming the machine that can hold it.
-    #[tokio::test]
-    async fn a_pinned_batch_whose_home_can_never_hold_it_is_refused_at_once_when_another_machine_can(
-    ) {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (pool, db, request) =
-            ceiling_fleet("ceiling-home-refused.db", 100 * GIB, 0.01, 60 * GIB).await;
-        let request = pinned_to(request, "bgsrv-ub");
-        let plan = ReservationPlan::new(db, &request, None);
-
-        let started = std::time::Instant::now();
-        let refusal = pool
-            .select_executor(
-                &request,
-                Some(&plan),
-                &ActivePlacementPolicy::default_profile(),
-                None,
-            )
-            .await
-            .expect_err("a home that can never hold the batch does not take it");
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "refused on the first pass, not at the horizon"
-        );
-        let CellOutcome::Unavailable {
-            reason:
-                CellUnavailableReason::HomeCannotHold {
-                    home,
-                    ceiling,
-                    alternative_executor_id,
-                    ..
-                },
-            diagnostic,
-        } = refusal
-        else {
-            panic!("expected HomeCannotHold, got {refusal:?}");
-        };
-        assert_eq!(home, "bgsrv-ub");
-        assert_eq!(alternative_executor_id, "bglab-mac");
-        assert_eq!(ceiling.ceiling_bytes, 8_282_086_656);
-        assert!(ceiling.estimate_bytes > ceiling.ceiling_bytes);
-        assert!(diagnostic.contains("can ever hold"), "{diagnostic}");
-
-        let decision = pool
-            .placements_naming("bgsrv-ub")
-            .into_iter()
-            .next()
-            .expect("the refusal is a recorded decision");
-        assert!(matches!(decision.outcome, PlacementOutcome::Refused { .. }));
-        assert!(decision.rejected.iter().any(|rejection| {
-            rejection.executor_id == "bgsrv-ub"
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-                )
-        }));
-    }
-
-    /// When no machine can hold it the pin holds, at the clamp, and nothing
-    /// about that is silent: every machine that could not hold it says so in
-    /// the decision, and the selection carries the ceiling it went above.
-    #[tokio::test]
-    async fn when_no_machine_can_hold_it_the_pinned_batch_runs_home_at_the_clamp_and_says_so() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (pool, db, request) =
-            ceiling_fleet("ceiling-nothing-holds.db", 10 * GIB, 0.01, 8 * GIB).await;
-        let request = pinned_to(request, "bgsrv-ub");
-        let plan = ReservationPlan::new(db, &request, None);
-
-        let placement = pool
-            .select_executor_once_with(
-                &request,
-                Some(&plan),
-                &ActivePlacementPolicy::default_profile(),
-                &HashMap::new(),
-                &AdmissionView::default(),
-                |_, _| SyncCost::Known(0),
-            )
-            .await
-            .unwrap()
-            .placed()
-            .expect("the pin holds when nothing else can hold the work");
-        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-        assert_eq!(
-            placement
-                .reservation
-                .as_ref()
-                .unwrap()
-                .reservation
-                .memory_bytes,
-            8_282_086_656,
-            "the reservation is the clamp"
-        );
-        let PlacementOutcome::Selected(selection) = &placement.decision.outcome else {
-            panic!("selected");
-        };
-        assert!(selection.memory_ceiling.is_some());
-        assert!(placement.decision.rejected.iter().any(|rejection| {
-            rejection.executor_id == "bglab-mac"
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-                )
-        }));
-        let above = placement.above_ceiling.expect("the result is told");
-        assert!(!above.holdable_elsewhere);
-        let note = above.note();
-        assert!(note.contains("no executor can hold"), "{note}");
-        assert!(note.contains("bgsrv-ub"), "{note}");
-    }
-
-    /// cairn/4931 review: a cold machine with a smaller budget than the home
-    /// is never named as the place that can hold the work, and the pin holds
-    /// at the clamp. Since cairn/6089 a borrowed process-tree total no longer
-    /// decides any machine's fit (it grew with the width the measuring machine
-    /// granted), so the cold machine's fit is unknown rather than a ceiling,
-    /// and unknown is still not "can hold it".
-    #[tokio::test]
-    async fn a_smaller_cold_machine_is_never_named_as_able_to_hold_what_its_home_cannot() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (pool, db, request) = ceiling_fleet_with(
-            "ceiling-smaller-cold.db",
-            Some(6 * GIB),
-            false,
-            0.01,
-            5 * GIB,
-        )
-        .await;
-        let request = pinned_to(request, "bgsrv-ub");
-        let plan = ReservationPlan::new(db, &request, None);
-
-        let placement = pool
-            .select_executor_once_with(
-                &request,
-                Some(&plan),
-                &ActivePlacementPolicy::default_profile(),
-                &HashMap::new(),
-                &AdmissionView::default(),
-                |_, _| SyncCost::Known(0),
-            )
-            .await
-            .expect("no HomeCannotHold naming the smaller machine")
-            .placed()
-            .expect("the pin holds");
-        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
-        assert!(!placement.decision.rejected.iter().any(|rejection| {
-            rejection.executor_id == "bglab-mac"
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-                )
-        }));
-        let above = placement.above_ceiling.unwrap();
-        assert!(!above.holdable_elsewhere && above.unknown_elsewhere);
-        assert!(above
-            .note()
-            .contains("no usable machine is known to hold it"));
-    }
-
     /// A machine with no stated budget has no measured fit either way. It is not
     /// named as able to hold the work, and the note does not claim that nothing
     /// can.
@@ -29642,76 +29348,6 @@ mod tests {
         );
     }
 
-    /// cairn/5472's specimens: the capable machines had declined on provisioning
-    /// holds, leaving one too small for the command as the only usable machine,
-    /// and the pass placed it there at the clamp. The clamp is for a fleet with
-    /// nowhere bigger to go; this one has a machine that only said "not yet", so
-    /// the work waits for it.
-    #[tokio::test]
-    async fn work_too_big_for_the_only_usable_machine_waits_for_a_capable_one_that_declined() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (pool, db, mut request) =
-            ceiling_fleet("ceiling-waits-on-decliner.db", 100 * GIB, 0.01, 60 * GIB).await;
-        request.repository = RepositoryLocator::ManagedObjects {
-            project_id: "p".into(),
-            repository_id: "repo".into(),
-            object_format: GitObjectFormat::Sha1,
-        };
-        let generation = pool.lock_connections()["bglab-mac"].generation;
-        let declined = HashMap::from([(
-            "bglab-mac".to_string(),
-            queue::EntryDecline {
-                generation,
-                reason: DeclineReason::ProjectProvisioning,
-                detail: Some("provisioning project p".into()),
-                disk: None,
-                at_unix_ms: unix_time_ms(),
-                condition: None,
-                backoff_ms: 0,
-                retry_after_unix_ms: 0,
-                superseded_at_unix_ms: None,
-            },
-        )]);
-        let plan = ReservationPlan::new(db, &request, None);
-        let policy = ActivePlacementPolicy::default_profile();
-
-        let selection = pool
-            .select_executor_once_with(
-                &request,
-                Some(&plan),
-                &policy,
-                &declined,
-                &AdmissionView::default(),
-                |_, _| SyncCost::Known(0),
-            )
-            .await
-            .unwrap();
-        let Selection::Waiting { rejected } = selection else {
-            panic!("placed at the clamp while a capable machine had only declined");
-        };
-        assert!(rejected.iter().any(|rejection| {
-            rejection.executor_id == "bgsrv-ub"
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-                )
-        }));
-        assert!(rejected.iter().any(|rejection| {
-            rejection.executor_id == "bglab-mac"
-                && matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
-        }));
-        let waiting =
-            wait_decision(&request, &policy, &rejected, &[]).expect("the wait is recorded");
-        let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
-            unreachable!("a memory wait is a waiting decision");
-        };
-        assert!(
-            diagnostic.contains("bgsrv-ub: its measured memory demand"),
-            "{diagnostic}"
-        );
-        assert!(diagnostic.contains("Waited on: bglab-mac"), "{diagnostic}");
-    }
-
     /// cairn/5731's specimen: a macOS-only whole-suite pass measured above the
     /// only Mac's ceiling, and a 125 GiB Linux machine on an executor-update
     /// hold. The Linux machine can hold the memory and can never run the work,
@@ -29928,47 +29564,6 @@ mod tests {
             ..kill
         };
         assert!(memory_kill_exclusion(&crowded, &machine(TOTAL)).is_none());
-    }
-
-    /// A big machine that is busy right now queues the work in its own
-    /// admission; a small idle one runs it into its memory limit. The ceiling
-    /// therefore outranks momentary fit and predicted speed alike.
-    #[tokio::test]
-    async fn unpinned_work_prefers_a_machine_that_can_ever_hold_it_over_a_more_idle_one_that_cannot(
-    ) {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        let (pool, db, request) =
-            ceiling_fleet("ceiling-ranking.db", 100 * GIB, 0.60, 4 * GIB).await;
-        let mut request = request;
-        request.repository = RepositoryLocator::ManagedObjects {
-            project_id: "p".into(),
-            repository_id: "repo".into(),
-            object_format: GitObjectFormat::Sha1,
-        };
-        let plan = ReservationPlan::new(db, &request, None);
-
-        let placement = pool
-            .select_executor_once_with(
-                &request,
-                Some(&plan),
-                &ActivePlacementPolicy::default_profile(),
-                &HashMap::new(),
-                &AdmissionView::default(),
-                |_, _| SyncCost::Known(0),
-            )
-            .await
-            .unwrap()
-            .placed()
-            .unwrap();
-        assert_eq!(placement.selected.executor_id, "bglab-mac");
-        assert!(placement.above_ceiling.is_none());
-        assert!(placement.decision.rejected.iter().any(|rejection| {
-            rejection.executor_id == "bgsrv-ub"
-                && matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
-                )
-        }));
     }
 
     #[test]
@@ -37355,132 +36950,6 @@ mod tests {
         assert!(matches!(result, CellOutcome::Cancelled { .. }));
     }
 
-    /// Object authority names one machine, one request, and one connection
-    /// generation, and only the runner closes it. Opening it at the claim left
-    /// it open whenever the runner then failed to dispatch: the machine never
-    /// received `Granted`, so it had nothing to fail and nothing to report, and
-    /// its read access to that request's objects survived until the connection
-    /// ended. Authority belongs to the grant, not to the claim.
-    #[tokio::test]
-    async fn a_claim_the_runner_never_grants_leaves_no_object_authority_behind() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = Arc::new(test_orchestrator(temp.path()).await);
-        let (sender, mut remote) = mpsc::unbounded_channel();
-        let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
-        let generation = orch
-            .fleet
-            .attach_advertised_executor(
-                Arc::unwrap_or_clone(advertised.advertisement),
-                sender,
-                false,
-                None,
-                None,
-            )
-            .expect("attach an enrolled machine");
-
-        let mut request = provenance_request();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        // Placement will not choose a machine it cannot see, and a fixture
-        // machine posts no measurements. The pin settles placement so this test
-        // is about what happens after the claim rather than about ranking.
-        request.pinned_executor_id = Some("remote".into());
-        // A batch naming a runner callback context this runner does not hold is
-        // the smallest pre-grant failure there is: binding that context is the
-        // last fallible step between the claim and the grant.
-        let batch = ProcessBatch {
-            files: Vec::new(),
-            runtime_packages: Vec::new(),
-            sequential: true,
-            stop_on_error: true,
-            sandbox_mode: ProcessSandboxMode::Unconfined,
-            timeout_bases: Vec::new(),
-            items: vec![cache_batch_item(Vec::new())],
-            runner_context_id: Some("a context the runner does not hold".into()),
-            execution_residency: None,
-            containment: None,
-            node_scratch: None,
-        };
-
-        let submitting = {
-            let orch = orch.clone();
-            tokio::spawn(async move {
-                orch.fleet
-                    .submit_execution(&orch, request, Some(batch))
-                    .await
-            })
-        };
-        // Answering here rather than in the spawned task keeps the receiver in
-        // hand afterwards, so what the machine did NOT hear is checkable, and
-        // bounds every wait: a runner that never offers is a failure this test
-        // reports rather than a hang.
-        let (offered, summary) = loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), remote.recv()).await {
-                Ok(Some(ExecutorMessage::DrainModeRequest { .. })) => continue,
-                Ok(Some(ExecutorMessage::Offer { entry_id, summary })) => {
-                    break (entry_id, summary)
-                }
-                Err(_) => {
-                    let outcome = submitting.await.unwrap();
-                    panic!("the runner never offered this work to the one machine attached: {outcome:?}")
-                }
-                other => panic!("the chosen machine hears an offer first, got {other:?}"),
-            }
-        };
-        let (_machine_home, machine) = claiming_machine();
-        machine_claims(&machine, &offered, &summary).await;
-        orch.fleet.handle_executor_message(
-            "remote",
-            generation,
-            ExecutorMessage::Claim {
-                entry_id: offered.clone(),
-            },
-        );
-        let outcome = submitting.await.unwrap();
-
-        assert!(
-            matches!(
-                outcome,
-                CellOutcome::Unavailable { ref diagnostic, .. }
-                    if diagnostic.contains("unknown runner callback context")
-            ),
-            "the dispatch fails after the claim, got {outcome:?}"
-        );
-        // The machine is told the grant is never coming, and nothing else: no
-        // grant, and nothing that would leave its ticket standing.
-        match remote.try_recv() {
-            Ok(frame @ ExecutorMessage::Lost { .. }) => {
-                assert!(
-                    matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == offered)
-                );
-                machine_hears(&machine, frame).await;
-            }
-            other => panic!("an abandoned claim is withdrawn with Lost, got {other:?}"),
-        }
-        assert!(
-            remote.try_recv().is_err(),
-            "a machine whose claim the runner could not dispatch never receives a grant"
-        );
-        assert_machine_released(&machine, &summary).await;
-        assert!(
-            !orch.object_plane.authorizes(
-                &ObjectTransferCoordinate {
-                    repository: RepositoryLocator::ScratchOnly {
-                        owner_id: "p".into(),
-                    }
-                    .identity(),
-                    request_id: "provenance".into(),
-                    attempt_id: "attempt".into(),
-                    executor_id: "remote".into(),
-                    connection_generation: generation,
-                },
-                "base",
-            ),
-            "a machine that never received a grant holds no authority over that request's objects"
-        );
-    }
-
     #[tokio::test]
     async fn a_drain_between_claim_and_grant_releases_the_unstarted_machine_reservation() {
         let temp = tempfile::tempdir().unwrap();
@@ -38146,35 +37615,6 @@ mod tests {
         );
     }
 
-    fn completion_fixture(
-        request_id: &str,
-        attempt_id: &str,
-    ) -> cairn_common::executor_protocol::CellCompletion {
-        cairn_common::executor_protocol::CellCompletion {
-            executor_id: COLOCATED_EXECUTOR_ID.into(),
-            request_id: request_id.into(),
-            attempt_id: attempt_id.into(),
-            owner: None,
-            command_class: Default::default(),
-            command: "bun run test:rust".into(),
-            priority: CellPriority::ReviewCheck,
-            queued_at_unix_ms: 0,
-            started_at_unix_ms: Some(0),
-            finished_at_unix_ms: 0,
-            duration_ms: 0,
-            verdict: cairn_common::executor_protocol::CellCompletionVerdict::Succeeded,
-            failure_output_tail: None,
-            transcript_event_uri: None,
-            resource_reservation: None,
-            learned_estimate: None,
-            actuals: None,
-            cached: false,
-            subscriber_count: 1,
-            served_at_unix_ms: 0,
-            result_evicted: None,
-        }
-    }
-
     /// The cairn/4912 shape: a machine is granted a batch and is never heard
     /// from about it again. The outcome the runner composes when the machine's
     /// silence ends the wait has to arrive with the account of the grant, not
@@ -38274,49 +37714,6 @@ mod tests {
             executed.outcome
         );
         assert!(executed.grant_without_result.is_none());
-    }
-
-    /// The cairn/4934 shape: the machine ran the attempt and lists it as
-    /// completed, but the result frame was lost with a dying socket. A
-    /// completion the runner has no result for is not progress, so the wait
-    /// ends on the silence bound, naming what the machine said.
-    #[tokio::test]
-    async fn a_completion_whose_result_never_arrived_ends_on_silence() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = Arc::new(test_orchestrator(temp.path()).await);
-        let (generation, submitting, _machine) = granted_and_held(&orch).await;
-        let request = provenance_request();
-
-        orch.fleet.set_executor_snapshot(
-            COLOCATED_EXECUTOR_ID,
-            generation,
-            granted_snapshot(&request, true),
-            ExecutorSubstrateReport::default(),
-        );
-        tokio::time::sleep(Duration::from_millis(TEST_CLAIMED_SILENCE_MS / 2)).await;
-        orch.fleet.set_executor_snapshot(
-            COLOCATED_EXECUTOR_ID,
-            generation,
-            FleetSnapshot {
-                recent_completions: vec![completion_fixture(
-                    &request.request_id,
-                    &request.attempt_id,
-                )],
-                ..FleetSnapshot::default()
-            },
-            ExecutorSubstrateReport::default(),
-        );
-        let executed = settled(submitting).await;
-        assert_eq!(
-            silent_accounts(&executed.outcome),
-            Some((
-                Some(ClaimedAttemptAccount::Executing),
-                ClaimedAttemptAccount::CompletedWithoutResult
-            )),
-            "{:?}",
-            executed.outcome
-        );
-        assert!(executed.grant_without_result.is_some());
     }
 
     /// What a machine's posted state says about one attempt, strongest first,
@@ -38525,175 +37922,6 @@ mod tests {
                 .expect("the next offer for the same project claims without reconnecting");
         })
         .await;
-    }
-
-    /// An entry that leaves the queue while its offer is out may already have
-    /// been claimed on the machine, with the `Claim` frame still on its way.
-    /// The dispatch that finds the entry gone must say `Lost`; otherwise the
-    /// machine's ticket holds the project until the link drops, and the
-    /// colocated link never drops.
-    #[tokio::test]
-    async fn an_entry_gone_while_offered_withdraws_the_machines_claim() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = Arc::new(test_orchestrator(temp.path()).await);
-        let (sender, mut remote) = mpsc::unbounded_channel();
-        let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
-        orch.fleet
-            .attach_advertised_executor(
-                Arc::unwrap_or_clone(advertised.advertisement),
-                sender,
-                false,
-                None,
-                None,
-            )
-            .expect("attach an enrolled machine");
-
-        let mut request = provenance_request();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        request.pinned_executor_id = Some("remote".into());
-        let submitting = {
-            let orch = orch.clone();
-            tokio::spawn(async move { orch.fleet.submit_execution(&orch, request, None).await })
-        };
-        let (offered, summary) = loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), remote.recv()).await {
-                Ok(Some(ExecutorMessage::DrainModeRequest { .. })) => continue,
-                Ok(Some(ExecutorMessage::Offer { entry_id, summary })) => {
-                    break (entry_id, summary)
-                }
-                other => panic!("the chosen machine hears an offer first, got {other:?}"),
-            }
-        };
-        let (_machine_home, machine) = claiming_machine();
-        machine_claims(&machine, &offered, &summary).await;
-
-        // The claim has not reached the runner when the entry goes.
-        assert!(orch
-            .fleet
-            .queue
-            .take(
-                &(summary.request_id.clone(), summary.attempt_id.clone()),
-                super::queue::TerminalState::Cancelled,
-                unix_time_ms(),
-            )
-            .is_some());
-        orch.fleet.binding_changed.notify_waiters();
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), submitting)
-            .await
-            .expect("the dispatch notices the entry is gone")
-            .unwrap();
-        assert!(
-            matches!(outcome, CellOutcome::Cancelled { .. }),
-            "{outcome:?}"
-        );
-
-        loop {
-            match remote.try_recv() {
-                Ok(ExecutorMessage::DrainModeRequest { .. }) => continue,
-                Ok(frame @ ExecutorMessage::Lost { .. }) => {
-                    assert!(
-                        matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == offered)
-                    );
-                    machine_hears(&machine, frame).await;
-                    break;
-                }
-                other => {
-                    panic!("an entry gone under its offer is withdrawn with Lost, got {other:?}")
-                }
-            }
-        }
-        assert_machine_released(&machine, &summary).await;
-    }
-
-    /// The offer is the machine's whole basis for admission, so it must name
-    /// the reservation the grant will carry. A whole-machine declaration is
-    /// clamped to the chosen machine's budget by placement; offered unclamped it
-    /// can never fit and is declined until its horizon, and offered as anything
-    /// other than what is granted it is charged at one size and released at
-    /// another.
-    #[tokio::test]
-    async fn an_offer_names_the_reservation_its_grant_carries() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = Arc::new(test_orchestrator(temp.path()).await);
-        let (sender, mut remote) = mpsc::unbounded_channel();
-        let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
-        let generation = orch
-            .fleet
-            .attach_advertised_executor(
-                Arc::unwrap_or_clone(advertised.advertisement),
-                sender,
-                false,
-                None,
-                None,
-            )
-            .expect("attach an enrolled machine");
-
-        let mut request = provenance_request();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        request.pinned_executor_id = Some("remote".into());
-        request.resource_reservation = ResourceReservation {
-            concurrency_units: ResourceReservation::WHOLE_MACHINE_CONCURRENCY,
-            source: ResourceReservationSource::Declared,
-            ..ResourceReservation::default()
-        };
-        let submitting = {
-            let orch = orch.clone();
-            tokio::spawn(async move { orch.fleet.submit_execution(&orch, request, None).await })
-        };
-        let (offered, summary) = loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), remote.recv()).await {
-                Ok(Some(ExecutorMessage::DrainModeRequest { .. })) => continue,
-                Ok(Some(ExecutorMessage::Offer { entry_id, summary })) => {
-                    break (entry_id, summary)
-                }
-                other => panic!("the chosen machine hears an offer first, got {other:?}"),
-            }
-        };
-        assert_ne!(
-            summary.reservation.concurrency_units,
-            ResourceReservation::WHOLE_MACHINE_CONCURRENCY,
-            "the offer carries placement's clamp, not the submitted declaration"
-        );
-        let (_machine_home, machine) = claiming_machine();
-        machine_claims(&machine, &offered, &summary).await;
-        orch.fleet.handle_executor_message(
-            "remote",
-            generation,
-            ExecutorMessage::Claim {
-                entry_id: offered.clone(),
-            },
-        );
-        let granted = loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), remote.recv()).await {
-                Ok(Some(ExecutorMessage::DrainModeRequest { .. })) => continue,
-                Ok(Some(ExecutorMessage::Granted {
-                    entry_id, request, ..
-                })) => {
-                    assert_eq!(entry_id, offered);
-                    break request;
-                }
-                other => panic!("a claimed offer is granted, got {other:?}"),
-            }
-        };
-        assert_eq!(
-            summary.reservation, granted.resource_reservation,
-            "the machine admits exactly the reservation it will run and release"
-        );
-        // The grant is consumed on the blocking pool, where the machine's link
-        // handler consumes it.
-        let consumed = {
-            let machine = machine.clone();
-            cairn_exec::blocking::offload(move || {
-                machine.consume_claim(&offered, &granted.resource_reservation)
-            })
-            .await
-        };
-        assert!(consumed);
-        submitting.abort();
     }
 
     /// A pending route records that an acquisition may have reached an executor
@@ -39794,36 +39022,6 @@ mod tests {
             PlacementOutcome::Selected(selection) => *selection,
             other => panic!("expected a selection, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn an_unpriced_pair_places_unmeasured_and_the_next_placement_reads_its_price() {
-        let (pool, walks, measures, directory) = priced_fleet();
-        let request = distance_request(directory.path());
-
-        let first = place_priced(&pool, &request);
-        assert_eq!(first.sync_cost, PlacementSyncCost::Unknown);
-        assert_eq!(first.cache_distance, None);
-
-        pool.placement_prices.settle();
-        let second = place_priced(&pool, &request);
-        assert_eq!(second.sync_cost, PlacementSyncCost::Known { bytes: 4096 });
-        assert_eq!(
-            second
-                .cache_distance
-                .map(|measured| measured.distance.files),
-            Some(3)
-        );
-        // Two candidates sharing a warm root and a slot head: one computation
-        // of each price, for this request's target.
-        assert_eq!(
-            *walks.lock().unwrap(),
-            vec![("current-target".to_owned(), vec!["warm".to_owned()])]
-        );
-        assert_eq!(
-            *measures.lock().unwrap(),
-            vec![("near".to_owned(), "current-target".to_owned())]
-        );
     }
 
     #[test]
@@ -41874,8 +41072,6 @@ mod tests {
         );
     }
 
-    use cairn_common::executor_protocol::BindingEvent;
-
     // Bound the entire scenario, including fixture setup and all join branches.
     // Keeping futures in the join means a timeout drops every acquisition too.
     async fn residency_queue_scenario(future: impl std::future::Future<Output = ()>) {
@@ -42000,41 +41196,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn residency_queue_fresh_offer_claim_grant_records_binding() {
-        residency_queue_scenario(async {
-                let temp = tempfile::tempdir().unwrap();
-                let orch = test_orchestrator(temp.path()).await;
-                let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-                let request = residency_queue_request("fresh");
-                let identity = (residency_queue_entry_id(&request.holder), RESIDENCY_ACQUIRE_ATTEMPT_ID.into());
-                let (result, ()) = tokio::join!(
-                    orch.fleet.operate_residency(&orch, ResidencyOperation::Acquire { request: request.clone() }),
-                    async {
-                        let entry = residency_queue_offer(&mut remote).await;
-                        assert!(matches!(orch.fleet.queue.state_of(&entry), Some(queue::EntryState::Offered { .. })));
-                        assert_eq!(orch.fleet.queue.len(), 1);
-                        assert!(orch.fleet.residency_routes.lock().unwrap().is_empty());
-                        assert!(remote.try_recv().is_err(), "offer does not grant execution");
-                        orch.fleet.handle_executor_message("remote", generation, ExecutorMessage::Claim { entry_id: entry.clone() });
-                        let (correlation, granted) = residency_queue_grant(&mut remote, Some(&entry)).await;
-                        assert_eq!(granted.holder, request.holder);
-                        let chain = orch.fleet.queue.with_entry(&entry, |entry| entry.chain.clone()).unwrap();
-                        assert!(matches!(chain.as_slice(), [BindingEvent::Offered { executor_id, .. }, BindingEvent::Claimed { executor_id: claimant, .. }] if executor_id == "remote" && claimant == "remote"));
-                        assert_eq!(orch.fleet.queue.claimed_binding_of(&identity), Some(("remote".into(), generation)));
-                        let recent = orch.fleet.recent_placements.lock().unwrap();
-                        let decision = recent.iter().rev().find(|decision| decision.request_id == identity.0).expect("acquisition records placement evidence");
-                        assert_eq!(decision.binding, chain);
-                        drop(recent);
-                        residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
-                    }
-                );
-                assert!(matches!(result, ResidencyResult::State { .. }), "{result:?}");
-                assert!(!orch.fleet.queue.holds(&identity));
-                assert!(!orch.fleet.residency_routes.lock().unwrap().values().next().unwrap().pending);
-            }).await;
-    }
-
     /// Grant `job`'s fresh acquisition on `remote` and return the cell the
     /// grant answered with. No snapshot carries it.
     async fn residency_grant_on_remote(
@@ -42122,60 +41283,6 @@ mod tests {
         result
     }
 
-    async fn residency_stop_refusal(orch: &Orchestrator, cell: &PersistentCellState) -> String {
-        let result = orch
-            .fleet
-            .operate_residency(
-                orch,
-                ResidencyOperation::StopProcess {
-                    fence: residency_fence_of(cell),
-                    process_key: "svc".into(),
-                },
-            )
-            .await;
-        match result {
-            ResidencyResult::Failed {
-                kind: ResidencyFailureKind::Unavailable,
-                diagnostic,
-                ..
-            } => diagnostic,
-            other => panic!("an unroutable operation is refused Unavailable: {other:?}"),
-        }
-    }
-
-    /// The specimen ordering: the executor's answer to a grant reaches the
-    /// runner before any snapshot showing the cell. An operation sent straight
-    /// after the acquire routes to the granting link by the grant itself, and
-    /// the fence a holder-only caller reads comes from the grant too.
-    #[tokio::test]
-    async fn an_operation_right_after_its_grant_routes_to_the_granting_link() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "granted").await;
-            let holder = cell.residency.as_ref().unwrap().holder.clone();
-            assert!(
-                orch.fleet.lock_connections()["remote"]
-                    .snapshot
-                    .cells
-                    .is_empty(),
-                "no snapshot carries the granted cell"
-            );
-            assert_eq!(
-                orch.fleet.residency_fence(&holder),
-                Some(residency_fence_of(&cell))
-            );
-            let result =
-                residency_stop_routed_to(&orch, &mut remote, "remote", generation, &cell).await;
-            assert!(
-                matches!(result, ResidencyResult::State { .. }),
-                "{result:?}"
-            );
-        })
-        .await;
-    }
-
     /// A snapshot taken before the grant can reach the runner after the grant's
     /// answer. It does not carry the cell, and rewriting the executor's routes
     /// from it must not erase the route the grant just recorded.
@@ -42215,150 +41322,6 @@ mod tests {
         .await;
     }
 
-    /// A grant speaks only for the link it was answered on. With that link
-    /// gone, the refusal names the machine and that it stopped answering; on
-    /// the machine's next link, before and after that link's opening snapshot,
-    /// the refusal names what the runner then knows.
-    #[tokio::test]
-    async fn a_grant_on_a_retired_link_is_refused_naming_the_routing_case() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "retired").await;
-            let key = (
-                "remote".to_string(),
-                cell.residency.as_ref().unwrap().holder.storage_key(),
-            );
-            assert!(orch.fleet.disconnect_advertised_executor_with_origin(
-                "remote",
-                generation,
-                ExecutorDisconnectOrigin::RunnerInitiated
-            ));
-            let detached = residency_stop_refusal(&orch, &cell).await;
-            assert!(
-                detached.starts_with(
-                    "remote holds this execution environment and has not answered since "
-                ) && detached.ends_with("; disconnected)"),
-                "{detached}"
-            );
-
-            let (next_generation, _next) = residency_queue_attach(&orch.fleet, "remote");
-            assert_ne!(next_generation, generation);
-            assert_eq!(
-                residency_stop_refusal(&orch, &cell).await,
-                "remote's latest report no longer carries this execution environment"
-            );
-            orch.fleet.handle_executor_message(
-                "remote",
-                next_generation,
-                ExecutorMessage::SnapshotUpdated {
-                    snapshot: FleetSnapshot::default(),
-                    health: ExecutorSubstrateReport::default(),
-                },
-            );
-            assert!(!orch.fleet.granted_cells.lock().unwrap().contains_key(&key));
-            assert!(!orch
-                .fleet
-                .residency_routes
-                .lock()
-                .unwrap()
-                .contains_key(&key));
-            assert_eq!(
-                residency_stop_refusal(&orch, &cell).await,
-                "no executor holds a route to this execution environment"
-            );
-        })
-        .await;
-    }
-
-    /// A report carrying the cell retires its grant, and the route stands on
-    /// the report. A grant that reports go on lacking past the grace is given
-    /// up, and its route with it.
-    #[tokio::test]
-    async fn a_grant_is_retired_by_a_report_that_carries_it_or_by_the_grace() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-            let confirmed =
-                residency_grant_on_remote(&orch, &mut remote, generation, "confirmed").await;
-            let confirmed_key = (
-                "remote".to_string(),
-                confirmed.residency.as_ref().unwrap().holder.storage_key(),
-            );
-            orch.fleet.handle_executor_message(
-                "remote",
-                generation,
-                ExecutorMessage::SnapshotUpdated {
-                    snapshot: FleetSnapshot {
-                        cells: vec![confirmed.clone()],
-                        ..FleetSnapshot::default()
-                    },
-                    health: ExecutorSubstrateReport::default(),
-                },
-            );
-            assert!(!orch
-                .fleet
-                .granted_cells
-                .lock()
-                .unwrap()
-                .contains_key(&confirmed_key));
-            assert!(orch
-                .fleet
-                .residency_routes
-                .lock()
-                .unwrap()
-                .contains_key(&confirmed_key));
-
-            let expired =
-                residency_grant_on_remote(&orch, &mut remote, generation, "expired").await;
-            let expired_key = (
-                "remote".to_string(),
-                expired.residency.as_ref().unwrap().holder.storage_key(),
-            );
-            orch.fleet
-                .granted_cells
-                .lock()
-                .unwrap()
-                .get_mut(&expired_key)
-                .unwrap()
-                .recorded_unix_ms = unix_time_ms().saturating_sub(GRANT_CONFIRMATION_GRACE_MS + 1);
-            orch.fleet.handle_executor_message(
-                "remote",
-                generation,
-                ExecutorMessage::SnapshotUpdated {
-                    snapshot: FleetSnapshot {
-                        cells: vec![confirmed.clone()],
-                        ..FleetSnapshot::default()
-                    },
-                    health: ExecutorSubstrateReport::default(),
-                },
-            );
-            assert!(!orch
-                .fleet
-                .granted_cells
-                .lock()
-                .unwrap()
-                .contains_key(&expired_key));
-            assert!(!orch
-                .fleet
-                .residency_routes
-                .lock()
-                .unwrap()
-                .contains_key(&expired_key));
-            assert!(
-                orch.fleet
-                    .residency_routes
-                    .lock()
-                    .unwrap()
-                    .contains_key(&confirmed_key),
-                "the report that keeps carrying a cell keeps its route"
-            );
-        })
-        .await;
-    }
-
     /// After a runner restart no grant is held, and a route recorded only from
     /// an executor's report routes exactly as it always has.
     #[tokio::test]
@@ -42385,357 +41348,6 @@ mod tests {
                 residency_stop_routed_to(&orch, &mut remote, "remote", generation, &cell).await;
             assert!(
                 matches!(result, ResidencyResult::State { .. }),
-                "{result:?}"
-            );
-        })
-        .await;
-    }
-
-    /// A machine that posts another acquisition's provisioning hold on the
-    /// project would decline this one, and has said so before being asked.
-    /// The first offer goes to the idle machine: no decline round trip, and a
-    /// binding of exactly offered then claimed there. Without the hold, "first"
-    /// would win on the stable order.
-    #[tokio::test]
-    async fn residency_queue_first_offer_skips_a_machine_posting_the_projects_provisioning() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (_, mut held) = residency_queue_attach(&orch.fleet, "first");
-            let (generation, mut idle) = residency_queue_attach(&orch.fleet, "second");
-            Arc::make_mut(
-                &mut orch
-                    .fleet
-                    .lock_connections()
-                    .get_mut("first")
-                    .unwrap()
-                    .snapshot,
-            )
-            .provisioning_holds = vec![cairn_common::executor_protocol::ProvisioningHold {
-                project_id: "p".into(),
-                owner_request_id: "another-acquisition".into(),
-                entry_id: Some("another-entry".into()),
-                since_unix_ms: unix_time_ms() - 30_000,
-            }];
-            let mut request = residency_queue_request("held");
-            request.executor = None;
-            let (result, ()) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: request.clone()
-                    }
-                ),
-                async {
-                    let entry = residency_queue_offer(&mut idle).await;
-                    while let Ok(frame) = held.try_recv() {
-                        assert!(
-                            !matches!(frame, ExecutorMessage::Offer { .. }),
-                            "the held machine is never offered: {frame:?}"
-                        );
-                    }
-                    orch.fleet.handle_executor_message(
-                        "second",
-                        generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let (correlation, granted) =
-                        residency_queue_grant(&mut idle, Some(&entry)).await;
-                    let chain = orch
-                        .fleet
-                        .queue
-                        .with_entry(&entry, |entry| entry.chain.clone())
-                        .unwrap();
-                    assert!(
-                        matches!(
-                            chain.as_slice(),
-                            [
-                                BindingEvent::Offered { executor_id, .. },
-                                BindingEvent::Claimed { executor_id: claimant, .. }
-                            ] if executor_id == "second" && claimant == "second"
-                        ),
-                        "{chain:?}"
-                    );
-                    residency_queue_reply(&orch.fleet, "second", generation, correlation, &granted);
-                }
-            );
-            assert!(
-                matches!(result, ResidencyResult::State { .. }),
-                "{result:?}"
-            );
-        })
-        .await;
-    }
-
-    /// A grant belongs to one claim. The machine that received it can go away,
-    /// come back, and claim the requeued entry afresh; if that second claim is
-    /// abandoned before its own grant, the machine holds only a ticket and must
-    /// hear `Lost`. Remembering the first grant would send `Cancel`, which
-    /// leaves the ticket, and so the project, held until the link drops.
-    #[tokio::test]
-    async fn a_reclaim_by_the_same_machine_after_its_grant_was_requeued_is_withdrawn_with_lost() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let mut orch = test_orchestrator(temp.path()).await;
-            let route_parent = temp.path().join("route-parent");
-            orch.fleet = Arc::new(Fleet::with_residency_route_path(
-                route_parent.join("routes.json"),
-            ));
-            let (first_generation, mut first_link) = residency_queue_attach(&orch.fleet, "remote");
-            let mut request = residency_queue_request("regrant");
-            request.executor = None;
-            let (_machine_home, machine) = claiming_machine();
-            let (result, (entry, summary, mut second_link)) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: request.clone()
-                    }
-                ),
-                async {
-                    let entry = residency_queue_offer(&mut first_link).await;
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        first_generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let _ = residency_queue_grant(&mut first_link, Some(&entry)).await;
-                    // The runner recycles the machine: its claim is requeued, not held.
-                    assert!(orch.fleet.disconnect_advertised_executor_with_origin(
-                        "remote",
-                        first_generation,
-                        ExecutorDisconnectOrigin::RunnerInitiated
-                    ));
-                    let (second_generation, mut second_link) =
-                        residency_queue_attach(&orch.fleet, "remote");
-                    let (reoffered, summary) = match residency_queue_frame(&mut second_link).await {
-                        ExecutorMessage::Offer { entry_id, summary } => (entry_id, summary),
-                        other => panic!("the requeued entry is offered again: {other:?}"),
-                    };
-                    assert_eq!(
-                        reoffered, entry,
-                        "the same entry comes back to the same machine"
-                    );
-                    machine_claims(&machine, &reoffered, &summary).await;
-                    // The second claim fails before its grant.
-                    std::fs::remove_dir_all(&route_parent).ok();
-                    std::fs::write(&route_parent, "not a directory").unwrap();
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        second_generation,
-                        ExecutorMessage::Claim {
-                            entry_id: reoffered.clone(),
-                        },
-                    );
-                    (reoffered, summary, second_link)
-                }
-            );
-            assert!(
-                matches!(
-                    result,
-                    ResidencyResult::Failed {
-                        kind: ResidencyFailureKind::Persistence,
-                        ..
-                    }
-                ),
-                "the second claim fails before its grant: {result:?}"
-            );
-            let mut withdrawn = false;
-            while let Ok(frame) = second_link.try_recv() {
-                assert!(
-                    !matches!(frame, ExecutorMessage::ResidencyRequest { .. }),
-                    "the second claim is never granted: {frame:?}"
-                );
-                assert!(
-                    !matches!(frame, ExecutorMessage::Cancel { .. }),
-                    "no grant reached the second claim, so it is not cancelled: {frame:?}"
-                );
-                if matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == entry) {
-                    machine_hears(&machine, frame).await;
-                    withdrawn = true;
-                }
-            }
-            assert!(withdrawn, "the second claim is withdrawn with Lost");
-            assert_machine_released(&machine, &summary).await;
-        })
-        .await;
-    }
-
-    async fn residency_queue_moves_after_first_machine(decline: bool, claimed: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let (generation, mut first) = residency_queue_attach(&orch.fleet, "first");
-        let mut request = residency_queue_request("moves");
-        request.executor = None;
-        let (result, ()) = tokio::join!(
-            orch.fleet.operate_residency(
-                &orch,
-                ResidencyOperation::Acquire {
-                    request: request.clone()
-                }
-            ),
-            async {
-                let entry = residency_queue_offer(&mut first).await;
-                let (second_generation, mut second) = residency_queue_attach(&orch.fleet, "second");
-                if claimed {
-                    orch.fleet.handle_executor_message(
-                        "first",
-                        generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let _ = residency_queue_grant(&mut first, Some(&entry)).await;
-                    assert!(
-                        orch.fleet
-                            .residency_routes
-                            .lock()
-                            .unwrap()
-                            .get(&("first".into(), request.holder.storage_key()))
-                            .unwrap()
-                            .pending
-                    );
-                }
-                if decline {
-                    orch.fleet.handle_executor_message(
-                        "first",
-                        generation,
-                        ExecutorMessage::Decline {
-                            entry_id: entry.clone(),
-                            reason: DeclineReason::Pressure,
-                            detail: Some("live memory floor".into()),
-                            disk: None,
-                        },
-                    );
-                } else {
-                    assert!(orch.fleet.disconnect_advertised_executor_with_origin(
-                        "first",
-                        generation,
-                        ExecutorDisconnectOrigin::RunnerInitiated
-                    ));
-                }
-                let reoffered = residency_queue_offer(&mut second).await;
-                assert_eq!(reoffered, entry, "a retry retains the same queue entry");
-                assert!(
-                    !orch
-                        .fleet
-                        .residency_routes
-                        .lock()
-                        .unwrap()
-                        .contains_key(&("first".into(), request.holder.storage_key())),
-                    "old pending route must be removed before the new offer"
-                );
-                assert!(orch.fleet.pending_residency.lock().unwrap().is_empty());
-                let chain = orch
-                    .fleet
-                    .queue
-                    .with_entry(&entry, |entry| entry.chain.clone())
-                    .unwrap();
-                if decline {
-                    assert!(chain.iter().any(|event| matches!(event, BindingEvent::Declined { executor_id, reason: DeclineReason::Pressure, .. } if executor_id == "first")));
-                } else {
-                    assert!(chain.iter().any(|event| matches!(event, BindingEvent::GenerationEnded { executor_id, .. } if executor_id == "first")));
-                }
-                orch.fleet.handle_executor_message(
-                    "second",
-                    second_generation,
-                    ExecutorMessage::Claim {
-                        entry_id: entry.clone(),
-                    },
-                );
-                let (correlation, granted) = residency_queue_grant(&mut second, Some(&entry)).await;
-                residency_queue_reply(
-                    &orch.fleet,
-                    "second",
-                    second_generation,
-                    correlation,
-                    &granted,
-                );
-            }
-        );
-        assert!(
-            matches!(result, ResidencyResult::State { ref cell } if cell.executor_id == "second"),
-            "{result:?}"
-        );
-        assert_eq!(orch.fleet.queue.len(), 0);
-        let routes = orch.fleet.residency_routes.lock().unwrap();
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes.values().next().unwrap().executor_id, "second");
-    }
-
-    /// The only machine this acquisition may use says "not yet": its project is
-    /// provisioning another cell. That hold clears on its own, so the request
-    /// stays queued against its horizon and is offered to the same machine again
-    /// as soon as the machine posts new state, rather than failing the agent's
-    /// `run` on the first answer.
-    #[tokio::test]
-    async fn a_declined_acquisition_waits_for_the_same_machine_and_is_admitted_when_it_posts_state()
-    {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-            let request = residency_queue_request("parked");
-            let identity = (
-                residency_queue_entry_id(&request.holder),
-                RESIDENCY_ACQUIRE_ATTEMPT_ID.to_string(),
-            );
-            let (result, ()) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: request.clone()
-                    }
-                ),
-                async {
-                    let entry = residency_queue_offer(&mut remote).await;
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        generation,
-                        ExecutorMessage::Decline {
-                            entry_id: entry.clone(),
-                            reason: DeclineReason::ProjectProvisioning,
-                            detail: Some("project p is provisioning for request other, 2s ago".into()),
-                            disk: None,
-                        },
-                    );
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    assert!(
-                        orch.fleet.queue.holds(&identity),
-                        "a decline from a live machine parks the request rather than refusing it"
-                    );
-                    assert!(
-                        remote.try_recv().is_err(),
-                        "nothing is re-offered until the machine posts new state"
-                    );
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        generation,
-                        ExecutorMessage::SnapshotUpdated {
-                            snapshot: FleetSnapshot::default(),
-                            health: ExecutorSubstrateReport::default(),
-                        },
-                    );
-                    let reoffered = residency_queue_offer(&mut remote).await;
-                    assert_eq!(reoffered, entry, "the same entry is offered again");
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let (correlation, granted) =
-                        residency_queue_grant(&mut remote, Some(&entry)).await;
-                    residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
-                }
-            );
-            assert!(
-                matches!(result, ResidencyResult::State { ref cell } if cell.executor_id == "remote"),
                 "{result:?}"
             );
         })
@@ -42798,136 +41410,6 @@ mod tests {
                 other => return other,
             }
         }
-    }
-
-    /// A healthy colocated executor declines a check lane for a hold that
-    /// clears on its own, with no substrate declaration in force. The lane
-    /// waits for the machine to post state, is offered again, and runs; it is
-    /// not told that no colocated executor is configured.
-    async fn a_declined_cell_waits_for_posted_state_and_runs(
-        reason: DeclineReason,
-        clear_with_heartbeat: bool,
-    ) {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let (sender, mut executor) = mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
-        let fleet = orch.fleet.clone();
-        let machine = tokio::spawn(async move {
-            let Some(ExecutorMessage::Offer {
-                entry_id: first, ..
-            }) = next_work_frame(&mut executor).await
-            else {
-                panic!("the lane is offered to the colocated executor");
-            };
-            fleet.handle_executor_message(
-                COLOCATED_EXECUTOR_ID,
-                generation,
-                ExecutorMessage::Decline {
-                    entry_id: first.clone(),
-                    reason,
-                    detail: Some("the hold this machine is under".into()),
-                    disk: None,
-                },
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(150), next_work_frame(&mut executor))
-                    .await
-                    .is_err(),
-                "nothing is re-offered before the machine posts new state"
-            );
-            assert!(
-                fleet.queue.state_of(&first).is_some(),
-                "the declined lane is still queued, not refused"
-            );
-            if clear_with_heartbeat {
-                let advertisement = fleet
-                    .lock_connections()
-                    .get(COLOCATED_EXECUTOR_ID)
-                    .unwrap()
-                    .advertisement
-                    .as_ref()
-                    .clone();
-                fleet.handle_executor_message(
-                    COLOCATED_EXECUTOR_ID,
-                    generation,
-                    ExecutorMessage::Heartbeat {
-                        advertisement,
-                        health: ExecutorSubstrateReport::default(),
-                        last_update: None,
-                        machine: None,
-                    },
-                );
-            } else {
-                fleet.handle_executor_message(
-                    COLOCATED_EXECUTOR_ID,
-                    generation,
-                    ExecutorMessage::SnapshotUpdated {
-                        snapshot: FleetSnapshot::default(),
-                        health: ExecutorSubstrateReport::default(),
-                    },
-                );
-            }
-            let Some(ExecutorMessage::Offer {
-                entry_id: again, ..
-            }) = next_work_frame(&mut executor).await
-            else {
-                panic!("the lane is offered again once the machine posts state");
-            };
-            assert_eq!(
-                again, first,
-                "the same entry comes back to the same machine"
-            );
-            fleet.handle_executor_message(
-                COLOCATED_EXECUTOR_ID,
-                generation,
-                ExecutorMessage::Claim { entry_id: again },
-            );
-            let Some(ExecutorMessage::Granted { request, .. }) =
-                next_work_frame(&mut executor).await
-            else {
-                panic!("the claimed lane is granted");
-            };
-            fleet.handle_executor_message(
-                COLOCATED_EXECUTOR_ID,
-                generation,
-                ExecutorMessage::Result {
-                    request_id: request.request_id.clone(),
-                    attempt_id: request.attempt_id.clone(),
-                    outcome: completed_for(&request, COLOCATED_EXECUTOR_ID, generation),
-                },
-            );
-        });
-        let mut request = provenance_request();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(10), orch.fleet.submit(&orch, request))
-                .await
-                .expect("the lane settles within its horizon");
-        machine.await.unwrap();
-        assert!(
-            matches!(
-                outcome,
-                CellOutcome::Completed {
-                    exit_code: Some(0),
-                    ..
-                }
-            ),
-            "{outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_lane_declined_for_project_provisioning_runs_after_the_next_snapshot() {
-        a_declined_cell_waits_for_posted_state_and_runs(DeclineReason::ProjectProvisioning, false)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn a_lane_declined_for_pressure_runs_after_the_next_heartbeat() {
-        a_declined_cell_waits_for_posted_state_and_runs(DeclineReason::Pressure, true).await;
     }
 
     /// A shared execution belongs to everyone who joined it, not to the caller
@@ -43306,193 +41788,6 @@ mod tests {
         );
     }
 
-    /// Each batch item is classified from its own outcome when the batch comes
-    /// back, so three lanes run together teach their profiles three different
-    /// things: the one that did the work teaches its duration, the one that
-    /// failed teaches only its memory, and the one that declared an empty
-    /// selection teaches nothing at all.
-    #[tokio::test]
-    async fn each_batch_item_teaches_its_profile_according_to_its_own_outcome() {
-        use cairn_common::executor_protocol::{
-            ExecutionLoadContext, ExecutionMeasurementQuality, ExecutionWarmth, MeasurementQuality,
-            ProcessBatchItemOutcome,
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let (sender, mut executor) = mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
-        let keys = ["worked", "failed", "selected-nothing"];
-        let items = keys
-            .iter()
-            .map(|key| ProcessBatchItem {
-                header: key.to_string(),
-                stream_id: format!("stream:{key}"),
-                command_resource_identity: Some(CommandResourceIdentity {
-                    version: cairn_common::executor_protocol::COMMAND_RESOURCE_IDENTITY_VERSION,
-                    key: key.to_string(),
-                    suite: None,
-                }),
-                ..cache_batch_item(Vec::new())
-            })
-            .collect::<Vec<_>>();
-
-        let fleet = orch.fleet.clone();
-        let machine = tokio::spawn(async move {
-            let Some(ExecutorMessage::Offer { entry_id, .. }) =
-                next_work_frame(&mut executor).await
-            else {
-                panic!("the batch is offered");
-            };
-            fleet.handle_executor_message(
-                COLOCATED_EXECUTOR_ID,
-                generation,
-                ExecutorMessage::Claim { entry_id },
-            );
-            let Some(ExecutorMessage::Granted {
-                request,
-                batch: Some(batch),
-                ..
-            }) = next_work_frame(&mut executor).await
-            else {
-                panic!("the claimed batch is granted with its items");
-            };
-            assert_eq!(batch.items.len(), 3);
-            let item = |header: &str, succeeded: bool, body: String, duration_ms: u64| {
-                ProcessBatchItemOutcome {
-                    header: header.into(),
-                    body,
-                    succeeded,
-                    suspended: false,
-                    images: Vec::new(),
-                    exit_code: Some(if succeeded { 0 } else { 101 }),
-                    timed_out: false,
-                    started_at_unix_ms: 1,
-                    finished_at_unix_ms: 1 + duration_ms,
-                    duration_ms,
-                    peak_rss_bytes: Some(1_000),
-                    peak_process: None,
-                    cpu: None,
-                    granted_units: None,
-                    disk_delta_bytes: Some(10),
-                    sandbox_denials: Vec::new(),
-                    tracked_modifications: None,
-                    environment_fingerprint: String::new(),
-                    verdict_platform: None,
-                    verdict_arch: None,
-                    toolchain_fingerprint: None,
-                    verdict_environment_hash: None,
-                    stop: None,
-                    build_jobs: None,
-                    unrecorded_cache_checkpoint: None,
-                }
-            };
-            let marker = |selection: &str| {
-                format!(
-                    "CAIRN_CHECK_RESULT_JSON={{\"schemaVersion\":1,\"parser\":\"nextest\",\"complete\":true,\"selection\":\"{selection}\",\"tests\":[],\"undeclaredSkips\":0}}"
-                )
-            };
-            let outcomes = vec![
-                item("worked", true, marker("full"), 400_000),
-                item("failed", false, "cmake: not found".into(), 4_000),
-                item(
-                    "selected-nothing",
-                    true,
-                    format!("nothing to run.\n{}", marker("empty")),
-                    250,
-                ),
-            ];
-            let mut outcome = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
-            if let CellOutcome::Completed {
-                output, metadata, ..
-            } = &mut outcome
-            {
-                *output = serde_json::to_string(&outcomes).unwrap();
-                metadata.warmth = Some(ExecutionWarmth::PreparedWarmSlot);
-                metadata.load_context = Some(ExecutionLoadContext::default());
-                metadata.measurement_quality = Some(ExecutionMeasurementQuality {
-                    duration: MeasurementQuality::Authoritative,
-                    memory: MeasurementQuality::Sampled,
-                    disk: MeasurementQuality::Sampled,
-                    memory_platform: None,
-                    disk_boundary: "cell".into(),
-                });
-            }
-            fleet.handle_executor_message(
-                COLOCATED_EXECUTOR_ID,
-                generation,
-                ExecutorMessage::Result {
-                    request_id: request.request_id.clone(),
-                    attempt_id: request.attempt_id.clone(),
-                    outcome,
-                },
-            );
-        });
-
-        let mut request = provenance_request();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        let batch = ProcessBatch {
-            files: Vec::new(),
-            runtime_packages: Vec::new(),
-            sequential: true,
-            stop_on_error: false,
-            sandbox_mode: ProcessSandboxMode::Unconfined,
-            timeout_bases: Vec::new(),
-            items,
-            runner_context_id: None,
-            execution_residency: None,
-            containment: None,
-            node_scratch: None,
-        };
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            orch.fleet.submit_execution(&orch, request, Some(batch)),
-        )
-        .await
-        .expect("the batch settles within its horizon");
-        machine.await.unwrap();
-        assert!(
-            matches!(outcome, CellOutcome::Completed { .. }),
-            "{outcome:?}"
-        );
-
-        let learned = |table: &'static str| {
-            let db = orch.db.local.clone();
-            async move {
-                db.read(move |conn| {
-                    Box::pin(async move {
-                        let mut rows = conn
-                            .query(
-                                &format!(
-                                    "SELECT command_identity FROM {table} ORDER BY command_identity"
-                                ),
-                                (),
-                            )
-                            .await?;
-                        let mut identities = Vec::new();
-                        while let Some(row) = rows.next().await? {
-                            identities.push(row.get::<String>(0)?);
-                        }
-                        Ok(identities)
-                    })
-                })
-                .await
-                .unwrap()
-            }
-        };
-        assert_eq!(
-            learned("command_duration_profiles").await,
-            vec!["worked".to_string()],
-            "only the item that did its work teaches a duration"
-        );
-        assert_eq!(
-            learned("command_resource_profiles").await,
-            vec!["failed".to_string(), "worked".to_string()],
-            "a failure's memory is real demand; an empty selection's is not"
-        );
-    }
-
     /// An agent's batch carries no command identities, and its items' kills
     /// live only in their own outcomes. Through the real completion path each
     /// item teaches its own command class: the two cargo items killed below
@@ -43697,125 +41992,6 @@ mod tests {
         assert_eq!(kills.crowded.unwrap().count, 2);
     }
 
-    /// A machine that provisions one cell at a time: it claims the first offer
-    /// while it is free, declines every other offer while that one is held, and
-    /// posts its state when the held one finishes.
-    async fn one_cell_at_a_time(
-        fleet: Arc<Fleet>,
-        executor_id: &'static str,
-        generation: u64,
-        mut receiver: mpsc::UnboundedReceiver<ExecutorMessage>,
-        ran: Arc<std::sync::Mutex<Vec<String>>>,
-    ) {
-        let mut busy = false;
-        while let Some(frame) = next_work_frame(&mut receiver).await {
-            match frame {
-                ExecutorMessage::Offer { entry_id, .. } if busy => {
-                    fleet.handle_executor_message(
-                        executor_id,
-                        generation,
-                        ExecutorMessage::Decline {
-                            entry_id,
-                            reason: DeclineReason::ProjectProvisioning,
-                            detail: Some(format!("{executor_id} provisions one cell at a time")),
-                            disk: None,
-                        },
-                    );
-                }
-                ExecutorMessage::Offer { entry_id, .. } => {
-                    busy = true;
-                    fleet.handle_executor_message(
-                        executor_id,
-                        generation,
-                        ExecutorMessage::Claim { entry_id },
-                    );
-                }
-                ExecutorMessage::Granted { request, .. } => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    ran.lock().unwrap().push(request.request_id.clone());
-                    fleet.handle_executor_message(
-                        executor_id,
-                        generation,
-                        ExecutorMessage::Result {
-                            request_id: request.request_id.clone(),
-                            attempt_id: request.attempt_id.clone(),
-                            outcome: completed_for(&request, executor_id, generation),
-                        },
-                    );
-                    busy = false;
-                    fleet.handle_executor_message(
-                        executor_id,
-                        generation,
-                        ExecutorMessage::SnapshotUpdated {
-                            snapshot: FleetSnapshot::default(),
-                            health: ExecutorSubstrateReport::default(),
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// The merge-gate shape: more lanes than machines, and each machine
-    /// provisions one cell at a time. Every machine declines some lane while it
-    /// holds another, so at least one lane is declined by the whole fleet at
-    /// once. That lane waits for a machine to post state and then runs, rather
-    /// than being recorded as an unreachable fleet a second after submission.
-    #[tokio::test]
-    async fn a_wave_larger_than_the_fleet_serialises_through_declines_and_every_lane_runs() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut machines = Vec::new();
-        for id in ["mac-a", "mac-b"] {
-            let (generation, receiver) = residency_queue_attach(&orch.fleet, id);
-            machines.push(tokio::spawn(one_cell_at_a_time(
-                orch.fleet.clone(),
-                id,
-                generation,
-                receiver,
-                ran.clone(),
-            )));
-        }
-        let lane = |name: &str| {
-            let mut request = provenance_request();
-            request.request_id = name.into();
-            request.repository = RepositoryLocator::ScratchOnly {
-                owner_id: request.project_id.clone(),
-            };
-            request.placement_mobility = PlacementMobility::SpillEligible;
-            request
-        };
-        let (first, second, third) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(
-                orch.fleet.submit(&orch, lane("lane-1")),
-                orch.fleet.submit(&orch, lane("lane-2")),
-                orch.fleet.submit(&orch, lane("lane-3")),
-            )
-        })
-        .await
-        .expect("every lane settles within its horizon");
-        for machine in machines {
-            machine.abort();
-        }
-        for outcome in [first, second, third] {
-            assert!(
-                matches!(
-                    outcome,
-                    CellOutcome::Completed {
-                        exit_code: Some(0),
-                        ..
-                    }
-                ),
-                "{outcome:?}"
-            );
-        }
-        let mut ran = ran.lock().unwrap().clone();
-        ran.sort();
-        assert_eq!(ran, vec!["lane-1", "lane-2", "lane-3"]);
-    }
-
     fn held_by(pid: u32) -> cairn_common::executor_protocol::ColocatedGenerationHold {
         cairn_common::executor_protocol::ColocatedGenerationHold {
             holder_pid: Some(pid),
@@ -43998,111 +42174,6 @@ mod tests {
         );
     }
 
-    /// When the hold outlasts the horizon, the refusal names the machine that
-    /// declined, its reason, and its own detail, and the placement record for
-    /// the request carries the same decline. It does not say that nothing is
-    /// attached while the machine that answered is.
-    #[tokio::test]
-    async fn a_request_that_waits_out_its_horizon_names_who_declined_it() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let (sender, mut executor) = mpsc::unbounded_channel();
-        let generation = orch.fleet.attach_executor(sender);
-        let detail = "project p is provisioning for request holder (entry e), since unix ms 1, 2s ago; a project provisions one cell at a time";
-        let fleet = orch.fleet.clone();
-        let machine = tokio::spawn(async move {
-            while let Some(frame) = next_work_frame(&mut executor).await {
-                if let ExecutorMessage::Offer { entry_id, .. } = frame {
-                    fleet.handle_executor_message(
-                        COLOCATED_EXECUTOR_ID,
-                        generation,
-                        ExecutorMessage::Decline {
-                            entry_id,
-                            reason: DeclineReason::ProjectProvisioning,
-                            detail: Some(detail.into()),
-                            disk: None,
-                        },
-                    );
-                }
-            }
-        });
-        let mut request = provenance_request();
-        request.request_id = "outwaited".into();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        request.wait_horizon_unix_ms = unix_time_ms() + 600;
-        let outcome = orch.fleet.submit(&orch, request).await;
-        machine.abort();
-
-        let CellOutcome::Unavailable { diagnostic, .. } = outcome else {
-            panic!("a request whose horizon passed is refused: {outcome:?}");
-        };
-        let name = orch
-            .fleet
-            .executor_public_name(COLOCATED_EXECUTOR_ID)
-            .unwrap();
-        assert!(diagnostic.contains(&name), "{diagnostic}");
-        assert!(diagnostic.contains("ProjectProvisioning"), "{diagnostic}");
-        assert!(diagnostic.contains(detail), "{diagnostic}");
-        assert!(
-            !diagnostic.contains("no executor is currently attached"),
-            "{diagnostic}"
-        );
-        assert!(
-            !diagnostic.contains("no colocated executor is configured"),
-            "{diagnostic}"
-        );
-        let recorded = orch.fleet.placements_naming(COLOCATED_EXECUTOR_ID);
-        let refusal = recorded
-            .iter()
-            .find(|decision| {
-                decision.request_id == "outwaited"
-                    && matches!(decision.outcome, PlacementOutcome::Refused { .. })
-            })
-            .expect("the horizon refusal is recorded as a placement decision");
-        assert!(
-            refusal.rejected.iter().any(|rejection| matches!(
-                &rejection.reason,
-                PlacementRejectionReason::Declined {
-                    reason: DeclineReason::ProjectProvisioning,
-                    detail: Some(recorded),
-                    ..
-                } if recorded == detail
-            )),
-            "{refusal:?}"
-        );
-        let PlacementOutcome::Refused {
-            diagnostic: recorded_diagnostic,
-        } = &refusal.outcome
-        else {
-            unreachable!()
-        };
-        assert_eq!(recorded_diagnostic, &diagnostic);
-    }
-
-    /// Post a snapshot the way a live executor does: carrying its current
-    /// readings. A default health report would erase the machine's
-    /// measurements and make it unrankable, which is not what posting state
-    /// means.
-    fn post_current_state(pool: &Fleet, executor_id: &str, generation: u64) {
-        let health = pool
-            .lock_connections()
-            .get(executor_id)
-            .expect("the machine is attached")
-            .health
-            .as_ref()
-            .clone();
-        pool.handle_executor_message(
-            executor_id,
-            generation,
-            ExecutorMessage::SnapshotUpdated {
-                snapshot: FleetSnapshot::default(),
-                health,
-            },
-        );
-    }
-
     /// Work only a machine whose room a loading model holds could take waits
     /// on the model rather than being refused, placement's model pass hears of
     /// the refusal on that machine (and only that machine), and the room
@@ -44264,77 +42335,6 @@ mod tests {
         assert_eq!(placement.selected.executor_id, "remote");
     }
 
-    /// A decline from the one machine policy allows must park the request even
-    /// when another machine is structurally usable but ranking may not choose
-    /// it. Here policy keeps this work off the colocated executor, the remote
-    /// declined, and ranking has nothing it may pick: that is a wait for the
-    /// remote, not a refusal, and the colocated executor is still never used.
-    #[tokio::test]
-    async fn a_decline_parks_the_request_when_ranking_can_choose_nothing_else() {
-        let pool = Fleet::default();
-        let (sender, _colocated) = mpsc::unbounded_channel();
-        pool.attach_executor(sender);
-        let (generation, _remote) = residency_queue_attach(&pool, "remote");
-        let mut request = spillable_request();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        let mut policy = ActivePlacementPolicy::default_profile();
-        policy
-            .profile
-            .routes
-            .insert(request.placement_work_class, PlacementStance::RemoteOnly);
-        let (entry, _waiter) = pool
-            .queue
-            .enqueue(
-                queue::NewEntry {
-                    request: request.clone(),
-                    admission_kind: CellAdmissionKind::Command,
-                    interactive: false,
-                    execution_residency: None,
-                    standing: false,
-                },
-                unix_time_ms(),
-            )
-            .unwrap();
-        assert!(pool
-            .queue
-            .offer(&entry, "remote", "remote", generation, unix_time_ms()));
-        assert!(pool
-            .queue
-            .decline(
-                &entry,
-                "remote",
-                generation,
-                DeclineReason::ProjectProvisioning,
-                Some("project p is provisioning another cell".into()),
-                None,
-                None,
-                unix_time_ms(),
-            )
-            .applied());
-
-        let posting = pool.clone();
-        let post = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            post_current_state(&posting, "remote", generation);
-        });
-        let started = Instant::now();
-        let placement = tokio::time::timeout(
-            Duration::from_secs(5),
-            pool.select_executor(&request, None, &policy, Some(&entry)),
-        )
-        .await
-        .expect("placement settles once the decliner posts state")
-        .expect("a standing decline is a wait, not a refusal");
-        post.await.unwrap();
-        assert_eq!(placement.selected.executor_id, "remote");
-        assert!(
-            started.elapsed() >= Duration::from_millis(100),
-            "placement waited for the remote rather than answering at once"
-        );
-    }
-
     /// A machine declines, posts state, and is offered the request again, but
     /// the requester's horizon arrives while that re-offer is out. The
     /// refusal still names the decline, and the newest placement decision for
@@ -44424,91 +42424,6 @@ mod tests {
             !newest.binding.is_empty(),
             "the refusal carries its binding chain"
         );
-    }
-
-    /// Two machines decline the same request under pressure and post state at
-    /// different moments, so every re-placement carries the other machine's
-    /// standing decline in its rejections. None of those rows may reach the log
-    /// at WARN: the decline handler already logged each machine's answer, once
-    /// loudly, and the placement record keeps every row regardless.
-    #[tokio::test]
-    async fn repeated_declines_from_several_machines_never_log_at_warn_in_placement() {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let mut links = Vec::new();
-        for id in ["mac-a", "mac-b"] {
-            let (generation, receiver) = residency_queue_attach(&orch.fleet, id);
-            links.push((id, generation, receiver));
-        }
-        let fleet = orch.fleet.clone();
-        let machines = tokio::spawn(async move {
-            // Each machine declines whatever it is offered; one of them posts
-            // state after each decline, alternating, so the request keeps
-            // being re-placed with the other's decline standing.
-            let mut rounds = 0;
-            let mut turn = 0;
-            let mut links = links;
-            while rounds < 6 {
-                let (id, generation, receiver) = &mut links[turn % 2];
-                turn += 1;
-                let Ok(Some(ExecutorMessage::Offer { entry_id, .. })) =
-                    tokio::time::timeout(Duration::from_millis(400), next_work_frame(receiver))
-                        .await
-                else {
-                    let other = &links[turn % 2];
-                    post_current_state(&fleet, other.0, other.1);
-                    continue;
-                };
-                fleet.handle_executor_message(
-                    id,
-                    *generation,
-                    ExecutorMessage::Decline {
-                        entry_id,
-                        reason: DeclineReason::Pressure,
-                        detail: Some(format!("{id} CPU utilization 99%")),
-                        disk: None,
-                    },
-                );
-                rounds += 1;
-            }
-        });
-        let mut request = provenance_request();
-        request.request_id = "pressured".into();
-        request.repository = RepositoryLocator::ScratchOnly {
-            owner_id: request.project_id.clone(),
-        };
-        request.placement_mobility = PlacementMobility::SpillEligible;
-        request.wait_horizon_unix_ms = unix_time_ms() + 3_000;
-        let _ = orch.fleet.submit(&orch, request).await;
-        machines.abort();
-
-        let decisions: Vec<PlacementDecision> = orch
-            .fleet
-            .recent_placements
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|decision| decision.request_id == "pressured")
-            .cloned()
-            .collect();
-        let declined_rows: Vec<&PlacementRejection> = decisions
-            .iter()
-            .flat_map(|decision| decision.rejected.iter())
-            .filter(|rejection| {
-                matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
-            })
-            .collect();
-        assert!(
-            declined_rows.len() >= 2,
-            "the sequence re-placed the request with a standing decline: {decisions:?}"
-        );
-        for row in declined_rows {
-            assert_eq!(
-                placement_rejection_log_level(row),
-                log::Level::Debug,
-                "{row:?}"
-            );
-        }
     }
 
     /// An attached machine on the platform asked for makes "no enrolled
@@ -44635,248 +42550,6 @@ mod tests {
             .is_some());
     }
 
-    #[tokio::test]
-    async fn residency_queue_pressure_decline_reoffers() {
-        residency_queue_scenario(residency_queue_moves_after_first_machine(true, false)).await;
-    }
-
-    #[tokio::test]
-    async fn residency_queue_machine_gone_while_offered_moves() {
-        residency_queue_scenario(residency_queue_moves_after_first_machine(false, false)).await;
-    }
-
-    #[tokio::test]
-    async fn residency_queue_requeued_claim_removes_pending_route() {
-        residency_queue_scenario(residency_queue_moves_after_first_machine(false, true)).await;
-    }
-
-    #[tokio::test]
-    async fn residency_queue_claimed_link_gap_keeps_waiter_and_binding() {
-        residency_queue_scenario(async {
-                let temp = tempfile::tempdir().unwrap();
-                let orch = test_orchestrator(temp.path()).await;
-                let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-                let mut request = residency_queue_request("gap");
-                request.executor = None;
-                let (result, ()) = tokio::join!(
-                    orch.fleet.operate_residency(&orch, ResidencyOperation::Acquire { request }),
-                    async {
-                        let entry = residency_queue_offer(&mut remote).await;
-                        orch.fleet.handle_executor_message("remote", generation, ExecutorMessage::Claim { entry_id: entry.clone() });
-                        let (correlation, granted) = residency_queue_grant(&mut remote, Some(&entry)).await;
-                        let (_, mut second) = residency_queue_attach(&orch.fleet, "second");
-                        assert!(orch.fleet.disconnect_advertised_executor("remote", generation));
-                        assert!(matches!(orch.fleet.queue.state_of(&entry), Some(queue::EntryState::Claimed { generation: held, .. }) if held == generation));
-                        assert!(orch.fleet.pending_residency.lock().unwrap().contains_key(&correlation));
-                        assert!(tokio::time::timeout(Duration::from_millis(50), residency_queue_frame(&mut second)).await.is_err(), "a held claim cannot spill");
-                        let (replacement, mut reattached) = residency_queue_attach(&orch.fleet, "remote");
-                        assert_ne!(replacement, generation);
-                        assert!(matches!(orch.fleet.queue.state_of(&entry), Some(queue::EntryState::Claimed { generation: held, .. }) if held == replacement));
-                        // The machine's answer to the original correlation was the
-                        // frame the old link dropped: it never arrives. The returning
-                        // link carries a plain acquire for the same declaration, not
-                        // another offer, and the machine converges on the cell it
-                        // holds.
-                        let (converge, reasked) = residency_queue_grant(&mut reattached, None).await;
-                        assert_ne!(converge, correlation, "the re-ask is a fresh correlation");
-                        assert_eq!(reasked.holder, granted.holder);
-                        assert_eq!(reasked.repository, granted.repository);
-                        assert!(!orch.fleet.pending_residency.lock().unwrap().contains_key(&correlation), "the dropped correlation is forgotten");
-                        assert_eq!(orch.fleet.pending_residency.lock().unwrap().get(&converge).unwrap().generation, replacement);
-                        assert_eq!(orch.fleet.queue.len(), 1, "convergence consumes no queue entry");
-                        // A late answer to the dropped correlation is not a second
-                        // delivery.
-                        residency_queue_reply(&orch.fleet, "remote", replacement, correlation, &granted);
-                        residency_queue_reply(&orch.fleet, "remote", replacement, converge, &reasked);
-                        assert!(tokio::time::timeout(Duration::from_millis(50), residency_queue_frame(&mut reattached)).await.is_err(), "reattach preserves the existing grant, not another offer");
-                    }
-                );
-                assert!(matches!(result, ResidencyResult::State { .. }), "{result:?}");
-                assert!(!orch.fleet.queue.holds(&(residency_queue_entry_id(&ResidencyHolder::Job { job_id: "gap".into() }), RESIDENCY_ACQUIRE_ATTEMPT_ID.into())));
-            }).await;
-    }
-
-    #[tokio::test]
-    async fn residency_queue_dev_instance_never_spills_after_machine_gone() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut local) =
-                residency_queue_attach(&orch.fleet, COLOCATED_EXECUTOR_ID);
-            let mut request = residency_queue_request("dev");
-            request.holder = ResidencyHolder::DevInstance {
-                instance_id: "dev".into(),
-            };
-            request.executor = None;
-            let (result, ()) = tokio::join!(
-                orch.fleet
-                    .operate_residency(&orch, ResidencyOperation::Acquire { request }),
-                async {
-                    let entry = residency_queue_offer(&mut local).await;
-                    let (_, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-                    orch.fleet.handle_executor_message(
-                        COLOCATED_EXECUTOR_ID,
-                        generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let _ = residency_queue_grant(&mut local, Some(&entry)).await;
-                    assert!(orch.fleet.disconnect_advertised_executor_with_origin(
-                        COLOCATED_EXECUTOR_ID,
-                        generation,
-                        ExecutorDisconnectOrigin::RunnerInitiated
-                    ));
-                    assert!(
-                        tokio::time::timeout(
-                            Duration::from_millis(50),
-                            residency_queue_frame(&mut remote)
-                        )
-                        .await
-                        .is_err(),
-                        "pinned development instance must not reach a remote"
-                    );
-                }
-            );
-            assert!(
-                matches!(result, ResidencyResult::Failed { .. }),
-                "{result:?}"
-            );
-            assert_eq!(orch.fleet.queue.len(), 0);
-        })
-        .await;
-    }
-
-    /// A machine that answers a fresh acquisition with a failure of its own
-    /// storage is withdrawn from that owner. The refusal names the machine, the
-    /// cell, and the withdrawal, and the owner's next acquisition is offered to
-    /// another machine and never to it. Before, the idle machine claimed every
-    /// fresh acquisition and refused each the same way (cairn/5868).
-    #[tokio::test]
-    async fn a_machine_that_refuses_to_provision_a_home_is_withdrawn_from_its_owner() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (broken_generation, mut broken) = residency_queue_attach(&orch.fleet, "broken");
-            let mut request = residency_queue_request("thread");
-            request.executor = None;
-            let refusal = r"provision residency checkout: quarantine cell slot-1's authority C:\Users\cairn\.cairn-exec\build-slots\cairn\.authority\slot-1: Access is denied. (os error 5)";
-            let (refused, ()) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: request.clone()
-                    }
-                ),
-                async {
-                    let entry = residency_queue_offer(&mut broken).await;
-                    orch.fleet.handle_executor_message(
-                        "broken",
-                        broken_generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let (correlation, _) = residency_queue_grant(&mut broken, Some(&entry)).await;
-                    orch.fleet.handle_executor_message(
-                        "broken",
-                        broken_generation,
-                        ExecutorMessage::ResidencyResponse {
-                            correlation_id: correlation,
-                            result: residency_core_failure(
-                                ResidencyFailureKind::Persistence,
-                                refusal,
-                                None,
-                            ),
-                        },
-                    );
-                }
-            );
-            let machine = orch.fleet.executor_name_for_text("broken");
-            let ResidencyResult::Failed {
-                kind, diagnostic, ..
-            } = &refused
-            else {
-                panic!("the refusing machine's answer is a refusal: {refused:?}");
-            };
-            assert_eq!(*kind, ResidencyFailureKind::Persistence);
-            assert!(
-                diagnostic.starts_with(&format!(
-                    "{machine} refused to provision this job's execution environment: {refusal}."
-                )),
-                "names the machine and keeps its own words, which name the cell: {diagnostic}"
-            );
-            assert!(
-                diagnostic.contains(&format!("The job is withdrawn from {machine}")),
-                "says the job was withdrawn: {diagnostic}"
-            );
-            assert_eq!(
-                orch.fleet.withdrawn_home_executors(&request.holder),
-                vec!["broken".to_string()]
-            );
-            assert!(
-                orch.fleet.residency_routes.lock().unwrap().is_empty(),
-                "a refused acquisition leaves no route binding the job to the machine"
-            );
-
-            let (healthy_generation, mut healthy) =
-                residency_queue_attach(&orch.fleet, "healthy");
-            let (placed, ()) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: request.clone()
-                    }
-                ),
-                async {
-                    let entry = residency_queue_offer(&mut healthy).await;
-                    orch.fleet.handle_executor_message(
-                        "healthy",
-                        healthy_generation,
-                        ExecutorMessage::Claim {
-                            entry_id: entry.clone(),
-                        },
-                    );
-                    let (correlation, granted) =
-                        residency_queue_grant(&mut healthy, Some(&entry)).await;
-                    residency_queue_reply(
-                        &orch.fleet,
-                        "healthy",
-                        healthy_generation,
-                        correlation,
-                        &granted,
-                    );
-                }
-            );
-            assert!(
-                matches!(placed, ResidencyResult::State { .. }),
-                "the next acquisition lands on the other machine: {placed:?}"
-            );
-            while let Ok(frame) = broken.try_recv() {
-                assert!(
-                    !matches!(
-                        frame,
-                        ExecutorMessage::Offer { .. } | ExecutorMessage::ResidencyRequest { .. }
-                    ),
-                    "the withdrawn machine is never offered the job's next acquisition: {frame:?}"
-                );
-            }
-            let recent = orch.fleet.recent_placements.lock().unwrap();
-            let decision = recent
-                .iter()
-                .rev()
-                .find(|decision| decision.request_id == residency_queue_entry_id(&request.holder))
-                .expect("the second acquisition records its placement");
-            assert!(
-                decision.rejected.iter().any(|rejection| rejection.executor_id == "broken"
-                    && rejection.reason == PlacementRejectionReason::AvoidedInfrastructure),
-                "placement passed over the withdrawn machine by name: {:?}",
-                decision.rejected
-            );
-        })
-        .await;
-    }
-
     /// A withdrawal is a verdict about the session that refused: it lapses when
     /// the machine reattaches under another generation, when it is not attached,
     /// and after the withdrawal window, whichever comes first.
@@ -44978,14 +42651,6 @@ mod tests {
         }
     }
 
-    /// A platform no test machine that means to lose is ever on by accident.
-    fn another_platform() -> &'static str {
-        match std::env::consts::OS {
-            "windows" => "linux",
-            _ => "windows",
-        }
-    }
-
     /// cairn/5875's first specimen: the idle Windows and Linux machines both
     /// sort ahead of the Mac, and neither is ever offered the home.
     #[tokio::test(flavor = "multi_thread")]
@@ -45065,72 +42730,6 @@ mod tests {
             assert!(
                 orch.fleet.residency_routes.lock().unwrap().is_empty(),
                 "nothing was acquired"
-            );
-        })
-        .await;
-    }
-
-    /// A freshly attached machine on another platform has never been selected,
-    /// which sorts it first on every tie, and its id sorts first too.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_thread_home_prefers_the_runners_platform_over_a_fresh_machine() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (_, mut fresh) =
-                residency_queue_attach_on(&orch.fleet, "a-fresh", another_platform());
-            let (runner_generation, mut runner) =
-                residency_queue_attach_on(&orch.fleet, "b-runners", std::env::consts::OS);
-            let request = residency_queue_untargeted("thread");
-            let prices = HomePrices {
-                home_affinity: Some(orch.fleet.thread_home_affinity(&request.holder)),
-                scratch_sync: None,
-            };
-            let (placed, ()) = tokio::join!(
-                orch.fleet
-                    .acquire_priced_home(&orch, request.clone(), prices),
-                residency_queue_accepts(&orch.fleet, "b-runners", runner_generation, &mut runner)
-            );
-            assert!(
-                matches!(placed, ResidencyResult::State { .. }),
-                "{placed:?}"
-            );
-            assert_never_offered(&mut fresh, "the machine that just attached");
-            assert_eq!(
-                orch.fleet
-                    .thread_home_affinity(&request.holder)
-                    .previous_executor_id,
-                Some("b-runners".to_string()),
-                "the machine that answered is the thread's previous home from here on"
-            );
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_thread_home_lands_off_platform_when_nothing_else_can_take_it() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut only) =
-                residency_queue_attach_on(&orch.fleet, "only", another_platform());
-            let request = residency_queue_untargeted("thread");
-            let prices = HomePrices {
-                home_affinity: Some(orch.fleet.thread_home_affinity(&request.holder)),
-                scratch_sync: None,
-            };
-            let (placed, ()) = tokio::join!(
-                orch.fleet
-                    .acquire_priced_home(&orch, request.clone(), prices),
-                residency_queue_accepts(&orch.fleet, "only", generation, &mut only)
-            );
-            assert!(
-                matches!(placed, ResidencyResult::State { .. }),
-                "priced, not pinned: {placed:?}"
-            );
-            assert_eq!(
-                orch.fleet.residency_route_executor(&request.holder),
-                Some("only".to_string())
             );
         })
         .await;
@@ -45528,63 +43127,6 @@ mod tests {
         .await;
     }
 
-    /// A withdrawal standing from an untargeted acquisition steers later ones. It
-    /// must not stop a caller who then names that machine from reaching it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_standing_withdrawal_never_bars_a_machine_the_caller_names() {
-        residency_queue_scenario(async {
-            let temp = tempfile::tempdir().unwrap();
-            let orch = test_orchestrator(temp.path()).await;
-            let (generation, mut only) = residency_queue_attach(&orch.fleet, "only");
-            let untargeted = residency_queue_untargeted("thread");
-            let (refused, ()) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: untargeted.clone()
-                    }
-                ),
-                residency_queue_refuses(
-                    &orch.fleet,
-                    "only",
-                    generation,
-                    &mut only,
-                    ResidencyFailureKind::Persistence,
-                    "provision residency checkout: Access is denied",
-                )
-            );
-            assert!(
-                matches!(refused, ResidencyResult::Failed { .. }),
-                "{refused:?}"
-            );
-            assert_eq!(
-                orch.fleet.withdrawn_home_executors(&untargeted.holder),
-                vec!["only".to_string()],
-                "an untargeted request is free to go elsewhere, so it is withdrawn"
-            );
-
-            let mut named = untargeted.clone();
-            named.executor = Some(ExecutorSelector {
-                name: Some("only".into()),
-                ..Default::default()
-            });
-            let (placed, ()) = tokio::join!(
-                orch.fleet.operate_residency(
-                    &orch,
-                    ResidencyOperation::Acquire {
-                        request: named.clone()
-                    }
-                ),
-                residency_queue_accepts(&orch.fleet, "only", generation, &mut only)
-            );
-            assert!(
-                matches!(placed, ResidencyResult::State { .. }),
-                "the machine the caller named is asked: {placed:?}"
-            );
-        })
-        .await;
-    }
-
     /// Two machines match: the first refusal steers to the second, and running
     /// out leaves the last one askable rather than locking the selector out.
     #[tokio::test(flavor = "multi_thread")]
@@ -45798,158 +43340,6 @@ mod tests {
             );
         })
         .await;
-    }
-
-    async fn residency_queue_duplicate_scenario(winner_fails: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator(temp.path()).await;
-        let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-        let request = residency_queue_request("duplicate");
-        let (start_tx, start_rx) = oneshot::channel();
-        let (first, second, ()) = tokio::join!(
-            orch.fleet.operate_residency(
-                &orch,
-                ResidencyOperation::Acquire {
-                    request: request.clone()
-                }
-            ),
-            async {
-                start_rx.await.unwrap();
-                orch.fleet
-                    .operate_residency(
-                        &orch,
-                        ResidencyOperation::Acquire {
-                            request: request.clone(),
-                        },
-                    )
-                    .await
-            },
-            async {
-                let entry = residency_queue_offer(&mut remote).await;
-                orch.fleet.handle_executor_message(
-                    "remote",
-                    generation,
-                    ExecutorMessage::Claim {
-                        entry_id: entry.clone(),
-                    },
-                );
-                let (correlation, granted) = residency_queue_grant(&mut remote, Some(&entry)).await;
-                assert!(
-                    orch.fleet
-                        .residency_routes
-                        .lock()
-                        .unwrap()
-                        .values()
-                        .next()
-                        .unwrap()
-                        .pending
-                );
-                start_tx.send(()).unwrap();
-                assert!(
-                    tokio::time::timeout(
-                        Duration::from_millis(100),
-                        residency_queue_frame(&mut remote)
-                    )
-                    .await
-                    .is_err(),
-                    "duplicate must wait, not dispatch to a pending route"
-                );
-                assert_eq!(orch.fleet.queue.len(), 1);
-                if winner_fails {
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        generation,
-                        ExecutorMessage::ResidencyResponse {
-                            correlation_id: correlation,
-                            result: residency_core_failure(
-                                ResidencyFailureKind::Admission,
-                                "winner failed deliberately",
-                                None,
-                            ),
-                        },
-                    );
-                    let retry = residency_queue_offer(&mut remote).await;
-                    assert_ne!(entry, retry);
-                    assert!(
-                        orch.fleet.residency_routes.lock().unwrap().is_empty(),
-                        "failed winner cannot leave a pending route"
-                    );
-                    orch.fleet.handle_executor_message(
-                        "remote",
-                        generation,
-                        ExecutorMessage::Claim {
-                            entry_id: retry.clone(),
-                        },
-                    );
-                    let (correlation, granted) =
-                        residency_queue_grant(&mut remote, Some(&retry)).await;
-                    residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
-                } else {
-                    residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
-                    let (correlation, reattached) = residency_queue_grant(&mut remote, None).await;
-                    assert_eq!(reattached.holder, granted.holder);
-                    assert_eq!(
-                        orch.fleet.queue.len(),
-                        0,
-                        "reattachment consumes no queue entry"
-                    );
-                    residency_queue_reply(
-                        &orch.fleet,
-                        "remote",
-                        generation,
-                        correlation,
-                        &reattached,
-                    );
-                }
-            }
-        );
-        if winner_fails {
-            assert!(
-                matches!(first, ResidencyResult::Failed { ref diagnostic, .. } if diagnostic == "winner failed deliberately")
-            );
-        } else {
-            assert!(matches!(first, ResidencyResult::State { .. }), "{first:?}");
-        }
-        assert!(
-            matches!(second, ResidencyResult::State { .. }),
-            "{second:?}"
-        );
-        assert_eq!(orch.fleet.queue.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn residency_queue_duplicates_converge_without_second_offer() {
-        residency_queue_scenario(residency_queue_duplicate_scenario(false)).await;
-    }
-
-    #[tokio::test]
-    async fn residency_queue_duplicate_retries_after_winner_failure() {
-        residency_queue_scenario(residency_queue_duplicate_scenario(true)).await;
-    }
-
-    #[tokio::test]
-    async fn residency_queue_duplicate_horizon_names_live_entry_and_state() {
-        residency_queue_scenario(async {
-                let temp = tempfile::tempdir().unwrap();
-                let orch = test_orchestrator(temp.path()).await;
-                let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
-                let request = residency_queue_request("horizon");
-                let (winner, ()) = tokio::join!(
-                    orch.fleet.operate_residency(&orch, ResidencyOperation::Acquire { request: request.clone() }),
-                    async {
-                        let entry = residency_queue_offer(&mut remote).await;
-                        let mut duplicate = request.clone();
-                        duplicate.wait_horizon_unix_ms = unix_time_ms() + 30;
-                        let result = orch.fleet.operate_residency(&orch, ResidencyOperation::Acquire { request: duplicate }).await;
-                        assert!(matches!(result, ResidencyResult::Failed { ref diagnostic, .. } if diagnostic.contains(&entry) && diagnostic.contains("Offered") && diagnostic.contains("wait horizon")), "{result:?}");
-                        assert_eq!(orch.fleet.queue.len(), 1, "duplicate expiry must not remove winner");
-                        orch.fleet.handle_executor_message("remote", generation, ExecutorMessage::Claim { entry_id: entry.clone() });
-                        let (correlation, granted) = residency_queue_grant(&mut remote, Some(&entry)).await;
-                        residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
-                    }
-                );
-                assert!(matches!(winner, ResidencyResult::State { .. }), "{winner:?}");
-            }).await;
     }
 
     /// A route can outlive the environment it names: the executor released or
@@ -47522,6 +44912,631 @@ mod tests {
         assert!(orch.fleet.lock_connections()[COLOCATED_EXECUTOR_ID]
             .preparation_refusals
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn residency_queue_duplicate_horizon_names_live_entry_and_state() {
+        residency_queue_scenario(async {
+                let temp = tempfile::tempdir().unwrap();
+                let orch = test_orchestrator(temp.path()).await;
+                let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+                let request = residency_queue_request("horizon");
+                let (winner, ()) = tokio::join!(
+                    orch.fleet.operate_residency(&orch, ResidencyOperation::Acquire { request: request.clone() }),
+                    async {
+                        let entry = residency_queue_offer(&mut remote).await;
+                        let mut duplicate = request.clone();
+                        duplicate.wait_horizon_unix_ms = unix_time_ms() + 30;
+                        let result = orch.fleet.operate_residency(&orch, ResidencyOperation::Acquire { request: duplicate }).await;
+                        assert!(matches!(result, ResidencyResult::Failed { ref diagnostic, .. } if diagnostic.contains(&entry) && diagnostic.contains("Offered") && diagnostic.contains("wait horizon")), "{result:?}");
+                        assert_eq!(orch.fleet.queue.len(), 1, "duplicate expiry must not remove winner");
+                        orch.fleet.handle_executor_message("remote", generation, ExecutorMessage::Claim { entry_id: entry.clone() });
+                        let (correlation, granted) = residency_queue_grant(&mut remote, Some(&entry)).await;
+                        residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
+                    }
+                );
+                assert!(matches!(winner, ResidencyResult::State { .. }), "{winner:?}");
+            }).await;
+    }
+
+    /// When no machine can hold it the pin holds, at the clamp, and nothing
+    /// about that is silent: every machine that could not hold it says so in
+    /// the decision, and the selection carries the ceiling it went above.
+    #[tokio::test]
+    async fn when_no_machine_can_hold_it_the_pinned_batch_runs_home_at_the_clamp_and_says_so() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) =
+            ceiling_fleet("ceiling-nothing-holds.db", 10 * GIB, 0.01, 8 * GIB).await;
+        let request = pinned_to(request, "bgsrv-ub");
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .expect("the pin holds when nothing else can hold the work");
+        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
+        assert_eq!(
+            placement
+                .reservation
+                .as_ref()
+                .unwrap()
+                .reservation
+                .memory_bytes,
+            8_282_086_656,
+            "the reservation is the clamp"
+        );
+        let PlacementOutcome::Selected(selection) = &placement.decision.outcome else {
+            panic!("selected");
+        };
+        assert!(selection.memory_ceiling.is_some());
+        assert!(placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bglab-mac"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+        let above = placement.above_ceiling.expect("the result is told");
+        assert!(!above.holdable_elsewhere);
+        let note = above.note();
+        assert!(note.contains("no executor can hold"), "{note}");
+        assert!(note.contains("bgsrv-ub"), "{note}");
+    }
+
+    /// A grant speaks only for the link it was answered on. With that link
+    /// gone, the refusal names the machine and that it stopped answering; on
+    /// the machine's next link, before and after that link's opening snapshot,
+    /// the refusal names what the runner then knows.
+    #[tokio::test]
+    async fn a_grant_on_a_retired_link_is_refused_naming_the_routing_case() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "retired").await;
+            let key = (
+                "remote".to_string(),
+                cell.residency.as_ref().unwrap().holder.storage_key(),
+            );
+            assert!(orch.fleet.disconnect_advertised_executor_with_origin(
+                "remote",
+                generation,
+                ExecutorDisconnectOrigin::RunnerInitiated
+            ));
+            let detached = residency_stop_refusal(&orch, &cell).await;
+            assert!(
+                detached.starts_with(
+                    "remote holds this execution environment and has not answered since "
+                ) && detached.ends_with("; disconnected)"),
+                "{detached}"
+            );
+
+            let (next_generation, _next) = residency_queue_attach(&orch.fleet, "remote");
+            assert_ne!(next_generation, generation);
+            assert_eq!(
+                residency_stop_refusal(&orch, &cell).await,
+                "remote's latest report no longer carries this execution environment"
+            );
+            orch.fleet.handle_executor_message(
+                "remote",
+                next_generation,
+                ExecutorMessage::SnapshotUpdated {
+                    snapshot: FleetSnapshot::default(),
+                    health: ExecutorSubstrateReport::default(),
+                },
+            );
+            assert!(!orch.fleet.granted_cells.lock().unwrap().contains_key(&key));
+            assert!(!orch
+                .fleet
+                .residency_routes
+                .lock()
+                .unwrap()
+                .contains_key(&key));
+            assert_eq!(
+                residency_stop_refusal(&orch, &cell).await,
+                "no executor holds a route to this execution environment"
+            );
+        })
+        .await;
+    }
+
+    /// A big machine that is busy right now queues the work in its own
+    /// admission; a small idle one runs it into its memory limit. The ceiling
+    /// therefore outranks momentary fit and predicted speed alike.
+    #[tokio::test]
+    async fn unpinned_work_prefers_a_machine_that_can_ever_hold_it_over_a_more_idle_one_that_cannot(
+    ) {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) =
+            ceiling_fleet("ceiling-ranking.db", 100 * GIB, 0.60, 4 * GIB).await;
+        let mut request = request;
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .unwrap();
+        assert_eq!(placement.selected.executor_id, "bglab-mac");
+        assert!(placement.above_ceiling.is_none());
+        assert!(placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bgsrv-ub"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+    }
+
+    /// Object authority names one machine, one request, and one connection
+    /// generation, and only the runner closes it. Opening it at the claim left
+    /// it open whenever the runner then failed to dispatch: the machine never
+    /// received `Granted`, so it had nothing to fail and nothing to report, and
+    /// its read access to that request's objects survived until the connection
+    /// ended. Authority belongs to the grant, not to the claim.
+    #[tokio::test]
+    async fn a_claim_the_runner_never_grants_leaves_no_object_authority_behind() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let (sender, mut remote) = mpsc::unbounded_channel();
+        let (_, advertised) = fleet_entry("remote", "macos", 0, &[]);
+        let generation = orch
+            .fleet
+            .attach_advertised_executor(
+                Arc::unwrap_or_clone(advertised.advertisement),
+                sender,
+                false,
+                None,
+                None,
+            )
+            .expect("attach an enrolled machine");
+
+        let mut request = provenance_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        // Placement will not choose a machine it cannot see, and a fixture
+        // machine posts no measurements. The pin settles placement so this test
+        // is about what happens after the claim rather than about ranking.
+        request.pinned_executor_id = Some("remote".into());
+        // A batch naming a runner callback context this runner does not hold is
+        // the smallest pre-grant failure there is: binding that context is the
+        // last fallible step between the claim and the grant.
+        let batch = ProcessBatch {
+            files: Vec::new(),
+            runtime_packages: Vec::new(),
+            sequential: true,
+            stop_on_error: true,
+            sandbox_mode: ProcessSandboxMode::Unconfined,
+            timeout_bases: Vec::new(),
+            items: vec![cache_batch_item(Vec::new())],
+            runner_context_id: Some("a context the runner does not hold".into()),
+            execution_residency: None,
+            containment: None,
+            node_scratch: None,
+        };
+
+        let submitting = {
+            let orch = orch.clone();
+            tokio::spawn(async move {
+                orch.fleet
+                    .submit_execution(&orch, request, Some(batch))
+                    .await
+            })
+        };
+        // Answering here rather than in the spawned task keeps the receiver in
+        // hand afterwards, so what the machine did NOT hear is checkable, and
+        // bounds every wait: a runner that never offers is a failure this test
+        // reports rather than a hang.
+        let (offered, summary) = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), remote.recv()).await {
+                Ok(Some(ExecutorMessage::DrainModeRequest { .. })) => continue,
+                Ok(Some(ExecutorMessage::Offer { entry_id, summary })) => {
+                    break (entry_id, summary)
+                }
+                Err(_) => {
+                    let outcome = submitting.await.unwrap();
+                    panic!("the runner never offered this work to the one machine attached: {outcome:?}")
+                }
+                other => panic!("the chosen machine hears an offer first, got {other:?}"),
+            }
+        };
+        let (_machine_home, machine) = claiming_machine();
+        machine_claims(&machine, &offered, &summary).await;
+        orch.fleet.handle_executor_message(
+            "remote",
+            generation,
+            ExecutorMessage::Claim {
+                entry_id: offered.clone(),
+            },
+        );
+        let outcome = submitting.await.unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                CellOutcome::Unavailable { ref diagnostic, .. }
+                    if diagnostic.contains("unknown runner callback context")
+            ),
+            "the dispatch fails after the claim, got {outcome:?}"
+        );
+        // The machine is told the grant is never coming, and nothing else: no
+        // grant, and nothing that would leave its ticket standing.
+        match remote.try_recv() {
+            Ok(frame @ ExecutorMessage::Lost { .. }) => {
+                assert!(
+                    matches!(&frame, ExecutorMessage::Lost { entry_id } if *entry_id == offered)
+                );
+                machine_hears(&machine, frame).await;
+            }
+            other => panic!("an abandoned claim is withdrawn with Lost, got {other:?}"),
+        }
+        assert!(
+            remote.try_recv().is_err(),
+            "a machine whose claim the runner could not dispatch never receives a grant"
+        );
+        assert_machine_released(&machine, &summary).await;
+        assert!(
+            !orch.object_plane.authorizes(
+                &ObjectTransferCoordinate {
+                    repository: RepositoryLocator::ScratchOnly {
+                        owner_id: "p".into(),
+                    }
+                    .identity(),
+                    request_id: "provenance".into(),
+                    attempt_id: "attempt".into(),
+                    executor_id: "remote".into(),
+                    connection_generation: generation,
+                },
+                "base",
+            ),
+            "a machine that never received a grant holds no authority over that request's objects"
+        );
+    }
+
+    /// A withdrawal standing from an untargeted acquisition steers later ones. It
+    /// must not stop a caller who then names that machine from reaching it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_standing_withdrawal_never_bars_a_machine_the_caller_names() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut only) = residency_queue_attach(&orch.fleet, "only");
+            let untargeted = residency_queue_untargeted("thread");
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: untargeted.clone()
+                    }
+                ),
+                residency_queue_refuses(
+                    &orch.fleet,
+                    "only",
+                    generation,
+                    &mut only,
+                    ResidencyFailureKind::Persistence,
+                    "provision residency checkout: Access is denied",
+                )
+            );
+            assert!(
+                matches!(refused, ResidencyResult::Failed { .. }),
+                "{refused:?}"
+            );
+            assert_eq!(
+                orch.fleet.withdrawn_home_executors(&untargeted.holder),
+                vec!["only".to_string()],
+                "an untargeted request is free to go elsewhere, so it is withdrawn"
+            );
+
+            let mut named = untargeted.clone();
+            named.executor = Some(ExecutorSelector {
+                name: Some("only".into()),
+                ..Default::default()
+            });
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: named.clone()
+                    }
+                ),
+                residency_queue_accepts(&orch.fleet, "only", generation, &mut only)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "the machine the caller named is asked: {placed:?}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_home_lands_off_platform_when_nothing_else_can_take_it() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut only) =
+                residency_queue_attach_on(&orch.fleet, "only", another_platform());
+            let request = residency_queue_untargeted("thread");
+            let prices = HomePrices {
+                home_affinity: Some(orch.fleet.thread_home_affinity(&request.holder)),
+                scratch_sync: None,
+            };
+            let (placed, ()) = tokio::join!(
+                orch.fleet
+                    .acquire_priced_home(&orch, request.clone(), prices),
+                residency_queue_accepts(&orch.fleet, "only", generation, &mut only)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "priced, not pinned: {placed:?}"
+            );
+            assert_eq!(
+                orch.fleet.residency_route_executor(&request.holder),
+                Some("only".to_string())
+            );
+        })
+        .await;
+    }
+
+    /// The specimen ordering: the executor's answer to a grant reaches the
+    /// runner before any snapshot showing the cell. An operation sent straight
+    /// after the acquire routes to the granting link by the grant itself, and
+    /// the fence a holder-only caller reads comes from the grant too.
+    #[tokio::test]
+    async fn an_operation_right_after_its_grant_routes_to_the_granting_link() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "granted").await;
+            let holder = cell.residency.as_ref().unwrap().holder.clone();
+            assert!(
+                orch.fleet.lock_connections()["remote"]
+                    .snapshot
+                    .cells
+                    .is_empty(),
+                "no snapshot carries the granted cell"
+            );
+            assert_eq!(
+                orch.fleet.residency_fence(&holder),
+                Some(residency_fence_of(&cell))
+            );
+            let result =
+                residency_stop_routed_to(&orch, &mut remote, "remote", generation, &cell).await;
+            assert!(
+                matches!(result, ResidencyResult::State { .. }),
+                "{result:?}"
+            );
+        })
+        .await;
+    }
+
+    /// cairn/5472's specimens: the capable machines had declined on provisioning
+    /// holds, leaving one too small for the command as the only usable machine,
+    /// and the pass placed it there at the clamp. The clamp is for a fleet with
+    /// nowhere bigger to go; this one has a machine that only said "not yet", so
+    /// the work waits for it.
+    #[tokio::test]
+    async fn work_too_big_for_the_only_usable_machine_waits_for_a_capable_one_that_declined() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, mut request) =
+            ceiling_fleet("ceiling-waits-on-decliner.db", 100 * GIB, 0.01, 60 * GIB).await;
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        let generation = pool.lock_connections()["bglab-mac"].generation;
+        let declined = HashMap::from([(
+            "bglab-mac".to_string(),
+            queue::EntryDecline {
+                generation,
+                reason: DeclineReason::ProjectProvisioning,
+                detail: Some("provisioning project p".into()),
+                disk: None,
+                at_unix_ms: unix_time_ms(),
+                condition: None,
+                backoff_ms: 0,
+                retry_after_unix_ms: 0,
+                superseded_at_unix_ms: None,
+            },
+        )]);
+        let plan = ReservationPlan::new(db, &request, None);
+        let policy = ActivePlacementPolicy::default_profile();
+
+        let selection = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &policy,
+                &declined,
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap();
+        let Selection::Waiting { rejected } = selection else {
+            panic!("placed at the clamp while a capable machine had only declined");
+        };
+        assert!(rejected.iter().any(|rejection| {
+            rejection.executor_id == "bgsrv-ub"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+        assert!(rejected.iter().any(|rejection| {
+            rejection.executor_id == "bglab-mac"
+                && matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
+        }));
+        let waiting =
+            wait_decision(&request, &policy, &rejected, &[]).expect("the wait is recorded");
+        let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
+            unreachable!("a memory wait is a waiting decision");
+        };
+        assert!(
+            diagnostic.contains("bgsrv-ub: its measured memory demand"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("Waited on: bglab-mac"), "{diagnostic}");
+    }
+
+    /// A freshly attached machine on another platform has never been selected,
+    /// which sorts it first on every tie, and its id sorts first too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_home_prefers_the_runners_platform_over_a_fresh_machine() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (_, mut fresh) =
+                residency_queue_attach_on(&orch.fleet, "a-fresh", another_platform());
+            let (runner_generation, mut runner) =
+                residency_queue_attach_on(&orch.fleet, "b-runners", std::env::consts::OS);
+            let request = residency_queue_untargeted("thread");
+            let prices = HomePrices {
+                home_affinity: Some(orch.fleet.thread_home_affinity(&request.holder)),
+                scratch_sync: None,
+            };
+            let (placed, ()) = tokio::join!(
+                orch.fleet
+                    .acquire_priced_home(&orch, request.clone(), prices),
+                residency_queue_accepts(&orch.fleet, "b-runners", runner_generation, &mut runner)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "{placed:?}"
+            );
+            assert_never_offered(&mut fresh, "the machine that just attached");
+            assert_eq!(
+                orch.fleet
+                    .thread_home_affinity(&request.holder)
+                    .previous_executor_id,
+                Some("b-runners".to_string()),
+                "the machine that answered is the thread's previous home from here on"
+            );
+        })
+        .await;
+    }
+
+    /// cairn/4931 review: a cold machine with a smaller budget than the home
+    /// is never named as the place that can hold the work, and the pin holds
+    /// at the clamp. Since cairn/6089 a borrowed process-tree total no longer
+    /// decides any machine's fit (it grew with the width the measuring machine
+    /// granted), so the cold machine's fit is unknown rather than a ceiling,
+    /// and unknown is still not "can hold it".
+    #[tokio::test]
+    async fn a_smaller_cold_machine_is_never_named_as_able_to_hold_what_its_home_cannot() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) = ceiling_fleet_with(
+            "ceiling-smaller-cold.db",
+            Some(6 * GIB),
+            false,
+            0.01,
+            5 * GIB,
+        )
+        .await;
+        let request = pinned_to(request, "bgsrv-ub");
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .expect("no HomeCannotHold naming the smaller machine")
+            .placed()
+            .expect("the pin holds");
+        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
+        assert!(!placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bglab-mac"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+        let above = placement.above_ceiling.unwrap();
+        assert!(!above.holdable_elsewhere && above.unknown_elsewhere);
+        assert!(above
+            .note()
+            .contains("no usable machine is known to hold it"));
+    }
+
+    /// A platform no test machine that means to lose is ever on by accident.
+    fn another_platform() -> &'static str {
+        match std::env::consts::OS {
+            "windows" => "linux",
+            _ => "windows",
+        }
+    }
+
+    /// cairn/4931 specimen B, as placement sees it: a ~12 GiB home whose
+    /// reservation cap is exactly the 8,282,086,656 bytes it once reported as a
+    /// cargo test's requirement, a measured demand above that cap, and a second
+    /// machine with room. `other_budget` sizes the second machine.
+    async fn ceiling_fleet(
+        db_name: &str,
+        other_budget: u64,
+        other_cpu: f64,
+        other_available: u64,
+    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+        ceiling_fleet_with(
+            db_name,
+            Some(other_budget),
+            true,
+            other_cpu,
+            other_available,
+        )
+        .await
+    }
+
+    async fn residency_stop_refusal(orch: &Orchestrator, cell: &PersistentCellState) -> String {
+        let result = orch
+            .fleet
+            .operate_residency(
+                orch,
+                ResidencyOperation::StopProcess {
+                    fence: residency_fence_of(cell),
+                    process_key: "svc".into(),
+                },
+            )
+            .await;
+        match result {
+            ResidencyResult::Failed {
+                kind: ResidencyFailureKind::Unavailable,
+                diagnostic,
+                ..
+            } => diagnostic,
+            other => panic!("an unroutable operation is refused Unavailable: {other:?}"),
+        }
     }
 }
 

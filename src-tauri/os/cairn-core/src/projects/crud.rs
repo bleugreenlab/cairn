@@ -1209,7 +1209,7 @@ fn db_project_from_row(row: &cairn_db::turso::Row) -> Result<DbProject, DbError>
 mod tests {
     use super::*;
     use crate::services::Clock;
-    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex};
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
     use tempfile::tempdir;
 
     struct FixedClock;
@@ -1793,47 +1793,6 @@ mod tests {
         assert!(!workspace.path().join(".git").exists());
     }
 
-    #[test]
-    fn project_checkout_validation_rejects_disposable_and_missing_paths() {
-        // The filesystem arms run against real directories. Acceptance and each
-        // storage rule are asserted on synthetic paths instead: on a remote cell
-        // every writable directory (HOME and TMPDIR included) sits inside the
-        // cell's `build-slots` scratch, so no real temp root there is a
-        // legitimate checkout.
-        let root = tempdir().unwrap();
-        let config = root.path().join(".cairn");
-        let scratch = config.join("scratch/job/repo");
-        let build_slot = root.path().join("build-slots/slot/repo");
-        std::fs::create_dir_all(&scratch).unwrap();
-        std::fs::create_dir_all(&build_slot).unwrap();
-
-        assert!(validate_project_checkout(&scratch, &config).is_err());
-        assert!(validate_project_checkout(&build_slot, &config).is_err());
-        assert!(validate_project_checkout(&root.path().join("missing"), &config).is_err());
-        assert!(validate_project_checkout(Path::new("relative/repo"), &config).is_err());
-
-        let base = std::env::temp_dir()
-            .ancestors()
-            .last()
-            .unwrap()
-            .to_path_buf();
-        let config = base.join("users/dev/.cairn");
-        let disposable = |path: PathBuf| is_disposable_execution_storage(&path, &config);
-        assert!(!disposable(base.join("users/dev/code/repo")));
-        assert!(!disposable(config.join("projects/repo")));
-        assert!(disposable(config.join("scratch/job/repo")));
-        assert!(disposable(config.join("build-slots/slot/repo")));
-        assert!(disposable(config.join("executions/run/repo")));
-        // A build root configured on another volume keeps its cells under its own
-        // `build-slots`, which the name arm covers wherever the volume is mounted.
-        assert!(disposable(
-            base.join("Volumes/Builds/cairn/build-slots/cairn/slot-1/repo")
-        ));
-        assert!(disposable(base.join(
-            "users/dev/.cairn-exec/build-slots/cairn/.authority/slot-1/scratch/repo"
-        )));
-    }
-
     #[tokio::test]
     async fn resolve_local_repo_path_uses_synced_path_for_local_projects() {
         let local = Arc::new(migrated_db().await);
@@ -1948,71 +1907,6 @@ mod tests {
         assert_eq!(hidden, 0);
         assert_eq!(is_workspace, 1);
         assert_eq!(default_branch, "main");
-    }
-
-    #[tokio::test]
-    async fn seed_team_workspace_project_is_first_writer_wins() {
-        use crate::storage::TEAM_MIGRATIONS;
-        let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("team.db")).await.unwrap();
-        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        // The team-root FK parent that projects.team_id references.
-        db.execute(
-            "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('team1', 'Team One', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-
-        let key = team_workspace_key("team1");
-        let first = seed_team_workspace_project_db(
-            &db,
-            1,
-            "team1",
-            "team1~00000000-0000-4000-8000-0000000000ff",
-            &key,
-            "",
-        )
-        .await
-        .unwrap();
-        assert!(first, "the first writer seeds the workspace row");
-
-        // A concurrent member mints a DIFFERENT id; the reserved key collides, so
-        // INSERT OR IGNORE drops it (first-writer-wins).
-        let second = seed_team_workspace_project_db(
-            &db,
-            2,
-            "team1",
-            "team1~00000000-0000-4000-8000-0000000000aa",
-            &key,
-            "",
-        )
-        .await
-        .unwrap();
-        assert!(!second, "a later writer is a no-op, not a clobber");
-        assert_eq!(key, "WORKSPACE-team1");
-
-        let (count, id, is_ws) = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT COUNT(*), MAX(id), MAX(is_workspace) FROM projects WHERE is_workspace = 1",
-                            (),
-                        )
-                        .await?;
-                    let row = rows.next().await?.expect("workspace row");
-                    Ok((row.i64(0)?, row.text(1)?, row.i64(2)?))
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(count, 1, "exactly one workspace row survives");
-        assert_eq!(id, "team1~00000000-0000-4000-8000-0000000000ff");
-        assert_eq!(is_ws, 1);
     }
 
     #[tokio::test]

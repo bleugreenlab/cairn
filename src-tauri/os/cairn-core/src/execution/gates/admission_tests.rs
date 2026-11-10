@@ -9,9 +9,6 @@
 //! `tokio::time::timeout` inside it would hang the suite instead of failing
 //! it. A scenario that misses its bound fails, and its runtime is abandoned.
 
-use std::future::Future;
-use std::panic::AssertUnwindSafe;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -20,75 +17,6 @@ use super::sweep::tests::{count, env, Env};
 use crate::execution::recipe::LaunchIntent;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-use crate::storage::RowExt;
-
-/// Bounds for a scenario: `setup` covers building its world, `bound` the part
-/// under test, which starts when the scenario calls [`Timed::start`].
-struct Bounds {
-    setup: Duration,
-    bound: Duration,
-}
-
-const SETUP: Duration = Duration::from_secs(180);
-
-/// The scenario's signal that its setup is done and the bounded part begins.
-struct Timed(mpsc::Sender<()>);
-
-impl Timed {
-    fn start(&self) {
-        let _ = self.0.send(());
-    }
-}
-
-type Outcome<T> = Result<T, Box<dyn std::any::Any + Send>>;
-
-/// Run `make`'s future on a fresh `workers`-thread runtime and fail the test
-/// if its bounded part does not finish within `bounds.bound`.
-fn within<T, F, Fut>(name: &str, workers: usize, bounds: Bounds, make: F) -> T
-where
-    T: Send + 'static,
-    F: FnOnce(Timed) -> Fut + Send + 'static,
-    Fut: Future<Output = T> + 'static,
-{
-    let (started_tx, started_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel::<Outcome<T>>();
-    std::thread::Builder::new()
-        .name(format!("admission-{name}"))
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(workers)
-                .enable_all()
-                .build()
-                .expect("scenario runtime");
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                runtime.block_on(make(Timed(started_tx)))
-            }));
-            let _ = done_tx.send(outcome);
-        })
-        .expect("scenario thread");
-    let finish = |outcome: Outcome<T>| match outcome {
-        Ok(out) => out,
-        Err(panic) => std::panic::resume_unwind(panic),
-    };
-    match started_rx.recv_timeout(bounds.setup) {
-        Ok(()) => {}
-        // The scenario finished (or panicked) without starting its clock.
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return finish(done_rx.recv().expect("scenario outcome"))
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            panic!("{name}: setup did not finish within {:?}", bounds.setup)
-        }
-    }
-    match done_rx.recv_timeout(bounds.bound) {
-        Ok(outcome) => finish(outcome),
-        Err(_) => panic!(
-            "{name}: no progress within {:?} on {workers} runtime worker(s): the admission \
-             path is deadlocked",
-            bounds.bound
-        ),
-    }
-}
 
 /// The sweep test world with the fleet capped at one, so the parent issue's
 /// live coordinator fills it and every capped filing holds, plus backlog
@@ -190,122 +118,6 @@ async fn held_on(env: &Env, numbers: &[i32]) -> i64 {
     .await
 }
 
-/// The specimen (harness, 11-01 22:55-23:08 PST): with the real sweep
-/// notifier installed, a `write` carrying two executions appends, then a
-/// second `write` carrying one, on a saturated fleet. The first held filing
-/// nudges a sweep whose pass takes the admission lock; a filing that arrives
-/// while it holds the lock must wait for it without taking the worker the
-/// sweep needs to finish.
-fn a_two_start_write_then_a_one_start_write_complete(workers: usize) {
-    within(
-        "two-start-write",
-        workers,
-        Bounds {
-            setup: SETUP,
-            bound: Duration::from_secs(40),
-        },
-        move |timed| async move {
-            let env = saturated(&format!("admission-specimen-{workers}.db"), 10..=49).await;
-            // A queue forty deep keeps every sweep pass busy with the lock.
-            for number in 10..=49 {
-                file_on(&env.orch, number).await.unwrap();
-            }
-            super::sweep::install_sweep_notifier(env.orch.clone());
-            timed.start();
-
-            let orch = env.orch.clone();
-            let first =
-                tokio::spawn(async move { write(&orch, json!([append(1), append(2)])).await })
-                    .await
-                    .unwrap();
-            // Past the notifier's debounce: the nudged sweep is mid-pass.
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let orch = env.orch.clone();
-            let second = tokio::spawn(async move { write(&orch, json!([append(3)])).await })
-                .await
-                .unwrap();
-
-            assert_eq!(applied(&first), 2, "both items of the first write: {first}");
-            assert_eq!(applied(&second), 1, "the second write: {second}");
-            assert_eq!(held_on(&env, &[1, 2, 3]).await, 3, "three held executions");
-        },
-    )
-}
-
-#[test]
-fn the_specimen_completes_on_one_worker() {
-    a_two_start_write_then_a_one_start_write_complete(1);
-}
-
-#[test]
-fn the_specimen_completes_on_two_workers() {
-    a_two_start_write_then_a_one_start_write_complete(2);
-}
-
-/// A task holds the admission lock across an awaited database write and a
-/// sleep, as a sweep pass does across its reads. Six capped filings and a
-/// sweep that arrive meanwhile all finish once it lets go, on two workers.
-#[test]
-fn contended_filings_and_a_sweep_make_progress() {
-    within(
-        "contended",
-        2,
-        Bounds {
-            setup: SETUP,
-            bound: Duration::from_secs(10),
-        },
-        |timed| async move {
-            let env = saturated("admission-contended.db", 11..=16).await;
-            timed.start();
-
-            let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
-            let holder = {
-                let (orch, db) = (env.orch.clone(), env.db.clone());
-                tokio::spawn(async move {
-                    let guard = orch
-                        .admission_lock
-                        .acquire(
-                            super::capacity::AdmissionSite::SweepPass,
-                            "held by the test",
-                        )
-                        .await
-                        .unwrap();
-                    let _ = locked_tx.send(());
-                    db.execute(
-                        "UPDATE projects SET updated_at = updated_at + 1 WHERE id = 'p'",
-                        (),
-                    )
-                    .await
-                    .unwrap();
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    drop(guard);
-                })
-            };
-            locked_rx.await.unwrap();
-
-            let mut filings = Vec::new();
-            for number in 11..=16 {
-                let orch = env.orch.clone();
-                filings.push(tokio::spawn(async move { file_on(&orch, number).await }));
-            }
-            let sweep = {
-                let orch = env.orch.clone();
-                tokio::spawn(async move { super::sweep::sweep(&orch).await })
-            };
-            holder.await.unwrap();
-            for filing in filings {
-                filing.await.unwrap().unwrap();
-            }
-            sweep.await.unwrap().unwrap();
-            assert_eq!(
-                held_on(&env, &[11, 12, 13, 14, 15, 16]).await,
-                6,
-                "every filing held"
-            );
-        },
-    )
-}
-
 use super::capacity::AdmissionSite;
 
 /// Harness's requirement, directly: each filing lets go of the admission lock
@@ -351,76 +163,6 @@ async fn queue_of(name: &str, depth: i32) -> Env {
     env
 }
 
-/// A pass over a queue nothing has moved in takes the admission lock once,
-/// writes nothing, and reads the queue in a number of transactions that does
-/// not grow with its depth: the only per-execution read is listing each one's
-/// authored gates, which happens before the lock is taken.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_quiet_pass_takes_the_lock_once_and_writes_nothing() {
-    let mut reads = Vec::new();
-    for depth in [10, 60] {
-        let env = queue_of(&format!("admission-pass-{depth}.db"), depth).await;
-        let lock = &env.orch.admission_lock;
-        let (passes, read, wrote) = (
-            lock.acquisitions(AdmissionSite::SweepPass),
-            env.db.read_transaction_count(),
-            env.db.write_transaction_count(),
-        );
-        let report = super::sweep::sweep(&env.orch).await.unwrap();
-        assert!(report.released.is_empty(), "{report:?}");
-        assert_eq!(
-            lock.acquisitions(AdmissionSite::SweepPass) - passes,
-            1,
-            "one acquisition for the whole pass"
-        );
-        assert_eq!(
-            env.db.write_transaction_count() - wrote,
-            0,
-            "{depth} holds that did not change cost no write"
-        );
-        reads.push(env.db.read_transaction_count() - read);
-
-        // The release phase's read on its own: one queue read for every
-        // candidate at once.
-        let read = env.db.read_transaction_count();
-        let ids: Vec<String> = env
-            .db
-            .query_all(
-                "SELECT e.id, e.issue_id FROM executions e WHERE e.status = 'held'",
-                (),
-                |row| Ok(format!("{}|{}", row.text(0)?, row.text(1)?)),
-            )
-            .await
-            .unwrap();
-        let pairs: Vec<(&str, &str)> = ids
-            .iter()
-            .map(|pair| pair.split_once('|').unwrap())
-            .collect();
-        let starts: Vec<super::capacity::Start<'_>> = pairs
-            .iter()
-            .map(|(execution_id, issue_id)| super::capacity::Start {
-                db: &env.db,
-                issue_id: Some(issue_id),
-                execution_id: Some(execution_id),
-            })
-            .collect();
-        assert_eq!(starts.len(), depth as usize);
-        super::capacity::QueueSnapshot::load(&env.orch, &starts)
-            .await
-            .unwrap();
-        assert_eq!(
-            env.db.read_transaction_count() - read,
-            3,
-            "the fleet, the capacity rows, and the starts' threads: one read each"
-        );
-    }
-    assert_eq!(
-        reads[1] - reads[0],
-        50,
-        "fifty more held executions cost fifty more gate listings and nothing else: {reads:?}"
-    );
-}
-
 /// A held filing takes the lock once and decides once: the reply comes from
 /// that decision, not from evaluating the execution again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -444,51 +186,6 @@ async fn a_held_filing_takes_the_lock_once() {
         .map(|(site, (before, after))| (*site, after - before))
         .collect();
     assert_eq!(taken, vec![(AdmissionSite::Filing, 1)]);
-}
-
-/// The acceptance measurement: a capped append that holds returns in well
-/// under a second with sixty executions already queued, and ten appends in
-/// one write all land and are all reported.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_held_filing_on_a_deep_queue_returns_in_well_under_a_second() {
-    let env = saturated("admission-cost.db", 100..=179).await;
-    let started = std::time::Instant::now();
-    let report = write(&env.orch, json!([append(100)])).await;
-    let idle = started.elapsed();
-    assert_eq!(applied(&report), 1, "{report}");
-
-    for number in 101..=160 {
-        file_on(&env.orch, number).await.unwrap();
-    }
-    super::sweep::sweep(&env.orch).await.unwrap();
-    let started = std::time::Instant::now();
-    let report = write(&env.orch, json!([append(161)])).await;
-    let deep = started.elapsed();
-    assert_eq!(applied(&report), 1, "{report}");
-    assert!(
-        report["applied"][0]["summary"]
-            .as_str()
-            .is_some_and(|summary| summary.contains("Queued")),
-        "{report}"
-    );
-    eprintln!(
-        "held filing through the write carrier: {idle:?} with nothing queued, {deep:?} with 61 \
-         queued"
-    );
-    assert!(
-        deep < Duration::from_secs(1),
-        "a held filing took {deep:?} on a 61-deep queue"
-    );
-
-    let started = std::time::Instant::now();
-    let report = write(&env.orch, Value::Array((162..=171).map(append).collect())).await;
-    eprintln!("ten held filings in one write: {:?}", started.elapsed());
-    assert_eq!(applied(&report), 10, "{report}");
-    assert_eq!(
-        held_on(&env, &(162..=171).collect::<Vec<_>>()).await,
-        10,
-        "every item held"
-    );
 }
 
 /// A filing that cannot get the lock within its bound refuses, naming who

@@ -3585,125 +3585,6 @@ pub(crate) mod slot_publication_tests {
         assert_eq!(fx.bookmark(), fx.base, "the branch was never published");
     }
 
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn acceptance_debt_is_checked_again_after_preparation_before_a_delta_lands() {
-        for (status, publishes) in [("unknown", false), ("pending", true)] {
-            let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
-                eprintln!("skipping acceptance_debt_is_checked_again: jj not resolvable");
-                return;
-            };
-            let orch = orchestrator(&fx).await;
-            let prepared = prepare_slot_publication(
-                &orch,
-                &fx.target,
-                &fx.request,
-                &fx.delta,
-                "the batch",
-                None,
-            )
-            .await
-            .unwrap();
-            let coordinate = prepared.coordinate.as_ref().expect("the branch prepares");
-            let expected_head = coordinate.prepared.head_after.clone();
-            let reservation = reserve(&orch, &fx, &["feature"]).await;
-            let guard = lock(&orch, &fx).await;
-            let store_key =
-                crate::orchestrator::base_advance::preparation::journal_store_key(fx.store())
-                    .unwrap();
-            // Model a row whose terminal SQL write was lost after installation.
-            // It appears after capture, so preparation alone cannot enforce it.
-            coordinate
-                .db
-                .execute(
-                    "INSERT INTO branch_advance_acceptances
-                   (id, project_id, store_path, branch, head_before, head_after, base_branch,
-                    base_commit, captured_operation, dropped_commits_json, inherited_drops_json,
-                    status, created_at)
-                 VALUES ('debt-after-capture', 'project', ?1, 'feature', ?2, ?3, 'main',
-                         ?3, 'captured-op', '[]', '[]', ?4, 1)",
-                    cairn_db::turso::params![
-                        store_key.as_str(),
-                        fx.delta.delta_commit.as_str(),
-                        expected_head.as_str(),
-                        status
-                    ],
-                )
-                .await
-                .unwrap();
-            let landed = land_prepared_slot_delta(
-                &orch,
-                &fx.target,
-                &fx.request,
-                &fx.delta,
-                "the batch",
-                None,
-                &reservation,
-                &guard,
-                &expected_head,
-                prepared,
-            )
-            .await;
-            drop(guard);
-
-            if publishes {
-                assert!(
-                    landed.is_ok(),
-                    "exact pending acceptance settles in the same call: {landed:?}"
-                );
-                let published_head = match landed.unwrap().outcome {
-                    SlotPublicationOutcome::Published { landed, .. } => landed.head,
-                    SlotPublicationOutcome::AlreadyLanded { head } => head,
-                    SlotPublicationOutcome::PublishedEarlier { .. } => {
-                        panic!("a landing that is no re-drive finds no earlier one")
-                    }
-                };
-                assert_eq!(fx.bookmark(), published_head);
-                assert_eq!(fx.blob(&published_head, "mine.rs"), "the batch's work");
-                // Publication stamps the managed identity; its commit id can
-                // differ from the sealed delta while its exact tree is preserved.
-                assert_eq!(
-                    git_stdout(
-                        &fx.repository,
-                        &["show", "-s", "--format=%T", &published_head]
-                    ),
-                    git_stdout(
-                        &fx.repository,
-                        &["show", "-s", "--format=%T", &fx.delta.delta_commit]
-                    ),
-                );
-                let status = orch.db.local.query_one(
-                    "SELECT status FROM branch_advance_acceptances WHERE id = 'debt-after-capture'",
-                    (), |row| row.text(0),
-                ).await.unwrap();
-                assert_eq!(status, "accepted");
-            } else {
-                let held = match landed {
-                    Err(SlotPublicationError::Held { held, .. }) => held,
-                    other => {
-                        panic!("unknown acceptance must hold the immutable delta, got {other:?}")
-                    }
-                };
-                assert_eq!(
-                    git_stdout(
-                        &fx.repository,
-                        &[
-                            "rev-parse",
-                            &held.reference.expect("the delta stays protected")
-                        ]
-                    ),
-                    fx.delta.delta_commit,
-                );
-                assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
-                assert_eq!(
-                    fx.bookmark(),
-                    expected_head,
-                    "no branch move under unknown debt"
-                );
-            }
-        }
-    }
-
     /// Nothing about the ordinary path changes. With the bookmark still at the
     /// commit the batch was routed against, the sealed delta publishes exactly
     /// as it was sealed and nothing is reported as integrated.
@@ -3906,47 +3787,6 @@ pub(crate) mod slot_publication_tests {
             orch.object_plane.staged_delta(&receipt).is_none(),
             "the upload was installed and fully handled, so its receipt must not be left staged"
         );
-    }
-
-    /// Even a disjoint advance supersedes check output. Only the unmoved case
-    /// publishes; ordinary agent deltas retain their separate merge behavior.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn a_check_fix_publishes_only_on_its_tested_base() {
-        for (advance, expected) in [
-            (None, true),
-            (Some(&[("advanced.rs", "after\n")][..]), false),
-        ] {
-            let Some(fx) = straddle(advance, &[("mine.rs", "formatted\n")]).await else {
-                eprintln!("skipping a_fix_merged_onto_an_advanced_head: jj not resolvable");
-                return;
-            };
-            let orch = orchestrator(&fx).await;
-            let published = publish_and_seal_slot_delta(
-                &orch,
-                fx.store(),
-                &fx.request,
-                &fx.delta,
-                "feature",
-                "fix: apply write-check changes",
-                None,
-            )
-            .await
-            .expect("a clean fix publishes");
-            assert_eq!(
-                published.is_some(),
-                expected,
-                "advance={}",
-                advance.is_some()
-            );
-            if let Some(published) = published {
-                assert!(published.landed_on_tested_base);
-                assert_eq!(fx.blob(&published.commit, "mine.rs"), "formatted");
-            } else {
-                assert_eq!(fx.bookmark(), fx.head);
-                assert_eq!(fx.blob(&fx.head, "mine.rs"), "base");
-            }
-        }
     }
 
     #[tokio::test]
@@ -4525,150 +4365,6 @@ pub(crate) mod slot_publication_tests {
         );
     }
 
-    /// A held delta meets the branch wherever it has moved to: merged onto a
-    /// sibling's disjoint work, or stranded with the route back when it
-    /// conflicts.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn a_drain_merges_onto_a_moved_head_or_strands_on_conflict() {
-        for (sibling, conflicts) in [
-            (("advanced.rs", "after the advance\n"), false),
-            (("mine.rs", "the sibling's version\n"), true),
-        ] {
-            let Some(mut fx) =
-                straddle(Some(&[sibling]), &[("mine.rs", "the batch's version\n")]).await
-            else {
-                eprintln!("skipping a_drain_merges_onto_a_moved_head: jj not resolvable");
-                return;
-            };
-            let orch = orchestrator(&fx).await;
-            let held = hold(&orch, &mut fx, "later").await;
-            create_bookmark(&fx, "later", &fx.head);
-
-            let drained = drain(&orch, &fx, "later").await;
-
-            let reference = held.reference.unwrap();
-            if conflicts {
-                let [held::Drained::Note(note)] = drained.as_slice() else {
-                    panic!("expected one note, got {drained:?}");
-                };
-                assert!(note.contains("can no longer be published"), "{note}");
-                assert!(note.contains("mine.rs"), "{note}");
-                assert_eq!(held_status(&orch, "attempt-3231").await.0, "stranded");
-                assert!(ref_exists(&fx, &reference), "the route back stays open");
-                assert_eq!(bookmark_at(&fx, "later"), fx.head);
-            } else {
-                assert!(held::any_landed(&drained), "{drained:?}");
-                let landed = bookmark_at(&fx, "later");
-                assert_eq!(
-                    git_stdout(&fx.repository, &["rev-parse", &format!("{landed}^")]),
-                    fx.head
-                );
-                assert_eq!(fx.blob(&landed, "advanced.rs"), "after the advance");
-                assert_eq!(fx.blob(&landed, "mine.rs"), "the batch's version");
-                assert!(!ref_exists(&fx, &reference));
-            }
-        }
-    }
-
-    /// A batch that opened on a held commit and then edited it means exactly
-    /// what it did: a new path, a further edit of the held commit's line, or an
-    /// undo of it. Merged against its own parent once the held commit lands,
-    /// all three come out right, in either order of arrival. Publishing the
-    /// later batch first is refused: it waits behind the held commit, so the
-    /// held commit can never land afterwards and re-apply what was undone.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn a_batch_built_on_a_held_commit_lands_as_its_own_edit_in_either_order() {
-        // (what the batch did, the file it wrote, that file's content, paths it touched)
-        type Case<'a> = (&'a str, (&'a str, &'a str), &'a str, &'a [&'a str]);
-        let cases: [Case; 3] = [
-            (
-                "a new path",
-                ("other.rs", "the next batch\n"),
-                "the batch's work",
-                &["other.rs"],
-            ),
-            (
-                "a further edit",
-                ("mine.rs", "a third version\n"),
-                "a third version",
-                &["mine.rs"],
-            ),
-            ("an undo", ("mine.rs", "base\n"), "base", &["mine.rs"]),
-        ];
-        for (name, edit, mine_after, own_paths) in cases {
-            for drain_first in [true, false] {
-                let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await
-                else {
-                    eprintln!("skipping a_batch_built_on_a_held_commit: jj not resolvable");
-                    return;
-                };
-                let orch = orchestrator(&fx).await;
-                hold(&orch, &mut fx, "later").await;
-                create_bookmark(&fx, "later", &fx.base);
-                let (next_request, next_delta) = absorbing_delta(&fx, &[edit]);
-                let publish_next = || {
-                    publish_visible_slot_delta(
-                        &orch,
-                        &fx.target,
-                        &next_request,
-                        &next_delta,
-                        "the next batch",
-                        None,
-                        None,
-                    )
-                };
-
-                if drain_first {
-                    let drained = drain(&orch, &fx, "later").await;
-                    assert!(held::any_landed(&drained), "{name}: {drained:?}");
-                    held::settle_drained(&orch, drained).await;
-                    let SlotPublicationOutcome::Published { patch, .. } = publish_next()
-                        .await
-                        .unwrap_or_else(|error| panic!("{name}: {error}"))
-                        .outcome
-                    else {
-                        panic!("{name}: expected the next batch to publish");
-                    };
-                    assert_eq!(
-                        published_paths(&patch),
-                        own_paths,
-                        "{name}: the next batch is credited only with its own paths"
-                    );
-                } else {
-                    let refused = publish_next().await;
-                    let Err(SlotPublicationError::Held { held, .. }) = &refused else {
-                        panic!("{name}: expected the next batch to wait, got {refused:?}");
-                    };
-                    assert!(
-                        held.error.contains("waits behind it"),
-                        "{name}: {}",
-                        held.error
-                    );
-                    let drained = drain(&orch, &fx, "later").await;
-                    assert_eq!(
-                        drained
-                            .iter()
-                            .filter(|entry| matches!(entry, held::Drained::Landed(_)))
-                            .count(),
-                        2,
-                        "{name}: both land, in order: {drained:?}"
-                    );
-                    held::settle_drained(&orch, drained).await;
-                    assert_eq!(held_status(&orch, "attempt-next").await.0, "landed");
-                }
-                assert_eq!(held_status(&orch, "attempt-3231").await.0, "landed");
-                let head = bookmark_at(&fx, "later");
-                assert_eq!(
-                    fx.blob(&head, "mine.rs"),
-                    mine_after,
-                    "{name} (drain first: {drain_first})"
-                );
-            }
-        }
-    }
-
     /// cairn/5536: exactly once must survive landing on a moved base. The
     /// first runner process lands the batch on a head that moved under it, so
     /// the landed commit is an integration whose id nobody recorded, and then
@@ -4936,79 +4632,6 @@ pub(crate) mod slot_publication_tests {
         assert_eq!(held_status(&orch, "attempt-3231").await.0, "landed");
     }
 
-    /// Held commits land in the order they were made. A barrier that cannot
-    /// prepare the branch publishes none of them and says so, leaving each one
-    /// held and unattempted; once it can, the earlier lands first and the later
-    /// lands on the head the earlier one became.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn held_deltas_land_in_the_order_they_were_made() {
-        let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
-            eprintln!("skipping held_deltas_land_in_the_order: jj not resolvable");
-            return;
-        };
-        let orch = orchestrator(&fx).await;
-        hold(&orch, &mut fx, "later").await;
-        let (next_request, next_delta) = absorbing_delta(&fx, &[("other.rs", "next\n")]);
-        let next = publish_visible_slot_delta(
-            &orch,
-            &fx.target,
-            &next_request,
-            &next_delta,
-            "the next batch",
-            None,
-            None,
-        )
-        .await;
-        assert!(
-            matches!(next, Err(SlotPublicationError::Held { .. })),
-            "{next:?}"
-        );
-
-        let refused = held::pr_commit_barrier(&orch, "project", "later").await;
-        assert!(
-            refused
-                .notes
-                .iter()
-                .any(|note| note.contains("could not be published") && note.contains("stay held")),
-            "{:?}",
-            refused.notes
-        );
-        refused.refuse_merge().expect_err("nothing held has landed");
-        assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
-        assert_eq!(
-            held_status(&orch, "attempt-next").await,
-            ("held".into(), 1),
-            "the later delta is not attempted ahead of the earlier one"
-        );
-
-        create_bookmark(&fx, "later", &fx.base);
-        let drained = drain(&orch, &fx, "later").await;
-        assert_eq!(
-            drained
-                .iter()
-                .filter(|entry| matches!(entry, held::Drained::Landed(_)))
-                .count(),
-            2,
-            "{drained:?}"
-        );
-        held::settle_drained(&orch, drained).await;
-        let first = landed_head(&orch, "attempt-3231").await;
-        let second = landed_head(&orch, "attempt-next").await;
-        assert_eq!(
-            git_stdout(&fx.repository, &["rev-parse", &format!("{first}^")]),
-            fx.base
-        );
-        assert_eq!(
-            git_stdout(&fx.repository, &["rev-parse", &format!("{second}^")]),
-            first,
-            "the later delta lands on the head the earlier one became"
-        );
-        assert_eq!(bookmark_at(&fx, "later"), second);
-        assert_eq!(fx.blob(&second, "mine.rs"), "the batch's work");
-        assert_eq!(fx.blob(&second, "other.rs"), "next");
-    }
-
     /// A base that advances between preparation and the lock is caught by
     /// revalidation: the branch is prepared again onto the new base and the
     /// sealed delta is planned again onto that preparation, so what lands
@@ -5068,159 +4691,6 @@ pub(crate) mod slot_publication_tests {
         assert_eq!(fx.bookmark(), landed.head);
         assert_eq!(fx.blob(&landed.head, "upstream.rs"), "from main");
         assert_eq!(fx.blob(&landed.head, "mine.rs"), "the batch's work");
-    }
-
-    /// A sealed delta whose branch cannot be prepared is already in the store,
-    /// so it is held exactly as sealed, with the refusal as its reason, and is
-    /// never reported as having missed the store. The branch does not move.
-    /// Another batch in flight on the branch refuses it whether the base is
-    /// current (the barrier refuses the landing) or stale (preparation refuses
-    /// the replay).
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn a_preparation_refusal_holds_the_sealed_delta_exactly_as_sealed() {
-        for (case, stale) in [
-            ("unmanaged", false),
-            ("unmanaged", true),
-            ("busy", false),
-            ("busy", true),
-        ] {
-            eprintln!("case {case}, stale base: {stale}");
-            let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
-                eprintln!("skipping a_preparation_refusal_holds: jj not resolvable");
-                return;
-            };
-            let orch = orchestrator(&fx).await;
-            if case == "unmanaged" {
-                orch.db
-                    .local
-                    .execute(
-                        "UPDATE jobs SET status = 'complete' WHERE id = ?1",
-                        (FEATURE_JOB,),
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                add_job(&orch, "job-sibling", "feature").await;
-                park_run_batch(&orch, "job-sibling", "request-sibling").await;
-            }
-            if stale {
-                advance_base(&fx, "upstream.rs");
-            }
-
-            let error = publish_visible_slot_delta(
-                &orch,
-                &fx.target,
-                &fx.request,
-                &fx.delta,
-                "the batch",
-                None,
-                None,
-            )
-            .await
-            .expect_err("an unprepared branch takes nothing");
-            let held = match error {
-                SlotPublicationError::Held { held, .. } => held,
-                other => panic!("{case}: an installed delta is held, got {other:?}"),
-            };
-            assert!(
-                held.error.contains("could not be prepared for publication"),
-                "{case}: {}",
-                held.error
-            );
-            if case == "busy" {
-                assert!(
-                    held.error.contains("may still commit to this branch"),
-                    "{}",
-                    held.error
-                );
-            }
-            let reference = held.reference.clone().expect("the delta is ref-protected");
-            assert_eq!(
-                git_stdout(&fx.repository, &["rev-parse", &reference]),
-                fx.delta.delta_commit,
-                "{case}: what is held is the sealed commit itself"
-            );
-            assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
-            assert_eq!(fx.bookmark(), fx.base, "{case}: the branch did not move");
-        }
-    }
-
-    /// The batch being published is exempt from its own pending suspension,
-    /// and only that: its sealed result names the job that parked it (a child
-    /// task sharing the branch names itself, not the branch's owner) and the
-    /// request. Any other batch in flight on the branch still holds it: another
-    /// request of the same job, a sibling job's batch sharing the request id,
-    /// or the owner's batch under a child's publication. Both on a current
-    /// base, where the barrier's permit enforces it, and on a stale one, where
-    /// preparation does.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn only_the_publishing_batch_itself_is_exempt_from_the_inflight_hold() {
-        // (the job that routed the batch, the job with a pending batch, its
-        // request, whether the delta publishes)
-        let cases = [
-            (FEATURE_JOB, FEATURE_JOB, "request", true),
-            ("job-child", "job-child", "request", true),
-            (FEATURE_JOB, FEATURE_JOB, "another-request", false),
-            (FEATURE_JOB, "job-sibling", "request", false),
-            ("job-child", FEATURE_JOB, "request", false),
-        ];
-        for (requester, parker, parked, publishes) in cases {
-            for stale in [false, true] {
-                eprintln!(
-                    "case {requester} publishing under {parker}/{parked}, stale base: {stale}"
-                );
-                let Some(fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
-                    eprintln!("skipping only_the_publishing_batch_itself: jj not resolvable");
-                    return;
-                };
-                assert_eq!(fx.request.request_id, "request");
-                let orch = orchestrator(&fx).await;
-                add_job(&orch, "job-child", "feature").await;
-                add_job(&orch, "job-sibling", "feature").await;
-                park_run_batch(&orch, parker, parked).await;
-                if stale {
-                    advance_base(&fx, "upstream.rs");
-                }
-                let request = CellRequest {
-                    requesting_job_id: Some(requester.into()),
-                    ..fx.request.clone()
-                };
-
-                let published = publish_visible_slot_delta(
-                    &orch,
-                    &fx.target,
-                    &request,
-                    &fx.delta,
-                    "the batch",
-                    None,
-                    None,
-                )
-                .await;
-                let case = format!("{requester} under {parker}/{parked}, stale {stale}");
-                if publishes {
-                    let Ok(SlotPublication {
-                        outcome: SlotPublicationOutcome::Published { landed, .. },
-                        ..
-                    }) = published
-                    else {
-                        panic!("{case}: its own batch does not block it: {published:?}");
-                    };
-                    assert_eq!(fx.bookmark(), landed.head, "{case}");
-                } else {
-                    let Err(SlotPublicationError::Held { held, .. }) = &published else {
-                        panic!("{case}: another batch holds the branch: {published:?}");
-                    };
-                    assert!(
-                        held.error.contains("may still commit to this branch"),
-                        "{case}: {}",
-                        held.error
-                    );
-                    assert_eq!(fx.bookmark(), fx.base, "{case}");
-                }
-            }
-        }
     }
 
     async fn row_count(orch: &Orchestrator, table: &str) -> i64 {
@@ -5502,123 +4972,6 @@ pub(crate) mod slot_publication_tests {
         assert_eq!(fx.blob(&landed.head, "third.rs"), "own");
     }
 
-    /// A trivial batch with a commit_msg drains older held work while its own
-    /// suspension is still pending: its verified-empty settlement exempts that
-    /// one wait and authorizes no content of its own, while each held delta
-    /// carries its own installed objects. Only the exact capability exempts it:
-    /// the same job and request, minted for this project, store (an alias of
-    /// it included) and branch. Any other batch in flight on the branch, or a
-    /// capability that is missing or minted for another job, request, branch
-    /// or store, refuses the whole drain, and the held delta stays held saying
-    /// why. Both on a current base and on a stale one.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn a_trivial_commit_barrier_drains_past_its_own_batch_but_not_another() {
-        // (the job with a pending batch, the capability presented as
-        // (job, request, branch, store), whether the drain lands)
-        type Capability = Option<(&'static str, &'static str, &'static str, &'static str)>;
-        let cases: [(&str, Capability, bool); 8] = [
-            (
-                LATER_JOB,
-                Some((LATER_JOB, "request-trivial", "later", "same")),
-                true,
-            ),
-            (
-                LATER_JOB,
-                Some((LATER_JOB, "request-trivial", "later", "alias")),
-                true,
-            ),
-            (
-                "job-sibling",
-                Some((LATER_JOB, "request-trivial", "later", "same")),
-                false,
-            ),
-            (LATER_JOB, None, false),
-            (
-                LATER_JOB,
-                Some(("job-sibling", "request-trivial", "later", "same")),
-                false,
-            ),
-            (
-                LATER_JOB,
-                Some((LATER_JOB, "another-request", "later", "same")),
-                false,
-            ),
-            (
-                LATER_JOB,
-                Some((LATER_JOB, "request-trivial", "feature", "same")),
-                false,
-            ),
-            (
-                LATER_JOB,
-                Some((LATER_JOB, "request-trivial", "later", "foreign")),
-                false,
-            ),
-        ];
-        for (job, capability, drains) in cases {
-            for stale in [false, true] {
-                eprintln!("case {job} under {capability:?}, stale base: {stale}");
-                let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await
-                else {
-                    eprintln!("skipping a_trivial_commit_barrier_drains: jj not resolvable");
-                    return;
-                };
-                let orch = orchestrator(&fx).await;
-                hold(&orch, &mut fx, "later").await;
-                create_bookmark(&fx, "later", &fx.base);
-                if job != LATER_JOB {
-                    add_job(&orch, job, "later").await;
-                }
-                park_run_batch(&orch, job, "request-trivial").await;
-                if stale {
-                    advance_base(&fx, "upstream.rs");
-                }
-
-                let foreign = tempfile::tempdir().unwrap();
-                let trivial = capability.map(|(sealed_job, request, branch, store)| {
-                    let store = match store {
-                        "same" => fx.store().to_path_buf(),
-                        "alias" => fx.store().join("."),
-                        _ => foreign.path().to_path_buf(),
-                    };
-                    SealedPublication::for_test(sealed_job, request, "project", &store, branch)
-                });
-                let barrier = prepared_barrier(
-                    &orch,
-                    Some(fx.store()),
-                    "slot publication test",
-                    true,
-                    PreparationKey {
-                        project_id: "project",
-                        branch: "later",
-                        owner_job_id: Some(LATER_JOB),
-                        sealed: trivial.as_ref(),
-                    },
-                    None,
-                )
-                .await;
-                assert!(barrier.own.is_none());
-                if drains {
-                    assert!(held::any_landed(&barrier.drained), "{:?}", barrier.drained);
-                    held::settle_drained(&orch, barrier.drained).await;
-                    assert_eq!(held_status(&orch, "attempt-3231").await.0, "landed");
-                    assert_eq!(
-                        fx.blob(&bookmark_at(&fx, "later"), "mine.rs"),
-                        "the batch's work"
-                    );
-                } else {
-                    let [held::Drained::Note(note)] = barrier.drained.as_slice() else {
-                        panic!("expected one note, got {:?}", barrier.drained);
-                    };
-                    assert!(note.contains("could not be published"), "{note}");
-                    assert!(note.contains("may still commit to this branch"), "{note}");
-                    assert_eq!(held_status(&orch, "attempt-3231").await, ("held".into(), 1));
-                    assert_eq!(bookmark_at(&fx, "later"), fx.base);
-                }
-            }
-        }
-    }
-
     async fn set_held_path(orch: &Orchestrator, attempt_id: &str, column: &str, path: &Path) {
         orch.db
             .local
@@ -5688,105 +5041,6 @@ pub(crate) mod slot_publication_tests {
                     "{case}: the route back stays open"
                 );
             }
-        }
-    }
-
-    /// Held rows judged by the publication authority, drained after a merge
-    /// that left the branch in place and a reopen that continued its owner in
-    /// a new session (`s-old` closed by the merge at 200, `s-new` open). A row
-    /// from before held rows named their run cannot have its session checked,
-    /// so it is refused whether it was held before the session closed (100) or
-    /// only after (300), the delayed completion no hold timestamp tells apart
-    /// from the successor's work. A row naming a run of the closed session is
-    /// refused by that session; one naming a run of the successor lands. A
-    /// refused row stops waiting, keeps its recovery ref, and moves nothing.
-    #[tokio::test]
-    #[serial_test::serial(jj)]
-    async fn a_held_row_publishes_only_while_its_session_may() {
-        for (case, run_id, held_at, lands) in [
-            ("unattributed, held before the close", None, 100, false),
-            ("unattributed, held after the close", None, 300, false),
-            ("its run's session was closed", Some("run-old"), 300, false),
-            ("its run is the successor's", Some("run-new"), 300, true),
-        ] {
-            let Some(mut fx) = straddle(None, &[("mine.rs", "the batch's work\n")]).await else {
-                eprintln!(
-                    "skipping a_held_row_publishes_only_while_its_session_may: jj not resolvable"
-                );
-                return;
-            };
-            let orch = orchestrator(&fx).await;
-            hold(&orch, &mut fx, "later").await;
-            create_bookmark(&fx, "later", &fx.base);
-            let run_sql = run_id.map_or("NULL".to_string(), |run| format!("'{run}'"));
-            orch.db
-                .local
-                .execute_script(format!(
-                    "INSERT INTO sessions(id, job_id, status, backend_id, terminal_reason, created_at, closed_at, updated_at)
-                       VALUES('s-old', '{LATER_JOB}', 'closed', 'backend', 'issue_merged', 1, 200, 200),
-                             ('s-new', '{LATER_JOB}', 'open', 'backend', NULL, 400, NULL, 400);
-                     INSERT INTO runs(id, project_id, job_id, issue_id, status, session_id, created_at, updated_at)
-                       VALUES('run-old', 'project', '{LATER_JOB}', 'issue-1', 'live', 's-old', 1, 1),
-                             ('run-new', 'project', '{LATER_JOB}', 'issue-1', 'live', 's-new', 400, 400);
-                     UPDATE held_publications SET job_id = '{LATER_JOB}', run_id = {run_sql},
-                            created_at = {held_at}, updated_at = {held_at}
-                      WHERE attempt_id = 'attempt-3231';"
-                ))
-                .await
-                .unwrap();
-
-            let drained = drain(&orch, &fx, "later").await;
-
-            if lands {
-                assert!(held::any_landed(&drained), "{case}: {drained:?}");
-                assert_eq!(
-                    fx.blob(&bookmark_at(&fx, "later"), "mine.rs"),
-                    "the batch's work",
-                    "{case}"
-                );
-                continue;
-            }
-            let [held::Drained::Note(note)] = drained.as_slice() else {
-                panic!("{case}: expected one refusal note, got {drained:?}");
-            };
-            assert!(
-                note.contains("branch_retired (session_closed)"),
-                "{case}: {note}"
-            );
-            assert!(note.contains("proj/1"), "{case}: {note}");
-            assert_eq!(
-                held_status(&orch, "attempt-3231").await.0,
-                "stranded",
-                "{case}: the row stops waiting"
-            );
-            assert!(
-                held::held_rows(&orch.db.local, "project", "later")
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "{case}"
-            );
-            assert!(
-                ref_exists(&fx, "refs/cairn/stranded/attempt-3231"),
-                "{case}: the recovery ref is kept"
-            );
-            let recorded = orch
-                .db
-                .local
-                .query_opt(
-                    "SELECT reference FROM held_publications WHERE attempt_id = 'attempt-3231'",
-                    (),
-                    |row| row.opt_text(0),
-                )
-                .await
-                .unwrap()
-                .flatten();
-            assert_eq!(
-                recorded.as_deref(),
-                Some("refs/cairn/stranded/attempt-3231"),
-                "{case}: the row still names its recovery ref"
-            );
-            assert_eq!(bookmark_at(&fx, "later"), fx.base, "{case}: nothing moved");
         }
     }
 
@@ -13823,7 +13077,6 @@ mod decide_door_tests {
         choosing_b, with_logprobs, workspace_with_server, DecideOutcome,
     };
     use serde_json::{json, Value};
-    use std::time::{Duration, Instant};
 
     fn request(payload: Value) -> McpCallbackRequest {
         McpCallbackRequest {
@@ -14074,80 +13327,6 @@ mod decide_door_tests {
             "{text}"
         );
     }
-
-    /// The facet's decide cannot be cancelled mid-request, so the item's
-    /// timeout is what releases the caller; the abandoned call ends on its own.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_timeout_releases_the_caller_while_the_provider_hangs() {
-        let (orch, server, _) = workspace_with_server(
-            CustomProtocol::OpenAiChatCompletions,
-            None,
-            "qwen3",
-            vec![with_logprobs(), choosing_b()],
-        )
-        .await;
-        server.hold_each_reply(Duration::from_secs(3));
-
-        let started = Instant::now();
-        let text = run(&orch, json!([decide_item(Some(300))])).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "released after {:?}",
-            started.elapsed()
-        );
-        assert!(
-            text.contains("Decision timed out at the 0.3 s bound its caller requested."),
-            "the failure names the bound and that the caller set it: {text}"
-        );
-    }
-
-    /// A response item cut off by its bound says which bound and what the
-    /// definition declared, and the call is still journaled: the history is the
-    /// one place a later reader looks for a model call's fate.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_response_timeout_names_its_bound_and_is_journaled() {
-        let (orch, server, key) = workspace_with_server(
-            CustomProtocol::OpenAiChatCompletions,
-            None,
-            "qwen3",
-            vec![json!({"model": "qwen3", "choices": [{"message": {"role": "assistant", "content": "late"}}]})],
-        )
-        .await;
-        server.hold_each_reply(Duration::from_secs(3));
-        let responses = orch.config_dir.join("responses");
-        std::fs::create_dir_all(&responses).unwrap();
-        std::fs::write(
-            responses.join("slow.md"),
-            format!("---\nname: Slow\ndescription: a reasoning call\nmodels: [{key}/qwen3]\ntimeout: 300s\n---\nLabel this."),
-        )
-        .unwrap();
-
-        let started = Instant::now();
-        let text = run(
-            &orch,
-            json!([{"target": "cairn://responses/slow", "payload": {"args_json": {}}, "timeout": 300}]),
-        )
-        .await;
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "released after {:?}",
-            started.elapsed()
-        );
-        let named = "response timed out at the 0.3 s bound its caller requested (the definition declares 300 s).";
-        assert!(text.contains(named), "{text}");
-        assert_eq!(server.calls(), 1, "the provider was reached");
-
-        let journal =
-            crate::storage::list_response_invocations(&orch.db.local, "workspace", "slow", 10)
-                .await
-                .unwrap();
-        assert_eq!(journal.len(), 1, "the timed-out call has its row");
-        assert_eq!(journal[0].status, "failed");
-        assert_eq!(journal[0].error.as_deref(), Some(named));
-        assert_eq!(journal[0].model.as_deref(), Some("qwen3"));
-        assert_eq!(journal[0].backend.as_deref(), Some(key.as_str()));
-        assert_eq!(journal[0].rendered_prompt, "Label this.");
-    }
 }
 
 /// A batch holding a response item takes the durable-suspend path a long shell
@@ -14157,10 +13336,10 @@ mod decide_door_tests {
 pub(crate) mod host_batch_tests {
     use super::types::RunSpec;
     use super::*;
-    use crate::backends::{CompletionOutcome, CompletionRequest};
+
     use crate::db::DbState;
     use crate::mcp::handlers::durable_suspend;
-    use crate::responses::ResponseError;
+
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, SearchIndex};
     use serde_json::json;
@@ -14238,53 +13417,6 @@ pub(crate) mod host_batch_tests {
         run_suspendable_host_batch(orch, settlement, batch, grace).await
     }
 
-    /// A provider that takes `delay` (or the request's own timeout, if that is
-    /// shorter, as a real one would) and records the timeout it was sent.
-    fn provider(orch: &Orchestrator, delay: Duration) -> Arc<Mutex<Option<Duration>>> {
-        let sent = Arc::new(Mutex::new(None));
-        let recorded = sent.clone();
-        crate::responses::test_completion::install(
-            &orch.config_dir,
-            Arc::new(move |_, request: CompletionRequest, _| {
-                *recorded.lock().unwrap() = Some(request.timeout);
-                if request.timeout < delay {
-                    std::thread::sleep(request.timeout);
-                    return Err(ResponseError::Timeout.into());
-                }
-                std::thread::sleep(delay);
-                Ok(CompletionOutcome {
-                    text: "the long answer".into(),
-                    reasoning: None,
-                    parsed: None,
-                    model: "test-model".into(),
-                    usage: Default::default(),
-                    latency_ms: delay.as_millis() as u64,
-                    account_id: None,
-                })
-            }),
-        );
-        sent
-    }
-
-    /// One response item, from a call that can park when `parkable` (it names
-    /// its tool call) and from a nested `cairn.run` that cannot otherwise.
-    async fn batch(
-        orch: &Orchestrator,
-        timeout: Option<u32>,
-        parkable: bool,
-    ) -> (RunBatchSettlement, HostBatch) {
-        let item = (
-            "cairn://responses/slow".to_string(),
-            RunSpec::ResponseCall {
-                response_id: "slow".into(),
-                project: None,
-                args: json!({}),
-                timeout,
-            },
-        );
-        batch_of(orch, item, parkable).await
-    }
-
     /// One item of any host kind, parkable as [`batch`] describes.
     async fn batch_of(
         orch: &Orchestrator,
@@ -14351,11 +13483,6 @@ pub(crate) mod host_batch_tests {
         InputRequired {
             input_requests: serde_json::Value,
             request_state: Option<String>,
-        },
-        Task {
-            task_id: String,
-            poll_interval_ms: Option<u64>,
-            ttl_ms: Option<u64>,
         },
     }
 
@@ -14457,15 +13584,6 @@ pub(crate) mod host_batch_tests {
                 } => McpCallOutcome::InputRequired {
                     input_requests,
                     request_state,
-                },
-                FirstAnswer::Task {
-                    task_id,
-                    poll_interval_ms,
-                    ttl_ms,
-                } => McpCallOutcome::Task {
-                    task_id,
-                    poll_interval_ms,
-                    ttl_ms,
                 },
             })
         }
@@ -14585,39 +13703,6 @@ pub(crate) mod host_batch_tests {
         }
     }
 
-    /// The contract this change exists for: an MCP call declared longer than
-    /// the synchronous window suspends its batch and resumes with the tool's
-    /// result, rather than being cut at the window.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_mcp_call_that_outlives_grace_suspends_and_resumes_with_its_result() {
-        let orch = env().await;
-        let (abandoned, sent) = slow_tool(&orch, Duration::from_millis(800));
-        let (settlement, batch) = batch_of(&orch, mcp_item(Some(5_000)), true).await;
-
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-        let (state, condition) = wait_row(&orch).await;
-        assert_eq!(state, "pending");
-        assert!(condition.contains("\"host\":true"), "{condition}");
-
-        let result = eventually(Duration::from_secs(10), || {
-            tool_result_containing(&orch, "the tool answered")
-        })
-        .await
-        .expect("the parked call resumes with the tool's result");
-        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(resumed["toolUseId"], "tool-1");
-        assert_eq!(resumed["toolResult"], "the tool answered");
-        assert_eq!(resumed["isError"], false);
-        assert_eq!(
-            sent(),
-            Some(Some(5_000)),
-            "the gateway is held to the declared bound, not the host-item cap"
-        );
-        assert!(!was(&abandoned));
-    }
-
     /// A tool that asks for an approval 800 ms in, well after a 100 ms grace
     /// window has parked its batch.
     fn asks_after_park() -> (&'static str, Duration, FirstAnswer) {
@@ -14661,206 +13746,6 @@ pub(crate) mod host_batch_tests {
         id
     }
 
-    /// Drive the global MCP scheduler until `found` yields something.
-    async fn ticking<T, F, Fut>(orch: &Orchestrator, limit: Duration, mut found: F) -> Option<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Option<T>>,
-    {
-        eventually(limit, || {
-            let tick = crate::mcp::handlers::mcp_continuation::scheduler_tick(orch);
-            let found = found();
-            async move {
-                tick.await;
-                found.await
-            }
-        })
-        .await
-    }
-
-    /// The prompt continuation `wait_id` asked, once the scheduler drives it
-    /// past its park handoff.
-    async fn continuation_prompt(orch: &Orchestrator, wait_id: &str) -> String {
-        ticking(orch, Duration::from_secs(10), || async {
-            orch.db
-                .local
-                .query_text(
-                    "SELECT id FROM prompts WHERE mcp_wait_id=?1 ORDER BY created_at DESC LIMIT 1",
-                    (wait_id.to_string(),),
-                )
-                .await
-                .ok()
-                .flatten()
-        })
-        .await
-        .expect("the continuation asks its prompt")
-    }
-
-    /// Commit `answer` to `prompt_id` the way an answered prompt lands.
-    async fn answer_prompt(orch: &Orchestrator, prompt_id: &str, answer: serde_json::Value) {
-        let encoded = answer.to_string();
-        let answers = crate::models::question::PromptAnswers::new(
-            1,
-            vec![crate::models::question::QuestionAnswer {
-                index: 0,
-                answer: encoded.clone(),
-            }],
-        )
-        .unwrap();
-        orch.db
-            .local
-            .execute(
-                "UPDATE prompts SET response=?1, answered_at=1 WHERE id=?2",
-                (answers.to_stored(), prompt_id.to_string()),
-            )
-            .await
-            .unwrap();
-        let _ = orch.prompt_responses.send((
-            prompt_id.to_string(),
-            crate::mcp::handlers::planning::AnsweredPrompt {
-                answers,
-                rendered: encoded,
-            },
-        ));
-    }
-
-    async fn tool_results_for_call(orch: &Orchestrator) -> i64 {
-        orch.db
-            .local
-            .query_one(
-                "SELECT COUNT(*) FROM events WHERE event_type='tool_result' AND json_extract(data,'$.toolUseId')='tool-1'",
-                (),
-                |row| row.i64(0),
-            )
-            .await
-            .unwrap()
-    }
-
-    /// The defect this handoff exists for: a tool that asks for input only
-    /// after its batch parked used to fail its item as "could not be
-    /// suspended", because the batch's own row already answered for the call.
-    /// It now hands the call to a continuation in the same write that retires
-    /// that row, and the scheduler carries the answer back to the tool and the
-    /// tool's final answer to the same call.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_mcp_call_that_asks_for_input_after_its_batch_parked_hands_its_call_to_a_continuation(
-    ) {
-        let orch = env().await;
-        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
-        let (settlement, batch) = batch_of(&orch, mcp_item_named("ask", Some(5_000)), true).await;
-
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-
-        let continuation = handed_over(&orch).await;
-        let prompt_id = continuation_prompt(&orch, &continuation).await;
-        answer_prompt(&orch, &prompt_id, json!({"approval": true})).await;
-        let result = ticking(&orch, Duration::from_secs(10), || {
-            tool_result_containing(&orch, TOOL_FINISHED)
-        })
-        .await
-        .expect("the continuation answers the call with the tool's final answer");
-        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(resumed["toolUseId"], "tool-1");
-
-        assert_eq!(
-            *tool.rounds.lock().unwrap(),
-            vec![(json!({"approval": true}), Some("round-1".to_string()))],
-            "the continuation round carries the answer and the server's state"
-        );
-        assert_eq!(
-            tool_results_for_call(&orch).await,
-            1,
-            "answered exactly once"
-        );
-        assert!(tool_result_containing(&orch, "could not be suspended")
-            .await
-            .is_none());
-    }
-
-    /// The same handoff for a tool that opens a task after its batch parked:
-    /// the scheduler polls the task and answers the call with its result.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_mcp_call_that_opens_a_task_after_its_batch_parked_hands_its_call_to_a_continuation()
-    {
-        let orch = env().await;
-        let tool = scripted_tool(
-            &orch,
-            Duration::from_secs(30),
-            [(
-                "task",
-                Duration::from_millis(800),
-                FirstAnswer::Task {
-                    task_id: "task-1".into(),
-                    poll_interval_ms: Some(100),
-                    ttl_ms: Some(30_000),
-                },
-            )],
-        );
-        let (settlement, batch) = batch_of(&orch, mcp_item_named("task", Some(5_000)), true).await;
-
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-
-        handed_over(&orch).await;
-        let result = ticking(&orch, Duration::from_secs(10), || {
-            tool_result_containing(&orch, TASK_FINISHED)
-        })
-        .await
-        .expect("the continuation answers the call with the task's result");
-        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(resumed["toolUseId"], "tool-1");
-        assert_eq!(*tool.polls.lock().unwrap(), vec!["task-1".to_string()]);
-        assert_eq!(
-            tool_results_for_call(&orch).await,
-            1,
-            "answered exactly once"
-        );
-    }
-
-    async fn wait_state_of(orch: &Orchestrator, id: &str) -> String {
-        orch.db
-            .local
-            .query_one(
-                "SELECT state FROM agent_waits WHERE id=?1",
-                (id.to_string(),),
-                |row| row.text(0),
-            )
-            .await
-            .unwrap()
-    }
-
-    /// A stop after the handoff ends the continuation the way it ends any:
-    /// its row is cancelled, so an answer that arrives anyway is never carried
-    /// to the tool and nothing answers the call but the stop.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stopping_the_run_during_a_handed_over_continuation_ends_it_stopped() {
-        let orch = env().await;
-        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
-        let (settlement, batch) = batch_of(&orch, mcp_item_named("ask", Some(5_000)), true).await;
-
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-        let continuation = handed_over(&orch).await;
-        let prompt_id = continuation_prompt(&orch, &continuation).await;
-
-        crate::orchestrator::lifecycle::stop_active_turn_for_run(&orch, "run-1", true);
-        assert_eq!(wait_state_of(&orch, &continuation).await, "cancelled");
-        answer_prompt(&orch, &prompt_id, json!({"approval": true})).await;
-        // Long enough past the handoff gate that a pending continuation with a
-        // committed answer would have been driven.
-        let driven = ticking(&orch, Duration::from_millis(1_500), || async {
-            (!tool.rounds.lock().unwrap().is_empty()).then_some(())
-        })
-        .await;
-        assert!(driven.is_none(), "the gateway saw no continuation round");
-        assert_eq!(wait_state_of(&orch, &continuation).await, "cancelled");
-        assert!(tool_result_containing(&orch, TOOL_FINISHED).await.is_none());
-    }
-
     /// The stop reaches the batch's one interrupter after a handoff too: an
     /// item still running beside the one that handed its call over is ended
     /// at once, rather than left to its own bound because the batch's row now
@@ -14894,60 +13779,6 @@ pub(crate) mod host_batch_tests {
             stopped.elapsed() < Duration::from_millis(2_500),
             "interrupted {:?} after the stop",
             stopped.elapsed()
-        );
-    }
-
-    /// A batch still holding its call on the socket when the tool asks is
-    /// parked by the handoff itself: the call answers inline with the item's
-    /// suspension, the turn yields once, and the continuation finishes the
-    /// call as it does for a parked batch.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_mcp_call_that_asks_for_input_while_its_batch_is_held_parks_the_call_and_hands_it_over(
-    ) {
-        let orch = env().await;
-        let tool = scripted_tool(&orch, Duration::from_secs(30), [asks_after_park()]);
-        let (settlement, batch) = batch_of(&orch, mcp_item_named("ask", Some(5_000)), true).await;
-
-        let text = run_host_batch_declaring(
-            &orch,
-            settlement,
-            batch,
-            Duration::from_millis(100),
-            Some(Duration::from_secs(10)),
-        )
-        .await;
-        assert!(
-            text.contains(RUN_ITEM_SUSPENDED_MARKER),
-            "the held call answers on its socket with the item's suspension: {text}"
-        );
-        let continuation = handed_over(&orch).await;
-        let turn = orch
-            .db
-            .local
-            .query_text("SELECT state FROM turns WHERE id='pred-turn'", ())
-            .await
-            .unwrap();
-        assert_eq!(
-            turn.as_deref(),
-            Some("yielded"),
-            "the handoff parked the turn"
-        );
-
-        let prompt_id = continuation_prompt(&orch, &continuation).await;
-        answer_prompt(&orch, &prompt_id, json!({"approval": true})).await;
-        ticking(&orch, Duration::from_secs(10), || {
-            tool_result_containing(&orch, TOOL_FINISHED)
-        })
-        .await
-        .expect("the continuation answers the call with the tool's final answer");
-        assert_eq!(
-            *tool.rounds.lock().unwrap(),
-            vec![(json!({"approval": true}), Some("round-1".to_string()))]
-        );
-        assert_eq!(
-            tool_results_for_call(&orch).await,
-            1,
-            "answered exactly once"
         );
     }
 
@@ -15046,29 +13877,6 @@ pub(crate) mod host_batch_tests {
         assert!(tool_result_containing(&orch, "tool-1").await.is_none());
     }
 
-    /// What the interrupted MCP item itself reports when the run stops.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_stopped_mcp_item_reports_itself_stopped() {
-        let orch = env().await;
-        let (abandoned, _) = slow_tool(&orch, Duration::from_secs(30));
-        let (_, batch) = batch_of(&orch, mcp_item(Some(60_000)), true).await;
-        let (interrupter, interrupt) = crate::responses::interruption();
-
-        let (outcomes, ()) = tokio::join!(
-            run_host_items(&orch, batch, Some(&interrupt), None),
-            async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                interrupter.interrupt(Interruption::Cancelled(RUN_STOPPED_REASON.into()));
-            }
-        );
-        assert!(!outcomes[0].succeeded);
-        assert_eq!(
-            outcomes[0].body,
-            "MCP call 'fake/slow' stopped: the run that called it was stopped before it answered. Its request was cancelled at the server."
-        );
-        assert!(was(&abandoned));
-    }
-
     /// A host item cancelled by a principal names them in its own body, and
     /// that name survives composition for a model's context and for code alike,
     /// even beside a sibling large enough that the context budget elides it.
@@ -15148,12 +13956,6 @@ pub(crate) mod host_batch_tests {
         assert_eq!(parked, 0, "nothing was parked");
     }
 
-    async fn journal(orch: &Orchestrator) -> Vec<cairn_db::storage::ResponseInvocationRecord> {
-        crate::storage::list_response_invocations(&orch.db.local, "workspace", "slow", 10)
-            .await
-            .unwrap()
-    }
-
     /// Poll for up to `limit` until `found` yields something.
     async fn eventually<T, F, Fut>(limit: Duration, mut found: F) -> Option<T>
     where
@@ -15198,155 +14000,6 @@ pub(crate) mod host_batch_tests {
             .await
             .ok()
             .flatten()
-    }
-
-    /// The ruling's contract: a response runs past the synchronous window by
-    /// suspending, keeps running while the turn is parked, and the resumed
-    /// call carries its answer, journaled like any other.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_response_that_outlives_grace_suspends_and_resumes_with_its_answer() {
-        let orch = env().await;
-        let sent = provider(&orch, Duration::from_millis(800));
-        let (settlement, batch) = batch(&orch, None, true).await;
-
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-        let (state, condition) = wait_row(&orch).await;
-        assert_eq!(state, "pending");
-        assert!(
-            condition.contains("\"host\":true"),
-            "a host batch holds no tree: {condition}"
-        );
-        assert!(journal(&orch).await.is_empty(), "still running when parked");
-
-        let result = eventually(Duration::from_secs(10), || {
-            tool_result_containing(&orch, "the long answer")
-        })
-        .await
-        .expect("the parked call resumes with the response");
-        // A one-item batch composes as the item's body alone.
-        let resumed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            resumed["toolUseId"], "tool-1",
-            "it answers the call that parked"
-        );
-        assert_eq!(resumed["toolResult"], "the long answer");
-        assert_eq!(resumed["isError"], false);
-
-        let rows = journal(&orch).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "ok");
-        assert_eq!(rows[0].output_text.as_deref(), Some("the long answer"));
-        assert_eq!(
-            *sent.lock().unwrap(),
-            Some(Duration::from_secs(300)),
-            "with no item timeout, the definition's own timeout governs the request"
-        );
-    }
-
-    /// The item's own bound still ends it, in 5250's words, with its row.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_response_items_own_timeout_names_its_bound_and_is_journaled() {
-        let orch = env().await;
-        provider(&orch, Duration::from_secs(5));
-        let (settlement, batch) = batch(&orch, Some(200), true).await;
-
-        let started = Instant::now();
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_secs(5)).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
-        );
-        let named = "response timed out at the 0.2 s bound its caller requested (the definition declares 300 s).";
-        assert!(text.contains(named), "{text}");
-        let rows = journal(&orch).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, "failed");
-        assert_eq!(rows[0].error.as_deref(), Some(named));
-    }
-
-    /// A stop cancels the suspension row and nothing else. The batch notices,
-    /// interrupts its response item at once, and the item journals the stop;
-    /// the abandoned request was held to the item's bound, so it ends on its
-    /// own within it. The stop already answered the call, so nothing resumes.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stopping_the_run_interrupts_a_suspended_response_and_journals_it() {
-        let orch = env().await;
-        let sent = provider(&orch, Duration::from_secs(30));
-        let (settlement, batch) = batch(&orch, Some(4_000), true).await;
-
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(100)).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-        orch.db
-            .local
-            .execute(
-                "UPDATE agent_waits SET state='cancelled' WHERE run_id='run-1' AND state='pending'",
-                (),
-            )
-            .await
-            .unwrap();
-        let stopped = Instant::now();
-
-        let rows = eventually(Duration::from_secs(5), || async {
-            let rows = journal(&orch).await;
-            (!rows.is_empty()).then_some(rows)
-        })
-        .await
-        .expect("the interrupted call is journaled");
-        assert!(
-            stopped.elapsed() < Duration::from_millis(2_500),
-            "released {:?} after the stop, while the provider still had seconds to run",
-            stopped.elapsed()
-        );
-        assert_eq!(rows[0].status, "failed");
-        assert_eq!(
-            rows[0].error.as_deref(),
-            Some("response cancelled: the run that called it was stopped before it answered")
-        );
-        let sent = sent.lock().unwrap().expect("the request was sent");
-        assert!(
-            sent <= Duration::from_secs(4),
-            "the abandoned request is bounded by the item's bound: {sent:?}"
-        );
-        assert!(tool_result_containing(&orch, "slow").await.is_none());
-    }
-
-    /// A nested `cairn.run` has no tool call of its own to park on, and nothing
-    /// above the host listens past grace. Its response is ended at the window
-    /// with a failure saying why and how to get the full timeout, and journaled.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_call_that_cannot_park_ends_its_response_at_the_window_and_says_why() {
-        let orch = env().await;
-        provider(&orch, Duration::from_secs(6));
-        let (settlement, batch) = batch(&orch, None, false).await;
-
-        let started = Instant::now();
-        let text =
-            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_millis(200)).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "{:?}",
-            started.elapsed()
-        );
-        let named = format!(
-            "response timed out at the 0.2 s host-item cap (no timeout was requested; the definition declares 300 s). {UNPARKED_HOST_BATCH_WHY}"
-        );
-        assert!(text.contains(&named), "{text}");
-        assert!(UNPARKED_HOST_BATCH_WHY.contains("@cairn/sdk"));
-        let rows = journal(&orch).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].error.as_deref(), Some(named.as_str()));
-        let parked: i64 = orch
-            .db
-            .local
-            .query_one("SELECT COUNT(*) FROM agent_waits", (), |row| row.i64(0))
-            .await
-            .unwrap();
-        assert_eq!(parked, 0, "nothing was parked");
     }
 
     /// Responses take the run-item ceiling; decide keeps the 120 s host-item
@@ -15563,78 +14216,6 @@ pub(crate) mod host_batch_tests {
         check(orch.clone()).await;
     }
 
-    /// Publication that blocks on the store past the work deadline parks the
-    /// call at that deadline; the park's admission waits for the same lock but
-    /// only until the answer deadline, so the call still answers in time, and
-    /// the published result reaches the turn through the resolver.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_finish_blocked_on_the_store_parks_in_time_and_delivers_later() {
-        let orch = env().await;
-        let store = tempfile::tempdir().unwrap().keep();
-        let request = call_request(json!({"commands": [{"command": "cargo build"}]}));
-        // The answer bound leaves the park's admission (which gives up
-        // `CANCEL_MARGIN` before the answer deadline) time to outwait the lock.
-        let deadlines = CallDeadlines::new(
-            tokio::time::Instant::now(),
-            ms(100),
-            ms(3_900),
-            ms(4_000),
-            None,
-        );
-        let control = BatchControl::new(true);
-        control.set_facts(BatchFacts {
-            store_lock: Some(store.clone()),
-            host: false,
-            may_park: true,
-            verdict_only: false,
-        });
-        let held = orch
-            .hold_jj_store_lock_on_another_task(
-                &store,
-                crate::orchestrator::StoreLockClass::Foreground,
-                "test holds the store",
-            )
-            .await;
-        tokio::spawn(async move {
-            tokio::time::sleep(ms(600)).await;
-            held.release().await;
-        });
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn({
-            let orch = orch.clone();
-            let store = store.clone();
-            async move {
-                // The batch finished running at once; its publication waits
-                // on the store.
-                let publishing = orch
-                    .acquire_jj_store_lock_with_timeout(
-                        &store,
-                        crate::orchestrator::StoreLockClass::Foreground,
-                        "test publication",
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                drop(publishing);
-                let _ = tx.send(batch_answer("published after the lock"));
-            }
-        });
-
-        let started = Instant::now();
-        let text = answer_call(&orch, &request, deadlines, control, rx).await;
-        assert!(text.contains(RUN_BATCH_SUSPENDED_MARKER), "{text}");
-        assert!(
-            started.elapsed() < ms(4_000),
-            "answered {:?} after arrival, past its answer deadline",
-            started.elapsed()
-        );
-        eventually(Duration::from_secs(10), || {
-            tool_result_containing(&orch, "published after the lock")
-        })
-        .await
-        .expect("the parked call resumes with the published result");
-    }
-
     fn envelope_text(envelope: &str) -> String {
         serde_json::from_str::<cairn_common::read::RunBatchEnvelope>(envelope)
             .map(|parsed| parsed.text)
@@ -15659,23 +14240,6 @@ pub(crate) mod host_batch_tests {
             "SELECT COUNT(*) FROM suppressed_wakes WHERE job_id='job-1' AND source_kind='run_batch'",
         )
         .await
-    }
-
-    /// Re-register the fixture's run under another backend.
-    fn set_backend(orch: &Orchestrator, backend: &str) {
-        let mut handle = crate::agent_process::process::RunHandle::new(
-            Arc::new(std::sync::Mutex::new(None)),
-            Arc::new(std::sync::Mutex::new(None)),
-            Some("session-1".to_string()),
-            Some("job-1".to_string()),
-        );
-        handle.backend = Some(backend.to_string());
-        handle.begin_turn("pred-turn");
-        orch.process_state
-            .processes
-            .lock()
-            .unwrap()
-            .register("run-1".to_string(), handle);
     }
 
     /// Settle a detached batch and wait for its notice: the row settles with
@@ -15771,133 +14335,6 @@ pub(crate) mod host_batch_tests {
             "built after the call answered",
         )
         .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_task_detached_handle_reads_running_and_settled_through_its_home() {
-        use crate::resources::read_cairn_resource;
-        for thread_home in [false, true] {
-            let orch = env().await;
-            for sql in [
-                "UPDATE jobs SET node_name='Atomic incident',uri_segment='atomic-incident' WHERE id='job-1'",
-                "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('parent','e','i','p','Builder','running',1,1,'builder')",
-                "UPDATE jobs SET parent_job_id='parent' WHERE id='job-1'",
-                "INSERT INTO jobs (id,parent_job_id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('sibling','parent','e','i','p','Sibling','running',1,1,'sibling')",
-            ] {
-                orch.db.local.execute(sql, ()).await.unwrap();
-            }
-            let parent_home = if thread_home {
-                for sql in [
-                    "INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('thread','p','execution','active','none',1,1)",
-                    "UPDATE jobs SET thread_id='thread',issue_id=NULL,execution_id=NULL",
-                    "UPDATE jobs SET uri_segment='thread' WHERE id='parent'",
-                ] {
-                    orch.db.local.execute(sql, ()).await.unwrap();
-                }
-                "cairn://p/prj/execution"
-            } else {
-                "cairn://p/prj/1/1/builder"
-            };
-            let task_home = format!("{parent_home}/task/atomic-incident");
-            let mut request = call_request(declared_payload());
-            request.tool_use_id = None;
-            let actual_home = super::super::run_context::lookup_home_uri_routed(&orch.db, &request)
-                .await
-                .unwrap();
-            assert_eq!(actual_home, task_home);
-
-            let control = BatchControl::new(false);
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let deadlines = CallDeadlines::new(
-                tokio::time::Instant::now(),
-                ms(50),
-                ms(100),
-                ms(1_500),
-                Some(ms(600_000)),
-            );
-            let answer =
-                envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
-            let handle = answer
-                .split('`')
-                .find(|s| s.starts_with("cairn:~/batches/"))
-                .expect("detach response names a readable handle");
-            let canonical = format!("{task_home}/batches/{}", control.request_id);
-            assert_eq!(
-                crate::resources::resolve_home_relative_against(&task_home, handle).as_deref(),
-                Some(canonical.as_str()),
-            );
-            for uri in [handle, canonical.as_str()] {
-                let running = read_cairn_resource(&orch, &request, uri).await;
-                assert!(running.contains("State: running"), "{uri}: {running}");
-                assert!(running.contains("## Task batch"), "{running}");
-            }
-            let task_list = read_cairn_resource(&orch, &request, "cairn:~/batches").await;
-            assert!(task_list.contains(&canonical), "{task_list}");
-            let parent_list =
-                read_cairn_resource(&orch, &request, &format!("{parent_home}/batches")).await;
-            assert!(!parent_list.contains(&control.request_id), "{parent_list}");
-            assert!(parent_list.contains("Tasks' batches"), "{parent_list}");
-            let parent_handle = format!("{parent_home}/batches/{}", control.request_id);
-            let misplaced = read_cairn_resource(&orch, &request, &parent_handle).await;
-            assert!(
-                misplaced.contains("belongs to a different job"),
-                "{misplaced}"
-            );
-            assert!(misplaced.contains(&canonical), "{misplaced}");
-
-            control.set_verdict("failed".to_string());
-            deliver_and_expect_one_notice(
-                &orch,
-                &control.request_id,
-                tx,
-                "compiler error: specimen",
-            )
-            .await;
-            for uri in [handle, canonical.as_str()] {
-                let settled = read_cairn_resource(&orch, &request, uri).await;
-                assert!(settled.contains("State: settled"), "{settled}");
-                assert!(settled.contains("Verdict: failed"), "{settled}");
-                assert!(settled.contains("compiler error: specimen"), "{settled}");
-            }
-            let sibling_handle =
-                format!("{parent_home}/task/sibling/batches/{}", control.request_id);
-            let sibling = read_cairn_resource(&orch, &request, &sibling_handle).await;
-            assert!(sibling.contains(&canonical), "{sibling}");
-            assert!(!sibling.contains("compiler error: specimen"), "{sibling}");
-            let missing = read_cairn_resource(&orch, &request, "cairn:~/batches/missing").await;
-            assert!(missing.contains("No detached run batch"), "{missing}");
-        }
-    }
-
-    /// A call whose transcript holds no `run` call of its own to claim (the
-    /// Claude parallel-block race) detaches too.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_call_with_no_claimable_tool_call_detaches_and_delivers() {
-        let orch = env().await;
-        set_backend(&orch, "claude");
-        let mut request = call_request(json!({"commands": [{"command": "rg needle"}]}));
-        request.tool_use_id = None;
-        let deadlines = CallDeadlines::new(
-            tokio::time::Instant::now(),
-            ms(100),
-            ms(3_900),
-            ms(4_000),
-            None,
-        );
-        let control = BatchControl::new(false);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        let text =
-            envelope_text(&answer_call(&orch, &request, deadlines, control.clone(), rx).await);
-        assert_eq!(
-            text,
-            detached::detach_answer_text(
-                &control.request_id,
-                "it has no `run` tool call of its own to park on"
-            )
-        );
-        assert!(control.begin_settling(), "the batch was not cancelled");
-        deliver_and_expect_one_notice(&orch, &control.request_id, tx, "needle found").await;
     }
 
     /// cairn/6145 requirement 2: a call with no tool call of its own that a
@@ -17000,6 +15437,63 @@ pub(crate) mod host_batch_tests {
         );
     }
 
+    /// A reissue of a batch still held for its turn (its answer was lost on
+    /// the way back) is refused before anything is placed; a different batch,
+    /// or the same batch once the first has answered, is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_reissued_while_its_twin_is_held_is_refused() {
+        let orch = env().await;
+        let payload = declared_payload();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO events(id,run_id,turn_id,sequence,timestamp,event_type,data,created_at) VALUES('ev-1','run-1','pred-turn',1,1,'assistant',?1,1)",
+                (json!({"toolUses": [{"toolUseId": "tool-1", "name": "run", "input": payload}]})
+                    .to_string(),),
+            )
+            .await
+            .unwrap();
+        let condition = json!({
+            "kind": "run_batch",
+            "request_id": "req-held",
+            "commits": false,
+            "label": "cargo test",
+            "host": false
+        })
+        .to_string();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,hold) VALUES('wait-held','job-1','run-1','session-1','pred-turn','tool-1',?1,NULL,'pending',1,'inline')",
+                (condition,),
+            )
+            .await
+            .unwrap();
+
+        let mut reissue = call_request(payload.clone());
+        reissue.tool_use_id = Some("tool-2".into());
+        assert_eq!(
+            reissue_refusal(&orch, &reissue).await.as_deref(),
+            Some(RUN_BATCH_ALREADY_RUNNING)
+        );
+        let different = call_request(json!({"commands": [{"command": "cargo check"}]}));
+        assert_eq!(reissue_refusal(&orch, &different).await, None);
+
+        orch.db
+            .local
+            .execute(
+                "UPDATE agent_waits SET state='resolved' WHERE id='wait-held'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reissue_refusal(&orch, &reissue).await,
+            None,
+            "a sequential re-run after an answered call is not a reissue"
+        );
+    }
+
     /// The transport dropping a held call converts its hold to a park in
     /// place, and the batch's result then reaches the resumed turn exactly
     /// once: one tool result and one successor turn.
@@ -17057,63 +15551,6 @@ pub(crate) mod host_batch_tests {
         tokio::time::sleep(ms(500)).await;
         assert_eq!(tool_results_for_the_call(&orch).await, 1);
         assert_eq!(successor_turns(&orch).await, 1);
-    }
-
-    /// A reissue of a batch still held for its turn (its answer was lost on
-    /// the way back) is refused before anything is placed; a different batch,
-    /// or the same batch once the first has answered, is not.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_batch_reissued_while_its_twin_is_held_is_refused() {
-        let orch = env().await;
-        let payload = declared_payload();
-        orch.db
-            .local
-            .execute(
-                "INSERT INTO events(id,run_id,turn_id,sequence,timestamp,event_type,data,created_at) VALUES('ev-1','run-1','pred-turn',1,1,'assistant',?1,1)",
-                (json!({"toolUses": [{"toolUseId": "tool-1", "name": "run", "input": payload}]})
-                    .to_string(),),
-            )
-            .await
-            .unwrap();
-        let condition = json!({
-            "kind": "run_batch",
-            "request_id": "req-held",
-            "commits": false,
-            "label": "cargo test",
-            "host": false
-        })
-        .to_string();
-        orch.db
-            .local
-            .execute(
-                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,hold) VALUES('wait-held','job-1','run-1','session-1','pred-turn','tool-1',?1,NULL,'pending',1,'inline')",
-                (condition,),
-            )
-            .await
-            .unwrap();
-
-        let mut reissue = call_request(payload.clone());
-        reissue.tool_use_id = Some("tool-2".into());
-        assert_eq!(
-            reissue_refusal(&orch, &reissue).await.as_deref(),
-            Some(RUN_BATCH_ALREADY_RUNNING)
-        );
-        let different = call_request(json!({"commands": [{"command": "cargo check"}]}));
-        assert_eq!(reissue_refusal(&orch, &different).await, None);
-
-        orch.db
-            .local
-            .execute(
-                "UPDATE agent_waits SET state='resolved' WHERE id='wait-held'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            reissue_refusal(&orch, &reissue).await,
-            None,
-            "a sequential re-run after an answered call is not a reissue"
-        );
     }
 }
 

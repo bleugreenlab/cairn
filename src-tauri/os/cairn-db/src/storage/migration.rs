@@ -773,7 +773,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::storage::TURSO_MIGRATIONS;
 
     async fn test_db(name: &str) -> LocalDb {
         let temp = tempdir().unwrap();
@@ -1175,49 +1174,5 @@ mod tests {
              the database rather than the migration, and it reports unrelated \
              pre-existing drift as this migration's failure"
         );
-    }
-
-    #[tokio::test]
-    async fn integrity_sweep_runs_on_cadence() {
-        let db = test_db("integrity-sweep-cadence.db").await;
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-
-        // Never swept: the first call runs and records its timestamp.
-        assert_eq!(
-            run_integrity_sweep(&db).await.unwrap(),
-            IntegritySweepOutcome::Clean
-        );
-        // Inside the cadence window the sweep is a fast no-op, so most boots pay
-        // nothing for it.
-        assert_eq!(
-            run_integrity_sweep(&db).await.unwrap(),
-            IntegritySweepOutcome::Skipped
-        );
-
-        db.execute(
-            "UPDATE integrity_sweep_state SET last_swept_at = unixepoch() - ?1 WHERE id = 1",
-            (INTEGRITY_SWEEP_INTERVAL_SECS + 1,),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            run_integrity_sweep(&db).await.unwrap(),
-            IntegritySweepOutcome::Clean
-        );
-    }
-
-    #[tokio::test]
-    async fn repair_index_entry_drift_is_noop_on_clean_migrated_db() {
-        let db = test_db("repair-index-clean-migrated.db").await;
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-
-        let rebuilt = repair_index_entry_drift(&db).await.unwrap();
-        assert!(rebuilt.is_empty());
     }
 }

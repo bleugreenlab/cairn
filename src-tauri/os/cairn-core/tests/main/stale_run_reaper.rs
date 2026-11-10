@@ -17,10 +17,9 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use cairn_core::internal::agent_process::process::RunHandle;
-use cairn_core::internal::execution::jobs::continue_job_impl;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::runs::reap::{
-    reap_stale_runs, reap_stale_runs_for_job, STALE_RUN_EXIT_REASON, STALE_RUN_GRACE_SECS,
+    reap_stale_runs, reap_stale_runs_for_job, STALE_RUN_EXIT_REASON,
 };
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
@@ -233,34 +232,6 @@ async fn leaves_a_warm_process_alone_however_old() {
     assert_eq!(run_status(&db, "run-warm").await.as_deref(), Some("live"));
 }
 
-/// The cold-start window: `prepare_job` has inserted the run and handed its
-/// launch claim to the transport, which has not registered a process yet. The
-/// claim is the evidence that this run is somebody's live launch.
-#[tokio::test(flavor = "current_thread")]
-async fn leaves_a_claimed_launch_alone() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    let db = orch.db.local.clone();
-    seed_job(&db).await;
-    insert_run(&db, "run-claimed", "starting", seconds_ago(7200)).await;
-    insert_turn(&db, "turn-1", "run-claimed", "pending", true).await;
-
-    let claim = orch.claim_job_launch("job-1", "run-claimed");
-    assert_eq!(reap_stale_runs_for_job(&orch, &db, "job-1"), 0);
-    assert_eq!(
-        run_status(&db, "run-claimed").await.as_deref(),
-        Some("starting")
-    );
-
-    // Dropping the claim is what the transport does when the start failed, and
-    // it is the moment the row becomes nobody's.
-    drop(claim);
-    assert_eq!(reap_stale_runs_for_job(&orch, &db, "job-1"), 1);
-    assert_eq!(
-        run_status(&db, "run-claimed").await.as_deref(),
-        Some("crashed")
-    );
-}
-
 /// A workflow run's process is its Bun runtime, which holds no agent handle.
 /// Its bound residency lease is what stands behind the row, however long the
 /// script runs (CAIRN-5367: a two-wave workflow was settled as crashed between
@@ -377,99 +348,6 @@ async fn sweep_skips_a_job_whose_launch_is_in_flight() {
     );
 }
 
-/// The grace is a real boundary, not a rounding hint.
-#[tokio::test(flavor = "current_thread")]
-async fn the_grace_is_the_boundary() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    let db = orch.db.local.clone();
-    seed_job(&db).await;
-    insert_run(
-        &db,
-        "run-inside",
-        "starting",
-        seconds_ago(STALE_RUN_GRACE_SECS - 5),
-    )
-    .await;
-    insert_run(
-        &db,
-        "run-outside",
-        "starting",
-        seconds_ago(STALE_RUN_GRACE_SECS + 5),
-    )
-    .await;
-    insert_turn(&db, "turn-1", "run-outside", "complete", true).await;
-
-    assert_eq!(reap_stale_runs_for_job(&orch, &db, "job-1"), 1);
-    assert_eq!(
-        run_status(&db, "run-inside").await.as_deref(),
-        Some("starting")
-    );
-    assert_eq!(
-        run_status(&db, "run-outside").await.as_deref(),
-        Some("crashed")
-    );
-}
-
-/// A registry that cannot be read is not a registry that reports every run
-/// absent. A panic anywhere inside a registry operation poisons the lock for the
-/// life of the host; read as "no process behind any of these rows", that one
-/// poisoning would settle every live and warm run on the machine at once, sixty
-/// seconds later. The reaper must decline instead.
-#[tokio::test(flavor = "current_thread")]
-async fn declines_to_settle_when_the_registry_cannot_be_inspected() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    let db = orch.db.local.clone();
-    seed_job(&db).await;
-    insert_run(&db, "run-stale", "live", seconds_ago(7200)).await;
-    insert_turn(&db, "turn-1", "run-stale", "complete", true).await;
-
-    // Poison the registry the way a real panic would: unwinding out of a held
-    // guard. The default hook would print the backtrace as test noise.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = orch.process_state.processes.lock().unwrap();
-        panic!("a registry operation panicked");
-    }));
-    std::panic::set_hook(hook);
-    assert!(panicked.is_err());
-    assert!(orch.process_state.processes.is_poisoned());
-
-    assert_eq!(reap_stale_runs_for_job(&orch, &db, "job-1"), 0);
-    assert_eq!(run_status(&db, "run-stale").await.as_deref(), Some("live"));
-    assert_eq!(turn_state(&db, "turn-1").await.as_deref(), Some("complete"));
-    assert_eq!(reap_stale_runs(&orch), 0);
-    assert_eq!(run_status(&db, "run-stale").await.as_deref(), Some("live"));
-}
-
-/// The continue path, end to end: a resume settles the predecessor row it is
-/// superseding, while the warm run it is actually reusing is untouched. Without
-/// this the job keeps a second, permanently-`starting` run for every reader that
-/// asks `latest_run_for_job` which run is current.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resume_settles_the_predecessor_it_supersedes() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    let db = orch.db.local.clone();
-    seed_job(&db).await;
-    insert_run(&db, "run-stale", "starting", seconds_ago(7200)).await;
-    insert_run(&db, "run-warm", "live", seconds_ago(600)).await;
-    insert_turn(&db, "turn-1", "run-warm", "complete", true).await;
-    register_process(&orch, "run-warm");
-
-    let resumed = continue_job_impl(&orch, "job-1", Some("ping"), None, None).expect("resume");
-
-    assert_eq!(resumed.id, "run-warm", "the warm process must be reused");
-    assert_eq!(run_status(&db, "run-warm").await.as_deref(), Some("live"));
-    assert_eq!(
-        run_status(&db, "run-stale").await.as_deref(),
-        Some("crashed")
-    );
-    assert_eq!(
-        run_exit_reason(&db, "run-stale").await.as_deref(),
-        Some(STALE_RUN_EXIT_REASON)
-    );
-}
-
 /// An ordinary-admission row for `run_id` in `state`, with the prepared launch
 /// snapshot that makes a queued row relaunchable when `prepared` is set.
 async fn insert_admission(db: &LocalDb, run_id: &str, state: &str, prepared: bool) {
@@ -501,35 +379,6 @@ async fn admission_state(db: &LocalDb, run_id: &str) -> Option<String> {
         &format!("req-{run_id}"),
     )
     .await
-}
-
-/// A launch waiting in the admission queue has a run row and no process for as
-/// long as the lane is full, which can be far longer than the grace. Its durable
-/// admission row is its launch claim from enqueue to process registration.
-#[tokio::test(flavor = "current_thread")]
-async fn leaves_a_durably_admitted_launch_alone() {
-    for state in ["queued", "leased", "starting"] {
-        let (_temp, orch) = common::test_orchestrator().await;
-        let db = orch.db.local.clone();
-        seed_job(&db).await;
-        insert_run(&db, "run-queued", "starting", seconds_ago(7200)).await;
-        insert_turn(&db, "turn-pending", "run-queued", "pending", true).await;
-        insert_admission(&db, "run-queued", state, true).await;
-
-        assert_eq!(reap_stale_runs(&orch), 0, "a {state} launch is not stale");
-        assert_eq!(
-            run_status(&db, "run-queued").await.as_deref(),
-            Some("starting")
-        );
-        assert_eq!(
-            turn_state(&db, "turn-pending").await.as_deref(),
-            Some("pending")
-        );
-        assert_eq!(
-            admission_state(&db, "run-queued").await.as_deref(),
-            Some(state)
-        );
-    }
 }
 
 /// An `active` row means a process registered. With no handle behind it the

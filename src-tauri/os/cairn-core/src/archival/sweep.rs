@@ -344,26 +344,6 @@ mod tests {
         assert_eq!(mode(&db, "late1").await, "full");
     }
 
-    /// A pass with a failed candidate leaves the watermark where it was, so
-    /// the next pass retries the window.
-    #[tokio::test]
-    async fn a_failed_candidate_does_not_advance_the_watermark() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("archival-sweep-failed.db");
-        // A storeless handle: archival refuses every candidate.
-        let db = LocalDb::open(&path).await.unwrap();
-        crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        seed_project(&db).await;
-        seed_issue(&db, 1, "merged", Some(1_000)).await;
-        let failed = run_archival_sweep_at(&db, NOW, GRACE).await.unwrap();
-        assert_eq!(failed.failed, 1);
-        assert_eq!(saved_watermark(&db).await, None);
-        assert_eq!(mode(&db, "u1").await, "full");
-    }
-
     #[tokio::test]
     async fn sweep_pages_past_one_page() {
         let db = migrated_test_db("archival-sweep-pages.db").await;

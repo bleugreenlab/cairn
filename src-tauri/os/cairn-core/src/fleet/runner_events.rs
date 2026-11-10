@@ -879,7 +879,6 @@ pub(crate) async fn load_window(db: &LocalDb, since_ms: u64) -> DbResult<RunnerE
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicBool;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -913,10 +912,6 @@ mod tests {
             .unwrap()
     }
 
-    fn kinds(rows: &[(String, Option<String>, Option<i64>, Value)]) -> Vec<&str> {
-        rows.iter().map(|row| row.0.as_str()).collect()
-    }
-
     #[test]
     fn the_kind_vocabulary_is_pinned() {
         let strings: Vec<&str> = RunnerEventKind::ALL
@@ -944,146 +939,6 @@ mod tests {
             ]
         );
         assert_eq!(strings.iter().collect::<HashSet<_>>().len(), strings.len());
-    }
-
-    #[test]
-    fn events_recorded_before_attach_follow_runner_started_in_order() {
-        let runtime = runtime();
-        let db = test_db(&runtime, "runner_events_pre_attach.db");
-        let events = RunnerEvents::default();
-        events.record(RunnerEvent::new(RunnerEventKind::ListenerRestaged));
-        events.record(
-            RunnerEvent::new(RunnerEventKind::ExecutorAttached)
-                .executor("colocated")
-                .generation(1),
-        );
-        assert_eq!(events.recent().len(), 2);
-
-        events.attach_journal(db.clone(), "runner-1").unwrap();
-        events.record(
-            RunnerEvent::new(RunnerEventKind::ExecutorDetached)
-                .executor("colocated")
-                .generation(1),
-        );
-        assert!(events.flush(Duration::from_secs(10)));
-
-        let rows = stored(&runtime, &db);
-        assert_eq!(
-            kinds(&rows),
-            [
-                "runner_started",
-                "listener_restaged",
-                "executor_attached",
-                "executor_detached"
-            ]
-        );
-        assert_eq!(rows[0].3["runner_incarnation"], "runner-1");
-        assert_eq!(rows[2].1.as_deref(), Some("colocated"));
-        assert_eq!(rows[2].2, Some(1));
-        // The incarnation's opening row predates everything it recorded, so
-        // ordering by time keeps those events inside this incarnation.
-        let times = runtime
-            .block_on(db.query_all(
-                "SELECT occurred_at_ms FROM runner_events ORDER BY rowid",
-                (),
-                |row| row.i64(0),
-            ))
-            .unwrap();
-        assert!(times[1..].iter().all(|at| *at >= times[0]), "{times:?}");
-        assert!(events.recent().is_empty());
-        assert_eq!(events.journal_state().last_error, None);
-        assert!(events.attach_journal(db, "runner-1").is_err());
-    }
-
-    /// The row for a stall must land while the stall is happening, so the
-    /// writer cannot depend on the runtime the runner works on.
-    #[test]
-    fn the_writer_does_not_wait_for_a_stalled_runtime() {
-        let stalled = Arc::new(runtime());
-        let db = test_db(&stalled, "runner_events_stalled_runtime.db");
-        let events = RunnerEvents::default();
-        events.attach_journal(db.clone(), "runner-stall").unwrap();
-
-        let stall_ended = Arc::new(AtomicBool::new(false));
-        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
-        let blocker = {
-            let stalled = stalled.clone();
-            let stall_ended = stall_ended.clone();
-            std::thread::spawn(move || {
-                stalled.block_on(async {
-                    blocked_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_secs(4));
-                });
-                stall_ended.store(true, Ordering::SeqCst);
-            })
-        };
-        blocked_rx.recv().unwrap();
-        events.record(RunnerEvent::new(RunnerEventKind::RuntimeStall).cause("Runner stalled"));
-
-        let observer = runtime();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let found = observer
-                .block_on(db.query_opt_text(
-                    "SELECT cause FROM runner_events WHERE kind = 'runtime_stall'",
-                    (),
-                ))
-                .unwrap();
-            if found.as_deref() == Some("Runner stalled") {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the stall row never landed");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            !stall_ended.load(Ordering::SeqCst),
-            "the stall row landed only after the stall ended"
-        );
-        blocker.join().unwrap();
-    }
-
-    #[test]
-    fn events_dropped_on_a_full_channel_become_exactly_one_gap_row() {
-        let runtime = runtime();
-        let db = test_db(&runtime, "runner_events_overflow.db");
-        let events = RunnerEvents::default();
-        let (sender, receiver) = sync_channel(2);
-        assert!(events.install(sender).unwrap().is_empty());
-        for generation in 0..5 {
-            events.record(
-                RunnerEvent::new(RunnerEventKind::ExecutorDetached)
-                    .executor("fedora")
-                    .generation(generation),
-            );
-        }
-        assert_eq!(events.journal_state().dropped, 3);
-        spawn_writer(
-            receiver,
-            db.clone(),
-            "runner-overflow".into(),
-            Vec::new(),
-            events.inner.shared.clone(),
-            Retention::default(),
-        )
-        .unwrap();
-        assert!(events.flush(Duration::from_secs(10)));
-
-        let rows = stored(&runtime, &db);
-        let gaps: Vec<&Value> = rows
-            .iter()
-            .filter(|row| row.0 == "journal_gap")
-            .map(|row| &row.3)
-            .collect();
-        assert_eq!(gaps.len(), 1, "{rows:?}");
-        assert_eq!(gaps[0]["reason"], "overflow");
-        assert_eq!(gaps[0]["count"], 3);
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.0 == "executor_detached")
-                .count(),
-            2
-        );
-        assert_eq!(events.journal_state().dropped, 0);
     }
 
     #[test]
@@ -1368,5 +1223,102 @@ mod tests {
         assert!(bounded.len() <= CAUSE_MAX_BYTES + "…".len());
         assert!(bounded.ends_with('…'));
         assert_eq!(bounded_cause("short"), "short");
+    }
+
+    #[test]
+    fn events_recorded_before_attach_follow_runner_started_in_order() {
+        let runtime = runtime();
+        let db = test_db(&runtime, "runner_events_pre_attach.db");
+        let events = RunnerEvents::default();
+        events.record(RunnerEvent::new(RunnerEventKind::ListenerRestaged));
+        events.record(
+            RunnerEvent::new(RunnerEventKind::ExecutorAttached)
+                .executor("colocated")
+                .generation(1),
+        );
+        assert_eq!(events.recent().len(), 2);
+
+        events.attach_journal(db.clone(), "runner-1").unwrap();
+        events.record(
+            RunnerEvent::new(RunnerEventKind::ExecutorDetached)
+                .executor("colocated")
+                .generation(1),
+        );
+        assert!(events.flush(Duration::from_secs(10)));
+
+        let rows = stored(&runtime, &db);
+        assert_eq!(
+            kinds(&rows),
+            [
+                "runner_started",
+                "listener_restaged",
+                "executor_attached",
+                "executor_detached"
+            ]
+        );
+        assert_eq!(rows[0].3["runner_incarnation"], "runner-1");
+        assert_eq!(rows[2].1.as_deref(), Some("colocated"));
+        assert_eq!(rows[2].2, Some(1));
+        // The incarnation's opening row predates everything it recorded, so
+        // ordering by time keeps those events inside this incarnation.
+        let times = runtime
+            .block_on(db.query_all(
+                "SELECT occurred_at_ms FROM runner_events ORDER BY rowid",
+                (),
+                |row| row.i64(0),
+            ))
+            .unwrap();
+        assert!(times[1..].iter().all(|at| *at >= times[0]), "{times:?}");
+        assert!(events.recent().is_empty());
+        assert_eq!(events.journal_state().last_error, None);
+        assert!(events.attach_journal(db, "runner-1").is_err());
+    }
+
+    #[test]
+    fn events_dropped_on_a_full_channel_become_exactly_one_gap_row() {
+        let runtime = runtime();
+        let db = test_db(&runtime, "runner_events_overflow.db");
+        let events = RunnerEvents::default();
+        let (sender, receiver) = sync_channel(2);
+        assert!(events.install(sender).unwrap().is_empty());
+        for generation in 0..5 {
+            events.record(
+                RunnerEvent::new(RunnerEventKind::ExecutorDetached)
+                    .executor("fedora")
+                    .generation(generation),
+            );
+        }
+        assert_eq!(events.journal_state().dropped, 3);
+        spawn_writer(
+            receiver,
+            db.clone(),
+            "runner-overflow".into(),
+            Vec::new(),
+            events.inner.shared.clone(),
+            Retention::default(),
+        )
+        .unwrap();
+        assert!(events.flush(Duration::from_secs(10)));
+
+        let rows = stored(&runtime, &db);
+        let gaps: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row.0 == "journal_gap")
+            .map(|row| &row.3)
+            .collect();
+        assert_eq!(gaps.len(), 1, "{rows:?}");
+        assert_eq!(gaps[0]["reason"], "overflow");
+        assert_eq!(gaps[0]["count"], 3);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.0 == "executor_detached")
+                .count(),
+            2
+        );
+        assert_eq!(events.journal_state().dropped, 0);
+    }
+
+    fn kinds(rows: &[(String, Option<String>, Option<i64>, Value)]) -> Vec<&str> {
+        rows.iter().map(|row| row.0.as_str()).collect()
     }
 }

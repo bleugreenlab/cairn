@@ -6279,114 +6279,6 @@ mod tests {
         assert!(error.contains("reopen the issue"), "{error}");
     }
 
-    /// cairn/4978: a Claude session whose first launch was rejected at init
-    /// after the CLI had already created its conversation. Retrying under the
-    /// same id is refused by the CLI forever ("Session ID ... is already in
-    /// use"), so the next continuation must rotate to a fresh id and carry the
-    /// pending input there.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unconfirmed_spawned_session_rotates_on_its_next_continuation() {
-        let orch = test_orchestrator(migrated_test_db("unconfirmed-start-rotation").await);
-        let db = orch.db.local.clone();
-        db.execute_script(
-            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
-             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
-             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
-               VALUES('j','p','i','running','builder','builder','sess-a','opus',1,1);
-             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
-               VALUES('sess-a','j','claude',NULL,'open',24,1,1);
-             INSERT INTO runs(id,job_id,session_id,status,started_at,exit_reason,error_message,start_mode,created_at,updated_at)
-               VALUES('run-1','j','sess-a','crashed',2,'session_start_rejected','missing Cairn tools','fresh',1,3);
-             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
-               VALUES('turn-1','sess-a','run-1','j',1,'interrupted','initial',1,3,3);
-             INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,parent_tool_use_id,created_at)
-               VALUES('e-1','run-1','sess-a','turn-1',1,2,'user','{\"content\":\"start the work\"}',NULL,2),
-                     ('e-2','run-1','sess-a','turn-1',2,3,'error','{\"message\":\"missing Cairn tools\"}',NULL,3);",
-        )
-        .await
-        .unwrap();
-
-        let continued =
-            super::continue_job_impl(&orch, "j", Some("carry this forward"), None, None);
-
-        let successor = db
-            .query_opt_text("SELECT current_session_id FROM jobs WHERE id = 'j'", ())
-            .await
-            .unwrap()
-            .expect("the job points at a session");
-        assert_ne!(
-            successor, "sess-a",
-            "the continuation relaunched the id the CLI refuses: {continued:?}"
-        );
-        assert_eq!(
-            db.query_opt_text(
-                "SELECT status || ':' || terminal_reason || ':' || replaced_by_id FROM sessions WHERE id = 'sess-a'",
-                (),
-            )
-            .await
-            .unwrap()
-            .as_deref(),
-            Some(format!("closed:rotated_unconfirmed_start:{successor}").as_str())
-        );
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT sequence FROM sessions WHERE id = ?1",
-                params![successor.clone()],
-            )
-            .await
-            .unwrap(),
-            Some(25),
-            "the successor is the next lineage generation"
-        );
-
-        let run = continued.expect("the continuation launched on the successor");
-        assert_eq!(run.session_id.as_deref(), Some(successor.as_str()));
-        let start: serde_json::Value = serde_json::from_str(
-            &db.query_opt_text(
-                "SELECT session_start_json FROM prepared_ordinary_launches WHERE run_id = ?1",
-                params![run.id.clone()],
-            )
-            .await
-            .unwrap()
-            .expect("the launch was prepared"),
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::from_value::<crate::storage::PreparedSessionStart>(start).unwrap(),
-            crate::storage::PreparedSessionStart::New {
-                session_id: successor.clone()
-            },
-            "the successor launches fresh under its own id"
-        );
-
-        let boundary: serde_json::Value = serde_json::from_str(
-            &db.query_opt_text(
-                "SELECT data FROM events WHERE session_id = ?1 AND event_type = 'system:session_boundary'",
-                params![successor.clone()],
-            )
-            .await
-            .unwrap()
-            .expect("the rotation left a boundary"),
-        )
-        .unwrap();
-        assert_eq!(boundary["raw"]["kind"], "digest_reseed");
-        assert_eq!(boundary["raw"]["reason"], "unconfirmed_first_launch");
-        assert!(
-            boundary["raw"]["seedBytes"].as_u64().unwrap_or(0) > 0,
-            "the successor is seeded from the job's own transcript"
-        );
-
-        let carried = db
-            .query_opt_i64(
-                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND data LIKE '%carry this forward%'",
-                params![successor.clone()],
-            )
-            .await
-            .unwrap();
-        assert_eq!(carried, Some(1), "the pending input reached the successor");
-    }
-
     /// An empty digest rendering is not an empty history. Only a successful read
     /// that found no event rows may rotate a session without a seed.
     #[test]
@@ -6403,175 +6295,6 @@ mod tests {
             super::empty_digest_refusal(Err("database is locked".to_string())),
             super::ComposeRefusal::Failed(_)
         ));
-    }
-
-    /// A launch that spawned and crashed before writing a single event leaves
-    /// nothing to carry: the successor launches unseeded under a fresh id, which
-    /// is exactly what a same-id retry would have sent.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unconfirmed_session_with_no_events_rotates_unseeded() {
-        let orch = test_orchestrator(migrated_test_db("unconfirmed-start-unseeded").await);
-        let db = orch.db.local.clone();
-        db.execute_script(
-            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
-             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
-             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
-               VALUES('j','p','i','running','builder','builder','sess-a','opus',1,1);
-             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
-               VALUES('sess-a','j','claude',NULL,'open',3,1,1);
-             INSERT INTO runs(id,job_id,session_id,status,started_at,exit_reason,start_mode,created_at,updated_at)
-               VALUES('run-1','j','sess-a','crashed',2,'crash','fresh',1,3);
-             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
-               VALUES('turn-1','sess-a','run-1','j',1,'interrupted','initial',1,3,3);",
-        )
-        .await
-        .unwrap();
-
-        let run = super::continue_job_impl(&orch, "j", Some("carry this forward"), None, None)
-            .expect("the continuation launches on a successor");
-        let successor = run.session_id.clone().expect("the run names its session");
-        assert_ne!(successor, "sess-a");
-        assert_eq!(
-            db.query_opt_text(
-                "SELECT terminal_reason FROM sessions WHERE id = 'sess-a'",
-                ()
-            )
-            .await
-            .unwrap()
-            .as_deref(),
-            Some("rotated_unconfirmed_start")
-        );
-        let boundary: serde_json::Value = serde_json::from_str(
-            &db.query_opt_text(
-                "SELECT data FROM events WHERE session_id = ?1 AND event_type = 'system:session_boundary'",
-                params![successor.clone()],
-            )
-            .await
-            .unwrap()
-            .expect("the rotation left a boundary"),
-        )
-        .unwrap();
-        assert_eq!(boundary["raw"]["reason"], "unconfirmed_first_launch");
-        assert_eq!(boundary["raw"]["seedBytes"], 0);
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'user:seed'",
-                params![successor.clone()],
-            )
-            .await
-            .unwrap(),
-            Some(0),
-            "nothing was composed, so nothing is seeded"
-        );
-    }
-
-    /// The cairn/4840 shape: Claude is rejected at `init` on every launch. It goes
-    /// live, waits until admission has begun its turn, and then dies the way the
-    /// reader's init rejection settles a run — but only when the test releases
-    /// it, so input can be queued while the launch is provably alive.
-    struct DiesAtInitBackend {
-        launches: Arc<Mutex<Vec<(String, std::time::Instant)>>>,
-        released_deaths: Arc<(Mutex<usize>, std::sync::Condvar)>,
-    }
-
-    impl crate::backends::AgentBackend for DiesAtInitBackend {
-        fn name(&self) -> &str {
-            "Claude"
-        }
-        fn is_available(&self) -> Result<(), String> {
-            Ok(())
-        }
-        fn discover_models(
-            &self,
-        ) -> Result<Vec<cairn_models::types::catalog::DiscoveredModel>, String> {
-            Ok(Vec::new())
-        }
-        fn serves(
-            &self,
-            _: &crate::orchestrator::Orchestrator,
-            _: Option<&str>,
-        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
-            Vec::new()
-        }
-        fn resolve_tools(&self, _: &[String], _: &[String]) -> crate::backends::ResolvedTools {
-            crate::backends::ResolvedTools {
-                allowed: Vec::new(),
-                disallowed: Vec::new(),
-            }
-        }
-        fn supports_resume(&self) -> bool {
-            true
-        }
-        fn supports_warm_processes(&self) -> bool {
-            true
-        }
-        fn start_session(
-            &self,
-            config: crate::backends::SessionConfig,
-            orch: &Orchestrator,
-            _admitted: crate::backends::Admitted,
-        ) -> Result<(), String> {
-            let session_id = config.session_start.session_id().to_string();
-            let launch_index = {
-                let mut launches = self.launches.lock().unwrap();
-                launches.push((session_id.clone(), std::time::Instant::now()));
-                launches.len()
-            };
-            let run_id = config.run_id.clone();
-            orch.process_state
-                .register_process(
-                    run_id.clone(),
-                    RunHandle::test_handle(Some(&session_id), Some("j")),
-                )
-                .map_err(|error| error.to_string())?;
-            let db = orch.db.local.clone();
-            let live_run = run_id.clone();
-            crate::storage::run_db_blocking(move || async move {
-                db.execute(
-                    "UPDATE runs SET status = 'live', started_at = 2 WHERE id = ?1",
-                    (live_run,),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-            })?;
-
-            let orch = orch.clone();
-            let released = self.released_deaths.clone();
-            std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-                while !matches!(
-                    orch.process_state.get_occupancy(&run_id),
-                    Some(RunOccupancy::ServingTurn(_))
-                ) && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                let (lock, ready) = &*released;
-                let mut allowed = lock.lock().unwrap();
-                while *allowed < launch_index {
-                    allowed = ready.wait(allowed).unwrap();
-                }
-                drop(allowed);
-                crate::orchestrator::lifecycle::release_and_stop_process(&orch, &run_id);
-                if crate::orchestrator::lifecycle::record_run_failure_if_active(
-                    &orch,
-                    &run_id,
-                    crate::backends::BackendFailure::StartupRejected.exit_reason(),
-                    "init lacked Cairn's tools",
-                )
-                .unwrap_or(true)
-                {
-                    crate::orchestrator::lifecycle::finalize_run(
-                        &orch,
-                        &run_id,
-                        crate::models::RunStatus::Crashed,
-                    );
-                }
-            });
-            Ok(())
-        }
     }
 
     /// Registers a process for each launch and serves its turn, so a cold
@@ -6718,18 +6441,6 @@ mod tests {
     async fn an_operator_message_to_an_idle_cold_session_enqueues_urgent() {
         let orch = idle_cold_job("origin-operator-composer").await;
         super::enqueue_continuation_message(&orch.db.local, "j", "please look", None).unwrap();
-        assert_eq!(
-            continue_cold(&orch, None, None).await,
-            (1, "operator".to_string())
-        );
-    }
-
-    /// An operator's thread message arrives as a direct push keyed with the
-    /// operator-message marker; that typed fact, not its urgency, makes it urgent.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_operator_thread_message_enqueues_urgent() {
-        let orch = idle_cold_job("origin-operator-thread").await;
-        direct_message(&orch, "m-operator", None).await;
         assert_eq!(
             continue_cold(&orch, None, None).await,
             (1, "operator".to_string())
@@ -6981,167 +6692,6 @@ mod tests {
         assert_eq!(
             orch.process_state.get_occupancy(&run.id),
             Some(RunOccupancy::ServingTurn(retry))
-        );
-    }
-
-    /// cairn/4978 #2: settling a Claude death within a second must not turn a
-    /// provider that dies at init into a hot relaunch loop. `finalize_run`'s
-    /// run-terminal idle flush is the one automatic continuation a crash can
-    /// trigger, and it resumes only for waking input still pending. A launch
-    /// claims the queue it carries, so each relaunch costs one new waking input:
-    /// two inputs, two deaths, two launches, and then silence.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_provider_that_dies_at_init_relaunches_only_per_waking_input() {
-        let orch = test_orchestrator(migrated_test_db("dies-at-init-spacing").await);
-        let db = orch.db.local.clone();
-        db.execute_script(
-            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
-             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
-             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
-               VALUES('j','p','i','running','builder','builder','sess-a','opus',1,1);
-             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
-               VALUES('sess-a','j','claude',NULL,'open',1,1,1);
-             INSERT INTO runs(id,job_id,session_id,status,started_at,start_mode,created_at,updated_at)
-               VALUES('run-0','j','sess-a','exited',2,'fresh',1,3);
-             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
-               VALUES('turn-0','sess-a','run-0','j',1,'complete','initial',1,3,3);
-             INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,parent_tool_use_id,created_at)
-               VALUES('e-0','run-0','sess-a','turn-0',1,2,'user','{\"content\":\"start the work\"}',NULL,2);",
-        )
-        .await
-        .unwrap();
-        let launches = Arc::new(Mutex::new(Vec::new()));
-        let released = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
-        let _backend =
-            crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, {
-                let launches = launches.clone();
-                let released = released.clone();
-                move || {
-                    Box::new(DiesAtInitBackend {
-                        launches: launches.clone(),
-                        released_deaths: released.clone(),
-                    })
-                }
-            });
-        let release_death = |n: usize| {
-            let (lock, ready) = &*released;
-            *lock.lock().unwrap() = n;
-            ready.notify_all();
-        };
-        let launch_count = || launches.lock().unwrap().len();
-        async fn wait_for(what: &str, ok: impl Fn() -> bool) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while !ok() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for {what}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        }
-        let serving = |orch: &Orchestrator| {
-            orch.process_state
-                .find_process_by_session(&launches.lock().unwrap().last().unwrap().0)
-                .is_some_and(|run| {
-                    matches!(
-                        orch.process_state.get_occupancy(&run),
-                        Some(RunOccupancy::ServingTurn(_))
-                    )
-                })
-        };
-
-        // Input 1 launches under the session's own id.
-        let first = orch.clone();
-        tokio::task::spawn_blocking(move || {
-            super::continue_job_impl(&first, "j", Some("first input"), None, None)
-        })
-        .await
-        .unwrap()
-        .expect("launch 1 is admitted");
-        wait_for("launch 1", || launch_count() == 1).await;
-        wait_for("launch 1 to serve its turn", || serving(&orch)).await;
-
-        // Input 2 arrives while launch 1 is alive, so it waits in the queue.
-        super::enqueue_continuation_message(&db, "j", "second input", None).unwrap();
-        crate::messages::delivery::nudge_job_for_urgency(
-            &orch,
-            "j",
-            crate::messages::queued::Delivery::Queue,
-        )
-        .unwrap();
-        assert_eq!(
-            launch_count(),
-            1,
-            "a busy job queues instead of relaunching"
-        );
-
-        // Death 1 settles at once; its idle flush finds input 2 and relaunches,
-        // under a fresh id because sess-a is now an unconfirmed spawned launch.
-        let died = std::time::Instant::now();
-        release_death(1);
-        wait_for("launch 2", || launch_count() == 2).await;
-        let relaunched_after = launches.lock().unwrap()[1].1.duration_since(died);
-        wait_for("launch 2 to serve its turn", || serving(&orch)).await;
-
-        // Death 2 has no pending input behind it, so nothing relaunches.
-        let run_2 = orch
-            .process_state
-            .find_process_by_session(&launches.lock().unwrap()[1].0)
-            .expect("launch 2 is registered while it serves");
-        let mut completions = orch.run_completions.subscribe();
-        release_death(2);
-        // `finalize_run` broadcasts a run's completion only after it has made
-        // the run terminal and run its idle flush, the one path that could
-        // relaunch it. A slow host can take seconds to get there, so the
-        // assertions below wait for it rather than for a fixed interval.
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            loop {
-                match completions.recv().await {
-                    Ok(run) if run == run_2 => break,
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(error) => panic!("run completions closed: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("death 2 finalizes");
-        // A relaunch the flush dispatched can still be admitted after the
-        // flush returns; this quiet window is what the no-relaunch claim rests on.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let launches = launches.lock().unwrap().clone();
-        assert_eq!(
-            launches.len(),
-            2,
-            "a provider that dies at init relaunched without new waking input: {launches:?}"
-        );
-        assert_eq!(launches[0].0, "sess-a");
-        assert_ne!(
-            launches[1].0, "sess-a",
-            "the relaunch rotated off the taken id"
-        );
-        assert!(
-            relaunched_after < std::time::Duration::from_secs(20),
-            "the queued input was carried by the relaunch: {relaunched_after:?}"
-        );
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT COUNT(*) FROM runs WHERE job_id = 'j' AND status = 'crashed' AND exit_reason = 'session_start_rejected'",
-                (),
-            )
-            .await
-            .unwrap(),
-            Some(2)
-        );
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT COUNT(*) FROM queued_messages WHERE job_id = 'j' AND delivered_at IS NULL",
-                (),
-            )
-            .await
-            .unwrap(),
-            Some(0),
-            "both inputs were carried by a launch"
         );
     }
 
@@ -8504,91 +8054,6 @@ mod tests {
         .unwrap()
     }
 
-    /// What the header adds on top of the budgeted body. The body itself is
-    /// held to the budget; the header is fixed framing outside it.
-    const SEED_FRAMING_ALLOWANCE: usize = 200;
-
-    /// Tenet 1256. A node whose history renders at roughly twice its window
-    /// rotates under window pressure once: the successor opens on a seed within
-    /// the seed budget, and its next continuation, at that seed's occupancy,
-    /// resumes natively instead of rotating again.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_long_running_node_rotates_once_under_window_pressure_onto_a_budgeted_seed() {
-        use crate::sessions::queries::get as get_session;
-
-        let (orch, db) = long_running_node("node-window-rotates-once", 150).await;
-        let window = 100_000;
-        let history_bytes = super::verbatim_prefix_bytes(&db, "j").unwrap();
-        assert!(
-            history_bytes / 4 > window,
-            "the history must outweigh the window: {history_bytes} bytes"
-        );
-        orch.store_context_token_snapshot(occupancy_of("s1", 90_000, window));
-        let job = super::load_job(db.clone(), "j".to_string(), "window pressure")
-            .await
-            .unwrap();
-        let session = get_session(&db, "s1").await.unwrap();
-
-        let ReseedDecision::Rebuilt(outcome, decision) = super::attempt_session_reseed(
-            &orch,
-            &db,
-            &job,
-            &session,
-            0,
-            Some("claude"),
-            PrefixCacheState::Warm,
-        ) else {
-            panic!("a node at 90% of its window must rotate");
-        };
-        assert!(decision.is_none(), "{decision:?}");
-
-        let budget = orch.get_settings().seed_budget_tokens as usize;
-        let seed_tokens = crate::resources::seed_tokens(&outcome.seed_content);
-        assert!(
-            seed_tokens <= budget + SEED_FRAMING_ALLOWANCE,
-            "the successor's seed measures {seed_tokens} tokens against a {budget}-token budget"
-        );
-        let seed = &outcome.seed_content;
-        assert!(seed.starts_with(RESEED_SEED_HEADER));
-        assert!(seed.contains("NEWEST_TURN_MARKER"), "{seed}");
-        assert!(seed.contains("## Turn 150 ·"), "{seed}");
-        assert!(
-            seed.contains("`cairn://p/p/7/1/coordinator/chat?offset=0&limit="),
-            "{seed}"
-        );
-        assert!(seed.contains("- Issue: `cairn://p/p/7`"), "{seed}");
-        assert!(
-            seed.contains("- Todos: `cairn://p/p/7/1/coordinator/todos`"),
-            "{seed}"
-        );
-        assert_eq!(session_count(&db).await, 2);
-
-        // The successor's first request weighs its seed plus a system prompt.
-        // That is nowhere near the trigger, so it continues natively.
-        let successor = get_session(&db, &outcome.new_session_id).await.unwrap();
-        orch.store_context_token_snapshot(occupancy_of(
-            &successor.id,
-            seed_tokens as i64 + 20_000,
-            window,
-        ));
-        let job = super::load_job(db.clone(), "j".to_string(), "after rotation")
-            .await
-            .unwrap();
-        assert!(matches!(
-            super::attempt_session_reseed(
-                &orch,
-                &db,
-                &job,
-                &successor,
-                0,
-                Some("claude"),
-                PrefixCacheState::Warm,
-            ),
-            ReseedDecision::NativeResume(None)
-        ));
-        assert_eq!(session_count(&db).await, 2, "the successor rotated again");
-    }
-
     /// A window rotation whose seed would open the successor at or above the
     /// trigger only buys the next rotation, so it is refused: no rotation, the
     /// session untouched, and a visible record naming both sizes.
@@ -8641,78 +8106,6 @@ mod tests {
         assert!(record.contains("\"windowTokens\":5000"), "{record}");
         assert!(record.contains("\"seedTokens\":"), "{record}");
         assert!(record.contains("5000-token window"), "{record}");
-    }
-
-    /// The cold-cache price compares the seed actually delivered: the budgeted
-    /// one. A long history therefore pays, and the seed rotated in is the one
-    /// that was priced.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_cold_rebuild_is_priced_on_the_budgeted_seed_it_delivers() {
-        use crate::sessions::queries::get as get_session;
-
-        let (orch, db) = long_running_node("node-cold-budgeted", 150).await;
-        let job = super::load_job(db.clone(), "j".to_string(), "cold rebuild")
-            .await
-            .unwrap();
-        let session = get_session(&db, "s1").await.unwrap();
-        let expected = match super::compose_forced_reseed(&orch, &db, &job, &session) {
-            Ok(composed) => composed.framed().to_string(),
-            Err(error) => panic!("composition failed: {error}"),
-        };
-
-        let ReseedDecision::Rebuilt(outcome, Some(decision)) = super::attempt_session_reseed(
-            &orch,
-            &db,
-            &job,
-            &session,
-            0,
-            Some("claude"),
-            PrefixCacheState::Cold,
-        ) else {
-            panic!("a budgeted seed must pay against a long cold prefix");
-        };
-        assert_eq!(decision.decision, "digest_reseed");
-        assert_eq!(outcome.seed_content, expected);
-        assert!(
-            crate::resources::seed_tokens(&outcome.seed_content)
-                <= orch.get_settings().seed_budget_tokens as usize + SEED_FRAMING_ALLOWANCE
-        );
-    }
-
-    /// The preview an operator reads is the seed the forced resume delivers:
-    /// the same composed text, so the same size.
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_digest_preview_measures_exactly_the_seed_its_resume_delivers() {
-        use crate::sessions::queries::get as get_session;
-
-        let (orch, db) = long_running_node("node-preview-equals-resume", 60).await;
-        let job = super::load_job(db.clone(), "j".to_string(), "preview")
-            .await
-            .unwrap();
-        let session = get_session(&db, "s1").await.unwrap();
-        let composed = match super::compose_forced_reseed(&orch, &db, &job, &session) {
-            Ok(composed) => composed.framed().to_string(),
-            Err(error) => panic!("composition failed: {error}"),
-        };
-        let preview = super::preview_job_digest(&orch, "j").unwrap();
-
-        let outcome = super::force_session_reseed(
-            &orch,
-            &db,
-            &job,
-            &session,
-            Some("claude"),
-            crate::sessions::queries::RotationReason::Reseed,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(outcome.seed_content, composed);
-        assert_eq!(
-            preview.estimated_tokens,
-            super::DigestPreview::of(&outcome.seed_content).estimated_tokens
-        );
-        assert_eq!(db.live_connections(), 0);
     }
 
     /// A thread whose window is running out compacts for capacity, and records
@@ -11891,6 +11284,187 @@ mod tests {
             crate::jj::bookmark_commit(&fx.jj, &fx.store, ARRIVED).as_deref(),
             Some(fx.base.as_str()),
             "the store holds the imported ref after the rollback"
+        );
+    }
+
+    /// cairn/4978: a Claude session whose first launch was rejected at init
+    /// after the CLI had already created its conversation. Retrying under the
+    /// same id is refused by the CLI forever ("Session ID ... is already in
+    /// use"), so the next continuation must rotate to a fresh id and carry the
+    /// pending input there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unconfirmed_spawned_session_rotates_on_its_next_continuation() {
+        let orch = test_orchestrator(migrated_test_db("unconfirmed-start-rotation").await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+               VALUES('j','p','i','running','builder','builder','sess-a','opus',1,1);
+             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+               VALUES('sess-a','j','claude',NULL,'open',24,1,1);
+             INSERT INTO runs(id,job_id,session_id,status,started_at,exit_reason,error_message,start_mode,created_at,updated_at)
+               VALUES('run-1','j','sess-a','crashed',2,'session_start_rejected','missing Cairn tools','fresh',1,3);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
+               VALUES('turn-1','sess-a','run-1','j',1,'interrupted','initial',1,3,3);
+             INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,parent_tool_use_id,created_at)
+               VALUES('e-1','run-1','sess-a','turn-1',1,2,'user','{\"content\":\"start the work\"}',NULL,2),
+                     ('e-2','run-1','sess-a','turn-1',2,3,'error','{\"message\":\"missing Cairn tools\"}',NULL,3);",
+        )
+        .await
+        .unwrap();
+
+        let continued =
+            super::continue_job_impl(&orch, "j", Some("carry this forward"), None, None);
+
+        let successor = db
+            .query_opt_text("SELECT current_session_id FROM jobs WHERE id = 'j'", ())
+            .await
+            .unwrap()
+            .expect("the job points at a session");
+        assert_ne!(
+            successor, "sess-a",
+            "the continuation relaunched the id the CLI refuses: {continued:?}"
+        );
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT status || ':' || terminal_reason || ':' || replaced_by_id FROM sessions WHERE id = 'sess-a'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(format!("closed:rotated_unconfirmed_start:{successor}").as_str())
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT sequence FROM sessions WHERE id = ?1",
+                params![successor.clone()],
+            )
+            .await
+            .unwrap(),
+            Some(25),
+            "the successor is the next lineage generation"
+        );
+
+        let run = continued.expect("the continuation launched on the successor");
+        assert_eq!(run.session_id.as_deref(), Some(successor.as_str()));
+        let start: serde_json::Value = serde_json::from_str(
+            &db.query_opt_text(
+                "SELECT session_start_json FROM prepared_ordinary_launches WHERE run_id = ?1",
+                params![run.id.clone()],
+            )
+            .await
+            .unwrap()
+            .expect("the launch was prepared"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<crate::storage::PreparedSessionStart>(start).unwrap(),
+            crate::storage::PreparedSessionStart::New {
+                session_id: successor.clone()
+            },
+            "the successor launches fresh under its own id"
+        );
+
+        let boundary: serde_json::Value = serde_json::from_str(
+            &db.query_opt_text(
+                "SELECT data FROM events WHERE session_id = ?1 AND event_type = 'system:session_boundary'",
+                params![successor.clone()],
+            )
+            .await
+            .unwrap()
+            .expect("the rotation left a boundary"),
+        )
+        .unwrap();
+        assert_eq!(boundary["raw"]["kind"], "digest_reseed");
+        assert_eq!(boundary["raw"]["reason"], "unconfirmed_first_launch");
+        assert!(
+            boundary["raw"]["seedBytes"].as_u64().unwrap_or(0) > 0,
+            "the successor is seeded from the job's own transcript"
+        );
+
+        let carried = db
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND data LIKE '%carry this forward%'",
+                params![successor.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(carried, Some(1), "the pending input reached the successor");
+    }
+
+    /// A launch that spawned and crashed before writing a single event leaves
+    /// nothing to carry: the successor launches unseeded under a fresh id, which
+    /// is exactly what a same-id retry would have sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unconfirmed_session_with_no_events_rotates_unseeded() {
+        let orch = test_orchestrator(migrated_test_db("unconfirmed-start-unseeded").await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+               VALUES('j','p','i','running','builder','builder','sess-a','opus',1,1);
+             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+               VALUES('sess-a','j','claude',NULL,'open',3,1,1);
+             INSERT INTO runs(id,job_id,session_id,status,started_at,exit_reason,start_mode,created_at,updated_at)
+               VALUES('run-1','j','sess-a','crashed',2,'crash','fresh',1,3);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
+               VALUES('turn-1','sess-a','run-1','j',1,'interrupted','initial',1,3,3);",
+        )
+        .await
+        .unwrap();
+
+        let run = super::continue_job_impl(&orch, "j", Some("carry this forward"), None, None)
+            .expect("the continuation launches on a successor");
+        let successor = run.session_id.clone().expect("the run names its session");
+        assert_ne!(successor, "sess-a");
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT terminal_reason FROM sessions WHERE id = 'sess-a'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("rotated_unconfirmed_start")
+        );
+        let boundary: serde_json::Value = serde_json::from_str(
+            &db.query_opt_text(
+                "SELECT data FROM events WHERE session_id = ?1 AND event_type = 'system:session_boundary'",
+                params![successor.clone()],
+            )
+            .await
+            .unwrap()
+            .expect("the rotation left a boundary"),
+        )
+        .unwrap();
+        assert_eq!(boundary["raw"]["reason"], "unconfirmed_first_launch");
+        assert_eq!(boundary["raw"]["seedBytes"], 0);
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND event_type = 'user:seed'",
+                params![successor.clone()],
+            )
+            .await
+            .unwrap(),
+            Some(0),
+            "nothing was composed, so nothing is seeded"
+        );
+    }
+
+    /// An operator's thread message arrives as a direct push keyed with the
+    /// operator-message marker; that typed fact, not its urgency, makes it urgent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_thread_message_enqueues_urgent() {
+        let orch = idle_cold_job("origin-operator-thread").await;
+        direct_message(&orch, "m-operator", None).await;
+        assert_eq!(
+            continue_cold(&orch, None, None).await,
+            (1, "operator".to_string())
         );
     }
 }

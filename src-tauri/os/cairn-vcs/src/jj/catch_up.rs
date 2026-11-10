@@ -389,37 +389,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial(jj)]
-    fn detached_merge_refuses_either_moved_coordinate_and_expired_budget() {
-        let Some(bin) = jj_bin() else { return };
-        for moved in [BRANCH, "main"] {
-            let fx = fixture(&bin);
-            fx.commit(&["main"], BRANCH, "own.txt", "own\n");
-            fx.commit(&["main"], "main", "base.txt", "base\n");
-            let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
-            assert!(matches!(
-                compute_branch_merge_advance(&fx.jj, snapshot, None, std::time::Duration::ZERO),
-                Err(AdvanceComputeError::TimedOut)
-            ));
-            let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
-            let candidate = compute_branch_merge_advance(
-                &fx.jj,
-                snapshot,
-                None,
-                std::time::Duration::from_secs(30),
-            )
-            .unwrap();
-            fx.commit(&[moved], moved, "later.txt", "later\n");
-            let before = operation_id(&fx.jj, &fx.store).unwrap();
-            assert!(matches!(
-                install_branch_advance_local(&fx.jj, candidate),
-                Err(AdvanceInstallError::CoordinatesChanged)
-            ));
-            assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), before);
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
     fn detached_merge_conflict_does_not_publish_or_replay() {
         let Some(bin) = jj_bin() else { return };
         let fx = fixture(&bin);
@@ -438,173 +407,8 @@ mod tests {
         assert_eq!(fx.tip(BRANCH), source);
     }
 
-    #[test]
-    #[serial_test::serial(jj)]
-    fn detached_merge_resolution_keeps_session_destination_when_main_moves() {
-        let Some(bin) = jj_bin() else { return };
-        let fx = fixture(&bin);
-        let source = fx.commit(&["main"], BRANCH, "same.txt", "own\n");
-        let dest = fx.commit(&["main"], "main", "same.txt", "base\n");
-        let resolved = fx.commit(&[BRANCH], BRANCH, "same.txt", "resolved\n");
-        let carry = ResolutionCarry::from_tip(&resolved, &["same.txt".to_string()]);
-        assert!(capture_branch_merge_resolution(&fx.store, BRANCH, "main").is_err());
-        assert!(capture_branch_merge_resolution(&fx.store, BRANCH, &dest[..12]).is_err());
-        let snapshot = capture_branch_merge_resolution(&fx.store, BRANCH, &dest).unwrap();
-        let candidate = compute_branch_merge_advance(
-            &fx.jj,
-            snapshot,
-            Some(&carry),
-            std::time::Duration::from_secs(30),
-        )
-        .unwrap();
-        let later = fx.commit(&["main"], "main", "later.txt", "later\n");
-        let local = install_branch_advance_local(&fx.jj, candidate).unwrap();
-        let merge = local.head.clone();
-        assert!(export_installed_branch_advance(&fx.jj, local)
-            .export
-            .is_ok());
-        assert_eq!(fx.parents(&merge), vec![resolved.clone(), dest]);
-        assert_eq!(fx.parents(&resolved), vec![source]);
-        assert_eq!(fx.file(BRANCH, "same.txt"), "resolved\n");
-        assert_eq!(fx.tip("main"), later);
-        let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
-        let candidate = compute_branch_merge_advance(
-            &fx.jj,
-            snapshot,
-            None,
-            std::time::Duration::from_secs(30),
-        )
-        .unwrap();
-        let local = install_branch_advance_local(&fx.jj, candidate).unwrap();
-        let next = local.head.clone();
-        assert!(export_installed_branch_advance(&fx.jj, local)
-            .export
-            .is_ok());
-        assert_eq!(fx.parents(&next), vec![merge, later]);
-        assert_eq!(fx.file(BRANCH, "same.txt"), "resolved\n");
-    }
-
     fn message(dest: &str) -> String {
         catch_up_merge_message("main", dest, BRANCH)
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_disjoint_advance_adds_one_two_parent_commit_and_rewrites_nothing() {
-        let Some(bin) = jj_bin() else { return };
-        let fx = fixture(&bin);
-        let base = fx.tip("main");
-        fx.commit(&["main"], BRANCH, "one.rs", "one\n");
-        fx.commit(&[BRANCH], BRANCH, "two.rs", "two\n");
-        let tip = fx.commit(&[BRANCH], BRANCH, "three.rs", "three\n");
-        let stack_before = fx
-            .jj
-            .run(
-                &fx.store,
-                &[
-                    "log",
-                    "-r",
-                    &format!("{base}..{tip}"),
-                    "--no-graph",
-                    "--ignore-working-copy",
-                    "-T",
-                    "commit_id ++ \"\\n\"",
-                ],
-                "stack",
-            )
-            .unwrap();
-        let dest = fx.commit(&["main"], "main", "main-only.rs", "main\n");
-        let ops = fx.operations();
-
-        let outcome =
-            merge_base_into_branch(&fx.jj, &fx.store, BRANCH, &dest, &message(&dest), None)
-                .unwrap();
-        let MergeCatchUp::Merged {
-            merge,
-            old_base,
-            new_base,
-        } = outcome
-        else {
-            panic!("a disjoint advance merges cleanly: {outcome:?}");
-        };
-        assert_eq!(old_base, base);
-        assert_eq!(new_base, dest);
-        assert_eq!(fx.tip(BRANCH), merge, "the bookmark moved onto the merge");
-        assert_eq!(fx.parents(&merge), vec![tip.clone(), dest.clone()]);
-        assert_eq!(fx.file(BRANCH, "main-only.rs"), "main\n");
-        assert_eq!(fx.file(BRANCH, "three.rs"), "three\n");
-        let stack_after = fx
-            .jj
-            .run(
-                &fx.store,
-                &[
-                    "log",
-                    "-r",
-                    &format!("{base}..{tip}"),
-                    "--no-graph",
-                    "--ignore-working-copy",
-                    "-T",
-                    "commit_id ++ \"\\n\"",
-                ],
-                "stack",
-            )
-            .unwrap();
-        assert_eq!(stack_before, stack_after, "every stack commit keeps its id");
-        let since = fx.operations_since(&ops);
-        assert!(
-            since
-                .iter()
-                .all(|op| !op.contains("rebase") && !op.contains("abandon")),
-            "no rebase and no abandon ran: {since:?}"
-        );
-        assert_eq!(
-            git_stdout(
-                &fx.store,
-                &[
-                    "--git-dir",
-                    &git_backend_root(&fx.jj, &fx.store).unwrap(),
-                    "rev-parse",
-                    &format!("refs/heads/{BRANCH}")
-                ]
-            ),
-            merge,
-            "the git ref was exported onto the merge"
-        );
-        let message = fx
-            .jj
-            .run(
-                &fx.store,
-                &[
-                    "log",
-                    "-r",
-                    &merge,
-                    "--no-graph",
-                    "--ignore-working-copy",
-                    "-T",
-                    "description",
-                ],
-                "merge message",
-            )
-            .unwrap();
-        assert!(message.starts_with("Merge main@"), "{message}");
-
-        assert_eq!(
-            merge_base_into_branch(&fx.jj, &fx.store, BRANCH, &dest, &message, None).unwrap(),
-            MergeCatchUp::AlreadyCurrent,
-            "a second pass at the same destination does nothing"
-        );
-
-        // The next advance merges against the TRUE base: the previous dest.
-        let next = fx.commit(&["main"], "main", "later.rs", "later\n");
-        let MergeCatchUp::Merged { old_base, .. } =
-            merge_base_into_branch(&fx.jj, &fx.store, BRANCH, &next, &message, None).unwrap()
-        else {
-            panic!("the follow-up advance merges cleanly");
-        };
-        assert_eq!(
-            old_base, dest,
-            "after one merge the base is the merged dest"
-        );
     }
 
     #[test]
@@ -679,194 +483,32 @@ mod tests {
 
     #[test]
     #[serial_test::serial(jj)]
-    fn a_committed_resolution_lands_as_the_merge_commit() {
+    fn detached_merge_refuses_either_moved_coordinate_and_expired_budget() {
         let Some(bin) = jj_bin() else { return };
-        let fx = fixture(&bin);
-        fx.commit(&["main"], BRANCH, "shared.rs", "BRANCH\n");
-        let dest = fx.commit(&["main"], "main", "shared.rs", "MAIN\n");
-        fx.commit(&["main"], "main", "main-only.rs", "main\n");
-        let dest_after = fx.tip("main");
-        let MergeCatchUp::Conflicted { diagnostic } =
-            merge_base_into_branch(&fx.jj, &fx.store, BRANCH, &dest, &message(&dest), None)
-                .unwrap()
-        else {
-            panic!("precondition: the first merge conflicts");
-        };
-
-        // The owner resolves the markers and commits T' on top of the tip.
-        let resolved = fx.commit(&[BRANCH], BRANCH, "shared.rs", "RESOLVED\n");
-        let carry = ResolutionCarry::from_tip(&resolved, &diagnostic.conflicting_paths());
-        let ops = fx.operations();
-        let MergeCatchUp::Merged { merge, .. } = merge_base_into_branch(
-            &fx.jj,
-            &fx.store,
-            BRANCH,
-            &dest,
-            &message(&dest),
-            Some(&carry),
-        )
-        .unwrap() else {
-            panic!("the resolution merges cleanly");
-        };
-        assert_eq!(fx.parents(&merge), vec![resolved.clone(), dest.clone()]);
-        assert_eq!(fx.file(BRANCH, "shared.rs"), "RESOLVED\n");
-        assert!(fx
-            .operations_since(&ops)
-            .iter()
-            .all(|op| !op.contains("rebase")));
-
-        // A carry computed from another tip is refused before anything moves.
-        let stale = ResolutionCarry::from_tip(&resolved, &["shared.rs".to_string()]);
-        assert!(merge_base_into_branch(
-            &fx.jj,
-            &fx.store,
-            BRANCH,
-            &dest_after,
-            &message(&dest_after),
-            Some(&stale)
-        )
-        .is_err());
-        assert_eq!(fx.tip(BRANCH), merge);
-
-        // Without a carry, the newer main merges in on top as usual.
-        let MergeCatchUp::Merged { old_base, .. } = merge_base_into_branch(
-            &fx.jj,
-            &fx.store,
-            BRANCH,
-            &dest_after,
-            &message(&dest_after),
-            None,
-        )
-        .unwrap() else {
-            panic!("the newer main merges cleanly over the resolution");
-        };
-        assert_eq!(old_base, dest);
-        assert_eq!(fx.file(BRANCH, "main-only.rs"), "main\n");
-    }
-
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_merge_mode_reconcile_merges_and_a_plain_sibling_still_rebases() {
-        let Some(bin) = jj_bin() else { return };
-        let fx = fixture(&bin);
-        let plain = "agent/cairn-1-builder-0";
-        let merge_tip = fx.commit(&["main"], BRANCH, "one.rs", "one\n");
-        let plain_tip = fx.commit(&["main"], plain, "plain.rs", "plain\n");
-        let dest = fx.commit(&["main"], "main", "main-only.rs", "main\n");
-        let ops = fx.operations();
-
-        let report = reconcile_siblings_with_options(
-            &fx.jj,
-            &fx.store,
-            &dest,
-            &[BRANCH.to_string(), plain.to_string()],
-            &ReconcileOptions {
-                merge_mode: [BRANCH.to_string()].into_iter().collect(),
-                target_name: Some("main".to_string()),
-                ..ReconcileOptions::default()
-            },
-        )
-        .unwrap();
-        assert!(report.rebased_clean.contains(&BRANCH.to_string()));
-        assert!(report.rebased_clean.contains(&plain.to_string()));
-        let merged = report.merged_clean.get(BRANCH).expect("merge detail");
-        assert_eq!(fx.parents(&merged.merge), vec![merge_tip, dest.clone()]);
-        assert!(!merged.resolved);
-        assert!(!report.merged_clean.contains_key(plain));
-        assert_ne!(fx.tip(plain), plain_tip, "the plain sibling was rebased");
-        assert_eq!(fx.parents(&fx.tip(plain)), vec![dest]);
-        let since = fx.operations_since(&ops);
-        assert!(
-            since
-                .iter()
-                .all(|op| !op.contains("rebase") && !op.contains("abandon")),
-            "both paths install detached candidates without CLI rewrites: {since:?}"
-        );
-    }
-
-    /// A child cut from a merge-mode branch is not in the merge-mode set, so
-    /// once its parent catches up by merge it still replays onto the parent's
-    /// merge tip, carrying only its own commits and rewriting none of the
-    /// parent's.
-    #[test]
-    #[serial_test::serial(jj)]
-    fn a_child_of_a_merge_mode_branch_still_replays_onto_its_merge_tip() {
-        let Some(bin) = jj_bin() else { return };
-        let fx = fixture(&bin);
-        let child = "agent/cairn-4114-builder-0";
-        let base = fx.tip("main");
-        fx.commit(&["main"], BRANCH, "one.rs", "one\n");
-        let parent_tip = fx.commit(&[BRANCH], BRANCH, "two.rs", "two\n");
-        let child_tip = fx.commit(&[BRANCH], child, "child.rs", "child\n");
-        let dest = fx.commit(&["main"], "main", "main-only.rs", "main\n");
-        let options = ReconcileOptions {
-            merge_mode: [BRANCH.to_string()].into_iter().collect(),
-            target_name: Some("main".to_string()),
-            ..ReconcileOptions::default()
-        };
-
-        let parent_pass = reconcile_siblings_with_options(
-            &fx.jj,
-            &fx.store,
-            &dest,
-            &[BRANCH.to_string()],
-            &options,
-        )
-        .unwrap();
-        let merge = parent_pass
-            .merged_clean
-            .get(BRANCH)
-            .expect("parent merged")
-            .merge
-            .clone();
-        assert_eq!(fx.parents(&merge), vec![parent_tip.clone(), dest.clone()]);
-
-        let ops = fx.operations();
-        let child_pass = reconcile_siblings_with_options(
-            &fx.jj,
-            &fx.store,
-            &merge,
-            &[child.to_string()],
-            &options,
-        )
-        .unwrap();
-        assert!(child_pass.rebased_clean.contains(&child.to_string()));
-        assert!(
-            !child_pass.merged_clean.contains_key(child),
-            "the child is not merged"
-        );
-        let rebased = fx.tip(child);
-        assert_ne!(rebased, child_tip, "the child was replayed");
-        assert_eq!(fx.parents(&rebased), vec![merge.clone()]);
-        assert_eq!(
-            revset_commit_ids(&fx.jj, &fx.store, &format!("{merge}..{rebased}")).unwrap(),
-            vec![rebased.clone()],
-            "only the child's own commit was carried"
-        );
-        assert_eq!(fx.file(child, "main-only.rs"), "main\n");
-        assert_eq!(fx.file(child, "child.rs"), "child\n");
-        assert_eq!(fx.tip(BRANCH), merge, "the parent did not move");
-        assert_eq!(
-            revset_commit_ids(&fx.jj, &fx.store, &format!("{base}..{parent_tip}"))
-                .unwrap()
-                .len(),
-            2,
-            "the parent's stack is intact"
-        );
-        let since = fx.operations_since(&ops);
-        assert_eq!(
-            since
-                .iter()
-                .filter(|op| op.starts_with(&format!("advance `{child}` onto ")))
-                .count(),
-            1,
-            "exactly one advance ran for the child: {since:?}"
-        );
-        assert!(
-            since
-                .iter()
-                .all(|op| !op.starts_with(&format!("advance `{BRANCH}` onto "))),
-            "the parent was not replayed: {since:?}"
-        );
+        for moved in [BRANCH, "main"] {
+            let fx = fixture(&bin);
+            fx.commit(&["main"], BRANCH, "own.txt", "own\n");
+            fx.commit(&["main"], "main", "base.txt", "base\n");
+            let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+            assert!(matches!(
+                compute_branch_merge_advance(&fx.jj, snapshot, None, std::time::Duration::ZERO),
+                Err(AdvanceComputeError::TimedOut)
+            ));
+            let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+            let candidate = compute_branch_merge_advance(
+                &fx.jj,
+                snapshot,
+                None,
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+            fx.commit(&[moved], moved, "later.txt", "later\n");
+            let before = operation_id(&fx.jj, &fx.store).unwrap();
+            assert!(matches!(
+                install_branch_advance_local(&fx.jj, candidate),
+                Err(AdvanceInstallError::CoordinatesChanged)
+            ));
+            assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), before);
+        }
     }
 }

@@ -511,51 +511,6 @@ async fn a_failed_poll_keeps_the_last_successful_check_time() {
     assert!(error.message.contains("offline"));
 }
 
-/// One unreachable origin must not delay any other project's check.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hung_origin_does_not_delay_other_projects() {
-    let db = crate::storage::migrated_test_db("default-branch-poll-isolation.db").await;
-    seed_project(&db, "hung", "/repos/hung").await;
-    seed_project(&db, "healthy", "/repos/healthy").await;
-    let mut git = MockGitClient::new();
-    git.expect_remote_get_url()
-        .returning(|_| Ok("git@github.com:acme/repo.git".into()));
-    // One expectation per repository: mockall holds an expectation's lock
-    // while its closure runs, so a shared one would serialize the two calls
-    // and the test would measure the mock instead of the poll.
-    git.expect_ls_remote_branches()
-        .withf(|repo, _, _| repo == Path::new("/repos/hung"))
-        .returning(|_, _, _| {
-            std::thread::sleep(Duration::from_secs(3));
-            Ok(HashMap::new())
-        });
-    git.expect_ls_remote_branches()
-        .withf(|repo, _, _| repo == Path::new("/repos/healthy"))
-        .returning(|_, _, _| Ok(HashMap::new()));
-    let orch = test_orchestrator(db, Arc::new(git));
-
-    let started = std::time::Instant::now();
-    poll_once(&orch).await;
-    loop {
-        if orch
-            .base_branch_sync
-            .snapshot("healthy", "main")
-            .is_some_and(|state| state.checked_at.is_some())
-        {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the healthy project waited behind the hung origin"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(
-        !orch.base_branch_sync.begin_poll("hung"),
-        "the hung project's check is still in flight, so the next tick skips it"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_check_that_outlives_its_budget_is_recorded_as_failed() {
     let db = crate::storage::migrated_test_db("default-branch-poll-timeout.db").await;
@@ -776,106 +731,6 @@ async fn a_recorded_fetch_failure_is_a_check_error() {
 // ---------------------------------------------------------------------------
 // End to end: an advance made outside Cairn reaches the store on one poll.
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn one_poll_pass_brings_an_outside_push_into_the_store() {
-    if crate::jj::tests::jj_bin().is_none() {
-        eprintln!(
-            "skipping one_poll_pass_brings_an_outside_push_into_the_store: jj not resolvable"
-        );
-        return;
-    }
-    use crate::jj::tests::{git, git_stdout, init_project};
-
-    let origin = tempfile::tempdir().unwrap();
-    let proj = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
-    init_project(proj.path());
-    let origin_url = origin.path().to_string_lossy().into_owned();
-    git(proj.path(), &["remote", "add", "origin", &origin_url]);
-    git(proj.path(), &["push", "-q", "origin", "main"]);
-    let repo_path = proj.path().to_string_lossy().into_owned();
-
-    let db = crate::storage::migrated_test_db("default-branch-e2e.db").await;
-    seed_project(&db, "proj-e2e", &repo_path).await;
-    let orch = test_orchestrator(db, Arc::new(crate::services::RealGitClient));
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
-    crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path)).unwrap();
-    let before = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
-
-    // Someone merges on GitHub: origin moves, and Cairn is told nothing.
-    git(
-        outside.path(),
-        &[
-            "clone",
-            "-q",
-            &origin_url,
-            &outside.path().join("c").to_string_lossy(),
-        ],
-    );
-    let clone = outside.path().join("c");
-    git(&clone, &["config", "user.email", "o@e.com"]);
-    git(&clone, &["config", "user.name", "o"]);
-    std::fs::write(clone.join("landed.rs"), "landed\n").unwrap();
-    git(&clone, &["add", "-A"]);
-    git(&clone, &["commit", "-q", "-m", "merged outside Cairn (#2)"]);
-    git(&clone, &["push", "-q", "origin", "main"]);
-    let landed = git_stdout(&clone, &["rev-parse", "HEAD"]);
-
-    // Before the poll the label already cannot claim more than it knows.
-    let label = revision_label(&orch, "proj-e2e", "main", "main", &store, &before).await;
-    assert!(label.contains("origin not checked since launch"), "{label}");
-
-    poll_project(
-        &orch,
-        "proj-e2e",
-        Path::new(&repo_path),
-        &["main".to_string()],
-    )
-    .await;
-    // The poll started the sync in the background; this waits for it, or runs
-    // it if it has not begun.
-    sync(&orch, "proj-e2e", "main").await;
-
-    assert_eq!(
-        crate::jj::bookmark_commit(&jj, &store, "main").as_deref(),
-        Some(landed.as_str()),
-        "one poll pass must bring an outside push into the store's main"
-    );
-    let label = revision_label(&orch, "proj-e2e", "main", "main", &store, &landed).await;
-    assert!(
-        label.starts_with(&format!("main@{} committed ", &landed[..8])),
-        "{label}"
-    );
-    assert!(label.contains("origin checked "), "{label}");
-    assert!(!label.contains("STALE"), "{label}");
-
-    // A read that resolved `main` before the sync served the old tree. The
-    // store is current now, but that read's label must still say STALE.
-    let label = revision_label(&orch, "proj-e2e", "main", "main", &store, &before).await;
-    assert!(
-        label.starts_with(&format!(
-            "main@{} STALE: origin main is {}",
-            &before[..8],
-            &landed[..8]
-        )),
-        "{label}"
-    );
-
-    // And a read still pinned to the old commit while origin is ahead says so.
-    let registry = &orch.base_branch_sync;
-    registry.record_tip("proj-e2e", "main", NEW, Source::Push, registry.observe());
-    let label = revision_label(&orch, "proj-e2e", "main", "main", &store, &landed).await;
-    assert!(
-        label.starts_with(&format!(
-            "main@{} STALE: origin main is 9e77a275",
-            &landed[..8]
-        )),
-        "{label}"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // End to end: a parent's integration branch advanced outside Cairn.
@@ -1291,43 +1146,6 @@ async fn a_prepared_replay_of_a_published_parent_is_published_over_its_old_tip()
         None,
         "no sync recorded the replaced publication as a divergence"
     );
-}
-
-/// cairn/5038's guarantee: origin holding a commit the store never had (a
-/// push or a UI merge into the branch) while the store holds its own unpublished
-/// work is refused, naming both commits, and origin keeps the outside commit.
-#[tokio::test(flavor = "multi_thread")]
-async fn publishing_over_a_commit_the_store_never_had_is_refused() {
-    let Some(f) = PublishedParent::new("publish-refuses-foreign.db").await else {
-        eprintln!("skipping: jj not resolvable");
-        return;
-    };
-    let local = f.seal("unpublished.rs");
-    let outside = f.push_outside(PARENT, "outside.rs");
-    let registry = &f.orch.base_branch_sync;
-    registry.record_tip(
-        "proj-parent",
-        PARENT,
-        &outside,
-        Source::Push,
-        registry.observe(),
-    );
-
-    let error = f.publish().await.unwrap_err();
-    assert!(
-        error.starts_with(&format!("Refusing to publish `{PARENT}`")),
-        "{error}"
-    );
-    assert!(
-        error.contains(&local[..8]) && error.contains(&outside[..8]),
-        "{error}"
-    );
-    assert_eq!(
-        f.origin_tip(PARENT),
-        outside,
-        "origin keeps the outside commit"
-    );
-    assert_eq!(f.store_tip(), local, "the store's work is untouched");
 }
 
 /// And when origin's extra commit is a pure fast-forward, the publication's

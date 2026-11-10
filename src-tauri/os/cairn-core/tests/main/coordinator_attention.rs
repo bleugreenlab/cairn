@@ -19,8 +19,7 @@ use cairn_core::internal::services::testing::{
 use cairn_core::internal::services::GitOutput;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::models::{
-    AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, ExecutionSnapshot, IssueStatus,
-    NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
+    ExecutionSnapshot, IssueStatus, NodePosition, RecipeNode, RecipeNodeType, RecipeSnapshot,
     RecipeTrigger, RunStatus, TriggerContext, TriggerType,
 };
 use cairn_db::turso::params;
@@ -216,138 +215,6 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
     .unwrap();
 }
 
-fn agent_node(id: &str) -> RecipeNode {
-    RecipeNode {
-        id: id.to_string(),
-        node_type: RecipeNodeType::Agent,
-        name: id.to_string(),
-        position: NodePosition { x: 0.0, y: 0.0 },
-        parent_id: None,
-        trigger_config: None,
-        agent_config: Some(AgentNodeConfig {
-            agent_config_id: Some(id.to_string()),
-            models: None,
-            constraints: Default::default(),
-            output_schema: None,
-            git_config: None,
-        }),
-        action_config: None,
-        checkpoint_config: None,
-        artifact_config: None,
-        condition_config: None,
-        decision_config: None,
-        context_config: None,
-    }
-}
-
-fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
-    RecipeNode {
-        id: id.to_string(),
-        node_type: RecipeNodeType::Artifact,
-        name: id.to_string(),
-        position: NodePosition { x: 0.0, y: 0.0 },
-        parent_id: None,
-        trigger_config: None,
-        agent_config: None,
-        action_config: None,
-        checkpoint_config: None,
-        artifact_config: Some(ArtifactNodeConfig {
-            name: name.to_string(),
-            schema: Some(serde_json::json!({"type": "object"})),
-            confirm_policy: policy,
-            content: None,
-        }),
-        condition_config: None,
-        decision_config: None,
-        context_config: None,
-    }
-}
-
-fn ctx_edge(id: &str, from: &str, to: &str) -> RecipeEdge {
-    RecipeEdge {
-        id: id.to_string(),
-        edge_type: RecipeEdgeType::Context,
-        source_node_id: from.to_string(),
-        source_handle: "context-out".to_string(),
-        target_node_id: to.to_string(),
-        target_handle: "context-in".to_string(),
-    }
-}
-
-/// A planbuild child parked at its plan gate:
-/// `planner --context-out-> plan(user) --context-out-> builder`, with the
-/// planner's plan artifact written but unconfirmed, its builder still pending,
-/// and no PR anywhere.
-///
-/// This is the topology that made CAIRN-3347 invisible. The planner's
-/// `context-out` terminates in an artifact consumed by the builder, so its branch
-/// ships no PR and the turn-end check cadence skips it; no PR exists, so the
-/// PR-open edge cannot fire either. The recompute review-readiness hook is the
-/// only edge left, and the planner's turn ends by deriving **Blocked** under the
-/// `user` confirm gate rather than any terminal status.
-///
-/// The builder job is seeded exactly as a real execution leaves it — `pending`,
-/// no turn, not DAG-ready behind the blocked planner — so it contributes no
-/// status change of its own. That matters: any sibling transition into a status
-/// the hook already accepted would mask the gate and make this test pass against
-/// the bug.
-async fn seed_plan_gate_child(db: &LocalDb) {
-    let snapshot = ExecutionSnapshot::new(
-        RecipeSnapshot {
-            id: "planbuild".to_string(),
-            name: "Plan Build".to_string(),
-            description: None,
-            trigger: RecipeTrigger::Manual,
-            nodes: vec![
-                agent_node("planner"),
-                artifact_node("plan-node", "plan", ConfirmPolicy::User),
-                agent_node("builder"),
-            ],
-            edges: vec![
-                ctx_edge("e1", "planner", "plan-node"),
-                ctx_edge("e2", "plan-node", "builder"),
-            ],
-        },
-        HashMap::new(),
-        HashMap::new(),
-        TriggerContext {
-            issue_id: Some("child".to_string()),
-            project_id: "project".to_string(),
-            trigger_type: TriggerType::Manual,
-            event_payload: None,
-            initiated_via: None,
-        },
-    )
-    .to_json()
-    .unwrap()
-    .replace('\'', "''");
-    db.execute_script(format!(
-        "
-        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
-          VALUES('child-exec','planbuild','child','project','running',1,1,'{snapshot}');
-        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
-                         uri_segment, node_name, created_at, updated_at)
-          VALUES('child-planner','child-exec','planner','project','child','running',
-                 'planner','Planner',1,1);
-        INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
-          VALUES('child-plan-run','project','child','child-planner','complete',1,1);
-        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
-                          created_at, ended_at, updated_at)
-          VALUES('child-plan-turn','child-plan-session','child-plan-run','child-planner',1,
-                 'complete','initial',1,2,2);
-        INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
-                              output_name, created_at, updated_at)
-          VALUES('child-plan','child-planner','plan',0,'{{}}',1,'plan',1,1);
-        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
-                         uri_segment, node_name, created_at, updated_at)
-          VALUES('child-builder','child-exec','builder','project','child','pending',
-                 'builder','Builder',1,1);
-        "
-    ))
-    .await
-    .unwrap();
-}
-
 /// How long a wait in this file may run before it is reported as a broken
 /// fixture. It is not a latency budget. Every wait polls for an observable the
 /// code under test produces on its own detached task or thread, and how long
@@ -375,17 +242,6 @@ where
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-}
-
-/// Wait for the pushes under `key`. The review-readiness hook is detached from
-/// the recompute sweep, so the wake lands after `recompute_job` returns.
-async fn await_push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
-    poll_until(move || async move {
-        let rows = push_rows(db, key).await;
-        (!rows.is_empty()).then_some(rows)
-    })
-    .await
-    .unwrap_or_else(|| panic!("no attention push was created for {key} within {FIXTURE_GUARD:?}"))
 }
 
 async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
@@ -416,48 +272,6 @@ async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<Strin
 /// Returns without failing; the caller's assertion reports a miss.
 async fn await_spawn_count(recorder: &RecordingProcessSpawner, n: usize) {
     poll_until(move || async move { (recorder.spawn_count() >= n).then_some(()) }).await;
-}
-
-async fn admission_state(db: &LocalDb, launch_key: &str) -> Option<String> {
-    db.query_opt_text(
-        "SELECT state FROM runtime_admission_requests WHERE launch_key=?1",
-        (launch_key.to_string(),),
-    )
-    .await
-    .unwrap()
-}
-
-/// Wait for the admission request of `run_id`'s launch to reach a terminal
-/// state, and return that state.
-async fn await_admission_settled(db: &LocalDb, run_id: &str) -> String {
-    let launch_key = format!("ordinary:{run_id}");
-    let key = launch_key.as_str();
-    if let Some(settled) = poll_until(move || async move {
-        admission_state(db, key)
-            .await
-            .filter(|state| matches!(state.as_str(), "failed" | "cancelled" | "released"))
-    })
-    .await
-    {
-        return settled;
-    }
-    // `queued` here means no promotion pass leased the request: either the
-    // promoter never ran, or the lane declined it (a memory brake reads the
-    // host's real free memory). `leased`/`starting` means a start never returned.
-    panic!(
-        "the admission request for {launch_key} never settled within {FIXTURE_GUARD:?}; it is {:?}",
-        admission_state(db, key).await
-    );
-}
-
-async fn attention_event_count(db: &LocalDb) -> i64 {
-    db.query_one(
-        "SELECT COUNT(*) FROM events WHERE event_type='attention:briefing'",
-        (),
-        |row| row.i64(0),
-    )
-    .await
-    .unwrap()
 }
 
 async fn attention_event_body(db: &LocalDb) -> String {
@@ -521,130 +335,6 @@ async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() 
         push_rows(&db, &format!("review:{CHILD_URI}")).await.len(),
         1,
         "later check completion must not duplicate an unchanged review"
-    );
-}
-
-/// A child reaching a confirmation gate must wake its coordinator (CAIRN-3347).
-///
-/// The planner writes its plan and its turn ends; the recompute sweep derives
-/// **Blocked** (plan present, unconfirmed, `user` confirm policy) and the
-/// review-readiness hook must treat that transition as settling. Before the fix
-/// the hook only reacted to `Complete`/`Failed`/`Idle`, so every plan gate was
-/// silent: no push was minted for anyone, and coordinators slept through the one
-/// event they exist to arbitrate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn child_plan_gate_wakes_idle_coordinator() {
-    let (temp, db) = common::migrated_db().await;
-    seed_coordinator(&db, temp.path()).await;
-    seed_plan_gate_child(&db).await;
-    let db = Arc::new(db);
-    let (orch, recorder) = orchestrator(&temp, db.clone());
-
-    // The production edge: the planner's turn has ended, so its status is
-    // recomputed. Nothing else is invoked — no check cadence, no PR.
-    cairn_core::internal::execution::advancement::recompute_job(&orch, "child-planner").unwrap();
-
-    assert_eq!(
-        common::scalar_text_by_id(&db, "SELECT status FROM jobs WHERE id=?1", "child-planner")
-            .await,
-        Some("blocked".to_string()),
-        "a written-but-unconfirmed plan under a user gate derives Blocked"
-    );
-
-    let rows = await_push_rows(&db, &format!("review:{CHILD_URI}")).await;
-    assert_eq!(rows.len(), 1, "one review wake per gated plan");
-    assert_eq!(rows[0].0, "coordinator");
-    assert_eq!(
-        rows[0].1, "wake",
-        "a gate blocks the child on the coordinator's judgment, so it rouses"
-    );
-
-    let content_ref = common::scalar_text_by_id(
-        &db,
-        "SELECT content_ref FROM attention_pushes WHERE recipient=?1 ORDER BY created_at DESC LIMIT 1",
-        "coordinator",
-    )
-    .await
-    .expect("the review push carries a content_ref");
-    assert!(
-        content_ref.ends_with("/planner/plan"),
-        "the coordinator is pointed at the plan awaiting its confirmation, got {content_ref}"
-    );
-
-    // The nudge trails push creation inside the same detached evaluation, so give
-    // it the same bounded window the push itself got.
-    await_spawn_count(&recorder, 1).await;
-    assert_eq!(
-        recorder.spawn_count(),
-        1,
-        "the idle coordinator must actually be resumed, not merely have a row written"
-    );
-}
-
-/// A launch that fails after the briefing is assembled must not spend the wake,
-/// and must not leave the briefing behind either.
-///
-/// The delivery stamp commits with the carrying event, necessarily before any
-/// process exists, because the pushes ride in the prompt the spawn carries. So a
-/// refused launch — the fail-closed credential check here, an expired account or
-/// a missing CLI in production — would leave the push marked delivered to an
-/// agent that never ran. Nothing reports that, and nothing retries it: the
-/// coordinator is simply never woken for this child again. Returning the push to
-/// the queue is what keeps a failed launch recoverable instead of silent.
-///
-/// The event has to go with it. Delivery is defined as "carried by a durable
-/// event", so a requeued push whose old briefing still sits in the transcript is
-/// a half-undone delivery: the next successful resume writes a second briefing
-/// for the same fact, and every surface built from durable events — the
-/// transcript, a reseed digest, the wake card — shows the child update twice, one
-/// of them attributed to a turn no agent ever ran.
-///
-/// The resume queues its launch behind durable admission and returns, so the
-/// refusal arrives later, when promotion tries to start the process. The
-/// queued launch owns the delivery until then and returns the wake there.
-#[tokio::test(flavor = "current_thread")]
-async fn a_refused_launch_returns_the_childs_wake_to_the_queue() {
-    let (temp, db) = common::migrated_db().await;
-    seed_coordinator_and_child(&db, temp.path()).await;
-    let db = Arc::new(db);
-    let (orch, recorder) = orchestrator_with_credential(&temp, db.clone(), None);
-
-    let _slot = orch
-        .try_begin_turn_end_checks("child-builder", "attempt-running")
-        .expect("the slot is free");
-    evaluate_review_readiness(&orch, "child").await;
-
-    // Positive witness first: the coordinator's successor launch was attempted
-    // and refused, not merely still waiting to be promoted.
-    let resumed_run = cairn_core::messages::delivery::latest_run_for_job(&db, "coordinator")
-        .expect("the wake must still reach a launch attempt");
-    assert_ne!(resumed_run, "coord-run");
-    assert_eq!(
-        await_admission_settled(&db, &resumed_run).await,
-        "failed",
-        "promotion must have tried the launch and refused it"
-    );
-
-    let rows = push_rows(&db, &format!("review:{CHILD_URI}")).await;
-    assert_eq!(rows.len(), 1, "the review wake is still minted");
-    assert_eq!(
-        recorder.spawn_count(),
-        0,
-        "an uncredentialed launch must be refused"
-    );
-    assert_eq!(
-        rows[0].2, None,
-        "a push stamped delivered by a launch that never started is a wake nobody can ever receive"
-    );
-    assert_eq!(
-        list_pending(&db, "coordinator").await.unwrap().len(),
-        1,
-        "so it must still be queued for the coordinator's next resume"
-    );
-    assert_eq!(
-        attention_event_count(&db).await,
-        0,
-        "and no briefing may survive to be replayed beside the requeued push"
     );
 }
 

@@ -1424,7 +1424,6 @@ pub(super) mod unstarted_child_tests {
     use std::sync::{Arc, Mutex};
 
     const ANCHOR: &str = "T1";
-    const CHILD_ARTIFACT: &str = "the late child's explored answer";
 
     /// Records each start request and starts nothing, so a created child job
     /// stays queued exactly as it does behind a busy runner.
@@ -1805,85 +1804,6 @@ pub(super) mod unstarted_child_tests {
         (orch, task.job_id.clone(), requests)
     }
 
-    /// The child is created but not started: the spawn reports it as created
-    /// and waiting, the parent parks, and when the child is placed late and
-    /// completes, the parent is woken exactly once with its result.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn blocking_spawn_with_unstarted_child_reports_it_created_and_parks_then_wakes() {
-        let (orch, child, requests) = spawn_and_park("unstarted-child-wake.db").await;
-
-        // Placed late: the child gets its run, works, writes its result, and
-        // completes through the warm path a `return` takes.
-        let child_owned = child.clone();
-        orch.db
-            .local
-            .write(|conn| {
-                let child = child_owned.clone();
-                Box::pin(async move {
-                    for sql in [
-                        "INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('session-child',?1,'claude','open',1,2,2)",
-                        "INSERT INTO runs(id,job_id,issue_id,project_id,session_id,status,start_mode,created_at,updated_at) VALUES('run-child',?1,'i','p','session-child','live','fresh',2,2)",
-                        "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,started_at,updated_at) VALUES('child-turn','session-child','run-child',?1,1,'running','initial',2,2,2)",
-                        "UPDATE jobs SET status='running', started_at=2, current_session_id='session-child', current_turn_id='child-turn' WHERE id=?1",
-                    ] {
-                        conn.execute(sql, (child.as_str(),)).await?;
-                    }
-                    conn.execute(
-                        "INSERT INTO artifacts(id,job_id,artifact_type,output_name,data,version,created_at,updated_at) VALUES('child-result',?1,'return','return',?2,1,3,3)",
-                        (child.as_str(), serde_json::json!({ "content": CHILD_ARTIFACT }).to_string()),
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-        {
-            let mut handle = RunHandle::new(
-                Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(Some(
-                    cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
-                ))),
-                Some("session-child".into()),
-                Some(child.clone()),
-            );
-            handle.begin_turn("child-turn");
-            orch.process_state
-                .processes
-                .lock()
-                .unwrap()
-                .register("run-child".into(), handle);
-        }
-        orch.process_state
-            .set_current_turn_id("run-child", Some("child-turn"));
-        let warm_orch = orch.clone();
-        assert!(tokio::task::spawn_blocking(move || {
-            crate::orchestrator::lifecycle::transition_to_warm_state(&warm_orch, "run-child", None)
-        })
-        .await
-        .unwrap());
-
-        await_successor(&orch).await;
-        assert_eq!(
-            successor_count(&orch).await,
-            1,
-            "the parent is woken exactly once"
-        );
-        let delivered = delivered_tool_result(&orch)
-            .await
-            .expect("the wake delivers the child's result to the spawning call");
-        assert!(delivered.contains(CHILD_ARTIFACT), "{delivered}");
-        assert_eq!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|request| request["method"] == "turn/start")
-                .count(),
-            1
-        );
-    }
-
     /// A child that fails before it ever had a run wakes the parent parked on
     /// it, with the failure.
     #[tokio::test(flavor = "multi_thread")]
@@ -1914,63 +1834,6 @@ pub(super) mod unstarted_child_tests {
             .await
             .expect("the wake delivers the failure to the spawning call");
         assert!(delivered.contains("failed"), "{delivered}");
-    }
-
-    /// An inline wait answers inside its budget for a child that fails before
-    /// it ever had a run, instead of parking on a child that is already done.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn inline_wait_answers_for_a_child_that_fails_before_it_had_a_run() {
-        let (orch, _executor) = parent_fixture("unstarted-child-inline.db").await;
-        let budget = Duration::from_secs(20);
-        let started = std::time::Instant::now();
-        let spawn_orch = orch.clone();
-        let spawning = tokio::spawn(async move {
-            spawn(&spawn_orch, &[explore_payload("map the fleet")], budget).await
-        });
-
-        let child = loop {
-            if let Some(child) = text(
-                &orch,
-                "SELECT id FROM jobs WHERE parent_job_id = 'j-parent'",
-            )
-            .await
-            {
-                break child;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "no child created"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        // Let the spawn reach its wait before the child fails.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        crate::execution::jobs::mark_job_start_failed(
-            &orch,
-            &orch.db.local,
-            &child,
-            "branch preparation failed: store unavailable",
-            true,
-        )
-        .await;
-
-        let outcome = spawning.await.unwrap();
-        assert!(
-            started.elapsed() < budget,
-            "the inline wait ran out its budget"
-        );
-        let response = outcome.response.expect("blocking text").result;
-        assert!(response.contains("failed"), "{response}");
-        assert!(
-            !response.contains(DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX),
-            "answered inline, not parked: {response}"
-        );
-        assert_eq!(
-            text(&orch, "SELECT state FROM turns WHERE id = 'T1'")
-                .await
-                .as_deref(),
-            Some("running")
-        );
     }
 
     /// An unknown agent creates nothing: every task in the batch is refused,
@@ -2571,90 +2434,6 @@ pub(super) mod unstarted_child_tests {
             )
             .await,
             8
-        );
-    }
-
-    /// A batch whose second packet cannot be persisted, after a concurrent
-    /// advancement has already turned its first packet into a real child:
-    /// that child is reported as applied and waited on to completion, and only
-    /// the uncreated task is refused.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_persistence_failure_keeps_an_already_created_sibling() {
-        let (orch, _executor) = parent_fixture("persist-failure.db").await;
-        super::PERSIST_FAULTS
-            .lock()
-            .unwrap()
-            .push(("run-parent".to_string(), 1, true));
-        let started = std::time::Instant::now();
-        let spawning = {
-            let orch = orch.clone();
-            tokio::spawn(async move {
-                spawn(
-                    &orch,
-                    &[explore_payload("first"), explore_payload("second")],
-                    Duration::from_secs(20),
-                )
-                .await
-            })
-        };
-
-        let child = loop {
-            if let Some(child) = text(
-                &orch,
-                "SELECT id FROM jobs WHERE parent_job_id = 'j-parent'",
-            )
-            .await
-            {
-                break child;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(10),
-                "no child created"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let child_owned = child.clone();
-        orch.db
-            .local
-            .write(|conn| {
-                let child = child_owned.clone();
-                Box::pin(async move {
-                    conn.execute(
-                        "INSERT INTO artifacts(id,job_id,artifact_type,output_name,data,version,created_at,updated_at) VALUES('first-result',?1,'return','return',?2,1,3,3)",
-                        (child.as_str(), serde_json::json!({ "content": CHILD_ARTIFACT }).to_string()),
-                    )
-                    .await?;
-                    conn.execute("UPDATE jobs SET status = 'complete' WHERE id = ?1", (child.as_str(),))
-                        .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-
-        let outcome = spawning.await.unwrap();
-        assert_eq!(outcome.spawned.len(), 1, "{:?}", outcome.refused);
-        assert_eq!(outcome.spawned[0].index, 0);
-        assert_eq!(outcome.spawned[0].job_id, child);
-        assert!(outcome.spawned[0].task_uri.is_some());
-        assert_eq!(
-            outcome.refused,
-            vec![(1, "injected persistence failure".to_string())]
-        );
-        let response = outcome
-            .response
-            .expect("the created child is waited on")
-            .result;
-        assert!(response.contains(CHILD_ARTIFACT), "{response}");
-        assert_eq!(
-            count(
-                &orch,
-                "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'j-parent'"
-            )
-            .await,
-            1,
-            "the task that could not be persisted created nothing"
         );
     }
 

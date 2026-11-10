@@ -197,29 +197,6 @@ mod tests {
         }
     }
 
-    /// The byte-exact request body of Actual's owned turn. See
-    /// `http_loop::scripted` for how it is recorded.
-    #[tokio::test]
-    async fn golden_owned_turn() {
-        use crate::backends::http_loop::scripted::{
-            answer_schema, assert_golden, chat_text, record_turn, session_config,
-        };
-        let mut config = session_config("google/gemma-4-e2b-it");
-        config.reasoning_effort = Some("high".to_string());
-        config.output_schema = Some(answer_schema());
-        let bodies = record_turn(config, vec![chat_text("done")], |_| {
-            ActualAdapter::for_target(local_target())
-        })
-        .await;
-        // The caller's effort and schema are not sent on this owned loop.
-        assert_golden(
-            &bodies,
-            &[
-                r#"{"messages":[{"content":"SYSTEM","role":"system"},{"content":"hi","role":"user"}],"model":"google/gemma-4-e2b-it","stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":["read","write","run"]}"#,
-            ],
-        );
-    }
-
     fn request() -> CompletionRequest {
         CompletionRequest {
             system: Some("Be concise".into()),

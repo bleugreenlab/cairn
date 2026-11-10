@@ -2974,22 +2974,6 @@ impl Orchestrator {
         }
     }
 
-    /// Free `job_id`'s slot whichever wave holds it, as if that wave had settled.
-    /// Test-only: production releases go through the holder's own guard, and a
-    /// guard dropped after this finds its entry gone and releases nothing.
-    #[cfg(test)]
-    pub(crate) fn release_turn_end_slot_for_test(&self, job_id: &str) {
-        let holder = self
-            .turn_end_checks_in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(job_id)
-            .cloned();
-        if let Some(holder) = holder {
-            self.end_turn_end_checks(job_id, &holder);
-        }
-    }
-
     /// Release `job_id`'s slot if, and only if, `owner` is the wave holding it,
     /// so a late release can never free a successor's slot. Called only by
     /// [`TurnEndSlot`]. Reports whether this call released it.
