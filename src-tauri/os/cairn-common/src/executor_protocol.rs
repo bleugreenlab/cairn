@@ -653,6 +653,52 @@ impl SandboxCapabilityEvidence {
     pub fn check_lane_can_nest(&self) -> bool {
         self.nested_sandbox_write_available && self.nested_sandbox_write_context.is_some()
     }
+
+    /// Whether a check lane here cannot nest for exactly one measured reason:
+    /// the executor is unconfined and wraps its lanes in the operator
+    /// credential floor, a Seatbelt profile no lane command can apply another
+    /// inside. The only incapability placement may waive a nested-Seatbelt
+    /// requirement for ([`NestedSandboxWaiver`]); an executor that is itself
+    /// confined, could not tell, or measured without its context is not this.
+    pub fn check_lane_floor_refuses_nesting(&self) -> bool {
+        !self.nested_sandbox_write_available
+            && self
+                .nested_sandbox_write_context
+                .as_ref()
+                .is_some_and(|context| {
+                    context.launcher == SandboxLauncherClass::Unconfined
+                        && context.credential_floor_sha256.is_some()
+                })
+    }
+
+    /// The nested-Seatbelt fact a check verdict records about the lane that
+    /// produced it, in one line: the measured answer, what confined the lane,
+    /// and the probe's own detail. `None` when the measurement names no
+    /// context, which says nothing about a lane.
+    pub fn check_lane_provenance(&self) -> Option<String> {
+        let context = self.nested_sandbox_write_context.as_ref()?;
+        let state = if self.nested_sandbox_write_available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        let floor = match context.credential_floor_sha256.as_deref() {
+            Some(floor) => format!(
+                "under the operator credential floor {}",
+                floor.chars().take(12).collect::<String>()
+            ),
+            None => "under no credential floor".to_string(),
+        };
+        Some(format!(
+            "{state} ({floor}; launcher {}): {}",
+            match context.launcher {
+                SandboxLauncherClass::Unconfined => "unconfined",
+                SandboxLauncherClass::ConfinedDescendant => "confined descendant",
+                SandboxLauncherClass::Unknown => "unknown",
+            },
+            self.nested_sandbox_write_detail.trim()
+        ))
+    }
 }
 
 /// What a nested-Seatbelt measurement was taken under: every input that
@@ -7367,6 +7413,17 @@ pub struct LearnedResourceEstimate {
 /// to its caller as a refused call. What a runner gets wrong talking to an
 /// older executor: nothing. That executor would have dropped the link on the
 /// oversized frame instead; it now receives a small frame it already reads.
+///
+/// cairn/6341 does not move the number. It adds
+/// [`PlacementSelection::nested_sandbox_waived`] with its new
+/// [`NestedSandboxWaiver`], and
+/// [`PlacementRejectionReason::NestedSandboxCapableElsewhere`]: runner
+/// placement vocabulary under cairn/4931's argument, omitted when absent and
+/// carried to no executor. `requiresMacosNestedSandboxWrite` keeps its wire
+/// spelling; the runner now waives it for a Mac refused nesting only by the
+/// credential floor while no capable machine could take the work, a choice
+/// the runner alone makes from evidence every executor already sends. What a
+/// runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -8290,9 +8347,15 @@ pub struct ExecutorSelector {
     /// and stands alone as "anywhere that can build this".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_toolchains: Vec<String>,
-    /// On macOS, require proof that the executor parent can apply a nested
-    /// Seatbelt profile and write inside its explicit allowance. Other
-    /// platforms are unaffected.
+    /// On macOS, require proof that a check lane can apply a nested Seatbelt
+    /// profile and write inside its explicit allowance. Other platforms are
+    /// unaffected.
+    ///
+    /// Placement waives it, on the record ([`NestedSandboxWaiver`]), for a Mac
+    /// whose lanes are refused nesting only by the operator credential floor,
+    /// and only while no attached machine that satisfies it could take the
+    /// work. That fallback is retired by cairn/6339, which gives macOS lanes a
+    /// machine they can nest on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_macos_nested_sandbox_write: bool,
     /// Maximum edge authority this workload permits.
@@ -16737,6 +16800,11 @@ pub struct PlacementSelection {
     /// down. See [`ProcessFitWaiver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_fit_waived: Option<ProcessFitWaiver>,
+    /// Present when the work required a nested Seatbelt write this machine's
+    /// check lanes cannot apply, and it was placed here anyway because no
+    /// attached machine that can could take it. See [`NestedSandboxWaiver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_sandbox_waived: Option<NestedSandboxWaiver>,
     /// The single process this machine was judged on, or that heavy work
     /// was placed with none known. Absent for work whose class compiles
     /// nothing and that measured no process, and on a record from before it
@@ -18244,6 +18312,56 @@ impl ProcessFitWaiver {
     }
 }
 
+/// Why work that requires a nested Seatbelt write
+/// ([`ExecutorSelector::requires_macos_nested_sandbox_write`]) was placed on a
+/// Mac whose check lanes cannot apply one.
+///
+/// Placement prefers a machine that satisfies the requirement and waives it
+/// only for a Mac refused nesting by the operator credential floor alone
+/// ([`SandboxCapabilityEvidence::check_lane_floor_refuses_nesting`]), and only
+/// while no attached machine that satisfies it could take the work. The lane
+/// still runs under the floor: this relaxes where it runs, never how it is
+/// confined. Tests that need the capability skip there as
+/// `nested-sandbox-exec` and are never counted as passed.
+///
+/// A fallback for a fleet with no capable Mac attached, retired by cairn/6339.
+/// Runner placement vocabulary like [`ProcessFitWaiver`]: nothing the runner
+/// sends an executor carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NestedSandboxWaiver {
+    /// The machine's own probe detail, verbatim.
+    pub detail: String,
+    /// The credential floor its check lanes run under.
+    pub credential_floor_sha256: String,
+}
+
+impl NestedSandboxWaiver {
+    /// The waiver this machine's evidence supports, or `None` when its lanes
+    /// can nest or are refused for any reason but the credential floor.
+    pub fn for_evidence(evidence: &SandboxCapabilityEvidence) -> Option<Self> {
+        if !evidence.check_lane_floor_refuses_nesting() {
+            return None;
+        }
+        Some(Self {
+            detail: evidence.nested_sandbox_write_detail.trim().to_string(),
+            credential_floor_sha256: evidence
+                .nested_sandbox_write_context
+                .as_ref()?
+                .credential_floor_sha256
+                .clone()?,
+        })
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "the nested Seatbelt requirement was waived: this machine's check lanes run under the operator credential floor {} and cannot apply a nested profile ({}), and no attached machine that can was able to take the work. Tests that need it skip as nested-sandbox-exec and are not counted as passed (a fallback cairn/6339 retires)",
+            self.credential_floor_sha256.chars().take(12).collect::<String>(),
+            self.detail
+        )
+    }
+}
+
 /// The single process a placement judged the chosen machine on, so every
 /// record of heavy work says what one process of it was expected to need,
 /// or that nothing was known.
@@ -18527,6 +18645,13 @@ pub enum PlacementRejectionReason {
     ProcessDeferred(ProcessMisfit),
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
+    /// The work requires a nested Seatbelt write, this machine's check lanes
+    /// are refused one by the operator credential floor, and the machines
+    /// named satisfy the requirement and could take the work, so it is not
+    /// waived here ([`NestedSandboxWaiver`]). Neither a filter of the machine
+    /// nor something to wait for: it takes such work again once none of them
+    /// can.
+    NestedSandboxCapableElsewhere { capable: Vec<String> },
     /// Capable of running the work, but not a platform whose answer the
     /// requester counts as the verdict. Placement will not turn a lane red on a
     /// platform the project does not gate on.
@@ -18775,6 +18900,10 @@ impl PlacementRejectionReason {
                 misfit.describe()
             ),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
+            Self::NestedSandboxCapableElsewhere { capable } => format!(
+                "its check lanes cannot apply a nested Seatbelt profile under the operator credential floor, and {} can take the work, so the requirement is not waived here",
+                capable.join(", ")
+            ),
             Self::UntrustedVerdictPlatform { os, trusted } => format!(
                 "runs {os}, and this verdict counts only from {}",
                 trusted.join(", ")
@@ -22653,6 +22782,7 @@ mod tests {
                 prediction: None,
                 memory_ceiling: None,
                 process_fit_waived: None,
+                nested_sandbox_waived: None,
                 process_demand: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),

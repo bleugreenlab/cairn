@@ -2150,6 +2150,10 @@ pub(crate) struct FreshCheckObservationWrite {
     /// machinery produced (`SubstrateFailureShape::stored`). `None` for a
     /// verdict and for a failure the classifier read from the command's output.
     pub substrate_shape: Option<String>,
+    /// The nested-Seatbelt state of the lane that ran, as the executor attested
+    /// it for a macOS run
+    /// (`SandboxCapabilityEvidence::check_lane_provenance`). `None` elsewhere.
+    pub nested_sandbox_lane: Option<String>,
 }
 
 impl FreshCheckObservationWrite {
@@ -2292,6 +2296,9 @@ pub(crate) struct CheckResultObservationProjection {
     pub execution_warmth: Option<String>,
     pub cell_origin: Option<ObservedCellOrigin>,
     pub build_jobs: Option<cairn_common::executor_protocol::BuildJobs>,
+    /// The source observation's nested-Seatbelt lane state; `None` on rows
+    /// recorded before it and on rows that are not macOS.
+    pub nested_sandbox_lane: Option<String>,
     pub tests: Vec<CheckTestResultRow>,
     /// Global counts, independent of the requested page and filters.
     pub persisted_counts: ObservationTestCounts,
@@ -2764,6 +2771,7 @@ pub(crate) fn record_fresh_check_observation(
                     "substrateShape": observation.substrate_shape,
                     "planAuditState": observation.plan_audit_state,
                     "planAuditNote": observation.plan_audit_note,
+                    "nestedSandboxLane": observation.nested_sandbox_lane,
                 })
                 .to_string();
                 let mut existing = conn
@@ -2807,7 +2815,8 @@ pub(crate) fn record_fresh_check_observation(
                            AND placement_facts IS json_extract(?31,'$.placementFacts')
                            AND substrate_shape IS json_extract(?31,'$.substrateShape')
                            AND plan_audit_state IS json_extract(?31,'$.planAuditState')
-                           AND plan_audit_note IS json_extract(?31,'$.planAuditNote')",
+                           AND plan_audit_note IS json_extract(?31,'$.planAuditNote')
+                           AND nested_sandbox_lane IS json_extract(?31,'$.nestedSandboxLane')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2876,7 +2885,7 @@ pub(crate) fn record_fresh_check_observation(
                         execution_warmth, cell_origin_kind, cell_origin_distance_files,
                         cell_origin_distance_crates, build_jobs, build_jobs_json,
                         failure_signature, placement_facts, substrate_shape, verdict_result_json, publication_id,
-                        plan_audit_state, plan_audit_note
+                        plan_audit_state, plan_audit_note, nested_sandbox_lane
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2906,7 +2915,8 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.verdictResultJson'),
                               json_extract(?31,'$.publicationId'),
                               json_extract(?31,'$.planAuditState'),
-                              json_extract(?31,'$.planAuditNote'))
+                              json_extract(?31,'$.planAuditNote'),
+                              json_extract(?31,'$.nestedSandboxLane'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -3344,7 +3354,7 @@ pub(crate) fn get_check_result_observation(
                             o.output_tail,a.defined_by_commit_sha,o.defined_by_commit_sha,
                             o.verdict_platform,o.verdict_arch,o.selection,o.deferred_count,
                             {OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,o.public_handle,
-                            o.plan_audit_state,o.plan_audit_note
+                            o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane
                        FROM check_result_commit_aliases a
                        JOIN check_result_observations o ON o.id=a.source_observation_id
                       WHERE a.project_id=?1 AND a.commit_sha=?2 AND a.check_name=?3
@@ -3381,7 +3391,8 @@ pub(crate) fn get_check_result_observation(
                     verdict_platform: row.opt_text(36)?, verdict_arch: row.opt_text(37)?,
                     output_tail: row.text(33)?,
                     selection: row.opt_text(38)?, deferred_count: row.i64(39)?,
-                    phases, execution_warmth, cell_origin, build_jobs, tests: Vec::new(),
+                    phases, execution_warmth, cell_origin, build_jobs,
+                    nested_sandbox_lane: row.opt_text(57)?, tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &observation_id).await?,
                     verdict_result: compact_result(row.opt_text(53)?),
                     public_handle: row.opt_text(54)?,
@@ -3419,7 +3430,7 @@ fn observation_by_handle_sql() -> String {
                 o.executor_finished_at_unix_ms,o.runner_build_id,o.toolchain_fingerprint,
                 o.output_tail,o.defined_by_commit_sha,o.verdict_platform,o.verdict_arch,
                 o.selection,o.deferred_count,{OBSERVATION_PHASE_COLUMNS},o.verdict_result_json,
-                o.plan_audit_state,o.plan_audit_note
+                o.plan_audit_state,o.plan_audit_note,o.nested_sandbox_lane
            FROM check_result_observations o INDEXED BY {CHECK_OBSERVATION_HANDLE_INDEX}
           WHERE o.project_id=?1 AND o.public_handle=?2 AND o.public_handle IS NOT NULL"
     )
@@ -3496,6 +3507,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     execution_warmth,
                     cell_origin,
                     build_jobs,
+                    nested_sandbox_lane: row.opt_text(51)?,
                     tests: Vec::new(),
                     persisted_counts: observation_test_totals(conn, &id).await?,
                     verdict_result: compact_result(row.opt_text(48)?),
@@ -4050,6 +4062,7 @@ pub(crate) mod tests {
             id: id.to_string(),
             public_handle: format!("{id:0<24}"),
             infra_reset_scopes: Vec::new(),
+            nested_sandbox_lane: None,
             failure_signature: None,
             placement_facts: None,
             substrate_shape: None,
@@ -6607,6 +6620,48 @@ pub(crate) mod tests {
             Some(SubstrateFailureShape::CommandPreempted)
         );
         assert_eq!(newest.placement_facts.as_deref(), Some("facts-a"));
+    }
+
+    /// The lane's nested-Seatbelt state is part of the immutable row: both
+    /// readers return what was written, and a row without it reads as none.
+    #[tokio::test]
+    async fn the_lanes_nested_seatbelt_state_survives_the_store() {
+        let db = cache_db().await;
+        let lane = "unavailable (under the operator credential floor abababababab; launcher unconfined): refused (exit Some(71))";
+        let mut recorded = observation("obs-nested", "commit-nested", "env-a");
+        recorded.nested_sandbox_lane = Some(lane.to_string());
+        let handle = recorded.public_handle.clone();
+        record_fresh_check_observation(db.clone(), recorded.clone()).unwrap();
+        // Recording the identical row again is idempotent: the field is part
+        // of the immutable equality, not a reason to refuse.
+        record_fresh_check_observation(db.clone(), recorded).unwrap();
+        let loaded = get_check_result_observation(
+            db.clone(),
+            "project-a",
+            "commit-nested",
+            "rust",
+            "env-a",
+            1,
+            None,
+            None,
+            100,
+            0,
+        )
+        .unwrap()
+        .expect("fresh alias");
+        assert_eq!(loaded.nested_sandbox_lane.as_deref(), Some(lane));
+        let permalink = get_check_result_observation_by_handle(db.clone(), "project-a", &handle)
+            .unwrap()
+            .expect("the handle resolves");
+        assert_eq!(permalink.nested_sandbox_lane.as_deref(), Some(lane));
+
+        let plain = observation("obs-plain", "commit-plain", "env-a");
+        let handle = plain.public_handle.clone();
+        record_fresh_check_observation(db.clone(), plain).unwrap();
+        let permalink = get_check_result_observation_by_handle(db.clone(), "project-a", &handle)
+            .unwrap()
+            .expect("the handle resolves");
+        assert_eq!(permalink.nested_sandbox_lane, None);
     }
 
     #[tokio::test]

@@ -298,6 +298,9 @@ async fn a_read_that_would_need_a_fence_permission_goes_to_a_machine_unasked() {
 /// item that is not read-shaped says nothing.
 #[tokio::test]
 async fn a_read_on_a_machine_ends_with_why() {
+    if cairn_sandbox::skip_if_confined("a_read_on_a_machine_ends_with_why") {
+        return;
+    }
     let (_temp, _db, orch, cwd) = setup("run-read-notes").await;
     let run = |payload: Value| {
         let request = request(&cwd, Some("run-read-notes"), payload);
@@ -1984,6 +1987,9 @@ fn point_thread_store_at_fixture(db: &LocalDb, thread_id: &str) {
 /// spawn configuration, so the executor transport is part of the assertion.
 #[tokio::test]
 async fn spawned_run_items_receive_their_canonical_home_uri() {
+    if cairn_sandbox::skip_if_confined("spawned_run_items_receive_their_canonical_home_uri") {
+        return;
+    }
     let (_temp, db, orch, cwd) = setup("run-home-uri").await;
     let probe = json!({"commands": [{
         "command": "printf 'child-home=<%s>\\n' \"$CAIRN_HOME_URI\""
@@ -2022,6 +2028,11 @@ async fn spawned_run_items_receive_their_canonical_home_uri() {
 
 #[tokio::test]
 async fn spawned_run_items_receive_their_canonical_home_uri_from_the_team_database() {
+    if cairn_sandbox::skip_if_confined(
+        "spawned_run_items_receive_their_canonical_home_uri_from_the_team_database",
+    ) {
+        return;
+    }
     let (temp, team) = common::migrated_db().await;
     let team = Arc::new(team);
     let (_private_temp, private) = common::migrated_db().await;
@@ -2138,6 +2149,11 @@ async fn a_retired_procedure_target_is_refused_with_the_service_shape() {
 /// lane without it is broken rather than one where this may quietly pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_thread_batch_persists_its_sdk_writes_to_the_thread_database() {
+    if cairn_sandbox::skip_if_confined(
+        "a_thread_batch_persists_its_sdk_writes_to_the_thread_database",
+    ) {
+        return;
+    }
     assert!(
         binary_available("bun"),
         "bun must be on PATH: it runs the test suite and every TypeScript batch"
@@ -2473,6 +2489,11 @@ async fn wait_rows(db: &LocalDb) -> Vec<(String, String, Option<String>)> {
 /// then resolves with the item's actual result.
 #[tokio::test]
 async fn a_batch_outliving_grace_suspends_over_the_transport_agents_actually_use() {
+    if cairn_sandbox::skip_if_confined(
+        "a_batch_outliving_grace_suspends_over_the_transport_agents_actually_use",
+    ) {
+        return;
+    }
     let (_temp, db, orch, cwd) = setup("run-mcp-suspend").await;
     // Runs far past the shortened window, so an inline await could not answer
     // anywhere near it, and prints a marker only completion can produce.
@@ -2613,6 +2634,9 @@ async fn a_suspension_binds_to_its_own_call_among_siblings() {
 /// many rows a turn is now allowed to own.
 #[tokio::test]
 async fn indistinguishable_concurrent_batches_claim_nothing() {
+    if cairn_sandbox::skip_if_confined("indistinguishable_concurrent_batches_claim_nothing") {
+        return;
+    }
     let (_temp, db, orch, cwd) = setup("run-ambiguous").await;
     let batch = json!({ "commands": [{ "command": "sleep 3; echo settled" }] });
     seed_suspendable_run_with_calls(
@@ -2948,6 +2972,9 @@ const PARTIAL_OUTPUT_TIMEOUT_MS: u32 = 3000;
 /// terminal is created only by an explicit write to a terminal URI.
 #[tokio::test]
 async fn explicit_timeout_kills_the_item_and_creates_no_terminal() {
+    if cairn_sandbox::skip_if_confined("explicit_timeout_kills_the_item_and_creates_no_terminal") {
+        return;
+    }
     let (_temp, db, orch, cwd) = setup("run-timeout").await;
     let payload = json!({
         "commands": [{ "command": "echo started; sleep 30", "timeout": PARTIAL_OUTPUT_TIMEOUT_MS }],
@@ -3052,6 +3079,11 @@ async fn timed_out_item_in_subtask_job_creates_no_terminal() {
 /// shared helper is pinned by `child_agent_snapshot_tests`; this is the batch.
 #[tokio::test]
 async fn a_task_job_runs_its_batch_once_its_own_agent_is_in_the_snapshot() {
+    if cairn_sandbox::skip_if_confined(
+        "a_task_job_runs_its_batch_once_its_own_agent_is_in_the_snapshot",
+    ) {
+        return;
+    }
     let (temp, db, orch, cwd) = setup("run-xtask").await;
     let agents = temp.path().join("config").join("agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -3100,6 +3132,9 @@ async fn a_task_job_runs_its_batch_once_its_own_agent_is_in_the_snapshot() {
 
 #[tokio::test]
 async fn sequential_stop_on_error_halts_after_timed_out_slot_item() {
+    if cairn_sandbox::skip_if_confined("sequential_stop_on_error_halts_after_timed_out_slot_item") {
+        return;
+    }
     let (_temp, _db, orch, cwd) = setup("run-halt").await;
     let payload = json!({
         "commands": [
@@ -3399,6 +3434,9 @@ fn binary_available(bin: &str) -> bool {
 
 #[tokio::test]
 async fn typescript_code_item_executes_via_bun() {
+    if cairn_sandbox::skip_if_confined("typescript_code_item_executes_via_bun") {
+        return;
+    }
     if !binary_available("bun") {
         eprintln!("skipping typescript_code_item_executes_via_bun: bun not resolvable");
         return;
@@ -3421,6 +3459,10 @@ async fn typescript_code_item_executes_via_bun() {
 // coordinate even when its residence happens to be an unrelated Git checkout.
 #[tokio::test]
 async fn forged_cwd_does_not_replace_authenticated_branch_identity() {
+    if cairn_sandbox::skip_if_confined("forged_cwd_does_not_replace_authenticated_branch_identity")
+    {
+        return;
+    }
     let (_temp, _db, orch, _managed_cwd) = setup("run-plain-cwd").await;
     let loose = tempfile::tempdir().unwrap();
     init_git_repo(loose.path());
@@ -3500,6 +3542,11 @@ async fn python_code_item_honors_pep723_inline_deps_via_uv() {
 /// the *resolution mechanism* independent of the real package's current exports.
 #[tokio::test]
 async fn code_item_resolves_bare_package_import_from_worktree_node_modules() {
+    if cairn_sandbox::skip_if_confined(
+        "code_item_resolves_bare_package_import_from_worktree_node_modules",
+    ) {
+        return;
+    }
     if !binary_available("bun") {
         eprintln!("skipping code_item_resolves_bare_package_import_from_worktree_node_modules: bun not resolvable");
         return;
@@ -3722,6 +3769,9 @@ async fn timed_out_code_item_is_killed_with_partial_output() {
 
 #[tokio::test]
 async fn chained_commands_surface_all_segments() {
+    if cairn_sandbox::skip_if_confined("chained_commands_surface_all_segments") {
+        return;
+    }
     let (_temp, _db, orch, cwd) = setup("run-chain").await;
     // `||` chain: the first grep misses, then the second matches README.
     let or_chain = handle_run(

@@ -5624,6 +5624,7 @@ mod complete_input_projection_tests {
                 sealed_coordinate: SealedCheckCoordinate::new(&head.commit_sha, &head.commit_sha, &head.tree_hash, input),
                 id: id.into(),
                 public_handle: format!("{id:0<24}"),
+                nested_sandbox_lane: None,
                 project_id: "project-a".into(),
                 commit_sha: head.commit_sha.clone(),
                 defined_by_commit_sha: head.commit_sha.clone(),

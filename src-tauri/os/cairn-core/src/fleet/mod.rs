@@ -16588,16 +16588,28 @@ fn survey_candidates<'a>(
     // two decisions about the same fleet must not see the machines reshuffle.
     let mut ordered: Vec<_> = connections.values().collect();
     ordered.sort_by(|a, b| a.identity.executor_id.cmp(&b.identity.executor_id));
+    let nests_elsewhere = nested_sandbox_preference(&ordered, scope, now_unix_ms);
 
     let mut usable = Vec::new();
     let mut rejected = Vec::new();
     for entry in ordered {
-        let reason = candidate_rejection(entry, scope, now_unix_ms).or_else(|| {
-            declined
-                .get(&entry.identity.executor_id)
-                .filter(|decline| decline.stands_on(entry.generation, now_unix_ms))
-                .map(declined_rejection)
-        });
+        let waived_needlessly = !nests_elsewhere.is_empty()
+            && scope.selector.is_some_and(|selector| {
+                nested_sandbox_fit(&entry.advertisement.capabilities, selector)
+                    == NestedSandboxFit::Waivable
+            });
+        let reason = candidate_rejection(entry, scope, now_unix_ms)
+            .or_else(|| {
+                waived_needlessly.then(|| PlacementRejectionReason::NestedSandboxCapableElsewhere {
+                    capable: nests_elsewhere.clone(),
+                })
+            })
+            .or_else(|| {
+                declined
+                    .get(&entry.identity.executor_id)
+                    .filter(|decline| decline.stands_on(entry.generation, now_unix_ms))
+                    .map(declined_rejection)
+            });
         match reason {
             Some(reason) => rejected.push(PlacementRejection {
                 drain_blockers: entry.drain_blockers.clone(),
@@ -17727,6 +17739,9 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::ProcessTooLarge(_) => "processTooLarge",
         PlacementRejectionReason::ProcessDeferred(_) => "processDeferred",
         PlacementRejectionReason::OutrankedBy { .. } => "outrankedBy",
+        PlacementRejectionReason::NestedSandboxCapableElsewhere { .. } => {
+            "nestedSandboxCapableElsewhere"
+        }
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
         PlacementRejectionReason::UpdatePending => "updatePending",
@@ -18245,6 +18260,9 @@ fn rank_survey(
         process_demand: winner.reservation.and_then(|resolved| {
             process_demand_record(&resolved.process_evidence, winner.entry)
         }),
+        // The survey kept a waivable Mac only when nothing that satisfies the
+        // requirement could take the work, so its winning is the fallback.
+        nested_sandbox_waived: nested_sandbox_waiver(request, winner.entry),
         cache_distance: winner.cache_distance.map(|distance| {
             cairn_common::cache_distance::MeasuredDistance {
                 target_commit: request.base_commit.clone(),
@@ -21035,7 +21053,7 @@ fn selector_shortfall(
         capability,
         advertised_at_unix_ms: entry.advertisement.observed_at_unix_ms,
     };
-    if !matches_sandbox_capability(capabilities, selector) {
+    if nested_sandbox_fit(capabilities, selector) == NestedSandboxFit::Refused {
         return Some(match capabilities.sandbox.as_ref() {
             None => unreported("check-lane nested Seatbelt probe"),
             Some(evidence) => SelectorShortfall::NestedSandbox(nested_sandbox_shortfall(evidence)),
@@ -21102,20 +21120,94 @@ fn containment_deficiency(
     }
 }
 
-/// Whether a macOS machine can take work that applies its own nested Seatbelt
-/// profile. Only a measurement taken on the check-lane path counts: one taken
-/// from the executor's own process is how a machine whose lanes all exited 71
-/// kept receiving them (cairn/5316).
+/// Whether a machine satisfies the nested-Seatbelt part of a selector.
 fn matches_sandbox_capability(
     capabilities: &ExecutorCapabilities,
     selector: &ExecutorSelector,
 ) -> bool {
-    !selector.requires_macos_nested_sandbox_write
+    nested_sandbox_fit(capabilities, selector) == NestedSandboxFit::Satisfied
+}
+
+/// How one machine meets a selector's nested-Seatbelt requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedSandboxFit {
+    /// The selector asks nothing of it, the machine is not a Mac, or its
+    /// check lanes measured a nested write on the check-lane path.
+    Satisfied,
+    /// A Mac whose check lanes are refused nesting by the operator credential
+    /// floor alone. Eligible, but taken only when nothing that satisfies the
+    /// requirement could take the work ([`nested_sandbox_preference`]), with
+    /// the waiver on the record. Retired by cairn/6339.
+    Waivable,
+    /// Any other Mac: no evidence, evidence measured from the executor's own
+    /// process, or a refusal the floor does not explain.
+    Refused,
+}
+
+/// Only a measurement taken on the check-lane path counts: one taken from the
+/// executor's own process is how a machine whose lanes all exited 71 kept
+/// receiving them (cairn/5316).
+fn nested_sandbox_fit(
+    capabilities: &ExecutorCapabilities,
+    selector: &ExecutorSelector,
+) -> NestedSandboxFit {
+    if !selector.requires_macos_nested_sandbox_write
         || !capabilities.os.eq_ignore_ascii_case("macos")
-        || capabilities
-            .sandbox
-            .as_ref()
-            .is_some_and(SandboxCapabilityEvidence::check_lane_can_nest)
+    {
+        return NestedSandboxFit::Satisfied;
+    }
+    match capabilities.sandbox.as_ref() {
+        Some(evidence) if evidence.check_lane_can_nest() => NestedSandboxFit::Satisfied,
+        Some(evidence) if evidence.check_lane_floor_refuses_nesting() => NestedSandboxFit::Waivable,
+        _ => NestedSandboxFit::Refused,
+    }
+}
+
+/// The machines among `ordered` that satisfy the scope's nested-Seatbelt
+/// requirement outright and could take the work: structurally eligible, or
+/// away only for something that ends on its own (a decline, an update, a
+/// provisioning turn). Empty when the scope requires nothing of the kind.
+///
+/// While any is named, a Mac that is merely [`NestedSandboxFit::Waivable`]
+/// takes none of this work: a lane never runs without the capability while a
+/// machine with it could have run it. A capable machine an operator drained,
+/// or one the work's own selector excludes, does not hold the fallback back.
+fn nested_sandbox_preference(
+    ordered: &[&ExecutorConnectionState],
+    scope: PlacementScope<'_>,
+    now_unix_ms: u64,
+) -> Vec<String> {
+    let Some(selector) = scope
+        .selector
+        .filter(|selector| selector.requires_macos_nested_sandbox_write)
+    else {
+        return Vec::new();
+    };
+    ordered
+        .iter()
+        .filter(|entry| matches_sandbox_capability(&entry.advertisement.capabilities, selector))
+        .filter(|entry| {
+            candidate_rejection(entry, scope, now_unix_ms)
+                .is_none_or(|reason| waits_on_machine(&reason))
+        })
+        .map(|entry| executor_public_name(entry))
+        .collect()
+}
+
+/// The waiver a selection on `entry` records for `request`, when the request
+/// requires a nested Seatbelt write and the machine is only
+/// [`NestedSandboxFit::Waivable`].
+fn nested_sandbox_waiver(
+    request: &CellRequest,
+    entry: &ExecutorConnectionState,
+) -> Option<cairn_common::executor_protocol::NestedSandboxWaiver> {
+    let capabilities = &entry.advertisement.capabilities;
+    request.executor.as_ref().filter(|selector| {
+        nested_sandbox_fit(capabilities, selector) == NestedSandboxFit::Waivable
+    })?;
+    cairn_common::executor_protocol::NestedSandboxWaiver::for_evidence(
+        capabilities.sandbox.as_ref()?,
+    )
 }
 
 /// The nested-Seatbelt fact as a refusal inventory states it.
@@ -35662,12 +35754,217 @@ mod tests {
         );
     }
 
+    /// A capable Mac and one whose check lanes run under the operator
+    /// credential floor, as both evidence shapes are published.
+    fn capable_and_floored_evidence() -> (SandboxCapabilityEvidence, SandboxCapabilityEvidence) {
+        let context = cairn_common::executor_protocol::NestedSandboxProbeContext {
+            launcher: cairn_common::executor_protocol::SandboxLauncherClass::Unconfined,
+            credential_floor_sha256: None,
+            outer_profile_sha256: None,
+            fingerprint: Some("f".into()),
+            measured_at_unix_ms: 1,
+        };
+        let capable = SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: true,
+            nested_sandbox_write_detail: "live probe succeeded".into(),
+            nested_sandbox_write_context: Some(context.clone()),
+            violation_recovery: None,
+        };
+        let floored = SandboxCapabilityEvidence {
+            nested_sandbox_write_available: false,
+            nested_sandbox_write_detail:
+                "outer profile inherited: a confined process cannot apply a second profile".into(),
+            nested_sandbox_write_context: Some(
+                cairn_common::executor_protocol::NestedSandboxProbeContext {
+                    credential_floor_sha256: Some("f1007f1007f1007".into()),
+                    outer_profile_sha256: Some("outer".into()),
+                    ..context
+                },
+            ),
+            ..capable.clone()
+        };
+        (capable, floored)
+    }
+
+    fn set_sandbox(
+        connections: &mut HashMap<String, ExecutorConnectionState>,
+        executor_id: &str,
+        evidence: Option<SandboxCapabilityEvidence>,
+    ) {
+        Arc::make_mut(&mut connections.get_mut(executor_id).unwrap().advertisement)
+            .capabilities
+            .sandbox = evidence;
+    }
+
+    fn nested_sandbox_lane(os: &str) -> CellRequest {
+        let mut request = targeted_request(os);
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        request.placement_mobility = PlacementMobility::SpillEligible;
+        request.executor = Some(ExecutorSelector {
+            os: Some(os.into()),
+            required_toolchains: vec!["rust".into()],
+            requires_macos_nested_sandbox_write: true,
+            ..ExecutorSelector::default()
+        });
+        request
+    }
+
+    /// cairn/6341. A Mac whose check lanes the credential floor refuses a
+    /// nested profile is eligible for a lane that requires one, but never
+    /// while a capable machine could take it: with both attached and idle the
+    /// capable Mac wins and the floored one is passed over by name, whatever
+    /// order ranking would otherwise have put them in.
+    #[test]
+    fn a_capable_mac_is_chosen_over_one_under_the_credential_floor() {
+        let (capable, floored) = capable_and_floored_evidence();
+        let mut connections = HashMap::from([
+            fleet_entry("bgsrv-mac", "macos", 6, &[]),
+            fleet_entry("mac-floor", "macos", 0, &[]),
+            fleet_entry("fedora", "linux", 0, &[]),
+        ]);
+        set_sandbox(&mut connections, "bgsrv-mac", Some(capable));
+        set_sandbox(&mut connections, "mac-floor", Some(floored.clone()));
+        let request = nested_sandbox_lane("macos");
+
+        let draft = place(&connections, &request).expect("the capable Mac takes it");
+        let (selected, selection) = draft.selected.expect("placed");
+        assert_eq!(selected.executor_id, "bgsrv-mac");
+        assert_eq!(selection.nested_sandbox_waived, None);
+        let passed_over = draft
+            .rejected
+            .iter()
+            .find(|rejection| rejection.executor_id == "mac-floor")
+            .expect("the floored Mac is accounted for");
+        assert_eq!(
+            passed_over.reason,
+            PlacementRejectionReason::NestedSandboxCapableElsewhere {
+                capable: vec!["bgsrv-mac".into()],
+            }
+        );
+        assert!(
+            passed_over
+                .reason
+                .describe()
+                .contains("bgsrv-mac can take the work, so the requirement is not waived here"),
+            "{}",
+            passed_over.reason.describe()
+        );
+
+        // With no capable Mac attached the floored one takes the lane, and the
+        // record says it ran without the capability and why.
+        connections.remove("bgsrv-mac");
+        let draft = place(&connections, &request).expect("the fallback takes it");
+        let (selected, selection) = draft.selected.expect("placed on the fallback");
+        assert_eq!(selected.executor_id, "mac-floor");
+        let waiver = selection
+            .nested_sandbox_waived
+            .expect("the record names the waiver");
+        assert_eq!(waiver.credential_floor_sha256, "f1007f1007f1007");
+        let text = waiver.describe();
+        assert!(
+            text.contains("operator credential floor f1007f1007f1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "outer profile inherited: a confined process cannot apply a second profile"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("skip as nested-sandbox-exec"), "{text}");
+        assert!(text.contains("cairn/6339"), "{text}");
+    }
+
+    /// The waiver is for the floor alone. A Mac whose executor is itself
+    /// confined, or that could not tell, is refused as before, and so is one
+    /// that measured from its own process.
+    #[test]
+    fn only_the_credential_floor_is_waived() {
+        let (_, floored) = capable_and_floored_evidence();
+        let selector = ExecutorSelector {
+            requires_macos_nested_sandbox_write: true,
+            ..ExecutorSelector::default()
+        };
+        let mut capabilities = capabilities_with_cores(8);
+        capabilities.sandbox = Some(floored.clone());
+        assert_eq!(
+            nested_sandbox_fit(&capabilities, &selector),
+            NestedSandboxFit::Waivable
+        );
+        assert!(!matches_sandbox_capability(&capabilities, &selector));
+
+        for launcher in [
+            cairn_common::executor_protocol::SandboxLauncherClass::ConfinedDescendant,
+            cairn_common::executor_protocol::SandboxLauncherClass::Unknown,
+        ] {
+            let mut evidence = floored.clone();
+            evidence
+                .nested_sandbox_write_context
+                .as_mut()
+                .unwrap()
+                .launcher = launcher;
+            capabilities.sandbox = Some(evidence);
+            assert_eq!(
+                nested_sandbox_fit(&capabilities, &selector),
+                NestedSandboxFit::Refused,
+                "{launcher:?}"
+            );
+        }
+        let mut unfloored = floored.clone();
+        unfloored
+            .nested_sandbox_write_context
+            .as_mut()
+            .unwrap()
+            .credential_floor_sha256 = None;
+        capabilities.sandbox = Some(unfloored);
+        assert_eq!(
+            nested_sandbox_fit(&capabilities, &selector),
+            NestedSandboxFit::Refused
+        );
+        let mut contextless = floored;
+        contextless.nested_sandbox_write_context = None;
+        capabilities.sandbox = Some(contextless);
+        assert_eq!(
+            nested_sandbox_fit(&capabilities, &selector),
+            NestedSandboxFit::Refused
+        );
+    }
+
+    /// Linux placement for the same lane is untouched: a Linux machine
+    /// satisfies the requirement, records no waiver, and holds a floored Mac
+    /// back from a lane that would count either platform.
+    #[test]
+    fn the_nested_sandbox_preference_leaves_linux_placement_alone() {
+        let (_, floored) = capable_and_floored_evidence();
+        let mut connections = HashMap::from([
+            fleet_entry("mac-floor", "macos", 0, &[]),
+            fleet_entry("fedora", "linux", 4, &[]),
+        ]);
+        set_sandbox(&mut connections, "mac-floor", Some(floored));
+
+        let draft = place(&connections, &nested_sandbox_lane("linux")).expect("linux places");
+        let (selected, selection) = draft.selected.expect("placed");
+        assert_eq!(selected.executor_id, "fedora");
+        assert_eq!(selection.nested_sandbox_waived, None);
+
+        let mut either = nested_sandbox_lane("linux");
+        either.executor.as_mut().unwrap().os = None;
+        let draft = place(&connections, &either).expect("either platform places");
+        assert_eq!(draft.selected.expect("placed").0.executor_id, "fedora");
+    }
+
     /// The macOS cadence's refusal named only the Mac being emptied for its
-    /// update. The other Mac with rust was excluded because its check lanes
-    /// cannot apply a nested Seatbelt profile under the operator credential
-    /// floor, and the refusal says so, along with the machines that are simply
-    /// not macOS. While the capable Mac is only being emptied the lane waits
-    /// for it; under an operator's drain it is refused with the whole account.
+    /// update. While the capable Mac is only being emptied the lane waits for
+    /// it, and the Mac under the operator credential floor is passed over
+    /// because the capable one is coming back. Under an operator's drain the
+    /// capable Mac is not coming back on its own, so the floored Mac takes the
+    /// lane with the waiver on its record (cairn/6341); before that Mac has
+    /// reported its probe at all, the refusal says it is waiting on one.
     #[test]
     fn a_macos_refusal_names_the_excluded_mac_and_the_capability_it_lacks() {
         let context = cairn_common::executor_protocol::NestedSandboxProbeContext {
@@ -35734,21 +36031,35 @@ mod tests {
             "{:?}",
             draft.rejected
         );
+        assert!(
+            draft
+                .rejected
+                .iter()
+                .any(|rejection| rejection.executor_name == "local"
+                    && rejection.reason
+                        == PlacementRejectionReason::NestedSandboxCapableElsewhere {
+                            capable: vec!["bgsrv-mac".into()],
+                        }),
+            "{:?}",
+            draft.rejected
+        );
 
         let mac = connections.get_mut("bgsrv-mac").unwrap();
         runtime_update_hold_fixture(mac, false);
         mac.drained = true;
-        let refusal = place(&connections, &request)
-            .expect_err("no macOS machine can take a nested-Seatbelt check lane now");
-        assert!(refusal.contains("bgsrv-mac is drained"), "{refusal}");
-        assert!(refusal.contains("bgsrv-mac: drained"), "{refusal}");
+        let draft = place(&connections, &request)
+            .expect("with the capable Mac drained, the floored Mac takes the lane");
+        let (selected, selection) = draft.selected.expect("placed on the fallback");
+        assert_eq!(selected.executor_id, COLOCATED_EXECUTOR_ID);
         assert!(
-            refusal.contains(
-                "local: check lanes need a nested Seatbelt write and this machine cannot apply one (outer profile inherited: a confined process cannot apply a second profile; operator credential floor)"
-            ),
-            "{refusal}"
+            selection
+                .nested_sandbox_waived
+                .as_ref()
+                .is_some_and(|waiver| waiver
+                    .detail
+                    .contains("a confined process cannot apply a second profile")),
+            "{selection:?}"
         );
-        assert!(refusal.contains("3 other machines: not macos"), "{refusal}");
 
         // Just attached, before its first sandbox probe has reported: a wait
         // with an age, not evidence that the capability is absent.

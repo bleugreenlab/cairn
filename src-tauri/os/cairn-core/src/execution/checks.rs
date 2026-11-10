@@ -10526,7 +10526,24 @@ fn fresh_observation_write(
         failure_signature: None,
         placement_facts: None,
         substrate_shape: None,
+        nested_sandbox_lane: nested_sandbox_lane(provenance),
     }
+}
+
+/// The nested-Seatbelt state of the lane a macOS run executed in, from the
+/// evidence its executor attested for that run. A lane that requires the
+/// capability lands on a Mac without it only when placement waived the
+/// requirement (`NestedSandboxWaiver`), so this is how the row itself says it
+/// ran without it (cairn/4062 requirement 4). Elsewhere, and on evidence that
+/// names no measured context, nothing.
+fn nested_sandbox_lane(
+    provenance: Option<&cairn_common::executor_protocol::CellExecutionMeta>,
+) -> Option<String> {
+    let meta = provenance?;
+    meta.verdict_platform
+        .as_deref()
+        .filter(|platform| platform.eq_ignore_ascii_case("macos"))?;
+    meta.sandbox.as_ref()?.check_lane_provenance()
 }
 
 /// The verdict environment a fresh observation is stored under: the declared
@@ -21346,6 +21363,79 @@ cairn-common = { path = "../cairn-common" }
         }
     }
 
+    /// cairn/6341. A macOS row records the nested-Seatbelt state its executor
+    /// attested for the run, so a row from a lane under the credential floor
+    /// says it ran without the capability. A Linux row, and evidence that
+    /// names no measured context, record nothing.
+    #[test]
+    fn a_macos_row_records_the_lanes_attested_nested_seatbelt_state() {
+        use cairn_common::executor_protocol::{
+            NestedSandboxProbeContext, SandboxCapabilityEvidence, SandboxLauncherClass,
+        };
+        let floored = SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: false,
+            nested_sandbox_write_detail:
+                "nested Seatbelt in-bounds temp write refused (exit Some(71))".into(),
+            nested_sandbox_write_context: Some(NestedSandboxProbeContext {
+                launcher: SandboxLauncherClass::Unconfined,
+                credential_floor_sha256: Some("ab".repeat(32)),
+                outer_profile_sha256: Some("cd".repeat(32)),
+                fingerprint: Some("ef".repeat(32)),
+                measured_at_unix_ms: 1,
+            }),
+            violation_recovery: None,
+        };
+        let meta = |platform: &str, sandbox: Option<SandboxCapabilityEvidence>| {
+            cairn_common::executor_protocol::CellExecutionMeta {
+                warmth: None,
+                load_context: None,
+                executor_id: "local".to_string(),
+                executor_device_id: "device".to_string(),
+                executor_connection_generation: 1,
+                cell_id: "slot".to_string(),
+                cell_epoch: 1,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                duration_ms: None,
+                peak_rss_bytes: None,
+                peak_physical_footprint_bytes: None,
+                peak_process: None,
+                cpu: None,
+                allocation: None,
+                disk_delta_bytes: None,
+                measurement_quality: None,
+                environment_fingerprint: "env".to_string(),
+                verdict_platform: Some(platform.to_string()),
+                verdict_arch: Some("aarch64".to_string()),
+                verdict_environment_hash: None,
+                sandbox,
+                toolchain_fingerprint: None,
+                containment: None,
+                stop: None,
+                cell_origin: None,
+            }
+        };
+        assert_eq!(
+            nested_sandbox_lane(Some(&meta("macos", Some(floored.clone())))).as_deref(),
+            Some(
+                "unavailable (under the operator credential floor abababababab; launcher unconfined): nested Seatbelt in-bounds temp write refused (exit Some(71))"
+            )
+        );
+        assert_eq!(
+            nested_sandbox_lane(Some(&meta("linux", Some(floored.clone())))),
+            None
+        );
+        let mut contextless = floored;
+        contextless.nested_sandbox_write_context = None;
+        assert_eq!(
+            nested_sandbox_lane(Some(&meta("macos", Some(contextless)))),
+            None
+        );
+        assert_eq!(nested_sandbox_lane(Some(&meta("macos", None))), None);
+        assert_eq!(nested_sandbox_lane(None), None);
+    }
+
     #[tokio::test]
     async fn remote_executor_without_environment_identity_is_not_reusable() {
         let db = cache_db().await;
@@ -22053,6 +22143,7 @@ cairn-common = { path = "../cairn-common" }
             id: format!("obs-{check_name}"),
             public_handle: format!("handle-{check_name}"),
             infra_reset_scopes: Vec::new(),
+            nested_sandbox_lane: None,
             failure_signature: None,
             placement_facts: None,
             substrate_shape: None,

@@ -613,6 +613,11 @@ async fn wait_for_terminal_exit(db: &LocalDb, slug: &str) -> Option<i64> {
 /// means here, stated as something checked rather than something asserted.
 #[tokio::test(flavor = "current_thread")]
 async fn a_terminal_that_echoes_a_registered_credential_records_it_redacted() {
+    if cairn_sandbox::skip_if_confined(
+        "a_terminal_that_echoes_a_registered_credential_records_it_redacted",
+    ) {
+        return;
+    }
     use cairn_core::security::{registry, SecretCategory, SecretId, SecretMaterial};
 
     const CREDENTIAL: &str = "sk-live-terminal-Qa9Zm2Xp7Lr4";
@@ -683,6 +688,10 @@ async fn terminal_output_tail(db: &LocalDb, slug: &str) -> Option<String> {
 /// old semantics, which is exactly the reported symptom.
 #[tokio::test(flavor = "current_thread")]
 async fn agent_command_terminal_exits_with_the_commands_own_status() {
+    if cairn_sandbox::skip_if_confined("agent_command_terminal_exits_with_the_commands_own_status")
+    {
+        return;
+    }
     let (t, db, orch) = real_pty_orchestrator_fixture().await;
     let repo_path = t.path().join("repo");
     seed_node(&db).await;
@@ -926,6 +935,11 @@ async fn project_terminal_wake_requires_agent_caller_before_spawning() {
 /// an operator kill still ends it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_recovery_kill_keeps_the_jobs_terminal_and_an_operator_kill_ends_it() {
+    if cairn_sandbox::skip_if_confined(
+        "a_recovery_kill_keeps_the_jobs_terminal_and_an_operator_kill_ends_it",
+    ) {
+        return;
+    }
     use cairn_core::internal::orchestrator::lifecycle;
 
     let (t, db, orch) = real_pty_orchestrator_fixture().await;

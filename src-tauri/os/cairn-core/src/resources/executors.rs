@@ -3234,6 +3234,9 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
             if let Some(waiver) = &selection.process_fit_waived {
                 out.push_str(&format!("  - Single-process fit: {}\n", waiver.describe()));
             }
+            if let Some(waiver) = &selection.nested_sandbox_waived {
+                out.push_str(&format!("  - Nested Seatbelt: {}\n", waiver.describe()));
+            }
             out.push_str(&format!(
                 "  - Repository sync: {}\n",
                 match selection.sync_cost {
@@ -11122,6 +11125,7 @@ mod tests {
                 prediction: None,
                 memory_ceiling: None,
                 process_fit_waived: None,
+                nested_sandbox_waived: None,
                 process_demand: None,
                 executor_name: executor_name.into(),
                 executor_id: "executor-7b21ce".into(),

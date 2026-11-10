@@ -1,0 +1,15 @@
+-- lineage: shared
+-- cairn/6341: the nested-Seatbelt state of the check lane that produced each
+-- macOS observation, as the executor attested it for the run: available or
+-- unavailable, the credential floor and launcher it was measured under, and
+-- the probe's own detail (`SandboxCapabilityEvidence::check_lane_provenance`).
+--
+-- A lane that requires the capability can now land on a Mac whose lanes the
+-- operator credential floor refuses it, when no capable machine could take it;
+-- its tests that need the capability skip as `nested-sandbox-exec`. This
+-- column is what lets the row itself say it ran without the capability, rather
+-- than only the placement record. That fallback is retired by cairn/6339.
+--
+-- NULL on rows recorded before it, on non-macOS rows, and when the executor
+-- attested no measured context. Nothing filters on it, so no index is needed.
+ALTER TABLE check_result_observations ADD COLUMN nested_sandbox_lane TEXT;

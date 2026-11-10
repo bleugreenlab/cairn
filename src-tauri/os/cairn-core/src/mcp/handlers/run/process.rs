@@ -2221,6 +2221,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_command_item_executes_exactly_as_written() {
+        // Spawns under the product's own Seatbelt profile, which macOS refuses
+        // inside a process already confined (exit 71 at `sandbox_apply`).
+        if cairn_sandbox::skip_if_confined("a_command_item_executes_exactly_as_written") {
+            return;
+        }
         let orch = real_spawn_orchestrator().await;
         for (command, expected) in [
             ("bash -c 'echo a' && echo 'b   c'", "a\nb   c"),

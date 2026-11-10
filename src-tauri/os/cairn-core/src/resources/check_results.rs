@@ -712,6 +712,9 @@ fn render_observation_page(
     if let Some(build_jobs) = observation.build_jobs {
         body.push(format!("- Build jobs: {}", build_jobs.describe()));
     }
+    if let Some(lane) = observation.nested_sandbox_lane.as_deref() {
+        body.push(nested_sandbox_lane_line(lane));
+    }
     if let Some(generation) = observation.executor_connection_generation {
         body.push(format!("- Executor generation: {generation}"));
     }
@@ -1064,6 +1067,20 @@ fn render_miss(
     format!(
         "# Check results: {suite}\n\n- Project: {project}\n- Requested revision: {revision}\n- Resolved commit: {commit}\n- Environment fingerprint: {environment}\n- Result schema: {RESULT_SCHEMA_VERSION}\n\n## Miss\n\nNo authoritative observation is recorded for this exact commit, suite, environment, and schema. Run the suite fresh; do not substitute a result from another commit or environment."
     )
+}
+
+/// The lane's nested-Seatbelt state as its executor attested it. A lane
+/// without the capability ran its tests that need it as skips, never passes:
+/// a check that requires it is placed on such a lane only when no capable
+/// machine could take it, which is the fallback cairn/6339 retires.
+fn nested_sandbox_lane_line(lane: &str) -> String {
+    if lane.starts_with("unavailable") {
+        format!(
+            "- Nested Seatbelt (check lane): {lane}. Tests that need it were recorded skipped as nested-sandbox-exec, never passed; a check requiring it runs here only when placement waived the requirement because no capable machine could take it (cairn/6341, retired by cairn/6339)"
+        )
+    } else {
+        format!("- Nested Seatbelt (check lane): {lane}")
+    }
 }
 
 /// `- Cell: preparedWarmSlot · origin reused (12 files / 3 crates from the
@@ -1615,6 +1632,7 @@ mod tests {
             execution_warmth: None,
             cell_origin: None,
             build_jobs: None,
+            nested_sandbox_lane: None,
             persisted_counts: crate::execution::cache::ObservationTestCounts {
                 passed: 2,
                 failed: 1,
@@ -2101,6 +2119,29 @@ mod tests {
             "one pass needs no breakdown: {body}"
         );
         assert!(!body.contains("- Build jobs:"), "{body}");
+        assert!(!body.contains("- Nested Seatbelt"), "{body}");
+        observation.nested_sandbox_lane = Some(
+            "unavailable (under the operator credential floor abababababab; launcher unconfined): refused (exit Some(71))"
+                .into(),
+        );
+        let body = render(&observation);
+        assert!(
+            body.contains(
+                "- Nested Seatbelt (check lane): unavailable (under the operator credential floor abababababab; launcher unconfined): refused (exit Some(71)). Tests that need it were recorded skipped as nested-sandbox-exec, never passed;"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("retired by cairn/6339"), "{body}");
+        observation.nested_sandbox_lane =
+            Some("available (under no credential floor; launcher unconfined): ok".into());
+        let body = render(&observation);
+        assert!(
+            body.contains(
+                "- Nested Seatbelt (check lane): available (under no credential floor; launcher unconfined): ok\n"
+            ),
+            "{body}"
+        );
+        observation.nested_sandbox_lane = None;
         const GIB: u64 = 1 << 30;
         observation.build_jobs = Some(cairn_common::executor_protocol::BuildJobs::new(
             8,

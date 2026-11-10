@@ -1530,6 +1530,12 @@ impl LocalDb {
     /// whatever else reads the database meanwhile, such as an orchestrator's
     /// background tasks, so a pin on one path's cost measures it here. Reads
     /// on another task, even one `body` spawns, are not counted.
+    ///
+    /// On a handle nothing else reads, such as a bare `migrated_test_db`, the
+    /// handle-wide counters are the stronger pin: they also see a read the
+    /// path moves onto a spawned task or [`crate::storage::run_db_blocking`] thread, which this
+    /// scope would silently drop. Measure here only when something else
+    /// shares the handle.
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn own_reads<T>(&self, body: impl Future<Output = T>) -> (T, OwnReads) {
         let tally = Arc::new(OwnReadTally {

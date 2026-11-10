@@ -67,6 +67,22 @@ pub fn current_process_is_confined() -> bool {
     false
 }
 
+/// For a test that spawns through the product's own confinement (the operator
+/// credential floor, or a fence): whether to skip because this process already
+/// runs inside a Seatbelt profile, where macOS refuses the spawn's profile at
+/// `sandbox_apply` with exit 71. Measured from kernel state, never from the
+/// `CAIRN_SANDBOXED` marker, so it is true only on macOS. A skip is recorded as
+/// the declared `nested-sandbox-exec`, never a pass; pass the test's own name as
+/// a string literal so the skip census can match its manifest stanza.
+pub fn skip_if_confined(test: &str) -> bool {
+    if !current_process_is_confined() {
+        return false;
+    }
+    eprintln!("skipping {test}: this process runs inside a Seatbelt profile, so the product's own confinement of its spawns cannot apply");
+    cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
+    true
+}
+
 /// Evidence that a process can launch a nested macOS Seatbelt profile and
 /// perform a write which that profile explicitly permits.
 #[derive(Debug, Clone, PartialEq, Eq)]
