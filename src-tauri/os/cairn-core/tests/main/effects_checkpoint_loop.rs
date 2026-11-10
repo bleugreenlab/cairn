@@ -160,7 +160,13 @@ async fn advance_execution(h: &CheckpointLoop) {
 }
 
 async fn assert_job_status(h: &CheckpointLoop, job_id: &str, status: &str) {
-    assert_eq!(job_status(&h.c.db, job_id).await, status);
+    assert_eq!(
+        job_status(&h.c.db, job_id).await,
+        status,
+        "job {job_id}; branch head {}; checkpoint runs: {}",
+        h.worktree.head(),
+        recorded_runs(&h.c.db, CHECKPOINT_JOB).await
+    );
 }
 
 async fn assert_checkpoint(h: &CheckpointLoop, status: &str, run_count_expected: i64) {
@@ -446,6 +452,44 @@ async fn run_count(db: &LocalDb, job_id: &str) -> i64 {
                 )
                 .await?;
             rows.next().await?.unwrap().i64(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// Every recorded run of `job_id`, oldest first, as one line each: what the
+/// checkpoint executed against and what it said, so a status assertion that
+/// fails names the run that decided it.
+async fn recorded_runs(db: &LocalDb, job_id: &str) -> String {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT attempt, commit_sha, exit_code, passed, stdout_tail, stderr_tail
+                     FROM checkpoint_runs WHERE job_id = ?1 ORDER BY ran_at, attempt",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let mut runs = Vec::new();
+            while let Some(row) = rows.next().await? {
+                runs.push(format!(
+                    "\n  attempt {} at {:?}: exit {} passed {} stdout {:?} stderr {:?}",
+                    row.i64(0)?,
+                    row.opt_text(1)?,
+                    row.i64(2)?,
+                    row.i64(3)? != 0,
+                    row.opt_text(4)?,
+                    row.opt_text(5)?,
+                ));
+            }
+            Ok(if runs.is_empty() {
+                "none".to_string()
+            } else {
+                runs.concat()
+            })
         })
     })
     .await

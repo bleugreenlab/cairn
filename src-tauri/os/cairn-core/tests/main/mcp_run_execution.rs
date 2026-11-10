@@ -1098,8 +1098,12 @@ async fn a_full_machine_makes_a_batch_slower_not_broken() {
         !resolution.contains("could not execute"),
         "the resume carried a placement refusal instead of the result: {resolution}"
     );
+    // The occupants are scaffolding, so they are abandoned rather than awaited.
+    // The second asks for the machine's whole memory budget, and the batch's
+    // execution home keeps a residency reservation here for as long as its job
+    // lives, so it is declined for capacity on every offer and never runs.
     for occupant in occupants {
-        let _ = occupant.await;
+        occupant.abort();
     }
     kill_all_sessions(&orch);
 }

@@ -20,6 +20,7 @@ use cairn_common::executor_protocol::{
     CpuPressure, DeclineReason, ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity,
     ExecutorMessage, MachineMemory, Measurement, MeasurementGap, ObjectChannelCredential,
     OfferSummary, RelayAuthorization, RelayIdentity, ResidencyRuntimeConfig, ResidentRelayId,
+    EXECUTOR_HEARTBEAT_INTERVAL_MS,
 };
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::dispatch::{dispatch_tool, DispatchOutput};
@@ -964,6 +965,52 @@ fn attach_executor(
         .attach_advertised_executor(hello, tx, colocated, None, None)
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
+    // Beat as a real machine does, on the production interval and whatever it
+    // is doing. Placement judges a link stale once nothing has crossed it for
+    // `EXECUTOR_PROGRESS_FRESHNESS_MS`, and refuses untargeted work outright
+    // when its only machine is stale. Without the beat, a test whose setup
+    // between attach and its first placement outlasts that bound on a loaded
+    // host is told no colocated executor exists.
+    //
+    // A beat replaces the runner's whole health record for the machine, so it
+    // must carry what a refresh pass just measured, as a real executor's beat
+    // does; a beat carrying an unrefreshed report erases the busy state a
+    // full machine posted. A non-colocated machine is refreshed by its own
+    // liveness loop below. The first beat is one interval after attach, as
+    // the hello already carries the attach-time state.
+    {
+        let core_pool = core_pool.clone();
+        let pool = executor_pool.clone();
+        let projects_served = projects_served.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_millis(EXECUTOR_HEARTBEAT_INTERVAL_MS);
+            let mut beat =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                beat.tick().await;
+                if colocated {
+                    pool.refresh_liveness().await;
+                }
+                pool.record_protocol_heartbeat();
+                core_pool.handle_executor_message(
+                    executor_id,
+                    attached_generation,
+                    ExecutorMessage::Heartbeat {
+                        advertisement: test_executor_advertisement(
+                            executor_id,
+                            colocated,
+                            &projects_served,
+                            Some(&pool),
+                        ),
+                        health: pool.liveness().health.clone(),
+                        last_update: None,
+                        machine: None,
+                    },
+                );
+            }
+        });
+    }
     // Every machine reaches the node scratch routes over an object channel, a
     // colocated one included, as in production. A machine given no object
     // server gets one that serves only those routes.
