@@ -1627,10 +1627,10 @@ async fn settled_statuses(
     cadence: WaveCadence,
     clock: &mut PhaseClock,
 ) -> Option<Vec<NodeCheckStatus>> {
-    let project_root = std::path::PathBuf::from(&coords.repository_path);
     // Inspection never initializes or imports a store. Symbolic resolution
     // refuses a split operation log instead of settling it through the CLI.
-    let logical_repository = crate::jj::project_store_dir(&orch.config_dir, &project_root);
+    let logical_repository =
+        crate::jj::project_store_dir(&orch.config_dir, Path::new(&coords.repository_path));
     let logical_head = cairn_vcs::resolve_coordinate(&logical_repository, &coords.branch)
         .await
         .ok()?;
@@ -1647,7 +1647,122 @@ async fn settled_statuses(
             .ok()
             .flatten();
     clock.lap("live_range");
-    let live_base = live_range.as_ref().map(|range| range.base.clone());
+    statuses_at_range(
+        orch,
+        job_id,
+        db,
+        coords,
+        logical_head,
+        live_range.map(|range| range.base),
+        cadence,
+        None,
+        clock,
+    )
+    .await
+}
+
+/// The lanes as they stood at `head`, a head the node's branch may already
+/// have left.
+///
+/// A pull request's resolution is recorded after its merge has landed, and a
+/// landing can move the node's branch onto the commit it landed, which the
+/// target already contains. Projecting that branch measures an empty change
+/// against a tree nobody judged: every impact-gated lane reads as not
+/// applicable, and every verdict keyed to the judged tree is missed. This
+/// projects the judged head itself, measured from the base its review wave
+/// planned against or, with no wave at that head, from its fork point on the
+/// target. A head the target already contains has no change left to measure,
+/// and then no lane is declared not applicable.
+pub(crate) async fn node_check_statuses_at_head(
+    orch: &Orchestrator,
+    job_id: &str,
+    head: &str,
+) -> Option<Vec<NodeCheckStatus>> {
+    let mut clock = PhaseClock::start();
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .ok()?;
+    let coords = resolve_job_coords(&db, job_id).await.ok().flatten()?;
+    let cadence = WaveCadence::of(orch, job_id);
+    let wave = orch
+        .turn_end_check_runtime_status(job_id)
+        .filter(|wave| wave.plan.head == head);
+    let planned_base = match &wave {
+        Some(wave) => Some(wave.plan.base.clone()),
+        None => recorded_wave_plan_at(&db, job_id, head)
+            .await
+            .map(|plan| plan.base),
+    };
+    let base = match planned_base {
+        Some(base) => Some(base),
+        None => crate::diff::job_range_at_head(
+            &db,
+            job_id,
+            &orch.jj_binary_path,
+            &orch.config_dir,
+            head,
+        )
+        .await
+        .map_err(|error| log::debug!("node {job_id}: no fork point for {head}: {error}"))
+        .ok()
+        .flatten()
+        .map(|range| range.base)
+        .filter(|base| base != head),
+    };
+    clock.lap("judged_range");
+    let statuses = statuses_at_range(
+        orch,
+        job_id,
+        &db,
+        &coords,
+        head.to_string(),
+        base,
+        cadence,
+        wave.as_ref(),
+        &mut clock,
+    )
+    .await?;
+    clock.report(job_id, "at-head");
+    Some(statuses)
+}
+
+/// The newest plan a review wave recorded for `head`.
+async fn recorded_wave_plan_at(db: &LocalDb, job_id: &str, head: &str) -> Option<WavePlan> {
+    let plan_json = db
+        .query_opt(
+            "SELECT plan_json FROM turn_end_check_attempts
+              WHERE job_id = ?1 AND sealed_commit = ?2 AND plan_json IS NOT NULL
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+            (job_id.to_string(), head.to_string()),
+            |row| row.text(0),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    serde_json::from_str(&plan_json)
+        .map_err(|error| log::warn!("node {job_id}: recorded wave plan is unreadable ({error})"))
+        .ok()
+}
+
+/// The settled projection of one explicit range: `head`, measured from
+/// `base`. A `None` base decides no lane's applicability. `wave` is the review
+/// wave in flight at `head`, whose requests and board say which lanes it has
+/// started.
+#[allow(clippy::too_many_arguments)]
+async fn statuses_at_range(
+    orch: &Orchestrator,
+    job_id: &str,
+    db: &Arc<LocalDb>,
+    coords: &JobCoords,
+    logical_head: String,
+    base: Option<String>,
+    cadence: WaveCadence,
+    wave: Option<&crate::orchestrator::TurnEndCheckRuntimeStatus>,
+    clock: &mut PhaseClock,
+) -> Option<Vec<NodeCheckStatus>> {
+    let project_root = std::path::PathBuf::from(&coords.repository_path);
+    let logical_repository = crate::jj::project_store_dir(&orch.config_dir, &project_root);
+    let live_base = base.clone();
     // The status a node renders must be the suite its own cadences plan, so the
     // contract comes from the node's logical head — the same commit the cadences
     // read it from. Reading the project checkout here would show a node checks
@@ -1673,8 +1788,8 @@ async fn settled_statuses(
     let (rows_by_name, applicable_names, verdicts_elapsed) =
         tokio::task::spawn_blocking(move || {
             let mut commits = vec![logical_head.as_str()];
-            if let Some(range) = &live_range {
-                commits.push(range.base.as_str());
+            if let Some(base) = &base {
+                commits.push(base.as_str());
             }
             let status_jj = status_jj
                 .pin_immutable_read(&logical_repository, &commits)
@@ -1699,12 +1814,11 @@ async fn settled_statuses(
             let inputs = ResolvedInputs::resolve(checks, &status_contract.extra_inputs, &snapshot);
             let mut verdicts_elapsed = Duration::ZERO;
             let head_tree = logical_tree_hash(&status_jj, &logical_repository, &logical_head).ok();
-            let changed = live_range.as_ref().and_then(|range| {
-                logical_changed_files(&status_jj, &logical_repository, &range.base, &logical_head)
+            let changed = base.as_ref().and_then(|base| {
+                logical_changed_files(&status_jj, &logical_repository, base, &logical_head)
                     .inspect_err(|error| {
                         log::debug!(
-                            "check status: changed files of {}..{logical_head} unreadable: {error}",
-                            range.base
+                            "check status: changed files of {base}..{logical_head} unreadable: {error}"
                         );
                     })
                     .ok()
@@ -1712,12 +1826,12 @@ async fn settled_statuses(
             // A base-relative check is keyed by the change it was measured
             // against, so the projection asks with the same change the runners
             // planned with; without one it can name no such verdict.
-            let base_entries = live_range.as_ref().and_then(|range| {
+            let base_entries = base.as_ref().and_then(|base| {
                 crate::execution::checks::key_base_entries(
                     checks,
                     &status_jj,
                     &logical_repository,
-                    &range.base,
+                    base,
                 )
             });
             let basis = match changed.as_deref() {
@@ -1783,6 +1897,14 @@ async fn settled_statuses(
     };
     clock.lap("base_attribution");
 
+    let recent_request_ids;
+    let request_ids = match wave {
+        Some(wave) => &wave.request_ids,
+        None => {
+            recent_request_ids = orch.recent_turn_end_check_request_ids(job_id);
+            &recent_request_ids
+        }
+    };
     let statuses = assemble_statuses(
         orch,
         job_id,
@@ -1793,9 +1915,9 @@ async fn settled_statuses(
             attributions,
         },
         applicable_names.as_ref(),
-        &orch.recent_turn_end_check_request_ids(job_id),
+        request_ids,
         cadence,
-        None,
+        wave.and_then(|wave| wave.board.as_ref()),
     );
     Some(with_unsupported_lanes(
         statuses,
@@ -5419,7 +5541,7 @@ mod complete_input_projection_tests {
         pub(super) db: Arc<LocalDb>,
         pub(super) checks: HashMap<String, CheckCommand>,
         pub(super) tools: String,
-        name: String,
+        pub(super) name: String,
     }
 
     impl Fixture {
@@ -6374,6 +6496,223 @@ mod moved_wave_projection_tests {
         let rows = current_verdict_rows(f.db.clone(), "project-a", &f.checks, Some(keys.keys()));
         assert_eq!(rows.len(), 1, "the original green remains in history");
         assert!(rows[0].row.passed);
+    }
+
+    /// The order cairn/6681 resolved in. A review wave is submitted at the
+    /// judged head; one lane passes and one is still running; the target
+    /// advances; the merge lands and moves the node's branch onto the commit it
+    /// landed, which the target already contains; only then does the resolution
+    /// record its lanes and, through the issue's cascade, cancel the wave.
+    ///
+    /// Read from the branch, that record measured an empty change against the
+    /// landed tree: every lane without a verdict at that tree, the passed one
+    /// included, read "not applicable". It is read at the judged head instead.
+    #[tokio::test]
+    async fn a_resolution_records_its_lanes_at_the_judged_head_after_the_landing_moved_the_branch()
+    {
+        let Some(bin) = jj_bin() else { return };
+        let check = |command: &str, impact: &str| -> CheckCommand {
+            serde_yaml::from_str(&format!(
+                "command: {command}\nwhen: review\npolicy: advisory\nimpact: [{impact}]\n"
+            ))
+            .unwrap()
+        };
+        let mut f = Fixture::new("lint-a").await;
+        f.orch.jj_binary_path = bin.clone();
+        f.checks = HashMap::from([
+            ("lint-a".to_string(), check("bun run lint-a", "src/**")),
+            ("tests-b".to_string(), check("bun run tests-b", "src/**")),
+            ("docs-c".to_string(), check("bun run docs-c", "docs/**")),
+        ]);
+        let repo = f.root.path().join("repo");
+        for dir in [".cairn", "src", "docs"] {
+            std::fs::create_dir_all(repo.join(dir)).unwrap();
+        }
+        init_project(&repo);
+        let mut config = "checks:\n".to_string();
+        for (name, command, impact) in [
+            ("lint-a", "bun run lint-a", "src/**"),
+            ("tests-b", "bun run tests-b", "src/**"),
+            ("docs-c", "bun run docs-c", "docs/**"),
+        ] {
+            config.push_str(&format!(
+                "  {name}:\n    command: {command}\n    when: review\n    policy: advisory\n    impact: [{impact}]\n"
+            ));
+        }
+        std::fs::write(repo.join(".cairn/config.yaml"), config).unwrap();
+        std::fs::write(repo.join("src/lib.txt"), "one").unwrap();
+        std::fs::write(repo.join("docs/guide.txt"), "guide").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "contract"]);
+        let base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-qb", "review-branch"]);
+        std::fs::write(repo.join("src/lib.txt"), "two").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "the judged change"]);
+        let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        let recipe = serde_json::json!({
+            "recipe": {
+                "id": "r", "name": "Recipe", "description": null, "trigger": "manual",
+                "nodes": [
+                    {"id": "builder", "nodeType": "agent", "name": "Builder", "position": {"x": 0.0, "y": 0.0}},
+                    {"id": "pr", "nodeType": "pr", "name": "PR", "position": {"x": 1.0, "y": 0.0}}
+                ],
+                "edges": [
+                    {"id": "edge-1", "edgeType": "context", "sourceNodeId": "builder", "sourceHandle": "create-pr", "targetNodeId": "pr", "targetHandle": "create-pr"}
+                ]
+            },
+            "agents": {}, "skills": {},
+            "triggerContext": {"issueId": "issue-a", "projectId": "project-a", "triggerType": "manual"},
+            "createdAt": 1
+        })
+        .to_string();
+        f.db.execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='project-a'",
+            (repo.to_string_lossy().into_owned(),),
+        )
+        .await
+        .unwrap();
+        f.db.execute(
+            "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('issue-a','project-a',1,'I','active',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+        f.db.execute(
+            "INSERT INTO executions(id,recipe_id,issue_id,project_id,status,snapshot,started_at,seq)
+               VALUES('exec-a','r','issue-a','project-a','running',?1,1,1)",
+            (recipe,),
+        )
+        .await
+        .unwrap();
+        f.db.execute_script(
+            "INSERT INTO jobs(id,project_id,issue_id,execution_id,recipe_node_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+               VALUES('job-a','project-a','issue-a','exec-a','builder','complete','builder','builder','review-branch','main',1,1);
+             INSERT INTO action_runs(id,execution_id,recipe_node_id,action_config_id,issue_id,project_id,status,created_at,parent_job_id)
+               VALUES('pr-run','exec-a','pr','builtin:pr','issue-a','project-a','blocked',2,'job-a');",
+        )
+        .await
+        .unwrap();
+        f.db.execute(
+            "INSERT INTO merge_requests(id,job_id,project_id,issue_id,title,body,source_branch,target_branch,status,opened_at,updated_at,head_sha)
+               VALUES('mr-a','job-a','project-a','issue-a','T','B','review-branch','main','open',1,1,?1)",
+            (head.clone(),),
+        )
+        .await
+        .unwrap();
+
+        f.tools = cairn_checkenv::expected_toolchain_identity_in(&repo);
+        let jj = crate::jj::environment(&bin, &f.orch.config_dir);
+        let store = crate::jj::coordinate_repository(&jj, &f.orch.config_dir, &repo).unwrap();
+        let judged = captured_keys(&f, &jj, &store, &head, &base);
+        let plan = Arc::new(WavePlan {
+            capture: None,
+            head: head.clone(),
+            base: base.clone(),
+            tree_hash: judged.tree_hash.clone(),
+            checks: f.checks.clone(),
+            applicable_names: HashSet::from(["lint-a".into(), "tests-b".into()]),
+            input_hashes: judged.input_hashes.clone(),
+            expected_toolchain: judged.expected_toolchain.clone(),
+            unsupported: BTreeMap::new(),
+        });
+        let slot = f.orch.try_begin_turn_end_checks("job-a", "wave-1").unwrap();
+        f.db.execute(
+            "INSERT INTO turn_end_check_attempts(id,job_id,state,sealed_commit,plan_json,created_at,updated_at)
+               VALUES('wave-1','job-a','submitted',?1,?2,1,1)",
+            (head.clone(), serde_json::to_string(plan.as_ref()).unwrap()),
+        )
+        .await
+        .unwrap();
+        f.db.execute(
+            "UPDATE jobs SET turn_end_check_attempt_id='wave-1' WHERE id='job-a'",
+            (),
+        )
+        .await
+        .unwrap();
+        slot.cancel().set_runtime_status("wave-1", plan.clone());
+        // One lane of the wave passes; the other is still running.
+        f.name = "lint-a".into();
+        f.observe(&judged, true, "lint-a-pass");
+
+        // The target advances under the wave, and the merge lands: the branch
+        // is replayed onto it and both bookmarks point at the landed commit.
+        git(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("src/other.txt"), "main advanced").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &["commit", "-qm", "main advanced while the wave ran"],
+        );
+        git(&repo, &["checkout", "-q", "review-branch"]);
+        git(&repo, &["rebase", "-q", "main"]);
+        let landed = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["update-ref", "refs/heads/main", &landed]);
+        crate::jj::import_git(&jj, &store).unwrap();
+        assert_ne!(landed, head);
+        assert_eq!(
+            cairn_vcs::resolve_coordinate(&store, "review-branch")
+                .await
+                .unwrap(),
+            landed,
+            "the landing moved the node's branch"
+        );
+        f.orch.invalidate_node_check_status("job-a", "test-landing");
+
+        crate::pr_data::actions::resolve_pr_node_landed(
+            &f.orch,
+            "job-a",
+            Some(crate::pr_data::actions::PrResolutionAttribution::operator_ui()),
+            crate::pr_data::actions::Landed {
+                commit: Some(&landed),
+                source: Some(&landed),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            slot.is_cancelled(),
+            "the resolution's cascade cancels the wave"
+        );
+
+        let attribution = crate::pr_data::actions::latest_resolution_attribution(&f.db, "mr-a")
+            .await
+            .expect("the resolution journals its lanes");
+        let snapshot = serde_json::to_value(&attribution.lane_snapshot).unwrap();
+        assert_eq!(snapshot["head"], head.as_str());
+        let lane = |name: &str| {
+            snapshot["systematicChecks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|lane| lane["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is recorded: {snapshot}"))
+                .clone()
+        };
+        let passed = lane("lint-a");
+        assert_eq!(passed["state"], "passed", "{snapshot}");
+        assert_eq!(passed["observation"]["kind"], "cited", "{snapshot}");
+        assert_eq!(passed["observation"]["id"], "lint-a-pass", "{snapshot}");
+        let running = lane("tests-b");
+        assert!(
+            matches!(running["state"].as_str(), Some("pending" | "running")),
+            "{snapshot}"
+        );
+        assert_eq!(running["cancelledBy"], "wave-1", "{snapshot}");
+        assert_eq!(
+            running["observation"]["reason"], "cancelled by this resolution",
+            "{snapshot}"
+        );
+        let out_of_scope = lane("docs-c");
+        assert_eq!(out_of_scope["state"], "notApplicable", "{snapshot}");
+        assert_eq!(
+            out_of_scope["observation"]["reason"], "the check does not apply",
+            "{snapshot}"
+        );
+        assert!(out_of_scope.get("cancelledBy").is_none(), "{snapshot}");
+        drop(slot);
     }
 
     async fn resolved_gate(

@@ -304,6 +304,38 @@ pub async fn live_job_branch_range(
     .map(Some)
 }
 
+/// The range `head` occupies on this job's integration target as the store
+/// holds it now: [`live_job_branch_range`] for a named commit rather than the
+/// job's branch, so it still answers for a head the branch has since left, as
+/// a merge that moved the branch onto the commit it landed leaves it.
+///
+/// `Ok(None)` means the job has no coordinates. A `base` equal to `head` means
+/// the target already contains `head`, so the store no longer says what it
+/// changed.
+pub async fn job_range_at_head(
+    db: &LocalDb,
+    job_id: &str,
+    jj_binary_path: &str,
+    config_dir: &Path,
+    head: &str,
+) -> Result<Option<BranchRange>, String> {
+    let Some(coords) = load_diff_coords(db, job_id)
+        .await
+        .map_err(|error| format!("loading node diff coordinates: {error}"))?
+    else {
+        return Ok(None);
+    };
+    live_branch_range(
+        jj_binary_path,
+        config_dir,
+        Path::new(&coords.repo_path),
+        head,
+        &coords.integration_target,
+    )
+    .await
+    .map(Some)
+}
+
 async fn load_execution_history(
     db: &LocalDb,
     execution_id: &str,

@@ -66,7 +66,8 @@ pub struct JobAtResolution {
 
 /// One check lane as it stood at the resolution. `state` is the lane's
 /// [`NodeCheckState`](crate::execution::checks_status::NodeCheckState) word;
-/// `pending` and `running` mean the lane had no verdict yet.
+/// `pending` and `running` mean the lane had no verdict yet, and
+/// `notApplicable` that the impact gate excluded it from the judged change.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaneAtResolution {
@@ -96,7 +97,15 @@ pub struct LaneAtResolution {
     /// the resolution is rendered ([`hydrate_lane_failures`]), never stored.
     #[serde(skip)]
     pub failure: Option<ObservedFailure>,
+    /// The review wave attempt this resolution cancelled while the lane was
+    /// still waiting on it. Absent on rows journaled before it was recorded,
+    /// which therefore cannot say whether their resolution cancelled a wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by: Option<String>,
 }
+
+/// Why a lane the resolution's own cascade cancelled has no observation.
+const CANCELLED_BY_RESOLUTION: &str = "cancelled by this resolution";
 
 /// A failed verdict as its observation holds it: the failure kind and the
 /// first failing test names, with how many failed in all as the lane counted.
@@ -273,10 +282,14 @@ impl LaneAtResolution {
     }
 
     fn verdict(&self) -> String {
-        let mut state = match self.state.as_str() {
-            "pending" | "running" => format!("{}, no verdict", self.state),
-            "notApplicable" => "not applicable".to_string(),
-            state => state.to_string(),
+        let mut state = match (self.state.as_str(), self.cancelled_by.as_deref()) {
+            ("pending" | "running", Some(attempt)) => format!(
+                "{}, no verdict; {CANCELLED_BY_RESOLUTION} (wave `{attempt}`)",
+                self.state
+            ),
+            ("pending" | "running", None) => format!("{}, no verdict", self.state),
+            ("notApplicable", _) => "not applicable".to_string(),
+            (state, _) => state.to_string(),
         };
         if !self.has_verdict() {
             return state;
@@ -483,6 +496,18 @@ pub fn render_resolution_provenance(
                 waiting.len(),
                 lanes.len(),
                 bounded_list(&waiting)
+            ));
+        }
+        if let Some(attempt) = lanes.iter().find_map(|lane| lane.cancelled_by.as_deref()) {
+            let cancelled = lanes
+                .iter()
+                .filter(|lane| lane.cancelled_by.is_some())
+                .map(|lane| lane.name.clone())
+                .collect::<Vec<_>>();
+            out.push_str(&format!(
+                "This resolution cancelled review wave `{}` while these lanes waited on it: {}.\n",
+                table_cell(attempt),
+                bounded_list(&cancelled)
             ));
         }
         out.push_str("\n| Lane | Verdict | Head | Observation |\n|---|---|---|---|\n");
@@ -749,9 +774,17 @@ async fn lane_snapshot_for_job(
         .ok()
         .flatten()
         .flatten();
-    let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id)
-        .await
-        .unwrap_or_default();
+    // The lanes are read at the head the pull request was judged on, not at
+    // the branch's current position: a landing may already have moved the
+    // branch onto the commit it landed, whose change against the target is
+    // empty and whose tree no lane judged.
+    let statuses = match head.as_deref() {
+        Some(head) => {
+            crate::execution::checks_status::node_check_statuses_at_head(orch, job_id, head).await
+        }
+        None => crate::execution::checks_status::node_check_statuses(orch, job_id).await,
+    }
+    .unwrap_or_default();
     let mut systematic_checks = Vec::with_capacity(statuses.len());
     for status in &statuses {
         let Some(mut lane) = LaneAtResolution::from_status(status) else {
@@ -765,6 +798,42 @@ async fn lane_snapshot_for_job(
         execution: execution_at_resolution(db, job_id).await,
         head,
         systematic_checks,
+    }
+}
+
+/// The review wave in flight for `job_id` at `head`, which resolving the issue
+/// will cancel: its attempt id. A wave still planning has published no head,
+/// and its attempt row names it.
+async fn review_wave_in_flight(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    head: Option<&str>,
+) -> Option<String> {
+    if !orch.turn_end_checks_in_flight(job_id) {
+        return None;
+    }
+    match orch.turn_end_check_runtime_status(job_id) {
+        Some(wave) => (Some(wave.plan.head.as_str()) == head).then_some(wave.attempt_id),
+        None => crate::execution::checks_turn_end::current_turn_end_attempt(db, job_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|attempt| attempt.id),
+    }
+}
+
+/// Name `attempt` on every review lane still waiting on it: the resolution's
+/// cascade cancels the wave, so the lane will never have a verdict at this
+/// head, and saying only that it had none yet would hide why.
+fn record_cancelled_wave(snapshot: &mut LaneSnapshot, attempt: &str) {
+    for lane in &mut snapshot.systematic_checks {
+        if lane.when.as_deref() == Some("review") && !lane.has_verdict() {
+            lane.cancelled_by = Some(attempt.to_string());
+            lane.observation = Some(LaneObservation::Absent {
+                reason: CANCELLED_BY_RESOLUTION.to_string(),
+            });
+        }
     }
 }
 
@@ -990,11 +1059,26 @@ async fn resolve_pr_node_as(
     let merge_context = resolve_merge_mr_context_for_job(&db, owner_id).await?;
     let mr_id = merge_context.mr.mr_id.clone();
     let now = chrono::Utc::now().timestamp();
-    let lane_snapshot =
-        serde_json::to_string(&lane_snapshot_for_job(orch, &db, owner_id, &mr_id).await)
-            .map_err(|e| format!("Failed to record the lane snapshot: {e}"))?;
+    // Both read before the claim and the cascade it licenses, which cancels
+    // the node's review wave: the record is of the lanes as the resolution
+    // found them.
+    let mut lane_snapshot = lane_snapshot_for_job(orch, &db, owner_id, &mr_id).await;
+    let wave_in_flight =
+        review_wave_in_flight(orch, &db, owner_id, lane_snapshot.head.as_deref()).await;
     let performed = matches!(resolver, Resolver::Performed(_));
     let claimed = claim_merge_request_resolution(&db, &mr_id, resolution, landed, now).await?;
+    let issue_to_resolve = match merge_context.issue_id.as_deref() {
+        Some(issue_id) if claimed && performed => Some(issue_id),
+        Some(issue_id) if claimed => observation_resolves_issue(&db, issue_id, &mr_id)
+            .await?
+            .then_some(issue_id),
+        _ => None,
+    };
+    if let (Some(_), Some(attempt)) = (issue_to_resolve, wave_in_flight.as_deref()) {
+        record_cancelled_wave(&mut lane_snapshot, attempt);
+    }
+    let lane_snapshot = serde_json::to_string(&lane_snapshot)
+        .map_err(|e| format!("Failed to record the lane snapshot: {e}"))?;
     let attribution = match resolver {
         Resolver::Performed(attribution) => Some(attribution.unwrap_or_else(|| {
             log::error!(
@@ -1040,13 +1124,6 @@ async fn resolve_pr_node_as(
         return Ok(false);
     }
 
-    let issue_to_resolve = match merge_context.issue_id.as_deref() {
-        Some(issue_id) if performed => Some(issue_id),
-        Some(issue_id) => observation_resolves_issue(&db, issue_id, &mr_id)
-            .await?
-            .then_some(issue_id),
-        None => None,
-    };
     // Resolving the PR resolves its issue, and resolving an issue runs the
     // terminal cascade: the issue's live work is stopped, its queued work is
     // cancelled, its sessions close, and any in-flight turn-end review suite is
@@ -2278,6 +2355,96 @@ mod tests {
             created_at: 1_700_000_000,
             lane_snapshot,
         }
+    }
+
+    /// A review lane still waiting on the wave this resolution cancels is named
+    /// as cancelled by it, with the wave's attempt. A lane no wave of this
+    /// resolution was running still reads as having had no verdict yet, and
+    /// neither is ever "not applicable", which only the impact gate decides.
+    #[test]
+    fn a_lane_the_resolution_cancels_is_named_as_cancelled_not_inapplicable() {
+        use crate::execution::checks_status::{test_status, NodeCheckState};
+        let mut snapshot = LaneSnapshot {
+            execution: None,
+            head: Some("feedfacecafe0123".to_string()),
+            systematic_checks: [
+                test_status("rust-lint", "advisory", "review", NodeCheckState::Passed),
+                test_status("rust-tests", "advisory", "review", NodeCheckState::Running),
+                test_status(
+                    "dead-code",
+                    "advisory",
+                    "review",
+                    NodeCheckState::NotApplicable,
+                ),
+                test_status("api", "gate", "write", NodeCheckState::Pending),
+            ]
+            .iter()
+            .filter_map(LaneAtResolution::from_status)
+            .collect(),
+        };
+        record_cancelled_wave(&mut snapshot, "wave-1");
+
+        let stored = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(LaneSnapshot::parse(&stored), snapshot);
+        let cancelled = snapshot
+            .systematic_checks
+            .iter()
+            .filter(|lane| lane.cancelled_by.is_some())
+            .map(|lane| lane.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancelled,
+            ["rust-tests"],
+            "only a review lane waits on the wave"
+        );
+
+        let rendered =
+            render_resolution_provenance(&attribution_with(snapshot), &ProvenanceLinks::default());
+        assert!(
+            rendered.contains(
+                "| rust-tests | running, no verdict; cancelled by this resolution (wave `wave-1`) |"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| none: cancelled by this resolution |"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "This resolution cancelled review wave `wave-1` while these lanes waited on it: rust-tests."
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("| api | pending, no verdict |"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("| rust-lint | passed |"), "{rendered}");
+        assert!(
+            rendered.contains("| dead-code | not applicable |"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("2 of 4 check lanes had no verdict at resolution: rust-tests, api."),
+            "{rendered}"
+        );
+    }
+
+    /// A row journaled before the cancellation was recorded parses with none,
+    /// and renders exactly as it did: it claims nothing it did not record.
+    #[test]
+    fn a_row_without_a_recorded_cancellation_renders_as_it_was_journaled() {
+        let stored = r#"{"head":"feedfacecafe0123","systematicChecks":[{"name":"rust-tests","state":"notApplicable","when":"review","observation":{"kind":"absent","reason":"the check does not apply"}}]}"#;
+        let snapshot = LaneSnapshot::parse(stored);
+        assert_eq!(snapshot.systematic_checks[0].cancelled_by, None);
+        let rendered =
+            render_resolution_provenance(&attribution_with(snapshot), &ProvenanceLinks::default());
+        assert!(
+            rendered.contains("| rust-tests | not applicable |"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("cancelled"), "{rendered}");
     }
 
     /// The stored record keeps each lane's state, policy, cadence, counts and
