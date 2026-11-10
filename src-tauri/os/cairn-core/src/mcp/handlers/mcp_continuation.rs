@@ -587,7 +587,8 @@ pub(super) const DUE_SQL: &str = "SELECT id FROM agent_waits WHERE state='pendin
 
 /// The selection [`DUE_SQL`] replaced, read from `condition_json` on every
 /// row. Kept so tests can prove the two agree everywhere but the intended
-/// differences (see `due_selection_matches_the_reference_but_for_intended_differences`).
+/// differences (`due_selection_matches_the_reference_query_in_order` and
+/// `due_selection_differs_from_the_reference_only_where_intended`).
 #[cfg(test)]
 pub(super) const REFERENCE_DUE_SQL: &str = "SELECT id FROM agent_waits WHERE state='pending' AND created_at<=?1-?2 AND json_extract(condition_json,'$.kind')='mcp_continuation' AND (deadline_ms<=?1 OR json_type(condition_json,'$.state.pending_operation') NOT IN ('null') OR (json_type(condition_json,'$.state.pending_input_requests') NOT IN ('null') AND json_type(condition_json,'$.state.pending_prompt_id') IN ('null')) OR EXISTS (SELECT 1 FROM prompts WHERE prompts.mcp_wait_id=agent_waits.id AND prompts.response IS NOT NULL) OR (json_type(condition_json,'$.state.task') NOT IN ('null') AND COALESCE(json_extract(condition_json,'$.state.next_poll_at_ms'),0)<=?1)) ORDER BY COALESCE(json_extract(condition_json,'$.state.next_poll_at_ms'),deadline_ms,created_at),created_at LIMIT ?3";
 
@@ -768,9 +769,10 @@ fn validate(state: &McpContinuationState) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::durable_suspend::{Condition, ConditionColumns};
+    use super::super::durable_suspend::{store_columns_conn, Condition, ConditionColumns};
     use super::*;
-    use crate::storage::LocalDb;
+    use crate::storage::{DbError, DbResult, LocalDb};
+    use cairn_db::storage::TrackedConnection;
 
     /// The row JSON the writer stores for `state`.
     fn condition_json(state: &McpContinuationState) -> String {
@@ -1081,4 +1083,506 @@ mod tests {
     }
 
     // ---- The due selection against the real schema -----------------------
+
+    const NOW: i64 = 10_000_000_000;
+
+    const PARENT_ROWS: [&str; 8] = [
+        "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1)",
+        "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
+        "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at) VALUES ('i','p',1,'T','active',1,1)",
+        "INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES ('e','recipe','i','p','running',1,1)",
+        "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('job-1','e','i','p','Builder','running',1,1,'builder')",
+        "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-1','job-1','open','handle-1',1,1)",
+        "INSERT INTO runs (id,issue_id,project_id,job_id,status,session_id,created_at,updated_at) VALUES ('run-1','i','p','job-1','live','session-1',1,1)",
+        "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-1','session-1','run-1','job-1',1,'running','initial',1,1)",
+    ];
+
+    async fn seed_parents(db: &LocalDb) {
+        db.execute_script(PARENT_ROWS.join(";")).await.unwrap();
+    }
+
+    async fn migrated_db() -> LocalDb {
+        let root = tempfile::tempdir().unwrap().keep();
+        let db = LocalDb::open_migrated_for_test(root.join("test.db"))
+            .await
+            .unwrap();
+        seed_parents(&db).await;
+        db
+    }
+
+    /// What an MCP continuation's state is doing.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Shape {
+        ContinueTool,
+        UpdateTask,
+        InputUnasked,
+        /// Input requests serialized as JSON `null`, which reads as none.
+        InputNull,
+        AwaitingUnanswered,
+        AwaitingAnswered,
+        PollDue,
+        PollFuture,
+        TaskNoPoll,
+        Idle,
+        /// A stored completion not yet resolved: due at once now, where the
+        /// reference waited for the deadline.
+        Complete,
+        /// An earlier answer consumed, a second-round prompt unanswered: the
+        /// reference re-selected it on every tick for the earlier answer.
+        SecondRound,
+        /// An earlier answer consumed, a task polling later: likewise.
+        PollFutureAfterAnswer,
+    }
+
+    impl Shape {
+        const AGREEING: [Shape; 10] = [
+            Shape::ContinueTool,
+            Shape::UpdateTask,
+            Shape::InputUnasked,
+            Shape::InputNull,
+            Shape::AwaitingUnanswered,
+            Shape::AwaitingAnswered,
+            Shape::PollDue,
+            Shape::PollFuture,
+            Shape::TaskNoPoll,
+            Shape::Idle,
+        ];
+        const INTENDED_DIFFERENCES: [Shape; 3] = [
+            Shape::Complete,
+            Shape::SecondRound,
+            Shape::PollFutureAfterAnswer,
+        ];
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Kind {
+        Mcp(Shape),
+        Other(usize),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Deadline {
+        None,
+        Past,
+        Future,
+    }
+
+    #[derive(Clone)]
+    struct Seed {
+        id: String,
+        kind: Kind,
+        condition: Condition,
+        deadline: Option<i64>,
+        deadline_kind: Deadline,
+        created: i64,
+        inside_handoff: bool,
+        row_state: &'static str,
+        /// Prompts the wait owns: (id, answered).
+        prompts: Vec<(String, bool)>,
+    }
+
+    fn other_condition(index: usize) -> Condition {
+        match index {
+            0 => Condition::Duration,
+            1 => Condition::Terminal {
+                uri: "cairn:~/terminal/t".into(),
+                slug: "t".into(),
+                owner: None,
+                on: super::super::run::TerminalWaitEvent::Exit,
+                phrase: None,
+            },
+            _ => Condition::RunBatch {
+                request_id: "request".into(),
+                commits: false,
+                label: None,
+                host: false,
+                identity: None,
+                verdict_only: false,
+                settlement: None,
+            },
+        }
+    }
+
+    fn mcp_condition(shape: Shape, id: &str, n: i64) -> (Condition, Vec<(String, bool)>) {
+        let mut state = state();
+        let mut prompts = Vec::new();
+        let task = |state: &mut McpContinuationState, next: Option<i64>| {
+            state.task = Some(McpTaskCoordinates {
+                id: format!("{id}-task"),
+                poll_interval_ms: 100,
+            });
+            state.next_poll_at_ms = next;
+        };
+        let future_poll = NOW + 500_000 + n;
+        match shape {
+            Shape::ContinueTool => {
+                state.pending_operation = Some(PendingOperation::ContinueTool {
+                    operation_id: format!("{id}-op"),
+                    input_responses: serde_json::json!({}),
+                    request_state: None,
+                })
+            }
+            Shape::UpdateTask => {
+                task(&mut state, Some(future_poll));
+                state.pending_operation = Some(PendingOperation::UpdateTask {
+                    operation_id: format!("{id}-op"),
+                    task_id: format!("{id}-task"),
+                    input_responses: serde_json::json!({}),
+                });
+            }
+            Shape::InputUnasked => {
+                state.pending_input_requests = Some(serde_json::json!([{"id": "q"}]))
+            }
+            Shape::InputNull => state.pending_input_requests = Some(serde_json::Value::Null),
+            Shape::AwaitingUnanswered | Shape::AwaitingAnswered => {
+                state.pending_input_requests = Some(serde_json::json!([{"id": "q"}]));
+                state.pending_prompt_id = Some(format!("{id}-p"));
+                prompts.push((format!("{id}-p"), shape == Shape::AwaitingAnswered));
+            }
+            Shape::PollDue => task(&mut state, Some(NOW - 100 - (n * 37) % 5_000)),
+            Shape::PollFuture => task(&mut state, Some(future_poll)),
+            Shape::TaskNoPoll => task(&mut state, None),
+            Shape::Idle => {}
+            Shape::Complete => {
+                state.arguments = serde_json::json!({
+                    "__cairn_complete": crate::mcp::gateway::McpToolCallResult::from_text("done")
+                })
+            }
+            Shape::SecondRound => {
+                state.mrtr_round = 1;
+                state.pending_input_requests = Some(serde_json::json!([{"id": "q2"}]));
+                state.pending_prompt_id = Some(format!("{id}-p2"));
+                prompts.push((format!("{id}-p1"), true));
+                prompts.push((format!("{id}-p2"), false));
+            }
+            Shape::PollFutureAfterAnswer => {
+                prompts.push((format!("{id}-p1"), true));
+                task(&mut state, Some(future_poll));
+            }
+        }
+        (Condition::McpContinuation { state }, prompts)
+    }
+
+    /// Every kind, crossed with every row state, deadline and side of the park
+    /// handoff, `reps` times over. `created_at` is unique per row, so ties in
+    /// the ordering always break the same way.
+    fn matrix(kinds: &[Kind], reps: usize) -> Vec<Seed> {
+        let mut seeds = Vec::new();
+        let (mut inside, mut outside, mut n) = (0_i64, 0_i64, 0_i64);
+        for _ in 0..reps {
+            for &kind in kinds {
+                for row_state in ["pending", "resolving", "resolved", "cancelled"] {
+                    for deadline_kind in [Deadline::None, Deadline::Past, Deadline::Future] {
+                        for inside_handoff in [false, true] {
+                            n += 1;
+                            let id = format!("w{n:05}");
+                            let created = if inside_handoff {
+                                inside += 1;
+                                assert!(inside < INITIAL_PARK_HANDOFF_MS);
+                                NOW - INITIAL_PARK_HANDOFF_MS + inside
+                            } else {
+                                outside += 1;
+                                NOW - INITIAL_PARK_HANDOFF_MS - 1 - outside * 3
+                            };
+                            let deadline = match deadline_kind {
+                                Deadline::None => None,
+                                Deadline::Past => Some(NOW - 10 - n),
+                                Deadline::Future => Some(NOW + 1_000_000 + n),
+                            };
+                            let (condition, prompts) = match kind {
+                                Kind::Mcp(shape) => mcp_condition(shape, &id, n),
+                                Kind::Other(index) => (other_condition(index), Vec::new()),
+                            };
+                            seeds.push(Seed {
+                                id,
+                                kind,
+                                condition,
+                                deadline,
+                                deadline_kind,
+                                created,
+                                inside_handoff,
+                                row_state,
+                                prompts,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        seeds
+    }
+
+    /// Write each seed through the condition writer's statement, then its
+    /// prompts, then move it to its row state.
+    ///
+    /// One transaction for the whole matrix: every commit is a durable flush,
+    /// and committing each statement on its own made this fixture cost minutes
+    /// on hosts where a flush is slow.
+    async fn write_seeds(db: &LocalDb, seeds: &[Seed]) {
+        let seeds = Arc::new(seeds.to_vec());
+        db.write(move |conn| {
+            let seeds = seeds.clone();
+            Box::pin(async move {
+                for seed in seeds.iter() {
+                    conn.execute(
+                        "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES(?1,'job-1','run-1','session-1','turn-1',?1,'{}','pending',?2)",
+                        params![seed.id.as_str(), seed.created],
+                    )
+                    .await?;
+                    let columns = ConditionColumns::of(&seed.condition, seed.deadline)
+                        .map_err(DbError::internal)?;
+                    assert!(store_columns_conn(conn, &seed.id, &columns, seed.deadline).await?);
+                    write_prompts(conn, seed).await?;
+                    if seed.row_state != "pending" {
+                        conn.execute(
+                            "UPDATE agent_waits SET state=?2 WHERE id=?1",
+                            params![seed.id.as_str(), seed.row_state],
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn write_prompts(conn: &TrackedConnection, seed: &Seed) -> DbResult<()> {
+        for (prompt, answered) in &seed.prompts {
+            conn.execute(
+                "INSERT INTO prompts(id,run_id,questions,response,created_at,mcp_wait_id) VALUES(?1,'run-1','[]',?2,1,?3)",
+                params![prompt.as_str(), answered.then_some("yes"), seed.id.as_str()],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn agreeing_kinds() -> Vec<Kind> {
+        Shape::AGREEING
+            .into_iter()
+            .map(Kind::Mcp)
+            .chain((0..3).map(Kind::Other))
+            .collect()
+    }
+
+    /// The schedule columns select exactly what the JSON predicates did, in
+    /// the same order, across every shape both are meant to agree on. More
+    /// waits are due than one tick takes, so the limit and the ordering both
+    /// decide the answer.
+    #[tokio::test]
+    async fn due_selection_matches_the_reference_query_in_order() {
+        let db = migrated_db().await;
+        write_seeds(&db, &matrix(&agreeing_kinds(), 4)).await;
+
+        let every_due = query_due(&db, REFERENCE_DUE_SQL, NOW, usize::MAX >> 1)
+            .await
+            .unwrap();
+        assert!(
+            every_due.len() > SCHEDULER_SCAN_LIMIT,
+            "the matrix must hold more due waits ({}) than a tick takes",
+            every_due.len()
+        );
+        assert_eq!(
+            query_due(&db, DUE_SQL, NOW, usize::MAX >> 1).await.unwrap(),
+            every_due,
+            "every due wait, in order"
+        );
+        let reference = query_due(&db, REFERENCE_DUE_SQL, NOW, SCHEDULER_SCAN_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(reference.len(), SCHEDULER_SCAN_LIMIT);
+        assert_eq!(due_wait_ids(&db, NOW).await.unwrap(), reference);
+    }
+
+    /// The same matrix, with the due column blanked as a writer that skipped
+    /// it would leave it, no longer matches: the equivalence test has the
+    /// power to catch that writer.
+    #[tokio::test]
+    async fn the_equivalence_matrix_detects_a_writer_that_skips_the_due_column() {
+        let db = migrated_db().await;
+        write_seeds(&db, &matrix(&agreeing_kinds(), 4)).await;
+        db.execute("UPDATE agent_waits SET due_at_ms=NULL", ())
+            .await
+            .unwrap();
+        assert_ne!(
+            due_wait_ids(&db, NOW).await.unwrap(),
+            query_due(&db, REFERENCE_DUE_SQL, NOW, SCHEDULER_SCAN_LIMIT)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Where the new selection departs from the reference, it departs on
+    /// purpose, and nowhere else:
+    ///
+    /// - A wait that consumed an earlier answer and now awaits a second-round
+    ///   prompt, or polls a task later, is not due. The reference matched any
+    ///   answered prompt the wait ever owned, so it re-drove such a wait every
+    ///   tick for the rest of its life, each drive a no-op.
+    /// - A stored completion is due at once. The reference left it to its
+    ///   deadline, so a host lost between storing the completion and resolving
+    ///   it held the agent until then.
+    ///
+    /// Asked twice, so a wait that is not due stays not due across ticks.
+    #[tokio::test]
+    async fn due_selection_differs_from_the_reference_only_where_intended() {
+        let db = migrated_db().await;
+        let kinds: Vec<Kind> = Shape::INTENDED_DIFFERENCES
+            .into_iter()
+            .map(Kind::Mcp)
+            .collect();
+        let seeds = matrix(&kinds, 1);
+        write_seeds(&db, &seeds).await;
+
+        let all = usize::MAX >> 1;
+        let reference = query_due(&db, REFERENCE_DUE_SQL, NOW, all).await.unwrap();
+        for _ in 0..2 {
+            let selected = query_due(&db, DUE_SQL, NOW, all).await.unwrap();
+            for seed in &seeds {
+                let (in_reference, in_selected) =
+                    (reference.contains(&seed.id), selected.contains(&seed.id));
+                let live = seed.row_state == "pending"
+                    && !seed.inside_handoff
+                    && seed.deadline_kind != Deadline::Past;
+                match seed.kind {
+                    Kind::Mcp(Shape::Complete) if live => assert!(
+                        !in_reference && in_selected,
+                        "a stored completion is due at once: {}",
+                        seed.id
+                    ),
+                    Kind::Mcp(Shape::SecondRound | Shape::PollFutureAfterAnswer) if live => {
+                        assert!(
+                            in_reference && !in_selected,
+                            "an answer already consumed must not make {} ({:?}) due",
+                            seed.id,
+                            seed.kind
+                        )
+                    }
+                    _ => assert_eq!(
+                        in_reference, in_selected,
+                        "{} ({:?}, {}, {:?}) must agree",
+                        seed.id, seed.kind, seed.row_state, seed.deadline_kind
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The migration's backfill derives, from a row an earlier host wrote, the
+    /// same columns the writer derives from the same condition.
+    #[tokio::test]
+    async fn the_backfill_derives_what_the_writer_derives() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("backfill.db")).await.unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "agent_waits_schedule_columns")
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            before.len() < TURSO_MIGRATIONS.len(),
+            "the schedule-columns migration must be in the lineage"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        seed_parents(&db).await;
+
+        let kinds: Vec<Kind> = Shape::AGREEING
+            .into_iter()
+            .chain(Shape::INTENDED_DIFFERENCES)
+            .map(Kind::Mcp)
+            .chain((0..3).map(Kind::Other))
+            .collect();
+        let seeds = matrix(&kinds, 1);
+        // A run-batch wait a transfer retired can be returned to `pending`.
+        let transferred = seeds
+            .iter()
+            .position(|seed| seed.kind == Kind::Other(2) && seed.row_state == "resolved")
+            .unwrap();
+        // Rows as an earlier host wrote them, before the columns existed.
+        let rows: Arc<Vec<(Seed, Option<&'static str>)>> = Arc::new(
+            seeds
+                .iter()
+                .enumerate()
+                .map(|(index, seed)| {
+                    let resolution = match seed.row_state {
+                        "resolved" if index == transferred => {
+                            Some(r#"{"outcome":"transferred_to_inner_wait"}"#)
+                        }
+                        "pending" => None,
+                        _ => Some(r#"{"outcome":"elapsed"}"#),
+                    };
+                    (seed.clone(), resolution)
+                })
+                .collect(),
+        );
+        db.write(move |conn| {
+            let rows = rows.clone();
+            Box::pin(async move {
+                for (seed, resolution) in rows.iter() {
+                    let condition = serde_json::to_string(&seed.condition)
+                        .map_err(|error| DbError::internal(error.to_string()))?;
+                    conn.execute(
+                        "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,resolution_json) VALUES(?1,'job-1','run-1','session-1','turn-1',?1,?2,?3,?4,?5,?6)",
+                        params![
+                            seed.id.as_str(),
+                            condition,
+                            seed.deadline,
+                            seed.row_state,
+                            seed.created,
+                            *resolution
+                        ],
+                    )
+                    .await?;
+                    write_prompts(conn, seed).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        for (index, seed) in seeds.iter().enumerate() {
+            let stored = db
+                .query_one(
+                    "SELECT kind,due_at_ms,next_poll_at_ms,pending_prompt_id FROM agent_waits WHERE id=?1",
+                    (seed.id.clone(),),
+                    |row| {
+                        Ok((
+                            row.opt_text(0)?,
+                            row.opt_i64(1)?,
+                            row.opt_i64(2)?,
+                            row.opt_text(3)?,
+                        ))
+                    },
+                )
+                .await
+                .unwrap();
+            let readable =
+                matches!(seed.row_state, "pending" | "resolving") || index == transferred;
+            let expected = if readable {
+                let columns = ConditionColumns::of(&seed.condition, seed.deadline).unwrap();
+                (
+                    Some(columns.kind.to_string()),
+                    columns.due_at_ms,
+                    columns.next_poll_at_ms,
+                    columns.pending_prompt_id,
+                )
+            } else {
+                (None, None, None, None)
+            };
+            assert_eq!(
+                stored, expected,
+                "{} ({:?}, {})",
+                seed.id, seed.kind, seed.row_state
+            );
+        }
+    }
 }

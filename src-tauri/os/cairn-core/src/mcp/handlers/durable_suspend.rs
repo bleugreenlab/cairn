@@ -569,26 +569,35 @@ pub(crate) async fn store_condition(
     db.write(|conn| {
         let wait_id = wait_id.clone();
         let columns = columns.clone();
-        Box::pin(async move {
-            Ok(conn
-                .execute(
-                    STORE_CONDITION_SQL,
-                    params![
-                        wait_id,
-                        columns.json,
-                        deadline_ms,
-                        columns.kind,
-                        columns.due_at_ms,
-                        columns.next_poll_at_ms,
-                        columns.pending_prompt_id
-                    ],
-                )
-                .await?
-                == 1)
-        })
+        Box::pin(async move { store_columns_conn(conn, &wait_id, &columns, deadline_ms).await })
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+/// [`store_condition`] inside the caller's transaction, from columns already
+/// derived for `deadline_ms`.
+pub(crate) async fn store_columns_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    wait_id: &str,
+    columns: &ConditionColumns,
+    deadline_ms: Option<i64>,
+) -> DbResult<bool> {
+    Ok(conn
+        .execute(
+            STORE_CONDITION_SQL,
+            params![
+                wait_id,
+                columns.json.as_str(),
+                deadline_ms,
+                columns.kind,
+                columns.due_at_ms,
+                columns.next_poll_at_ms,
+                columns.pending_prompt_id.as_deref()
+            ],
+        )
+        .await?
+        == 1)
 }
 
 /// One suspended call: the parked turn, the tool call awaiting a result, and
@@ -1072,19 +1081,7 @@ async fn convert_run_batch(db: &LocalDb, r: &Record) -> Result<(bool, bool), Str
             };
             let columns =
                 ConditionColumns::of(&r.condition, r.deadline).map_err(DbError::internal)?;
-            c.execute(
-                STORE_CONDITION_SQL,
-                params![
-                    r.id.as_str(),
-                    columns.json.as_str(),
-                    r.deadline,
-                    columns.kind,
-                    columns.due_at_ms,
-                    columns.next_poll_at_ms,
-                    columns.pending_prompt_id.as_deref()
-                ],
-            )
-            .await?;
+            store_columns_conn(c, r.id.as_str(), &columns, r.deadline).await?;
             c.execute(
                 "UPDATE agent_waits SET hold=NULL,created_at=?2 WHERE id=?1",
                 params![r.id.as_str(), r.created],
