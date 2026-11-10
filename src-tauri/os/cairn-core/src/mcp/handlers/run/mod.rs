@@ -35,7 +35,7 @@ pub(crate) use machine_route::{
     machine_os, serves as machine_service_serves,
     takes_named_call as machine_service_takes_named_call,
 };
-pub(crate) use process::{cache_checkpoint_callback, MAX_BUFFER_SIZE};
+pub(crate) use process::{record_cache_checkpoint, MAX_BUFFER_SIZE};
 pub(crate) use redact::redact_command;
 pub(crate) use sandbox_policy::{resolve_run_confinement, RunCheckout};
 pub use types::{
@@ -11462,6 +11462,9 @@ async fn settle_routed_run_batch(
     >(&output)
     {
         Ok(items) => {
+            if let Some(run_context) = settlement.run_context.as_ref() {
+                process::record_missed_cache_checkpoints(orch, &run_context.job_id, &items).await;
+            }
             let (outcomes, took) = pace::time_batch(
                 items,
                 notes.pace.as_ref(),
@@ -14529,7 +14532,7 @@ pub(crate) mod host_batch_tests {
                 timeout,
                 route: super::types::McpRoute::Gateway {
                     credential_key: "fake".into(),
-                    config: serde_json::from_value(json!({})).unwrap(),
+                    config: Box::new(serde_json::from_value(json!({})).unwrap()),
                 },
             })),
         )

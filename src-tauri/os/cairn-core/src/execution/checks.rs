@@ -13013,7 +13013,7 @@ fn outcome_result(
         CellOutcome::FailedAfterExecution { diagnostic, .. } => {
             Err(CheckExecutionFailure::substrate(
                 SubstrateFailureShape::Result,
-                format!("slot result publication failed: {diagnostic}"),
+                format!("the command ran, but its result could not be reported: {diagnostic}"),
             ))
         }
         CellOutcome::Unavailable {
@@ -28271,6 +28271,7 @@ mod write_check_stack_headroom {
             verdict_environment_hash: None,
             stop: None,
             build_jobs: None,
+            unrecorded_cache_checkpoint: None,
         };
         CellOutcome::Completed {
             request_id: request.request_id.clone(),

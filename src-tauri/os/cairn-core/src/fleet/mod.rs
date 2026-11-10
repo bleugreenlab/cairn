@@ -13365,17 +13365,13 @@ impl Fleet {
                 }
             }
             RunnerCallback::CacheCheckpoint {
-                command,
-                cwd,
-                exit_code,
-                ..
+                command, exit_code, ..
             } => {
                 if let Some(run_context) = context.run_context {
-                    crate::mcp::handlers::run::cache_checkpoint_callback(
+                    crate::mcp::handlers::run::record_cache_checkpoint(
                         orch,
                         &run_context.job_id,
                         &command,
-                        &cwd,
                         exit_code,
                     )
                     .await;
@@ -43059,6 +43055,7 @@ mod tests {
                 verdict_environment_hash: None,
                 stop: None,
                 build_jobs: None,
+                unrecorded_cache_checkpoint: None,
             }])
             .unwrap();
         }
@@ -43257,6 +43254,7 @@ mod tests {
             verdict_environment_hash: None,
             stop,
             build_jobs: None,
+            unrecorded_cache_checkpoint: None,
         };
         let silent = CommandStop::Silent {
             quiet_ms: 30 * 60 * 1_000,
@@ -43385,6 +43383,7 @@ mod tests {
                     verdict_environment_hash: None,
                     stop: None,
                     build_jobs: None,
+                    unrecorded_cache_checkpoint: None,
                 }
             };
             let marker = |selection: &str| {
@@ -43572,6 +43571,7 @@ mod tests {
                         verdict_environment_hash: None,
                         stop,
                         build_jobs: None,
+                        unrecorded_cache_checkpoint: None,
                     }
                 };
             let killed = || {

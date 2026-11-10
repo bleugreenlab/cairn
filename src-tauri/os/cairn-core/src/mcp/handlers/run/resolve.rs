@@ -507,7 +507,7 @@ async fn resolve_mcp_route(
             let credential_key = crate::config::secrets::credential_key(server, project_scope);
             Ok(McpRoute::Gateway {
                 credential_key,
-                config: entry.config.clone(),
+                config: Box::new(entry.config.clone()),
             })
         }
         None => Err(crate::config::mcp_servers::unknown_server_refusal(

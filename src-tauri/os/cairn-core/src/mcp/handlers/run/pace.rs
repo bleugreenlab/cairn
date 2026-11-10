@@ -241,6 +241,7 @@ mod tests {
             toolchain_fingerprint: None,
             verdict_environment_hash: None,
             stop: None,
+            unrecorded_cache_checkpoint: None,
         }
     }
 

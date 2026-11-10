@@ -7424,6 +7424,17 @@ pub struct LearnedResourceEstimate {
 /// credential floor while no capable machine could take the work, a choice
 /// the runner alone makes from evidence every executor already sends. What a
 /// runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/6544 does not move the number. A cache checkpoint callback the runner
+/// does not acknowledge no longer fails the item that finished before it: the
+/// executor returns the item's outcome with a new optional
+/// `unrecordedCacheCheckpoint`, and the runner records the checkpoint from that
+/// outcome. A failure after an item's command ran now comes back as
+/// `FailedAfterExecution` rather than `Unavailable { reason: spawn }`; both are
+/// variants every runner already decodes. What a runner gets wrong talking to
+/// an older executor: nothing it decodes differently; that executor still fails
+/// such an item as a spawn failure, as before. An older runner ignores the new
+/// field, so it loses only the cache entry, never the result.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -20483,6 +20494,13 @@ pub struct ProcessBatchItemOutcome {
     /// itself. A stopped item is not a verdict, whatever its exit code says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<CommandStop>,
+    /// Why the runner did not acknowledge this item's cache checkpoint
+    /// callback, when it did not. The checkpoint is bookkeeping about a command
+    /// that already finished, so its failure never fails the item: it travels
+    /// here instead, and the runner records the checkpoint from this outcome's
+    /// `header` and `exit_code`, which are everything the callback carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrecorded_cache_checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

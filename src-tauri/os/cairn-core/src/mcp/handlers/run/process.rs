@@ -606,7 +606,7 @@ pub(crate) async fn run_one(
     if let Some(ref command) = shell_command {
         if !exec.timed_out {
             if let Some(ctx) = run_context {
-                cache_checkpoint_result(orch, &ctx.job_id, command, exec.exit_code).await;
+                record_cache_checkpoint(orch, &ctx.job_id, command, exec.exit_code).await;
             }
         }
     }
@@ -656,7 +656,7 @@ async fn run_mcp_call(
         McpRoute::Gateway {
             credential_key,
             config,
-        } => (credential_key, config),
+        } => (credential_key, *config),
         McpRoute::MachineService { key, machine } => {
             return run_machine_service_call(
                 orch,
@@ -2023,20 +2023,39 @@ async fn reap_readers_bounded(
     .await;
 }
 
+/// The items of a routed batch whose cache checkpoint the runner never
+/// acknowledged while the batch ran, as the `(command, exit_code)` the
+/// checkpoint callback would have carried.
+fn missed_cache_checkpoints(
+    items: &[cairn_common::executor_protocol::ProcessBatchItemOutcome],
+) -> impl Iterator<Item = (&str, Option<i32>)> {
+    items
+        .iter()
+        .filter(|item| item.unrecorded_cache_checkpoint.is_some())
+        .map(|item| (item.header.as_str(), item.exit_code))
+}
+
+/// Record, from a routed batch's result, every cache checkpoint whose callback
+/// the runner did not answer in time. The executor keeps the item's result
+/// whatever the callback met, so this is the checkpoint's second chance, and a
+/// missed callback costs nothing at all.
+pub(super) async fn record_missed_cache_checkpoints(
+    orch: &Orchestrator,
+    job_id: &str,
+    items: &[cairn_common::executor_protocol::ProcessBatchItemOutcome],
+) {
+    for (command, exit_code) in missed_cache_checkpoints(items) {
+        log::info!(
+            "recording cache checkpoint for job {job_id} from its batch result; its callback was not answered"
+        );
+        record_cache_checkpoint(orch, job_id, command, exit_code).await;
+    }
+}
+
 /// Cache a checkpoint command result if the executed command matches the job's checkpoint command.
 /// This enables the checkpoint lookback optimization: when the programmatic checkpoint runs,
 /// it can use this cached result instead of re-running the command.
-pub(crate) async fn cache_checkpoint_callback(
-    orch: &Orchestrator,
-    job_id: &str,
-    command: &str,
-    _cwd: &str,
-    exit_code: Option<i32>,
-) {
-    cache_checkpoint_result(orch, job_id, command, exit_code).await;
-}
-
-async fn cache_checkpoint_result(
+pub(crate) async fn record_cache_checkpoint(
     orch: &Orchestrator,
     job_id: &str,
     command: &str,
@@ -2166,6 +2185,29 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_items_whose_checkpoint_went_unanswered_are_recorded_from_the_result() {
+        let item = |header: &str, exit: i32, unrecorded: Option<&str>| {
+            serde_json::from_value::<cairn_common::executor_protocol::ProcessBatchItemOutcome>(
+                serde_json::json!({
+                    "header": header, "body": "", "succeeded": exit == 0, "suspended": false,
+                    "exitCode": exit, "startedAtUnixMs": 0, "finishedAtUnixMs": 1,
+                    "durationMs": 1, "unrecordedCacheCheckpoint": unrecorded,
+                }),
+            )
+            .unwrap()
+        };
+        let items = [
+            item("bun run check", 1, Some("runner callback timed out")),
+            item("echo acknowledged", 0, None),
+        ];
+
+        assert_eq!(
+            missed_cache_checkpoints(&items).collect::<Vec<_>>(),
+            [("bun run check", Some(1))]
+        );
+    }
 
     /// An orchestrator whose process spawner really spawns, so a host item's
     /// output is the shell's own.

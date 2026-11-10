@@ -252,7 +252,7 @@ pub(crate) enum McpRoute {
         /// the gateway call, so a resolved credential exists for the duration
         /// of one call rather than for the life of a batch that may also be
         /// cloned, suspended, and persisted.
-        config: McpServerConfig,
+        config: Box<McpServerConfig>,
     },
     /// A machine service, through the resident on one machine. `machine` is
     /// `None` until the batch is routed ([`super::machine_route`]), which
@@ -464,6 +464,7 @@ mod tests {
             toolchain_fingerprint: None,
             stop: None,
             build_jobs: None,
+            unrecorded_cache_checkpoint: None,
         };
 
         let encoded = serde_json::to_string(&vec![wire]).unwrap();

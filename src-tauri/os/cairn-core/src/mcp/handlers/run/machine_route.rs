@@ -664,7 +664,7 @@ mod tests {
                 timeout: None,
                 route: McpRoute::Gateway {
                     credential_key: "github".into(),
-                    config: serde_json::from_value(serde_json::json!({})).unwrap(),
+                    config: Box::new(serde_json::from_value(serde_json::json!({})).unwrap()),
                 },
             }))),
         );
