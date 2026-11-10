@@ -1235,36 +1235,88 @@ pub(super) async fn enqueue_source(
     Ok(())
 }
 
-pub(super) async fn pending_sources(db: &LocalDb, limit: i64) -> DbResult<Vec<IncidentSource>> {
-    db.query_all(
-        "SELECT project_id,event_key,observation_id,check_name,platform,commit_sha,
-                notify,lane_kind,cause_class,cause,created_at
-         FROM main_incident_sources WHERE processed_at IS NULL
-         ORDER BY attempts,created_at,project_id,event_key LIMIT ?1",
-        params![limit.clamp(1, 1000)],
-        |row| {
-            Ok(IncidentSource {
-                project_id: row.text(0)?,
-                draft: SourceDraft {
-                    event_key: row.text(1)?,
-                    observation_id: row.opt_text(2)?,
-                    check_name: row.text(3)?,
-                    platform: row.text(4)?,
-                    commit_sha: row.opt_text(5)?,
-                    notify: row.opt_text(6)?,
-                    lane_kind: row.opt_text(7)?,
-                    cause_class: row.opt_text(8)?,
-                    cause: row.opt_text(9)?,
-                },
-                created_at: row.i64(10)?,
-            })
+const SOURCE_COLUMNS: &str = "project_id,event_key,observation_id,check_name,platform,commit_sha,
+                notify,lane_kind,cause_class,cause,created_at";
+
+fn source_row(row: &cairn_db::turso::Row) -> DbResult<IncidentSource> {
+    Ok(IncidentSource {
+        project_id: row.text(0)?,
+        draft: SourceDraft {
+            event_key: row.text(1)?,
+            observation_id: row.opt_text(2)?,
+            check_name: row.text(3)?,
+            platform: row.text(4)?,
+            commit_sha: row.opt_text(5)?,
+            notify: row.opt_text(6)?,
+            lane_kind: row.opt_text(7)?,
+            cause_class: row.opt_text(8)?,
+            cause: row.opt_text(9)?,
         },
+        created_at: row.i64(10)?,
+    })
+}
+
+/// Unacknowledged sources due for preparation at `now`: every one that is not
+/// held for corroboration, and every held one whose wait has ended.
+pub(super) async fn pending_sources(
+    db: &LocalDb,
+    limit: i64,
+    now: i64,
+) -> DbResult<Vec<IncidentSource>> {
+    db.query_all(
+        format!(
+            "SELECT {SOURCE_COLUMNS} FROM main_incident_sources
+             WHERE processed_at IS NULL AND (held_until IS NULL OR held_until<=?2)
+             ORDER BY attempts,created_at,project_id,event_key LIMIT ?1"
+        ),
+        params![limit.clamp(1, 1000), now],
+        source_row,
     )
     .await
 }
 
+/// The sources on one lane whose observations hold reds for corroboration,
+/// oldest first: a new row on the lane may decide them.
+pub(super) async fn held_sources(
+    db: &LocalDb,
+    project_id: &str,
+    check: &str,
+    platform: &str,
+) -> DbResult<Vec<IncidentSource>> {
+    db.query_all(
+        format!(
+            "SELECT {SOURCE_COLUMNS} FROM main_incident_sources
+             WHERE processed_at IS NULL AND held_until IS NOT NULL
+               AND project_id=?1 AND check_name=?2 AND platform=?3
+             ORDER BY created_at,event_key LIMIT 50"
+        ),
+        params![project_id, check, platform],
+        source_row,
+    )
+    .await
+}
+
+/// Leave a prepared source unacknowledged because its observation holds reds
+/// for corroboration until `until` (Unix seconds). It is not a failure: no
+/// attempt is counted, and the retention guard keeps the observation.
+pub(super) async fn hold_source(
+    db: &LocalDb,
+    project_id: &str,
+    event_key: &str,
+    until: i64,
+) -> DbResult<()> {
+    db.execute(
+        "UPDATE main_incident_sources SET held_until=?3,error=NULL
+         WHERE project_id=?1 AND event_key=?2 AND processed_at IS NULL",
+        params![project_id, event_key, until],
+    )
+    .await?;
+    Ok(())
+}
+
 /// A source is acknowledged only after its evidence intents are durable.
-/// Failure remains pending and records a visible retry reason.
+/// Failure remains pending and records a visible retry reason; either way the
+/// source is no longer held, so a failure is retried at once.
 pub(super) async fn finish_source(
     db: &LocalDb,
     project_id: &str,
@@ -1273,7 +1325,7 @@ pub(super) async fn finish_source(
     now: i64,
 ) -> DbResult<()> {
     db.execute(
-        "UPDATE main_incident_sources SET processed_at=?3,error=?4,attempts=attempts+1
+        "UPDATE main_incident_sources SET processed_at=?3,error=?4,attempts=attempts+1,held_until=NULL
          WHERE project_id=?1 AND event_key=?2 AND processed_at IS NULL",
         params![
             project_id,
@@ -1376,7 +1428,10 @@ const SOURCE_STUCK_AGE_S: i64 = 3600;
 
 #[derive(Debug)]
 pub(crate) struct SourceHealth {
+    /// Due for preparation: not held, or held past the end of its wait.
     pub pending: i64,
+    /// Waiting for corroboration ([`hold_source`]); not a failure.
+    pub held_for_corroboration: i64,
     pub held_observations: i64,
     pub stuck: i64,
     examples: Vec<String>,
@@ -1384,8 +1439,23 @@ pub(crate) struct SourceHealth {
 
 impl std::fmt::Display for SourceHealth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "main incident preparation: {} pending source events; retention holds {} canonical observations until durable filing acknowledgement",
-            self.pending,self.held_observations)?;
+        write!(
+            f,
+            "main incident preparation: {} pending source events",
+            self.pending
+        )?;
+        if self.held_for_corroboration > 0 {
+            write!(
+                f,
+                "; {} held for corroboration",
+                self.held_for_corroboration
+            )?;
+        }
+        write!(
+            f,
+            "; retention holds {} canonical observations until durable filing acknowledgement",
+            self.held_observations
+        )?;
         if self.stuck > 0 {
             write!(
                 f,
@@ -1412,13 +1482,18 @@ pub(crate) async fn source_health(
     project: Option<&str>,
     now: i64,
 ) -> DbResult<SourceHealth> {
-    let (pending, held_observations, stuck) = db
+    // A held source is waiting, not failing: it is neither pending nor stuck
+    // until its wait ends, and its age counts from then.
+    let (pending, held_for_corroboration, held_observations, stuck) = db
         .query_one(
-            "SELECT COUNT(*),COUNT(DISTINCT observation_id),
-                COALESCE(SUM(CASE WHEN attempts>=?3 OR created_at<=?2 THEN 1 ELSE 0 END),0)
+            "SELECT COALESCE(SUM(CASE WHEN held_until IS NULL OR held_until<=?4 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN held_until>?4 THEN 1 ELSE 0 END),0),
+                COUNT(DISTINCT observation_id),
+                COALESCE(SUM(CASE WHEN (held_until IS NULL OR held_until<=?4)
+                    AND (attempts>=?3 OR COALESCE(held_until,created_at)<=?2) THEN 1 ELSE 0 END),0)
          FROM main_incident_sources WHERE processed_at IS NULL AND (?1 IS NULL OR project_id=?1)",
-            params![project, now - SOURCE_STUCK_AGE_S, SOURCE_STUCK_ATTEMPTS],
-            |r| Ok((r.i64(0)?, r.i64(1)?, r.i64(2)?)),
+            params![project, now - SOURCE_STUCK_AGE_S, SOURCE_STUCK_ATTEMPTS, now],
+            |r| Ok((r.i64(0)?, r.i64(1)?, r.i64(2)?, r.i64(3)?)),
         )
         .await?;
     let examples =
@@ -1426,9 +1501,10 @@ pub(crate) async fn source_health(
             db.query_all(
             "SELECT event_key,observation_id,attempts,created_at,error FROM main_incident_sources
              WHERE processed_at IS NULL AND (?1 IS NULL OR project_id=?1)
-               AND (attempts>=?3 OR created_at<=?2)
+               AND (held_until IS NULL OR held_until<=?4)
+               AND (attempts>=?3 OR COALESCE(held_until,created_at)<=?2)
              ORDER BY created_at,project_id,event_key LIMIT 10",
-            params![project,now-SOURCE_STUCK_AGE_S,SOURCE_STUCK_ATTEMPTS],
+            params![project,now-SOURCE_STUCK_AGE_S,SOURCE_STUCK_ATTEMPTS,now],
             move |r| {
                 let error=r.opt_text(4)?.unwrap_or_else(||"pending delivery".into());
                 let error: String=error.chars().take(200).collect();
@@ -1442,6 +1518,7 @@ pub(crate) async fn source_health(
         };
     Ok(SourceHealth {
         pending,
+        held_for_corroboration,
         held_observations,
         stuck,
         examples,

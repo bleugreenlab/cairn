@@ -10388,25 +10388,7 @@ fn fresh_observation_write(
     let coordinator_ran = observed_on.is_coordinator();
     let plan_audit = parsed.and_then(|result| result.plan_audit.as_ref());
     let tests = parsed
-        .map(|result| {
-            result
-                .tests
-                .iter()
-                .map(|test| CheckTestResultRow {
-                    test_id: test.id.clone(),
-                    status: test.status.clone(),
-                    duration_ms: test.duration_ms.map(|value| value as i64),
-                    attempt_count: Some(test.attempts as i64),
-                    failure_excerpt: test.failure_message.clone(),
-                    skip_reason: test.skip_reason.clone(),
-                    declaration_source: test.skip_declaration_source.clone(),
-                    flaky: test.flaky,
-                    started_offset_ms: test
-                        .started_offset_ms
-                        .and_then(|offset| i64::try_from(offset).ok()),
-                })
-                .collect()
-        })
+        .map(|result| result.tests.iter().map(CheckTestResultRow::from).collect())
         .unwrap_or_default();
     // A remote executor's verdict environment is not the coordinator's environment.
     // Modern executors report the identity they computed where the check ran; legacy

@@ -61,6 +61,7 @@
 //! comparison could not be read, keeps the row's measured verdict, and claims
 //! no movement and no merge list.
 
+mod corroboration;
 mod incident_sources;
 mod incidents;
 
@@ -1571,20 +1572,21 @@ async fn report_lane(
         now_ms: now,
         rearmed: rearmed.as_ref(),
     };
-    let filing_note = incident_note(
+    let event_key = source.as_ref().ok().and_then(|s| s.as_deref());
+    let (mut filing_note, _) = incident_note(
         orch,
         db,
         project_id,
         project_key,
         &lane.notify,
         &report,
-        source
-            .as_ref()
-            .ok()
-            .and_then(|s| s.as_deref())
-            .map(|key| (key, captured_at)),
+        event_key.map(|key| (key, captured_at)),
     )
     .await;
+    // This row may be the second host or the newer tree that decides reds an
+    // earlier row on the lane holds for corroboration.
+    filing_note
+        .push_str(&incident_sources::revisit_held(orch, db, project_id, lane, event_key).await);
     let content = format!("{}{filing_note}", render_report(&report));
     orch.main_cadence.lock().unwrap().settled(
         project_id,
@@ -1700,6 +1702,8 @@ async fn retry_incident_intents(orch: &Orchestrator, db: &LocalDb) {
     }
 }
 
+/// Filing's note for a cadence notice, and whether the report's observation
+/// still holds reds for corroboration.
 async fn incident_note(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1708,7 +1712,10 @@ async fn incident_note(
     notify: &str,
     report: &CadenceReport<'_>,
     delivery: Option<(&str, i64)>,
-) -> String {
+) -> (String, bool) {
+    use crate::execution::main_incidents_store as store;
+
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
     let result = match crate::issues::crud::installation_machine_authorship(
         orch.anon_device_manager.device_id(),
         orch.services.clock.now(),
@@ -1722,28 +1729,43 @@ async fn incident_note(
                 report,
                 authorship,
                 delivery,
+                &names,
             )
             .await
         }
         Err(error) => Err(error),
     };
+    let held_until_ms = result
+        .as_ref()
+        .ok()
+        .and_then(|recorded| recorded.held_until_ms);
     if let Some((event_key, _)) = delivery {
-        if let Err(error) = crate::execution::main_incidents_store::finish_source(
-            db,
-            project_id,
-            event_key,
-            result.as_ref().err().map(ToString::to_string),
-            now_ms() / 1000,
-        )
-        .await
-        {
-            return format!(
-                "\nIncident source acknowledgement failed: {error}; retained for retry.\n"
+        let acknowledged = match held_until_ms {
+            // Left unacknowledged on purpose: the source keeps the observation
+            // and comes back when a new row lands on the lane or the wait ends.
+            Some(until_ms) => {
+                store::hold_source(db, project_id, event_key, (until_ms + 999) / 1000).await
+            }
+            None => {
+                store::finish_source(
+                    db,
+                    project_id,
+                    event_key,
+                    result.as_ref().err().map(ToString::to_string),
+                    now_ms() / 1000,
+                )
+                .await
+            }
+        };
+        if let Err(error) = acknowledged {
+            return (
+                format!("\nIncident source acknowledgement failed: {error}; retained for retry.\n"),
+                held_until_ms.is_some(),
             );
         }
     }
     let mut note = match result {
-        Ok(note) => note,
+        Ok(recorded) => recorded.note,
         Err(error) => {
             log::error!(
                 "main incident filing failed; durable source retained for cadence retry: {error}"
@@ -1766,7 +1788,7 @@ async fn incident_note(
         )),
         _ => {}
     }
-    note
+    (note, held_until_ms.is_some())
 }
 
 async fn replay_covered_incidents(
@@ -1815,7 +1837,7 @@ async fn replay_covered_incidents(
         now_ms: now_ms(),
         rearmed: None,
     };
-    let note = incident_note(
+    let (note, _) = incident_note(
         orch,
         db,
         context.project_id,
@@ -3488,6 +3510,7 @@ const BOUND_ENDINGS: &[(&str, BoundEnding)] = &[
     ("timeout: vitest terminated this test", BoundEnding::Timeout),
     ("elapsed(())", BoundEnding::Timeout),
     ("deadline has elapsed", BoundEnding::Timeout),
+    ("no progress within ", BoundEnding::Timeout),
     (REFUSED_NO_COLOCATED_EXECUTOR, BoundEnding::Refused),
 ];
 

@@ -98,11 +98,16 @@ const FINGERPRINT_CHARS: usize = 1_000;
 /// The `parser` a `bun test` run is recorded under.
 pub(crate) const BUN_TEST_PARSER: &str = "bun-test";
 
+/// The `parser` plain `cargo test` (libtest) output is recorded under. It is
+/// not nextest's: it prints no `Summary` witness, and its tally is the sum of
+/// each binary's `test result:` line.
+pub(crate) const CARGO_TEST_PARSER: &str = "cargo-test";
+
 /// Every `parser` whose counts are real tests, as opposed to `tsc`'s type-error
 /// tally or `rust-lint`'s gating sites. The one list every verdict, reuse, and
 /// rendering decision consults, and the set of result-file parsers accepted as
 /// per-test results.
-const TEST_RUNNER_PARSERS: [&str; 3] = ["nextest", "vitest", BUN_TEST_PARSER];
+const TEST_RUNNER_PARSERS: [&str; 4] = ["nextest", "vitest", BUN_TEST_PARSER, CARGO_TEST_PARSER];
 
 /// Whether `parser` names a test runner (see [`TEST_RUNNER_PARSERS`]).
 pub(crate) fn is_test_runner_parser(parser: &str) -> bool {
@@ -1159,6 +1164,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
 
     let mut failures = Vec::new();
     let mut tests = Vec::new();
+    let mut identities = PrintedIdentities::default();
     let mut suite_failures = 0usize;
     let mut unfinished = false;
     for file in files {
@@ -1200,6 +1206,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
                 }
                 _ => continue,
             };
+            let name = identities.claim(name);
             tests.push(CheckTestResult {
                 id: name.clone(),
                 status: canonical_status.to_string(),
@@ -1244,6 +1251,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
     // Counted from the rows: vitest's `numPendingTests` folds tests that never
     // finished in with declared skips.
     let skipped = tests.iter().filter(|test| test.status == "skipped").count();
+    let ingestion = printed_ingestion(tests.len(), tests.len(), passed + failed + skipped);
     Some(ParsedCheckResult {
         schema_version: 1,
         complete: !unfinished && tests.len() == passed + failed + skipped,
@@ -1263,7 +1271,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         lint_findings: None,
         plan_audit: None,
         accounting: None,
-        ingestion: None,
+        ingestion: Some(ingestion),
     })
 }
 
@@ -1293,6 +1301,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
     let (mut total, mut passed, mut failed, mut skipped) = (0usize, 0usize, 0usize, 0usize);
     let mut summaries = 0usize;
     let mut tests: Vec<CheckTestResult> = Vec::new();
+    let mut identities = PrintedIdentities::default();
     let mut failures: Vec<CheckFailure> = Vec::new();
     let mut awaiting_message = false;
     for line in clean.lines() {
@@ -1320,7 +1329,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
                 "×" => "failed",
                 _ => "skipped",
             };
-            let id = cap[2].to_string();
+            let id = identities.claim(cap[2].to_string());
             if status == "failed" {
                 failures.push(CheckFailure {
                     name: id.clone(),
@@ -1350,11 +1359,12 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         return None;
     }
     let complete = rows_account_for(&tests, total, passed, failed, skipped);
+    let (tests, ingestion) = printed_enumeration(tests, complete, total);
     Some(ParsedCheckResult {
         schema_version: 1,
         complete,
         selection: if total == 0 { "empty" } else { "unknown" }.to_string(),
-        tests: if complete { tests } else { vec![] },
+        tests,
         undeclared_skips: 0,
         parser: "vitest".to_string(),
         passed,
@@ -1369,7 +1379,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         lint_findings: None,
         plan_audit: None,
         accounting: None,
-        ingestion: None,
+        ingestion: Some(ingestion),
     })
 }
 
@@ -1424,6 +1434,7 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
     let mut in_recap = false;
     let mut last_error: Option<String> = None;
     let mut tests: Vec<CheckTestResult> = Vec::new();
+    let mut identities = PrintedIdentities::default();
     let mut failures: Vec<CheckFailure> = Vec::new();
     for line in clean.lines() {
         let line = line.trim_end();
@@ -1468,10 +1479,10 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
                 Some("fail" | "✗") => "failed",
                 _ => "skipped",
             };
-            let id = match &file {
+            let id = identities.claim(match &file {
                 Some(file) => format!("{file} > {}", &cap[3]),
                 None => cap[3].to_string(),
-            };
+            });
             let duration = millis(
                 cap.get(4),
                 cap.get(5).is_some_and(|unit| unit.as_str() == "s"),
@@ -1502,11 +1513,12 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         return None;
     }
     let complete = rows_account_for(&tests, ran, totals.pass, totals.fail, totals.skip);
+    let (tests, ingestion) = printed_enumeration(tests, complete, ran);
     Some(ParsedCheckResult {
         schema_version: 1,
         complete,
         selection: if ran == 0 { "empty" } else { "unknown" }.to_string(),
-        tests: if complete { tests } else { vec![] },
+        tests,
         undeclared_skips: 0,
         parser: BUN_TEST_PARSER.to_string(),
         passed: totals.pass,
@@ -1521,8 +1533,62 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         lint_findings: None,
         plan_audit: None,
         accounting: None,
-        ingestion: None,
+        ingestion: Some(ingestion),
     })
+}
+
+/// Distinct identities for the rows of a printed report. A printed report
+/// names a test by its title, and titles repeat: a `test.each` whose title has
+/// no placeholder, or one test path in two libtest binaries. Each repeat is a
+/// test that ran, so the n-th row under a title already taken is kept as
+/// `<title> (#n)` instead of being folded onto the first by the store's
+/// one-row-per-identity key. A lone title keeps its id when a namesake is
+/// added after it.
+#[derive(Default)]
+struct PrintedIdentities {
+    taken: std::collections::HashSet<String>,
+    repeats: std::collections::HashMap<String, usize>,
+}
+
+impl PrintedIdentities {
+    fn claim(&mut self, title: String) -> String {
+        if self.taken.insert(title.clone()) {
+            return title;
+        }
+        let occurrence = self.repeats.entry(title.clone()).or_insert(1);
+        loop {
+            *occurrence += 1;
+            let id = format!("{title} (#{occurrence})");
+            if self.taken.insert(id.clone()) {
+                return id;
+            }
+        }
+    }
+}
+
+/// What this core keeps from a printed report's rows: all of them when they
+/// account for the runner's tally (`enumerates`), none otherwise, since a
+/// partial set is whatever survived the capture rather than an enumeration.
+/// The [`Ingestion`] says so, so the tallied tests without a row are never
+/// read as rows the store lost.
+fn printed_enumeration(
+    rows: Vec<CheckTestResult>,
+    enumerates: bool,
+    tallied: usize,
+) -> (Vec<CheckTestResult>, Ingestion) {
+    let read = rows.len();
+    let kept = if enumerates { rows } else { Vec::new() };
+    let ingestion = printed_ingestion(read, kept.len(), tallied);
+    (kept, ingestion)
+}
+
+fn printed_ingestion(read: usize, kept: usize, tallied: usize) -> Ingestion {
+    Ingestion {
+        received: read,
+        kept,
+        unenumerated: tallied.saturating_sub(kept),
+        ..Ingestion::default()
+    }
 }
 
 /// Whether per-test rows read from printed output account for exactly the tests
@@ -1609,11 +1675,12 @@ fn parse_rust(clean: &str) -> Option<ParsedCheckResult> {
 }
 
 static NEXTEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
-    // `FAIL [   0.088s] (3/4) <crate> <test::path>` — the optional `(i/N)`
-    // progress counter appears during the run. Signal/timeout statuses are
-    // failures too; SLOW/PASS lines are deliberately excluded.
+    // `FAIL [   0.088s] ( 3/4) <crate> <test::path>` — the optional `(i/N)`
+    // progress counter appears during the run, its index padded to the width
+    // of N. Signal/timeout statuses are failures too; SLOW/PASS lines are
+    // deliberately excluded.
     Regex::new(
-        r"(?m)^\s*(?:FAIL|TIMEOUT|ABORT|SIGSEGV)\s+\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*$",
+        r"(?m)^\s*(?:FAIL|TIMEOUT|ABORT|SIGSEGV)\s+\[[^\]]*\]\s+(?:\(\s*\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*$",
     )
     .unwrap()
 });
@@ -1622,7 +1689,7 @@ static NEXTEST_SLOW: LazyLock<Regex> = LazyLock::new(|| {
     // `SLOW [>  60.000s] <crate> <test::path>` — nextest's marker for a test
     // still running past its slow-timeout threshold. When a suite is KILLED at
     // its budget these name the tests that were mid-flight at the kill.
-    Regex::new(r"(?m)^\s*SLOW\s+\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*$").unwrap()
+    Regex::new(r"(?m)^\s*SLOW\s+\[[^\]]*\]\s+(?:\(\s*\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*$").unwrap()
 });
 
 /// Extract the nextest tests still running when a suite was killed — its
@@ -1738,16 +1805,32 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         }
     }
 
+    let (passed, failed, skipped) = (
+        grab(&COUNT_PASSED),
+        grab(&COUNT_FAILED),
+        grab(&COUNT_SKIPPED),
+    );
+    let rows = nextest_status_rows(clean);
+    // The rows enumerate the run only when nextest's own Summary witnesses the
+    // same tally. Its default status level prints no SKIP line, so a run that
+    // skipped anything has no row for those tests and enumerates nothing.
+    let witnessed = nextest_summary_counts(clean).is_some_and(|summary| {
+        summary.timed_out == 0
+            && (summary.passed, summary.failed, summary.skipped) == (passed, failed, skipped)
+    });
+    let complete =
+        witnessed && rows_account_for(&rows, passed + failed + skipped, passed, failed, skipped);
+    let (tests, ingestion) = printed_enumeration(rows, complete, passed + failed + skipped);
     Some(ParsedCheckResult {
         schema_version: 1,
-        complete: false,
+        complete,
         selection: "unknown".to_string(),
-        tests: vec![],
+        tests,
         undeclared_skips: 0,
         parser: "nextest".to_string(),
-        passed: grab(&COUNT_PASSED),
-        failed: grab(&COUNT_FAILED),
-        skipped: grab(&COUNT_SKIPPED),
+        passed,
+        failed,
+        skipped,
         suite_failures: 0,
         phases: None,
         deferred: 0,
@@ -1757,8 +1840,60 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         lint_findings: None,
         plan_audit: None,
         accounting: None,
-        ingestion: None,
+        ingestion: Some(ingestion),
     })
+}
+
+/// One attempt's terminal status line in nextest's human report:
+/// `PASS [   0.004s] ( 1/4) crate test::path`, `TRY 2 FAIL [ ... ] ...`.
+/// START, SLOW and RETRY lines are not terminal and do not match.
+static NEXTEST_TERMINAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(?:TRY (\d+) )?(PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z]+|SKIP)\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(\S+)\s+(\S+)\s*$",
+    )
+    .unwrap()
+});
+
+/// The per-test rows of nextest's human report, read from the run itself:
+/// the lines before its first `Summary`, after which nextest repeats the
+/// failures it already reported. A test named on more than one line was
+/// retried; its last attempt is its outcome, and an earlier failure makes a
+/// final pass flaky.
+fn nextest_status_rows(clean: &str) -> Vec<CheckTestResult> {
+    let mut rows: Vec<CheckTestResult> = Vec::new();
+    let mut index = std::collections::HashMap::<String, usize>::new();
+    for line in clean.lines() {
+        if line.trim_start().starts_with("Summary [") {
+            break;
+        }
+        let Some(cap) = NEXTEST_TERMINAL.captures(line) else {
+            continue;
+        };
+        let status = match &cap[2] {
+            "PASS" | "LEAK" => "passed",
+            "SKIP" => "skipped",
+            _ => "failed",
+        };
+        let id = format!("{} {}", &cap[3], &cap[4]);
+        let attempt = cap.get(1).and_then(|n| n.as_str().parse::<u32>().ok());
+        match index.get(&id).copied() {
+            Some(at) => {
+                let row = &mut rows[at];
+                let failed_before = row.flaky || row.status == "failed";
+                row.attempts = attempt.unwrap_or(row.attempts + 1).max(row.attempts + 1);
+                row.retried = true;
+                row.flaky = status == "passed" && failed_before;
+                row.status = status.to_string();
+            }
+            None => {
+                index.insert(id.clone(), rows.len());
+                let mut row = test_row(id, status, None);
+                row.attempts = attempt.unwrap_or(1);
+                rows.push(row);
+            }
+        }
+    }
+    rows
 }
 
 static CARGO_RESULT: LazyLock<Regex> = LazyLock::new(|| {
@@ -1767,6 +1902,12 @@ static CARGO_RESULT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static CARGO_FAILED_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^test (\S+) \.\.\. FAILED\s*$").unwrap());
+
+/// One libtest status row: `test path ... ok`, `test path ... FAILED`, or
+/// `test path ... ignored[, reason]`. A doctest's path carries spaces
+/// (`src/lib.rs - item (line 42)`).
+static CARGO_TEST_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^test (.+?) \.\.\. (ok|FAILED|ignored)(?:,.*)?$").unwrap());
 
 fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
     // Sum the per-binary `test result:` lines; their absence means this is not
@@ -1839,15 +1980,32 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         summary_names.clear();
     }
 
+    // Libtest prints a binary's test paths without the binary, so one path in
+    // two binaries is two rows under one title. Binaries run one after another
+    // in a fixed order, so the occurrence a repeat is numbered by is stable.
+    let mut identities = PrintedIdentities::default();
+    let rows: Vec<CheckTestResult> = clean
+        .lines()
+        .filter_map(|line| CARGO_TEST_ROW.captures(line.trim_end()))
+        .map(|cap| {
+            let status = match &cap[2] {
+                "ok" => "passed",
+                "FAILED" => "failed",
+                _ => "skipped",
+            };
+            test_row(identities.claim(cap[1].to_string()), status, None)
+        })
+        .collect();
+    let tallied = passed + failed + ignored;
+    let complete = rows_account_for(&rows, tallied, passed, failed, ignored);
+    let (tests, ingestion) = printed_enumeration(rows, complete, tallied);
     Some(ParsedCheckResult {
         schema_version: 1,
-        complete: false,
+        complete,
         selection: "unknown".to_string(),
-        tests: vec![],
+        tests,
         undeclared_skips: 0,
-        // `nextest` is the persisted label for the whole Rust test-runner family,
-        // including the wrapper's cargo-test fallback.
-        parser: "nextest".to_string(),
+        parser: CARGO_TEST_PARSER.to_string(),
         passed,
         failed,
         skipped: ignored,
@@ -1860,7 +2018,7 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         lint_findings: None,
         plan_audit: None,
         accounting: None,
-        ingestion: None,
+        ingestion: Some(ingestion),
     })
 }
 
@@ -1985,7 +2143,7 @@ static BUN_PAREN_ROW: LazyLock<Regex> =
 /// failing ones.
 static NEXTEST_ROW: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^\s*(?:(?:TRY \d+ )?(?:PASS|FAIL|FLAKY|SLOW|LEAK|LEAK-FAIL|TIMEOUT|ABORT|SIGSEGV|SIGABRT|SIGBUS|SIGKILL|START|SKIP|CANCEL|SETUP)|RETRY \d+/\d+)\s+\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?\S+\s+\S",
+        r"^\s*(?:(?:TRY \d+ )?(?:PASS|FAIL|FLAKY|SLOW|LEAK|LEAK-FAIL|TIMEOUT|ABORT|SIGSEGV|SIGABRT|SIGBUS|SIGKILL|START|SKIP|CANCEL|SETUP)|RETRY \d+/\d+)\s+\[[^\]]*\]\s+(?:\(\s*\d+/\d+\)\s+)?\S+\s+\S",
     )
     .unwrap()
 });
@@ -3041,13 +3199,180 @@ real work
 
     #[test]
     fn rust_parser_falls_back_to_cargo_test() {
-        // No nextest Summary line ⇒ the cargo-test fallback parses libtest output.
+        // No nextest Summary line ⇒ the cargo-test fallback parses libtest output,
+        // and says so: it is not nextest's report.
         let r = parse_check_output("bun run test:rust:nextest", CARGO_TEST_FIXTURE).unwrap();
+        assert_eq!(r.parser, CARGO_TEST_PARSER);
+        assert!(r.is_test_runner());
         assert_eq!(r.passed, 2);
         assert_eq!(r.failed, 2);
         assert_eq!(r.skipped, 1);
         let names: Vec<&str> = r.failures.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["tests::fails_panic", "tests::fails_math"]);
+        // Every tallied test has its row, so the report is an enumeration.
+        assert!(r.complete);
+        let rows: Vec<(&str, &str)> = r
+            .tests
+            .iter()
+            .map(|t| (t.id.as_str(), t.status.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("tests::ignored_one", "skipped"),
+                ("tests::passes_one", "passed"),
+                ("tests::fails_panic", "failed"),
+                ("tests::fails_math", "failed"),
+                ("tests::passes_two", "passed"),
+            ]
+        );
+    }
+
+    /// Specimen arb b878ab1c (`cargo test --test schema` on bbs): libtest's rows
+    /// on stdout, the build on stderr. It was stored with its tally and no row,
+    /// which read as every row lost.
+    #[test]
+    fn a_plain_cargo_test_run_enumerates_its_rows() {
+        let output = "\nrunning 2 tests\ntest the_committed_schema_is_the_derived_one ... ok\ntest the_schema_names_its_root_and_definitions ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s\n\n\n\nstderr:\n   Compiling arbiter v0.1.0 (/home/bleu/.cairn-exec/build-slots/arb/slot-165)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.29s\n     Running tests/schema.rs (target/debug/deps/schema-3f589f9331f9e383)\n";
+        let parsed = parse_check_output("cargo test --test schema", output).unwrap();
+        assert_eq!(parsed.parser, CARGO_TEST_PARSER);
+        assert!(parsed.complete);
+        assert_eq!(parsed.tests.len(), 2);
+        let ingestion = parsed.ingestion.as_ref().unwrap();
+        assert_eq!((ingestion.kept, ingestion.unenumerated), (2, 0));
+    }
+
+    /// One test path in two binaries is two tests that ran. Each keeps a row,
+    /// the repeat numbered by its occurrence, so the store's one-row-per-id key
+    /// cannot fold them together. An `ignored, reason` row is a skip.
+    #[test]
+    fn one_test_path_in_two_libtest_binaries_keeps_both_rows() {
+        let output = "\
+running 1 test
+test tests::it_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 3 tests
+test tests::it_works ... ok
+test tests::needs_network ... ignored, needs a network
+test src/lib.rs - item (line 3) ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out";
+        let parsed = parse_check_output("cargo test --workspace", output).unwrap();
+        assert!(parsed.complete);
+        let ids: Vec<&str> = parsed.tests.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "tests::it_works",
+                "tests::it_works (#2)",
+                "tests::needs_network",
+                "src/lib.rs - item (line 3)",
+            ]
+        );
+        assert_eq!(parsed.tests[2].status, "skipped");
+    }
+
+    /// A libtest report whose rows were lost from the capture keeps its tally
+    /// and keeps no partial enumeration, and its ingestion says how many
+    /// tallied tests have no row.
+    #[test]
+    fn a_cargo_tally_without_its_rows_says_what_it_did_not_enumerate() {
+        let output = "test result: ok. 228 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+        let parsed = parse_check_output("cargo test", output).unwrap();
+        assert!(!parsed.complete);
+        assert!(parsed.tests.is_empty());
+        let ingestion = parsed.ingestion.unwrap();
+        assert_eq!((ingestion.kept, ingestion.unenumerated), (0, 229));
+    }
+
+    /// nextest's human report at its default status level: a PASS or FAIL line
+    /// per test, retries as `TRY n` lines, then the Summary, after which the
+    /// failures are repeated and must not become second attempts.
+    const NEXTEST_HUMAN_FIXTURE: &str = "\
+    Starting 4 tests across 2 binaries
+        PASS [   0.004s] ( 1/4) fixcrate tests::passes
+  TRY 1 FAIL [   0.010s] ( 2/4) fixcrate tests::flaky
+  RETRY 2/2 [         ] ( 2/4) fixcrate tests::flaky
+  TRY 2 PASS [   0.009s] ( 2/4) fixcrate tests::flaky
+        FAIL [   0.088s] ( 3/4) fixcrate tests::fails
+        PASS [   0.002s] ( 4/4) fixcrate::bin/tool cli::works
+     Summary [   0.093s] 4 tests run: 3 passed (1 flaky), 1 failed, 0 skipped
+        FAIL [   0.088s] ( 3/4) fixcrate tests::fails
+error: test run failed";
+
+    #[test]
+    fn a_nextest_human_report_enumerates_its_rows_when_the_summary_witnesses_them() {
+        let parsed = parse_check_output("cargo nextest run", NEXTEST_HUMAN_FIXTURE).unwrap();
+        assert_eq!(parsed.parser, "nextest");
+        assert!(parsed.complete);
+        assert_eq!((parsed.passed, parsed.failed, parsed.skipped), (3, 1, 0));
+        let rows: Vec<(&str, &str, u32, bool)> = parsed
+            .tests
+            .iter()
+            .map(|t| (t.id.as_str(), t.status.as_str(), t.attempts, t.flaky))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("fixcrate tests::passes", "passed", 1, false),
+                ("fixcrate tests::flaky", "passed", 2, true),
+                ("fixcrate tests::fails", "failed", 1, false),
+                ("fixcrate::bin/tool cli::works", "passed", 1, false),
+            ]
+        );
+        // The padded progress counter (`( 3/4)`) still names the failure.
+        let failing: Vec<&str> = parsed.failures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failing, ["fixcrate tests::fails"]);
+        assert_eq!(
+            extract_running_tests("        SLOW [>  60.000s] ( 2/40) fixcrate tests::slow"),
+            ["fixcrate tests::slow"]
+        );
+
+        // A skip has no line at the default status level: nothing enumerates.
+        let skipped = NEXTEST_HUMAN_FIXTURE.replace("0 skipped", "1 skipped");
+        let parsed = parse_check_output("cargo nextest run", &skipped).unwrap();
+        assert!(!parsed.complete);
+        assert!(parsed.tests.is_empty());
+        assert_eq!(parsed.ingestion.unwrap().unenumerated, 5);
+    }
+
+    /// Specimens a282f65d / dbec1123: `test.each` cases whose title has no
+    /// placeholder print one title per case. Each is a test that ran.
+    #[test]
+    fn bun_cases_sharing_one_title_keep_a_row_each() {
+        let output = "\
+scripts/auth-seed-dev-lib.test.ts:
+(pass) development auth seed guards > rejects unsafe configuration [0.10ms]
+(pass) development auth seed guards > rejects unsafe configuration [0.05ms]
+(pass) development auth seed guards > rejects unsafe configuration [0.04ms]
+
+ 3 pass
+ 0 fail
+Ran 3 tests across 1 file. [5.00ms]";
+        let parsed = parse_check_output("bun run test:api", output).unwrap();
+        assert!(parsed.complete);
+        let ids: Vec<&str> = parsed.tests.iter().map(|t| t.id.as_str()).collect();
+        let title = "scripts/auth-seed-dev-lib.test.ts > development auth seed guards > rejects unsafe configuration";
+        assert_eq!(
+            ids,
+            [
+                title.to_string(),
+                format!("{title} (#2)"),
+                format!("{title} (#3)")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_claimed_identity_never_collides_with_a_literal_title() {
+        let mut identities = PrintedIdentities::default();
+        let claimed: Vec<String> = ["t", "t (#2)", "t", "t"]
+            .into_iter()
+            .map(|title| identities.claim(title.to_string()))
+            .collect();
+        assert_eq!(claimed, ["t", "t (#2)", "t (#3)", "t (#4)"]);
     }
 
     #[test]
@@ -3603,6 +3928,13 @@ Exit code: 1";
         assert_eq!(parsed.passed, 11);
         assert!(!parsed.complete, "a per-file line is not a test row");
         assert!(parsed.tests.is_empty());
+        // Specimen triome 14accab2: the tally with no row is said, so no reader
+        // takes the eleven for rows the store lost.
+        let ingestion = parsed.ingestion.unwrap();
+        assert_eq!(
+            (ingestion.received, ingestion.kept, ingestion.unenumerated),
+            (0, 0, 11)
+        );
     }
 
     #[test]
@@ -3647,7 +3979,7 @@ Exit code: 1";
 
     #[test]
     fn every_test_runner_parser_is_one_list() {
-        for parser in ["nextest", "vitest", BUN_TEST_PARSER] {
+        for parser in ["nextest", "vitest", BUN_TEST_PARSER, CARGO_TEST_PARSER] {
             assert!(is_test_runner_parser(parser), "{parser}");
         }
         for parser in ["tsc", RUST_LINT_PARSER, "jest"] {

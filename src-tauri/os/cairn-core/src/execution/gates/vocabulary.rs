@@ -1747,7 +1747,8 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::execution::cache::{
-        record_fresh_check_observation, FreshCheckObservationWrite, SealedCheckCoordinate,
+        record_fresh_check_observation, CheckTestResultRow, FreshCheckObservationWrite,
+        SealedCheckCoordinate,
     };
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{migrated_test_db, SearchIndex};
@@ -2448,10 +2449,27 @@ mod tests {
         }
     }
 
-    fn parse_json(selection: &str) -> String {
-        format!(
-            "{{\"schemaVersion\":1,\"complete\":true,\"selection\":\"{selection}\",\"tests\":[],\"undeclaredSkips\":0,\"parser\":\"nextest\",\"passed\":96,\"failed\":0,\"suiteFailures\":0,\"skipped\":0,\"failures\":[]}}"
-        )
+    /// A green nextest parse under `selection` whose one passing test is both
+    /// tallied and stored, so recording judges it by its selection alone.
+    fn parsed_as(
+        mut observation: FreshCheckObservationWrite,
+        selection: &str,
+    ) -> FreshCheckObservationWrite {
+        observation.target_results_json = Some(format!(
+            "{{\"schemaVersion\":1,\"complete\":true,\"selection\":\"{selection}\",\"tests\":[{{\"id\":\"crate::the_test\",\"status\":\"passed\"}}],\"undeclaredSkips\":0,\"parser\":\"nextest\",\"passed\":1,\"failed\":0,\"suiteFailures\":0,\"skipped\":0,\"failures\":[]}}"
+        ));
+        observation.tests = vec![CheckTestResultRow {
+            test_id: "crate::the_test".to_string(),
+            status: "passed".to_string(),
+            duration_ms: None,
+            attempt_count: Some(1),
+            failure_excerpt: None,
+            skip_reason: None,
+            declaration_source: None,
+            flaky: false,
+            started_offset_ms: None,
+        }];
+        observation
     }
 
     fn passed() -> Value {
@@ -2480,8 +2498,7 @@ mod tests {
             ("obs-unknown", "input-unknown", "unknown"),
             ("obs-full", "input-full", "full"),
         ] {
-            let mut observed = observation(id, input);
-            observed.target_results_json = Some(parse_json(selection));
+            let observed = parsed_as(observation(id, input), selection);
             record_fresh_check_observation(db.clone(), reseal(observed)).unwrap();
             assert_eq!(
                 check_verdict_evidence(db.clone(), &coordinate(input), Some(&passed())).unwrap(),
@@ -2517,13 +2534,11 @@ mod tests {
         record_fresh_check_observation(db.clone(), reseal(incomplete)).unwrap();
 
         // A narrowed, related-mode selection: honest, and not "green on this ref".
-        let mut filtered = observation("obs-filtered", "input-filtered");
-        filtered.target_results_json = Some(parse_json("filtered"));
+        let filtered = parsed_as(observation("obs-filtered", "input-filtered"), "filtered");
         record_fresh_check_observation(db.clone(), reseal(filtered)).unwrap();
 
         // A fast-tier green: everything past the per-test budget was deferred.
-        let mut fast = observation("obs-fast", "input-fast");
-        fast.target_results_json = Some(parse_json("fast"));
+        let fast = parsed_as(observation("obs-fast", "input-fast"), "fast");
         record_fresh_check_observation(db.clone(), reseal(fast)).unwrap();
 
         for input in [

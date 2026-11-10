@@ -108,7 +108,7 @@ pub(super) struct PublishedLanding {
     pub attempt_id: String,
     /// Keeps the attempt in flight until the last copy is dropped, which the
     /// merge command does only after it has journaled the outcome.
-    pub driving: PublicationInFlight,
+    pub _driving: PublicationInFlight,
 }
 
 /// A publication attempt this process is driving, from its intent to its
@@ -116,7 +116,9 @@ pub(super) struct PublishedLanding {
 /// is held. Without it, recovery reads a live publication's missing outcome as
 /// a lost one and settles it under the command that is still recording it.
 #[derive(Clone)]
-pub(super) struct PublicationInFlight(Arc<InFlight>);
+pub(super) struct PublicationInFlight {
+    _held: Arc<InFlight>,
+}
 
 impl PublicationInFlight {
     /// Refused when something in this process already drives the attempt: a
@@ -124,7 +126,9 @@ impl PublicationInFlight {
     /// nothing has been pushed yet.
     pub(super) fn enter(attempt_id: &str) -> Result<Self, String> {
         InFlight::try_enter(attempt_id)
-            .map(|driving| Self(Arc::new(driving)))
+            .map(|driving| Self {
+                _held: Arc::new(driving),
+            })
             .ok_or_else(|| {
                 format!("publication attempt {attempt_id} is already being driven in this process")
             })
@@ -1539,7 +1543,7 @@ pub(super) async fn publish_pinned(
                 published: Some(PublishedLanding {
                     publication,
                     attempt_id: journal.attempt_id.to_string(),
-                    driving,
+                    _driving: driving,
                 }),
             }))
         }

@@ -5,10 +5,14 @@
 //! deliberately different sets. The executor registers the per-batch relay
 //! capability it injects and nothing else; a remote machine is never told the
 //! runner's own credentials, which is the CAIRN-3385 property. Meanwhile the
-//! runner hands its `CAIRN_MCP_SECRET` to terminals, workflows, and host
-//! processes, and the colocated executor is a child of this process. So the one
-//! credential most likely to appear in a terminal's output is precisely the one
-//! the executor cannot recognize. Each end scrubs for what it knows.
+//! runner mints a per-process relay capability for each terminal, REPL,
+//! workflow, and dev instance, and registers it here. On unix the executor
+//! keeps that capability out of the process's environment and attaches it to
+//! calls on the lineage socket; only on Windows does the process carry it in
+//! `CAIRN_MCP_SECRET`. Neither way does the executor register it for
+//! scrubbing, so the credential most likely to appear in a resident process's
+//! output is precisely the one the executor cannot recognize. Each end scrubs
+//! for what it knows.
 //!
 //! Relayed output arrives in chunks whose boundaries fall wherever the
 //! executor's coalescer put them, so this pass is streaming rather than

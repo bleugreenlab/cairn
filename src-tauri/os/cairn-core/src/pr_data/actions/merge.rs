@@ -1387,7 +1387,7 @@ mod tests {
         .unwrap();
         let published = PublishedLanding {
             publication,
-            driving: super::super::default_landing::PublicationInFlight::enter(&publication_id)
+            _driving: super::super::default_landing::PublicationInFlight::enter(&publication_id)
                 .unwrap(),
             attempt_id: publication_id,
         };

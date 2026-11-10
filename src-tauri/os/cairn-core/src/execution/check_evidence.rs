@@ -178,6 +178,17 @@ pub(crate) struct Ingestion {
     pub(crate) duplicate_ids: Vec<String>,
     /// Rows refused for an empty identity or a status that is not terminal.
     pub(crate) invalid_rows: usize,
+    /// Tests the runner's own tally counts that no kept row stands for. A
+    /// printed report that names fewer tests than it counts (vitest's default
+    /// reporter prints no passing row; a capture can lose rows) is read for
+    /// its tally, and its partial rows are not kept as an enumeration. Those
+    /// tests never reached the store, so they are not evidence it lost.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) unenumerated: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// The one classification of a lane result's evidence. Precedence runs from
@@ -615,7 +626,22 @@ pub(crate) fn reconcile_evidence(inputs: EvidenceInputs<'_>) -> EvidenceReconcil
                 ingestion.invalid_rows
             ));
         }
+        if ingestion.unenumerated > 0 {
+            findings.push(format!(
+                "{} of the {} tests the runner's tally counts have no per-test row: its printed report does not enumerate them ({} rows read, {} kept)",
+                ingestion.unenumerated,
+                ingestion.unenumerated + ingestion.kept,
+                ingestion.received,
+                ingestion.kept
+            ));
+        }
     }
+    // The tally's statuses describe the kept rows only when every tallied
+    // test has one.
+    let rows_carry_the_tally = parsed
+        .ingestion
+        .as_ref()
+        .is_none_or(|ingestion| ingestion.unenumerated == 0);
     if parsed.deferred > 0 {
         notes.push(format!(
             "{} deferred: started and terminated at the per-test budget, never judged",
@@ -635,7 +661,7 @@ pub(crate) fn reconcile_evidence(inputs: EvidenceInputs<'_>) -> EvidenceReconcil
             findings.push(format!(
                 "the store holds {stored} rows; ingestion kept {ingested}"
             ));
-        } else if stored_counts != ingested_counts {
+        } else if rows_carry_the_tally && stored_counts != ingested_counts {
             findings.push(format!(
                 "the stored rows ({}) do not match the ingested rows ({}) status by status",
                 counts_text(&stored_counts),
@@ -925,6 +951,45 @@ mod tests {
             .iter()
             .any(|finding| finding.contains("does not reconcile")));
         assert!(evidence.class.revokes_authority());
+    }
+
+    /// Specimens arb 742c682b and triome 14accab2: a printed report read for
+    /// its tally, with no enumeration kept. Nothing reached the store, so the
+    /// store lost nothing; the gap is the missing enumeration, and it is named.
+    #[test]
+    fn a_printed_tally_without_rows_is_an_incomplete_enumeration_not_lost_evidence() {
+        let parsed = parse_check_output(
+            "bunx vitest run",
+            " ✓ src/b.test.ts (11 tests) 5ms\n\n Test Files  1 passed (1)\n      Tests  11 passed (11)\n",
+        )
+        .unwrap();
+        // Through the stored compact column, as an observation read sees it.
+        let compact = crate::execution::cache::compact_verdict_result_for_test(
+            &serde_json::to_string(&parsed).unwrap(),
+        )
+        .unwrap();
+        let stored_parse: ParsedCheckResult = serde_json::from_str(&compact).unwrap();
+        for parsed in [&parsed, &stored_parse] {
+            let evidence = reconcile(Some(parsed), Some(&stored(0, 0, 0, 0)));
+            assert_eq!(evidence.class, EvidenceClass::Incomplete, "{evidence:#?}");
+            assert_eq!((evidence.ingested, evidence.persisted), (Some(0), Some(0)));
+            assert!(
+                evidence
+                    .findings
+                    .iter()
+                    .any(|finding| finding.starts_with("11 of the 11 tests")),
+                "{evidence:#?}"
+            );
+            assert!(
+                !evidence
+                    .findings
+                    .iter()
+                    .any(|finding| finding.contains("the store holds")
+                        || finding.contains("status by status")),
+                "{evidence:#?}"
+            );
+            assert!(evidence.class.revokes_authority());
+        }
     }
 
     #[test]

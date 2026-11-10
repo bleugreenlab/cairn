@@ -155,8 +155,9 @@ fn register_capability(
 /// carries its calls.
 pub(crate) struct MintedResidentRelay {
     pub grant: ResidentRelayGrant,
-    /// The value for the process's `CAIRN_MCP_SECRET`; `None` for a service,
-    /// which presents its run bearers instead.
+    /// The per-process capability, sent in the start's `CAIRN_MCP_SECRET` (the
+    /// executor strips it there on unix and attaches it on the lineage socket);
+    /// `None` for a service, which presents its run bearers instead.
     pub capability: Option<String>,
 }
 

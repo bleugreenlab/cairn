@@ -1,6 +1,7 @@
 //! Incident ingestion consumes cadence evidence; it never schedules a test or
 //! invents a verdict. Fingerprints name identities, not similar-looking prose.
 
+use super::corroboration::{self, Decision, HoldReason};
 use super::*;
 use crate::execution::main_incidents_store::{self, IncidentDraft};
 use crate::issues::crud::IssueAuthorship;
@@ -494,6 +495,17 @@ fn evidence_body(
     body
 }
 
+/// What filing one report came to.
+#[derive(Debug, Default)]
+pub(super) struct Recorded {
+    /// What the cadence notice says about filing.
+    pub(super) note: String,
+    /// When the observation's earliest red held for corroboration stops
+    /// waiting (Unix ms); `None` when nothing is held.
+    pub(super) held_until_ms: Option<i64>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn record(
     db: &LocalDb,
     project: &str,
@@ -502,9 +514,10 @@ pub(super) async fn record(
     report: &CadenceReport<'_>,
     authorship: IssueAuthorship,
     delivery: Option<(&str, i64)>,
-) -> DbResult<String> {
+    names: ExecutorNames<'_>,
+) -> DbResult<Recorded> {
     if matches!(report.verdict, CadenceVerdict::Cancelled { .. }) {
-        return Ok(String::new());
+        return Ok(Recorded::default());
     }
     let row = report.verdict.row();
     let (context, environment) = match row {
@@ -546,12 +559,90 @@ pub(super) async fn record(
     } else {
         Vec::new()
     };
+    // A red whose verdict is a duration, or that the cadence's own diff holds
+    // under a host condition, waits for a second host's row: see
+    // [`corroboration`]. Every other red files now, from one host.
+    let on_host: HashSet<&str> = row
+        .map(|row| {
+            row_diff(row, report.comparison)
+                .host_conditions
+                .into_iter()
+                .flat_map(|group| group.tests)
+                .collect()
+        })
+        .unwrap_or_default();
+    let reasons: BTreeMap<&str, HoldReason> = match row {
+        Some(row) => failed
+            .iter()
+            .filter(|(_, excerpt)| !disk_full(excerpt))
+            .filter_map(|(test, _)| {
+                let failure = match row.tests.get(test) {
+                    Some(TestOutcome::Failed(failure)) => Some(failure),
+                    _ => None,
+                };
+                corroboration::hold_reason(failure, on_host.contains(test.as_str()))
+                    .map(|reason| (test.as_str(), reason))
+            })
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    let sightings = match row {
+        Some(row) if !reasons.is_empty() => {
+            let tests: Vec<&str> = reasons.keys().copied().collect();
+            corroboration::sightings(
+                db,
+                project,
+                key,
+                report.check,
+                report.platform,
+                row,
+                &tests,
+                names,
+            )
+            .await?
+        }
+        _ => HashMap::new(),
+    };
+    let mut ledger = corroboration::Ledger::default();
     let mut disk_tests = Vec::new();
     for (test, excerpt) in &failed {
         if disk_full(excerpt) {
             disk_tests.push((test, excerpt));
             continue;
         }
+        // How a red that waited was decided: the line its evidence carries, and
+        // whether it files without a second host.
+        let waited = match (row, reasons.get(test.as_str())) {
+            (Some(row), Some(&reason)) => {
+                let decision = corroboration::decide(
+                    reason,
+                    row,
+                    sightings
+                        .get(test.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    report.now_ms,
+                );
+                match &decision {
+                    Decision::Held { until_ms } => {
+                        ledger.hold(test, reason, *until_ms);
+                        continue;
+                    }
+                    Decision::Released(release) => {
+                        ledger.release(test, release, row);
+                        continue;
+                    }
+                    Decision::Corroborated(_) | Decision::Uncorroborated(_) => {
+                        ledger.filed(test, &decision, row);
+                        Some((
+                            corroboration::filing_line(reason, &decision, row),
+                            matches!(decision, Decision::Uncorroborated(_)),
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
         let signature = assertion_signature(excerpt);
         let diagnostic_known = [
             "assert",
@@ -593,13 +684,24 @@ pub(super) async fn record(
         } else {
             "Attribution unavailable. No unique existing issue or single comparable introduction bracket establishes ownership.".into()
         };
+        let mut body = evidence_body(report, &context, test, excerpt, &attribution);
+        let mut title = format!("Main {class}: {}", truncate(test, 180));
+        if let Some((line, uncorroborated)) = &waited {
+            body.push_str(line);
+            if *uncorroborated {
+                title = format!(
+                    "Main {class} (single-host, uncorroborated): {}",
+                    truncate(test, 180)
+                );
+            }
+        }
         drafts.push(IncidentDraft {
             fingerprint,
             identity: test.clone(),
             signature,
             class: class.into(),
-            title: format!("Main {class}: {}", truncate(test, 180)),
-            body: evidence_body(report, &context, test, excerpt, &attribution),
+            title,
+            body,
             owner_uri: Some(suspect.unwrap_or_else(|| fallback.clone())),
             existing_issue_uri: known,
             event_key: event.clone(),
@@ -728,11 +830,17 @@ pub(super) async fn record(
             note.push_str(&format!("- {}\n", link.issue_uri));
         }
     }
+    if let Some(row) = row {
+        note.push_str(&ledger.render(row));
+    }
     if pending.count > 0 {
         note.push_str(&format!("\nIncident filing pending: {} retained evidence intents; the existing cadence retries them. Last filing error: {}.\n",
             pending.count, pending.last_error.as_deref().unwrap_or("creation budget reached")));
     }
-    Ok(note)
+    Ok(Recorded {
+        note,
+        held_until_ms: ledger.until_ms(),
+    })
 }
 
 #[cfg(test)]
@@ -764,7 +872,23 @@ mod tests {
         host: &str,
         tests: &[(&str, &str, &str)],
     ) -> CadenceRow {
-        let failed = tests.iter().any(|(_, status, _)| *status == "failed");
+        let tests: Vec<_> = tests
+            .iter()
+            .map(|(test, status, excerpt)| (*test, *status, *excerpt, None))
+            .collect();
+        observation_at(db, id, host, &format!("commit-{id}"), &tests).await
+    }
+
+    /// A row on `commit`, each test optionally dated on the lane's timeline
+    /// as `(started_offset_ms, duration_ms)`.
+    async fn observation_at(
+        db: &LocalDb,
+        id: &str,
+        host: &str,
+        commit: &str,
+        tests: &[(&str, &str, &str, Option<(i64, i64)>)],
+    ) -> CadenceRow {
+        let failed = tests.iter().any(|(_, status, ..)| *status == "failed");
         let observed_at = (count(db, "check_result_observations").await + 1) * 1000;
         db.execute(
             "INSERT INTO check_result_observations
@@ -774,19 +898,61 @@ mod tests {
               runner_build_id,selection)
              VALUES(?1,'p',?2,?3,'rust-tests','input','env',?4,?5,1,0,1,1,?7,17,
                     'main','retained lane log',?6,'linux','x86_64','rust-runtime','runner','full')",
-            params![id,format!("commit-{id}"),format!("tree-{id}"),if failed {100} else {0},
+            params![id,commit,format!("tree-{id}"),if failed {100} else {0},
                 if failed {"failed"} else {"passed"},host,observed_at],
         ).await.unwrap();
-        for (test, status, excerpt) in tests {
+        for (test, status, excerpt, span) in tests {
             db.execute(
-                "INSERT INTO check_test_results(observation_id,test_id,status,failure_excerpt)
-                 VALUES(?1,?2,?3,?4)",
-                params![id, *test, *status, *excerpt],
+                "INSERT INTO check_test_results
+                 (observation_id,test_id,status,failure_excerpt,started_offset_ms,duration_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    *test,
+                    *status,
+                    *excerpt,
+                    span.map(|(start, _)| start),
+                    span.map(|(_, duration)| duration)
+                ],
             )
             .await
             .unwrap();
         }
-        load_row(db, "proj", id, &|host| host.into()).await.unwrap()
+        load_row(db, "proj", id, &names).await.unwrap()
+    }
+
+    fn names(executor: &str) -> String {
+        executor.to_string()
+    }
+
+    async fn record_at(
+        db: &LocalDb,
+        verdict: &CadenceVerdict,
+        comparison: &Comparison,
+        now_ms: i64,
+    ) -> DbResult<Recorded> {
+        let report = CadenceReport {
+            check: "rust-tests",
+            platform: "linux",
+            kind: LaneVerdict::PerTest,
+            commit: Some("requested-tip"),
+            verdict,
+            comparison,
+            bracket: &Bracket::default(),
+            now_ms,
+            rearmed: None,
+        };
+        record(
+            db,
+            "p",
+            "proj",
+            "testing",
+            &report,
+            crate::issues::crud::installation_machine_authorship("fixture-device", 1).unwrap(),
+            None,
+            &names,
+        )
+        .await
     }
 
     async fn record_verdict(
@@ -814,8 +980,10 @@ mod tests {
             &report,
             crate::issues::crud::installation_machine_authorship("fixture-device", 1).unwrap(),
             None,
+            &names,
         )
         .await
+        .map(|recorded| recorded.note)
     }
 
     async fn count(db: &LocalDb, table: &str) -> i64 {
@@ -959,7 +1127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disk_full_has_one_infrastructure_incident_with_explicit_population_but_timeouts_do_not_group(
+    async fn disk_full_has_one_infrastructure_incident_with_explicit_population_and_timeouts_wait_for_a_second_host(
     ) {
         let (_temp, db) = fixture().await;
         let disk = CadenceVerdict::Complete(
@@ -1005,10 +1173,349 @@ mod tests {
             )
             .await,
         );
-        record_verdict(&db, &timed, &Comparison::Baseline, &Bracket::default())
+        let note = record_verdict(&db, &timed, &Comparison::Baseline, &Bracket::default())
             .await
             .unwrap();
-        assert_eq!(count(&db, "main_incidents").await, 3);
+        // Timeouts are not a disk-full census, and from one host they are not
+        // incidents yet either: they wait for a second host's row.
+        assert_eq!(count(&db, "main_incidents").await, 1);
+        assert!(
+            note.contains("**2 timing reds held for corroboration** on `host`"),
+            "{note}"
+        );
+    }
+
+    const TIMEOUT: &str = "TIMEOUT: nextest terminated this test at its slow-timeout bound (src-tauri/.config/nextest.toml)\nran 663s before termination";
+
+    async fn issue_titles(db: &LocalDb) -> Vec<String> {
+        db.query_all("SELECT title FROM issues ORDER BY number", (), |r| {
+            r.text(0)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn evidence_bodies(db: &LocalDb) -> Vec<String> {
+        db.query_all(
+            "SELECT body FROM main_incident_evidence ORDER BY created_at, event_key",
+            (),
+            |r| r.text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Specimens cairn/6470-6472, 6676-6678 and 6685: fedora's reds during an
+    /// I/O stall, minted from its row alone while bginf-sp2 passed them.
+    #[tokio::test]
+    async fn a_single_host_timeout_is_held_then_filed_when_another_host_fails_it_at_the_same_tree()
+    {
+        let (_temp, db) = fixture().await;
+        let test = "binary$slow::case";
+        let fedora = observation_at(
+            &db,
+            "fedora-row",
+            "fedora",
+            "c1",
+            &[(test, "failed", TIMEOUT, None)],
+        )
+        .await;
+        let held = record_at(
+            &db,
+            &CadenceVerdict::Complete(fedora.clone()),
+            &Comparison::Baseline,
+            10_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&db, "issues").await, 0);
+        assert_eq!(count(&db, "main_incident_evidence").await, 0);
+        assert_eq!(
+            held.held_until_ms,
+            Some(fedora.ran_at_ms + corroboration::CORROBORATION_BOUND_MS)
+        );
+        assert!(
+            held.note
+                .contains("**1 timing red held for corroboration** on `fedora` at `c1`"),
+            "{}",
+            held.note
+        );
+        assert!(held.note.contains(&format!("- `{test}`")), "{}", held.note);
+
+        // The second host's red at the same tree is corroborated by the first.
+        let sp2 = observation_at(
+            &db,
+            "sp2-row",
+            "sp2",
+            "c1",
+            &[(test, "failed", TIMEOUT, None)],
+        )
+        .await;
+        let second = record_at(
+            &db,
+            &CadenceVerdict::Complete(sp2),
+            &Comparison::Baseline,
+            20_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.held_until_ms, None);
+        assert_eq!(count(&db, "issues").await, 1);
+
+        // Re-deciding the held row files it too, onto the same incident.
+        let first = record_at(
+            &db,
+            &CadenceVerdict::Complete(fedora),
+            &Comparison::Baseline,
+            20_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.held_until_ms, None);
+        assert!(
+            first
+                .note
+                .contains("filed, corroborated: `sp2` failed it at the same commit"),
+            "{}",
+            first.note
+        );
+        assert_eq!(count(&db, "issues").await, 1);
+        assert_eq!(count(&db, "main_incident_evidence").await, 2);
+        assert_eq!(
+            issue_titles(&db).await,
+            vec![format!("Main test-failure: {test}")]
+        );
+        for body in evidence_bodies(&db).await {
+            assert!(body.contains("corroborated: `"), "{body}");
+            assert!(!body.contains("uncorroborated"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_timeout_is_released_when_another_host_passes_it_at_the_same_tree() {
+        let (_temp, db) = fixture().await;
+        let test = "binary$slow::case";
+        let fedora = observation_at(
+            &db,
+            "fedora-row",
+            "fedora",
+            "c1",
+            &[(test, "failed", TIMEOUT, None)],
+        )
+        .await;
+        observation_at(&db, "sp2-row", "sp2", "c1", &[(test, "passed", "", None)]).await;
+        let recorded = record_at(
+            &db,
+            &CadenceVerdict::Complete(fedora),
+            &Comparison::Baseline,
+            10_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recorded.held_until_ms, None, "released, not held");
+        assert_eq!(count(&db, "issues").await, 0);
+        assert_eq!(count(&db, "main_incident_evidence").await, 0);
+        assert!(
+            recorded.note.contains(&format!("- `{test}` — released: passed on `sp2` at the same commit (cairn://p/proj/check-observations/sp2-row), a difference between hosts, not the tree")),
+            "{}",
+            recorded.note
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_timeout_files_as_single_host_uncorroborated_when_its_wait_ends() {
+        let (_temp, db) = fixture().await;
+        let test = "binary$slow::case";
+        let fedora = observation_at(
+            &db,
+            "fedora-row",
+            "fedora",
+            "c1",
+            &[(test, "failed", TIMEOUT, None)],
+        )
+        .await;
+        let verdict = CadenceVerdict::Complete(fedora.clone());
+        let held = record_at(&db, &verdict, &Comparison::Baseline, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(count(&db, "issues").await, 0);
+        let until = held.held_until_ms.unwrap();
+        let filed = record_at(&db, &verdict, &Comparison::Baseline, until)
+            .await
+            .unwrap();
+        assert_eq!(filed.held_until_ms, None);
+        assert_eq!(
+            issue_titles(&db).await,
+            vec![format!(
+                "Main test-failure (single-host, uncorroborated): {test}"
+            )]
+        );
+        let body = evidence_bodies(&db).await.remove(0);
+        assert!(
+            body.contains("**single-host, uncorroborated**: its 6h wait ended, and no other host's row at `c1` observed it"),
+            "{body}"
+        );
+        assert!(
+            filed
+                .note
+                .contains("filed as single-host, uncorroborated: its 6h wait ended"),
+            "{}",
+            filed.note
+        );
+
+        // The same host's next row at a newer tree, red again, ends the wait
+        // before the bound does; it never corroborates.
+        let (_temp, db) = fixture().await;
+        let first = observation_at(
+            &db,
+            "first",
+            "fedora",
+            "c1",
+            &[(test, "failed", TIMEOUT, None)],
+        )
+        .await;
+        observation_at(
+            &db,
+            "next",
+            "fedora",
+            "c2",
+            &[(test, "failed", TIMEOUT, None)],
+        )
+        .await;
+        let filed = record_at(
+            &db,
+            &CadenceVerdict::Complete(first),
+            &Comparison::Baseline,
+            10_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(filed.held_until_ms, None);
+        assert_eq!(
+            issue_titles(&db).await,
+            vec![format!(
+                "Main test-failure (single-host, uncorroborated): {test}"
+            )]
+        );
+        assert!(
+            filed.note.contains("filed as single-host, uncorroborated: `fedora`'s next row (cairn://p/proj/check-observations/next, at `c2`) failed it again"),
+            "{}",
+            filed.note
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deterministic_assertion_red_files_at_once_from_one_host_beside_a_held_timeout() {
+        let (_temp, db) = fixture().await;
+        let row = observation_at(
+            &db,
+            "fedora-row",
+            "fedora",
+            "c1",
+            &[
+                (
+                    "binary$math::adds",
+                    "failed",
+                    "assertion `left == right` failed\n  left: 1\n right: 2",
+                    None,
+                ),
+                ("binary$slow::case", "failed", TIMEOUT, None),
+            ],
+        )
+        .await;
+        let recorded = record_at(
+            &db,
+            &CadenceVerdict::Complete(row),
+            &Comparison::Baseline,
+            10_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            issue_titles(&db).await,
+            vec!["Main test-failure: binary$math::adds".to_string()]
+        );
+        assert!(recorded.held_until_ms.is_some());
+        assert!(
+            recorded
+                .note
+                .contains("**1 timing red held for corroboration**"),
+            "{}",
+            recorded.note
+        );
+        assert!(!evidence_bodies(&db).await[0].contains("Corroboration:"));
+    }
+
+    /// Specimen cairn://p/cairn/check-observations/06cf896c5e1c4eccb855f24e:
+    /// the cadence held 13 fedora reds under two stall windows, and filing
+    /// minted 6723, 6726, 6728 and 6730 from them anyway.
+    #[tokio::test]
+    async fn reds_inside_a_stall_window_are_never_filed_as_test_failures() {
+        let (_temp, db) = fixture().await;
+        let tests = [
+            "crate::main$alpha::one",
+            "crate::main$beta::two",
+            "crate::main$gamma::three",
+            "crate::main$delta::four",
+        ];
+        let passing: Vec<_> = tests
+            .iter()
+            .map(|test| (*test, "passed", "", None))
+            .collect();
+        let previous = observation_at(&db, "prev", "fedora", "c0", &passing).await;
+        let current = observation_at(
+            &db,
+            "stalled",
+            "fedora",
+            "c1",
+            &[
+                (tests[0], "failed", TIMEOUT, Some((1_000, 600_000))),
+                (tests[1], "failed", TIMEOUT, Some((2_000, 600_000))),
+                // Froze inside the window: no error names the stall.
+                (
+                    tests[2],
+                    "failed",
+                    "assertion failed: froze",
+                    Some((5_000, 1_000)),
+                ),
+                // An hour later: the tree's red.
+                (
+                    tests[3],
+                    "failed",
+                    "assertion failed: real",
+                    Some((3_600_000, 10)),
+                ),
+            ],
+        )
+        .await;
+        let comparison = Comparison::SameExecutor {
+            previous,
+            neighbour: None,
+            peer: None,
+            unread: Unread::default(),
+        };
+        let verdict = CadenceVerdict::Complete(current);
+        let held = record_at(&db, &verdict, &comparison, 10_000).await.unwrap();
+        assert_eq!(
+            issue_titles(&db).await,
+            vec![format!("Main test-failure: {}", tests[3])]
+        );
+        assert!(
+            held.note
+                .contains("**3 reds inside a host condition held for corroboration** on `fedora`"),
+            "{}",
+            held.note
+        );
+        let ended = record_at(&db, &verdict, &comparison, held.held_until_ms.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ended.held_until_ms, None);
+        assert_eq!(count(&db, "issues").await, 1);
+        assert!(
+            ended.note.contains(&format!("- `{}` — recorded as a host condition on `fedora`, not filed as a test failure: its 6h wait ended", tests[2])),
+            "{}",
+            ended.note
+        );
     }
 
     #[tokio::test]
@@ -1539,8 +2046,10 @@ mod tests {
             &report,
             crate::issues::crud::installation_machine_authorship("fixture-device", 1).unwrap(),
             Some((attempt, at_ms)),
+            &names,
         )
         .await
+        .map(|recorded| recorded.note)
     }
 
     /// cairn/6461, cairn/6462 and cairn/6465: one unchanged row-less placement
@@ -1744,8 +2253,10 @@ mod tests {
             &report,
             crate::issues::crud::installation_machine_authorship("fixture-device", 1).unwrap(),
             Some((attempt, 5)),
+            &names,
         )
         .await
+        .map(|recorded| recorded.note)
     }
 
     #[tokio::test]
@@ -2145,7 +2656,7 @@ mod tests {
                 &[(
                     test,
                     "failed",
-                    "TIMEOUT: nextest terminated this test at its slow-timeout bound\nran 600s before termination",
+                    "assertion `left == right` failed: replay recorded twice\n  left: 2\n right: 1",
                 )],
             )
             .await,
@@ -2176,7 +2687,7 @@ mod tests {
             .unwrap();
         assert!(
             comment.contains("assertion failed: replay never recorded")
-                && comment.contains("TIMEOUT: nextest terminated"),
+                && comment.contains("replay recorded twice"),
             "{comment}"
         );
         let evidence = db

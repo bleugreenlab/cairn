@@ -1701,9 +1701,13 @@ pub struct Fleet {
     /// Streaming scrubbers for resident-process output, one per live stream.
     ///
     /// Terminals, REPLs, workflows, and dev instances all reach their consumers
-    /// through one fan-out, and all of them are handed this runner's own
-    /// `CAIRN_MCP_SECRET`. An executor cannot scrub for a credential it was
-    /// never told about, so this is the pass that covers them.
+    /// through one fan-out, and each of them is given a per-process relay
+    /// capability this runner mints (never its machine secret). On unix the
+    /// executor strips it from the environment and attaches it to calls on the
+    /// lineage socket; only on Windows is it carried in `CAIRN_MCP_SECRET`.
+    /// Either way the executor's scrubber registers only per-batch
+    /// capabilities, so this runner, which registered the resident one, is the
+    /// pass that covers it.
     resident_output: output_guard::SharedRelayedOutput,
     recent_cached_completions:
         Arc<Mutex<VecDeque<cairn_common::executor_protocol::CellCompletion>>>,
@@ -40810,9 +40814,11 @@ mod tests {
 
     // ── Ingested output is scrubbed against this runner's registry ─────────
     //
-    // Terminals, REPLs, workflows and dev instances are all handed this runner's
-    // own `CAIRN_MCP_SECRET`, and the executor that runs them was never told
-    // what that value is. These cover the pass that closes that gap.
+    // Terminals, REPLs, workflows and dev instances are each given a
+    // per-process relay capability this runner mints: kept by the executor and
+    // attached on the lineage socket on unix, carried in `CAIRN_MCP_SECRET` only
+    // on Windows. The executor's scrubber does not register it; this runner's
+    // does. These cover the pass that closes that gap.
 
     const RESIDENT_SECRET: &str = "resident-Qa9Zm2Xp7Lr4";
 

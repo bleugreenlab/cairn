@@ -1985,6 +1985,24 @@ pub(crate) struct CheckTestResultRow {
     pub started_offset_ms: Option<i64>,
 }
 
+impl From<&crate::execution::check_parsers::CheckTestResult> for CheckTestResultRow {
+    fn from(test: &crate::execution::check_parsers::CheckTestResult) -> Self {
+        Self {
+            test_id: test.id.clone(),
+            status: test.status.clone(),
+            duration_ms: test.duration_ms.map(|value| value as i64),
+            attempt_count: Some(test.attempts as i64),
+            failure_excerpt: test.failure_message.clone(),
+            skip_reason: test.skip_reason.clone(),
+            declaration_source: test.skip_declaration_source.clone(),
+            flaky: test.flaky,
+            started_offset_ms: test
+                .started_offset_ms
+                .and_then(|offset| i64::try_from(offset).ok()),
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct SealedCheckCoordinate {
@@ -2132,6 +2150,74 @@ pub(crate) struct FreshCheckObservationWrite {
     /// machinery produced (`SubstrateFailureShape::stored`). `None` for a
     /// verdict and for a failure the classifier read from the command's output.
     pub substrate_shape: Option<String>,
+}
+
+impl FreshCheckObservationWrite {
+    /// The rows this write stores, as the store will hold them: one row per
+    /// identity in each table, the first written (both inserts are
+    /// `ON CONFLICT DO NOTHING`).
+    fn stored_rows(&self) -> Vec<&CheckTestResultRow> {
+        let mut held = std::collections::HashSet::new();
+        self.tests
+            .iter()
+            .filter(|test| held.insert((test.status == "deferred", test.test_id.as_str())))
+            .collect()
+    }
+
+    fn stored_counts(&self) -> ObservationTestCounts {
+        let mut counts = ObservationTestCounts::default();
+        for test in self.stored_rows() {
+            match test.status.as_str() {
+                "passed" => counts.passed += 1,
+                "failed" => counts.failed += 1,
+                "skipped" => {
+                    counts.skipped += 1;
+                    counts.self_skipped += usize::from(test.skip_reason.is_some());
+                }
+                "deferred" => counts.deferred += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    /// This observation as it may be recorded: complete and reusable only if
+    /// the one evidence classification every reader applies
+    /// ([`reconcile_evidence`](crate::execution::check_evidence::reconcile_evidence))
+    /// grants that authority to the rows this write will store. The reuse
+    /// predicate reads the stored `complete` and `reusable` columns, so a
+    /// claim decided anywhere else could admit evidence its own page calls
+    /// lost or incomplete. `compact` is the compact result this write stores.
+    fn claiming_only_what_its_rows_carry(mut self, compact: Option<&str>) -> Self {
+        use crate::execution::check_evidence::{reconcile_evidence, EvidenceInputs};
+        if !(self.complete || self.reusable) {
+            return self;
+        }
+        let parsed = compact.and_then(|json| serde_json::from_str(json).ok());
+        let stored = self.stored_counts();
+        let evidence = reconcile_evidence(EvidenceInputs {
+            parsed: parsed.as_ref(),
+            failure_kind: self.failure_kind.as_deref(),
+            expects_enumeration: None,
+            persisted: Some(&stored),
+            reused_from: None,
+            retained_tally_mismatch: None,
+        });
+        if evidence.class.revokes_authority() {
+            if self.reusable || self.non_reusable_reason.is_none() {
+                let gap = evidence
+                    .findings
+                    .first()
+                    .map(|finding| format!(": {finding}"))
+                    .unwrap_or_default();
+                self.non_reusable_reason =
+                    Some(format!("evidence is {}{gap}", evidence.class.label()));
+            }
+            self.complete = false;
+            self.reusable = false;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2637,9 +2723,12 @@ pub(crate) fn record_fresh_check_observation(
             "reusable check observation does not match its sealed check coordinate".to_string(),
         );
     }
+    let compact = compact_verdict_result(observation.target_results_json.as_deref());
+    let observation = observation.claiming_only_what_its_rows_carry(compact.as_deref());
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
             let observation = observation.clone();
+            let compact = compact.clone();
             Box::pin(async move {
                 // Keep immutable equality and insertion under Turso's positional
                 // bind limit by carrying the trailing provenance as one value.
@@ -2648,7 +2737,7 @@ pub(crate) fn record_fresh_check_observation(
                     "definedByCommitSha": observation.defined_by_commit_sha,
                     "publicHandle": observation.public_handle,
                     "publicationId": observation.publication_id,
-                    "verdictResultJson": compact_verdict_result(observation.target_results_json.as_deref()),
+                    "verdictResultJson": compact,
                     "verdictPlatform": observation.verdict_platform,
                     "verdictArch": observation.verdict_arch,
                     "verdictEnvironmentHash": observation.verdict_environment_hash,
@@ -2756,7 +2845,8 @@ pub(crate) fn record_fresh_check_observation(
                     while let Some(row) = tests.next().await? {
                         stored.push(observation_test_row(&row)?);
                     }
-                    let mut expected = observation.tests.clone();
+                    let mut expected: Vec<CheckTestResultRow> =
+                        observation.stored_rows().into_iter().cloned().collect();
                     expected.sort_by(|a, b| a.test_id.cmp(&b.test_id));
                     if stored != expected {
                         return Err(crate::storage::DbError::internal(format!(
@@ -3128,8 +3218,10 @@ fn compact_verdict_result(json: Option<&str>) -> Option<String> {
         "skipped": summary.skipped, "deferred": summary.deferred,
         "unverified": summary.unverified, "failures": [],
     });
-    // Only results that carry accounting grow the column, so a row recorded
-    // before it keeps its exact immutable shape on re-record.
+    // Only results that carry accounting or an ingestion record grow the
+    // column, so a row recorded before them keeps its exact immutable shape on
+    // re-record. The ingestion record is what tells a printed report's tally
+    // with no kept rows from rows the store lost.
     if let Some(accounting) = summary.accounting {
         compact["accounting"] = accounting;
         compact["ingestion"] = summary.ingestion.unwrap_or(serde_json::Value::Null);
@@ -3138,6 +3230,8 @@ fn compact_verdict_result(json: Option<&str>) -> Option<String> {
             .report
             .and_then(|report| report.lines().next().map(str::to_string))
             .map_or(serde_json::Value::Null, serde_json::Value::String);
+    } else if let Some(ingestion) = summary.ingestion {
+        compact["ingestion"] = ingestion;
     }
     Some(compact.to_string())
 }
@@ -4538,6 +4632,164 @@ pub(crate) mod tests {
             .findings
             .iter()
             .any(|finding| finding.contains("status by status")));
+    }
+
+    /// Specimens arb 742c682b / b878ab1c (`cargo test`) and triome 631e1e04 /
+    /// 14accab2 (vitest), on a project other than cairn: every row a printed
+    /// report enumerates is stored under the observation and reads back, and the
+    /// observation reads accounted for rather than lost.
+    #[tokio::test]
+    async fn a_non_cairn_projects_printed_reports_persist_every_row() {
+        use crate::execution::check_evidence::{reconcile_evidence, EvidenceInputs};
+        use crate::execution::check_parsers::parse_check_output;
+        let db = cache_db().await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES ('arb', 'default', 'arb', 'ARB', '/tmp/arb', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let reports = [
+            (
+                "cargo-test",
+                "cargo test --test schema",
+                "running 2 tests\ntest the_committed_schema_is_the_derived_one ... ok\ntest the_schema_names_its_root_and_definitions ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s\n\n\n\nstderr:\n   Compiling arbiter v0.1.0 (/slot)\n     Running tests/schema.rs (target/debug/deps/schema-3f589f9331f9e383)\n",
+            ),
+            (
+                "nextest",
+                "cargo nextest run",
+                "        PASS [   0.004s] (1/3) arbiter tests::a\n        PASS [   0.004s] (2/3) arbiter tests::b\n        FAIL [   0.004s] (3/3) arbiter tests::c\n     Summary [   0.010s] 3 tests run: 2 passed, 1 failed, 0 skipped\n        FAIL [   0.004s] (3/3) arbiter tests::c\nerror: test run failed\n",
+            ),
+            (
+                "vitest",
+                "bunx vitest run --reporter=verbose",
+                " ✓ src/a.test.ts > a > works 1ms\n × src/a.test.ts > a > breaks 2ms\n   → expected 1 to be 2\n ↓ src/a.test.ts > a > later\n\n Test Files  1 failed (1)\n      Tests  1 failed | 1 passed | 1 skipped (3)\n",
+            ),
+        ];
+        for (name, command, output) in reports {
+            let parsed = parse_check_output(command, output).unwrap();
+            assert!(parsed.complete && !parsed.tests.is_empty(), "{name}");
+            let mut write =
+                observation(&format!("obs-arb-{name}"), &format!("c-{name}"), "env-arb");
+            write.project_id = "arb".to_string();
+            write.check_name = name.to_string();
+            write.exit_code = i32::from(parsed.failed > 0);
+            write.verdict = if parsed.failed > 0 {
+                "failed"
+            } else {
+                "passed"
+            }
+            .to_string();
+            write.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
+            write.tests = parsed.tests.iter().map(CheckTestResultRow::from).collect();
+            record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+
+            let stored = db
+                .query_all(
+                    format!(
+                        "SELECT test_id FROM check_test_results WHERE observation_id='{}' ORDER BY test_id",
+                        write.id
+                    ),
+                    (),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap();
+            let mut expected: Vec<String> = parsed.tests.iter().map(|t| t.id.clone()).collect();
+            expected.sort();
+            assert_eq!(stored, expected, "{name}: every row reads back");
+
+            let projection =
+                get_check_result_observation_by_handle(db.clone(), "arb", &write.public_handle)
+                    .unwrap()
+                    .unwrap();
+            let evidence = reconcile_evidence(EvidenceInputs {
+                parsed: projection.verdict_result.as_ref(),
+                failure_kind: projection.failure_kind.as_deref(),
+                expects_enumeration: None,
+                persisted: Some(&projection.persisted_counts),
+                reused_from: None,
+                retained_tally_mismatch: None,
+            });
+            let rows = Some(parsed.tests.len());
+            assert_eq!(
+                (evidence.ingested, evidence.persisted),
+                (rows, rows),
+                "{name}"
+            );
+            assert!(evidence.findings.is_empty(), "{name}: {evidence:#?}");
+            assert!(projection.complete && projection.reusable, "{name}");
+        }
+    }
+
+    /// Specimens a282f65d / dbec1123 (api@aa6c0e2fd207): six cases under one
+    /// title reached the writer as six rows of one identity, the store held
+    /// one, and the observation was still recorded complete and reusable, so a
+    /// later request reused what its own page called lost evidence. The writer
+    /// records only the authority the evidence classification grants the rows
+    /// it stores, and the reuse predicate reads exactly that.
+    #[tokio::test]
+    async fn rows_the_store_cannot_hold_revoke_the_authority_reuse_reads() {
+        let db = cache_db().await;
+        let claimed = r#"{"parser":"bun-test","complete":true,"selection":"unknown","passed":6,"failed":0,"skipped":0,"failures":[]}"#;
+        let row = |id: String| CheckTestResultRow {
+            test_id: id,
+            status: "passed".to_string(),
+            duration_ms: None,
+            attempt_count: Some(1),
+            failure_excerpt: None,
+            skip_reason: None,
+            declaration_source: None,
+            flaky: false,
+            started_offset_ms: None,
+        };
+        let title = "seed guards > rejects unsafe configuration";
+        let mut collided = observation("obs-collided", "commit-collided", "env-collided");
+        collided.check_name = "api".to_string();
+        collided.target_results_json = Some(claimed.to_string());
+        collided.tests = (0..6).map(|_| row(title.to_string())).collect();
+        let mut distinct = observation("obs-distinct", "commit-distinct", "env-distinct");
+        distinct.check_name = "api".to_string();
+        distinct.target_results_json = Some(claimed.to_string());
+        distinct.tests = (1..=6).map(|n| row(format!("{title} (#{n})"))).collect();
+        for write in [&collided, &distinct] {
+            record_fresh_check_observation(db.clone(), write.clone()).unwrap();
+        }
+
+        let reusable = |environment: &str| {
+            get_reusable_check_observation_id(
+                db.clone(),
+                "project-a",
+                "api",
+                "input-rust",
+                environment,
+                1,
+            )
+            .unwrap()
+        };
+        assert_eq!(reusable("env-collided"), None);
+        assert_eq!(reusable("env-distinct").as_deref(), Some("obs-distinct"));
+
+        let recorded = db
+            .query_all(
+                "SELECT complete, reusable, non_reusable_reason FROM check_result_observations
+                  WHERE id='obs-collided'",
+                (),
+                |row| Ok((row.i64(0)?, row.i64(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap();
+        let (complete, reusable, reason) = recorded[0].clone();
+        assert_eq!((complete, reusable), (0, 0));
+        assert!(
+            reason
+                .starts_with("evidence is lost evidence: the store holds 1 rows; ingestion kept 6"),
+            "{reason}"
+        );
+
+        // A re-record of the same write normalizes the same way, so it is the
+        // same immutable observation rather than a conflicting one.
+        record_fresh_check_observation(db.clone(), collided).unwrap();
     }
 
     async fn cache_db() -> Arc<LocalDb> {
@@ -7144,7 +7396,7 @@ pub(crate) mod tests {
         valid.cadence = "main".into();
         record_fresh_check_observation(db.clone(), valid.clone()).unwrap();
         record_fresh_check_observation(db.clone(), valid).unwrap();
-        let sources = crate::execution::main_incidents_store::pending_sources(&db, 10)
+        let sources = crate::execution::main_incidents_store::pending_sources(&db, 10, i64::MAX)
             .await
             .unwrap();
         assert_eq!(sources.len(), 1);

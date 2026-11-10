@@ -50,8 +50,10 @@ pub(super) async fn capture(
     Ok(Some(event))
 }
 
+/// Prepare every source that is due: never prepared, failed before, or held
+/// for corroboration past the end of its wait.
 pub(super) async fn retry(orch: &Orchestrator, db: &LocalDb) {
-    let sources = match store::pending_sources(db, 20).await {
+    let sources = match store::pending_sources(db, 20, now_ms() / 1000).await {
         Ok(sources) => sources,
         Err(error) => {
             log::error!("main incident source scan failed: {error}");
@@ -59,35 +61,86 @@ pub(super) async fn retry(orch: &Orchestrator, db: &LocalDb) {
         }
     };
     for source in sources {
-        if let Err(error) = replay(orch, db, &source).await {
-            let mut message = format!(
-                "FAIL-TO-FILE: main incident source {} could not be prepared: {error}; retained for retry. Held observation: {}.",
-                source.draft.event_key,
-                source.draft.observation_id.as_deref().unwrap_or("none (row-less source)")
-            );
-            if let Err(error) = store::finish_source(
-                db,
-                &source.project_id,
-                &source.draft.event_key,
-                Some(error.clone()),
-                now_ms() / 1000,
-            )
-            .await
-            {
-                log::error!("could not record main incident source retry error: {error}");
+        match prepare(orch, db, &source).await {
+            Ok((note, _)) => {
+                if filing_notice_due(orch, &source.project_id, &note, now_ms()) {
+                    let notify = failure_notify(db, &source).await;
+                    deliver(orch, db, &source.project_id, &notify, &note).await;
+                }
             }
-            if let Ok(health) =
-                store::source_health(db, Some(&source.project_id), now_ms() / 1000).await
-            {
-                message.push_str(&format!("\n{health}"));
-            }
-            log::error!("{message}");
-            let notify = failure_notify(db, &source).await;
-            if filing_notice_due(orch, &source.project_id, &message, now_ms()) {
-                deliver(orch, db, &source.project_id, &notify, &message).await;
+            Err(error) => {
+                let message = preparation_failed(db, &source, &error).await;
+                let notify = failure_notify(db, &source).await;
+                if filing_notice_due(orch, &source.project_id, &message, now_ms()) {
+                    deliver(orch, db, &source.project_id, &notify, &message).await;
+                }
             }
         }
     }
+}
+
+/// Re-decide the reds a lane's earlier rows hold for corroboration, now that
+/// a new row (`current`, which is not revisited) has landed on it, and say what
+/// that settled for the new row's notice. A source that stays held says
+/// nothing unless it filed an incident; its row's own notice listed it.
+pub(super) async fn revisit_held(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project: &str,
+    lane: &CadenceLane,
+    current: Option<&str>,
+) -> String {
+    let sources = match store::held_sources(db, project, &lane.check, &lane.platform).await {
+        Ok(sources) => sources,
+        Err(error) => {
+            log::error!("main incident held-source scan failed: {error}");
+            return format!("\nReds held for corroboration on this lane could not be re-read: {error}. They stay held, and the heartbeat decides them when their wait ends.\n");
+        }
+    };
+    let mut out = String::new();
+    for source in sources
+        .iter()
+        .filter(|source| Some(source.draft.event_key.as_str()) != current)
+    {
+        match prepare(orch, db, source).await {
+            Ok((note, still_held)) => {
+                if !still_held || note.contains("Durable main incidents") {
+                    out.push_str(&note);
+                }
+            }
+            Err(error) => {
+                out.push('\n');
+                out.push_str(&preparation_failed(db, source, &error).await);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Record a source's preparation failure for retry, and the notice naming it.
+async fn preparation_failed(db: &LocalDb, source: &IncidentSource, error: &str) -> String {
+    let mut message = format!(
+        "FAIL-TO-FILE: main incident source {} could not be prepared: {error}; retained for retry. Held observation: {}.",
+        source.draft.event_key,
+        source.draft.observation_id.as_deref().unwrap_or("none (row-less source)")
+    );
+    if let Err(error) = store::finish_source(
+        db,
+        &source.project_id,
+        &source.draft.event_key,
+        Some(error.to_string()),
+        now_ms() / 1000,
+    )
+    .await
+    {
+        log::error!("could not record main incident source retry error: {error}");
+    }
+    if let Ok(health) = store::source_health(db, Some(&source.project_id), now_ms() / 1000).await {
+        message.push_str(&format!("\n{health}"));
+    }
+    log::error!("{message}");
+    message
 }
 
 // Routing a preparation error is not classifying the observation. In particular,
@@ -135,7 +188,14 @@ async fn failure_notify(db: &LocalDb, source: &IncidentSource) -> String {
     "testing".into()
 }
 
-async fn replay(orch: &Orchestrator, db: &LocalDb, source: &IncidentSource) -> Result<(), String> {
+/// Rebuild a source's report from its immutable observation and file it:
+/// filing's note, and whether the observation still holds reds for
+/// corroboration.
+async fn prepare(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    source: &IncidentSource,
+) -> Result<(String, bool), String> {
     let draft = &source.draft;
     let (key, repo_path) = db
         .query_one(
@@ -259,7 +319,7 @@ async fn replay(orch: &Orchestrator, db: &LocalDb, source: &IncidentSource) -> R
         now_ms: now_ms(),
         rearmed: None,
     };
-    let note = incident_note(
+    Ok(incident_note(
         orch,
         db,
         &source.project_id,
@@ -268,11 +328,7 @@ async fn replay(orch: &Orchestrator, db: &LocalDb, source: &IncidentSource) -> R
         &report,
         Some((&draft.event_key, source.created_at * 1000)),
     )
-    .await;
-    if filing_notice_due(orch, &source.project_id, &note, report.now_ms) {
-        deliver(orch, db, &source.project_id, &notify, &note).await;
-    }
-    Ok(())
+    .await)
 }
 
 #[cfg(test)]
@@ -361,14 +417,29 @@ mod tests {
     }
 
     async fn observed(db: &LocalDb, id: &str, commit: &str, tree: &str, failed: bool, at: i64) {
+        let excerpt = failed.then_some("assertion failed: old red");
+        observed_on(db, id, commit, tree, "host", excerpt, at).await;
+    }
+
+    /// A row of `binary$test` on `host`: red with `excerpt`, or green.
+    async fn observed_on(
+        db: &LocalDb,
+        id: &str,
+        commit: &str,
+        tree: &str,
+        host: &str,
+        excerpt: Option<&str>,
+        at: i64,
+    ) {
+        let failed = excerpt.is_some();
         db.execute(
             "INSERT INTO check_result_observations
              (id,project_id,commit_sha,tree_hash,check_name,input_hash,environment_fingerprint,
               exit_code,verdict,complete,reusable,parser_version,result_schema_version,ran_at,duration_ms,
               cadence,output_tail,executor_id,verdict_platform,selection)
              VALUES(?1,'p',?2,?3,'rust-tests',?1,'env',?4,?5,1,0,1,1,?6,1,
-                    'main','retained log','host','linux','full')",
-            params![id,commit,tree,if failed {100} else {0},if failed {"failed"} else {"passed"},at],
+                    'main','retained log',?7,'linux','full')",
+            params![id,commit,tree,if failed {100} else {0},if failed {"failed"} else {"passed"},at,host],
         ).await.unwrap();
         db.execute(
             "INSERT INTO check_test_results(observation_id,test_id,status,failure_excerpt)
@@ -376,11 +447,7 @@ mod tests {
             params![
                 id,
                 if failed { "failed" } else { "passed" },
-                if failed {
-                    "assertion failed: old red"
-                } else {
-                    ""
-                }
+                excerpt.unwrap_or("")
             ],
         )
         .await
@@ -431,7 +498,9 @@ mod tests {
         );
         let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
         observed(&db, "unreadable", &"f".repeat(40), &tree, true, now_ms()).await;
-        let pending = store::pending_sources(&db, 20).await.unwrap();
+        let pending = store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].draft.notify.is_none() && pending[0].draft.lane_kind.is_none());
         retry(&orch, &db).await;
@@ -462,7 +531,9 @@ mod tests {
             (1, 1, 1)
         );
         assert!(health.to_string().contains("FAIL-TO-FILE"));
-        let pending = store::pending_sources(&db, 20).await.unwrap();
+        let pending = store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].draft.notify.is_none() && pending[0].draft.lane_kind.is_none());
         assert_eq!(count(&db, "issues").await, 0);
@@ -516,7 +587,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((health.pending, health.held_observations), (1, 1));
-        let pending = store::pending_sources(&db, 20).await.unwrap();
+        let pending = store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap();
         assert_eq!(pending.len(), 1);
         let notice = db
             .query_opt_text(
@@ -555,7 +628,10 @@ mod tests {
             .await
             .unwrap();
         retry(&orch, &db).await;
-        assert!(store::pending_sources(&db, 20).await.unwrap().is_empty());
+        assert!(store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(count(&db, "issues").await, 2);
         assert_eq!(count(&db, "comments").await, 1);
         assert_eq!(count(&db, "main_incident_evidence").await, 1);
@@ -614,7 +690,10 @@ mod tests {
             .await
             .unwrap();
         retry(&orch, &db).await;
-        assert!(store::pending_sources(&db, 20).await.unwrap().is_empty());
+        assert!(store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(count(&db, "issues").await, 1);
         db.execute("DELETE FROM check_result_observations WHERE id='held'", ())
             .await
@@ -630,7 +709,13 @@ mod tests {
         let initial_tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
         observed(&db, "red", &initial, &initial_tree, true, 1000).await;
         assert_eq!(count(&db, "main_incident_evidence").await, 0);
-        assert_eq!(store::pending_sources(&db, 20).await.unwrap().len(), 1);
+        assert_eq!(
+            store::pending_sources(&db, 20, now_ms() / 1000)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         // A crash has lost all in-memory reporting state; main advances before replay.
         std::fs::write(repo.join("advance"), "new tip").unwrap();
         git(&repo, &["add", "advance"]);
@@ -650,7 +735,9 @@ mod tests {
         let tip_tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
         observed(&db, "green", &tip, &tip_tree, false, 2000).await;
         retry(&orch, &db).await;
-        let pending = store::pending_sources(&db, 20).await.unwrap();
+        let pending = store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap();
         assert!(
             pending.is_empty(),
             "pending source replay failed: {pending:?}"
@@ -671,6 +758,111 @@ mod tests {
         assert_eq!(count(&db, "executions").await, 0);
         retry(&orch, &db).await;
         assert_eq!(count(&db, "comments").await, 1);
+    }
+
+    /// A held timing red is not a failure to file: its source stays
+    /// unacknowledged (so retention keeps the observation) without reading as
+    /// pending or stuck, and the next row on the lane decides it.
+    #[tokio::test]
+    async fn a_held_timing_red_keeps_its_observation_until_a_second_host_corroborates_it() {
+        const TIMEOUT: &str = "TIMEOUT: nextest terminated this test at its slow-timeout bound (src-tauri/.config/nextest.toml)\nran 663s before termination";
+        let (_temp, db, orch, repo) = fixture().await;
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+        observed_on(
+            &db,
+            "fedora-row",
+            &commit,
+            &tree,
+            "fedora",
+            Some(TIMEOUT),
+            now_ms(),
+        )
+        .await;
+        retry(&orch, &db).await;
+        assert_eq!(count(&db, "issues").await, 0);
+        assert_eq!(count(&db, "main_incident_evidence").await, 0);
+        let now = now_ms() / 1000;
+        assert!(store::pending_sources(&db, 20, now)
+            .await
+            .unwrap()
+            .is_empty());
+        let health = store::source_health(&db, Some("p"), now).await.unwrap();
+        assert_eq!(
+            (
+                health.pending,
+                health.held_for_corroboration,
+                health.held_observations,
+                health.stuck
+            ),
+            (0, 1, 1, 0)
+        );
+        assert!(
+            health.to_string().contains("1 held for corroboration"),
+            "{health}"
+        );
+        db.execute(
+            "DELETE FROM check_result_observations WHERE id='fedora-row'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(&db, "check_result_observations").await,
+            1,
+            "the held observation is the evidence, so retention keeps it"
+        );
+        // The heartbeat takes it back once the wait ends.
+        assert_eq!(
+            store::pending_sources(&db, 20, now + 7 * 3600)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        observed_on(
+            &db,
+            "sp2-row",
+            &commit,
+            &tree,
+            "sp2",
+            Some(TIMEOUT),
+            now_ms(),
+        )
+        .await;
+        let lane = CadenceLane {
+            check: "rust-tests".into(),
+            platform: "linux".into(),
+            notify: "testing".into(),
+            verdict: LaneVerdict::PerTest,
+        };
+        let note = revisit_held(&orch, &db, "p", &lane, Some("observation:sp2-row")).await;
+        assert!(note.contains("filed, corroborated"), "{note}");
+        assert_eq!(count(&db, "issues").await, 1);
+        assert!(store::held_sources(&db, "p", "rust-tests", "linux")
+            .await
+            .unwrap()
+            .is_empty());
+        // The second host's own source files onto the same incident.
+        retry(&orch, &db).await;
+        assert!(store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(count(&db, "issues").await, 1);
+        assert_eq!(count(&db, "main_incident_evidence").await, 2);
+        db.execute(
+            "DELETE FROM check_result_observations WHERE id='fedora-row'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count(&db, "check_result_observations").await,
+            1,
+            "acknowledgement released the held observation"
+        );
     }
 
     #[tokio::test]
@@ -694,9 +886,18 @@ mod tests {
         capture(&db, "p", &lane, None, &verdict, &first, 1000)
             .await
             .unwrap();
-        assert_eq!(store::pending_sources(&db, 20).await.unwrap().len(), 1);
+        assert_eq!(
+            store::pending_sources(&db, 20, now_ms() / 1000)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         retry(&orch, &db).await;
-        assert!(store::pending_sources(&db, 20).await.unwrap().is_empty());
+        assert!(store::pending_sources(&db, 20, now_ms() / 1000)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(count(&db, "issues").await, 1);
         db.execute("UPDATE issues SET status='closed',closed_at=2", ())
             .await
