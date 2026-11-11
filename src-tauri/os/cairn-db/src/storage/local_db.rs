@@ -16,7 +16,7 @@ use cairn_platform::runtime_regions;
 use cairn_platform::stack::off_frame;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
-use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{error::Elapsed, sleep, timeout};
 use turso::{params::IntoParams, Builder, Connection, Row};
 
@@ -130,6 +130,25 @@ pub fn install_crypto_provider() {
 /// cover the realistic peak of *simultaneous* transactions.
 const MAX_IDLE_CONNECTIONS: usize = 32;
 
+/// Most pooled writes one [`LocalDb`] has holding a connection at once.
+///
+/// Every pooled write holds a connection, its page cache (up to
+/// [`PAGE_CACHE_LIMIT`]) and an MVCC transaction for as long as the engine
+/// keeps its statement parked. Unbounded, a host with many periodic writers
+/// whose statements the engine parks for minutes ends up carrying one parked
+/// transaction per writer; 182 were held at once on 2026-11-08. A writer past
+/// the ceiling waits for a slot in process instead, first come first served,
+/// where the wait is cheap and the gate watch can name it.
+///
+/// Equal to [`MAX_IDLE_CONNECTIONS`] so a full complement of writers runs on
+/// warm connections, and above every ordinary day's observed peak (30). The
+/// ceiling bounds what a parked statement costs, not how long it parks.
+///
+/// A write issued from inside another pooled write's transaction on the same
+/// task bypasses the ceiling (see [`INSIDE_POOLED_WRITE`]), so nesting cannot
+/// wait on a slot its own caller holds.
+const MAX_IN_FLIGHT_POOLED_WRITES: usize = 32;
+
 /// Per-connection page cache ceiling, as a negative `PRAGMA cache_size` (KiB).
 ///
 /// The engine's default is `-2000` — two megabytes, a few hundred pages. The MVCC
@@ -155,7 +174,8 @@ const MAX_IDLE_CONNECTIONS: usize = 32;
 ///
 /// It is a ceiling rather than a reservation, so a connection that never
 /// checkpoints does not pay it, and the cost is bounded by the pool's
-/// [`MAX_IDLE_CONNECTIONS`] plus whatever transactions are genuinely in flight.
+/// [`MAX_IDLE_CONNECTIONS`] plus whatever transactions are genuinely in flight,
+/// of which pooled writes are at most [`MAX_IN_FLIGHT_POOLED_WRITES`].
 const PAGE_CACHE_LIMIT: i32 = -65536;
 
 /// `PRAGMA mvcc_checkpoint_threshold` value that disables the engine's
@@ -1177,6 +1197,61 @@ impl LocalDb {
         self
     }
 
+    /// Run at most `ceiling` pooled writes at once instead of
+    /// [`MAX_IN_FLIGHT_POOLED_WRITES`], so a test can reach the ceiling with a
+    /// handful of writers, or park every writer behind one it holds open.
+    /// Call it on a fresh handle, before any write is in flight.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn limit_pooled_writes_for_test(&self, ceiling: usize) {
+        let ceiling = ceiling.clamp(1, MAX_IN_FLIGHT_POOLED_WRITES);
+        self.gate
+            .write_slots
+            .forget_permits(MAX_IN_FLIGHT_POOLED_WRITES - ceiling);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_write_ceiling(self, ceiling: usize) -> Self {
+        self.limit_pooled_writes_for_test(ceiling);
+        self
+    }
+
+    /// Every pooled write that has waited longer than `threshold` for a slot
+    /// under [`MAX_IN_FLIGHT_POOLED_WRITES`], each reported once and then again
+    /// only every `rewarn` while it still waits.
+    ///
+    /// A waiter holds no connection, so it is not in [`Self::overdue_holders`]
+    /// and no checkpoint drain counts it; this is how the gate watch sees it.
+    pub fn overdue_write_waiters(
+        &self,
+        threshold: Duration,
+        rewarn: Duration,
+    ) -> Vec<OverdueWriteWaiter> {
+        let now = Instant::now();
+        let mut state = self.gate.lock();
+        let mut overdue = Vec::new();
+        for waiter in state.waiting.values_mut() {
+            let age = now.saturating_duration_since(waiter.since);
+            if age < threshold
+                || waiter
+                    .last_warned
+                    .is_some_and(|at| now.saturating_duration_since(at) < rewarn)
+            {
+                continue;
+            }
+            waiter.last_warned = Some(now);
+            overdue.push(OverdueWriteWaiter {
+                caller: waiter.caller,
+                age,
+            });
+        }
+        overdue
+    }
+
+    /// Pooled writes waiting for a slot right now.
+    pub fn pooled_writes_waiting(&self) -> usize {
+        self.gate.lock().waiting.len()
+    }
+
     /// Every connection held longer than `threshold`, each reported once and
     /// then again only every `rewarn` while it is still held.
     ///
@@ -1387,8 +1462,16 @@ impl LocalDb {
     /// what makes the pool structurally deadlock-free: a call path that nested
     /// one database call inside another's transaction closure would get its own
     /// connection rather than block forever on one its own caller is holding.
-    /// Concurrency is therefore unbounded exactly as it was before pooling;
     /// [`MAX_IDLE_CONNECTIONS`] bounds only what is *retained* when idle.
+    ///
+    /// Pooled writes do wait, for a slot under [`MAX_IN_FLIGHT_POOLED_WRITES`],
+    /// and before the gate admits them, so a waiter holds no connection and a
+    /// checkpoint drain never counts it. The slot travels with the connection's
+    /// gate registration and frees when it drops; a write's retry loop releases
+    /// both between attempts, so backoff never holds one. Nesting stays
+    /// deadlock-free because a write issued from inside a pooled write's
+    /// transaction on the same task takes no slot (see [`INSIDE_POOLED_WRITE`]).
+    /// Reads and `connect` holders are not bounded here.
     ///
     /// It does wait at the [`ConnectionGate`], which is a different thing and
     /// does not reintroduce that hazard. The gate is shut only while maintenance
@@ -1409,7 +1492,13 @@ impl LocalDb {
         kind: HolderKind,
         holder: &Holder,
     ) -> DbResult<TrackedConnection> {
-        let slot = self.gate.admit(caller, kind, holder.clone()).await;
+        let write_permit = if kind == HolderKind::PooledWrite && !inside_pooled_write() {
+            Some(self.gate.write_slot(caller).await)
+        } else {
+            None
+        };
+        let mut slot = self.gate.admit(caller, kind, holder.clone()).await;
+        slot.write_permit = write_permit;
         let pooled = self
             .idle
             .lock()
@@ -1946,7 +2035,9 @@ impl LocalDb {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, holder)
                 .await?;
-            let outcome = run_tx(&conn, begin_sql, &mut f).await;
+            let outcome = INSIDE_POOLED_WRITE
+                .scope((), run_tx(&conn, begin_sql, &mut f))
+                .await;
             // Released between attempts as well as after the last one, so a
             // contended write that retries several times still reuses one warm
             // connection instead of creating one per attempt.
@@ -2352,6 +2443,10 @@ pub(super) struct ConnectionGate {
     /// attempt it cannot make. On the gate because a slow commit reports it,
     /// and the gate is what every connection reaches.
     checkpoint_in_engine: Arc<AtomicBool>,
+    /// The [`MAX_IN_FLIGHT_POOLED_WRITES`] slots. Tokio's semaphore queues
+    /// waiters in arrival order, so a slot that frees goes to the writer that
+    /// has waited longest.
+    write_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Default)]
@@ -2359,6 +2454,50 @@ struct GateState {
     closed: bool,
     next_id: u64,
     live: HashMap<u64, LiveConnection>,
+    /// Pooled writes waiting for a slot, keyed from the same id space as
+    /// `live`. Never counted by a drain: none of them holds a connection.
+    waiting: HashMap<u64, WriteWaiter>,
+}
+
+#[derive(Debug)]
+struct WriteWaiter {
+    caller: Caller,
+    since: Instant,
+    last_warned: Option<Instant>,
+}
+
+/// One pooled write that has waited past the watch threshold for a slot under
+/// [`MAX_IN_FLIGHT_POOLED_WRITES`].
+#[derive(Debug, Clone)]
+pub struct OverdueWriteWaiter {
+    pub caller: Caller,
+    pub age: Duration,
+}
+
+tokio::task_local! {
+    /// Set for the body of a pooled write transaction. A pooled write issued
+    /// from inside one, on the same task, takes no slot under
+    /// [`MAX_IN_FLIGHT_POOLED_WRITES`]: its caller already holds one and will
+    /// not release it until the nested write returns, so waiting would let a
+    /// full complement of nesting writers deadlock the ceiling.
+    static INSIDE_POOLED_WRITE: ();
+}
+
+fn inside_pooled_write() -> bool {
+    INSIDE_POOLED_WRITE.try_with(|()| ()).is_ok()
+}
+
+/// Deregisters a write waiter however its wait ends, including the waiting
+/// future being dropped.
+struct WaitingForWriteSlot<'g> {
+    gate: &'g ConnectionGate,
+    id: u64,
+}
+
+impl Drop for WaitingForWriteSlot<'_> {
+    fn drop(&mut self) {
+        self.gate.lock().waiting.remove(&self.id);
+    }
 }
 
 /// One live connection, recorded to explain a drain that did not finish and a
@@ -2446,12 +2585,43 @@ impl ConnectionGate {
             reopened: Notify::new(),
             drained: Notify::new(),
             checkpoint_in_engine: Arc::new(AtomicBool::new(false)),
+            write_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_POOLED_WRITES)),
         }
+    }
+
+    /// A slot under [`MAX_IN_FLIGHT_POOLED_WRITES`], waiting in arrival order
+    /// when none is free. The wait is registered for the gate watch and the
+    /// slow-commit neighbourhood for as long as it lasts.
+    async fn write_slot(&self, caller: Caller) -> OwnedSemaphorePermit {
+        if let Ok(permit) = self.write_slots.clone().try_acquire_owned() {
+            return permit;
+        }
+        let id = {
+            let mut state = self.lock();
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1);
+            state.waiting.insert(
+                id,
+                WriteWaiter {
+                    caller,
+                    since: Instant::now(),
+                    last_warned: None,
+                },
+            );
+            id
+        };
+        let _waiting = WaitingForWriteSlot { gate: self, id };
+        self.write_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the pooled-write semaphore is never closed")
     }
 
     /// What a slow commit reports about the rest of the database: whether a
     /// checkpoint attempt is in the engine, how many pooled writes hold a
-    /// connection, and the oldest holders with their ages and statements.
+    /// connection and how many wait for a slot to, and the oldest holders with
+    /// their ages and statements.
     ///
     /// Only looks. [`LocalDb::overdue_holders`] marks the holders it reports
     /// and interrupts runaway reads; a commit path calling that would change
@@ -2459,8 +2629,9 @@ impl ConnectionGate {
     fn neighbourhood(&self) -> String {
         const SHOWN: usize = 8;
         let now = Instant::now();
-        let (pooled_writes, mut held) = {
+        let (pooled_writes, waiting, mut held) = {
             let state = self.lock();
+            let waiting = state.waiting.len();
             let pooled_writes = state
                 .live
                 .values()
@@ -2477,7 +2648,7 @@ impl ConnectionGate {
                     )
                 })
                 .collect();
-            (pooled_writes, held)
+            (pooled_writes, waiting, held)
         };
         held.sort_by_key(|(age, _, _)| std::cmp::Reverse(*age));
         let total = held.len();
@@ -2487,7 +2658,7 @@ impl ConnectionGate {
             .map(|(age, kind, statement)| format!("{} ms {kind} {statement}", age.as_millis()))
             .collect();
         format!(
-            "checkpoint_in_engine={} pooled_writes_held={pooled_writes} connections_held={total} oldest=[{}]",
+            "checkpoint_in_engine={} pooled_writes_held={pooled_writes} pooled_writes_waiting={waiting} connections_held={total} oldest=[{}]",
             self.checkpoint_in_engine.load(Ordering::SeqCst),
             shown.join("; "),
         )
@@ -2537,6 +2708,7 @@ impl ConnectionGate {
                         gate: self.clone(),
                         id,
                         holder,
+                        write_permit: None,
                     };
                 }
             }
@@ -2654,6 +2826,9 @@ pub(super) struct ConnectionSlot {
     gate: Arc<ConnectionGate>,
     id: u64,
     holder: Holder,
+    /// A pooled write's slot under [`MAX_IN_FLIGHT_POOLED_WRITES`], freed
+    /// when this registration drops, on the same paths that settle the gate.
+    write_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for ConnectionSlot {
@@ -6070,6 +6245,159 @@ mod tests {
             unblocked.succeeded() && unblocked.drain.drained,
             "dropping the result set should have freed the checkpoint: {unblocked}"
         );
+    }
+
+    fn live_pooled_writes(db: &LocalDb) -> usize {
+        db.gate
+            .lock()
+            .live
+            .values()
+            .filter(|live| live.kind == HolderKind::PooledWrite)
+            .count()
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A pooled write that parks until `release` hands it a permit.
+    fn parked_write(
+        db: &Arc<LocalDb>,
+        release: &Arc<Semaphore>,
+        id: &'static str,
+    ) -> tokio::task::JoinHandle<DbResult<()>> {
+        let (db, release) = (db.clone(), release.clone());
+        tokio::spawn(async move {
+            db.write(move |conn| {
+                let release = release.clone();
+                Box::pin(async move {
+                    conn.execute("INSERT INTO counters(id, value) VALUES (?1, 1)", (id,))
+                        .await?;
+                    release.acquire().await.expect("open").forget();
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    /// Past the ceiling a pooled write waits for a slot, holding no connection:
+    /// the holders never exceed the ceiling, the waiter is named in a slow
+    /// commit's neighbourhood and by the gate watch, no checkpoint drain counts
+    /// it, and it proceeds the moment a slot frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pooled_writes_past_the_ceiling_wait_for_a_slot_without_a_connection() {
+        let db = Arc::new(test_db().await.unwrap().with_write_ceiling(2));
+        let release = Arc::new(Semaphore::new(0));
+        let writers = ["w1", "w2", "w3"].map(|id| parked_write(&db, &release, id));
+
+        until("two writes hold and one waits", || {
+            live_pooled_writes(&db) == 2 && db.pooled_writes_waiting() == 1
+        })
+        .await;
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(live_pooled_writes(&db), 2, "the ceiling was exceeded");
+        let neighbourhood = db.gate.neighbourhood();
+        assert!(
+            neighbourhood.contains("pooled_writes_held=2 pooled_writes_waiting=1"),
+            "{neighbourhood}"
+        );
+        let waiters = db.overdue_write_waiters(Duration::ZERO, Duration::from_secs(600));
+        assert_eq!(waiters.len(), 1);
+        assert!(waiters[0].caller.file().ends_with("local_db.rs"));
+        assert!(db
+            .overdue_write_waiters(Duration::ZERO, Duration::from_secs(600))
+            .is_empty());
+
+        let report = db
+            .checkpoint(
+                1,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.drain.open_at_close, 2, "{report}");
+
+        release.add_permits(1);
+        until("the waiter takes the freed slot", || {
+            db.pooled_writes_waiting() == 0 && live_pooled_writes(&db) == 2
+        })
+        .await;
+        release.add_permits(2);
+        for writer in writers {
+            writer.await.unwrap().unwrap();
+        }
+        assert_eq!(db.live_connections(), 0);
+        assert_eq!(db.pooled_writes_waiting(), 0);
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM counters WHERE id LIKE 'w%'")
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    /// A write issued from inside a pooled write's transaction takes no slot,
+    /// so nesting completes even with every slot held by the outer writes.
+    #[tokio::test]
+    async fn a_write_nested_in_a_pooled_write_completes_at_the_ceiling() {
+        let db = Arc::new(test_db().await.unwrap().with_write_ceiling(1));
+        let inner = db.clone();
+        let outcome = timeout(
+            Duration::from_secs(10),
+            db.write(move |conn| {
+                let inner = inner.clone();
+                Box::pin(async move {
+                    conn.execute("INSERT INTO counters(id, value) VALUES ('outer', 1)", ())
+                        .await?;
+                    inner
+                        .execute("INSERT INTO counters(id, value) VALUES ('nested', 1)", ())
+                        .await?;
+                    Ok(())
+                })
+            }),
+        )
+        .await;
+        outcome
+            .expect("a nested write deadlocked on the ceiling")
+            .unwrap();
+        assert_eq!(db.live_connections(), 0);
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM counters WHERE id IN ('outer','nested')"
+            )
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
+    /// A waiter whose future is dropped leaves no registration behind.
+    #[tokio::test]
+    async fn an_abandoned_write_wait_deregisters() {
+        let db = Arc::new(test_db().await.unwrap().with_write_ceiling(1));
+        let release = Arc::new(Semaphore::new(0));
+        let holder = parked_write(&db, &release, "held");
+        until("the slot is held", || live_pooled_writes(&db) == 1).await;
+        let waiting = timeout(
+            Duration::from_millis(50),
+            db.execute("INSERT INTO counters(id, value) VALUES ('late', 1)", ()),
+        )
+        .await;
+        assert!(waiting.is_err(), "the second write should have waited");
+        assert_eq!(db.pooled_writes_waiting(), 0);
+        release.add_permits(1);
+        holder.await.unwrap().unwrap();
+        db.execute("INSERT INTO counters(id, value) VALUES ('late', 1)", ())
+            .await
+            .unwrap();
+        assert_eq!(db.live_connections(), 0);
     }
 
     /// Migrations must not deadlock against maintenance.

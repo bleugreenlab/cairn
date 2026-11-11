@@ -30,6 +30,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod admission_renewal;
+pub(crate) use admission_renewal::AdmissionRenewal;
 mod calls;
 mod child_tasks;
 mod config_loading;
@@ -50,7 +52,68 @@ pub(crate) use private_lane::{
 /// Drive queued private admission deterministically without a scheduler task.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn promote_private_lanes_for_test(orch: &Orchestrator) {
+    // A background trigger's pass may hold a lane; this one then folds into
+    // it, so wait for that pass to have run on this call's behalf too.
     private_lane::promote_private_lanes_blocking(orch);
+    orch.private_lanes.wait_for_passes();
+}
+
+/// Park a database's pooled writes so admission tests can hold a claim or a
+/// renewal inside the database layer, the way an engine that parks its
+/// statements does, and count what waits behind it.
+#[cfg(test)]
+pub(crate) mod parked_writes {
+    use crate::storage::LocalDb;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Limit `db` to one pooled write in flight and hold that slot with an
+    /// open write transaction until `release` gets a permit.
+    pub(crate) async fn hold_the_only_write_slot(
+        db: &Arc<LocalDb>,
+    ) -> (Arc<tokio::sync::Semaphore>, tokio::task::JoinHandle<()>) {
+        db.limit_pooled_writes_for_test(1);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let holder = {
+            let (db, release) = (db.clone(), release.clone());
+            tokio::spawn(async move {
+                db.write(move |_conn| {
+                    let release = release.clone();
+                    Box::pin(async move {
+                        release.acquire().await.expect("open").forget();
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap();
+            })
+        };
+        until("the slot is held", || {
+            db.overdue_holders(Duration::ZERO, Duration::ZERO)
+                .iter()
+                .any(|holder| holder.kind == crate::storage::HolderKind::PooledWrite)
+        })
+        .await;
+        (release, holder)
+    }
+
+    /// Pooled writes waiting for a slot whose call site is in `file`.
+    pub(crate) fn waiting_from(db: &LocalDb, file: &str) -> usize {
+        db.overdue_write_waiters(Duration::ZERO, Duration::ZERO)
+            .iter()
+            .filter(|waiter| waiter.caller.file().ends_with(file))
+            .count()
+    }
+
+    pub(crate) async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..2_000 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting until {what}");
+    }
 }
 
 mod team_admission_lifecycle;

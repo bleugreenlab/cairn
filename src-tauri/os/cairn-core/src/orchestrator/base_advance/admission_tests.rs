@@ -338,20 +338,30 @@ const NAMED_WRITERS: &[&str] = &[
     "fast_forward_branch_from_origin(",
 ];
 
-/// What admits a store-wide mutation. Never a branch permit: a mutation that
-/// can move bookmarks it does not name is safe for every other owed branch
-/// only inside the bracket, or as `undo_own_operations(`, which restores an
-/// operation its own guard hold captured, so nothing foreign lies between.
-const STORE_WIDE_ADMISSION: &[&str] = &["bracket_store_mutation(", "undo_own_operations("];
+/// What admits a store-wide mutation; each entry admits only when every one of
+/// its tokens is in reach. Never a branch permit: a mutation that can move
+/// bookmarks it does not name is safe for every other owed branch only inside
+/// the bracket, or as `undo_own_operations(`, which restores an operation its
+/// own guard hold captured, so nothing foreign lies between.
+///
+/// `bracket_admitted_store_mutation(` is the bracket without its
+/// foreign-reservation refusal, so it never admits alone: the pair admits,
+/// because `admit_store_import(` is what refused or returned the reserved
+/// names the import then preserves.
+const STORE_WIDE_ADMISSION: &[&[&str]] = &[
+    &["bracket_store_mutation("],
+    &["undo_own_operations("],
+    &["admit_store_import(", "bracket_admitted_store_mutation("],
+];
 
 /// What admits a named writer: its branch's permit (`admit_landing_writers(`,
 /// in `pr_data::actions::default_landing`, mints `branch_write_permit` for a
 /// landing's source and target together), or the bracket around it.
-const NAMED_ADMISSION: &[&str] = &[
-    "branch_write_permit(",
-    "branch_create_permit(",
-    "admit_landing_writers(",
-    "bracket_store_mutation(",
+const NAMED_ADMISSION: &[&[&str]] = &[
+    &["branch_write_permit("],
+    &["branch_create_permit("],
+    &["admit_landing_writers("],
+    &["bracket_store_mutation("],
 ];
 
 /// How far above a store-wide mutation its admission may be.
@@ -530,10 +540,16 @@ fn unadmitted_calls(relative: &str, text: &str) -> Vec<String> {
                 if !code.contains(mutator) || code.contains(&format!("fn {mutator}")) {
                     continue;
                 }
-                let admitted = lines[index.saturating_sub(reach)..=index]
+                let window: Vec<&str> = lines[index.saturating_sub(reach)..=index]
                     .iter()
+                    .copied()
                     .filter(|above| !is_inert(above))
-                    .any(|above| admission.iter().any(|token| above.contains(token)));
+                    .collect();
+                let admitted = admission.iter().any(|tokens| {
+                    tokens
+                        .iter()
+                        .all(|token| window.iter().any(|above| above.contains(token)))
+                });
                 if !admitted {
                     unadmitted.push(format!("{relative}: {mutator}"));
                 }
@@ -606,6 +622,45 @@ fn publish() {
 }
 
 #[test]
+fn an_admitted_bracket_admits_only_beside_its_import_admission() {
+    let wrapper_only = r#"
+fn import(orch: &Orchestrator, guard: JjStoreGuard) -> Result<(), String> {
+    run_db_borrowed(orch.bracket_admitted_store_mutation(guard, db, project, move || {
+        crate::jj::ensure_project_store(&jj, &store, &repo)
+    }))
+}
+"#;
+    assert_eq!(
+        unadmitted_calls("sample.rs", wrapper_only),
+        vec!["sample.rs: ensure_project_store(".to_string()],
+        "the admitted bracket skips the foreign-reservation refusal, so alone it admits nothing"
+    );
+
+    let admission_only = r#"
+fn import(orch: &Orchestrator, guard: JjStoreGuard) -> Result<(), String> {
+    let reserved = orch.admit_store_import(&guard, None)?;
+    crate::jj::import_git(&jj.preserving_import_bookmarks(reserved), &store)
+}
+"#;
+    assert_eq!(
+        unadmitted_calls("sample.rs", admission_only),
+        vec!["sample.rs: import_git(".to_string()],
+        "an import admitted but run outside any bracket is still unbracketed"
+    );
+
+    let paired = r#"
+fn import(orch: &Orchestrator, guard: JjStoreGuard) -> Result<(), String> {
+    let reserved = orch.admit_store_import(&guard, None)?;
+    let jj = jj.preserving_import_bookmarks(reserved);
+    run_db_borrowed(orch.bracket_admitted_store_mutation(guard, db, project, move || {
+        crate::jj::ensure_project_store(&jj, &store, &repo)
+    }))
+}
+"#;
+    assert!(unadmitted_calls("sample.rs", paired).is_empty());
+}
+
+#[test]
 fn the_brace_count_ignores_literals_and_comments() {
     assert_eq!(brace_balance(r#"mod tests {"#), 1);
     assert_eq!(brace_balance(r#"let s = format!("{{"); {"#), 1);
@@ -644,8 +699,9 @@ fn every_production_store_wide_mutation_is_admitted_or_named_as_owed() {
     assert_eq!(
         unadmitted, expected,
         "a production bookmark writer runs unadmitted: a store-wide mutation needs \
-         `bracket_store_mutation` (or the same-hold `undo_own_operations`), never just a branch \
-         permit; a named writer needs its branch's permit or the bracket. Admit it; or, only \
+         `bracket_store_mutation` (or the same-hold `undo_own_operations`, or \
+         `admit_store_import` paired with `bracket_admitted_store_mutation`), never just a \
+         branch permit; a named writer needs its branch's permit or the bracket. Admit it; or, only \
          while its owner is wiring it, name it in OWED with that owner; or, if a named writer's \
          admission is real but far from the call, name it in ADMITTED_ELSEWHERE with where"
     );

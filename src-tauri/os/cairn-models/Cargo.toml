@@ -40,8 +40,6 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-# Integration tests plant releases through `managed::testing`.
-cairn-models = { path = ".", features = ["test-utils"] }
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
 # The codex-contract suite counts and measures the processes under a server.
 cairn-procmem = { path = "../cairn-procmem" }

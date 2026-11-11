@@ -3,6 +3,7 @@ use crate::turso::params;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const COLUMNS: &str = "request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,failure_detail,created_at,updated_at";
 pub const DEFAULT_URGENT_BURST: i64 = 3;
@@ -1108,6 +1109,14 @@ fn adds_resident_process(claim: &RuntimeResourceClaim, resident_servers: &HashSe
 /// dedicated process; urgent ones and streams on a multiplexed server still
 /// lease.
 /// `None` applies no window.
+///
+/// Callers run one pass per lane at a time (the orchestrator's per-lane
+/// single-flight, `LaneSingleFlight`). The write to the lane's
+/// `runtime_admission_cursors` row is the backstop that serialises any that
+/// are not: it is what makes two claimers of one lane conflict under
+/// `BEGIN CONCURRENT`, so one retries and counts the other's lease instead of
+/// both admitting past the unit ceiling. It stays inside this transaction for
+/// that reason, and so the urgent streak advances atomically with the lease.
 #[allow(clippy::too_many_arguments)]
 pub async fn lease_next_admission_within(
     db: &LocalDb,
@@ -2014,6 +2023,47 @@ pub async fn transition_admission(
     Ok(changed == 1)
 }
 
+/// One lease to extend: the fence it was granted under and its new expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRenewal {
+    pub request_id: String,
+    pub owner: String,
+    pub generation: i64,
+    pub expires_at: i64,
+}
+
+/// Extend every lease in `leases` in one write transaction, returning, in
+/// order, whether each was still held under its owner and generation.
+///
+/// One transaction for any number of leases is the point: a host renewing a
+/// lease per live session one write at a time keeps one pooled write per
+/// session parked whenever the engine parks statements. Each row keeps its
+/// own fence, so a lease released or replaced since it was granted answers
+/// `false` and is left untouched, exactly as a single renewal would.
+pub async fn renew_admission_leases(
+    db: &LocalDb,
+    leases: &[LeaseRenewal],
+    now: i64,
+) -> DbResult<Vec<bool>> {
+    if leases.is_empty() {
+        return Ok(Vec::new());
+    }
+    let leases = Arc::new(leases.to_vec());
+    db.write(move |conn| {
+        let leases = leases.clone();
+        Box::pin(async move {
+            let mut renewed = Vec::with_capacity(leases.len());
+            for lease in leases.iter() {
+                let changed = conn.execute("UPDATE runtime_admission_requests SET lease_expires_at=?4,updated_at=?5 WHERE request_id=?1 AND lease_owner=?2 AND lease_generation=?3 AND state IN ('leased','starting','active')", params![lease.request_id.clone(),lease.owner.clone(),lease.generation,lease.expires_at,now]).await?;
+                renewed.push(changed == 1);
+            }
+            Ok(renewed)
+        })
+    })
+    .await
+}
+
+/// [`renew_admission_leases`] for one lease.
 pub async fn heartbeat_admission(
     db: &LocalDb,
     request_id: &str,
@@ -2022,11 +2072,13 @@ pub async fn heartbeat_admission(
     now: i64,
     expires_at: i64,
 ) -> DbResult<bool> {
-    let (request_id, owner) = (request_id.to_string(), owner.to_string());
-    let changed = db.write(move |conn| { let (request_id, owner) = (request_id.clone(), owner.clone()); Box::pin(async move {
-        Ok(conn.execute("UPDATE runtime_admission_requests SET lease_expires_at=?4,updated_at=?5 WHERE request_id=?1 AND lease_owner=?2 AND lease_generation=?3 AND state IN ('leased','starting','active')", params![request_id,owner,generation,expires_at,now]).await?)
-    })}).await?;
-    Ok(changed == 1)
+    let lease = LeaseRenewal {
+        request_id: request_id.to_string(),
+        owner: owner.to_string(),
+        generation,
+        expires_at,
+    };
+    Ok(renew_admission_leases(db, &[lease], now).await? == [true])
 }
 
 pub async fn cancel_queued_admission(
@@ -2170,6 +2222,59 @@ mod tests {
                 .unwrap()
                 .request_id,
             admission.request_id
+        );
+    }
+
+    #[tokio::test]
+    async fn many_leases_renew_in_one_write_and_each_keeps_its_own_fence() {
+        let db = crate::storage::migrated_test_db("admission-batch-renewal.db").await;
+        let mut leases = Vec::new();
+        for (seq, id) in ["one", "two", "three"].into_iter().enumerate() {
+            enqueue_admission_request(&db, request(id, false, seq as i64 + 1))
+                .await
+                .unwrap();
+            let lease = lease_next_admission(&db, "w", "process", "promoter", 2, 10)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(lease.request_id, id);
+            leases.push(LeaseRenewal {
+                request_id: lease.request_id,
+                owner: "promoter".into(),
+                generation: lease.lease_generation,
+                expires_at: 400,
+            });
+        }
+        // A stale generation and a foreign owner are both fenced out.
+        leases[1].generation += 1;
+        leases[2].owner = "someone-else".into();
+        let writes = db.write_transaction_count();
+        let renewed = renew_admission_leases(&db, &leases, 100).await.unwrap();
+        assert_eq!(db.write_transaction_count() - writes, 1);
+        assert_eq!(renewed, [true, false, false]);
+        let expiry = |id: &'static str| {
+            let db = &db;
+            async move {
+                get_admission_request(db, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .lease_expires_at
+            }
+        };
+        assert_eq!(expiry("one").await, Some(400));
+        assert_eq!(expiry("two").await, Some(10));
+        assert_eq!(expiry("three").await, Some(10));
+
+        let writes = db.write_transaction_count();
+        assert!(renew_admission_leases(&db, &[], 100)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.write_transaction_count(),
+            writes,
+            "nothing to renew writes nothing"
         );
     }
 

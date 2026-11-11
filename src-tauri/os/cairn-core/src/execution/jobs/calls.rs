@@ -347,11 +347,12 @@ pub(crate) fn start_call_run(
     // Promotion consumes whichever request durable fairness selects. It may be
     // an older request, so tying handoff to this enqueue's request id would drop
     // a valid lease and leave an otherwise idle lane stuck until expiry.
-    promote_next_call(orch, &capability.lane.0, concurrency);
+    promote_call_lane(orch, &capability.lane.0, concurrency);
     Ok(())
 }
 
 const CALL_ADMISSION_OWNER: &str = "local-call-promoter";
+const CALL_LEASE_SECONDS: i64 = 300;
 
 /// This boot's call lease owner. Boot-scoped like ordinary admission's, so
 /// startup recovery can requeue an earlier boot's leases without requeueing a
@@ -471,7 +472,7 @@ fn lease_next_call(
             &lane_owned,
             &owner,
             now,
-            now + 300,
+            now + CALL_LEASE_SECONDS,
             budget.capacity(),
             budget.memory,
             None,
@@ -576,45 +577,17 @@ fn start_leased_call(
         crate::orchestrator::lifecycle::release_and_stop_process(orch, &prepared.run_id);
         return Err("runtime admission lease was replaced during call start".into());
     }
-    start_call_admission_heartbeat(orch, &lease);
+    // A terminal release or generation replacement ends ownership, and the
+    // renewer drops the lease the first time its fenced renewal misses.
+    orch.admission_renewal
+        .register(super::admission_renewal::RenewedLease {
+            request_id: lease.request_id.clone(),
+            owner,
+            generation: lease.lease_generation,
+            lease_seconds: CALL_LEASE_SECONDS,
+            still_current: None,
+        });
     Ok(())
-}
-
-fn start_call_admission_heartbeat(orch: &Orchestrator, lease: &crate::storage::AdmissionRequest) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        log::warn!("active call admission lease has no Tokio runtime for heartbeat");
-        return;
-    };
-    let db = orch.db.local.clone();
-    let request_id = lease.request_id.clone();
-    let owner = lease.lease_owner.clone().unwrap_or_default();
-    let generation = lease.lease_generation;
-    handle.spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let now = chrono::Utc::now().timestamp();
-            match crate::storage::heartbeat_admission(
-                &db,
-                &request_id,
-                &owner,
-                generation,
-                now,
-                now + 300,
-            )
-            .await
-            {
-                Ok(true) => {}
-                // Terminal release or generation replacement ends ownership and
-                // therefore this task. A stale heartbeat cannot revive the lease.
-                Ok(false) => break,
-                Err(error) => {
-                    log::warn!("call admission heartbeat failed for {request_id}: {error}");
-                }
-            }
-        }
-    });
 }
 
 /// Resolve the backend name for admission through the SAME resolution
@@ -796,7 +769,7 @@ fn settle_call_admission(orch: &Orchestrator, run_id: &str) -> Option<SettledCal
     }
 
     let finalized_prepared = prepared_call_for(orch, &request.request_id);
-    promote_next_call(
+    promote_call_lane(
         orch,
         &request.resource_lane,
         call_lane_concurrency(finalized_prepared.as_ref()),
@@ -835,10 +808,14 @@ fn prepared_call_for(orch: &Orchestrator, request_id: &str) -> Option<PreparedCa
 /// nothing will ever finalize again. The pass then moves on, so the slot that
 /// triggered it still goes to live work.
 ///
-/// Returns whether a call was started (a start that failed still consumed its
-/// lease and failed its run); `false` when the lane is empty, has no room for
-/// its head, or is unreadable.
-fn promote_next_call(
+/// Drains the lane: starts calls until it is empty, has no room for its head,
+/// or is unreadable. One pass per lane runs at a time (see `private_lane`'s
+/// "One pass per lane"); a call that finds one running returns `false` at
+/// once, and the running pass drains once more on its behalf.
+///
+/// Returns whether this pass started a call (a start that failed still
+/// consumed its lease and failed its run).
+fn promote_call_lane(
     orch: &Orchestrator,
     lane: &str,
     concurrency: Option<crate::backends::CallConcurrency>,
@@ -854,6 +831,29 @@ fn promote_next_call(
         );
         return false;
     }
+    let Some(mut pass) = orch
+        .private_lanes
+        .enter_pass(crate::storage::CALL_ADMISSION_WORKSPACE, lane)
+    else {
+        return false;
+    };
+    let mut started = false;
+    loop {
+        while start_next_call(orch, lane, concurrency) {
+            started = true;
+        }
+        if !pass.again() {
+            return started;
+        }
+    }
+}
+
+/// Lease and start the lane's next call; `false` when there is none to start.
+fn start_next_call(
+    orch: &Orchestrator,
+    lane: &str,
+    concurrency: Option<crate::backends::CallConcurrency>,
+) -> bool {
     loop {
         let Ok(Some(next_lease)) = lease_next_call(orch, lane, concurrency) else {
             return false;
@@ -952,7 +952,7 @@ pub(crate) fn promote_call_lanes(orch: &Orchestrator) {
         lanes.push((row.resource_lane.clone(), concurrency));
     }
     for (lane, concurrency) in lanes {
-        while promote_next_call(orch, &lane, concurrency) {}
+        promote_call_lane(orch, &lane, concurrency);
     }
 }
 
@@ -2346,6 +2346,76 @@ mod restart_call_tests {
             0,
             "a second pass finds nothing"
         );
+    }
+
+    /// The call lane's claim parked in the database: triggers fold into the
+    /// running pass instead of claiming beside it, and its rerun claims the
+    /// call enqueued after its own claim was taken. The call's run is already
+    /// over, so the claim closes it rather than launching a process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_parked_call_claim_folds_every_trigger_and_its_rerun_claims_what_they_enqueued() {
+        use crate::execution::jobs::parked_writes::{
+            hold_the_only_write_slot, until, waiting_from,
+        };
+        let (orch, db) = orch_with_db().await;
+        seed_call_project(&db).await;
+        seed_call_admission(&db, "late", "crashed", "queued", None, 1).await;
+        db.execute(
+            "UPDATE runtime_admission_requests SET resource_lane='elsewhere' WHERE request_id='call-admission:late'",
+            (),
+        )
+        .await
+        .unwrap();
+        let (release, holder) = hold_the_only_write_slot(&db).await;
+
+        let first = {
+            let orch = orch.clone();
+            tokio::task::spawn_blocking(move || promote_call_lane(&orch, "claude-cli", None))
+        };
+        until("the pass's claim parks", || {
+            waiting_from(&db, "runtime_admission.rs") == 1
+        })
+        .await;
+        let enqueue = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.execute(
+                    "UPDATE runtime_admission_requests SET resource_lane='claude-cli' WHERE request_id='call-admission:late'",
+                    (),
+                )
+                .await
+                .unwrap();
+            })
+        };
+        until("the enqueue waits behind the claim", || {
+            db.pooled_writes_waiting() == 2
+        })
+        .await;
+        let triggers: Vec<_> = (0..10)
+            .map(|_| {
+                let orch = orch.clone();
+                tokio::task::spawn_blocking(move || promote_call_lane(&orch, "claude-cli", None))
+            })
+            .collect();
+        for trigger in triggers {
+            assert!(!trigger.await.unwrap(), "a folded trigger starts nothing");
+        }
+        assert_eq!(
+            waiting_from(&db, "runtime_admission.rs"),
+            1,
+            "ten triggers against a parked claim add no claim beside it"
+        );
+
+        release.add_permits(1);
+        holder.await.unwrap();
+        enqueue.await.unwrap();
+        first.await.unwrap();
+        assert_eq!(
+            admission_state(&db, "late").await,
+            "cancelled",
+            "the rerun claimed the call enqueued mid-pass"
+        );
+        assert_eq!(db.pooled_writes_waiting(), 0);
     }
 
     /// `cairn://executors`' Session admission section, as the read renders it.

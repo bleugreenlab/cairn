@@ -62,8 +62,8 @@ pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEE
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, AdHocRead, Caller,
     CheckpointReport, DbCall, DrainBudget, DrainReport, HolderActivity, HolderKind, LocalDb,
-    OverdueHolder, RetryConfig, TrackedConnection, TrackedRows, CHECKPOINT_SLOW_AFTER,
-    CHECKPOINT_WEDGE_BACKSTOP, FOLD_AT_LOG_BYTES, READ_STATEMENT_BOUND,
+    OverdueHolder, OverdueWriteWaiter, RetryConfig, TrackedConnection, TrackedRows,
+    CHECKPOINT_SLOW_AFTER, CHECKPOINT_WEDGE_BACKSTOP, FOLD_AT_LOG_BYTES, READ_STATEMENT_BOUND,
 };
 pub use migration::{
     repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,
@@ -97,11 +97,12 @@ pub use runtime_admission::{
     list_recoverable_team_ordinary_launches, list_unsettled_call_admissions,
     pending_launch_run_ids, persist_prepared_ordinary_launch, persist_prepared_runtime_call,
     persist_team_ordinary_lease, provider_admission_records, queue_team_ordinary_terminal,
-    reap_expired_admissions, requeue_orphaned_admissions, retire_team_mirror, transition_admission,
-    withdraw_queued_call_admission, withdraw_queued_ordinary_admission, AdmissionRequest,
-    AdmissionStatus, HostMemoryEnvelope, LaneBudget, LaneOccupancy, LaneShortfall, LaunchOrigin,
-    LeaseDecision, MemoryPriority, NewAdmissionRequest, PreparedOrdinaryLaunch,
-    PreparedRuntimeCall, PreparedRuntimeCapability, PreparedRuntimeClass, PreparedRuntimeHostKind,
+    reap_expired_admissions, renew_admission_leases, requeue_orphaned_admissions,
+    retire_team_mirror, transition_admission, withdraw_queued_call_admission,
+    withdraw_queued_ordinary_admission, AdmissionRequest, AdmissionStatus, HostMemoryEnvelope,
+    LaneBudget, LaneOccupancy, LaneShortfall, LaunchOrigin, LeaseDecision, LeaseRenewal,
+    MemoryPriority, NewAdmissionRequest, PreparedOrdinaryLaunch, PreparedRuntimeCall,
+    PreparedRuntimeCapability, PreparedRuntimeClass, PreparedRuntimeHostKind,
     PreparedRuntimeHostRequirement, PreparedSessionStart, PreparedUserIdentity,
     ProviderAdmissionOwner, ProviderAdmissionRecord, QueuedOrdinaryLaunch,
     RecoverableTeamOrdinaryLaunch, RuntimeAdmissionReason, RuntimeAdmissionState,

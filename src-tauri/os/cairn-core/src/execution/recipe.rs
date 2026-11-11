@@ -2061,12 +2061,20 @@ mod tests {
         );
         assert_eq!(out[1].error, None);
         assert_eq!(chosen(&out[1]), "claude/opus");
-        let line = &out[1].resolved.as_ref().unwrap().preview.line;
+        let preview = &out[1].resolved.as_ref().unwrap().preview;
+        let record = preview.record.as_ref().unwrap();
+        assert_eq!(
+            record.relaxations,
+            vec!["no model from a maker other than anthropic in [claude/opus, claude/sonnet]"]
+        );
         assert!(
-            line.ends_with(
-                "no model from a maker other than anthropic in [claude/opus, claude/sonnet]; same maker as Node n1"
-            ),
-            "{line}"
+            record.provenance.contains("; same maker as Node n1"),
+            "{}",
+            record.provenance
+        );
+        assert_eq!(
+            preview.line,
+            format!("depends on Node n1: would pick now {}", record.provenance)
         );
     }
 

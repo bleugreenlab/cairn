@@ -2231,7 +2231,7 @@ mod tests {
     /// its indexes:
     ///
     /// ```text
-    /// cargo test -p cairn-core --lib census_cost -- --ignored --nocapture
+    /// cargo test -p cairn-core --features test-utils --lib census_cost -- --ignored --nocapture
     /// ```
     ///
     /// The property it exists to expose is SHAPE, not absolute milliseconds:
@@ -2294,7 +2294,7 @@ mod tests {
     ///
     /// ```text
     /// CAIRN_MEASURE_DB=$TMPDIR/clone/cairn.db \
-    ///   cargo test -p cairn-core --lib projection_cost_on_a_database_clone -- --ignored --nocapture
+    ///   cargo test -p cairn-core --features test-utils --lib projection_cost_on_a_database_clone -- --ignored --nocapture
     /// ```
     ///
     /// It splits `list_issues` into the parts that run per call (the issue

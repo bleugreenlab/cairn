@@ -763,9 +763,14 @@ mod tests {
             assert_eq!(params["ephemeral"], true);
             assert_eq!(params["environments"], json!([]));
             assert_eq!(params["sandbox"], "read-only");
+            // The worker runs in the system temp directory, which with every
+            // ancestor is declared untrusted like any Codex session's cwd.
             assert_eq!(
                 params["config"],
                 json!({
+                    "projects": crate::session::codex::home::project_config_overrides(
+                        &std::env::temp_dir().to_string_lossy()
+                    )["projects"],
                     "web_search": "disabled",
                     "tools.update_plan.enabled": false,
                     "tools.experimental_request_user_input.enabled": false,

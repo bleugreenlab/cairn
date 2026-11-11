@@ -17,79 +17,7 @@ fn private_lease_owner(orch: &Orchestrator) -> String {
     format!("{OWNER}@{}", orch.boot_at)
 }
 const PRIVATE_LEASE_SECONDS: i64 = 300;
-const PRIVATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
-const PRIVATE_HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const TEAM_STARTUP_RECOVERY_BUDGET: Duration = Duration::from_secs(5);
-
-fn next_private_heartbeat_delay(result: &Result<bool, String>) -> Option<Duration> {
-    match result {
-        Ok(false) => None,
-        Ok(true) => Some(PRIVATE_HEARTBEAT_INTERVAL),
-        Err(_) => Some(PRIVATE_HEARTBEAT_RETRY_INTERVAL),
-    }
-}
-
-async fn heartbeat_private_once_if_current(
-    process_state: &crate::agent_process::process::AgentProcessState,
-    db: &crate::storage::LocalDb,
-    run_id: &str,
-    request_id: &str,
-    owner: &str,
-    generation: i64,
-    now: i64,
-) -> Result<bool, String> {
-    if !process_state.admission_claim_is_current(run_id, request_id, generation) {
-        return Ok(false);
-    }
-    crate::storage::heartbeat_admission(
-        db,
-        request_id,
-        owner,
-        generation,
-        now,
-        now + PRIVATE_LEASE_SECONDS,
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-fn spawn_private_heartbeat(
-    process_state: Arc<crate::agent_process::process::AgentProcessState>,
-    db: Arc<crate::storage::LocalDb>,
-    run_id: String,
-    request_id: String,
-    owner: String,
-    generation: i64,
-) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
-        let mut delay = PRIVATE_HEARTBEAT_INTERVAL;
-        loop {
-            tokio::time::sleep(delay).await;
-            let result = heartbeat_private_once_if_current(
-                &process_state,
-                &db,
-                &run_id,
-                &request_id,
-                &owner,
-                generation,
-                chrono::Utc::now().timestamp(),
-            )
-            .await;
-            if let Err(error) = &result {
-                    log::warn!(
-                        "private ordinary admission {request_id} generation {generation} heartbeat failed; retrying while process remains current: {error}"
-                    );
-            }
-            let Some(next_delay) = next_private_heartbeat_delay(&result) else {
-                return;
-            };
-            delay = next_delay;
-        }
-    });
-}
 
 fn apply_prepared_identity_metadata(
     identity: &mut crate::identity::UserIdentity,
@@ -1085,7 +1013,23 @@ pub(crate) fn promote_private_lane(orch: &Orchestrator, lane: &str) {
 /// surfaces that display it, and when the head is blocked with nothing mid-spawn
 /// asks the warm GC for room on its behalf. Inside the boot horizon it also
 /// leases against the boot ramp's warm-up window.
+///
+/// One pass per lane runs at a time (see `private_lane`'s "One pass per
+/// lane"). A call that finds one running returns at once, and that pass
+/// drains once more on its behalf.
 pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> Result<(), String> {
+    let Some(mut pass) = orch.private_lanes.enter_pass(WORKSPACE, lane) else {
+        return Ok(());
+    };
+    loop {
+        drain_private_lane(orch, lane)?;
+        if !pass.again() {
+            return Ok(());
+        }
+    }
+}
+
+fn drain_private_lane(orch: &Orchestrator, lane: &str) -> Result<(), String> {
     let owner = private_lease_owner(orch);
     loop {
         // Every caller wrote its admission row before reaching here, so a pass
@@ -1513,20 +1457,22 @@ fn start_leased_inner(
     );
     // Both lanes renew their lease from here, before the backend call: a
     // launch can wait there for minutes (a managed CLI's first install), and
-    // its lease must outlive that wait. Each heartbeat stops once the
-    // admission claim prepared above is no longer current.
+    // its lease must outlive that wait. Renewal stops once the admission claim
+    // prepared above is no longer current.
     match &lease {
-        OrdinaryLease::Private(request) => spawn_private_heartbeat(
-            orch.process_state.clone(),
-            orch.db.local.clone(),
-            snapshot.run_id.clone(),
-            request.request_id.clone(),
-            request
-                .lease_owner
-                .clone()
-                .ok_or_else(|| "private ordinary lease has no owner".to_string())?,
-            request.lease_generation,
-        ),
+        OrdinaryLease::Private(request) => {
+            orch.admission_renewal
+                .register(super::admission_renewal::RenewedLease {
+                    request_id: request.request_id.clone(),
+                    owner: request
+                        .lease_owner
+                        .clone()
+                        .ok_or_else(|| "private ordinary lease has no owner".to_string())?,
+                    generation: request.lease_generation,
+                    lease_seconds: PRIVATE_LEASE_SECONDS,
+                    still_current: Some(snapshot.run_id.clone()),
+                })
+        }
         OrdinaryLease::Team { request, .. } => super::team_admission_lifecycle::start_heartbeat(
             orch,
             snapshot.run_id.clone(),
@@ -1850,39 +1796,8 @@ fn finish(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_prepared_identity_metadata, heartbeat_private_once_if_current,
-        next_private_heartbeat_delay, PRIVATE_HEARTBEAT_INTERVAL, PRIVATE_HEARTBEAT_RETRY_INTERVAL,
-    };
-    use crate::agent_process::process::{AgentProcessState, ProcessAdmissionClaim};
-
-    async fn leased_private_request(name: &str) -> (crate::storage::LocalDb, AgentProcessState) {
-        let db = crate::storage::migrated_test_db(name).await;
-        db.execute_script(
-            r#"INSERT INTO runtime_admission_requests(
-                request_id,workspace_key,resource_lane,launch_key,claim_json,priority,
-                enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at
-             ) VALUES(
-                'request-1','private-runtime','codex','ordinary:run-1','{"residentProcessUnits":1,"logicalStreamUnits":1}',0,
-                1,'active','ordinary-session-promoter',7,300,0,0
-             );"#,
-        )
-        .await
-        .unwrap();
-        let state = AgentProcessState::default();
-        state.prepare_admission_claim(
-            "run-1".into(),
-            ProcessAdmissionClaim {
-                request_id: "request-1".into(),
-                workspace_key: "private-runtime".into(),
-                launch_key: "ordinary:run-1".into(),
-                owner: "ordinary-session-promoter".into(),
-                generation: 7,
-                team_workspace_id: None,
-            },
-        );
-        (db, state)
-    }
+    use super::apply_prepared_identity_metadata;
+    use crate::agent_process::process::ProcessAdmissionClaim;
 
     #[tokio::test(flavor = "current_thread")]
     async fn queued_watchdog_successor_completes_only_after_capacity_promotes_it_once() {
@@ -2038,94 +1953,6 @@ mod tests {
                 .count(),
             1,
         );
-    }
-
-    #[tokio::test]
-    async fn private_heartbeat_keeps_process_leased_beyond_original_lifetime() {
-        let (db, state) = leased_private_request("private-heartbeat-lifetime.db").await;
-
-        assert!(heartbeat_private_once_if_current(
-            &state,
-            &db,
-            "run-1",
-            "request-1",
-            "ordinary-session-promoter",
-            7,
-            240,
-        )
-        .await
-        .unwrap());
-        assert!(heartbeat_private_once_if_current(
-            &state,
-            &db,
-            "run-1",
-            "request-1",
-            "ordinary-session-promoter",
-            7,
-            480,
-        )
-        .await
-        .unwrap());
-
-        assert_eq!(
-            crate::storage::reap_expired_admissions(&db, 601)
-                .await
-                .unwrap(),
-            0
-        );
-        let request = crate::storage::get_admission_request(&db, "request-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(request.state, "active");
-        assert_eq!(request.lease_expires_at, Some(780));
-    }
-
-    #[tokio::test]
-    async fn private_heartbeat_stops_before_touching_a_replacement_generation() {
-        let (db, state) = leased_private_request("private-heartbeat-stale.db").await;
-        state.prepare_admission_claim(
-            "run-1".into(),
-            ProcessAdmissionClaim {
-                request_id: "request-1".into(),
-                workspace_key: "private-runtime".into(),
-                launch_key: "ordinary:run-1".into(),
-                owner: "replacement".into(),
-                generation: 8,
-                team_workspace_id: None,
-            },
-        );
-
-        assert!(!heartbeat_private_once_if_current(
-            &state,
-            &db,
-            "run-1",
-            "request-1",
-            "ordinary-session-promoter",
-            7,
-            240,
-        )
-        .await
-        .unwrap());
-        let request = crate::storage::get_admission_request(&db, "request-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(request.lease_expires_at, Some(300));
-    }
-
-    #[test]
-    fn private_heartbeat_retries_transient_errors_without_losing_its_generation() {
-        let transient = Err("database temporarily unavailable".to_string());
-        assert_eq!(
-            next_private_heartbeat_delay(&transient),
-            Some(PRIVATE_HEARTBEAT_RETRY_INTERVAL)
-        );
-        assert_eq!(
-            next_private_heartbeat_delay(&Ok(true)),
-            Some(PRIVATE_HEARTBEAT_INTERVAL)
-        );
-        assert_eq!(next_private_heartbeat_delay(&Ok(false)), None);
     }
 
     use super::run_db;
@@ -4294,6 +4121,184 @@ mod tests {
             .await,
             "4"
         );
+    }
+
+    /// Triggers that land while a pass is mid-start fold into it: none of them
+    /// claims beside it, each returns at once, and what was queued meanwhile
+    /// is started, once, by the pass they folded into.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn triggers_during_a_pass_fold_into_it_instead_of_claiming_beside_it() {
+        let (orch, _, snapshot) = lifecycle_fixture("lane-single-flight.db").await;
+        orch.db
+            .local
+            .execute(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        queue_launch(&orch, &snapshot, 1, "starting").await;
+        let (starts, _backend) =
+            install_slow_claude_like(&orch, std::time::Duration::from_millis(1500));
+        let first = {
+            let orch = orch.clone();
+            tokio::task::spawn_blocking(move || super::promote_private_lane_blocking(&orch, "lane"))
+        };
+        for _ in 0..500 {
+            if started(&starts) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(started(&starts), 1, "the first pass is mid-start");
+
+        queue_launch(&orch, &snapshot, 2, "starting").await;
+        let begun = std::time::Instant::now();
+        let triggers: Vec<_> = (0..10)
+            .map(|_| {
+                let orch = orch.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::promote_private_lane_blocking(&orch, "lane")
+                })
+            })
+            .collect();
+        for trigger in triggers {
+            trigger.await.unwrap().unwrap();
+        }
+        assert!(
+            begun.elapsed() < std::time::Duration::from_millis(1000),
+            "a folded trigger returns at once, not after the running pass"
+        );
+        assert_eq!(
+            request_state(&orch, "req2").await.0,
+            "queued",
+            "no trigger claimed beside the running pass"
+        );
+
+        first.await.unwrap().unwrap();
+        assert_eq!(
+            started(&starts),
+            2,
+            "the running pass started what was queued"
+        );
+        assert_eq!(request_state(&orch, "req2").await.0, "active");
+        assert!(
+            orch.private_lanes
+                .enter_pass(super::WORKSPACE, "lane")
+                .is_some(),
+            "the pass ended and freed the lane"
+        );
+    }
+
+    /// The claim itself parked in the database, as on 11-08: triggers that
+    /// land meanwhile add no claim beside it (one claim waits, however many
+    /// fire), and the pass they folded into runs once more and leases what
+    /// was enqueued after its own claim was taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_parked_claim_folds_every_trigger_and_its_rerun_leases_what_they_enqueued() {
+        use crate::execution::jobs::parked_writes::{
+            hold_the_only_write_slot, until, waiting_from,
+        };
+        let (orch, _, snapshot) = lifecycle_fixture("lane-parked-claim.db").await;
+        orch.db
+            .local
+            .execute(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        // req2 is fully prepared but not yet in this lane: moving it in is
+        // the enqueue that lands mid-pass.
+        queue_launch(&orch, &snapshot, 2, "starting").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET resource_lane='elsewhere' WHERE request_id='req2'",
+                (),
+            )
+            .await
+            .unwrap();
+        let (starts, _backend) = install_claude_like(&orch);
+        let db = orch.db.local.clone();
+        let (release, holder) = hold_the_only_write_slot(&db).await;
+
+        let first = {
+            let orch = orch.clone();
+            tokio::task::spawn_blocking(move || super::promote_private_lane_blocking(&orch, "lane"))
+        };
+        until("the pass's claim parks", || {
+            waiting_from(&db, "runtime_admission.rs") == 1
+        })
+        .await;
+        let enqueue = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.execute(
+                    "UPDATE runtime_admission_requests SET resource_lane='lane' WHERE request_id='req2'",
+                    (),
+                )
+                .await
+                .unwrap();
+            })
+        };
+        until("the enqueue waits behind the claim", || {
+            db.pooled_writes_waiting() == 2
+        })
+        .await;
+        let triggers: Vec<_> = (0..10)
+            .map(|_| {
+                let orch = orch.clone();
+                tokio::task::spawn_blocking(move || {
+                    super::promote_private_lane_blocking(&orch, "lane")
+                })
+            })
+            .collect();
+        for trigger in triggers {
+            trigger.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            waiting_from(&db, "runtime_admission.rs"),
+            1,
+            "ten triggers against a parked claim add no claim beside it"
+        );
+        assert_eq!(db.pooled_writes_waiting(), 2);
+
+        release.add_permits(1);
+        holder.await.unwrap();
+        enqueue.await.unwrap();
+        first.await.unwrap().unwrap();
+        assert_eq!(started(&starts), 1, "the rerun started the enqueued launch");
+        assert_eq!(request_state(&orch, "req2").await.0, "active");
+        assert_eq!(db.pooled_writes_waiting(), 0);
+    }
+
+    /// A live session's lease that expired while its renewal was parked still
+    /// holds its unit: the lane admits nothing extra, and neither promotion
+    /// nor the stale-run reaper re-queues it. Only startup recovery reaps.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_expired_lease_of_a_live_session_still_holds_its_unit() {
+        let (orch, _, snapshot) = lifecycle_fixture("expired-live-lease.db").await;
+        let (starts, _backend) = install_claude_like(&orch);
+        set_ceiling(&orch, 1);
+        hold_cold_active(&orch).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET lease_expires_at=1 WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        queue_launch(&orch, &snapshot, 2, "starting").await;
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+        crate::execution::jobs::promote_private_lanes_for_test(&orch);
+        crate::runs::reap::reap_stale_runs(&orch);
+
+        assert_eq!(started(&starts), 0, "no admission past the ceiling");
+        assert_eq!(request_state(&orch, "req").await.0, "active");
+        assert_eq!(request_state(&orch, "req2").await.0, "queued");
     }
 
     /// cairn/4758: launches that reach admission while startup recovery runs

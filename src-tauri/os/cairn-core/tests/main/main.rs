@@ -6,6 +6,11 @@
 //! names gain the module prefix (e.g. `todos::create_and_list`); nextest
 //! substring filters keep matching, and `--test main` selects the binary.
 
+#[cfg(not(feature = "test-utils"))]
+compile_error!(
+    "cairn-core's tests need `--features test-utils`; `bun run test:rust -p cairn-core` adds it"
+);
+
 mod common;
 
 // Seal this binary away from every live Cairn home before any test runs (see

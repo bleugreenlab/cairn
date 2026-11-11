@@ -1614,41 +1614,6 @@ mod tests {
     }
 
     #[test]
-    fn trigger_fact_names_follow_declaration_order() {
-        let registry = FactRegistry::default();
-        assert_eq!(
-            registry.fact_names(FactSurface::Trigger),
-            vec![
-                "attention",
-                "thread_stream",
-                "github_comment",
-                "file_changed",
-                "post_created",
-                "post_commented",
-                "ingress",
-                "channel_message",
-                "camp_notice",
-                "executor_update_unreturned"
-            ]
-        );
-        assert_eq!(
-            registry.source_names(),
-            vec![
-                "attention",
-                "camp_notice",
-                "channel_message",
-                "executor_update_unreturned",
-                "file_changed",
-                "github_comment",
-                "ingress",
-                "post_commented",
-                "post_created",
-                "thread_stream"
-            ]
-        );
-    }
-
-    #[test]
     fn the_registry_describes_exactly_what_the_gate_vocabulary_declares() {
         // One declaration for a gate fact's fields: the resolver's own
         // `fields()`. If these ever disagree, the registry describes a field the

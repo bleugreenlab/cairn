@@ -179,7 +179,6 @@ tempfile = "3"
 # the transport serves invokes on, which is where keychain reads actually run
 # (tests/main/keychain_runtime.rs).
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
-cairn-core = { path = ".", features = ["test-utils"] }
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }
 # SCM_RIGHTS, so a run test can hold a command's stdout from outside its tree.

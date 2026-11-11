@@ -5,6 +5,9 @@
 //! composition reads once per process.
 #![cfg(unix)]
 
+#[cfg(not(feature = "test-utils"))]
+compile_error!("cairn-models' integration tests need `--features test-utils`; `bun run test:rust -p cairn-models` adds it");
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};

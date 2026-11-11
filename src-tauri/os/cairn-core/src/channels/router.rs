@@ -6032,8 +6032,8 @@ mod tests {
     /// visible beside the duration. The load retires rows, so it WRITES the
     /// database it is given: point it at a copy, taken per docs/database.md
     /// "Taking a census", never at the live file. Run it with
-    /// `CAIRN_REVIEW_CLONE_DB=<copy>/cairn.db cargo test -p cairn-core --lib
-    /// review_load_timing -- --ignored --nocapture`.
+    /// `CAIRN_REVIEW_CLONE_DB=<copy>/cairn.db cargo test -p cairn-core
+    /// --features test-utils --lib review_load_timing -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real database copy via CAIRN_REVIEW_CLONE_DB"]
     async fn review_load_timing_on_a_database_clone() {
@@ -6199,7 +6199,7 @@ mod tests {
     ///
     /// Ignored by default because it builds a live-sized `events` table (the
     /// installation this was diagnosed on had 1,477,400 rows). Run it with
-    /// `cargo test -p cairn-core --lib measure_follow_read -- --ignored --nocapture`.
+    /// `cargo test -p cairn-core --features test-utils --lib measure_follow_read -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "measurement: seeds a live-sized events table"]
     async fn measure_follow_read_at_live_scale() {

@@ -556,6 +556,11 @@ mod tests {
             // crossing into JavaScript.
             "src-tauri/src/runner_client.rs",
             "src-tauri/src/commands/permission.rs",
+            // Project library trust, confirmation and revocation: the same
+            // shape as `permission.rs`. Main-webview only, local runner only,
+            // each forwards a fixed `{projectId[, items]}` and returns only
+            // the runner's payload.
+            "src-tauri/src/commands/library_trust.rs",
             // Main-webview-only Tauri attachment proxies run in the desktop
             // process and return only runner payloads. `runner_client` keeps the
             // credential solely in the loopback request header, never a

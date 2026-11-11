@@ -57,6 +57,18 @@
 //! waiting on the launch) is never held, though it counts as warming. The
 //! window and horizon are constants: a knob an operator had to set to recover
 //! from a convoy would be situational state.
+//!
+//! ## One pass per lane
+//!
+//! Promotion is triggered from many places (an enqueue, a release, a finalize,
+//! the pipe floor recovering, the process sweep), each of which used to start
+//! a pass of its own. Passes on one lane all claim through the lane's one
+//! cursor row, so parallel passes only conflict and park writers. Every pass
+//! therefore enters the lane's [`LaneSingleFlight`] first: a trigger that finds
+//! a pass running marks it to run once more and returns at once, and the
+//! running pass checks that mark under the same lock it ends under, so a
+//! trigger is never lost between the queue draining and the pass ending.
+//! However many triggers land during a pass, exactly one more pass runs.
 
 use super::{run_db, run_db_borrowed};
 use crate::agent_process::gc::SpawnRoom;
@@ -67,7 +79,7 @@ use crate::storage::{
 };
 use cairn_session::agent_process::gc::{memory_reserve, DEFAULT_SPAWN_RSS};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 pub(crate) const WORKSPACE: &str = "private-runtime";
@@ -182,9 +194,106 @@ pub struct PrivateLaneLedger {
     /// lease implies. Without it, concurrent passes (a restart's enqueue burst
     /// fires one each) all read the same count and lease past the window.
     ramp_admission: Mutex<()>,
+    /// Which lanes have a promotion pass running. See [`LaneSingleFlight`].
+    passes: LaneSingleFlight,
+}
+
+/// At most one promotion pass per `(workspace, lane)` at a time, with every
+/// trigger that arrives during a pass folded into one more run of it.
+#[derive(Default)]
+pub(crate) struct LaneSingleFlight {
+    /// A lane is present while a pass on it runs; its value is whether a
+    /// trigger arrived since the pass last checked.
+    running: Mutex<HashMap<(String, String), bool>>,
+    /// Signalled whenever a pass ends.
+    ended: Condvar,
+}
+
+impl LaneSingleFlight {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), bool>> {
+        self.running
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start a pass on the lane, or, when one is already running, mark it to
+    /// run again and return `None`: the running pass covers this trigger.
+    pub(crate) fn enter(&self, workspace: &str, lane: &str) -> Option<LanePass<'_>> {
+        let key = (workspace.to_string(), lane.to_string());
+        let mut running = self.lock();
+        if let Some(rerun) = running.get_mut(&key) {
+            *rerun = true;
+            return None;
+        }
+        running.insert(key.clone(), false);
+        Some(LanePass {
+            flight: self,
+            key,
+            ended: false,
+        })
+    }
+
+    /// Wait until no pass runs on any lane, or `limit` passes.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn wait_idle(&self, limit: Duration) {
+        let running = self.lock();
+        let _ = self
+            .ended
+            .wait_timeout_while(running, limit, |running| !running.is_empty());
+    }
+}
+
+/// A running promotion pass. Dropping it ends the pass, so one that unwinds or
+/// returns early never leaves its lane marked running.
+pub(crate) struct LanePass<'a> {
+    flight: &'a LaneSingleFlight,
+    key: (String, String),
+    ended: bool,
+}
+
+impl LanePass<'_> {
+    /// Called when the pass has drained what it can. `true` when a trigger
+    /// arrived meanwhile: the mark is cleared and the caller runs once more.
+    /// `false` ends the pass, under the same lock as the check, so a trigger
+    /// either lands before it (and is served) or finds no pass and starts one.
+    pub(crate) fn again(&mut self) -> bool {
+        let mut running = self.flight.lock();
+        if let Some(rerun) = running.get_mut(&self.key) {
+            if *rerun {
+                *rerun = false;
+                return true;
+            }
+        }
+        running.remove(&self.key);
+        self.ended = true;
+        drop(running);
+        self.flight.ended.notify_all();
+        false
+    }
+}
+
+impl Drop for LanePass<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            self.flight.lock().remove(&self.key);
+            self.flight.ended.notify_all();
+        }
+    }
 }
 
 impl PrivateLaneLedger {
+    /// Enter the lane's single-flight promotion. See [`LaneSingleFlight::enter`].
+    pub(crate) fn enter_pass(&self, workspace: &str, lane: &str) -> Option<LanePass<'_>> {
+        self.passes.enter(workspace, lane)
+    }
+
+    /// Wait for every running promotion pass to end, so a test that drives
+    /// promotion sees the outcome of a pass a background trigger was running.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn wait_for_passes(&self) {
+        self.passes.wait_idle(Duration::from_secs(30));
+    }
+
     /// Hold the ramp's admission critical section. The caller drops it before
     /// starting the leased launch, so a slow spawn never serializes the lane.
     pub(crate) fn lock_ramp_admission(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -937,6 +1046,71 @@ pub(super) fn run_settled(orch: &Orchestrator, run_id: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_triggers_on_a_lane_run_one_pass_and_exactly_one_more() {
+        let flight = LaneSingleFlight::default();
+        let mut pass = flight.enter("w", "lane").expect("the first trigger runs");
+        for _ in 0..10 {
+            assert!(flight.enter("w", "lane").is_none());
+        }
+        // Another lane, and the same lane name in another workspace, run beside it.
+        let other = flight.enter("w", "other").expect("lanes are independent");
+        let call = flight
+            .enter("calls", "lane")
+            .expect("workspaces are independent");
+        drop((other, call));
+        assert!(pass.again(), "triggers during the pass earn one more run");
+        assert!(!pass.again(), "and only one");
+        assert!(
+            flight.enter("w", "lane").is_some(),
+            "the ended pass freed the lane"
+        );
+    }
+
+    #[test]
+    fn a_dropped_pass_frees_its_lane() {
+        let flight = LaneSingleFlight::default();
+        let pass = flight.enter("w", "lane").unwrap();
+        assert!(flight.enter("w", "lane").is_none());
+        drop(pass);
+        assert!(flight.enter("w", "lane").is_some());
+    }
+
+    /// A trigger racing the pass's final check is never lost: either the pass
+    /// sees its mark and runs again, or the trigger finds no pass and runs
+    /// its own. Every trigger's work is covered by a pass that starts after it.
+    #[test]
+    fn a_trigger_racing_the_end_of_a_pass_is_never_lost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        for _ in 0..2_000 {
+            let flight = Arc::new(LaneSingleFlight::default());
+            let served = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(2));
+            let mut pass = flight.enter("w", "lane").unwrap();
+            let trigger = {
+                let (flight, served, barrier) = (flight.clone(), served.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if let Some(mut own) = flight.enter("w", "lane") {
+                        served.fetch_add(1, Ordering::SeqCst);
+                        while own.again() {}
+                    }
+                })
+            };
+            barrier.wait();
+            while pass.again() {
+                served.fetch_add(1, Ordering::SeqCst);
+            }
+            trigger.join().unwrap();
+            assert_eq!(
+                served.load(Ordering::SeqCst),
+                1,
+                "the trigger was served once"
+            );
+        }
+    }
 
     const GIB: u64 = 1 << 30;
 

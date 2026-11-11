@@ -974,7 +974,7 @@ mod tests {
     /// CI would be a flake. Run it when changing the query or its indexes:
     ///
     /// ```text
-    /// cargo test -p cairn-core --lib home_cost_at_reported_scale -- --ignored --nocapture
+    /// cargo test -p cairn-core --features test-utils --lib home_cost_at_reported_scale -- --ignored --nocapture
     /// ```
     ///
     /// The row counts are the ones measured on the workspace in CAIRN-4621, so

@@ -168,6 +168,8 @@ async fn every_writable_thread_task_descendant_reaches_dispatch() {
 
     let base = format!("cairn://p/{PROJECT}/{THREAD}/task/{TASK}");
     let cases = [
+        // The task itself takes one patch: its own placement default.
+        (base.clone(), "patch", json!({"executor": null})),
         (format!("{base}/return"), "create", json!({"content": "x"})),
         (
             format!("{base}/artifact"),
@@ -207,11 +209,7 @@ async fn every_writable_thread_task_descendant_reaches_dispatch() {
     // mutation and then reports a defect. Both canonical phrases are asserted:
     // the gate's rejection and the reason, which together are what tell a caller
     // the address was right and the mode was not.
-    for target in [
-        base.clone(),
-        format!("{base}/chat"),
-        format!("{base}/checks"),
-    ] {
+    for target in [format!("{base}/chat"), format!("{base}/checks")] {
         let read_only = common::change_resource(
             &orch,
             json!([{ "target": target, "mode": "append", "payload": {"content": "x"} }]),

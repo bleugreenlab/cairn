@@ -774,6 +774,10 @@ impl OrchestratorBuilder {
 
         let admission_lock = Arc::new(crate::execution::gates::capacity::AdmissionLock::default());
         let private_lanes = Arc::new(crate::execution::jobs::PrivateLaneLedger::default());
+        let admission_renewal = crate::execution::jobs::AdmissionRenewal::new(
+            self.db.local.clone(),
+            self.process_state.clone(),
+        );
         let provider_admission_cache = crate::runtime_admission::provider_admission_cache(
             &self.db,
             &private_lanes,
@@ -863,6 +867,7 @@ impl OrchestratorBuilder {
             host_scratch: Arc::default(),
             relay: Arc::default(),
             private_lanes,
+            admission_renewal,
             pipe_health: cairn_common::pipe_health::PipeHealthMonitor::new(),
             provider_admission_cache,
             agent_memory: Arc::default(),
@@ -997,6 +1002,7 @@ impl OrchestratorBuilder {
             orchestrator
                 .provider_admission_cache
                 .bind_runtime(handle.clone());
+            orchestrator.admission_renewal.start(&handle);
             let mut provider_admission_changes =
                 orchestrator.db.local.subscribe_provider_admission_changes();
             let provider_admission_cache = Arc::downgrade(&orchestrator.provider_admission_cache);
@@ -1606,6 +1612,9 @@ pub struct Orchestrator {
     /// The last admission decision each private ordinary-session lane made:
     /// the budget it measured and why its queue head waits, if it does.
     pub(crate) private_lanes: Arc<crate::execution::jobs::PrivateLaneLedger>,
+    /// The one renewer of every local admission lease this host holds. See
+    /// `execution::jobs::admission_renewal`.
+    pub(crate) admission_renewal: Arc<crate::execution::jobs::AdmissionRenewal>,
     /// This runner host's fresh-pipe evidence (cairn/6023), the floor every
     /// process-adding launch here admits against. See `pipe_floor`.
     pub(crate) pipe_health: cairn_common::pipe_health::PipeHealthMonitor,

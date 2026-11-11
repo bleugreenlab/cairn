@@ -7,6 +7,14 @@
 
 #![cfg_attr(kani, recursion_limit = "256")]
 
+// The unit tests are written against the `test-utils` surface, and the crate
+// deliberately does not enable it on itself through a dev-dependency: that
+// would make this test unit wait for a second compile of the library.
+#[cfg(all(test, not(feature = "test-utils")))]
+compile_error!(
+    "cairn-core's tests need `--features test-utils`; `bun run test:rust -p cairn-core` adds it"
+);
+
 // ── Domain operations ──────────────────────────────────
 pub mod action_configs;
 pub mod action_runs;

@@ -1402,24 +1402,24 @@ where
     if let Some(branch) = job.branch.as_deref() {
         refuse_fenced_coordinate(orch, store, branch)?;
     }
+    let journal = db.clone();
+    // The import preserves reserved names; the mint and continuity read below
+    // use the same scope, and never name a reserved branch of their own.
     let reserved = orch
         .admit_store_import(&store_guard, None)
         .map_err(CoordinateRefusal::Reserved)?;
-    // The import preserves reserved names; the mint and continuity read below
-    // use the same scope, and never name a reserved branch of their own.
     let scoped = jj
         .preserving_import_bookmarks(preserved)
         .preserving_import_bookmarks(reserved);
-    let jj = &scoped;
-    let journal = db.clone();
     let (import_jj, import_store, import_repo) =
-        (jj.clone(), store.to_path_buf(), repo_path.to_path_buf());
+        (scoped.clone(), store.to_path_buf(), repo_path.to_path_buf());
     let (store_guard, ()) = run_db_borrowed(orch.bracket_admitted_store_mutation(
         store_guard,
         db,
         &job.project_id,
         move || crate::jj::ensure_project_store(&import_jj, &import_store, &import_repo),
     ))?;
+    let jj = &scoped;
 
     // Every bookmark this preparation may create is admitted first, under the
     // same guard: a name the acceptance journal still owes (a deleted branch

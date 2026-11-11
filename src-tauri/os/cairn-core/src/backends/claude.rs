@@ -741,6 +741,7 @@ mod account_reach_tests {
     use crate::credentials::{AccountBlock, ApiProvider, ProviderAuth};
     use crate::orchestrator::wakes::{
         load_active_provider_limit_holds, resolve_provider_limit_hold, ProviderLimitHold,
+        SUPPLY_RECHECK_SECS,
     };
 
     struct Fixture {
@@ -1033,7 +1034,8 @@ mod account_reach_tests {
             "nothing was claimed"
         );
 
-        // With every account blocked on a guess, there is no time to wait for.
+        // With every account blocked on a guess, there is no declared reset to
+        // wait for: the hold asks again on the supply re-check cadence.
         for account in [&f.refused, &f.other] {
             f.orch
                 .record_account_health(
@@ -1052,7 +1054,10 @@ mod account_reach_tests {
             .unwrap()
             .remove(0);
         assert_eq!(timerless.retry_not_before, None);
-        assert_eq!(timerless.next_due_at(), None);
+        assert_eq!(
+            timerless.next_due_at(),
+            Some(timerless.updated_at + SUPPLY_RECHECK_SECS)
+        );
         assert_eq!(timerless.launch_attempts, 0);
     }
 }

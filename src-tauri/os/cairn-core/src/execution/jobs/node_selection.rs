@@ -675,12 +675,13 @@ pub(super) mod tests {
             unsubjected(launch(&orch, &db, "exact").unwrap())
         );
 
-        // Launched, the builder reports its stored choice, and the reviewer
-        // now reads that rather than a prediction.
+        // Launched, the builder reports its stored choice (model and effort,
+        // never the account), and the reviewer now reads that rather than a
+        // prediction.
         let after = preview().await;
         assert_eq!(
             step(&after, "builder-1").line(),
-            format!("builder-1 chose: {}", launched.provenance)
+            format!("builder-1 chose: {}", launched.pick_line())
         );
         let review = step(&after, "review").record().cloned().unwrap();
         assert_eq!(review, predicted_review);
