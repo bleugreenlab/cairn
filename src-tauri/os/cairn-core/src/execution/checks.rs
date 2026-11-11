@@ -10455,7 +10455,16 @@ pub(crate) fn applicable_turn_end_checks(
     changed: &[GraphFileChange],
     repo_root: &Path,
 ) -> Vec<CheckPlan> {
-    plan_checks(checks, inputs, changed, repo_root)
+    turn_end_plans(plan_checks(checks, inputs, changed, repo_root), checks)
+}
+
+/// The turn-end cadence's share of a full plan set ([`applicable_turn_end_checks`]),
+/// for a caller that also needs the plans of every other cadence.
+pub(crate) fn turn_end_plans(
+    plans: Vec<CheckPlan>,
+    checks: &HashMap<String, CheckCommand>,
+) -> Vec<CheckPlan> {
+    plans
         .into_iter()
         .filter(|plan| plan.applies)
         .filter(|plan| {

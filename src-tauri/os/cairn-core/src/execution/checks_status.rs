@@ -1490,9 +1490,11 @@ pub(crate) async fn node_retirement(orch: &Orchestrator, job_id: &str) -> Option
 
 /// The projection for a retired node: its last recorded plan's lanes, keyed
 /// exactly as the live projection keys them, so a wave that was still running
-/// at the merge and recorded afterwards is shown too. It reads nothing but the
-/// database. `None` when no wave ever recorded a plan, which callers tell apart
-/// from an unreadable node through [`node_retirement`].
+/// at the merge and recorded afterwards is shown too. Verdicts are read from
+/// the database alone; which lanes apply is measured over the judged head
+/// ([`retired_applicability`]). `None` when no wave ever recorded a plan,
+/// which callers tell apart from an unreadable node through
+/// [`node_retirement`].
 async fn retired_statuses(
     orch: &Orchestrator,
     job_id: &str,
@@ -1503,6 +1505,8 @@ async fn retired_statuses(
 ) -> Option<Vec<NodeCheckStatus>> {
     let plan = retired.plan.as_ref()?;
     let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
+    let measured = applicable_names_at(orch, coords, &plan.head, &plan.base).await;
+    let applicable = retired_applicability(plan, measured);
     let attributions = attribute_lanes(
         orch,
         db,
@@ -1521,12 +1525,102 @@ async fn retired_statuses(
             verified_on: HashMap::new(),
             attributions,
         },
-        Some(&plan.applicable_names),
+        Some(&applicable),
         &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
         None,
     );
     Some(with_unsupported_lanes(statuses, job_id, &plan.unsupported))
+}
+
+/// Which of a retired node's lanes apply.
+///
+/// A recorded plan cannot answer this alone: one recorded before plans listed
+/// every cadence names only the review lanes it ran, and a write lane missing
+/// from it would read as excluded when it applied and simply has no verdict at
+/// this head. So applicability is `measured` over the judged head by the same
+/// selection the live projection runs, and every lane the wave planned is kept
+/// with it. Unmeasured, only a review lane the wave left out is known not to
+/// apply; a lane of any other cadence is undecided, which reads as without a
+/// verdict rather than as excluded.
+fn retired_applicability(plan: &WavePlan, measured: Option<HashSet<String>>) -> HashSet<String> {
+    let mut applicable = measured.unwrap_or_else(|| {
+        plan.checks
+            .iter()
+            .filter(|(_, check)| check.when != CheckWhen::Review)
+            .map(|(name, _)| name.clone())
+            .collect()
+    });
+    applicable.extend(plan.applicable_names.iter().cloned());
+    applicable
+}
+
+/// The checks that apply to a change: the impact and scope selection, over
+/// every configured check whatever its cadence.
+fn applicable_check_names(
+    checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
+    changed: &[crate::jj::GraphFileChange],
+    project_root: &Path,
+) -> HashSet<String> {
+    plan_checks(checks, inputs, changed, project_root)
+        .into_iter()
+        .filter(|plan| plan.applies)
+        .map(|plan| plan.name)
+        .collect()
+}
+
+/// Which of the checks `head` declares apply to its change from `base`, as
+/// [`statuses_at_range`] decides it, read from the store by commit so it still
+/// answers once the node's branch has retired. `None` when the contract, either
+/// commit, or the change between them is unreadable.
+async fn applicable_names_at(
+    orch: &Orchestrator,
+    coords: &JobCoords,
+    head: &str,
+    base: &str,
+) -> Option<HashSet<String>> {
+    let project_root = std::path::PathBuf::from(&coords.repository_path);
+    let contract = orch
+        .node_check_status_cache
+        .contract_at_commit(&project_root, head)
+        .await?;
+    let repository = crate::jj::project_store_dir(&orch.config_dir, &project_root);
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let (head, base) = (head.to_string(), base.to_string());
+    tokio::task::spawn_blocking(move || {
+        let jj = jj
+            .pin_immutable_read(&repository, &[head.as_str(), base.as_str()])
+            .inspect_err(|error| log::debug!("check applicability read unavailable: {error}"))
+            .ok()?;
+        let checks = &contract.checks;
+        let entries = if any_check_declares_inputs(checks.values()) {
+            crate::jj::tree_entries(&jj, &repository, &head).ok()
+        } else {
+            None
+        };
+        let blobs = TreeBlobs {
+            jj: &jj,
+            repository: &repository,
+        };
+        let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+        let inputs = ResolvedInputs::resolve(checks, &contract.extra_inputs, &snapshot);
+        let changed = logical_changed_files(&jj, &repository, &base, &head)
+            .inspect_err(|error| {
+                log::debug!(
+                    "check applicability: changed files of {base}..{head} unreadable: {error}"
+                )
+            })
+            .ok()?;
+        Some(applicable_check_names(
+            checks,
+            &inputs,
+            &changed,
+            &project_root,
+        ))
+    })
+    .await
+    .ok()?
 }
 
 /// The exact settled projection: what applies to this head and which verdict
@@ -1800,13 +1894,9 @@ async fn statuses_at_range(
             // job's history: those rows may judge different inputs in either
             // direction. Historical observations remain available in the ledger.
             let rows = live_rows.unwrap_or_default();
-            let applicable_names = changed.as_ref().map(|changed| {
-                plan_checks(checks, &inputs, changed, &project_root)
-                    .into_iter()
-                    .filter(|plan| plan.applies)
-                    .map(|plan| plan.name)
-                    .collect::<HashSet<_>>()
-            });
+            let applicable_names = changed
+                .as_ref()
+                .map(|changed| applicable_check_names(checks, &inputs, changed, &project_root));
             Some((rows_by_name(rows), applicable_names, verdicts_elapsed))
         })
         .await
@@ -6278,6 +6368,154 @@ mod moved_wave_projection_tests {
         );
         assert!(out_of_scope.get("cancelledBy").is_none(), "{snapshot}");
         drop(slot);
+    }
+
+    /// cairn/6681's retired `/checks`. The review wave's recorded plan names
+    /// only the review lanes it ran, so rust-fmt, a write lane with no row at
+    /// the judged head, read "not applicable" though the change touched the
+    /// Rust it formats. Applicability is measured over the judged head: that
+    /// lane has no verdict recorded, and a write lane whose impact the change
+    /// misses is still not applicable.
+    #[tokio::test]
+    async fn a_retired_write_lane_without_a_row_reads_as_no_verdict_not_as_excluded() {
+        let Some(bin) = jj_bin() else { return };
+        let config = "checks:\n\
+            \x20 rust-lint:\n    command: bun run check:rust\n    when: review\n    policy: advisory\n    impact: ['src-tauri/**/*.rs']\n\
+            \x20 rust-fmt:\n    command: bun run fmt:check\n    when: write\n    policy: advisory\n    impact: ['src-tauri/**/*.rs']\n\
+            \x20 docs-lint:\n    command: bun run docs:lint\n    when: write\n    policy: advisory\n    impact: ['docs/**']\n";
+        let mut f = Fixture::new("rust-lint").await;
+        f.orch.jj_binary_path = bin.clone();
+        f.checks = crate::config::project_settings::parse_project_settings(config)
+            .unwrap()
+            .0
+            .checks
+            .unwrap();
+        assert_eq!(f.checks.len(), 3, "{config}");
+
+        let repo = f.root.path().join("repo");
+        for dir in [".cairn", "src-tauri/core", "docs"] {
+            std::fs::create_dir_all(repo.join(dir)).unwrap();
+        }
+        init_project(&repo);
+        std::fs::write(repo.join(".cairn/config.yaml"), config).unwrap();
+        std::fs::write(repo.join("src-tauri/core/lib.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(repo.join("docs/guide.md"), "guide\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "contract"]);
+        let base = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-qb", "review-branch"]);
+        std::fs::write(repo.join("src-tauri/core/lib.rs"), "fn two() {}\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "the judged change"]);
+        let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        f.db.execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='project-a'",
+            (repo.to_string_lossy().into_owned(),),
+        )
+        .await
+        .unwrap();
+        f.db.execute_script(
+            "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+               VALUES('issue-a','project-a',1,'I','merged',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,snapshot,started_at,seq)
+               VALUES('exec-a','r','issue-a','project-a','completed','{}',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,execution_id,recipe_node_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+               VALUES('job-a','project-a','issue-a','exec-a','builder','complete','builder','builder','review-branch','main',1,1);",
+        )
+        .await
+        .unwrap();
+
+        f.tools = cairn_checkenv::expected_toolchain_identity_in(&repo);
+        let jj = crate::jj::environment(&bin, &f.orch.config_dir);
+        let store = crate::jj::coordinate_repository(&jj, &f.orch.config_dir, &repo).unwrap();
+        let judged = captured_keys(&f, &jj, &store, &head, &base);
+        // As the review planner recorded it before plans listed every
+        // cadence: the review lanes it ran, and nothing else.
+        let plan = WavePlan {
+            capture: None,
+            head: head.clone(),
+            base: base.clone(),
+            tree_hash: judged.tree_hash.clone(),
+            checks: f.checks.clone(),
+            applicable_names: HashSet::from(["rust-lint".into()]),
+            input_hashes: judged.input_hashes.clone(),
+            expected_toolchain: judged.expected_toolchain.clone(),
+            unsupported: BTreeMap::new(),
+        };
+        f.db.execute(
+            "INSERT INTO turn_end_check_attempts(id,job_id,state,reason,sealed_commit,plan_json,created_at,updated_at)
+               VALUES('wave-1','job-a','failed','the issue resolved',?1,?2,1,1)",
+            (head.clone(), serde_json::to_string(&plan).unwrap()),
+        )
+        .await
+        .unwrap();
+        f.observe(&judged, true, "rust-lint-pass");
+
+        let statuses = node_check_statuses(&f.orch, "job-a")
+            .await
+            .expect("a retired node with a recorded plan has lanes");
+        let state = |name: &str| {
+            statuses
+                .iter()
+                .find(|status| status.name == name)
+                .unwrap_or_else(|| panic!("{name} is listed: {statuses:?}"))
+                .state
+        };
+        assert_eq!(state("rust-lint"), NodeCheckState::Passed, "{statuses:?}");
+        assert_eq!(
+            state("rust-fmt"),
+            NodeCheckState::Pending,
+            "an applicable write lane with no row is unanswered, not excluded: {statuses:?}"
+        );
+        assert_eq!(
+            state("docs-lint"),
+            NodeCheckState::NotApplicable,
+            "a write lane the change misses stays excluded: {statuses:?}"
+        );
+
+        let section =
+            crate::execution::checks_turn_end::render_turn_end_checks_section(&f.orch, "job-a")
+                .await
+                .expect("a retired node renders its section");
+        assert!(
+            section.contains("- rust-fmt: no verdict recorded at this head"),
+            "{section}"
+        );
+        assert!(!section.contains("- docs-lint: no verdict"), "{section}");
+    }
+
+    /// With the judged head unreadable, nothing measures a non-review lane, so
+    /// none is declared excluded; a review lane the wave left out still is.
+    #[test]
+    fn unmeasured_retired_applicability_excludes_only_review_lanes_the_wave_left_out() {
+        let check = |when: &str| -> CheckCommand {
+            serde_yaml::from_str(&format!("command: true\nwhen: {when}\n")).unwrap()
+        };
+        let plan = WavePlan {
+            capture: None,
+            head: "head".into(),
+            base: "base".into(),
+            tree_hash: "tree".into(),
+            checks: HashMap::from([
+                ("ran".to_string(), check("review")),
+                ("skipped".to_string(), check("review")),
+                ("fmt".to_string(), check("write")),
+            ]),
+            applicable_names: HashSet::from(["ran".into()]),
+            input_hashes: HashMap::new(),
+            expected_toolchain: String::new(),
+            unsupported: BTreeMap::new(),
+        };
+        assert_eq!(
+            retired_applicability(&plan, None),
+            HashSet::from(["ran".to_string(), "fmt".to_string()])
+        );
+        assert_eq!(
+            retired_applicability(&plan, Some(HashSet::new())),
+            HashSet::from(["ran".to_string()]),
+            "a lane the wave planned is never excluded by a measurement"
+        );
     }
 
     fn captured_keys(

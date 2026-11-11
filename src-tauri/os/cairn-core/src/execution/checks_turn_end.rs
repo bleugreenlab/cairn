@@ -106,16 +106,16 @@ use cairn_uri::{build_node_checks_uri, build_task_checks_uri};
 use sha2::{Digest, Sha256};
 
 use crate::execution::checks::{
-    applicable_turn_end_checks, check_input_hashes, execute_check_contract,
-    load_checks_contract_at_commit, resolve_check_contract_at_commit, resolve_check_timeout_ms,
-    submit_planned_check_batch, CheckExecMode, CheckFailureKind, CheckOutcome, CheckRunProducer,
+    check_input_hashes, execute_check_contract, load_checks_contract_at_commit,
+    resolve_check_contract_at_commit, resolve_check_timeout_ms, submit_planned_check_batch,
+    turn_end_plans, CheckExecMode, CheckFailureKind, CheckOutcome, CheckRunProducer,
     CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem, PlannedCheckBatchRequest,
     CHECKS_CONFIG_PATH, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
 };
-use crate::execution::selection::CheckPlan;
+use crate::execution::selection::{plan_checks, CheckPlan};
 use crate::execution::wire::CheckResourceIdentityInput;
 use crate::fleet::CellPriority;
 use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries, GraphFileChange};
@@ -157,6 +157,10 @@ pub(crate) struct WavePlan {
     pub base: String,
     pub tree_hash: String,
     pub checks: std::collections::HashMap<String, crate::config::project_settings::CheckCommand>,
+    /// Every check that applies to the head's change, whatever its cadence.
+    /// A plan recorded before this held write lanes lists only the review
+    /// lanes it ran, so a reader must not take a lane's absence from an old
+    /// record as its exclusion.
     pub applicable_names: std::collections::HashSet<String>,
     pub input_hashes: std::collections::HashMap<String, String>,
     /// The toolchain identity the wave planned under, which its lanes'
@@ -1892,7 +1896,7 @@ async fn run_turn_end_checks_inner(
     let planning_db = orch.db.local.clone();
     let planning_project = coords.project_id.clone();
     let planning_base_label = prepared.base_branch.clone();
-    let (plans, input_hashes, tree_hash, expected_toolchain, base_findings) =
+    let (plans, applicable_names, input_hashes, tree_hash, expected_toolchain, base_findings) =
         tokio::task::spawn_blocking(move || {
             // The entry listing feeds both the derived closures and the per-check
             // cache key below, so it is read once here.
@@ -1908,15 +1912,21 @@ async fn run_turn_end_checks_inner(
             let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
             let inputs =
                 ResolvedInputs::resolve(&planning_checks, &planning_extra_inputs, &snapshot);
-            let plans = applicable_turn_end_checks(
-                &planning_checks,
-                &inputs,
-                &planning_changed,
-                &planning_repo,
-            );
+            // Every check is planned once. The wave runs the turn-end share,
+            // and records which checks of every cadence apply: `/checks` reads
+            // a lane missing from that record as excluded by its impact, so a
+            // write lane the review cadence never runs must still be listed.
+            let every = plan_checks(&planning_checks, &inputs, &planning_changed, &planning_repo);
+            let applicable_names = every
+                .iter()
+                .filter(|plan| plan.applies)
+                .map(|plan| plan.name.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let plans = turn_end_plans(every, &planning_checks);
             if plans.is_empty() {
                 return Ok((
                     plans,
+                    applicable_names,
                     std::collections::HashMap::new(),
                     String::new(),
                     String::new(),
@@ -1964,6 +1974,7 @@ async fn run_turn_end_checks_inner(
             );
             Ok::<_, String>((
                 plans,
+                applicable_names,
                 input_hashes,
                 tree_hash,
                 expected_toolchain,
@@ -1982,10 +1993,6 @@ async fn run_turn_end_checks_inner(
         ));
     }
 
-    let applicable_names = plans
-        .iter()
-        .map(|plan| plan.name.clone())
-        .collect::<std::collections::HashSet<_>>();
     let canonical_repo = coords.repository_path.clone();
 
     // Is this node's sealed tree byte-identical to the tree of the exact base
@@ -3195,7 +3202,13 @@ pub(crate) async fn turn_end_checks_absence(orch: &Orchestrator, job_id: &str) -
 async fn latest_attempt_absence(orch: &Orchestrator, job_id: &str) -> String {
     use crate::execution::checks_status::human_duration;
     if let Some(status) = orch.turn_end_check_runtime_status(job_id) {
-        if status.plan.applicable_names.is_empty() {
+        let plan = &status.plan;
+        let review_applies = plan.applicable_names.iter().any(|name| {
+            plan.checks.get(name).is_some_and(|check| {
+                check.when == crate::config::project_settings::CheckWhen::Review
+            })
+        });
+        if !review_applies {
             return "No review checks apply to this tree.".to_string();
         }
     }
@@ -3408,7 +3421,10 @@ fn push_check_lines(
                 }
             }
             NodeCheckState::Pending => match (cadence, existence) {
-                (None, _) => out.push_str(&format!("- {}: no verdict\n", status.name)),
+                (None, _) => out.push_str(&format!(
+                    "- {}: no verdict recorded at this head\n",
+                    status.name
+                )),
                 (Some(_), Some(LaneExistence::Absent)) => out.push_str(&format!(
                     "- {}: absent \u{2014} no lane has run it on this head\n",
                     status.name
@@ -6040,10 +6056,15 @@ pinBumps:
             &std::collections::HashMap::new(),
             &TreeSnapshot::empty(),
         );
-        let ordinary = applicable_turn_end_checks(&checks, &inputs, changed, Path::new("/repo"))
-            .into_iter()
-            .map(|plan| plan.name)
-            .collect();
+        let ordinary = crate::execution::checks::applicable_turn_end_checks(
+            &checks,
+            &inputs,
+            changed,
+            Path::new("/repo"),
+        )
+        .into_iter()
+        .map(|plan| plan.name)
+        .collect();
         (
             ordinary,
             pin_bump_lanes_owed(target_config, changed).unwrap(),
