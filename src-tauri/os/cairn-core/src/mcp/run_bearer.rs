@@ -653,6 +653,10 @@ pub struct RunBearerBook {
     lineage: cairn_common::lineage::LineageRoots<BearerScope>,
     /// Set once this runner's lineage callback socket is bound and served.
     callback_socket_live: std::sync::atomic::AtomicBool,
+    /// Seconds this book's clock runs ahead of the wall clock, so a test can
+    /// reach a bearer's expiry without waiting for it.
+    #[cfg(test)]
+    clock_ahead: std::sync::atomic::AtomicI64,
 }
 
 /// A lineage root opened before an agent process spawns, recorded once its
@@ -675,6 +679,21 @@ impl RootRegistration {
 }
 
 impl RunBearerBook {
+    /// The time every expiry and revocation in this book is judged at.
+    fn now(&self) -> i64 {
+        #[cfg(test)]
+        return now() + self.clock_ahead.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        now()
+    }
+
+    /// Move this book's clock `by` into the future.
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, by: std::time::Duration) {
+        self.clock_ahead
+            .fetch_add(by.as_secs() as i64, Ordering::Relaxed);
+    }
+
     /// Mint a bearer for `run_id`, presentable only to `audience`. Refused once
     /// the run's bearers have been revoked.
     ///
@@ -693,14 +712,14 @@ impl RunBearerBook {
             run_id,
             node_uri,
             audience,
-            now() + BEARER_LIFETIME_SECS,
+            self.now() + BEARER_LIFETIME_SECS,
             token,
         )
     }
 
     /// [`Self::mint`] with a shorter life, for a bearer whose run is bounded:
-    /// a project service's per-call credential lives only as long as its call
-    /// may, even if the revocation at the call's end never runs.
+    /// a project service's per-call credential. Its run's revocation is its
+    /// real end; the lifetime only bounds one whose revocation never runs.
     pub fn mint_expiring(
         &self,
         run_id: &str,
@@ -712,7 +731,7 @@ impl RunBearerBook {
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         let token = URL_SAFE_NO_PAD.encode(bytes);
         let lifetime = (lifetime.as_secs() as i64).clamp(1, BEARER_LIFETIME_SECS);
-        self.mint_token(run_id, node_uri, audience, now() + lifetime, token)
+        self.mint_token(run_id, node_uri, audience, self.now() + lifetime, token)
     }
 
     /// Mint the bearer for pooled Codex server `server_id`, presentable only to
@@ -729,7 +748,7 @@ impl RunBearerBook {
             LeaseTerms {
                 source: &source,
                 audience,
-                expires_at: now() + BEARER_LIFETIME_SECS,
+                expires_at: self.now() + BEARER_LIFETIME_SECS,
                 purpose: "pooled Codex MCP bearer",
             },
             token.clone(),
@@ -761,7 +780,7 @@ impl RunBearerBook {
         expires_at: i64,
         token: String,
     ) -> Result<RunBearer, BearerRefusal> {
-        let at = now();
+        let at = self.now();
         // Held from the revocation check through the insert, so revocation
         // cannot slip between them.
         let mut state = self.state.lock().expect("run bearer book poisoned");
@@ -932,11 +951,15 @@ impl RunBearerBook {
     }
 
     /// Verify a presented token for a request that arrived at `presented_to`.
+    ///
+    /// Revocation is judged before expiry: a bearer is good while its run is
+    /// live, and its expiry only bounds a run whose revocation never came.
     pub fn verify(
         &self,
         token: &str,
         presented_to: &LeaseAudience,
     ) -> Result<VerifiedBearer, BearerRefusal> {
+        let at = self.now();
         let state = self.state.lock().expect("run bearer book poisoned");
         let entry = state
             .entries
@@ -949,7 +972,7 @@ impl RunBearerBook {
                 reason: revocation.reason.clone(),
             });
         }
-        let verdict = match entry.lease.present(presented_to) {
+        let verdict = match entry.lease.present_at(presented_to, at) {
             Ok(presented) if constant_time_eq(presented.expose().as_bytes(), token.as_bytes()) => {
                 Ok(VerifiedBearer {
                     scope: entry.scope.clone(),
@@ -979,7 +1002,7 @@ impl RunBearerBook {
     /// and refuse any later mint for it. Idempotent. Returns how many bearers
     /// this call revoked.
     pub fn revoke_run(&self, run_id: &str, reason: &str) -> usize {
-        let at = now();
+        let at = self.now();
         let mut state = self.state.lock().expect("run bearer book poisoned");
         #[cfg(unix)]
         Self::drop_roots(&mut state, &BearerScope::Run(run_id.to_string()));
@@ -1005,7 +1028,7 @@ impl RunBearerBook {
         let scope = BearerScope::CodexPool(server_id.to_string());
         #[cfg(unix)]
         Self::drop_roots(&mut state, &scope);
-        Self::revoke_scope(&mut state, &scope, now(), reason)
+        Self::revoke_scope(&mut state, &scope, self.now(), reason)
     }
 
     fn revoke_scope(state: &mut BookState, scope: &BearerScope, at: i64, reason: &str) -> usize {

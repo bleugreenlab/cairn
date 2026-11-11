@@ -780,6 +780,167 @@ async fn a_deadline_after_dispatch_cancels_the_call_and_revokes_its_bearer() {
     );
 }
 
+/// A starved orchestrator fires its timers late while the wall clock runs on.
+/// A call still live there keeps a bearer the store accepts, however far past
+/// its deadline the clock has gone; ending the call is what ends the bearer.
+#[tokio::test]
+async fn a_live_call_s_bearer_holds_past_its_deadline_until_its_run_ends() {
+    let h = harness().await;
+    let orch = h.orch.clone();
+    let mut caller =
+        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    let frame = dispatched(&h, "slow", &mut caller).await;
+    let (run_id, token) = authority_of(&frame);
+
+    // Echo's deadline is 5 s; two minutes on is far past it and past the
+    // 30 s grace the bearer once expired at, and the call has not ended.
+    h.orch
+        .run_bearers
+        .advance_clock(Duration::from_secs(5 + 120));
+    let verified = h
+        .orch
+        .run_bearers
+        .verify(&token, &local())
+        .expect("a live call's bearer is good past its deadline");
+    assert_eq!(verified.run_id(), Some(run_id.as_str()));
+
+    h.host.release_slow.notify_waiters();
+    caller.await.unwrap().unwrap();
+    // Ended, and refused at once: the clock is still well inside the backstop.
+    assert!(matches!(
+        h.orch.run_bearers.verify(&token, &local()),
+        Err(crate::mcp::run_bearer::BearerRefusal::Revoked { .. })
+    ));
+}
+
+/// A call whose end never came is still bounded: past the backstop its
+/// bearer is refused as expired, though its run was never ended.
+#[tokio::test]
+async fn a_call_bearer_past_its_backstop_is_refused_though_its_run_never_ended() {
+    let h = harness().await;
+    let orch = h.orch.clone();
+    let mut caller =
+        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    let frame = dispatched(&h, "slow", &mut caller).await;
+    let (run_id, token) = authority_of(&frame);
+
+    h.orch
+        .run_bearers
+        .advance_clock(Duration::from_secs(5) + BEARER_BACKSTOP + Duration::from_secs(1));
+    assert!(!h.orch.run_bearers.run_is_revoked(&run_id));
+    let refusal = h.orch.run_bearers.verify(&token, &local()).unwrap_err();
+    assert!(
+        matches!(
+            &refusal,
+            crate::mcp::run_bearer::BearerRefusal::Expired { .. }
+        ),
+        "{refusal:?}"
+    );
+
+    h.host.release_slow.notify_waiters();
+    let _ = caller.await;
+}
+
+/// A runtime that stalls past a call's deadline wakes to the service's answer
+/// before its own timer. The service's write during the stall lands, and the
+/// call is recorded as the deadline it overran, not as what the service said.
+#[tokio::test]
+async fn an_answer_taken_after_the_deadline_is_recorded_as_the_deadline() {
+    let h = harness().await;
+    let method = "slow";
+    let mut brief = request("echo", method, agent());
+    brief.timeout = Some(Duration::from_secs(1));
+    let orch = h.orch.clone();
+    let mut caller = tokio::spawn(async move { call(&orch, brief).await });
+    let frame = dispatched(&h, method, &mut caller).await;
+    let (_, token) = authority_of(&frame);
+
+    // The service answers, and then the runtime stalls: nothing on it runs,
+    // its timers included, while the wall clock passes the deadline.
+    h.host.release_slow.notify_waiters();
+    std::thread::sleep(Duration::from_millis(1_300));
+    // The service's own write, a minute on by the store's clock, lands.
+    h.orch.run_bearers.advance_clock(Duration::from_secs(60));
+    assert!(h.orch.run_bearers.verify(&token, &local()).is_ok());
+
+    let error = caller.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "deadline", "{error:?}");
+    assert!(
+        error.message.contains("overran its deadline by") && error.message.contains("answered ok"),
+        "the overrun is measured and the service's answer kept as detail: {error:?}"
+    );
+    let recent = status(&h, "echo").recent_calls;
+    let last = recent.last().unwrap();
+    assert_eq!(last.outcome, "deadline");
+    assert!(last.ran_ms >= 1_000, "{last:?}");
+    let log = log_texts(&h, "echo").await;
+    assert!(
+        log.iter()
+            .any(|text| text.starts_with("slow from agent") && text.contains("error (deadline)")),
+        "{log:?}"
+    );
+}
+
+#[test]
+fn an_answer_is_the_outcome_only_when_taken_by_the_deadline() {
+    let deadline = Instant::now();
+    let late = deadline + Duration::from_millis(41_000);
+    assert_eq!(
+        settle_answer(Ok(json!(1)), deadline, deadline).unwrap(),
+        json!(1)
+    );
+    let failed = Err(CallError::new("store", "Cairn write failed (HTTP 403)"));
+    assert_eq!(
+        settle_answer(failed.clone(), deadline, deadline)
+            .unwrap_err()
+            .code,
+        "store"
+    );
+    let overran = settle_answer(failed, deadline, late).unwrap_err();
+    assert_eq!(overran.code, "deadline");
+    assert!(
+        overran.message.contains("by 41000 ms")
+            && overran
+                .message
+                .contains("failed `store`: Cairn write failed (HTTP 403)"),
+        "{overran:?}"
+    );
+}
+
+/// A call's row says how long it waited to be served apart from how long it
+/// ran, so a slow placement is never read as a deadline that did not fire.
+#[tokio::test]
+async fn a_call_row_carries_its_wait_and_its_run_apart() {
+    let h = harness().await;
+    let orch = h.orch.clone();
+    let began = Instant::now();
+    let mut caller =
+        tokio::spawn(async move { call(&orch, request("echo", "slow", agent())).await });
+    dispatched(&h, "slow", &mut caller).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.host.release_slow.notify_waiters();
+    caller.await.unwrap().unwrap();
+    let total = began.elapsed().as_millis() as u64;
+
+    let recent = status(&h, "echo").recent_calls;
+    let row = recent.last().unwrap();
+    assert!(row.ran_ms >= 300, "{row:?}");
+    assert!(
+        row.waited_ms + row.ran_ms <= total,
+        "{row:?} within {total} ms"
+    );
+    let log = log_texts(&h, "echo").await;
+    let line = log
+        .iter()
+        .find(|text| text.starts_with("slow from agent"))
+        .unwrap_or_else(|| panic!("{log:?}"));
+    assert!(
+        line.contains(&format!("waited {} ms to be served", row.waited_ms))
+            && line.contains(&format!("ran {} ms", row.ran_ms)),
+        "{line}"
+    );
+}
+
 #[tokio::test]
 async fn a_crash_fails_pending_calls_then_restarts_at_the_next_generation() {
     let h = harness().await;

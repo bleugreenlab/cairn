@@ -387,6 +387,32 @@ fn log_line(row: &LogRow) -> String {
     format!("- {when} [{}] g{} {}\n", row.kind, row.generation, row.text)
 }
 
+/// The recent calls, newest first. Waiting to be served and running are
+/// separate columns: only running counts against the call's deadline.
+fn recent_calls(calls: &[supervisor::CallRecord]) -> String {
+    if calls.is_empty() {
+        return "None since this runner started.\n".to_string();
+    }
+    let mut out = String::from(
+        "| When | Method | Caller | Outcome | Waited ms | Ran ms |\n|---|---|---|---|---|---|\n",
+    );
+    for call in calls.iter().rev() {
+        let when = chrono::DateTime::from_timestamp_millis(call.at_ms)
+            .map(|at| at.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "| {when} | {} | {} {} | {} | {} | {} |\n",
+            cell(&call.method),
+            call.caller_kind,
+            cell(&call.acting_for),
+            cell(&call.outcome),
+            call.waited_ms,
+            call.ran_ms
+        ));
+    }
+    out
+}
+
 /// The status, recent calls, newest log lines, and links every service read
 /// ends with, whoever owns it.
 async fn live_sections(
@@ -399,28 +425,9 @@ async fn live_sections(
     out.push_str(&status_block(status, serving));
     out.push_str(&schedule_block(orch, target, status).await);
     out.push_str("\n## Recent calls\n\n");
-    match status
-        .map(|s| &s.recent_calls)
-        .filter(|calls| !calls.is_empty())
-    {
-        None => out.push_str("None since this runner started.\n"),
-        Some(calls) => {
-            out.push_str("| When | Method | Caller | Outcome | ms |\n|---|---|---|---|---|\n");
-            for call in calls.iter().rev() {
-                let when = chrono::DateTime::from_timestamp_millis(call.at_ms)
-                    .map(|at| at.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "| {when} | {} | {} {} | {} | {} |\n",
-                    cell(&call.method),
-                    call.caller_kind,
-                    cell(&call.acting_for),
-                    cell(&call.outcome),
-                    call.millis
-                ));
-            }
-        }
-    }
+    out.push_str(&recent_calls(
+        status.map_or(&[][..], |s| s.recent_calls.as_slice()),
+    ));
     out.push_str("\n## Last said\n\n");
     let newest = match owning_db(orch, target).await {
         Ok(db) => log::list(
@@ -692,4 +699,25 @@ pub(crate) async fn read_log(
         out.push_str(&format!("\nNewer rows: `?since={}`\n", last.created_at + 1));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recent_call_names_its_wait_and_its_run_apart() {
+        let table = recent_calls(&[supervisor::CallRecord {
+            at_ms: 1_793_000_000_000,
+            method: "refresh".into(),
+            caller_kind: "thread".into(),
+            acting_for: "cairn://p/cairn/thread-ux".into(),
+            outcome: "ok".into(),
+            waited_ms: 245_955,
+            ran_ms: 20_012,
+        }]);
+        assert!(table.contains("| Waited ms | Ran ms |"), "{table}");
+        assert!(table.contains("| ok | 245955 | 20012 |"), "{table}");
+        assert_eq!(recent_calls(&[]), "None since this runner started.\n");
+    }
 }

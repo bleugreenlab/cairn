@@ -237,6 +237,16 @@ impl CredentialLease {
     /// environment, or a request body addressed to `audience` — never in a log
     /// line, a serializer, a database row, or anything a model observes.
     pub fn present(&self, audience: &LeaseAudience) -> Result<Presented<'_>, LeaseDenied> {
+        self.present_at(audience, now())
+    }
+
+    /// [`Self::present`] with the deadline judged at `now` (unix seconds), for
+    /// a holder that keeps its own clock.
+    pub fn present_at(
+        &self,
+        audience: &LeaseAudience,
+        now: i64,
+    ) -> Result<Presented<'_>, LeaseDenied> {
         if &self.0.audience != audience {
             return Err(LeaseDenied::Audience {
                 lease: self.0.id.clone(),
@@ -254,7 +264,6 @@ impl CredentialLease {
                 lease: self.0.id.clone(),
             });
         }
-        let now = now();
         if self.0.expires_at <= now {
             return Err(LeaseDenied::Expired {
                 lease: self.0.id.clone(),

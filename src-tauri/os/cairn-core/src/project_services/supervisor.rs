@@ -62,9 +62,13 @@ const PLACEMENT_RETRY_BASE: Duration = if cfg!(test) {
 /// The largest params a call may carry.
 pub(crate) const MAX_PARAMS_BYTES: usize = 1024 * 1024;
 const RECENT_CALLS: usize = 10;
-/// How long a call's bearer outlives the call's own deadline, should its
-/// revocation at the call's end somehow not run.
-const BEARER_GRACE: Duration = Duration::from_secs(30);
+/// How far past the call's own deadline its bearer's expiry lies. A call's
+/// bearer dies at `end_run`, the one point a call ends; the expiry is only the
+/// backstop for a revocation that never ran. It lies minutes out because the
+/// deadline is kept by this runtime's timers, which a starved orchestrator
+/// fires late, while the expiry is judged by the wall clock: one any nearer
+/// refuses a live call's writes before the call has been ended.
+pub(crate) const BEARER_BACKSTOP: Duration = Duration::from_secs(10 * 60);
 /// The longest error text a service's failure carries back to a caller.
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 /// The longest a schedule task sleeps before reading the wall clock again, so
@@ -405,7 +409,11 @@ pub(crate) struct CallRecord {
     pub caller_kind: String,
     pub acting_for: String,
     pub outcome: String,
-    pub millis: u64,
+    /// From the call's admission until a generation was serving it: start
+    /// and placement, which the deadline does not count.
+    pub waited_ms: u64,
+    /// From then until the call ended: the span the deadline bounds.
+    pub ran_ms: u64,
 }
 
 #[derive(Default)]
@@ -2828,7 +2836,8 @@ async fn call_body(
     let limits = first.declaration.limits;
     let max = Duration::from_secs(limits.call_timeout_seconds as u64);
     let timeout = request.timeout.map_or(max, |timeout| timeout.min(max));
-    let deadline = Instant::now() + timeout;
+    let serving = Instant::now();
+    let deadline = serving + timeout;
 
     // Everything slow about a call happens before an incarnation is chosen, so
     // nothing stands between choosing the serving one and sending to it. The
@@ -2848,7 +2857,8 @@ async fn call_body(
         Err(error) => {
             let result = Err(error);
             let touched = CallTouched::default();
-            record_call(orch, &cell, &first, &request, &result, &touched, started).await;
+            let span = CallSpan { started, serving };
+            record_call(orch, &cell, &first, &request, &result, &touched, span).await;
             return Ok((result, touched));
         }
     };
@@ -2877,7 +2887,7 @@ async fn call_body(
                 orch,
                 &delegation.run_id,
                 &cell.home(),
-                Some(remaining + BEARER_GRACE),
+                Some(remaining + BEARER_BACKSTOP),
                 &incarnation.callback_audience,
             ) {
                 Ok(bearer) => {
@@ -2941,10 +2951,8 @@ async fn call_body(
             })
             .collect(),
     };
-    record_call(
-        orch, &cell, &served_by, &request, &result, &touched, started,
-    )
-    .await;
+    let span = CallSpan { started, serving };
+    record_call(orch, &cell, &served_by, &request, &result, &touched, span).await;
     Ok((result, touched))
 }
 
@@ -2994,7 +3002,13 @@ async fn delegate(
         .await
         .map_err(|error| CallError::new("service_unavailable", error))?;
     let home = cell.home();
-    let bearer = match mint_bearer(orch, &run_id, &home, Some(timeout + BEARER_GRACE), audience) {
+    let bearer = match mint_bearer(
+        orch,
+        &run_id,
+        &home,
+        Some(timeout + BEARER_BACKSTOP),
+        audience,
+    ) {
         Ok(bearer) => bearer,
         Err(error) => {
             end_run(orch, &cell.project_id, &run_id, "call ended").await;
@@ -3113,7 +3127,7 @@ async fn send_call(
             ))
         }
         Ok(()) => match tokio::time::timeout(timeout, answer).await {
-            Ok(Ok(outcome)) => outcome,
+            Ok(Ok(outcome)) => settle_answer(outcome, deadline, Instant::now()),
             Ok(Err(_)) => Err(CallError::new(
                 "service_crashed",
                 "the service went away while the call was in flight",
@@ -3133,6 +3147,42 @@ async fn send_call(
     result
 }
 
+/// A service's answer, judged against the deadline it was given. An answer
+/// taken after the deadline means the call overran it: the runtime's timer
+/// fired late (a starved orchestrator does), so what the service said is not
+/// the call's outcome, only its detail. It fails with `deadline`, as it would
+/// have had the timer been on time.
+pub(crate) fn settle_answer(
+    outcome: Result<Value, CallError>,
+    deadline: Instant,
+    now: Instant,
+) -> Result<Value, CallError> {
+    let overrun = now.saturating_duration_since(deadline);
+    if overrun.is_zero() {
+        return outcome;
+    }
+    let answered = match &outcome {
+        Ok(_) => "answered ok".to_string(),
+        Err(error) => format!("failed `{}`: {}", error.code, error.message),
+    };
+    Err(CallError::new(
+        "deadline",
+        format!(
+            "the call overran its deadline by {} ms before its answer was taken (the \
+             runtime's timer fired late); the service {answered}",
+            overrun.as_millis()
+        ),
+    ))
+}
+
+/// When a call was admitted, and when a generation was serving it: the
+/// boundary between placement wait and the time the deadline bounds.
+#[derive(Clone, Copy)]
+struct CallSpan {
+    started: Instant,
+    serving: Instant,
+}
+
 async fn record_call(
     orch: &Orchestrator,
     cell: &Arc<Cell>,
@@ -3140,9 +3190,10 @@ async fn record_call(
     request: &CallRequest,
     result: &Result<Value, CallError>,
     touched: &CallTouched,
-    started: Instant,
+    span: CallSpan,
 ) {
-    let millis = started.elapsed().as_millis() as u64;
+    let waited_ms = span.serving.duration_since(span.started).as_millis() as u64;
+    let ran_ms = span.serving.elapsed().as_millis() as u64;
     let (outcome, code) = match result {
         Ok(_) => ("ok", None),
         Err(error) => ("error", Some(error.code.clone())),
@@ -3153,7 +3204,8 @@ async fn record_call(
         caller_kind: request.caller.kind.as_str().to_string(),
         acting_for: request.caller.acting_for.clone(),
         outcome: code.clone().unwrap_or_else(|| outcome.to_string()),
-        millis,
+        waited_ms,
+        ran_ms,
     };
     {
         let mut state = cell.state.lock().unwrap();
@@ -3163,7 +3215,7 @@ async fn record_call(
         }
     }
     let text = format!(
-        "{} from {} {} → {}{} in {millis} ms",
+        "{} from {} {} → {}{}: waited {waited_ms} ms to be served, ran {ran_ms} ms",
         request.method,
         request.caller.kind.as_str(),
         request.caller.acting_for,
@@ -3184,7 +3236,8 @@ async fn record_call(
             "actingFor": request.caller.acting_for,
             "outcome": outcome,
             "code": code,
-            "ms": millis,
+            "waitedMs": waited_ms,
+            "ranMs": ran_ms,
             "writes": touched.writes,
             "batches": touched
                 .batches
