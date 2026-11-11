@@ -423,6 +423,8 @@ mod linux {
     /// the rlimits confine it).
     pub(super) fn seccomp_filter() -> Vec<libc::sock_filter> {
         let errno = |code: i32| SECCOMP_RET_ERRNO | (code as u32 & 0xffff);
+        // Only x86_64 has separate fork syscalls to add below.
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut refused = vec![
             libc::SYS_socket,
             libc::SYS_socketpair,
@@ -550,20 +552,6 @@ mod tests {
         assert_eq!(profile.matches("(version 1)").count(), 1);
     }
 
-    /// Whether this process can apply a Seatbelt profile to a child; a process
-    /// already inside one cannot, the declared `nested-sandbox-exec` gap.
-    #[cfg(target_os = "macos")]
-    fn skip_inside_seatbelt(test: &str) -> bool {
-        match IsolatedChild::availability() {
-            Ok(()) => false,
-            Err(why) => {
-                eprintln!("skipping {test}: {why}");
-                cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
-                true
-            }
-        }
-    }
-
     /// The pinned bun the app ships, staged by `ensure-sidecar` beside the crates.
     #[cfg(target_os = "macos")]
     fn staged_bun() -> PathBuf {
@@ -591,7 +579,7 @@ mod tests {
     #[test]
     fn bun_starts_under_the_isolated_profile_live() {
         use std::process::Command;
-        if skip_inside_seatbelt("bun_starts_under_the_isolated_profile_live") {
+        if crate::skip_without_nested_sandbox("bun_starts_under_the_isolated_profile_live") {
             return;
         }
         let bun = staged_bun();

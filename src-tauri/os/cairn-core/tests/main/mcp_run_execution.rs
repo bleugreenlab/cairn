@@ -2670,19 +2670,20 @@ await output("both waves landed");
 "#;
 
 /// Whether this host can confine a workflow runtime, which starts under the
-/// credential floor's profile. On macOS the only cause it cannot is a test
-/// process already inside a Seatbelt profile, the declared
-/// `nested-sandbox-exec` gap, recorded as a skip.
+/// credential floor's profile. A process that cannot nest a Seatbelt profile
+/// is the declared `nested-sandbox-exec` gap, recorded as a skip; any other
+/// host that cannot confine fails the test.
 fn workflow_confines_here(test: &str) -> bool {
-    match cairn_sandbox::IsolatedChild::availability() {
-        Ok(()) => true,
-        Err(why) if cfg!(target_os = "macos") => {
-            eprintln!("skipping {test}: {why}");
-            cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
-            false
-        }
-        Err(why) => panic!("{test} needs a host that can confine a workflow runtime: {why}"),
+    let here = cairn_sandbox::nested_sandbox_here();
+    if here.declines() {
+        eprintln!("skipping {test}: {}", here.detail());
+        cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
+        return false;
     }
+    if let Err(why) = cairn_sandbox::IsolatedChild::availability() {
+        panic!("{test} needs a host that can confine a workflow runtime: {why}");
+    }
+    true
 }
 
 /// What became of a run, for a failure message.

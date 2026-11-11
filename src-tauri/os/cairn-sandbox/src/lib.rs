@@ -25,6 +25,7 @@
 
 mod approved_crossing;
 pub mod containment;
+mod here;
 #[cfg(all(test, target_os = "linux"))]
 mod host_socket_tests;
 mod isolated;
@@ -42,7 +43,12 @@ mod write_refusal;
 pub use approved_crossing::{
     bounded_rerun, cairn_state_reached_by, crossing_access, NO_PATH_RECOVERED, NO_POLICY_TO_WIDEN,
 };
+pub use here::{
+    nested_sandbox_here, skip_without_nested_sandbox, CrossCheck, LaneNestedSandboxRecord,
+    NestedSandboxHere, LANE_NESTED_SANDBOX_ENV, NESTED_SANDBOX_DISAGREEMENT,
+};
 pub use isolated::{IsolatedChild, IsolatedLimits};
+pub use nested::lane_nested_sandbox_handoff;
 pub use operator_credential::{
     credential_denial, detect_credential_floor_denial, Confinement, MacosProfile,
     OperatorCredentialFloor, OPERATOR_CREDENTIAL_REFUSAL,
@@ -67,24 +73,12 @@ pub fn current_process_is_confined() -> bool {
     false
 }
 
-/// For a test that spawns through the product's own confinement (the operator
-/// credential floor, or a fence): whether to skip because this process already
-/// runs inside a Seatbelt profile, where macOS refuses the spawn's profile at
-/// `sandbox_apply` with exit 71. Measured from kernel state, never from the
-/// `CAIRN_SANDBOXED` marker, so it is true only on macOS. A skip is recorded as
-/// the declared `nested-sandbox-exec`, never a pass; pass the test's own name as
-/// a string literal so the skip census can match its manifest stanza.
-pub fn skip_if_confined(test: &str) -> bool {
-    if !current_process_is_confined() {
-        return false;
-    }
-    eprintln!("skipping {test}: this process runs inside a Seatbelt profile, so the product's own confinement of its spawns cannot apply");
-    cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
-    true
-}
-
 /// Evidence that a process can launch a nested macOS Seatbelt profile and
 /// perform a write which that profile explicitly permits.
+///
+/// The question a test asks of the process it runs in is answered by
+/// [`nested_sandbox_here`]; an executor deciding whether its check lanes can
+/// nest asks it of the lane's own wrapping ([`sandbox_capability_evidence`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedSandboxWriteProbe {
     pub available: bool,
@@ -93,28 +87,6 @@ pub struct NestedSandboxWriteProbe {
     /// nested profile should have permitted failing.
     pub apply_refused: bool,
     pub detail: String,
-}
-
-/// Whether THIS process can apply a nested profile and write inside it: the
-/// question a test asks of the environment it is already running in.
-///
-/// An executor deciding whether its check lanes can do so asks a different
-/// question, because it spawns those lanes inside a profile of its own; see
-/// [`sandbox_capability_evidence`].
-///
-/// This deliberately does not consult `CAIRN_SANDBOXED`: that marker records a
-/// Cairn policy decision, while an inherited Seatbelt profile is kernel state.
-#[cfg(target_os = "macos")]
-pub fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
-    static PROBE: std::sync::OnceLock<NestedSandboxWriteProbe> = std::sync::OnceLock::new();
-    PROBE
-        .get_or_init(|| macos::probe_nested_sandbox_write_under(&Confinement::Unconfined))
-        .clone()
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
-    nested_probe_not_applicable()
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -16,8 +16,12 @@
 //! cannot rot.
 //!
 //! A nested `sandbox-exec` is deliberately REPORTED and not required. It is the
-//! one capability the fence genuinely withholds, and the sandbox suites' own
-//! probe (`os/cairn-sandbox/src/macos.rs`) skips on it with a declared reason.
+//! one capability a confined lane genuinely withholds, and every test that needs
+//! it skips through the one predicate this report prints
+//! (`cairn_sandbox::nested_sandbox_here`), with a declared reason. The line names
+//! what decided it, this process's own probe, and how the executor's
+//! handed-down lane record compares: agreeing, disagreeing, not comparable, or
+//! absent.
 
 use std::net::TcpListener;
 use std::process::Command;
@@ -167,28 +171,20 @@ fn jj() -> Capability {
     }
 }
 
-/// Reported, never required: the capability the fence legitimately withholds.
-/// Probed the same way the sandbox suites probe it — an in-bounds write under a
-/// nested profile — because macOS sandboxes do not nest.
-#[cfg(target_os = "macos")]
+/// Reported, never required: the capability a confined lane legitimately
+/// withholds, read from the one predicate the guards skip on, because macOS
+/// sandboxes do not nest.
 fn nested_sandbox_exec() -> Capability {
-    let probe = cairn_sandbox::probe_nested_sandbox_write();
+    let here = cairn_sandbox::nested_sandbox_here();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
     Capability {
         name: "nested-sandbox-exec",
         required: false,
-        present: probe.available,
-        detail: probe.detail,
-        remedy: None,
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn nested_sandbox_exec() -> Capability {
-    Capability {
-        name: "nested-sandbox-exec",
-        required: false,
-        present: false,
-        detail: format!("not applicable on {}", std::env::consts::OS),
+        present: here.available(),
+        detail: here.report(now_ms),
         remedy: None,
     }
 }

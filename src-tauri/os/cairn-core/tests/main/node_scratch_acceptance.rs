@@ -504,7 +504,11 @@ pub(crate) async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 /// declaration, while the batch itself still goes where the guess said.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home() {
+    // The held terminal and the batch both spawn wrapped in a Seatbelt profile,
+    // which a process that cannot nest one sees refused at `sandbox_apply`.
     if common::skip_if_fenced(
+        "a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home",
+    ) || cairn_sandbox::skip_without_nested_sandbox(
         "a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home",
     ) {
         return;

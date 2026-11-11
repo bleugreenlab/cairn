@@ -24,14 +24,43 @@ use std::path::Path;
 /// The per-run skip log the Rust test runner hands every test process.
 pub const SKIP_LOG_ENV: &str = "CAIRN_SKIP_LOG";
 
+/// The first field of a skip-log line that records an observation about the
+/// run rather than a skip. The ledger reports these by kind and never counts
+/// one as a skip.
+pub const OBSERVATION_MARKER: &str = "#observation";
+
 /// Record that `test` skipped for `reason`, best-effort, when a skip log exists.
 pub fn record_skip(test: &str, reason: &str) {
     if let Some(log) = std::env::var_os(SKIP_LOG_ENV) {
-        append_skip(Path::new(&log), test, reason);
+        append_line(Path::new(&log), &format!("{test}\t{reason}\n"));
     }
 }
 
-fn append_skip(log: &Path, test: &str, reason: &str) {
+/// Record an observation of kind `kind` beside the run's skips, best-effort,
+/// when a skip log exists: something the run's owner should see in the skip
+/// report, such as two measurements of one capability disagreeing.
+pub fn record_observation(kind: &str, detail: &str) {
+    if let Some(log) = std::env::var_os(SKIP_LOG_ENV) {
+        append_line(Path::new(&log), &observation_line(kind, detail));
+    }
+}
+
+fn observation_line(kind: &str, detail: &str) -> String {
+    // One line, three fields: a tab or newline in the detail would split it.
+    let detail = detail
+        .chars()
+        .map(|c| {
+            if c == '\t' || c == '\n' || c == '\r' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    format!("{OBSERVATION_MARKER}\t{kind}\t{detail}\n")
+}
+
+fn append_line(log: &Path, line: &str) {
     use std::io::Write as _;
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -40,7 +69,7 @@ fn append_skip(log: &Path, test: &str, reason: &str) {
     {
         // One write_all (vs writeln!'s multiple syscalls) keeps the append atomic
         // when parallel test threads all skip at once.
-        let _ = file.write_all(format!("{test}\t{reason}\n").as_bytes());
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -90,11 +119,19 @@ mod tests {
     fn each_skip_appends_one_tab_separated_record() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("skips.log");
-        append_skip(&log, "first", "worktree-fence");
-        append_skip(&log, "second", "jj-unavailable");
+        append_line(&log, "first\tworktree-fence\n");
+        append_line(&log, "second\tjj-unavailable\n");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "first\tworktree-fence\nsecond\tjj-unavailable\n"
+        );
+    }
+
+    #[test]
+    fn an_observation_is_one_marked_line_whatever_its_detail_holds() {
+        assert_eq!(
+            observation_line("nested-sandbox-cross-check-disagreed", "in-process\tAVAILABLE\nrecord UNAVAILABLE"),
+            "#observation\tnested-sandbox-cross-check-disagreed\tin-process AVAILABLE record UNAVAILABLE\n"
         );
     }
 }

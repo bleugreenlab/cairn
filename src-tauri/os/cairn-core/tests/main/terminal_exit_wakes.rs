@@ -506,7 +506,7 @@ async fn project_terminal_wake_requires_agent_caller_before_spawning() {
 /// an operator kill still ends it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_recovery_kill_keeps_the_jobs_terminal_and_an_operator_kill_ends_it() {
-    if cairn_sandbox::skip_if_confined(
+    if cairn_sandbox::skip_without_nested_sandbox(
         "a_recovery_kill_keeps_the_jobs_terminal_and_an_operator_kill_ends_it",
     ) {
         return;

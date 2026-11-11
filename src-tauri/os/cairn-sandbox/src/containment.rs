@@ -1719,8 +1719,8 @@ mod tests {
                 panic!("the seam's control failed off macOS: {}", witness.detail);
             }
             assert!(
-                crate::current_process_is_confined(),
-                "an unconfined process must be able to exercise the seam: {}",
+                crate::nested_sandbox_here().declines(),
+                "a process that can nest a profile must be able to exercise the seam: {}",
                 witness.detail
             );
             return;
@@ -1740,24 +1740,6 @@ mod tests {
                 "a platform that cannot enforce the boundary must say so: {disposition:?}"
             );
         }
-    }
-
-    /// Live: through the real page-call wrapping, a planted secret, database,
-    /// home file and sibling stay unreadable while the batch's own file reads,
-    /// `sh` runs, and wherever the probe could try a connection the second
-    /// loopback port is refused on macOS and on Linux from Landlock ABI 4.
-    /// A confined macOS process cannot apply the page-call profile, so a test
-    /// lane inside a Seatbelt fence cannot exercise the probe; the executor
-    /// that measures it in production never is. Keyed to one reason so the
-    /// skip census resolves it (the test passes its own name as a literal).
-    #[cfg(target_os = "macos")]
-    fn skip_page_call_probe_when_confined(test: &str) -> bool {
-        if crate::current_process_is_confined() {
-            eprintln!("skipping {test}: a confined process cannot apply the page-call profile");
-            cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
-            return true;
-        }
-        false
     }
 
     /// macOS answers `KERN_PROCARGS2` for any same-uid process under every
@@ -1797,11 +1779,17 @@ mod tests {
         false
     }
 
+    /// Live: through the real page-call wrapping, a planted secret, database,
+    /// home file and sibling stay unreadable while the batch's own file reads,
+    /// `sh` runs, and wherever the probe could try a connection the second
+    /// loopback port is refused on macOS and on Linux from Landlock ABI 4.
+    /// A macOS process that cannot nest a profile cannot apply the page-call
+    /// profile, so a lane inside one cannot exercise the probe; the executor
+    /// that measures it in production never is.
     #[cfg(unix)]
     #[test]
     fn the_page_call_probe_refuses_every_planted_crossing_live() {
-        #[cfg(target_os = "macos")]
-        if skip_page_call_probe_when_confined(
+        if crate::skip_without_nested_sandbox(
             "the_page_call_probe_refuses_every_planted_crossing_live",
         ) {
             return;

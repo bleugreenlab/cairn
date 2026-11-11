@@ -7645,6 +7645,15 @@ pub struct LearnedResourceEstimate {
 /// changes what a runner concludes about admission on the machine (tenet
 /// 541). The handshake refuses mixed versions and the self-repair path
 /// updates the executor, so neither pairing attaches.
+///
+/// cairn/6444 does not move the number. The executor now sets
+/// `CAIRN_LANE_NESTED_SANDBOX` in the environment of every command it spawns,
+/// carrying the nested-Seatbelt lane record it already publishes in
+/// `SandboxCapabilityEvidence`, so the test process inside can compare it with
+/// its own measurement. That is the spawned command's environment, not a frame:
+/// no frame, variant or field changes. What a runner gets wrong talking to an
+/// older executor: nothing; that executor's commands carry no record, which the
+/// test process reports as no record handed down.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 168;
 
 /// The version `build.rs` derived from the paragraphs above

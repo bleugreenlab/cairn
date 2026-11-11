@@ -1577,56 +1577,13 @@ mod tests {
     // Reading `CAIRN_SANDBOXED` was such a guess, and it was wrong in both
     // directions: inherited down a spawn chain where no sandbox existed, and
     // absent where one did (CAIRN-3164). So each live test PROBES the capability
-    // and records a skip naming it, declared in `src-tauri/skip-manifest.toml`.
-    //
-    // The probe costs one process spawn and every live test asks, so it resolves
-    // once per test binary.
-    fn nested_sandbox_exec_available() -> bool {
-        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *AVAILABLE.get_or_init(|| {
-            let Ok(dir) = tempdir() else {
-                return false;
-            };
-            // The narrowest form of what every live test below does: a write the
-            // profile explicitly permits.
-            let policy = SandboxPolicy {
-                worktree: dir.path().to_path_buf(),
-                writable_extra: vec![],
-                deny_read: vec![],
-                writable_regex: vec![],
-                worktree_writable: true,
-                socket_resolvable: vec![],
-                callback_socket: None,
-                readable_extra: vec![],
-                violation_tag: crate::ViolationTag::fresh(),
-                reach: Default::default(),
-            };
-            let probe = dir.path().join("probe");
-            let (program, args) = wrap_argv(
-                "/bin/bash",
-                &["-c".into(), format!("echo ok > {}", probe.display())],
-                &policy,
-            );
-            Command::new(program)
-                .args(args)
-                .output()
-                .is_ok_and(|out| out.status.success())
-                && probe.exists()
-        })
-    }
-
-    fn skip_without_nested_sandbox_exec(test: &str) -> bool {
-        if nested_sandbox_exec_available() {
-            return false;
-        }
-        eprintln!("skipping {test}: a nested sandbox-exec cannot write inside its own profile");
-        cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
-        true
-    }
+    // and records a skip naming it, declared in `src-tauri/skip-manifest.toml`,
+    // through the one predicate every guard shares
+    // ([`crate::skip_without_nested_sandbox`]), measured once per test process.
 
     #[test]
     fn enforces_write_confinement_and_read_denylist_live() {
-        if skip_without_nested_sandbox_exec("enforces_write_confinement_and_read_denylist_live") {
+        if crate::skip_without_nested_sandbox("enforces_write_confinement_and_read_denylist_live") {
             return;
         }
         let wt = tempdir().unwrap();
@@ -1691,7 +1648,7 @@ mod tests {
     // while a sensitive sibling under the same denied base is blocked.
     #[test]
     fn worktree_under_denied_prefix_stays_readable_live() {
-        if skip_without_nested_sandbox_exec("worktree_under_denied_prefix_stays_readable_live") {
+        if crate::skip_without_nested_sandbox("worktree_under_denied_prefix_stays_readable_live") {
             return;
         }
         let base = tempdir().unwrap();
@@ -1737,7 +1694,7 @@ mod tests {
     // becomes writable in the process.
     #[test]
     fn interactive_shell_state_grant_creates_shell_paths_but_not_neighbours_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "interactive_shell_state_grant_creates_shell_paths_but_not_neighbours_live",
         ) {
             return;
@@ -1803,7 +1760,7 @@ mod tests {
     /// `cairn-core`; what the profile does once applied is this.
     #[test]
     fn readonly_checkout_profile_denies_the_checkout_and_neighbouring_state_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "readonly_checkout_profile_denies_the_checkout_and_neighbouring_state_live",
         ) {
             return;
@@ -1929,7 +1886,7 @@ mod tests {
     /// grant names is the kernel's own record.
     #[test]
     fn an_approved_write_crossing_opens_that_path_and_nothing_beside_it_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "an_approved_write_crossing_opens_that_path_and_nothing_beside_it_live",
         ) {
             return;
@@ -1984,7 +1941,7 @@ mod tests {
     /// and its sibling under the same denylist entry stays unreadable.
     #[test]
     fn an_approved_read_crossing_reopens_one_file_for_reads_only_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "an_approved_read_crossing_reopens_one_file_for_reads_only_live",
         ) {
             return;
@@ -2037,7 +1994,7 @@ mod tests {
     /// spawned pid finds nothing and the prompt would blame `sh -c`.
     #[test]
     fn a_denial_made_by_a_child_process_is_recovered_by_path_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "a_denial_made_by_a_child_process_is_recovered_by_path_live",
         ) {
             return;
@@ -2060,8 +2017,9 @@ mod tests {
     /// the other's: the tag, not the time window, is what attributes a denial.
     #[test]
     fn concurrent_spawns_recover_only_their_own_denials_live() {
-        if skip_without_nested_sandbox_exec("concurrent_spawns_recover_only_their_own_denials_live")
-        {
+        if crate::skip_without_nested_sandbox(
+            "concurrent_spawns_recover_only_their_own_denials_live",
+        ) {
             return;
         }
         let wt = tempdir().unwrap();
@@ -2120,7 +2078,7 @@ mod tests {
     /// violations made before it was ready.
     #[test]
     fn a_second_spawn_reuses_the_running_violation_stream_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "a_second_spawn_reuses_the_running_violation_stream_live",
         ) {
             return;
@@ -2408,7 +2366,7 @@ mod tests {
     /// merely started, never a blank.
     #[test]
     fn violation_recovery_is_measured_by_a_recovered_canary_or_names_its_refusal_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "violation_recovery_is_measured_by_a_recovered_canary_or_names_its_refusal_live",
         ) {
             return;
@@ -2517,25 +2475,27 @@ mod tests {
     #[test]
     fn nested_write_probe_is_authoritative_when_allow_default_false_negatives() {
         let allow_default_claims_unconfined = !current_process_is_confined();
-        let measured = crate::probe_nested_sandbox_write();
-        if allow_default_claims_unconfined && !measured.available {
+        let here = crate::nested_sandbox_here();
+        assert!(
+            matches!(here, crate::NestedSandboxHere::Measured { .. }),
+            "macOS always measures: {here:?}"
+        );
+        if allow_default_claims_unconfined && here.declines() {
             assert!(
-                measured.detail.contains("refused") || measured.detail.contains("could not"),
+                here.detail().contains("refused") || here.detail().contains("could not"),
                 "the measured refusal must retain actionable provenance: {}",
-                measured.detail
+                here.detail()
             );
         }
         // Capability classification is the behavioral result in every state;
         // the allow-default probe is intentionally not consulted.
-        assert_eq!(
-            measured.available,
-            crate::probe_nested_sandbox_write().available
-        );
+        assert_eq!(here.available(), crate::nested_sandbox_here().available());
+        assert_eq!(here.declines(), !here.available());
     }
 
     #[test]
     fn writable_extra_carveout_permits_writes_live() {
-        if skip_without_nested_sandbox_exec("writable_extra_carveout_permits_writes_live") {
+        if crate::skip_without_nested_sandbox("writable_extra_carveout_permits_writes_live") {
             return;
         }
         let wt = tempdir().unwrap();
@@ -2620,7 +2580,7 @@ mod tests {
     /// a sibling beside it.
     #[test]
     fn a_granted_tmpdir_is_writable_live_and_its_sibling_is_refused() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "a_granted_tmpdir_is_writable_live_and_its_sibling_is_refused",
         ) {
             return;
@@ -2797,7 +2757,7 @@ mod tests {
     /// widened by an executor's approved relayed-crossing rerun.
     #[test]
     fn rebuild_floor_refuses_child_writes_even_after_an_approved_crossing_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "rebuild_floor_refuses_child_writes_even_after_an_approved_crossing_live",
         ) {
             return;
@@ -2900,7 +2860,7 @@ mod tests {
 
     #[test]
     fn rebuild_floor_protects_relocated_roots_and_their_ancestors_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "rebuild_floor_protects_relocated_roots_and_their_ancestors_live",
         ) {
             return;
@@ -2942,7 +2902,7 @@ mod tests {
     // boundary exists to refuse, under the floor an unfenced agent spawn gets.
     #[test]
     fn operator_credential_boundary_refuses_every_spelling_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "operator_credential_boundary_refuses_every_spelling_live",
         ) {
             return;
@@ -3039,7 +2999,7 @@ mod tests {
     // temp directory all behave exactly as they do with no profile at all.
     #[test]
     fn operator_credential_boundary_leaves_ordinary_work_alone_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "operator_credential_boundary_leaves_ordinary_work_alone_live",
         ) {
             return;
@@ -3087,7 +3047,8 @@ mod tests {
     // launched the instance, and is still never writable.
     #[test]
     fn the_machine_secret_is_refused_under_the_floor_live() {
-        if skip_without_nested_sandbox_exec("the_machine_secret_is_refused_under_the_floor_live") {
+        if crate::skip_without_nested_sandbox("the_machine_secret_is_refused_under_the_floor_live")
+        {
             return;
         }
         let fixture = CredentialFixture::new();
@@ -3110,7 +3071,7 @@ mod tests {
     // discovered floor covers it there. And no agent may plant such a link.
     #[test]
     fn a_relocated_home_and_a_planted_link_are_both_refused_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "a_relocated_home_and_a_planted_link_are_both_refused_live",
         ) {
             return;
@@ -3148,7 +3109,7 @@ mod tests {
     // refuses its credential, because the boundary is the profile's last word.
     #[test]
     fn a_fenced_profile_cannot_reopen_the_operator_credential_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "a_fenced_profile_cannot_reopen_the_operator_credential_live",
         ) {
             return;
@@ -3182,7 +3143,7 @@ mod tests {
     // This is the regression guard for the Managed Build Services fix.
     #[test]
     fn service_sandbox_permits_worktree_target_writes_only_live() {
-        if skip_without_nested_sandbox_exec(
+        if crate::skip_without_nested_sandbox(
             "service_sandbox_permits_worktree_target_writes_only_live",
         ) {
             return;

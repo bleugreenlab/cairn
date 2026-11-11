@@ -14,7 +14,9 @@
 //! profile's bytes. Any of them moving re-probes, and an input that could not
 //! be read means no reuse at all.
 
-use crate::{Confinement, NestedSandboxWriteProbe, OperatorCredentialFloor};
+use crate::{
+    Confinement, LaneNestedSandboxRecord, NestedSandboxWriteProbe, OperatorCredentialFloor,
+};
 use cairn_common::executor_protocol::{
     NestedSandboxProbeContext, SandboxCapabilityEvidence, SandboxLauncherClass,
 };
@@ -130,7 +132,7 @@ fn probe_under(_outer: &Confinement) -> NestedSandboxWriteProbe {
     crate::nested_probe_not_applicable()
 }
 
-fn sha256(text: &str) -> String {
+pub(crate) fn sha256(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
@@ -150,8 +152,25 @@ pub(crate) fn unix_now_ms() -> u64 {
 /// [`crate::sandbox_capability_evidence`] is the one assembly point that reads
 /// it.
 pub(crate) fn check_lane_nested_sandbox_evidence() -> SandboxCapabilityEvidence {
-    static LAST: Mutex<Option<SandboxCapabilityEvidence>> = Mutex::new(None);
     evidence_for(&LaneContext::current(), &LAST, probe_under, unix_now_ms)
+}
+
+/// The last lane measurement this process made.
+static LAST: Mutex<Option<SandboxCapabilityEvidence>> = Mutex::new(None);
+
+/// The executor's lane record as handed to one spawn's environment
+/// ([`crate::LANE_NESTED_SANDBOX_ENV`]): the measurement it last published,
+/// with the outer profile `spawn` wraps the command in, so the test process can
+/// tell whether the record describes it. Measures once when nothing has been
+/// measured yet and otherwise never, so handing it down costs no probe per
+/// spawn; the liveness pass is what re-measures.
+pub fn lane_nested_sandbox_handoff(spawn: &Confinement) -> String {
+    let held = LAST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let evidence = held.unwrap_or_else(check_lane_nested_sandbox_evidence);
+    LaneNestedSandboxRecord::for_spawn(&evidence, spawn).to_env_value()
 }
 
 fn evidence_for(
@@ -386,6 +405,27 @@ mod tests {
             "{}",
             evidence.nested_sandbox_write_detail
         );
+    }
+
+    /// What a spawn is handed parses back to the evidence it was built from,
+    /// naming the outer profile that spawn was wrapped in.
+    #[test]
+    fn the_handoff_parses_back_to_the_evidence_it_was_built_from() {
+        let floored = context(SandboxLauncherClass::Unconfined, Some("(version 1) floor"));
+        let evidence = measure(&floored, &Mutex::new(None), &Cell::new(0), refused());
+        for spawn in [Confinement::Unconfined, Confinement::for_branch_code()] {
+            let record = LaneNestedSandboxRecord::parse(
+                &LaneNestedSandboxRecord::for_spawn(&evidence, &spawn).to_env_value(),
+            )
+            .unwrap();
+            assert_eq!(record.available, evidence.nested_sandbox_write_available);
+            assert_eq!(record.detail, evidence.nested_sandbox_write_detail);
+            assert_eq!(record.context, evidence.nested_sandbox_write_context);
+            assert_eq!(
+                record.spawn_outer_profile_sha256,
+                spawn.seatbelt_profile().as_deref().map(sha256)
+            );
+        }
     }
 
     /// The live context is the one a lane is spawned in: the same

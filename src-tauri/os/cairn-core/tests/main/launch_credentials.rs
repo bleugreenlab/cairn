@@ -75,17 +75,28 @@ async fn only_colocated(node: &Node) {
 async fn shell_env(node: &Node, machine: Option<&str>, name: &str) -> (String, Vec<String>) {
     let path = dump(node, name);
     let command = write_env(&path);
-    let (reply, observed) = tokio::join!(node.shell("r-1", machine, &command), observed(&path));
-    assert!(
-        path.is_file(),
-        "the item did not write its environment: {reply}"
-    );
+    let shell = node.shell("r-1", machine, &command);
+    tokio::pin!(shell);
+    // The item holds until its environment has been read, so a reply that
+    // arrives first means the item ended without writing it, and the reply is
+    // the only account of why.
+    tokio::select! {
+        reply = &mut shell => panic!("the item ended without writing its environment: {reply}"),
+        () = eventually("the process's environment", || path.is_file()) => {}
+    }
+    let (_reply, observed) = tokio::join!(shell, observed(&path));
     observed
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_colocated_run_shell_item_carries_no_callback_credential() {
+    // The colocated executor wraps the item in a Seatbelt profile, which a
+    // process that cannot nest one sees refused at `sandbox_apply`: the item
+    // never runs, so there is no environment to search.
     if common::skip_if_fenced("a_colocated_run_shell_item_carries_no_callback_credential")
+        || cairn_sandbox::skip_without_nested_sandbox(
+            "a_colocated_run_shell_item_carries_no_callback_credential",
+        )
         || !launch_canary::in_planted_child(
             module_path!(),
             "a_colocated_run_shell_item_carries_no_callback_credential",
