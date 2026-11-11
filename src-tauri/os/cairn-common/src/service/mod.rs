@@ -991,6 +991,82 @@ fn stop_each<'a>(
     }
 }
 
+/// The `launchctl` answers [`replace_launchd_job`] sequences, so the sequence is
+/// tested on every host without touching launchd.
+#[cfg(any(target_os = "macos", test))]
+trait Launchctl {
+    /// `launchctl bootout <target>`; an error carries launchctl's stderr.
+    fn bootout(&self, target: &str) -> Result<(), String>;
+    /// `launchctl print <target>`: its output while the job is loaded.
+    fn print(&self, target: &str) -> Option<String>;
+    /// `launchctl bootstrap <domain> <plist>`; an error carries launchctl's stderr.
+    fn bootstrap(&self, domain: &str, plist: &str) -> Result<(), String>;
+    fn pause(&self, interval: std::time::Duration);
+}
+
+#[cfg(any(target_os = "macos", test))]
+const BOOTOUT_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(any(target_os = "macos", test))]
+const BOOTOUT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Boot out whatever `target` has loaded, wait until launchd has finished
+/// unloading it, then bootstrap `plist`.
+///
+/// `bootout` returns before launchd has always removed the job, and a bootstrap
+/// that overlaps the removal fails `5: Input/output error` (cairn/3599). The
+/// wait is bounded, and a job still loaded at the bound is refused by name
+/// rather than bootstrapped over. A failing bootstrap reports what `launchctl
+/// print` says right after it, so its cause is evidence rather than a guess.
+/// Nothing here retries a bootstrap.
+#[cfg(any(target_os = "macos", test))]
+fn replace_launchd_job(
+    launchctl: &impl Launchctl,
+    domain: &str,
+    target: &str,
+    plist: &str,
+) -> Result<(), String> {
+    // Nothing loaded is an error from launchctl and not one here; a job still
+    // loaded afterwards is, whatever bootout said.
+    let booted_out = launchctl.bootout(target);
+    let polls = BOOTOUT_SETTLE_BOUND.as_millis() / BOOTOUT_POLL.as_millis();
+    let mut waited = 0;
+    while launchctl.print(target).is_some() {
+        if waited == polls {
+            let bound = BOOTOUT_SETTLE_BOUND.as_secs();
+            return Err(match booted_out {
+                Ok(()) => format!("launchctl bootout {target} left it loaded after {bound}s"),
+                Err(error) => {
+                    format!("launchctl bootout {target} left it loaded after {bound}s: {error}")
+                }
+            });
+        }
+        launchctl.pause(BOOTOUT_POLL);
+        waited += 1;
+    }
+    launchctl.bootstrap(domain, plist).map_err(|error| {
+        let state = match launchctl.print(target) {
+            None => "not loaded".to_string(),
+            Some(printed) => {
+                let runtime = parse_launchctl_print(&printed);
+                format!(
+                    "loaded, {}, pid {}",
+                    if runtime.running {
+                        "running"
+                    } else {
+                        "not running"
+                    },
+                    runtime
+                        .pid
+                        .map_or_else(|| "none".to_string(), |pid| pid.to_string())
+                )
+            }
+        };
+        format!(
+            "launchctl bootstrap failed: {error} (afterwards launchctl print {target}: {state})"
+        )
+    })
+}
+
 /// Bounce the installed service in place WITHOUT rewriting the unit file, so
 /// local edits survive and the restart is atomic where the platform allows it.
 /// Falls back to [`install`] when nothing is registered, so a repair path still

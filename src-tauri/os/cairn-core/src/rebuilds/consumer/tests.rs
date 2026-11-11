@@ -91,8 +91,8 @@ impl SourceStore for FixedSource {
     ) -> Result<String, String> {
         Ok("Developer ID Application: Test".into())
     }
-    async fn origin_url(&self, _: &Source) -> Result<String, String> {
-        Ok("https://example.invalid/cairn.git".into())
+    async fn object_repository(&self, _: &Orchestrator, _: &Source) -> Result<PathBuf, String> {
+        Ok(PathBuf::from("/nonexistent/store"))
     }
 }
 
@@ -176,19 +176,18 @@ async fn seed(orch: &Orchestrator) {
     }
 }
 
-fn opened(host: RebuildHost, launchd: Arc<FakeLaunchd>) -> RebuildConsumer {
-    RebuildConsumer::new(host, launchd, Arc::new(FixedSource)).with_gate_open_for_test()
-}
-
+/// `gate_open` is the production construction; closed is the held path a
+/// reviewed `MACOS_FLOOR_PROVEN = false` would give.
 async fn fixture_with(state: ActorState, gate_open: bool) -> Fixture {
     let root = tempfile::tempdir().unwrap().keep();
     let orch = orchestrator(&root).await;
     seed(&orch).await;
     let launchd = FakeLaunchd::new(state);
+    let consumer = RebuildConsumer::new(host(&root), launchd.clone(), Arc::new(FixedSource));
     let consumer = if gate_open {
-        opened(host(&root), launchd.clone())
+        consumer
     } else {
-        RebuildConsumer::new(host(&root), launchd.clone(), Arc::new(FixedSource))
+        consumer.with_gate_closed_for_test()
     };
     let consumer = Arc::new(consumer);
     orch.operator_requests.register(consumer.clone()).unwrap();
@@ -284,14 +283,25 @@ async fn launched(f: &Fixture) -> (OperatorRequest, String) {
     (get(&f.orch, &request.id).await, rebuild_id(attempt))
 }
 
-// Enabling request dispatch is a reviewed change to this line and the constant.
+// Holding request dispatch again is a reviewed change to this line and the
+// constant: the proof is cairn/6384 comment #13, at main 0c29467f.
 const _: () = assert!(
-    !MACOS_FLOOR_PROVEN,
-    "rebuild dispatch stays held until the cairn/6384 floor proof is posted"
+    MACOS_FLOOR_PROVEN,
+    "the cairn/6384 floor proof is posted; rebuild dispatch is open on macOS"
 );
 
 #[tokio::test]
-async fn macos_dispatch_is_held_until_the_floor_proof_is_posted() {
+async fn the_production_construction_dispatches_and_the_kind_is_available() {
+    let f = fixture().await;
+    assert!(f.consumer.dispatch_enabled);
+    f.consumer.availability(&f.orch).await.unwrap();
+    let filed = file(&f.orch).await;
+    let request = requests::get(&f.orch, &filed.id).await.unwrap().unwrap();
+    assert!(request.available, "{:?}", request.unavailable_reason);
+}
+
+#[tokio::test]
+async fn a_held_consumer_refuses_filing_acceptance_and_launch() {
     for name in [
         "rebuild_floor_refuses_child_writes_even_after_an_approved_crossing_live",
         "rebuild_floor_protects_relocated_roots_and_their_ancestors_live",
@@ -299,7 +309,6 @@ async fn macos_dispatch_is_held_until_the_floor_proof_is_posted() {
     ] {
         assert!(FLOOR_REFUSAL.contains(name), "{name}");
     }
-    // The production construction: no constructor argument opens the gate.
     let f = fixture_with(ActorState::Absent, false).await;
     // Availability: the kind is UNAVAILABLE, so a requesting thread is refused
     // at once by name instead of leaving a card that can never be accepted.
@@ -357,7 +366,8 @@ async fn macos_dispatch_is_held_until_the_floor_proof_is_posted() {
         open.consumer.host.clone(),
         f.launchd.clone(),
         Arc::new(FixedSource),
-    );
+    )
+    .with_gate_closed_for_test();
     assert_eq!(
         gated.launch(&open.orch, &context, &id).await.unwrap_err(),
         FLOOR_REFUSAL
@@ -389,6 +399,8 @@ async fn an_accepted_request_launches_the_actor_once_from_its_claimed_attempt() 
     )
     .unwrap();
     assert_eq!(spec["commit"], commit('b'));
+    // The store the acceptance was checked against, never a network remote.
+    assert_eq!(spec["origin"], "/nonexistent/store");
     assert_eq!(spec["request"]["attemptId"], attempt.acceptance.attempt_id);
     assert_eq!(
         spec["request"]["authorizationEventId"],
@@ -564,7 +576,11 @@ async fn restart_recovery_neither_duplicates_nor_relaunches() {
     // A new runner process over the same database and home.
     let restarted = orchestrator_over(&f.root, f.orch.db.local.clone()).await;
     let launchd = FakeLaunchd::new(ActorState::Loaded);
-    let consumer = Arc::new(opened(f.consumer.host.clone(), launchd.clone()));
+    let consumer = Arc::new(RebuildConsumer::new(
+        f.consumer.host.clone(),
+        launchd.clone(),
+        Arc::new(FixedSource),
+    ));
     restarted
         .operator_requests
         .register(consumer.clone())
@@ -645,7 +661,11 @@ async fn a_crash_after_report_and_before_acknowledgement_replays_the_same_receip
     // The restart's pass replays the receipt as its acknowledgement.
     let restarted = orchestrator_over(&f.root, f.orch.db.local.clone()).await;
     let launchd = FakeLaunchd::new(ActorState::Absent);
-    let consumer = Arc::new(opened(f.consumer.host.clone(), launchd.clone()));
+    let consumer = Arc::new(RebuildConsumer::new(
+        f.consumer.host.clone(),
+        launchd.clone(),
+        Arc::new(FixedSource),
+    ));
     restarted
         .operator_requests
         .register(consumer.clone())
@@ -862,7 +882,7 @@ async fn a_runner_outside_an_installed_bundle_cannot_offer_rebuilds() {
     let f = fixture().await;
     let mut host = f.consumer.host.clone();
     host.app = None;
-    let consumer = opened(host, f.launchd.clone());
+    let consumer = RebuildConsumer::new(host, f.launchd.clone(), Arc::new(FixedSource));
     let error = consumer.availability(&f.orch).await.unwrap_err();
     assert!(error.contains("installed Cairn.app"), "{error}");
 }

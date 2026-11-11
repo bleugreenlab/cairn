@@ -46,12 +46,13 @@ const COMPILE_CHECK: &str = "workspace-compile";
 const VERIFY_TIMEOUT_SECONDS: u64 = 600;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// cairn/6384 merged without the operator's live proof that the protected
-/// `~/.cairn/rebuilds` floor holds under nested Seatbelt. Until that proof is
-/// posted on cairn/6384, acceptance and dispatch refuse on macOS. Turning this
-/// on is a reviewed commit that cites the posted proof, and changes the test
-/// that pins it.
-pub(crate) const MACOS_FLOOR_PROVEN: bool = false;
+/// The protected `~/.cairn/rebuilds` write floor (cairn/6384) is proven to hold
+/// under nested Seatbelt: both `rebuild_floor_*_live` tests ran and passed from
+/// an unconfined terminal on macOS 26.4 arm64 at main `0c29467f`, posted as
+/// cairn/6384 comment #13. Turning this off again is a reviewed commit that says
+/// why the proof no longer holds and changes the test that pins it; filing,
+/// acceptance and launch then refuse with [`FLOOR_REFUSAL`].
+pub(crate) const MACOS_FLOOR_PROVEN: bool = true;
 pub(crate) const FLOOR_REFUSAL: &str = "rebuild dispatch is held: the protected ~/.cairn/rebuilds write floor (cairn/6384) has no live proof yet. `rebuild_floor_refuses_child_writes_even_after_an_approved_crossing_live` and `rebuild_floor_protects_relocated_roots_and_their_ancestors_live` must pass from an unconfined macOS terminal, with the summary posted on cairn/6384, before a request can launch the rebuild actor";
 
 fn now() -> i64 {
@@ -154,7 +155,13 @@ pub(crate) trait SourceStore: Send + Sync {
         source: &Source,
         commit: &str,
     ) -> Result<String, String>;
-    async fn origin_url(&self, source: &Source) -> Result<String, String>;
+    /// The Git object repository the acceptance was checked against, which the
+    /// actor fetches the accepted commit from: a local path, so no credential.
+    async fn object_repository(
+        &self,
+        orch: &Orchestrator,
+        source: &Source,
+    ) -> Result<PathBuf, String>;
 }
 
 /// Production answers: the runner-owned jj store of the one project whose
@@ -315,17 +322,18 @@ impl SourceStore for ProjectStores {
         )
     }
 
-    async fn origin_url(&self, source: &Source) -> Result<String, String> {
-        let checkout = source.checkout.display().to_string();
-        let url = git(&["-C", checkout.as_str(), "remote", "get-url", "origin"]).await?;
-        let url = url.trim();
-        if url.is_empty() {
-            return Err(format!(
-                "{} has no origin remote",
-                source.checkout.display()
-            ));
-        }
-        Ok(url.to_string())
+    async fn object_repository(
+        &self,
+        orch: &Orchestrator,
+        source: &Source,
+    ) -> Result<PathBuf, String> {
+        let store = crate::mcp::handlers::branch::resolve_for_project_read(
+            orch,
+            &source.project_id,
+            "main",
+        )
+        .await?;
+        Ok(store.object_repository_path)
     }
 }
 
@@ -642,7 +650,7 @@ pub(crate) struct RebuildConsumer {
 }
 
 impl RebuildConsumer {
-    /// The gate is the constant; no runtime value can open it.
+    /// The gate is the constant; no runtime value can change it.
     pub(crate) fn new(
         host: RebuildHost,
         launchd: Arc<dyn Launchd>,
@@ -657,10 +665,10 @@ impl RebuildConsumer {
         }
     }
 
-    /// Exercise the launch path in tests only.
+    /// Exercise the held path in tests only.
     #[cfg(test)]
-    fn with_gate_open_for_test(mut self) -> Self {
-        self.dispatch_enabled = true;
+    fn with_gate_closed_for_test(mut self) -> Self {
+        self.dispatch_enabled = false;
         self
     }
 
@@ -742,7 +750,7 @@ impl RebuildConsumer {
             .candidate_commit
             .clone()
             .ok_or("the acceptance froze no commit")?;
-        let origin = self.source.origin_url(&source).await?;
+        let origin = self.source.object_repository(orch, &source).await?;
         let plist = self.stage(
             id,
             &acceptance,
@@ -787,7 +795,7 @@ impl RebuildConsumer {
         acceptance: &RequestAcceptance,
         authorization_event_id: &str,
         commit: &str,
-        origin: &str,
+        origin: &Path,
         source: &Source,
         app: &Path,
         bun: &Path,

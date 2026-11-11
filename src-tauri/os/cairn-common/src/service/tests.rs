@@ -633,3 +633,117 @@ fn stop_attempts_every_identity_before_reporting_a_failure() {
     assert_eq!(error, "current bootout failed");
     assert_eq!(stop_each(["a", "b"], |_| Ok(())), Ok(()));
 }
+
+/// launchctl for one job that `print` reports loaded for its first
+/// `loaded_prints` reads after bootout, and unloaded after.
+struct FakeLaunchctl {
+    loaded_prints: std::cell::Cell<u32>,
+    bootstrap: Result<(), String>,
+    /// The bootstrap loads the job even when it reports an error.
+    loaded_after_bootstrap: bool,
+    calls: std::cell::RefCell<Vec<String>>,
+}
+
+impl FakeLaunchctl {
+    fn new(loaded_prints: u32) -> Self {
+        Self {
+            loaded_prints: std::cell::Cell::new(loaded_prints),
+            bootstrap: Ok(()),
+            loaded_after_bootstrap: false,
+            calls: Default::default(),
+        }
+    }
+    fn bootstraps(&self) -> usize {
+        self.calls
+            .borrow()
+            .iter()
+            .filter(|call| call.starts_with("bootstrap"))
+            .count()
+    }
+}
+
+impl Launchctl for FakeLaunchctl {
+    fn bootout(&self, target: &str) -> Result<(), String> {
+        self.calls.borrow_mut().push(format!("bootout {target}"));
+        Ok(())
+    }
+    fn print(&self, _target: &str) -> Option<String> {
+        self.calls.borrow_mut().push("print".into());
+        let left = self.loaded_prints.get();
+        if left == 0 {
+            return None;
+        }
+        self.loaded_prints.set(left.saturating_sub(1));
+        Some("gui/501/computer.cairn.orch = {\n\tstate = running\n\tpid = 4242\n}\n".into())
+    }
+    fn bootstrap(&self, domain: &str, plist: &str) -> Result<(), String> {
+        self.calls
+            .borrow_mut()
+            .push(format!("bootstrap {domain} {plist}"));
+        if self.loaded_after_bootstrap {
+            self.loaded_prints.set(u32::MAX);
+        }
+        self.bootstrap.clone()
+    }
+    fn pause(&self, _interval: std::time::Duration) {}
+}
+
+const TARGET: &str = "gui/501/computer.cairn.orch";
+
+#[test]
+fn a_job_still_unloading_after_bootout_is_bootstrapped_once_it_is_gone() {
+    let launchctl = FakeLaunchctl::new(3);
+    assert_eq!(
+        replace_launchd_job(&launchctl, "gui/501", TARGET, "/p.plist"),
+        Ok(())
+    );
+    assert_eq!(
+        *launchctl.calls.borrow(),
+        [
+            format!("bootout {TARGET}"),
+            "print".into(),
+            "print".into(),
+            "print".into(),
+            "print".into(),
+            "bootstrap gui/501 /p.plist".into(),
+        ]
+    );
+}
+
+#[test]
+fn a_job_still_loaded_at_the_bound_is_refused_by_name_without_a_bootstrap() {
+    let launchctl = FakeLaunchctl::new(u32::MAX);
+    let error = replace_launchd_job(&launchctl, "gui/501", TARGET, "/p.plist").unwrap_err();
+    assert_eq!(
+        error,
+        format!("launchctl bootout {TARGET} left it loaded after 10s")
+    );
+    assert_eq!(launchctl.bootstraps(), 0);
+}
+
+#[test]
+fn a_failing_bootstrap_reports_what_launchd_holds_afterwards() {
+    let launchctl = FakeLaunchctl {
+        bootstrap: Err("Bootstrap failed: 5: Input/output error".into()),
+        ..FakeLaunchctl::new(0)
+    };
+    let error = replace_launchd_job(&launchctl, "gui/501", TARGET, "/p.plist").unwrap_err();
+    assert_eq!(
+        error,
+        format!("launchctl bootstrap failed: Bootstrap failed: 5: Input/output error (afterwards launchctl print {TARGET}: not loaded)")
+    );
+
+    // A job loaded despite the failure is named with its pid.
+    let loaded = FakeLaunchctl {
+        bootstrap: Err("Bootstrap failed: 5: Input/output error".into()),
+        loaded_after_bootstrap: true,
+        ..FakeLaunchctl::new(0)
+    };
+    let error = replace_launchd_job(&loaded, "gui/501", TARGET, "/p.plist").unwrap_err();
+    assert!(
+        error.ends_with(&format!(
+            "(afterwards launchctl print {TARGET}: loaded, running, pid 4242)"
+        )),
+        "{error}"
+    );
+}

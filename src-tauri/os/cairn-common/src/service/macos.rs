@@ -51,27 +51,59 @@ pub fn install(spec: &ServiceSpec) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", path.display()))?;
 
     let target = format!("{domain}/{}", spec.label);
-    // Idempotent: bootout any existing instance before bootstrapping (ignore
-    // errors — there may be nothing loaded).
-    let _ = Command::new("launchctl")
-        .args(["bootout", &target])
-        .output();
-    let out = Command::new("launchctl")
-        .args(["bootstrap", &domain, &path.to_string_lossy()])
-        .output()
-        .map_err(|e| format!("launchctl bootstrap: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "launchctl bootstrap failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+    // Idempotent: replaces any instance already loaded.
+    super::replace_launchd_job(&SystemLaunchctl, &domain, &target, &path.to_string_lossy())?;
     // RunAtLoad should start it, but a non-destructive kickstart makes "running
     // now" explicit if launchd has not scheduled it yet. Do not use `-k` here:
     // bootstrap may already have started the new process, and killing that fresh
     // process immediately puts its replacement behind launchd's crash throttle.
     let _ = kickstart_command(&target, false).output();
     Ok(())
+}
+
+/// The real `launchctl`, in this user's GUI domain.
+struct SystemLaunchctl;
+
+fn launchctl_outcome(
+    verb: &str,
+    output: std::io::Result<std::process::Output>,
+) -> Result<(), String> {
+    match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(error) => Err(format!("launchctl {verb} could not run: {error}")),
+    }
+}
+
+impl super::Launchctl for SystemLaunchctl {
+    fn bootout(&self, target: &str) -> Result<(), String> {
+        launchctl_outcome(
+            "bootout",
+            Command::new("launchctl").args(["bootout", target]).output(),
+        )
+    }
+
+    fn print(&self, target: &str) -> Option<String> {
+        Command::new("launchctl")
+            .args(["print", target])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn bootstrap(&self, domain: &str, plist: &str) -> Result<(), String> {
+        launchctl_outcome(
+            "bootstrap",
+            Command::new("launchctl")
+                .args(["bootstrap", domain, plist])
+                .output(),
+        )
+    }
+
+    fn pause(&self, interval: std::time::Duration) {
+        std::thread::sleep(interval);
+    }
 }
 
 /// File-only self-heal for template drift: when launchd spawned this process
