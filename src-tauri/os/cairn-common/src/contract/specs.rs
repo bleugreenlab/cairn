@@ -1224,7 +1224,12 @@ pub(crate) const POST_TITLE: KeySpec =
 pub(crate) const POST_SCOPE: KeySpec = KeySpec::new(
     "scope",
     KeyType::Str,
-    "project or the authenticated caller's own project key",
+    "project or the authenticated caller's own project key; camp (with `camp`) addresses one camp of your project, reaching its participants by role",
+);
+pub(crate) const POST_CAMP: KeySpec = KeySpec::new(
+    "camp",
+    KeyType::Str,
+    "with scope:\"camp\" only: canonical camp URI of your own project (cairn://p/PROJECT/camps/SLUG); your thread must take part in it, and every thread takes part in base camp",
 );
 pub(crate) const FEED_ACK: KeySpec = KeySpec::new(
     "ack",

@@ -269,7 +269,46 @@ pub struct CampParticipant {
     pub lead: bool,
     pub level: Option<CampLevel>,
     pub reason: Option<String>,
+    /// Who set this participant's level, when someone did: absent for the
+    /// system's own seating (birth, backfill) and for the lead edge.
+    pub assigned_by: Option<PrincipalRef>,
     pub since: i64,
+}
+
+/// What a camp journal row records. Every kind the journal's CHECK admits is
+/// named here, so a history line is generated from a known kind; a stored kind
+/// this build does not know reads as [`CampEventKind::Other`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CampEventKind {
+    Pitched,
+    Joined,
+    RoleChanged,
+    Left,
+    LeadOffered,
+    LeadChanged,
+    Retitled,
+    Struck,
+    IssueJoined,
+    IssueLeft,
+    Other(String),
+}
+
+impl CampEventKind {
+    pub fn parse(kind: &str) -> Self {
+        match kind {
+            "pitched" => Self::Pitched,
+            "joined" => Self::Joined,
+            "role_changed" => Self::RoleChanged,
+            "left" => Self::Left,
+            "lead_offered" => Self::LeadOffered,
+            "lead_changed" => Self::LeadChanged,
+            "retitled" => Self::Retitled,
+            "struck" => Self::Struck,
+            "issue_joined" => Self::IssueJoined,
+            "issue_left" => Self::IssueLeft,
+            other => Self::Other(other.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]

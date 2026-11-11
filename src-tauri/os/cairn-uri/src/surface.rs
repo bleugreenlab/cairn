@@ -43,6 +43,12 @@ pub enum Surface {
     ProjectPages {
         project: String,
     },
+    /// One camp's page: its census, issue roll-call, posts and history. Base
+    /// camp's page is the project's generated roadmap.
+    Camp {
+        project: String,
+        slug: String,
+    },
     ProjectTerminal {
         project: String,
         slug: String,
@@ -299,11 +305,19 @@ impl CairnResource {
                 slug: slug.clone(),
             },
             Self::ProjectImage { .. } => Surface::Inline,
-            // No camp page exists yet; a camp opens as its resource.
-            Self::ProjectCamps { .. }
-            | Self::ProjectCamp { .. }
-            | Self::ProjectCampParticipants { .. }
-            | Self::ProjectCodemap { .. }
+            // A camp, its census and its posts are sections of one page; the
+            // camps collection opens base camp, whose page lists every camp.
+            Self::ProjectCamp { project, slug }
+            | Self::ProjectCampParticipants { project, slug }
+            | Self::ProjectCampPosts { project, slug } => Surface::Camp {
+                project: project.clone(),
+                slug: slug.clone(),
+            },
+            Self::ProjectCamps { project } => Surface::Camp {
+                project: project.clone(),
+                slug: "base".to_string(),
+            },
+            Self::ProjectCodemap { .. }
             | Self::ProjectMap { .. }
             | Self::ProjectQueue { .. }
             | Self::ProjectCheckResults { .. }

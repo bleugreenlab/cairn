@@ -2067,6 +2067,7 @@ mod tests {
             compile_ms,
             test_ms,
             compiled_units: 0,
+            local_units: None,
             compiled_crates: Vec::new(),
             summary_ms,
         };

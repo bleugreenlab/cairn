@@ -32,6 +32,7 @@ pub mod navigation;
 pub mod notifications;
 pub mod operator_requests;
 pub mod pages;
+pub mod posts;
 pub mod pr_data;
 pub mod pressure;
 pub mod projects;

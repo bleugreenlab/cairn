@@ -16,8 +16,8 @@ fn named(node: &str, task: &str) -> LabelContext {
     }
 }
 
-/// Every label `packages/ui/src/uri.test.ts` pins for `formatResourceLabel`,
-/// plus branches no test there reaches. The frontend renders those labels
+/// The chip labels the frontend showed before it adopted the Rust grammar,
+/// plus branches it never reached. The frontend now renders every label
 /// through `label` in the wasm module, so this holds them at their source.
 #[test]
 fn the_frontend_labels_are_reproduced() {
@@ -138,6 +138,16 @@ fn the_frontend_labels_are_reproduced() {
             "cairn://p/CAIRN/camps/rebuild/participants".into(),
             plain.clone(),
             "cairn / camp rebuild / participants",
+        ),
+        (
+            "cairn://p/CAIRN/camps/rebuild/posts".into(),
+            plain.clone(),
+            "cairn / rebuild camp posts",
+        ),
+        (
+            "cairn://p/CAIRN/camps/base/posts".into(),
+            plain.clone(),
+            "cairn / base camp posts",
         ),
         // Workspace-level.
         ("cairn://posts".into(), plain.clone(), "Posts"),

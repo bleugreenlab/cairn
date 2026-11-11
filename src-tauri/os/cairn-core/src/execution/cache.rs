@@ -4180,6 +4180,7 @@ pub(crate) mod tests {
                 compile_ms: 408_000,
                 test_ms: 149_735,
                 compiled_units: 37,
+                local_units: None,
                 compiled_crates: vec!["cairn-core".to_string()],
                 summary_ms: Some(144_635),
             }],

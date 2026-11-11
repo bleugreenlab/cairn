@@ -182,6 +182,11 @@ pub enum CairnResource {
         project: String,
         slug: String,
     },
+    /// A camp's posts, newest first; a participant posts to the camp here.
+    ProjectCampPosts {
+        project: String,
+        slug: String,
+    },
     /// A project's promoted pages: the latest version of each thread-owned page
     /// whose owning thread set `promoted`.
     ProjectPages {
@@ -1220,6 +1225,7 @@ impl CairnResource {
             Self::ProjectCamps { .. } => ResourceKind::ProjectCamps,
             Self::ProjectCamp { .. } => ResourceKind::ProjectCamp,
             Self::ProjectCampParticipants { .. } => ResourceKind::ProjectCampParticipants,
+            Self::ProjectCampPosts { .. } => ResourceKind::ProjectCampPosts,
             Self::ProjectPages { .. } => ResourceKind::ProjectPages,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,

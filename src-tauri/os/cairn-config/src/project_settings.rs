@@ -111,6 +111,43 @@ pub struct ProjectSettingsFile {
     /// See docs/checks.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<Vec<cairn_common::executor_protocol::ProjectCapability>>,
+    /// Wall-time budgets the check cadences are measured against. A budget
+    /// is reported beside what was measured and never gates a verdict or
+    /// changes a wake. See docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_budgets: Option<CheckBudgets>,
+    /// Checks that share one cell when a pure-verdict wave places them, each
+    /// group an ordered list: its members run one after another in that order
+    /// in one cell, so they build in one target directory. Ordered here, not
+    /// on each check, because `checks` is a map and keeps no order. A group's
+    /// members must share a verdict platform, and placement is never part of
+    /// a check's identity, so grouping changes where lanes run, never what a
+    /// verdict means. See docs/checks.md, "Cell groups".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_groups: Option<BTreeMap<String, Vec<String>>>,
+}
+
+/// The `checkBudgets` section of `.cairn/config.yaml`.
+///
+/// Unknown keys are refused, so a misspelled budget is an error rather than a
+/// budget the project believes it set. A zero budget is refused too: it would
+/// report every wave as over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckBudgets {
+    /// A review (turn-end) wave's wall time, in seconds: from the lanes'
+    /// submission, after the wave stops deferring to its node's own work, to
+    /// the last lane's verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_wave_seconds: Option<std::num::NonZeroU64>,
+}
+
+impl CheckBudgets {
+    /// The review wave budget in milliseconds, when one is set.
+    pub fn review_wave_ms(&self) -> Option<u64> {
+        self.review_wave_seconds
+            .map(|seconds| seconds.get().saturating_mul(1_000))
+    }
 }
 
 /// The `scratch` section of `.cairn/config.yaml`.
@@ -360,6 +397,10 @@ struct LegacyProjectSettingsFile {
     scratch: Option<ScratchSettings>,
     #[serde(default)]
     requires: Option<Vec<cairn_common::executor_protocol::ProjectCapability>>,
+    #[serde(default)]
+    check_budgets: Option<CheckBudgets>,
+    #[serde(default)]
+    cell_groups: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// Legacy terminal command with persistent field
@@ -671,11 +712,15 @@ fn parse_project_settings_under(
         pin_bumps: legacy.pin_bumps,
         scratch: legacy.scratch,
         requires: legacy.requires,
+        check_budgets: legacy.check_budgets,
+        cell_groups: legacy.cell_groups,
     };
 
     if let Some(policy) = &mut settings.contextual_packages {
         policy.normalize()?;
     }
+    validate_cell_groups(&settings)
+        .map_err(|error| format!("Failed to parse project config file: {error}"))?;
 
     Ok((settings, needs_migration))
 }
@@ -696,6 +741,94 @@ fn validate_check_cadence(check: &CheckCommand) -> Result<(), String> {
     }
     if check.policy == CheckPolicy::Gate {
         return Err(MAIN_ONLY_GATE.to_string());
+    }
+    Ok(())
+}
+
+/// A cell group is placed by one decision, so every member must be a check
+/// that decision can answer for:
+///
+/// - it is a configured check (one this build cannot run is skipped, as it is
+///   everywhere else), and a member of no other group;
+/// - the members share at least one verdict platform, because the group is
+///   placed on the intersection of what its members count;
+/// - a check `pinBumps` requires keeps every platform the bump must be proven
+///   on inside that intersection. Otherwise grouping would silently stop the
+///   other platform's verdict from ever being recorded at a bump's head, and
+///   every bump would be refused with `verdict missing`.
+fn validate_cell_groups(settings: &ProjectSettingsFile) -> Result<(), String> {
+    let Some(groups) = &settings.cell_groups else {
+        return Ok(());
+    };
+    let mut seated: HashMap<&str, &str> = HashMap::new();
+    for (group, members) in groups {
+        if members.is_empty() {
+            return Err(format!(
+                "cellGroups.{group}: a group needs at least one member"
+            ));
+        }
+        // `None` while no member constrains the platform; absent `verdictPlatforms`
+        // counts every platform.
+        let mut shared: Option<Vec<String>> = None;
+        for member in members {
+            if let Some(previous) = seated.insert(member.as_str(), group.as_str()) {
+                return Err(if previous == group.as_str() {
+                    format!("cellGroups.{group}: `{member}` is listed twice")
+                } else {
+                    format!(
+                        "cellGroups.{group}: `{member}` is already in cellGroups.{previous}; a check runs in at most one cell group"
+                    )
+                });
+            }
+            if settings.unsupported_checks.contains_key(member) {
+                continue;
+            }
+            let Some(check) = settings
+                .checks
+                .as_ref()
+                .and_then(|checks| checks.get(member))
+            else {
+                return Err(format!(
+                    "cellGroups.{group}: `{member}` is not a configured check"
+                ));
+            };
+            let Some(declared) = check
+                .verdict_platforms
+                .as_ref()
+                .filter(|platforms| !platforms.is_empty())
+            else {
+                continue;
+            };
+            let narrowed: Vec<String> = match shared.take() {
+                None => declared.clone(),
+                Some(current) => current
+                    .into_iter()
+                    .filter(|platform| declared.contains(platform))
+                    .collect(),
+            };
+            if narrowed.is_empty() {
+                return Err(format!(
+                    "cellGroups.{group}: `{member}` counts its verdict only on [{}], which no earlier member of the group shares, so no one placement can run them together",
+                    declared.join(", ")
+                ));
+            }
+            shared = Some(narrowed);
+        }
+        let Some(shared) = shared else { continue };
+        for (bump, spec) in settings.pin_bumps.iter().flatten() {
+            for required in spec.checks.iter().filter(|check| members.contains(check)) {
+                if let Some(platform) = spec
+                    .platforms
+                    .iter()
+                    .find(|platform| !shared.contains(platform))
+                {
+                    return Err(format!(
+                        "cellGroups.{group}: `{required}` is required by pinBumps.{bump} on {platform}, but the group runs only on [{}], so that verdict would never be recorded at a bump's head; keep `{required}` out of the group",
+                        shared.join(", ")
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -973,6 +1106,10 @@ pub struct ChecksContract {
     /// Declared checks this build cannot run. Never planned; carried so every
     /// surface that lists the contract can say why they are not running.
     pub unsupported: BTreeMap<String, UnsupportedCheck>,
+    /// The wall-time budgets the same commit declares for its cadences.
+    pub budgets: CheckBudgets,
+    /// The commit's cell groups, each an ordered member list (`cellGroups`).
+    pub cell_groups: BTreeMap<String, Vec<String>>,
 }
 
 /// Load the checks contract from a CHECKOUT without migrating. See [`load_checks`]
@@ -999,6 +1136,8 @@ pub fn checks_contract_from(file: ProjectSettingsFile) -> Option<ChecksContract>
         checks,
         extra_inputs: file.extra_inputs.unwrap_or_default(),
         unsupported: file.unsupported_checks,
+        budgets: file.check_budgets.unwrap_or_default(),
+        cell_groups: file.cell_groups.unwrap_or_default(),
     })
 }
 
@@ -1026,6 +1165,8 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "contextualPackages",
     "landing",
     "pinBumps",
+    "checkBudgets",
+    "cellGroups",
     // Legacy keys the load-path migration strips.
     "ciCommands",
     "copyFiles",
@@ -1634,6 +1775,115 @@ mod tests {
             serde_yaml::from_str::<ProjectSettingsFile>("scratch:\n  ceilingMB: 2048\n").is_err(),
             "a misspelled ceiling must be refused, not silently ignored"
         );
+    }
+
+    #[test]
+    fn check_budgets_parse_strictly_and_ride_the_checks_contract() {
+        let (parsed, _) = parse_project_settings(
+            "checks:\n  lint:\n    command: 'true'\ncheckBudgets:\n  reviewWaveSeconds: 120\n",
+        )
+        .unwrap();
+        let contract = checks_contract_from(parsed).unwrap();
+        assert_eq!(contract.budgets.review_wave_ms(), Some(120_000));
+
+        let (parsed, _) =
+            parse_project_settings("checks:\n  lint:\n    command: 'true'\n").unwrap();
+        assert_eq!(
+            checks_contract_from(parsed)
+                .unwrap()
+                .budgets
+                .review_wave_ms(),
+            None,
+            "no key means no budget, and no budget line"
+        );
+
+        for refused in [
+            "checkBudgets:\n  reviewWaveSecs: 120\n",
+            "checkBudgets:\n  reviewWaveSeconds: 0\n",
+            "checkBudgets:\n  reviewWaveSeconds: -5\n",
+        ] {
+            assert!(parse_project_settings(refused).is_err(), "{refused}");
+        }
+    }
+
+    const GROUPABLE: &str = "checks:
+  rust-lint:
+    command: bun run check:rust
+    verdictPlatforms: [linux, macos]
+  rust-tests:
+    command: bun run test:rust:full
+    verdictPlatforms: [linux, macos]
+  source-scans:
+    command: bun run test:rust --profile source-scans
+    verdictPlatforms: [linux]
+  codex-pin:
+    command: bun run codex:pin:check
+    verdictPlatforms: [linux, macos]
+  windows-only:
+    command: 'true'
+    verdictPlatforms: [windows]
+pinBumps:
+  codex:
+    pin: codex-pin.json
+    checks: [codex-pin]
+    platforms: [linux, macos]
+";
+
+    #[test]
+    fn cell_groups_keep_their_order_and_ride_the_checks_contract() {
+        let (parsed, _) = parse_project_settings(&format!(
+            "{GROUPABLE}cellGroups:\n  rust: [rust-lint, rust-tests, source-scans]\n"
+        ))
+        .unwrap();
+        let contract = checks_contract_from(parsed).unwrap();
+        assert_eq!(
+            contract.cell_groups["rust"],
+            vec!["rust-lint", "rust-tests", "source-scans"],
+            "the declared order is the order the cell runs them in"
+        );
+    }
+
+    #[test]
+    fn cell_groups_refuse_members_no_one_placement_can_serve() {
+        for (groups, expected) in [
+            (
+                "  rust: [rust-lint, missing]\n",
+                "is not a configured check",
+            ),
+            ("  rust: [rust-lint, rust-lint]\n", "is listed twice"),
+            (
+                "  rust: [rust-lint]\n  other: [rust-lint]\n",
+                "a check runs in at most one cell group",
+            ),
+            (
+                "  rust: [rust-lint, windows-only]\n",
+                "no earlier member of the group shares",
+            ),
+            ("  rust: []\n", "needs at least one member"),
+        ] {
+            let error = parse_project_settings(&format!("{GROUPABLE}cellGroups:\n{groups}"))
+                .expect_err(groups);
+            assert!(error.contains(expected), "{groups}: {error}");
+        }
+    }
+
+    /// devops's condition on cairn/6771: a check a pin bump needs on macOS may
+    /// not join a group that only Linux can run, or every bump is refused.
+    #[test]
+    fn a_cell_group_may_not_strand_a_pin_bump_platform() {
+        let error = parse_project_settings(&format!(
+            "{GROUPABLE}cellGroups:\n  rust: [rust-tests, source-scans, codex-pin]\n"
+        ))
+        .expect_err("codex-pin's macOS verdict would never be recorded");
+        assert!(
+            error.contains("`codex-pin` is required by pinBumps.codex on macos"),
+            "{error}"
+        );
+        // A group that keeps both platforms may hold it.
+        parse_project_settings(&format!(
+            "{GROUPABLE}cellGroups:\n  rust: [rust-lint, codex-pin]\n"
+        ))
+        .unwrap();
     }
 
     #[test]

@@ -858,6 +858,104 @@ pub async fn accept_lead_conn(
     Ok(())
 }
 
+/// Whether a camp's lead has ever been offered or handed over. A lead that
+/// moved by offer and acceptance was chosen, and nothing automatic moves it.
+pub async fn camp_lead_was_handed_conn(conn: &TrackedConnection, camp_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM camp_events
+             WHERE camp_id = ?1 AND kind IN ('lead_offered', 'lead_changed') LIMIT 1",
+            params![camp_id],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
+/// Why a base camp's lead was moved to its project's general thread.
+pub const BASE_LEAD_REPAIR_REASON: &str =
+    "base camp is led by its project's general thread; the lead seated without one is a watch participant";
+
+/// Seat `general_thread_id` as lead of a base camp that an earlier birth gave
+/// to another thread because the project had no general thread. Returns the
+/// displaced lead, or `None` when nothing was written.
+///
+/// The camp is left as it is when general already leads, when its lead was
+/// ever offered or handed over, or when the general thread predates the camp:
+/// a general that existed at birth was passed over deliberately, while one
+/// born after the camp was minted by this repair (a boot interrupted between
+/// minting and moving finishes the move on the next boot). The displaced lead
+/// keeps the `watch` membership birth seated it with.
+pub async fn repair_base_camp_lead_conn(
+    conn: &TrackedConnection,
+    project_id: &str,
+    general_thread_id: &str,
+    now: i64,
+) -> DbResult<Option<String>> {
+    let Some(camp) = base_camp_conn(conn, project_id).await? else {
+        return Ok(None);
+    };
+    if camp.lead_thread_id == general_thread_id || camp.is_struck() {
+        return Ok(None);
+    }
+    if camp_lead_was_handed_conn(conn, &camp.id).await? {
+        return Ok(None);
+    }
+    let mut rows = conn
+        .query(
+            "SELECT created_at FROM threads WHERE id = ?1 AND project_id = ?2",
+            params![general_thread_id, project_id],
+        )
+        .await?;
+    let general_born = match rows.next().await? {
+        Some(row) => row.i64(0)?,
+        None => {
+            return Err(DbError::internal(format!(
+                "general thread {general_thread_id} is not a thread of project {project_id}"
+            )))
+        }
+    };
+    drop(rows);
+    if general_born < camp.created_at {
+        return Ok(None);
+    }
+    let changed = conn
+        .execute(
+            "UPDATE camps SET lead_thread_id = ?2, updated_at = ?4
+             WHERE id = ?1 AND lead_thread_id = ?3 AND lead_offer_thread_id IS NULL",
+            params![
+                camp.id.as_str(),
+                general_thread_id,
+                camp.lead_thread_id.as_str(),
+                now
+            ],
+        )
+        .await?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let epoch = bump_epoch_conn(conn, &camp.id, now).await?;
+    journal_conn(
+        conn,
+        &camp.id,
+        epoch,
+        JournalEntry {
+            kind: "lead_changed",
+            subject: None,
+            old_value: Some(&camp.lead_thread_id),
+            new_value: Some(general_thread_id),
+            reason: Some(BASE_LEAD_REPAIR_REASON),
+        },
+        None,
+        now,
+    )
+    .await?;
+    let repaired = camp_by_id_conn(conn, &camp.id)
+        .await?
+        .ok_or_else(|| DbError::internal("camp vanished during lead repair"))?;
+    seat_project_threads_conn(conn, &repaired, now).await?;
+    Ok(Some(camp.lead_thread_id))
+}
+
 /// What an issue's camp write did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueCampChange {
@@ -1024,13 +1122,14 @@ pub struct CampIssue {
     pub number: i64,
     pub title: String,
     pub status: String,
+    pub updated_at: i64,
 }
 
 /// The issues joined to a camp, by number.
 pub async fn camp_issues_conn(conn: &TrackedConnection, camp_id: &str) -> DbResult<Vec<CampIssue>> {
     let mut rows = conn
         .query(
-            "SELECT number, title, status FROM issues WHERE camp_id = ?1 ORDER BY number",
+            "SELECT number, title, status, updated_at FROM issues WHERE camp_id = ?1 ORDER BY number",
             params![camp_id],
         )
         .await?;
@@ -1040,6 +1139,7 @@ pub async fn camp_issues_conn(conn: &TrackedConnection, camp_id: &str) -> DbResu
             number: row.i64(0)?,
             title: row.text(1)?,
             status: row.text(2)?,
+            updated_at: row.i64(3)?,
         });
     }
     Ok(issues)
@@ -1064,7 +1164,7 @@ pub async fn camp_participants_conn(
 ) -> DbResult<Vec<CampParticipant>> {
     let mut rows = conn
         .query(
-            "SELECT subject_key, subject_json, camp_level, reason, created_at
+            "SELECT subject_key, subject_json, camp_level, reason, created_at, assigned_by_json
              FROM wake_subscriptions WHERE camp_id = ?1",
             params![camp.id.as_str()],
         )
@@ -1087,6 +1187,9 @@ pub async fn camp_participants_conn(
                 lead: false,
                 level: Some(level),
                 reason: row.opt_text(3)?,
+                assigned_by: row
+                    .opt_text(5)?
+                    .and_then(|json| serde_json::from_str(&json).ok()),
                 since: row.i64(4)?,
             },
         );
@@ -1113,6 +1216,7 @@ pub async fn camp_participants_conn(
                     lead: true,
                     level: None,
                     reason: None,
+                    assigned_by: None,
                     since: camp.created_at,
                 },
             );
@@ -1208,6 +1312,31 @@ impl LocalDb {
         self.read(move |conn| {
             let thread_id = thread_id.clone();
             Box::pin(async move { camps_for_thread_conn(conn, &thread_id).await })
+        })
+        .await
+    }
+
+    pub async fn camp_lead_was_handed(&self, camp_id: &str) -> DbResult<bool> {
+        let camp_id = camp_id.to_string();
+        self.read(move |conn| {
+            let camp_id = camp_id.clone();
+            Box::pin(async move { camp_lead_was_handed_conn(conn, &camp_id).await })
+        })
+        .await
+    }
+
+    pub async fn repair_base_camp_lead(
+        &self,
+        project_id: &str,
+        general_thread_id: &str,
+        now: i64,
+    ) -> DbResult<Option<String>> {
+        let (project_id, general) = (project_id.to_string(), general_thread_id.to_string());
+        self.write(move |conn| {
+            let (project_id, general) = (project_id.clone(), general.clone());
+            Box::pin(
+                async move { repair_base_camp_lead_conn(conn, &project_id, &general, now).await },
+            )
         })
         .await
     }
@@ -1714,5 +1843,108 @@ mod handoff_tests {
         let participants = db.camp_participants(&after).await.unwrap();
         let former = participants.iter().find(|p| p.subject_key == "a").unwrap();
         assert_eq!(former.role, CampRole::Wake, "the former lead stays at wake");
+    }
+
+    async fn seed_fallback_led_base_camp(db: &LocalDb) -> Camp {
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, repository_id, created_at, updated_at, is_workspace)
+               VALUES ('p', 'default', 'Proj', 'proj', '/tmp/proj', 'p', 1, 1, 0);
+             INSERT INTO threads (id, project_id, name, status, created_at, updated_at) VALUES
+               ('main', 'p', 'main', 'active', 1, 1), ('other', 'p', 'other', 'active', 2, 2);",
+        )
+        .await
+        .unwrap();
+        db.ensure_base_camp("p", "main", 10).await.unwrap().0
+    }
+
+    async fn add_general(db: &LocalDb, born: i64) {
+        db.execute(
+            "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+             VALUES ('g', 'p', 'general', 'active', ?1, ?1)",
+            (born,),
+        )
+        .await
+        .unwrap();
+        db.write(|conn| Box::pin(async move { join_base_camp_conn(conn, "p", "g", 20).await }))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fallback_led_base_camp_moves_its_lead_to_a_general_born_after_it() {
+        let db = migrated_test_db("camps-lead-repair").await;
+        let camp = seed_fallback_led_base_camp(&db).await;
+        add_general(&db, 20).await;
+
+        let displaced = db.repair_base_camp_lead("p", "g", 21).await.unwrap();
+        assert_eq!(displaced.as_deref(), Some("main"));
+        let after = db.camp_by_slug("p", BASE_CAMP_SLUG).await.unwrap().unwrap();
+        assert_eq!(after.lead_thread_id, "g");
+        let participants = db.camp_participants(&after).await.unwrap();
+        assert_eq!(participants[0].subject_key, "g");
+        assert_eq!(participants[0].role, CampRole::Lead);
+        let main = participants
+            .iter()
+            .find(|p| p.subject_key == "main")
+            .unwrap();
+        assert_eq!(main.role, CampRole::Watch, "the displaced lead watches");
+        assert!(!main.lead);
+
+        let c = camp.id.clone();
+        let history = db
+            .read(move |conn| {
+                let c = c.clone();
+                Box::pin(async move { camp_history_conn(conn, &c, 1).await })
+            })
+            .await
+            .unwrap();
+        assert_eq!(history[0].kind, "lead_changed");
+        assert_eq!(history[0].old_value.as_deref(), Some("main"));
+        assert_eq!(history[0].new_value.as_deref(), Some("g"));
+        assert_eq!(history[0].reason.as_deref(), Some(BASE_LEAD_REPAIR_REASON));
+
+        let events = || async {
+            db.query_opt_i64("SELECT COUNT(*) FROM camp_events", ())
+                .await
+                .unwrap()
+        };
+        let before = events().await;
+        assert_eq!(db.repair_base_camp_lead("p", "g", 22).await.unwrap(), None);
+        assert_eq!(events().await, before, "a second repair writes nothing");
+    }
+
+    #[tokio::test]
+    async fn a_handed_lead_or_a_general_older_than_the_camp_is_left_alone() {
+        // A general that existed when the camp was born was passed over
+        // deliberately (it was closed); the repair does not second-guess it.
+        let db = migrated_test_db("camps-lead-repair-older").await;
+        seed_fallback_led_base_camp(&db).await;
+        add_general(&db, 5).await;
+        assert_eq!(db.repair_base_camp_lead("p", "g", 21).await.unwrap(), None);
+        let camp = db.camp_by_slug("p", BASE_CAMP_SLUG).await.unwrap().unwrap();
+        assert_eq!(camp.lead_thread_id, "main");
+
+        // A lead that was offered and accepted was chosen.
+        let db = migrated_test_db("camps-lead-repair-handed").await;
+        let camp = seed_fallback_led_base_camp(&db).await;
+        let c = camp.clone();
+        db.write(move |conn| {
+            let c = c.clone();
+            Box::pin(async move { offer_lead_conn(conn, &c, "other", None, 11).await })
+        })
+        .await
+        .unwrap();
+        let offered = db.camp_by_slug("p", BASE_CAMP_SLUG).await.unwrap().unwrap();
+        db.write(move |conn| {
+            let o = offered.clone();
+            Box::pin(async move { accept_lead_conn(conn, &o, "other", None, 12).await })
+        })
+        .await
+        .unwrap();
+        assert!(db.camp_lead_was_handed(&camp.id).await.unwrap());
+        add_general(&db, 20).await;
+        assert_eq!(db.repair_base_camp_lead("p", "g", 21).await.unwrap(), None);
+        let camp = db.camp_by_slug("p", BASE_CAMP_SLUG).await.unwrap().unwrap();
+        assert_eq!(camp.lead_thread_id, "other");
     }
 }

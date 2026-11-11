@@ -26,6 +26,7 @@ impl CairnResource {
             | ProjectCamps { project, .. }
             | ProjectCamp { project, .. }
             | ProjectCampParticipants { project, .. }
+            | ProjectCampPosts { project, .. }
             | ProjectPages { project, .. }
             | ProjectCodemap { project, .. }
             | ProjectQueue { project, .. }
@@ -145,6 +146,7 @@ impl CairnResource {
             | Self::ProjectCamps { project }
             | Self::ProjectCamp { project, .. }
             | Self::ProjectCampParticipants { project, .. }
+            | Self::ProjectCampPosts { project, .. }
             | Self::ProjectPages { project }
             | Self::ProjectCodemap { project }
             | Self::ProjectQueue { project }
@@ -426,6 +428,7 @@ impl CairnResource {
             | Self::ProjectCamps { .. }
             | Self::ProjectCamp { .. }
             | Self::ProjectCampParticipants { .. }
+            | Self::ProjectCampPosts { .. }
             | Self::ProjectPages { .. }
             | Self::ProjectCodemap { .. }
             | Self::ProjectQueue { .. }

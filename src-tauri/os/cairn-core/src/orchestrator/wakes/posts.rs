@@ -4,10 +4,15 @@
 //! `posts` or `post_comments` row is written, and minting is all this module
 //! does on the write path. Who a row reaches is the log worker's decision, by
 //! the rules every source shares: the registry names the fields that address
-//! recipients (`post_created.mentions`, `post_commented.postAuthor` and
-//! `.mentions`), a Posts watch is an ordinary `{fact: post_created}`
+//! recipients (`post_created.camp` and `.mentions`, `post_commented.postAuthor`,
+//! `.camp` and `.mentions`), a Posts watch is an ordinary `{fact: post_created}`
 //! consumer, and jurisdiction, the actor's own home, one wake per recipient
 //! per row, and coalescing are the index lane's.
+//!
+//! A camp post stores its camp's canonical URI as `camp`, and a comment on one
+//! stores its post's camp the same way, so the lane reaches the camp's
+//! participants by role (lead and wake woken, watch told passively) just as it
+//! does a camp notice.
 //!
 //! **A row stores addresses, never recipients.** An author is stored as the
 //! home URI its principal names and a mention as the canonical URI the text
@@ -155,6 +160,9 @@ pub async fn mint_post_created(
     if let Some(title) = &post.title {
         fields.insert("title".into(), Value::String(title.clone()));
     }
+    if let Some(camp) = crate::posts::post_camp_uri(orch, post).await {
+        fields.insert("camp".into(), Value::String(camp));
+    }
     mint_post_fact(
         orch,
         PostFact {
@@ -205,6 +213,9 @@ pub async fn mint_post_commented(
     if let Some(author) = principal_home(&post.author) {
         fields.insert("postAuthor".into(), Value::String(author));
     }
+    if let Some(camp) = crate::posts::post_camp_uri(orch, post).await {
+        fields.insert("camp".into(), Value::String(camp));
+    }
     mint_post_fact(
         orch,
         PostFact {
@@ -248,7 +259,8 @@ pub(crate) async fn render_post_wake(db: &LocalDb, record_ref: &str) -> Option<S
         _ => return None,
     };
     let post = db.get_post(post_id).await.ok()??;
-    let context = PostContext::resolve(db, std::slice::from_ref(&post)).await;
+    // The wake form names no scope, so no camp needs resolving.
+    let context = PostContext::resolve(db, None, std::slice::from_ref(&post)).await;
     match comment_id {
         None => Some(render_post(&post, &context, PostForm::Wake)),
         Some(comment_id) => {

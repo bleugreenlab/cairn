@@ -1,8 +1,8 @@
 use super::super::{build_failure, ResourceMutationResult};
 use super::append_payload;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
-use crate::models::{CreatePost, CreatePostComment};
 use crate::orchestrator::Orchestrator;
+use crate::posts::{PostTarget, PublishComment, PublishError, PublishPost};
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 use cairn_uri::CairnResource;
 
@@ -25,6 +25,22 @@ fn content<'a>(
         })
 }
 
+fn title<'a>(
+    index: usize,
+    item: &ChangeItem,
+    payload: &'a serde_json::Value,
+) -> ResourceMutationResult<Option<&'a str>> {
+    match payload.get("title") {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(Some)
+            .ok_or_else(|| build_failure(index, item, "payload.title must be a non-empty string")),
+    }
+}
+
 /// Fold the fact log mint into the mutation's summary.
 ///
 /// The post or comment row is the durable content boundary and is already
@@ -36,19 +52,7 @@ fn minted(created: String, event: Result<Option<String>, String>) -> String {
     match event {
         Ok(Some(event)) => format!("{created} (event {event})"),
         Ok(None) => created,
-        Err(error) => {
-            tracing::warn!(%error, "post fact mint failed");
-            format!("{created} (event log mint failed: {error})")
-        }
-    }
-}
-
-fn emit_db_change(orch: &Orchestrator, table: &str, action: &str) {
-    if let Err(error) = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": table, "action": action}),
-    ) {
-        tracing::warn!(%error, table, "failed to emit Posts db-change notification");
+        Err(error) => format!("{created} (event log mint failed: {error})"),
     }
 }
 
@@ -76,17 +80,114 @@ async fn identity(
     Ok((author, appearance, project, job_id))
 }
 
+/// The caller's own project's row id, in the private database posts live in.
+async fn own_project_id(
+    orch: &Orchestrator,
+    project: &str,
+    index: usize,
+    item: &ChangeItem,
+) -> ResourceMutationResult<String> {
+    crate::mcp::handlers::run_context::project_id_by_key(&orch.db.local, project)
+        .await
+        .map_err(|error| build_failure(index, item, error))
+}
+
+/// The camp a `camp:` value or a camp posts collection names, which must be a
+/// camp of the caller's own project.
+async fn camp_target(
+    orch: &Orchestrator,
+    own_project: &str,
+    camp_project: &str,
+    slug: &str,
+    index: usize,
+    item: &ChangeItem,
+) -> ResourceMutationResult<PostTarget> {
+    if cairn_uri::canonical_project(camp_project) != cairn_uri::canonical_project(own_project) {
+        return Err(build_failure(
+            index,
+            item,
+            "a post addresses a camp of your own project only",
+        ));
+    }
+    let project_id = own_project_id(orch, own_project, index, item).await?;
+    crate::posts::camp_target(orch, &project_id, slug)
+        .await
+        .map_err(|error| build_failure(index, item, error.to_string()))
+}
+
+/// Where an append to `cairn://posts` files its post, from `scope` and `camp`.
+async fn corpus_target(
+    orch: &Orchestrator,
+    payload: &serde_json::Value,
+    own_project: &str,
+    index: usize,
+    item: &ChangeItem,
+) -> ResourceMutationResult<PostTarget> {
+    let scope = match payload.get("scope") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| build_failure(index, item, "payload.scope must be a string"))?,
+        ),
+    };
+    let camp = payload.get("camp");
+    match (scope, camp) {
+        (Some("camp"), Some(camp)) => {
+            let uri = camp.as_str().map(str::trim).unwrap_or_default();
+            let Some(CairnResource::ProjectCamp { project, slug }) = cairn_uri::parse_uri(uri)
+            else {
+                return Err(build_failure(
+                    index,
+                    item,
+                    format!(
+                        "payload.camp must be a canonical camp URI like {}",
+                        cairn_uri::build_project_camp_uri(own_project, "SLUG")
+                    ),
+                ));
+            };
+            camp_target(orch, own_project, &project, &slug, index, item).await
+        }
+        (Some("camp"), None) => Err(build_failure(
+            index,
+            item,
+            "scope:\"camp\" needs payload.camp, the canonical URI of a camp of your project",
+        )),
+        (_, Some(_)) => Err(build_failure(
+            index,
+            item,
+            "payload.camp is only accepted with scope:\"camp\"",
+        )),
+        (None, None) => Ok(PostTarget::Workspace),
+        (Some(scope), None) => {
+            if scope != "project" && !scope.eq_ignore_ascii_case(own_project) {
+                return Err(build_failure(index, item, "payload.scope may only be \"project\", the authenticated caller's own project key, or \"camp\""));
+            }
+            Ok(PostTarget::Project {
+                project_id: own_project_id(orch, own_project, index, item).await?,
+            })
+        }
+    }
+}
+
+fn refused(
+    index: usize,
+    item: &ChangeItem,
+    error: PublishError,
+) -> super::super::ResourceMutationFailure {
+    build_failure(index, item, error.to_string())
+}
+
 /// Posts and their comments carry no caller-supplied provenance: the author
 /// principal and appearance below are captured from the live authenticated run
 /// by [`identity`], never read from the payload.
 ///
 /// A payload that tries to name one is refused before this arm runs. The
 /// contract gate in the parent module enumerates exactly what each post
-/// mutation accepts — `content`/`title`/`scope` for a post, `content` alone for
-/// a comment — and rejects every other top-level key, so an `author` or
+/// mutation accepts and rejects every other top-level key, so an `author` or
 /// `appearance` key is a gate rejection rather than a field this arm has to
-/// re-check. Keeping the check in one place is what stops the two from drifting
-/// into disagreement about which keys are forgeable.
+/// re-check. Every arm here is a thin caller of [`crate::posts`], the one
+/// publish path.
 pub(super) async fn dispatch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -96,62 +197,38 @@ pub(super) async fn dispatch(
     resource: &CairnResource,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
-        (CairnResource::Posts, ChangeMode::Append) => {
+        (CairnResource::Posts, ChangeMode::Append)
+        | (CairnResource::ProjectCampPosts { .. }, ChangeMode::Append) => {
             let payload = append_payload(index, item)?;
             let content = content(index, item, payload)?;
-            let title = match payload.get("title") {
-                None => None,
-                Some(value) => Some(
-                    value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
-                            build_failure(index, item, "payload.title must be a non-empty string")
-                        })?,
-                ),
-            };
+            let title = title(index, item, payload)?;
             if dry_run {
                 format!("Would create post: {}", title.unwrap_or("Untitled"))
             } else {
                 let (author, appearance, own_project, job_id) =
                     identity(orch, request, index, item).await?;
-                let project_id = match payload.get("scope") {
-                    None => None,
-                    Some(value) => {
-                        let scope = value.as_str().ok_or_else(|| {
-                            build_failure(index, item, "payload.scope must be a string")
-                        })?;
-                        if scope != "project" && !scope.eq_ignore_ascii_case(&own_project) {
-                            return Err(build_failure(index, item, "payload.scope may only be \"project\" or the authenticated caller's own project key"));
-                        }
-                        Some(
-                            crate::mcp::handlers::run_context::project_id_by_key(
-                                &orch.db.local,
-                                &own_project,
-                            )
-                            .await
-                            .map_err(|error| build_failure(index, item, error))?,
-                        )
+                let target = match resource {
+                    CairnResource::ProjectCampPosts { project, slug } => {
+                        camp_target(orch, &own_project, project, slug, index, item).await?
                     }
+                    _ => corpus_target(orch, payload, &own_project, index, item).await?,
                 };
-                let post = orch
-                    .db
-                    .local
-                    .create_post(CreatePost {
-                        project_id,
+                let published = crate::posts::publish_post(
+                    orch,
+                    PublishPost {
+                        target,
                         title: title.map(str::to_string),
                         content: content.to_string(),
                         author,
                         appearance,
-                    })
-                    .await
-                    .map_err(|error| build_failure(index, item, error.to_string()))?;
-                emit_db_change(orch, "posts", "insert");
-                let created = format!("Created post cairn://posts/{}", post.id);
+                        actor_job_id: Some(job_id),
+                    },
+                )
+                .await
+                .map_err(|error| refused(index, item, error))?;
                 minted(
-                    created,
-                    crate::orchestrator::wakes::mint_post_created(orch, &post, Some(&job_id)).await,
+                    format!("Created post cairn://posts/{}", published.record.id),
+                    published.event,
                 )
             }
         }
@@ -162,36 +239,25 @@ pub(super) async fn dispatch(
                 format!("Would comment on cairn://posts/{id}")
             } else {
                 let (author, appearance, _, job_id) = identity(orch, request, index, item).await?;
-                let comment = orch
-                    .db
-                    .local
-                    .create_post_comment(CreatePostComment {
+                let published = crate::posts::publish_comment(
+                    orch,
+                    PublishComment {
                         post_id: *id,
                         content: content.to_string(),
                         author,
                         appearance,
-                    })
-                    .await
-                    .map_err(|error| build_failure(index, item, error.to_string()))?;
-                emit_db_change(orch, "post_comments", "insert");
-                let created = format!("Created comment {} on cairn://posts/{id}", comment.id);
-                // The comment's fact names the post it landed on, so the author
-                // it replies to is read back from the durable row rather than
-                // trusted from anything the caller supplied.
-                match orch.db.local.get_post(*id).await {
-                    Ok(Some(post)) => minted(
-                        created,
-                        crate::orchestrator::wakes::mint_post_commented(
-                            orch,
-                            &post,
-                            &comment,
-                            Some(&job_id),
-                        )
-                        .await,
+                        actor_job_id: Some(job_id),
+                    },
+                )
+                .await
+                .map_err(|error| refused(index, item, error))?;
+                minted(
+                    format!(
+                        "Created comment {} on cairn://posts/{id}",
+                        published.record.id
                     ),
-                    Ok(None) => created,
-                    Err(error) => minted(created, Err(error.to_string())),
-                }
+                    published.event,
+                )
             }
         }
         _ => return Ok(None),

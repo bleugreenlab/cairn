@@ -579,6 +579,12 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 slug: (*slug).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, "camps", slug, "posts"] if is_camp_slug(slug) => {
+            Some(CairnResource::ProjectCampPosts {
+                project: canonical_project(project),
+                slug: (*slug).to_string(),
+            })
+        }
         // Must precede the thread arm below: a literal `pages` segment names
         // the project's page index, not a thread of that name.
         [PROJECT_SCOPE, project, "pages"] => Some(CairnResource::ProjectPages {

@@ -66,10 +66,14 @@ pub(crate) struct PostContext {
     /// `projects.id` → that project's key. Left empty when no post in the pass
     /// carries a scope, since there is then nothing to name.
     project_keys: HashMap<String, String>,
+    /// Camp id → that camp's current slug, for the camp posts in the pass.
+    camps: HashMap<String, String>,
 }
 
 impl PostContext {
-    pub(crate) async fn resolve(db: &LocalDb, posts: &[Post]) -> Self {
+    /// `orch`, when given, is where a camp post's camp is read from: the
+    /// database that owns its project, which for a team project is not `db`.
+    pub(crate) async fn resolve(db: &LocalDb, orch: Option<&Orchestrator>, posts: &[Post]) -> Self {
         let project_keys = if posts.iter().any(|post| post.project_id.is_some()) {
             db.query_all("SELECT id, key FROM projects", (), |row| {
                 Ok((row.text(0)?, row.text(1)?))
@@ -84,22 +88,39 @@ impl PostContext {
         Self {
             aliases: crate::identity::display::principal_aliases(db).await,
             project_keys,
+            camps: crate::posts::camps_for_posts(orch, db, posts)
+                .await
+                .into_iter()
+                .map(|(id, camp)| (id, camp.slug))
+                .collect(),
         }
     }
 
     /// How a post's scope reads: the readable word for the workspace-wide
-    /// corpus, or the project's key linked to that project's own collection.
+    /// corpus, or the project's key linked to that project's own collection,
+    /// followed for a camp post by the camp's slug linked to the camp.
     ///
     /// A scope whose project row this database cannot resolve renders as the id
     /// it actually holds — the same honesty an unresolved principal gets, since
-    /// a wrong name is worse than a raw id.
-    fn scope(&self, project_id: Option<&str>) -> String {
+    /// a wrong name is worse than a raw id. So does an unresolved camp.
+    fn scope(&self, project_id: Option<&str>, camp_id: Option<&str>) -> String {
         let Some(project_id) = project_id else {
             return "workspace".to_string();
         };
-        match self.project_keys.get(project_id) {
+        let key = self.project_keys.get(project_id);
+        let project = match key {
             Some(key) => format!("[{key}]({})", build_project_posts_uri(key)),
             None => project_id.to_string(),
+        };
+        let Some(camp_id) = camp_id else {
+            return project;
+        };
+        match (key, self.camps.get(camp_id)) {
+            (Some(key), Some(slug)) => format!(
+                "{project} · camp [{slug}]({})",
+                cairn_uri::build_project_camp_uri(key, slug)
+            ),
+            _ => format!("{project} · camp {camp_id}"),
         }
     }
 
@@ -182,7 +203,7 @@ pub(crate) fn render_post(post: &Post, context: &PostContext, form: PostForm) ->
         PostForm::Wake => head,
         PostForm::Read => format!(
             "{head}- Scope: {}\n- Created: {}\n",
-            context.scope(post.project_id.as_deref()),
+            context.scope(post.project_id.as_deref(), post.camp_id.as_deref()),
             crate::clock::age(post.created_at)
         ),
     }
@@ -261,9 +282,15 @@ pub(super) async fn read_corpus(
 ) -> String {
     match corpus_window(orch, request).await {
         Ok(Some(project_id)) => {
-            read_posts(&orch.db.local, PostScope::VisibleTo(&project_id), params).await
+            read_posts(
+                &orch.db.local,
+                Some(orch),
+                PostScope::VisibleTo(&project_id),
+                params,
+            )
+            .await
         }
-        Ok(None) => read_posts(&orch.db.local, PostScope::Corpus, params).await,
+        Ok(None) => read_posts(&orch.db.local, Some(orch), PostScope::Corpus, params).await,
         Err(error) => format!(
             "Failed to read posts: this request carries a run identity Cairn cannot resolve to a \
              project, so the corpus window it may see is unknown. A read is not widened to the \
@@ -274,6 +301,7 @@ pub(super) async fn read_corpus(
 
 pub(super) async fn read_posts(
     db: &LocalDb,
+    orch: Option<&Orchestrator>,
     scope: PostScope<'_>,
     params: &[QueryParam],
 ) -> String {
@@ -289,7 +317,7 @@ pub(super) async fn read_posts(
             if posts.is_empty() {
                 return "# Posts\n\nNo posts found.".into();
             }
-            let context = PostContext::resolve(db, &posts).await;
+            let context = PostContext::resolve(db, orch, &posts).await;
             format!(
                 "# Posts\n\n{}",
                 posts
@@ -303,7 +331,12 @@ pub(super) async fn read_posts(
     }
 }
 
-pub(super) async fn read_post(db: &LocalDb, id: i64, params: &[QueryParam]) -> String {
+pub(super) async fn read_post(
+    db: &LocalDb,
+    orch: Option<&Orchestrator>,
+    id: i64,
+    params: &[QueryParam],
+) -> String {
     let (_, search, json) = match options(params) {
         Ok(value) => value,
         Err(error) => return error,
@@ -323,10 +356,10 @@ pub(super) async fn read_post(db: &LocalDb, id: i64, params: &[QueryParam]) -> S
     if json {
         return serde_json::json!({"post": post, "comments": comments}).to_string();
     }
-    let context = PostContext::resolve(db, std::slice::from_ref(&post)).await;
+    let context = PostContext::resolve(db, orch, std::slice::from_ref(&post)).await;
     let mut output = format!("# {}\n\n{}\n\n- Post: cairn://posts/{id}\n- Scope: {}\n- Author: {}\n- Created: {}\n\n## Comments\n",
         post.title.as_deref().unwrap_or("Untitled"), post.content,
-        context.scope(post.project_id.as_deref()),
+        context.scope(post.project_id.as_deref(), post.camp_id.as_deref()),
         context.author(&post.author, &post.appearance), crate::clock::age(post.created_at));
     if comments.is_empty() {
         output.push_str("\nNo comments.\n");
@@ -366,7 +399,7 @@ pub(super) async fn read_post_comment(db: &LocalDb, post_id: i64, comment_id: i6
         Ok(None) => return format!("Comment {comment_id} not found on cairn://posts/{post_id}."),
         Err(error) => return error,
     };
-    let context = PostContext::resolve(db, std::slice::from_ref(&post)).await;
+    let context = PostContext::resolve(db, None, std::slice::from_ref(&post)).await;
     format!(
         "# On [{}](cairn://posts/{post_id})\n\n{}",
         post.title.as_deref().unwrap_or("Untitled"),
@@ -435,6 +468,7 @@ mod tests {
         let (author, appearance) = agent();
         db.create_post(CreatePost {
             project_id: project_id.map(str::to_string),
+            camp_id: None,
             title: Some(title.to_string()),
             content: format!("{title} body"),
             author,
@@ -455,7 +489,7 @@ mod tests {
         let db = fixture().await;
         post(&db, Some(PROJECT), "Scoped").await;
 
-        let rendered = read_posts(&db, PostScope::Corpus, &[]).await;
+        let rendered = read_posts(&db, None, PostScope::Corpus, &[]).await;
         assert!(
             rendered.contains("- Scope: [cairn](cairn://p/cairn/posts)"),
             "{rendered}"
@@ -495,8 +529,8 @@ mod tests {
         let epoch = created_at.to_string();
 
         for rendered in [
-            read_posts(&db, PostScope::Corpus, &[]).await,
-            read_post(&db, id, &[]).await,
+            read_posts(&db, None, PostScope::Corpus, &[]).await,
+            read_post(&db, None, id, &[]).await,
         ] {
             // The relative age leads and the labelled absolute anchor follows it,
             // so the surface is skimmable without becoming a second clock.
@@ -511,7 +545,7 @@ mod tests {
         }
 
         // The comment renderer is the same fix reaching a second surface.
-        let single = read_post(&db, id, &[]).await;
+        let single = read_post(&db, None, id, &[]).await;
         assert_eq!(
             single.matches("- Created: 0m ago (").count(),
             2,
@@ -530,6 +564,7 @@ mod tests {
 
         let json = read_post(
             &db,
+            None,
             id,
             &[QueryParam {
                 key: "format".into(),
@@ -552,7 +587,7 @@ mod tests {
         let db = fixture().await;
         post(&db, None, "Everyone").await;
 
-        let rendered = read_posts(&db, PostScope::Corpus, &[]).await;
+        let rendered = read_posts(&db, None, PostScope::Corpus, &[]).await;
         assert!(rendered.contains("- Scope: workspace"), "{rendered}");
     }
 
@@ -568,9 +603,10 @@ mod tests {
         let context = PostContext {
             aliases: PrincipalAliases::default(),
             project_keys: HashMap::new(),
+            camps: HashMap::new(),
         };
-        assert_eq!(context.scope(Some(PROJECT)), PROJECT);
-        assert_eq!(context.scope(None), "workspace");
+        assert_eq!(context.scope(Some(PROJECT), None), PROJECT);
+        assert_eq!(context.scope(None, None), "workspace");
     }
 
     /// One post and its comments resolve the same way the collection does, and
@@ -590,7 +626,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rendered = read_post(&db, id, &[]).await;
+        let rendered = read_post(&db, None, id, &[]).await;
         assert_eq!(
             rendered
                 .matches(&format!("- Author: cairn/4198 / builder ({NODE})"))
@@ -609,7 +645,7 @@ mod tests {
             value: "json".into(),
         }];
         let json: serde_json::Value =
-            serde_json::from_str(&read_post(&db, id, &params).await).unwrap();
+            serde_json::from_str(&read_post(&db, None, id, &params).await).unwrap();
         assert_eq!(json["post"]["author"]["run_id"], RUN);
         assert_eq!(json["post"]["projectId"], PROJECT);
         assert_eq!(json["comments"][0]["author"]["run_id"], RUN);

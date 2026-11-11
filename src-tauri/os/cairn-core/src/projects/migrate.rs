@@ -1719,8 +1719,8 @@ pub(super) mod tests {
               VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'project-delete', 'repo', 'sha1', 1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 1, 'reachable', 'tip', 1, 'published');
             INSERT INTO pack_catalog_references(content_hash, project_id, repository_id, object_format, owner_kind, owner_id, created_at)
               VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'project-delete', 'repo', 'sha1', 'mutation_delta', 'owner', 1);
-            INSERT INTO posts(project_id, content, author_principal_json, appearance_snapshot_json)
-              VALUES ('project-delete', 'post', '{}', '{}');
+            INSERT INTO posts(project_id, camp_id, content, author_principal_json, appearance_snapshot_json)
+              VALUES ('project-delete', 'camp-delete', 'post', '{}', '{}');
             INSERT INTO post_comments(post_id, content, author_principal_json, appearance_snapshot_json)
               VALUES ((SELECT id FROM posts WHERE project_id = 'project-delete'), 'comment', '{}', '{}');
             INSERT INTO comments(id, thread_id, content, source, created_at)

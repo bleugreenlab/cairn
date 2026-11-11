@@ -420,6 +420,11 @@ pub(crate) struct CheckPhasePass {
     pub(crate) test_ms: u64,
     #[serde(default)]
     pub(crate) compiled_units: u64,
+    /// How many of `compiled_units` were workspace (local-path) crates' lines;
+    /// the rest is dependency work. `None` on results from runners that did
+    /// not count it, where the split is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_units: Option<u64>,
     /// The workspace (local-path) crates among `compiled_units`, by name; the
     /// registry crates a cold build also compiles are counted, not named.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -466,6 +471,8 @@ impl CheckPhases {
                 pass.test_ms,
                 pass.compiled_units,
             ]
+            .into_iter()
+            .chain(pass.local_units)
         }))
         .all(|value| i64::try_from(value).is_ok());
         let crates_plausible = phases.passes.iter().all(|pass| {
@@ -1080,7 +1087,7 @@ fn parse_lint_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         failed: failures.len(),
         skipped: 0,
         suite_failures: 0,
-        phases: None,
+        phases: CheckPhases::from_artifact(value),
         deferred: 0,
         failures,
         report,
@@ -3792,6 +3799,25 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             assert_eq!(parsed.phases, None, "{bad}");
             assert!(parsed.complete, "the rest of the result still parses");
         }
+    }
+
+    /// rust-lint's clippy pass reports its compile like rust-tests does, so a
+    /// lint row carries `phase_compile_ms` and `compiled_units` too.
+    #[test]
+    fn a_lint_result_keeps_its_clippy_phases() {
+        let phases = r#"{"origin":"executor","setupMs":9000,"compileMs":75900,"testMs":40,"doctestMs":0,"publishMs":300,"compiledUnits":6,"passes":[{"name":"clippy","wallMs":75940,"compileMs":75900,"testMs":40,"compiledUnits":6,"localUnits":6,"compiledCrates":["cairn-core","cairn-exec"]}]}"#;
+        let output = format!(
+            r#"{RESULT_ARTIFACT_JSON_MARKER}{{"schemaVersion":1,"parser":"rust-lint","complete":true,"selection":"unknown","undeclaredSkips":0,"tests":[],"failures":[],"report":"ok","phases":{phases}}}"#
+        );
+        let parsed = parse_check_output("bun run check:rust", &output).unwrap();
+        assert_eq!(parsed.parser, "rust-lint");
+        let measured = parsed.phases.expect("the lint's phases are kept");
+        assert_eq!(
+            (measured.compile_ms, measured.compiled_units),
+            (75_900, Some(6))
+        );
+        assert_eq!(measured.passes[0].name, "clippy");
+        assert_eq!(measured.passes[0].local_units, Some(6));
     }
 
     #[test]

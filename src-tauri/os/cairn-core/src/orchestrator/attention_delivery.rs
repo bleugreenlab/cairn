@@ -194,6 +194,7 @@ mod tests {
         .unwrap();
         db.create_post(crate::models::CreatePost {
             project_id: None,
+            camp_id: None,
             title: Some(title.to_string()),
             content: content.to_string(),
             appearance: AppearanceSnapshot::new(author.clone(), evidence, vec![], None).unwrap(),

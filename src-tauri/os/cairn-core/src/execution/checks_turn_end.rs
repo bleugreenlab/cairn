@@ -51,11 +51,24 @@
 //!
 //! ## Slot-backed concurrency
 //!
-//! Cache-miss review checks run sequentially through one persistent cell lease. The
-//! slot scheduler owns admission and backpressure; the shared check engine still
+//! Cache-miss review checks are split into placement groups, and each group runs
+//! sequentially through one persistent cell lease while the groups run in
+//! parallel. Lanes that place alike share a group; a declared cell group
+//! (`cellGroups`, the Rust lanes) is seated as one group in its declared order
+//! even where its members' placements differ, so they compile once into one
+//! target directory ([`crate::execution::checks`]'s partitioning). The slot
+//! scheduler owns admission and backpressure; the shared check engine still
 //! owns caching, parsing, ordered results, cancellation, and wake delivery. There
 //! is no clone or in-place fallback. Substrate failures become infrastructure
 //! verdicts and the command is never invoked elsewhere.
+//!
+//! ## Wall time against the budget
+//!
+//! The wave records on its attempt row when its lanes reached the fleet, when
+//! the last returned, how long it first deferred to the node, and the
+//! observations its lanes recorded. The `/checks` header renders them against
+//! `checkBudgets.reviewWaveSeconds` ([`wave_budget_line`]). The line measures
+//! and never gates: it changes no verdict and no wake.
 //!
 //! ## Two guards keep it from looping
 //!
@@ -597,6 +610,270 @@ async fn record_cancelled_lanes(
              than a notice that would read their earlier rows as this head's"
         )
     })
+}
+
+/// Keep when the wave's lanes reached the fleet, how long it deferred to its
+/// node first, and the budget its commit declared. A measurement only: a
+/// failure here is logged and the wave goes on.
+async fn record_wave_submission(
+    db: &LocalDb,
+    job_id: &str,
+    attempt_id: &str,
+    settle_ms: u64,
+    submitted_at_ms: u64,
+    budget_ms: Option<u64>,
+) {
+    if let Err(error) = db
+        .execute(
+            "UPDATE turn_end_check_attempts
+                SET settle_ms = ?1, lanes_submitted_at_ms = ?2, budget_ms = ?3
+              WHERE id = ?4 AND job_id = ?5",
+            (
+                settle_ms as i64,
+                submitted_at_ms as i64,
+                budget_ms.map(|ms| ms as i64),
+                attempt_id,
+                job_id,
+            ),
+        )
+        .await
+    {
+        log::warn!(
+            "turn-end checks for job {}: could not record the wave's submission time: {error}",
+            short_id(job_id)
+        );
+    }
+}
+
+/// Keep when the wave's last lane returned and the observations its submitted
+/// lanes recorded. Written before the notice is delivered, because the notice
+/// renders its budget line from here when it is read.
+async fn record_wave_finish(
+    db: &LocalDb,
+    job_id: &str,
+    attempt_id: &str,
+    finished_at_ms: u64,
+    observation_ids: &[String],
+) {
+    let ids = serde_json::to_string(observation_ids).unwrap_or_else(|_| "[]".to_string());
+    if let Err(error) = db
+        .execute(
+            "UPDATE turn_end_check_attempts
+                SET lanes_finished_at_ms = ?1, lane_observations_json = ?2
+              WHERE id = ?3 AND job_id = ?4",
+            (finished_at_ms as i64, ids.as_str(), attempt_id, job_id),
+        )
+        .await
+    {
+        log::warn!(
+            "turn-end checks for job {}: could not record the wave's finish time: {error}",
+            short_id(job_id)
+        );
+    }
+}
+
+/// One review wave's wall clock, as its attempt row and its lanes'
+/// observations recorded it. The wall runs from the lanes' submission to the
+/// last one's return: queue and capacity waits are placement's and count; the
+/// settle wait before submission is the node's own activity and does not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WaveTiming {
+    pub(crate) settle_ms: Option<u64>,
+    pub(crate) submitted_at_ms: u64,
+    pub(crate) finished_at_ms: u64,
+    pub(crate) budget_ms: Option<u64>,
+    pub(crate) lanes: Vec<WaveLaneTiming>,
+}
+
+/// One submitted lane's share of the wave, from its observation row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WaveLaneTiming {
+    pub(crate) name: String,
+    /// The cell that ran it; lanes of one cell run one after another.
+    pub(crate) slot: Option<String>,
+    /// `execution_warmth` as the executor reported it.
+    pub(crate) warmth: Option<String>,
+    /// Units cargo compiled beyond the workspace's own crates: registry and git
+    /// dependencies. A warm cell compiles none unless the lockfile moved, so
+    /// this, not the slot's label, is what says a placement missed its warmth.
+    pub(crate) dependency_units: Option<u64>,
+    pub(crate) started_at_ms: Option<u64>,
+    pub(crate) finished_at_ms: Option<u64>,
+    pub(crate) compile_ms: Option<u64>,
+    pub(crate) test_ms: Option<u64>,
+}
+
+/// The finished wave behind the job's current attempt, or `None` while it
+/// runs, when it submitted nothing, or for an attempt older than the columns.
+async fn recorded_wave_timing(db: &LocalDb, job_id: &str) -> Option<WaveTiming> {
+    let job = job_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let unsigned = |value: Option<i64>| value.map(|value| value.max(0) as u64);
+            let (mut timing, ids) = {
+                let mut rows = conn
+                    .query(
+                        "SELECT a.settle_ms, a.lanes_submitted_at_ms, a.lanes_finished_at_ms,
+                                a.budget_ms, a.lane_observations_json
+                           FROM jobs j JOIN turn_end_check_attempts a
+                             ON a.id = j.turn_end_check_attempt_id
+                          WHERE j.id = ?1",
+                        (job.as_str(),),
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                let (Some(submitted), Some(finished)) = (row.opt_i64(1)?, row.opt_i64(2)?) else {
+                    return Ok(None);
+                };
+                (
+                    WaveTiming {
+                        settle_ms: unsigned(row.opt_i64(0)?),
+                        submitted_at_ms: submitted.max(0) as u64,
+                        finished_at_ms: finished.max(0) as u64,
+                        budget_ms: unsigned(row.opt_i64(3)?),
+                        lanes: Vec::new(),
+                    },
+                    row.opt_text(4)?.unwrap_or_else(|| "[]".to_string()),
+                )
+            };
+            let mut lanes = conn
+                .query(
+                    "SELECT o.executor_slot_id, o.executor_started_at_unix_ms,
+                            o.executor_finished_at_unix_ms, o.phase_compile_ms, o.phase_test_ms,
+                            o.check_name, o.execution_warmth, o.phase_passes_json
+                       FROM check_result_observations o
+                      WHERE o.id IN (SELECT value FROM json_each(?1))
+                      ORDER BY o.executor_started_at_unix_ms",
+                    (ids.as_str(),),
+                )
+                .await?;
+            while let Some(lane) = lanes.next().await? {
+                timing.lanes.push(WaveLaneTiming {
+                    name: lane.opt_text(5)?.unwrap_or_default(),
+                    slot: lane.opt_text(0)?,
+                    warmth: lane.opt_text(6)?,
+                    dependency_units: lane
+                        .opt_text(7)?
+                        .as_deref()
+                        .and_then(dependency_units_compiled),
+                    started_at_ms: unsigned(lane.opt_i64(1)?),
+                    finished_at_ms: unsigned(lane.opt_i64(2)?),
+                    compile_ms: unsigned(lane.opt_i64(3)?),
+                    test_ms: unsigned(lane.opt_i64(4)?),
+                });
+            }
+            Ok::<_, crate::storage::DbError>(Some(timing))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Dependency units a lane's passes compiled, from its stored
+/// `phase_passes_json`: each pass's progress lines less its workspace crates'
+/// lines (`localUnits`). Line counts on both sides, because one workspace
+/// crate can print two lines. `None` when the lane recorded no passes or a
+/// pass did not count its local lines, so an older runner never reads as a
+/// miss.
+fn dependency_units_compiled(passes_json: &str) -> Option<u64> {
+    let passes: Vec<crate::execution::check_parsers::CheckPhasePass> =
+        serde_json::from_str(passes_json).ok()?;
+    if passes.is_empty() {
+        return None;
+    }
+    passes
+        .iter()
+        .map(|pass| {
+            pass.local_units
+                .map(|local| pass.compiled_units.saturating_sub(local))
+        })
+        .sum()
+}
+
+/// A lane that did not find its build warm, judged by what it compiled.
+fn placement_miss(lane: &WaveLaneTiming) -> Option<String> {
+    let name = if lane.name.is_empty() {
+        "a lane"
+    } else {
+        lane.name.as_str()
+    };
+    if lane.warmth.as_deref() == Some("cold") {
+        return Some(format!("placement miss: {name} ran in a cold cell"));
+    }
+    match lane.dependency_units {
+        Some(units) if units > 0 => Some(format!(
+            "placement miss: {name} compiled {units} dependency unit(s) (a warm cell compiles none unless Cargo.lock moved)"
+        )),
+        _ => None,
+    }
+}
+
+fn seconds(ms: u64) -> String {
+    format!("{} s", (ms + 500) / 1_000)
+}
+
+/// The wave's wall time against its budget, with the critical cell's split:
+/// `Wave wall 143 s of 120 s budget (+23 s over) · critical cell: queue 12 s
+/// · compile 71 s · test 60 s · settle 41 s, not charged`. The critical cell
+/// is the one whose last lane returned last, so its split says which phase
+/// owns an overrun. `None` without a budget. Never changes a wake: it is a
+/// measurement beside the verdicts, not one of them.
+pub(crate) fn wave_budget_line(timing: &WaveTiming) -> Option<String> {
+    let budget = timing.budget_ms?;
+    let wall = timing.finished_at_ms.saturating_sub(timing.submitted_at_ms);
+    let standing = if wall > budget {
+        format!("+{} over", seconds(wall - budget))
+    } else {
+        "within budget".to_string()
+    };
+    let mut parts = vec![format!(
+        "Wave wall {} of {} budget ({standing})",
+        seconds(wall),
+        seconds(budget)
+    )];
+    // Lanes without a recorded cell each stand alone.
+    let mut cells: std::collections::BTreeMap<String, Vec<&WaveLaneTiming>> =
+        std::collections::BTreeMap::new();
+    for (index, lane) in timing.lanes.iter().enumerate() {
+        let key = lane.slot.clone().unwrap_or_else(|| format!("\u{0}{index}"));
+        cells.entry(key).or_default().push(lane);
+    }
+    let critical = cells
+        .values()
+        .filter(|lanes| lanes.iter().any(|lane| lane.finished_at_ms.is_some()))
+        .max_by_key(|lanes| lanes.iter().filter_map(|lane| lane.finished_at_ms).max());
+    if let Some(lanes) = critical {
+        let mut split = Vec::new();
+        if let Some(started) = lanes.iter().filter_map(|lane| lane.started_at_ms).min() {
+            split.push(format!(
+                "queue {}",
+                seconds(started.saturating_sub(timing.submitted_at_ms))
+            ));
+        }
+        let sum = |pick: fn(&WaveLaneTiming) -> Option<u64>| -> Option<u64> {
+            lanes
+                .iter()
+                .filter_map(|lane| pick(lane))
+                .reduce(|a, b| a + b)
+        };
+        if let Some(compile) = sum(|lane| lane.compile_ms) {
+            split.push(format!("compile {}", seconds(compile)));
+        }
+        if let Some(test) = sum(|lane| lane.test_ms) {
+            split.push(format!("test {}", seconds(test)));
+        }
+        if !split.is_empty() {
+            parts.push(format!("critical cell: {}", split.join(" · ")));
+        }
+    }
+    if let Some(settle) = timing.settle_ms {
+        parts.push(format!("settle {}, not charged", seconds(settle)));
+    }
+    parts.extend(timing.lanes.iter().filter_map(placement_miss));
+    Some(parts.join(" · "))
 }
 
 pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) {
@@ -1480,12 +1757,14 @@ async fn run_turn_end_checks_inner(
     // about. Definition and content come from the same tree, so a branch's own
     // `.cairn/config.yaml` edit governs its own cadence and no sibling's
     // (CAIRN-3333).
-    let (checks, extra_inputs, unsupported, defined_by_commit) =
+    let (checks, extra_inputs, unsupported, budgets, cell_groups, defined_by_commit) =
         match load_checks_contract_at_commit(&repo_root, &sealed_commit).await {
             Some(loaded) if !loaded.contract.checks.is_empty() => (
                 loaded.contract.checks,
                 loaded.contract.extra_inputs,
                 loaded.contract.unsupported,
+                loaded.contract.budgets,
+                loaded.contract.cell_groups,
                 loaded.defined_by_commit,
             ),
             _ => {
@@ -1849,9 +2128,10 @@ async fn run_turn_end_checks_inner(
     // wave has spent nothing but runner-local planning up to here, so a withdrawal
     // that lands during the wait costs a placement and a partial compile less than
     // the same withdrawal landing mid-suite.
-    if let WaveSettle::Cancelled { waited_ms, reason } =
-        defer_until_node_settles(orch, job_id, attempt_id, cancel).await
-    {
+    let settle_started_at = now_unix_ms();
+    let settled = defer_until_node_settles(orch, job_id, attempt_id, cancel).await;
+    let settle_ms = now_unix_ms().saturating_sub(settle_started_at);
+    if let WaveSettle::Cancelled { waited_ms, reason } = settled {
         log::info!(
             "turn-end checks for job {}: withdrawn after deferring {}s to the node's own work because {}; \
              no machine was ever asked",
@@ -2090,6 +2370,9 @@ async fn run_turn_end_checks_inner(
             // A turn-end wave answers for one node's own tip, so no other wave
             // is asking its question and there is nothing for it to displace.
             purpose: None,
+            // The commit's own groups: the Rust lanes it declares together run
+            // in one cell, in the declared order, on one target directory.
+            cell_groups,
         };
         // The last decision before the machine is asked for anything. Everything
         // since the first check took minutes, and a merge landing inside that window
@@ -2107,6 +2390,15 @@ async fn run_turn_end_checks_inner(
             return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
         }
         transition_turn_end_attempt(orch, job_id, attempt_id, "submitted", None)?;
+        record_wave_submission(
+            &owning,
+            job_id,
+            attempt_id,
+            settle_ms,
+            now_unix_ms(),
+            budgets.review_wave_ms(),
+        )
+        .await;
         cancel.mark_wave_submitted();
         tokio::select! {
             biased;
@@ -2164,6 +2456,15 @@ async fn run_turn_end_checks_inner(
             })
             .collect::<Vec<_>>()
     };
+
+    if !submit.is_empty() {
+        let recorded: Vec<String> = submit
+            .iter()
+            .filter_map(|&index| outcomes[index].recorded.as_ref())
+            .map(|recorded| recorded.id.clone())
+            .collect();
+        record_wave_finish(&owning, job_id, attempt_id, now_unix_ms(), &recorded).await;
+    }
 
     // Read once, here: a stop that begins after every lane has recorded its
     // verdict changes nothing about them, and the settlement below may itself
@@ -2821,6 +3122,16 @@ async fn review_progress_header(orch: &Orchestrator, job_id: &str) -> String {
         Some(status) => wave_header(status, now_unix_ms()),
         None => latest_attempt_absence(orch, job_id).await,
     };
+    if let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
+        if let Some(line) = recorded_wave_timing(&db, job_id)
+            .await
+            .as_ref()
+            .and_then(wave_budget_line)
+        {
+            header.push_str("\n\n");
+            header.push_str(&line);
+        }
+    }
     if let Some(unreviewed) = orch.review_deferrals.unreviewed_for(job_id) {
         let phase = if !orch.turn_end_checks_in_flight(job_id) {
             ReviewWaitPhase::NoWave
@@ -3851,6 +4162,173 @@ mod tests {
         PersistentCellState, QueuedCellRequest, RepositoryLocator, ResidencyFootprint,
         ResidencyHolder, ResidencyPhase, ResourceReservation,
     };
+
+    fn timed_lane(
+        slot: &str,
+        started: u64,
+        finished: u64,
+        compile: u64,
+        test: u64,
+    ) -> WaveLaneTiming {
+        WaveLaneTiming {
+            name: String::new(),
+            warmth: Some("preparedWarmSlot".into()),
+            dependency_units: Some(0),
+            slot: Some(slot.into()),
+            started_at_ms: Some(started),
+            finished_at_ms: Some(finished),
+            compile_ms: Some(compile),
+            test_ms: Some(test),
+        }
+    }
+
+    /// The budget line names the overrun and the critical cell's split: the
+    /// cell whose last lane returned last, its first lane's queue wait, and
+    /// its lanes' compile and test summed, because they ran one after another.
+    #[test]
+    fn an_over_budget_wave_names_its_overrun_and_the_critical_cells_split() {
+        let timing = WaveTiming {
+            settle_ms: Some(41_000),
+            submitted_at_ms: 1_000_000,
+            finished_at_ms: 1_143_000,
+            budget_ms: Some(120_000),
+            lanes: vec![
+                // The Rust cell: rust-lint then rust-tests, sequential.
+                timed_lane("slot-66", 1_012_000, 1_060_000, 40_000, 0),
+                timed_lane("slot-66", 1_060_000, 1_142_000, 31_000, 50_000),
+                // A TS lane in its own cell, done early.
+                timed_lane("slot-9", 1_002_000, 1_030_000, 0, 25_000),
+            ],
+        };
+        assert_eq!(
+            wave_budget_line(&timing).unwrap(),
+            "Wave wall 143 s of 120 s budget (+23 s over) · critical cell: queue 12 s · \
+             compile 71 s · test 50 s · settle 41 s, not charged"
+        );
+    }
+
+    /// Warmth is judged by what a lane compiled, not by its slot's label: a
+    /// lane labelled warm that rebuilt dependencies missed, and so did one
+    /// the executor ran cold.
+    #[test]
+    fn the_budget_line_names_a_placement_miss_by_what_the_lane_compiled() {
+        let pass = |units: u64, local: Option<u64>, crates: &[&str]| {
+            serde_json::json!({
+                "name": "clippy", "wallMs": 1, "compileMs": 1, "testMs": 0,
+                "compiledUnits": units, "localUnits": local, "compiledCrates": crates,
+            })
+        };
+        let passes = |passes: Vec<serde_json::Value>| serde_json::Value::Array(passes).to_string();
+        // A workspace crate whose build script reran prints `Compiling` and
+        // `Checking`: three local lines, two names, no dependency work. The
+        // runner's own timeline counts it this way (lane-phases.test.ts).
+        assert_eq!(
+            dependency_units_compiled(&passes(vec![pass(
+                3,
+                Some(3),
+                &["cairn-core", "cairn-exec"]
+            )])),
+            Some(0),
+            "a workspace-only rebuild is never a miss"
+        );
+        assert_eq!(
+            dependency_units_compiled(&passes(vec![
+                pass(180, Some(1), &["cairn-core"]),
+                pass(0, Some(0), &[]),
+            ])),
+            Some(179)
+        );
+        assert_eq!(
+            dependency_units_compiled(&passes(vec![pass(180, None, &["cairn-core"])])),
+            None,
+            "a pass that did not count its local lines says nothing"
+        );
+        assert_eq!(dependency_units_compiled("[]"), None);
+
+        let mut lint = timed_lane("slot-66", 0, 60_000, 50_000, 0);
+        lint.name = "rust-lint".into();
+        let mut tests = timed_lane("slot-66", 60_000, 150_000, 80_000, 10_000);
+        tests.name = "rust-tests".into();
+        tests.dependency_units = Some(179);
+        let mut scans = timed_lane("slot-66", 150_000, 160_000, 1_000, 9_000);
+        scans.name = "source-scans".into();
+        scans.warmth = Some("cold".into());
+        let line = wave_budget_line(&WaveTiming {
+            settle_ms: None,
+            submitted_at_ms: 0,
+            finished_at_ms: 160_000,
+            budget_ms: Some(120_000),
+            lanes: vec![lint, tests, scans],
+        })
+        .unwrap();
+        assert!(
+            line.ends_with(
+                "placement miss: rust-tests compiled 179 dependency unit(s) (a warm cell \
+                 compiles none unless Cargo.lock moved) · placement miss: source-scans ran in \
+                 a cold cell"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("rust-lint"), "{line}");
+    }
+
+    #[test]
+    fn a_wave_inside_its_budget_says_so_and_no_budget_means_no_line() {
+        let mut timing = WaveTiming {
+            settle_ms: None,
+            submitted_at_ms: 0,
+            finished_at_ms: 95_000,
+            budget_ms: Some(120_000),
+            lanes: Vec::new(),
+        };
+        assert_eq!(
+            wave_budget_line(&timing).unwrap(),
+            "Wave wall 95 s of 120 s budget (within budget)"
+        );
+        timing.budget_ms = None;
+        assert_eq!(wave_budget_line(&timing), None);
+    }
+
+    /// The attempt row carries the wave's timing from submission to finish,
+    /// and the header reads it back only once the wave has finished.
+    #[tokio::test]
+    async fn a_wave_records_its_submission_and_finish_on_its_attempt() {
+        let orch = launchability_orchestrator("active", "complete").await;
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO turn_end_check_attempts(id,job_id,state,created_at,updated_at)
+             VALUES('timed-wave','j-1','submitted',1,1);
+             UPDATE jobs SET turn_end_check_attempt_id='timed-wave' WHERE id='j-1';",
+        )
+        .await
+        .unwrap();
+        record_wave_submission(&db, "j-1", "timed-wave", 41_000, 1_000_000, Some(120_000)).await;
+        assert_eq!(
+            recorded_wave_timing(&db, "j-1").await,
+            None,
+            "a wave still running has no wall to report"
+        );
+        record_wave_finish(&db, "j-1", "timed-wave", 1_143_000, &["absent-row".into()]).await;
+        let timing = recorded_wave_timing(&db, "j-1").await.unwrap();
+        assert_eq!(
+            (
+                timing.settle_ms,
+                timing.submitted_at_ms,
+                timing.finished_at_ms,
+                timing.budget_ms
+            ),
+            (Some(41_000), 1_000_000, 1_143_000, Some(120_000))
+        );
+        assert!(
+            timing.lanes.is_empty(),
+            "an id with no row contributes no lane"
+        );
+        let header = review_progress_header(&orch, "j-1").await;
+        assert!(
+            header.contains("Wave wall 143 s of 120 s budget (+23 s over)"),
+            "{header}"
+        );
+    }
 
     fn cell_held_by(holder: ResidencyHolder, phase: ResidencyPhase) -> PersistentCellState {
         PersistentCellState {

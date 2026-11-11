@@ -2,10 +2,10 @@
 //! reference heading, a tool row.
 //!
 //! [`CairnResource::label`] is one exhaustive `match`, so a variant added to the
-//! enum without a label fails to compile here. The kinds the frontend labelled
-//! before this existed (`formatResourceLabel` in `packages/ui/src/uri.ts`) keep
-//! exactly the text they had, so moving the frontend onto this function changes
-//! no visible chip; `tests::the_frontend_labels_are_reproduced` pins them.
+//! enum without a label fails to compile here. The frontend renders every chip
+//! through this function (compiled to WebAssembly), and the kinds it labelled
+//! before it adopted the Rust grammar keep exactly the text they had;
+//! `tests::the_frontend_labels_are_reproduced` pins them.
 //!
 //! The style, extended to every other kind:
 //!
@@ -294,6 +294,12 @@ impl CairnResource {
             Self::ProjectCamp { project, slug } => in_project(project, format!("camp {slug}")),
             Self::ProjectCampParticipants { project, slug } => {
                 in_project(project, format!("camp {slug} / participants"))
+            }
+            Self::ProjectCampPosts { project, slug } if slug == "base" => {
+                in_project(project, "base camp posts")
+            }
+            Self::ProjectCampPosts { project, slug } => {
+                in_project(project, format!("{slug} camp posts"))
             }
             Self::ProjectHome { project } => in_project(project, "home"),
             Self::ProjectPages { project } => in_project(project, "pages"),

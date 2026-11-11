@@ -429,6 +429,7 @@ mod tests {
         let (author, appearance) = attribution();
         db.create_post(CreatePost {
             project_id: project_id.map(str::to_string),
+            camp_id: None,
             title: None,
             content: content.to_string(),
             author,

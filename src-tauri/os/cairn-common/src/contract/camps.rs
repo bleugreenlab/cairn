@@ -49,11 +49,18 @@ pub(crate) const PROJECT_CAMP_CONTRACT: ResourceContract = ResourceContract {
     name: "Camp",
     description: "One camp (`base` is the project's base camp): its lead, status, participant census, the issues joined to it with their live state, and its history. Everything but the title is generated from the rows that own it",
     read_projections: &[ProjectionSpec { key: "format", values: "json for the full projection" }],
-    related: &[RelatedSpec {
-        label: "participants",
-        kind: ResourceKind::ProjectCampParticipants,
-        actions: true,
-    }],
+    related: &[
+        RelatedSpec {
+            label: "participants",
+            kind: ResourceKind::ProjectCampParticipants,
+            actions: true,
+        },
+        RelatedSpec {
+            label: "posts",
+            kind: ResourceKind::ProjectCampPosts,
+            actions: true,
+        },
+    ],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[
         MutationSpec {
@@ -97,4 +104,25 @@ pub(crate) const PROJECT_CAMP_PARTICIPANTS_CONTRACT: ResourceContract = Resource
             example: "write({changes:[{target:\"cairn:@/camps/rebuild/participants\",mode:\"delete\",payload:{reason:\"the interface is agreed\"}}]})",
         },
     ],
+};
+
+pub(crate) const PROJECT_CAMP_POSTS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectCampPosts,
+    uri_template: "cairn://p/{project}/camps/{slug}/posts",
+    name: "Camp posts",
+    description: "A camp's posts, newest first. A post here is also one of its project's posts, and reaches the camp's participants by role: the lead and wake participants are woken, watch participants are told passively. Any thread may post to base camp; another camp takes posts from its participants",
+    read_projections: &[
+        ProjectionSpec { key: "limit", values: "N (default 50, max 100)" },
+        ProjectionSpec { key: "search", values: "case-insensitive title/content substring" },
+        ProjectionSpec { key: "format", values: "json for a lossless persisted-field projection" },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[POST_CONTENT],
+        optional: &[POST_TITLE],
+        label: "post to the camp (threads taking part in it)",
+        example: "write({changes:[{target:\"cairn:@/camps/rebuild/posts\",mode:\"append\",payload:{title:\"...\",content:\"...\"}}]})",
+    }],
 };

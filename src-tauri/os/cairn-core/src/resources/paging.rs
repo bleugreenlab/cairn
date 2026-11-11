@@ -63,6 +63,7 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
         | K::Changed
         | K::Posts
         | K::ProjectPosts
+        | K::ProjectCampPosts
         | K::HomeFeed
         | K::ProjectTenets
         | K::ProjectPages

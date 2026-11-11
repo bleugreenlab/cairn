@@ -504,11 +504,13 @@ impl Default for FactRegistry {
         // and mentions are home or resource URIs, resolved to a job only at
         // delivery, so a thread that rotated sessions receives on the new one.
         // A muted Posts watch is still told, quietly (CAIRN-1900).
+        // A camp post addresses its camp, which the lane fans out by role
+        // exactly as it does a camp notice.
         let post_created = SourceSpec {
             dedupe: LogDedupe::Unique,
             audience: Audience::AllProviders,
             max_stored_chars: None,
-            addressees: &["mentions"],
+            addressees: &["camp", "mentions"],
             actor_home: Some("author"),
             whole_lists: true,
             muted: MutedDelivery::RideAlong,
@@ -519,16 +521,18 @@ impl Default for FactRegistry {
                 ("author", Scalar, STORED),
                 ("scope", Scalar, STORED),
                 ("title", Scalar, STORED),
+                ("camp", Scalar, STORED),
                 ("mentions", List, STORED),
             ]),
         };
-        // A comment is not a feed event: it addresses the post's author and
-        // whoever it names, and reaches anyone else only through a trigger.
+        // A comment is not a feed event: it addresses the post's author, the
+        // post's camp, and whoever it names, and reaches anyone else only
+        // through a trigger.
         let post_commented = SourceSpec {
             dedupe: LogDedupe::Unique,
             audience: Audience::AllProviders,
             max_stored_chars: None,
-            addressees: &["postAuthor", "mentions"],
+            addressees: &["postAuthor", "camp", "mentions"],
             actor_home: Some("author"),
             whole_lists: true,
             muted: MutedDelivery::RideAlong,
@@ -539,6 +543,7 @@ impl Default for FactRegistry {
                 ("commentUri", Scalar, STORED),
                 ("author", Scalar, STORED),
                 ("postAuthor", Scalar, STORED),
+                ("camp", Scalar, STORED),
                 ("mentions", List, STORED),
             ]),
         };
@@ -1305,7 +1310,9 @@ mod tests {
             vec![
                 "camp_notice.camp",
                 "post_commented.postAuthor",
+                "post_commented.camp",
                 "post_commented.mentions",
+                "post_created.camp",
                 "post_created.mentions"
             ]
         );

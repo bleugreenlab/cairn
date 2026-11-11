@@ -213,6 +213,10 @@ pub fn build_project_camp_participants_uri(project: &str, slug: &str) -> String 
     format!("{}/participants", build_project_camp_uri(project, slug))
 }
 
+pub fn build_project_camp_posts_uri(project: &str, slug: &str) -> String {
+    format!("{}/posts", build_project_camp_uri(project, slug))
+}
+
 pub fn build_project_pages_uri(project: &str) -> String {
     format!("{}/pages", build_project_uri(project))
 }
@@ -1168,6 +1172,7 @@ impl CairnResource {
             Self::ProjectCampParticipants { project, slug } => {
                 build_project_camp_participants_uri(project, slug)
             }
+            Self::ProjectCampPosts { project, slug } => build_project_camp_posts_uri(project, slug),
             Self::ProjectPages { project } => build_project_pages_uri(project),
             Self::ProjectCodemap { project } => build_project_codemap_uri(project),
             Self::ProjectQueue { project } => build_project_queue_uri(project),

@@ -111,6 +111,197 @@ async fn existing_threads_are_seated_and_later_threads_join_at_birth() {
     );
 }
 
+#[tokio::test]
+async fn a_project_with_threads_but_no_general_is_given_one_to_lead_base_camp() {
+    let db = migrated_test_db("camps-birth-no-general").await;
+    // A project whose threads predate base camp, as at the first boot.
+    bare_project(&db, "p-busy", "busy", &[]).await;
+    let main = thread(&db, "p-busy", "main").await;
+    let coaching = thread(&db, "p-busy", "coaching").await;
+
+    let camp = ensure_project_base_camp(&db, "p-busy").await.unwrap();
+    let general = db
+        .query_opt_text(
+            "SELECT id FROM threads WHERE project_id = 'p-busy' AND name = 'general'",
+            (),
+        )
+        .await
+        .unwrap()
+        .expect("birth mints general beside the existing threads");
+    assert_eq!(
+        camp.lead_thread_id, general,
+        "general leads, not the oldest thread"
+    );
+    let participants = db.camp_participants(&camp).await.unwrap();
+    assert_eq!(participants[0].subject_key, general);
+    let mut watchers: Vec<_> = participants[1..]
+        .iter()
+        .map(|p| (p.subject_key.clone(), p.role))
+        .collect();
+    watchers.sort();
+    let mut expected = vec![(main, CampRole::Watch), (coaching, CampRole::Watch)];
+    expected.sort();
+    assert_eq!(watchers, expected);
+}
+
+async fn bare_project(db: &LocalDb, id: &str, key: &str, threads: &[(&str, &str)]) {
+    db.execute(
+        "INSERT INTO projects (id, workspace_id, name, key, repo_path, repository_id,
+                               created_at, updated_at, is_workspace)
+         VALUES (?1, 'default', ?2, ?2, '', ?1, 1, 1, 0)",
+        (id.to_string(), key.to_string()),
+    )
+    .await
+    .unwrap();
+    for (index, (thread_id, name)) in threads.iter().enumerate() {
+        db.execute(
+            "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?4)",
+            (
+                thread_id.to_string(),
+                id.to_string(),
+                name.to_string(),
+                index as i64 + 1,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn general_of(db: &LocalDb, project_id: &str) -> Option<String> {
+    db.query_opt_text(
+        "SELECT id FROM threads WHERE project_id = ?1 AND name = 'general'",
+        (project_id.to_string(),),
+    )
+    .await
+    .unwrap()
+}
+
+/// Base camps an earlier birth led by the project's oldest thread are moved to
+/// a general thread minted at boot; a lead that was handed over is not, and a
+/// second boot writes nothing.
+#[tokio::test]
+async fn boot_repairs_fallback_led_base_camps_once_and_leaves_handed_leads() {
+    use cairn_db::storage::camps::{accept_lead_conn, offer_lead_conn};
+    let local = std::sync::Arc::new(migrated_test_db("camps-boot-repair").await);
+    // As the oldest-thread fallback left them: `rs` led by `main`, and `crs`
+    // led by `coaching` until it handed the lead to `hardware`.
+    bare_project(&local, "p-rs", "rs", &[("rs-main", "main"), ("rs-x", "x")]).await;
+    bare_project(
+        &local,
+        "p-crs",
+        "crs",
+        &[("crs-coaching", "coaching"), ("crs-hw", "hardware")],
+    )
+    .await;
+    local.ensure_base_camp("p-rs", "rs-main", 10).await.unwrap();
+    let (crs, _) = local
+        .ensure_base_camp("p-crs", "crs-coaching", 10)
+        .await
+        .unwrap();
+    let c = crs.clone();
+    local
+        .write(move |conn| {
+            let c = c.clone();
+            Box::pin(async move { offer_lead_conn(conn, &c, "crs-hw", None, 11).await })
+        })
+        .await
+        .unwrap();
+    let offered = local
+        .camp_by_slug("p-crs", BASE_CAMP_SLUG)
+        .await
+        .unwrap()
+        .unwrap();
+    local
+        .write(move |conn| {
+            let o = offered.clone();
+            Box::pin(async move { accept_lead_conn(conn, &o, "crs-hw", None, 12).await })
+        })
+        .await
+        .unwrap();
+    // A project that has no base camp yet is born with general as lead.
+    bare_project(&local, "p-new", "fresh", &[("new-a", "a")]).await;
+
+    let search = std::sync::Arc::new(
+        crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap(),
+    );
+    let dbs = DbState::new(local.clone(), search);
+    let report = bootstrap_base_camps(&dbs).await;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(report.repaired, ["rs"]);
+    assert_eq!(report.established, ["fresh"]);
+
+    let rs_general = general_of(&local, "p-rs")
+        .await
+        .expect("general minted for rs");
+    let rs = local
+        .camp_by_slug("p-rs", BASE_CAMP_SLUG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rs.lead_thread_id, rs_general);
+    let participants = local.camp_participants(&rs).await.unwrap();
+    assert_eq!(participants.len(), 3);
+    assert_eq!(participants[0].subject_key, rs_general);
+    assert!(participants[1..]
+        .iter()
+        .all(|p| p.role == CampRole::Watch && !p.lead));
+    let (kind, old, new) = local
+        .query_opt(
+            "SELECT kind, old_value, new_value FROM camp_events
+             WHERE camp_id = ?1 ORDER BY id DESC LIMIT 1",
+            (rs.id.clone(),),
+            |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kind, "lead_changed");
+    assert_eq!(
+        old.as_deref(),
+        Some("rs-main"),
+        "the history names the old lead"
+    );
+    assert_eq!(new, Some(rs_general));
+
+    let crs_after = local
+        .camp_by_slug("p-crs", BASE_CAMP_SLUG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(crs_after.lead_thread_id, "crs-hw", "a handed lead stays");
+    assert_eq!(
+        general_of(&local, "p-crs").await,
+        None,
+        "nothing minted there"
+    );
+    let fresh = local
+        .camp_by_slug("p-new", BASE_CAMP_SLUG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Some(fresh.lead_thread_id),
+        general_of(&local, "p-new").await
+    );
+
+    let count = |sql: &'static str| {
+        let local = local.clone();
+        async move { local.query_opt_i64(sql, ()).await.unwrap().unwrap() }
+    };
+    let (events, threads, camps) = (
+        count("SELECT COUNT(*) FROM camp_events").await,
+        count("SELECT COUNT(*) FROM threads").await,
+        count("SELECT MAX(updated_at) FROM camps").await,
+    );
+    let again = bootstrap_base_camps(&dbs).await;
+    assert!(again.errors.is_empty() && again.repaired.is_empty() && again.established.is_empty());
+    assert_eq!(count("SELECT COUNT(*) FROM camp_events").await, events);
+    assert_eq!(count("SELECT COUNT(*) FROM threads").await, threads);
+    assert_eq!(count("SELECT MAX(updated_at) FROM camps").await, camps);
+}
+
 /// One base camp notice is one fact row, and it reaches each participant at
 /// its own role: the lead and a `wake` participant are woken with the camp's
 /// framing, a `watch` participant is told passively.

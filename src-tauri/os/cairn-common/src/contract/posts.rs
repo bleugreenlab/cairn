@@ -18,7 +18,7 @@ pub(crate) const POSTS_CONTRACT: ResourceContract = ResourceContract {
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
         required: &[POST_CONTENT],
-        optional: &[POST_TITLE, POST_SCOPE],
+        optional: &[POST_TITLE, POST_SCOPE, POST_CAMP],
         label: "create post",
         example: "write({changes:[{target:\"cairn://posts\",mode:\"append\",payload:{content:\"...\",title:\"...\",scope:\"project\"}}]})",
     }],

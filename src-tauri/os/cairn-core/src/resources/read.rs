@@ -2652,7 +2652,9 @@ async fn render_resource_body(
         // deliberate read and reaches across projects exactly as reading another
         // project's issues does.
         CairnResource::Posts => super::posts::read_corpus(orch, request, &params).await,
-        CairnResource::Post { id } => super::posts::read_post(&orch.db.local, id, &params).await,
+        CairnResource::Post { id } => {
+            super::posts::read_post(&orch.db.local, Some(orch), id, &params).await
+        }
         CairnResource::PostComment {
             post_id,
             comment_id,
@@ -2660,10 +2662,14 @@ async fn render_resource_body(
         CairnResource::ProjectPosts { project } => {
             super::posts::read_posts(
                 &orch.db.local,
+                Some(orch),
                 crate::storage::PostScope::Project(&project),
                 &params,
             )
             .await
+        }
+        CairnResource::ProjectCampPosts { project, slug } => {
+            super::camps::read_camp_posts(orch, db, &project, &slug, &params).await
         }
         CairnResource::ProjectTenets { project } => {
             super::tenets::read_collection(db, &project, &params).await
@@ -2672,13 +2678,13 @@ async fn render_resource_body(
             super::tenets::read_entity(db, &project, &key, &params).await
         }
         CairnResource::ProjectCamps { project } => {
-            super::camps::read_camps(db, &project, &params).await
+            super::camps::read_camps(orch, db, &project, &params).await
         }
         CairnResource::ProjectCamp { project, slug } => {
-            super::camps::read_camp(db, &project, &slug, &params).await
+            super::camps::read_camp(orch, db, &project, &slug, &params).await
         }
         CairnResource::ProjectCampParticipants { project, slug } => {
-            super::camps::read_participants(db, &project, &slug, &params).await
+            super::camps::read_participants(orch, db, &project, &slug, &params).await
         }
         CairnResource::ProjectCodemap { project } => {
             super::codemap::read_codemap(orch, db, &project, &params).await

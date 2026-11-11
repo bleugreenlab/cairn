@@ -12,6 +12,8 @@ use crate::error::CairnError;
 use crate::models::{Camp, CreateThread, BASE_CAMP_SLUG};
 use crate::storage::LocalDb;
 
+pub mod view;
+
 /// The thread every project is born with, and base camp's first lead.
 pub const GENERAL_THREAD_NAME: &str = "general";
 
@@ -75,43 +77,9 @@ pub async fn notify_camp(
     .await
 }
 
-/// The project's general thread, created if the project has none.
-///
-/// Base camp's lead must be someone who hears it, so an active `general` is
-/// preferred, then the project's oldest active thread; a project whose threads
-/// are all closed keeps its closed `general` as lead until a thread reopens
-/// and the lead is handed over.
-async fn base_lead_thread_id(db: &LocalDb, project_id: &str) -> Result<String, CairnError> {
-    use crate::storage::RowExt;
-    let general = db
-        .query_opt(
-            "SELECT id, status FROM threads WHERE project_id = ?1 AND name = ?2",
-            (project_id.to_string(), GENERAL_THREAD_NAME),
-            |row| Ok((row.text(0)?, row.text(1)?)),
-        )
-        .await?;
-    if let Some((id, status)) = &general {
-        if status == "active" {
-            return Ok(id.clone());
-        }
-    }
-    if let Some(id) = db
-        .query_opt_text(
-            "SELECT id FROM threads WHERE project_id = ?1 AND status = 'active'
-             ORDER BY created_at, id LIMIT 1",
-            (project_id.to_string(),),
-        )
-        .await?
-    {
-        return Ok(id);
-    }
-    if let Some((id, _)) = general {
-        return Ok(id);
-    }
-    general_thread_id(db, project_id).await
-}
-
-/// The project's general thread, created if the project has none.
+/// The project's general thread, created if the project has none. It is base
+/// camp's lead whether or not it is open: whether the lead hears its camp is
+/// the lead-offer path's and the operator's concern, not birth's.
 async fn general_thread_id(db: &LocalDb, project_id: &str) -> Result<String, CairnError> {
     let find = || async {
         db.query_opt_text(
@@ -155,7 +123,7 @@ pub async fn ensure_project_base_camp(db: &LocalDb, project_id: &str) -> Result<
     if let Some(camp) = db.camp_by_slug(project_id, BASE_CAMP_SLUG).await? {
         return Ok(camp);
     }
-    let lead = base_lead_thread_id(db, project_id).await?;
+    let lead = general_thread_id(db, project_id).await?;
     let (camp, _) = db
         .ensure_base_camp(project_id, &lead, chrono::Utc::now().timestamp())
         .await?;
@@ -167,7 +135,39 @@ pub async fn ensure_project_base_camp(db: &LocalDb, project_id: &str) -> Result<
 pub struct BaseCampBootstrap {
     pub projects: usize,
     pub established: Vec<String>,
+    /// Projects whose base camp lead moved to a general thread minted for it.
+    pub repaired: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// Give a base camp born before birth always minted `general` the general
+/// thread it should have been led by. Returns the displaced lead, if any.
+///
+/// Earlier births seated the project's oldest active thread as lead when the
+/// project had no general thread. Such a camp gets `general` minted through
+/// the ordinary thread birth (which seats it in base camp) and the lead moved
+/// to it, unless the lead was ever offered or handed over. A camp general
+/// already leads is only read.
+async fn repair_base_camp_lead(db: &LocalDb, camp: &Camp) -> Result<Option<String>, CairnError> {
+    let general = db
+        .query_opt_text(
+            "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
+            (camp.project_id.clone(), GENERAL_THREAD_NAME),
+        )
+        .await?;
+    if general.as_deref() == Some(camp.lead_thread_id.as_str()) {
+        return Ok(None);
+    }
+    if db.camp_lead_was_handed(&camp.id).await? {
+        return Ok(None);
+    }
+    let general = match general {
+        Some(id) => id,
+        None => general_thread_id(db, &camp.project_id).await?,
+    };
+    Ok(db
+        .repair_base_camp_lead(&camp.project_id, &general, chrono::Utc::now().timestamp())
+        .await?)
 }
 
 /// Give every project in every open database its base camp, before anything
@@ -188,14 +188,25 @@ pub async fn bootstrap_base_camps(dbs: &DbState) -> BaseCampBootstrap {
         };
         for project in projects {
             report.projects += 1;
-            let existed = match db.camp_by_slug(&project.id, BASE_CAMP_SLUG).await {
-                Ok(camp) => camp.is_some(),
+            let existing = match db.camp_by_slug(&project.id, BASE_CAMP_SLUG).await {
+                Ok(camp) => camp,
                 Err(error) => {
                     report.errors.push(format!("{}: {error}", project.key));
                     continue;
                 }
             };
-            if existed {
+            if let Some(camp) = existing {
+                match repair_base_camp_lead(&db, &camp).await {
+                    Ok(Some(displaced)) => {
+                        tracing::info!(project = %project.key, %displaced, "base camp lead moved to general");
+                        report.repaired.push(project.key.clone());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(project = %project.key, %error, "base camp lead repair failed");
+                        report.errors.push(format!("{}: {error}", project.key));
+                    }
+                }
                 continue;
             }
             match ensure_project_base_camp(&db, &project.id).await {

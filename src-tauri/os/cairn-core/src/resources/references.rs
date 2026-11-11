@@ -676,7 +676,7 @@ async fn post_comment_quotation(
     let comment = super::posts::find_post_comment(db, post_id, comment_id)
         .await
         .ok()??;
-    let context = super::posts::PostContext::resolve(db, std::slice::from_ref(&post)).await;
+    let context = super::posts::PostContext::resolve(db, None, std::slice::from_ref(&post)).await;
     let (text, elided) = quotation_excerpt(without_references_block(&comment.content));
     Some(ReferenceEntry::Quotation {
         uri: cite.uri.clone(),

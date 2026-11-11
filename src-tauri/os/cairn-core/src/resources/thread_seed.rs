@@ -900,8 +900,9 @@ async fn thread_store_census(thread_id: Option<String>, now: i64) -> String {
 const SEED_CAMPS: usize = 8;
 
 /// One generated line per camp this thread takes part in: its role and the
-/// camp's live size, read from the camp's rows as the seed is composed. A
-/// camp's authored description is never copied here; its URI reads it.
+/// camp's live size and state line ([`crate::camps::view::state_line`]), read
+/// from the camp's rows as the seed is composed. A camp's authored description
+/// is never copied here; its URI reads it.
 async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) -> String {
     let Some(thread_id) = thread_id else {
         return String::new();
@@ -919,12 +920,11 @@ async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) ->
                         cairn_db::storage::camps::camp_participants_conn(conn, &camp)
                             .await?
                             .len();
-                    let open = cairn_db::storage::camps::camp_issues_conn(conn, &camp.id)
-                        .await?
-                        .into_iter()
-                        .filter(|issue| !TERMINAL_ISSUE_STATUSES.contains(&issue.status.as_str()))
-                        .count();
-                    rows.push((camp, role, participants, open));
+                    let issues = cairn_db::storage::camps::camp_issues_conn(conn, &camp.id).await?;
+                    let counts = crate::camps::view::IssueCounts::from_statuses(
+                        issues.iter().map(|issue| issue.status.as_str()),
+                    );
+                    rows.push((camp, role, participants, counts));
                 }
                 Ok(rows)
             })
@@ -935,15 +935,33 @@ async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) ->
         Ok(rows) => rows,
         Err(error) => return format!("_Your camps could not be read: {error}_\n\n"),
     };
+    // Posts live in the install's private database, which is `db` for a local
+    // project; a team replica holds no posts, and its camps' lines then say
+    // nothing about posts rather than guess.
+    let mut posts = std::collections::HashMap::new();
+    for project_id in rows
+        .iter()
+        .map(|(camp, ..)| camp.project_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        posts.extend(db.camp_post_stats(project_id).await.unwrap_or_default());
+    }
     let mut out = String::from("## Camps\n\n");
-    for (camp, role, participants, open) in rows.iter().take(SEED_CAMPS) {
+    let now = chrono::Utc::now().timestamp();
+    for (camp, role, participants, counts) in rows.iter().take(SEED_CAMPS) {
+        let state =
+            crate::camps::view::state_line(counts, posts.get(&camp.id).map(|(_, at)| *at), now);
         out.push_str(&format!(
-            "- `{}` {} — your role: {} · {participants} participant{} · {open} open issue{} → {}\n",
+            "- `{}` {} — your role: {} · {participants} participant{}{} → {}\n",
             camp.slug,
             one_line(&camp.title),
             role.as_str(),
             if *participants == 1 { "" } else { "s" },
-            if *open == 1 { "" } else { "s" },
+            if state.is_empty() {
+                String::new()
+            } else {
+                format!(" · {state}")
+            },
             cairn_uri::build_project_camp_uri(project_key, &camp.slug),
         ));
     }
@@ -4582,6 +4600,35 @@ mod tests {
 
         assert!(!seed.content.contains("EMBEDDED_PRIOR_SEED_BODY"));
         assert!(seed.content.contains("[prior context compacted]"));
+    }
+
+    /// A seed's camp line is the camp's generated state, post activity
+    /// included: a camp with a recent post says when it was.
+    #[tokio::test]
+    async fn a_camp_line_carries_the_camps_state_and_its_last_post() {
+        let db = migrated_test_db("thread-seed-camp-line.db").await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
+             INSERT INTO threads(id, project_id, name, status, created_at, updated_at)
+               VALUES ('t', 'p', 'general', 'active', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let (base, _) = db.ensure_base_camp("p", "t", 1).await.unwrap();
+        db.execute_script(format!(
+            "INSERT INTO posts(project_id, camp_id, content, author_principal_json, appearance_snapshot_json, created_at)
+               VALUES ('p', '{}', 'hello', '{{}}', '{{}}', unixepoch() - 7200);",
+            base.id
+        ))
+        .await
+        .unwrap();
+
+        let lines = camp_lines(&db, Some("t"), "cairn").await;
+        assert!(
+            lines.contains("`base` Base camp — your role: lead · 1 participant · last post 2h ago"),
+            "{lines}"
+        );
     }
 
     #[tokio::test]

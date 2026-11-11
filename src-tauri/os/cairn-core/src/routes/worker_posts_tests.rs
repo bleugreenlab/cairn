@@ -108,6 +108,7 @@ async fn post(
         .local
         .create_post(CreatePost {
             project_id: project.map(str::to_owned),
+            camp_id: None,
             title: Some(title.to_string()),
             content: content.to_string(),
             author,

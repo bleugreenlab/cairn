@@ -281,6 +281,7 @@ fn lane_with_env(
         status_board: None,
         on_group_complete: None,
         purpose: None,
+        cell_groups: Default::default(),
     };
     (batch, item)
 }

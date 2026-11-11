@@ -70,15 +70,15 @@ pub use issue::{
     IssueStatus, SidebarActiveIssue, UpdateIssue,
 };
 pub use label::{CreateLabel, Label, UpdateLabel};
-pub use post::{CreatePost, CreatePostComment, Post, PostComment};
+pub use post::{CreatePost, CreatePostComment, Post, PostCamp, PostComment};
 
 // Thread types
 pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};
 
 // Camp types
 pub use camp::{
-    validate_camp_slug, Camp, CampKind, CampLevel, CampParticipant, CampRole, CampStatus,
-    CampSubject, BASE_CAMP_SLUG, CAMP_SLUG_MAX_LEN,
+    validate_camp_slug, Camp, CampEventKind, CampKind, CampLevel, CampParticipant, CampRole,
+    CampStatus, CampSubject, BASE_CAMP_SLUG, CAMP_SLUG_MAX_LEN,
 };
 
 // Job types (replaces timeline_nodes)

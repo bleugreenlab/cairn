@@ -2862,6 +2862,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::ProjectCamps => "cairn://p/cairn/camps",
         K::ProjectCamp => "cairn://p/cairn/camps/rebuild",
         K::ProjectCampParticipants => "cairn://p/cairn/camps/rebuild/participants",
+        K::ProjectCampPosts => "cairn://p/cairn/camps/rebuild/posts",
         K::ChannelsConversations => "cairn://channels/conversations",
         K::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback",
         K::ProjectThreads => "cairn://p/cairn/threads",
@@ -3591,7 +3592,7 @@ async fn post_reads_are_complete_ordered_and_search_before_limit_without_mutatin
     ];
     let original = params.clone();
     let rendered =
-        crate::resources::posts::read_posts(&orch.db.local, PostScope::Corpus, &params).await;
+        crate::resources::posts::read_posts(&orch.db.local, None, PostScope::Corpus, &params).await;
     assert!(rendered.contains("Needle") && rendered.contains("old match"));
     assert!(!rendered.contains("Newer one"));
     assert_eq!(
@@ -3613,7 +3614,7 @@ async fn post_reads_are_complete_ordered_and_search_before_limit_without_mutatin
         value: "json".into(),
     }];
     let json: serde_json::Value = serde_json::from_str(
-        &crate::resources::posts::read_post(&orch.db.local, post.id, &json_params).await,
+        &crate::resources::posts::read_post(&orch.db.local, None, post.id, &json_params).await,
     )
     .unwrap();
     assert_eq!(json["post"]["content"], "old match");
@@ -3623,7 +3624,7 @@ async fn post_reads_are_complete_ordered_and_search_before_limit_without_mutatin
     assert!(json["comments"][0]["author"].is_object());
     assert!(json["comments"][0]["appearance"].is_object());
 
-    let markdown = crate::resources::posts::read_post(&orch.db.local, post.id, &[]).await;
+    let markdown = crate::resources::posts::read_post(&orch.db.local, None, post.id, &[]).await;
     let first = markdown.find("first comment").unwrap();
     let second = markdown.find("second comment").unwrap();
     assert!(first < second, "comments must render in creation order");
@@ -3695,6 +3696,7 @@ async fn seed_post(
         .local
         .create_post(crate::models::CreatePost {
             project_id: project_id.map(str::to_string),
+            camp_id: None,
             title: Some(title.to_string()),
             content: content.to_string(),
             author,
