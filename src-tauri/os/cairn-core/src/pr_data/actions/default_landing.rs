@@ -147,6 +147,42 @@ pub(super) struct Landed {
     pub published: Option<PublishedLanding>,
 }
 
+/// What one landing attempt came to, short of an error.
+pub(super) enum Attempt {
+    Landed(Box<Landed>),
+    /// The store's source, target or their relationship moved after the
+    /// attempt prepared: prepare again.
+    StoreMoved,
+    /// Origin refused the target's lease: its copy is not the commit the
+    /// attempt leased on, so it moved outside this store's record. Nothing was
+    /// published; the next attempt reads origin before preparing.
+    OriginMoved,
+}
+
+/// How a landing attempt learns origin's copy of its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OriginRead {
+    /// Lease on the store's recorded copy when the store's target is exactly
+    /// it ([`recorded_origin_target`]), and read origin only when it is not.
+    /// The publication's compare-and-swap asks origin anyway: a copy that moved
+    /// refuses the lease with nothing pushed, and the landing retries with
+    /// [`OriginRead::Fetch`].
+    Recorded,
+    /// Fetch origin's copy and judge it before preparing.
+    Fetch,
+}
+
+impl OriginRead {
+    /// The read the attempt after `attempt` makes. Once origin has refused a
+    /// lease, every later attempt of the landing reads origin first.
+    pub(super) fn after(self, attempt: &Attempt) -> Self {
+        match attempt {
+            Attempt::OriginMoved => Self::Fetch,
+            Attempt::Landed(_) | Attempt::StoreMoved => self,
+        }
+    }
+}
+
 /// What pushing a folded landing to origin's target did.
 enum Publish {
     /// Origin accepted it. `unconfirmed` carries why the read-back did not
@@ -803,22 +839,30 @@ pub(super) async fn land_on_default(
     let reservation = Arc::new(reservation);
     let _lease = object_lease(&store, merge_context)?;
     drop(reserving);
+    let mut origin_read = OriginRead::Recorded;
     for attempt in 0..MAX_LANDING_ATTEMPTS {
         super::merge_metrics::landing_attempt();
-        let prospect =
-            match prepare_prospect(orch, job_id, merge_context, method, &store, &reservation)
-                .await?
-            {
-                Built::Ready(prospect) => prospect,
-                Built::Moved(moved) => {
-                    log::info!(
+        let prospect = match prepare_prospect(
+            orch,
+            job_id,
+            merge_context,
+            method,
+            &store,
+            &reservation,
+            origin_read,
+        )
+        .await?
+        {
+            Built::Ready(prospect) => prospect,
+            Built::Moved(moved) => {
+                log::info!(
                     "landing[{job_id}]: the prepared coordinate of `{source}` moved before its \
                      merge result was built (attempt {}): {moved}",
                     attempt + 1
                 );
-                    continue;
-                }
-            };
+                continue;
+            }
+        };
         if let Some(verified) = verified_head {
             // A pin bump lands exactly its verified head: one the preparation
             // carried onto a newer target is a different input, never reused.
@@ -872,19 +916,26 @@ pub(super) async fn land_on_default(
             )
             .await?
         };
+        origin_read = origin_read.after(&landed);
         match landed {
-            Some(Landed { commit, published }) => {
+            Attempt::Landed(landed) => {
+                let Landed { commit, published } = *landed;
                 return Ok(DefaultLanding {
                     landed_commit: commit,
                     plan: prospect.plan,
                     config_notice,
                     published,
                     reservation: Some(reservation),
-                })
+                });
             }
-            None => log::info!(
+            Attempt::StoreMoved => log::info!(
                 "landing[{job_id}]: `{source}` or `{target}` moved while the landing was \
                  validated (attempt {}); building and validating the new merge result",
+                attempt + 1
+            ),
+            Attempt::OriginMoved => log::info!(
+                "landing[{job_id}]: origin's `{target}` was not the copy the landing leased on \
+                 (attempt {}); reading origin and preparing again",
                 attempt + 1
             ),
         }
@@ -945,7 +996,8 @@ async fn validate_prospect(
 }
 
 /// Prepare the source onto the landing target, then build the merge result on
-/// exactly the prepared coordinate.
+/// exactly the prepared coordinate. `origin_read` says whether a project with
+/// a remote reads origin's target first or may lease on the store's record.
 async fn prepare_prospect(
     orch: &Orchestrator,
     job_id: &str,
@@ -953,11 +1005,25 @@ async fn prepare_prospect(
     method: &str,
     store: &Store,
     reservation: &Arc<BranchReservation>,
+    origin_read: OriginRead,
 ) -> Result<Built, String> {
     let source = merge_context.source_branch.as_str();
     reservation_covers(reservation, store, merge_context)?;
     if !merge_context.mr.is_local {
-        take_origin_target(orch, store, merge_context, reservation).await?;
+        let recorded = match origin_read {
+            OriginRead::Recorded => {
+                recorded_origin_target(store, &merge_context.target_branch).await
+            }
+            OriginRead::Fetch => None,
+        };
+        match recorded {
+            Some(recorded) => log::debug!(
+                "landing[{job_id}]: the store's `{}` is its recorded copy of origin's ({recorded}); \
+                 leasing on it without a fetch",
+                merge_context.target_branch
+            ),
+            None => take_origin_target(orch, store, merge_context, reservation).await?,
+        }
     }
     let prepared = prepare_landing_source(orch, job_id, merge_context, reservation).await?;
     let wait = super::merge_metrics::time(super::merge_metrics::Phase::LockWait);
@@ -1015,6 +1081,39 @@ pub(super) async fn take_origin_target(
     Ok(())
 }
 
+/// The store's `target` when it is exactly the store's tracked record of
+/// origin's copy, which a landing may lease on without asking origin: the
+/// publication's compare-and-swap asks origin anyway, and refuses with nothing
+/// pushed when origin holds anything else. `None` when there is no tracked
+/// record, the store's target is anything else (ahead of origin's, diverged,
+/// conflicted, absent), or the store cannot be read at one settled operation;
+/// the landing then reads origin first.
+///
+/// A literal read with no store lock taken: it only decides whether to ask
+/// origin. The landing's reservation keeps the target still, and the
+/// prepared target is checked again under the lock before anything lands.
+pub(super) async fn recorded_origin_target(store: &Store, target: &str) -> Option<String> {
+    let (path, branch) = (store.path.clone(), target.to_string());
+    let read =
+        tokio::task::spawn_blocking(move || {
+            let (recorded, tracked) = cairn_vcs::recorded_origin_bookmark(&path, &branch)?;
+            let local = cairn_vcs::local_bookmark_targets(&path, &branch)?;
+            Ok::<_, String>(recorded.filter(|recorded| {
+                tracked && matches!(local.as_slice(), [only] if only == recorded)
+            }))
+        })
+        .await
+        .map_err(|error| format!("the read did not finish: {error}"))
+        .and_then(|read| read);
+    read.unwrap_or_else(|error| {
+        log::debug!(
+            "the store's record of origin's `{target}` could not be read, so the landing reads \
+             origin: {error}"
+        );
+        None
+    })
+}
+
 /// Origin's copy of a landing target, and what the store made of it.
 pub(super) struct OriginTarget {
     /// The commit origin's copy names.
@@ -1055,23 +1154,21 @@ pub(super) async fn judge_origin_target(
         merge_context.target_branch.as_str(),
     );
     let refuse = |why: String| origin_target_refusal(merge_context, why);
-    let (path, branch) = (store.path.clone(), target.to_string());
     let fetch = super::merge_metrics::time(super::merge_metrics::Phase::Fetch);
-    let observed =
-        crate::orchestrator::base_branch_sync::with_fetch_lock(orch, &store.path, || {
-            let (path, branch) = (path.clone(), branch.clone());
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    crate::jj::fetch_origin_observation(&path, &branch)
-                })
-                .await
-                .map_err(|error| format!("the fetch worker did not finish: {error}"))
-                .and_then(|fetched| fetched)
-            }
-        })
-        .await
-        .map_err(|error| refuse(format!("origin's `{target}` could not be read ({error})")))?
-        .ok_or_else(|| refuse(format!("origin has no `{target}`")))?;
+    // Recorded as a look at origin, so the base-branch registry holds what
+    // the landing learned and when.
+    let observed = crate::orchestrator::base_branch_sync::fetch_origin_observation_serialized(
+        orch,
+        Path::new(&merge_context.mr.repo_path),
+        target,
+        crate::orchestrator::base_branch_sync::FetchRecord {
+            project_id: &merge_context.project_id,
+            source: crate::orchestrator::base_branch_sync::Source::Fetch,
+        },
+    )
+    .await
+    .map_err(|error| refuse(format!("origin's `{target}` could not be read ({error})")))?
+    .ok_or_else(|| refuse(format!("origin has no `{target}`")))?;
     drop(fetch);
     let wait = super::merge_metrics::time(super::merge_metrics::Phase::LockWait);
     let guard = orch
@@ -1361,16 +1458,16 @@ async fn land_if_unchanged(
     guard: JjStoreGuard,
     reservation: &BranchReservation,
     journal: &MergeAttemptJournal<'_>,
-) -> Result<Option<Landed>, String> {
+) -> Result<Attempt, String> {
     // The admission below is timed as its own phase, nested in this one.
     let recheck = super::merge_metrics::time(super::merge_metrics::Phase::Recheck);
     reservation_covers(reservation, store, merge_context)?;
     if let Some(moved) = coordinate_moved(store, merge_context, &prospect.prepared) {
         log::info!("landing: {moved}; preparing again");
-        return Ok(None);
+        return Ok(Attempt::StoreMoved);
     }
     if !prepared_landing_holds(orch, merge_context, &prospect.prepared, &guard).await? {
-        return Ok(None);
+        return Ok(Attempt::StoreMoved);
     }
     // Both branches are admitted before anything is folded or pushed; the
     // reservation keeps the admission true while the guard is free.
@@ -1399,7 +1496,7 @@ async fn land_if_unchanged(
                 .map_err(|error| {
                     format!("failed to roll back a landing whose tree changed: {error}")
                 })?;
-            return Ok(None);
+            return Ok(Attempt::StoreMoved);
         }
         bound.head
     } else {
@@ -1450,10 +1547,10 @@ async fn land_if_unchanged(
         if let Err(error) = repoint_landed_children(orch, merge_context, &guard).await {
             log::warn!("landing: {error}");
         }
-        return Ok(Some(Landed {
+        return Ok(Attempt::Landed(Box::new(Landed {
             commit: Some(commit),
             published: None,
-        }));
+        })));
     }
 
     // The landing commit exists; pin it, then the store goes back to the
@@ -1499,9 +1596,11 @@ async fn land_if_unchanged(
 /// prepared coordinate under it, and has pinned `publication.landing_commit` as
 /// [`landing_pin_ref`]`(journal.attempt_id)`; the store's bookmarks still name
 /// the prepared target and source. The intent is journaled before anything is
-/// sent, and the pin is released unless the outcome is unknown. `Ok(None)` when
-/// origin's target was no longer the prepared one, which restarts the landing
-/// from preparation.
+/// sent, and the pin is released unless the outcome is unknown.
+/// [`Attempt::OriginMoved`] when origin's target was no longer the leased one,
+/// which restarts the landing from preparation with origin read first. Only
+/// that refusal (`LeasedPushError::TargetMoved`) restarts it: every other
+/// refusal, and an unknown outcome, is the landing's error.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_pinned(
     orch: &Orchestrator,
@@ -1512,7 +1611,7 @@ pub(super) async fn publish_pinned(
     journal: &MergeAttemptJournal<'_>,
     publication: Publication,
     refs: PublishRefs,
-) -> Result<Option<Landed>, String> {
+) -> Result<Attempt, String> {
     let source = merge_context.source_branch.as_str();
     let repo_path = merge_context.mr.repo_path.as_str();
     let commit = publication.landing_commit.clone();
@@ -1579,7 +1678,7 @@ pub(super) async fn publish_pinned(
                     merge_context.target_branch
                 );
             }
-            Ok(Some(Landed {
+            Ok(Attempt::Landed(Box::new(Landed {
                 commit: Some(commit),
                 // The caller journals the outcome once the landing is
                 // recorded; the attempt stays driven until then.
@@ -1588,12 +1687,12 @@ pub(super) async fn publish_pinned(
                     attempt_id: journal.attempt_id.to_string(),
                     _driving: driving,
                 }),
-            }))
+            })))
         }
         Publish::TargetMoved { observed, error } => {
             outcome(PublicationOutcome::TargetMoved { observed }).await;
-            log::info!("landing: {error}; preparing again");
-            Ok(None)
+            log::info!("landing: {error}; reading origin and preparing again");
+            Ok(Attempt::OriginMoved)
         }
         Publish::Refused(error) => {
             // Definitive: origin is unchanged. Recovery proves that from
@@ -1817,6 +1916,8 @@ impl LandingWorld for GatedLanding<'_> {
         let mut prospect = None;
         for attempt in 0..MAX_LANDING_ATTEMPTS {
             super::merge_metrics::landing_attempt();
+            // Origin is read up front: a lease refused after the approval
+            // voids the approval itself, which costs far more than a fetch.
             match prepare_prospect(
                 self.orch,
                 self.job_id,
@@ -1824,6 +1925,7 @@ impl LandingWorld for GatedLanding<'_> {
                 self.method,
                 &self.store,
                 &reservation,
+                OriginRead::Fetch,
             )
             .await?
             {

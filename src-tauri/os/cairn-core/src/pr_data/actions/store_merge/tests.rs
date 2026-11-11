@@ -666,32 +666,102 @@ async fn a_remote_landing_moves_the_store_only_after_origin_accepts_and_blocks_o
     );
 }
 
-/// Every stretch of a publishing landing is a named phase of its merge
-/// attempt: the origin take and the writer admission included, and what is
-/// left unattributed is only the short gaps between phases.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial_test::serial(jj)]
-async fn a_publishing_landing_attributes_its_time_to_named_phases() {
-    use crate::pr_data::actions::merge_metrics::{self, MergeAttempt, Phase};
-    let Some(bin) = jj_bin() else { return };
-    let fx = setup_clean_merge(&bin).await;
-    let ctx = remote_default_context(&fx).await;
+/// A remote default landing run inside its own merge attempt, so its phases
+/// and attempts are recorded.
+async fn measured_landing(
+    fx: &MergeFixture,
+    ctx: &MergeMrContext,
+) -> (
+    Arc<crate::pr_data::actions::merge_metrics::MergeAttempt>,
+    Result<crate::pr_data::actions::default_landing::DefaultLanding, String>,
+) {
+    use crate::pr_data::actions::merge_metrics::{self, MergeAttempt};
     let attempt = MergeAttempt::begin("job-src");
     let landed = merge_metrics::measured(Arc::clone(&attempt), async {
         merge_metrics::identify("mr", None, &ctx.source_branch, &ctx.target_branch);
         crate::pr_data::actions::default_landing::land_on_default(
-            &fx.orch, "job-src", &ctx, "squash", None, &JOURNAL,
+            &fx.orch, "job-src", ctx, "squash", None, &JOURNAL,
         )
         .await
     })
     .await;
+    (attempt, landed)
+}
+
+/// Record the store's `main` as its tracked copy of origin's, through the
+/// writer every accepted publication and every origin take records with, so
+/// the store looks as it does after its first landing. A freshly created store
+/// holds origin's copy only as an untracked import. Returns the commit.
+fn record_origin_main(fx: &MergeFixture) -> String {
+    let main = crate::jj::bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+    cairn_vcs::record_origin_bookmarks(
+        &fx.store,
+        &[cairn_vcs::OriginRecord {
+            branch: "main".to_string(),
+            expected: Some(main.clone()),
+            target: Some(main.clone()),
+            advance_local_from: None,
+        }],
+        "test: record origin's main",
+    )
+    .unwrap();
+    assert_eq!(
+        cairn_vcs::recorded_origin_bookmark(&fx.store, "main").unwrap(),
+        (Some(main.clone()), true)
+    );
+    main
+}
+
+/// Push a commit onto origin's `main` from a clone of its own, as a merge made
+/// outside Cairn would. Returns the new commit.
+fn push_main_outside_cairn(fx: &MergeFixture, file: &str) -> String {
+    let clone = tempfile::tempdir().unwrap();
+    let checkout = clone.path().join("outside");
+    git(
+        clone.path(),
+        &["clone", "-q", &fx.origin_path.to_string_lossy(), "outside"],
+    );
+    git(&checkout, &["config", "user.email", "o@e.com"]);
+    git(&checkout, &["config", "user.name", "O"]);
+    std::fs::write(checkout.join(file), "pushed outside Cairn\n").unwrap();
+    git(&checkout, &["add", "-A"]);
+    git(&checkout, &["commit", "-q", "-m", "pushed outside Cairn"]);
+    git(&checkout, &["push", "-q", "origin", "main"]);
+    git_stdout(&checkout, &["rev-parse", "HEAD"])
+}
+
+/// Every stretch of a publishing landing is a named phase of its merge
+/// attempt: the writer admission included, and what is left unattributed is
+/// only the short gaps between phases. A store whose `main` is its recorded
+/// copy of origin's leases on it: no fetch, no take, one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(jj)]
+async fn a_publishing_landing_attributes_its_time_to_named_phases() {
+    use crate::pr_data::actions::merge_metrics::Phase;
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let ctx = remote_default_context(&fx).await;
+    record_origin_main(&fx);
+    let (attempt, landed) = measured_landing(&fx, &ctx).await;
     let landed = landed.expect("a clean remote landing lands");
     assert!(landed.published.is_some(), "the landing published");
 
+    for phase in [Phase::Fetch, Phase::Take] {
+        assert_eq!(
+            attempt.phase_total(phase),
+            None,
+            "origin at the recorded copy is never fetched or taken ({phase:?})"
+        );
+    }
+    assert!(
+        fx.orch
+            .base_branch_sync
+            .snapshot("proj-1", "main")
+            .is_none(),
+        "no fetch was recorded, because none ran"
+    );
     for phase in [
         Phase::ReservationWait,
-        Phase::Fetch,
-        Phase::Take,
         Phase::Build,
         Phase::Validate,
         Phase::ConfigPreflight,
@@ -711,12 +781,152 @@ async fn a_publishing_landing_attributes_its_time_to_named_phases() {
         );
     }
     let record = attempt.record(Ok(()));
-    assert!(record["take_ms"].is_u64() && record["admission_ms"].is_u64());
+    assert!(record["fetch_ms"].is_null() && record["take_ms"].is_null());
+    assert!(record["admission_ms"].is_u64());
+    assert_eq!(record["landing_attempts"], 1);
     let unattributed = record["unattributed_ms"].as_u64().unwrap();
     assert!(
         unattributed < 300,
         "all but {unattributed} ms of {} ms are named: {record}",
         record["total_ms"]
+    );
+}
+
+/// Origin's `main` moved outside Cairn, so the landing's lease on the store's
+/// recorded copy is refused with nothing pushed. Only then does the landing
+/// fetch: it takes origin's copy, prepares again onto it, and lands on the
+/// second attempt, and the fetch is recorded as a look at origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(jj)]
+async fn a_landing_whose_origin_target_moved_outside_cairn_fetches_once_and_lands_on_it() {
+    use crate::orchestrator::base_branch_sync::Source;
+    use crate::pr_data::actions::merge_metrics::Phase;
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let ctx = remote_default_context(&fx).await;
+    let recorded = record_origin_main(&fx);
+    let moved = push_main_outside_cairn(&fx, "outside.rs");
+    assert_ne!(moved, recorded);
+
+    let (attempt, landed) = measured_landing(&fx, &ctx).await;
+    let landed = landed.expect("the second attempt lands on origin's copy");
+
+    let commit = landed.landed_commit.expect("the landing names its commit");
+    assert_eq!(
+        parents_of(&fx, &commit),
+        vec![moved.clone()],
+        "the landing was prepared again onto origin's moved copy"
+    );
+    assert_eq!(git_stdout(&fx.origin_path, &["rev-parse", "main"]), commit);
+    let published = landed.published.expect("a remote landing is published");
+    assert_eq!(published.publication.expected_old, moved);
+    let record = attempt.record(Ok(()));
+    assert_eq!(record["landing_attempts"], 2, "exactly one retry: {record}");
+    assert!(
+        attempt.phase_total(Phase::Fetch).is_some(),
+        "the retry fetched origin"
+    );
+    let events = journal_events(&fx).await;
+    assert!(
+        events.starts_with("attempt-publication-1:1:executing,attempt-publication-1:2:failed,")
+            && events.contains("attempt-publication-2:1:executing"),
+        "the leased push on the recorded copy was refused, then the retry published: {events}"
+    );
+    let sync = fx
+        .orch
+        .base_branch_sync
+        .snapshot("proj-1", "main")
+        .expect("the retry's fetch is recorded");
+    assert_eq!(sync.remote_tip.as_deref(), Some(moved.as_str()));
+    assert_eq!(sync.remote_tip_source, Some(Source::Fetch));
+    assert!(sync.checked_at.is_some());
+}
+
+/// A store with no tracked record of origin's `main` (a fresh store holds only
+/// an untracked import of it) has nothing to lease on, so the landing fetches
+/// before its first attempt, as every landing used to. Its accepted
+/// publication leaves the tracked record the next landing leases on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(jj)]
+async fn a_landing_without_a_recorded_origin_target_fetches_first() {
+    use crate::pr_data::actions::default_landing::{recorded_origin_target, store_of};
+    use crate::pr_data::actions::merge_metrics::Phase;
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let ctx = remote_default_context(&fx).await;
+    let main = crate::jj::bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+    assert_eq!(
+        cairn_vcs::recorded_origin_bookmark(&fx.store, "main").unwrap(),
+        (Some(main), false),
+        "a fresh store's copy of origin's main is an untracked import"
+    );
+    let store = store_of(&fx.orch, &ctx);
+    assert_eq!(
+        recorded_origin_target(&store, "main").await,
+        None,
+        "an untracked copy is no record to lease on"
+    );
+
+    let (attempt, landed) = measured_landing(&fx, &ctx).await;
+    let landed = landed.expect("the landing lands after its fetch");
+
+    let commit = landed.landed_commit.expect("the landing names its commit");
+    assert!(landed.published.is_some());
+    assert!(
+        attempt.phase_total(Phase::Fetch).is_some(),
+        "the first attempt fetched origin"
+    );
+    assert_eq!(attempt.record(Ok(()))["landing_attempts"], 1);
+    assert_eq!(
+        recorded_origin_target(&store, "main").await,
+        Some(commit),
+        "the publication's record is what the next landing leases on"
+    );
+    assert!(fx
+        .orch
+        .base_branch_sync
+        .snapshot("proj-1", "main")
+        .is_some());
+}
+
+/// A refusal that is not a stale target lease (here origin's receiver declines
+/// every push) refuses the landing as it always did: no fetch, no second
+/// attempt, nothing published.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(jj)]
+async fn a_landing_refused_for_any_other_reason_retries_nothing() {
+    use crate::pr_data::actions::merge_metrics::Phase;
+    use std::os::unix::fs::PermissionsExt;
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let ctx = remote_default_context(&fx).await;
+    let target = record_origin_main(&fx);
+    let hook = fx.origin_path.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\necho 'declined by policy' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (attempt, landed) = measured_landing(&fx, &ctx).await;
+    let Err(refused) = landed else {
+        panic!("a declined push refuses the landing");
+    };
+
+    assert!(
+        refused.contains("Nothing was published"),
+        "refused as a definitive refusal: {refused}"
+    );
+    assert_eq!(attempt.record(Err(&refused))["landing_attempts"], 1);
+    assert_eq!(
+        attempt.phase_total(Phase::Fetch),
+        None,
+        "a refusal other than a stale lease never fetches"
+    );
+    assert_eq!(git_stdout(&fx.origin_path, &["rev-parse", "main"]), target);
+    let events = journal_events(&fx).await;
+    assert!(
+        !events.contains("attempt-publication-2"),
+        "one publication was attempted: {events}"
     );
 }
 

@@ -51,9 +51,9 @@ use crate::storage::LocalDb;
 use super::context::MergeMrContext;
 use super::default_landing::{
     admit_landing_writers, advance_landing_bookmarks, coordinate_moved, judge_origin_target,
-    origin_target_refusal, pin_landing, publish_pinned, repoint_landed_children,
-    reservation_covers, store_of, DefaultLanding, Landed, PublishRefs, Store,
-    LANDING_RESERVATION_WAIT, MAX_LANDING_ATTEMPTS,
+    origin_target_refusal, pin_landing, publish_pinned, recorded_origin_target,
+    repoint_landed_children, reservation_covers, store_of, Attempt, DefaultLanding, Landed,
+    OriginRead, PublishRefs, Store, LANDING_RESERVATION_WAIT, MAX_LANDING_ATTEMPTS,
 };
 use super::landing_record::{Publication, PublicationShape};
 use super::merge::MergeAttemptJournal;
@@ -89,13 +89,14 @@ pub(super) async fn land_on_integration(
             format!("Refusing to merge `{source}` into `{target}`: {error}. Nothing changed.")
         })?,
     );
+    let mut origin_read = OriginRead::Recorded;
     for attempt in 0..MAX_LANDING_ATTEMPTS {
         super::merge_metrics::landing_attempt();
         reservation_covers(&reservation, &store, merge_context)?;
         let origin_target = if merge_context.mr.is_local {
             None
         } else {
-            Some(origin_integration(orch, &store, merge_context, &reservation).await?)
+            Some(origin_integration(orch, &store, merge_context, &reservation, origin_read).await?)
         };
         let prepared = prepare_landing_source(orch, job_id, merge_context, &reservation).await?;
         // Maintenance reclaims nothing this attempt reads, validates or
@@ -158,19 +159,26 @@ pub(super) async fn land_on_integration(
             &publication_journal,
         )
         .await?;
+        origin_read = origin_read.after(&landed);
         match landed {
-            Some(Landed { commit, published }) => {
+            Attempt::Landed(landed) => {
+                let Landed { commit, published } = *landed;
                 return Ok(DefaultLanding {
                     landed_commit: commit,
                     plan: bind::BindPlan::default(),
                     config_notice: None,
                     published,
                     reservation: Some(reservation),
-                })
+                });
             }
-            None => log::info!(
+            Attempt::StoreMoved => log::info!(
                 "landing[{job_id}]: `{source}` or `{target}` moved while the landing was \
                  validated (attempt {}); preparing and validating again",
+                attempt + 1
+            ),
+            Attempt::OriginMoved => log::info!(
+                "landing[{job_id}]: origin's `{target}` was not the copy the landing leased on \
+                 (attempt {}); reading origin and preparing again",
                 attempt + 1
             ),
         }
@@ -195,14 +203,31 @@ pub(super) async fn land_on_integration(
 /// transport's supersession proof, which rewrites origin's copy only when
 /// every commit it would lose is proven the store's own replacement or drop,
 /// and otherwise refuses before anything is sent.
+///
+/// With [`OriginRead::Recorded`], a store copy that is exactly its tracked
+/// record of origin's is O, read without a fetch: the target's lease asks
+/// origin anyway. Every other shape is judged against a fetched O.
 async fn origin_integration(
     orch: &Orchestrator,
     store: &Store,
     merge_context: &MergeMrContext,
     reservation: &crate::orchestrator::BranchReservation,
+    origin_read: OriginRead,
 ) -> Result<OriginIntegration, String> {
-    let taken = judge_origin_target(orch, store, merge_context, reservation).await?;
     let target = merge_context.target_branch.as_str();
+    if origin_read == OriginRead::Recorded {
+        if let Some(origin) = recorded_origin_target(store, target).await {
+            log::debug!(
+                "landing: the store's `{target}` is its recorded copy of origin's ({origin}); \
+                 leasing on it without a fetch"
+            );
+            return Ok(OriginIntegration {
+                origin,
+                rewrites: false,
+            });
+        }
+    }
+    let taken = judge_origin_target(orch, store, merge_context, reservation).await?;
     match taken.judged {
         crate::jj::OriginFastForward::Current { .. }
         | crate::jj::OriginFastForward::Advanced { .. } => Ok(OriginIntegration {
@@ -379,10 +404,10 @@ async fn validate(
     }
 }
 
-/// Land the validated head if its prepared coordinate still holds: `Some` with
-/// what landed, `None` when the source, the target or the relationship moved,
-/// or origin's target was no longer `origin_target`, which restarts
-/// preparation. `origin_target` is origin's copy O for a project with a remote
+/// Land the validated head if its prepared coordinate still holds: what
+/// landed, [`Attempt::StoreMoved`] when the source, the target or the
+/// relationship moved, or [`Attempt::OriginMoved`] when origin's target was no
+/// longer `origin_target`; both restart preparation. `origin_target` is origin's copy O for a project with a remote
 /// (`None` without one). `guard` is the store lock for the final check; for a
 /// publication it is released for the network push and re-taken to record it,
 /// while `reservation` keeps the source and target still.
@@ -397,7 +422,7 @@ async fn land_if_unchanged(
     guard: JjStoreGuard,
     reservation: &BranchReservation,
     journal: &MergeAttemptJournal<'_>,
-) -> Result<Option<Landed>, String> {
+) -> Result<Attempt, String> {
     let (source, target) = (
         merge_context.source_branch.as_str(),
         merge_context.target_branch.as_str(),
@@ -405,10 +430,10 @@ async fn land_if_unchanged(
     reservation_covers(reservation, store, merge_context)?;
     if let Some(moved) = coordinate_moved(store, merge_context, prepared) {
         log::info!("landing: {moved}; preparing again");
-        return Ok(None);
+        return Ok(Attempt::StoreMoved);
     }
     if !prepared_landing_holds(orch, merge_context, prepared, &guard).await? {
-        return Ok(None);
+        return Ok(Attempt::StoreMoved);
     }
     // Both writers are admitted under this guard before either bookmark moves
     // or anything is pinned and published.
@@ -428,10 +453,10 @@ async fn land_if_unchanged(
         if let Err(error) = repoint_landed_children(orch, merge_context, &guard).await {
             log::warn!("landing: {error}");
         }
-        return Ok(Some(Landed {
+        return Ok(Attempt::Landed(Box::new(Landed {
             commit: Some(head.to_string()),
             published: None,
-        }));
+        })));
     };
 
     // What the store last recorded of origin's source is the source ref's
