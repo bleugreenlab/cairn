@@ -596,6 +596,10 @@ fn attribute_user_input(body: &str) -> (String, String) {
     if body.starts_with("Attention update (") {
         return ("Cairn (an attention update)".into(), body.to_string());
     }
+    // A camp's wake is the camp's, never the operator's.
+    if let Some(slug) = cairn_attention::message_render::camp_line_slug(body) {
+        return (format!("camp {slug} (a camp notice)"), body.to_string());
+    }
     ("the operator".into(), body.to_string())
 }
 

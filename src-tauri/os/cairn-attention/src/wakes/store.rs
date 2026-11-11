@@ -907,9 +907,12 @@ pub struct Receipt {
     pub last_refusal: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The structured facts of a fact with no row of its own to render from
+    /// (a one-shot subscription's firing); `None` for a logged fact or a push.
+    pub fact_json: Option<String>,
 }
 
-const RECEIPT_COLUMNS: &str = "id, fact_key, recipient_kind, recipient_id, project_id, fact_row_id, level, reasons_json, state, wake_id, message_id, delivered_job_id, push_id, last_refusal, created_at, updated_at";
+const RECEIPT_COLUMNS: &str = "id, fact_key, recipient_kind, recipient_id, project_id, fact_row_id, level, reasons_json, state, wake_id, message_id, delivered_job_id, push_id, last_refusal, created_at, updated_at, fact_json";
 
 fn receipt_from_row(row: &cairn_db::turso::Row) -> DbResult<Receipt> {
     let kind = row.text(2)?;
@@ -940,6 +943,7 @@ fn receipt_from_row(row: &cairn_db::turso::Row) -> DbResult<Receipt> {
         last_refusal: row.opt_text(13)?,
         created_at: row.i64(14)?,
         updated_at: row.i64(15)?,
+        fact_json: row.opt_text(16)?,
     })
 }
 
@@ -953,7 +957,11 @@ pub struct NewReceipt<'a> {
     pub fact_key: &'a str,
     pub candidate: &'a super::recipients::Candidate,
     pub project_id: Option<&'a str>,
+    /// The logged row this fact is, or the row it is delivered beside: a
+    /// recipient's receipts sharing a row go in one message.
     pub fact_row_id: Option<i64>,
+    /// See [`Receipt::fact_json`].
+    pub fact_json: Option<&'a str>,
 }
 
 /// What writing a receipt found.
@@ -1020,8 +1028,8 @@ pub async fn upsert_receipt_conn(
         conn.execute(
             "INSERT INTO delivery_receipts
                (id, fact_key, recipient_kind, recipient_id, project_id, fact_row_id, level,
-                reasons_json, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?9)",
+                reasons_json, state, created_at, updated_at, fact_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?9, ?10)",
             cairn_db::turso::params![
                 id.as_str(),
                 new.fact_key,
@@ -1031,7 +1039,8 @@ pub async fn upsert_receipt_conn(
                 new.fact_row_id,
                 new.candidate.level.as_str(),
                 reasons.as_str(),
-                now
+                now,
+                new.fact_json
             ],
         )
         .await?;
@@ -1051,6 +1060,7 @@ pub async fn upsert_receipt_conn(
             last_refusal: None,
             created_at: now,
             updated_at: now,
+            fact_json: new.fact_json.map(str::to_owned),
         }));
     };
     if existing.state != receipt_state::QUEUED {
@@ -1103,12 +1113,14 @@ pub async fn queue_fact_receipt(
     let candidate = new.candidate.clone();
     let project_id = new.project_id.map(str::to_owned);
     let fact_row_id = new.fact_row_id;
+    let fact_json = new.fact_json.map(str::to_owned);
     let matched = matched.clone();
     db.write(move |conn| {
-        let (fact_key, candidate, project_id, matched) = (
+        let (fact_key, candidate, project_id, fact_json, matched) = (
             fact_key.clone(),
             candidate.clone(),
             project_id.clone(),
+            fact_json.clone(),
             matched.clone(),
         );
         Box::pin(async move {
@@ -1117,33 +1129,150 @@ pub async fn queue_fact_receipt(
                 candidate: &candidate,
                 project_id: project_id.as_deref(),
                 fact_row_id,
+                fact_json: fact_json.as_deref(),
             };
-            let write = upsert_receipt_conn(conn, &new).await?;
-            let wake_id = match &write {
-                ReceiptWrite::Inserted(receipt) => {
-                    let wake_id =
-                        cairn_db::storage::coalesce_fact_wake_conn(conn, &matched, window).await?;
-                    attach_receipt_to_wake_conn(conn, &receipt.id, wake_id).await?;
-                    Some(wake_id)
-                }
-                ReceiptWrite::Raised(receipt) => {
-                    if let Some(wake_id) = receipt.wake_id {
-                        cairn_db::storage::raise_fact_wake_level_conn(
-                            conn,
-                            wake_id,
-                            receipt.level.as_str(),
-                            &matched.clause_ref,
-                        )
-                        .await?;
-                    }
-                    receipt.wake_id
-                }
-                ReceiptWrite::Consumed(receipt) => receipt.wake_id,
-            };
-            Ok((write, wake_id))
+            queue_receipt_conn(conn, &new, &matched, window, None).await
         })
     })
     .await
+}
+
+/// [`queue_fact_receipt`] inside the caller's transaction, so a producer can
+/// commit the receipt with the state change that owes it (a one-shot
+/// subscription spent as its firing is written).
+///
+/// A new receipt that shares its row with a receipt the recipient already has
+/// queued joins that receipt's pending wake rather than `matched`'s, so both
+/// go in one message at their maximum level whichever was written first.
+/// `not_before_ms` keeps the carrying wake from coming due before then: the
+/// drain's pacing for a burst of turn-launching deliveries.
+pub async fn queue_receipt_conn(
+    conn: &crate::storage::TrackedConnection,
+    new: &NewReceipt<'_>,
+    matched: &cairn_db::storage::WakeMatch,
+    window: cairn_db::storage::WakeWindow,
+    not_before_ms: Option<i64>,
+) -> DbResult<(ReceiptWrite, Option<i64>)> {
+    let write = upsert_receipt_conn(conn, new).await?;
+    let wake_id = match &write {
+        ReceiptWrite::Inserted(receipt) => {
+            let wake_id = match pending_sibling_wake_conn(conn, receipt).await? {
+                Some(wake_id) => {
+                    cairn_db::storage::raise_fact_wake_level_conn(
+                        conn,
+                        wake_id,
+                        receipt.level.as_str(),
+                        &matched.clause_ref,
+                    )
+                    .await?;
+                    wake_id
+                }
+                None => cairn_db::storage::coalesce_fact_wake_conn(conn, matched, window).await?,
+            };
+            attach_receipt_to_wake_conn(conn, &receipt.id, wake_id).await?;
+            Some(wake_id)
+        }
+        ReceiptWrite::Raised(receipt) => {
+            if let Some(wake_id) = receipt.wake_id {
+                cairn_db::storage::raise_fact_wake_level_conn(
+                    conn,
+                    wake_id,
+                    receipt.level.as_str(),
+                    &matched.clause_ref,
+                )
+                .await?;
+            }
+            receipt.wake_id
+        }
+        ReceiptWrite::Consumed(receipt) => receipt.wake_id,
+    };
+    if let (Some(wake_id), Some(at), true) = (wake_id, not_before_ms, write.is_owed()) {
+        cairn_db::storage::hold_fact_wake_until_conn(conn, wake_id, at).await?;
+    }
+    Ok((write, wake_id))
+}
+
+/// The pending wake carrying another queued receipt of the same recipient for
+/// the same row, if there is one.
+async fn pending_sibling_wake_conn(
+    conn: &crate::storage::TrackedConnection,
+    receipt: &Receipt,
+) -> DbResult<Option<i64>> {
+    let Some(row_id) = receipt.fact_row_id else {
+        return Ok(None);
+    };
+    let mut rows = conn
+        .query(
+            "SELECT r.wake_id FROM delivery_receipts r JOIN fact_log_wakes w ON w.id = r.wake_id
+              WHERE r.fact_row_id = ?1 AND r.recipient_kind = ?2 AND r.recipient_id = ?3
+                AND r.id != ?4 AND r.state = 'queued' AND w.delivered_at IS NULL
+              ORDER BY w.id LIMIT 1",
+            cairn_db::turso::params![
+                row_id,
+                receipt.recipient.kind(),
+                receipt.recipient.id(),
+                receipt.id.as_str()
+            ],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.i64(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// Whether a queued receipt was already carried by a message that told its
+/// recipient about the same row at least as loudly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Coverage {
+    /// Nothing delivered covers it; it is owed.
+    Owed,
+    /// A delivered receipt for the same row and recipient, at a level at
+    /// least this one's: delivering again would repeat that message.
+    Covered(Box<Receipt>),
+    /// Such a receipt is mid-settlement; ask again once it settles.
+    InFlight,
+}
+
+/// Judge `receipt` against the recipient's other receipts for its row. A
+/// louder receipt is never covered by a quieter one: a thread that read a
+/// camp line passively is still woken by the wake it subscribed to.
+pub async fn receipt_coverage(db: &LocalDb, receipt: &Receipt) -> DbResult<Coverage> {
+    let Some(row_id) = receipt.fact_row_id else {
+        return Ok(Coverage::Owed);
+    };
+    let siblings = db
+        .query_all(
+            format!(
+                "SELECT {RECEIPT_COLUMNS} FROM delivery_receipts
+                  WHERE fact_row_id = ?1 AND recipient_kind = ?2 AND recipient_id = ?3
+                    AND id != ?4 AND state IN ('delivering', 'delivered')
+                  ORDER BY created_at, id"
+            ),
+            (
+                row_id,
+                receipt.recipient.kind().to_string(),
+                receipt.recipient.id().to_string(),
+                receipt.id.clone(),
+            ),
+            receipt_from_row,
+        )
+        .await?;
+    let mut in_flight = false;
+    for sibling in siblings {
+        if sibling.level < receipt.level {
+            continue;
+        }
+        if sibling.state == receipt_state::DELIVERED {
+            return Ok(Coverage::Covered(Box::new(sibling)));
+        }
+        in_flight = true;
+    }
+    Ok(if in_flight {
+        Coverage::InFlight
+    } else {
+        Coverage::Owed
+    })
 }
 
 /// Bind a receipt to the coalesced wake that will carry it.
@@ -1276,6 +1405,44 @@ pub async fn bind_receipts(db: &LocalDb, receipt_ids: &[String], message_id: &st
     .await
 }
 
+/// Settle a queued receipt that `by`'s message already carried: delivered to
+/// whatever `by` was delivered to, in that message, noting which receipt
+/// covered it. Nothing is invented for a value `by` does not hold.
+pub async fn settle_covered_receipt(db: &LocalDb, receipt_id: &str, by: &Receipt) -> DbResult<()> {
+    let now = receipt_now_ms();
+    db.execute(
+        "UPDATE delivery_receipts
+            SET state = 'delivered', delivered_job_id = ?2, message_id = ?3,
+                last_refusal = ?4, updated_at = ?5, settled_at = ?5
+          WHERE id = ?1 AND state = 'queued'",
+        cairn_db::turso::params![
+            receipt_id.to_string(),
+            by.delivered_job_id.clone(),
+            by.message_id.clone(),
+            format!("carried by receipt {}", by.id),
+            now
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Return receipts a settlement bound but whose delivery was refused (nothing
+/// was written) to `queued`, so a receipt that waits out the refusal is owed
+/// again rather than bound to a message that will never exist.
+pub async fn unbind_receipts(db: &LocalDb, receipt_ids: &[String]) -> DbResult<()> {
+    let now = receipt_now_ms();
+    for id in receipt_ids {
+        db.execute(
+            "UPDATE delivery_receipts SET state = 'queued', message_id = NULL, updated_at = ?2
+              WHERE id = ?1 AND state = 'delivering'",
+            cairn_db::turso::params![id.clone(), now],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Mark receipts `delivered` inside the settlement's own transaction.
 pub async fn settle_receipts_conn(
     conn: &crate::storage::TrackedConnection,
@@ -1342,9 +1509,9 @@ pub fn delivery_message_id(
 /// it as held.
 pub const RECEIPT_OVERDUE_MS: i64 = 10 * 60_000;
 
-/// Queued receipts of `recipient` older than `older_than_ms`: what a drain
-/// has held past its bound, shown on the recipient's `/wakes` so nothing
-/// waits invisibly.
+/// Queued receipts of `recipient` older than `older_than_ms`, or that a drain
+/// attempt already refused: what is held, shown on the recipient's `/wakes`
+/// so nothing waits invisibly.
 pub async fn overdue_receipts(
     db: &LocalDb,
     recipient: &super::recipients::StableRecipient,
@@ -1354,13 +1521,40 @@ pub async fn overdue_receipts(
         format!(
             "SELECT {RECEIPT_COLUMNS} FROM delivery_receipts
               WHERE recipient_kind = ?1 AND recipient_id = ?2 AND state = 'queued'
-                AND created_at < ?3
+                AND (created_at < ?3 OR last_refusal IS NOT NULL)
               ORDER BY created_at, id"
         ),
         (
             recipient.kind().to_string(),
             recipient.id().to_string(),
             older_than_ms,
+        ),
+        receipt_from_row,
+    )
+    .await
+}
+
+/// `recipient`'s receipts under `key_prefix` dropped since `since_ms`, newest
+/// first: what a recipient was owed and will now never receive, kept visible
+/// on its `/wakes` for a while after the drop.
+pub async fn dropped_receipts(
+    db: &LocalDb,
+    recipient: &super::recipients::StableRecipient,
+    key_prefix: &str,
+    since_ms: i64,
+) -> DbResult<Vec<Receipt>> {
+    db.query_all(
+        format!(
+            "SELECT {RECEIPT_COLUMNS} FROM delivery_receipts
+              WHERE recipient_kind = ?1 AND recipient_id = ?2 AND state = 'dropped'
+                AND substr(fact_key, 1, length(?3)) = ?3 AND settled_at >= ?4
+              ORDER BY settled_at DESC, id"
+        ),
+        (
+            recipient.kind().to_string(),
+            recipient.id().to_string(),
+            key_prefix.to_string(),
+            since_ms,
         ),
         receipt_from_row,
     )

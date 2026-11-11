@@ -2477,12 +2477,15 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
 /// a table here; `cairn_vcs::history::contains` has its own store tests.
 mod rebuild {
     use super::*;
+    use crate::orchestrator::build_change::BuildChange;
     use futures_util::future::BoxFuture;
     use std::time::Duration;
 
     const TARGET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const CONTAINING: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const OLDER: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const WAKE_LINE: &str = "From camp base (your role: wake \u{2014} rebuild subscription): Cairn was rebuilt: 0.13.8 (content-v1:test) \u{2192} 0.13.9 (content-v2:test)";
+    const BASE_CAMP: &str = "cairn://p/cairn/camps/base";
 
     /// `CONTAINING` contains `TARGET`; nothing else contains anything.
     struct Graph;
@@ -2506,6 +2509,21 @@ mod rebuild {
             version: "0.13.9".to_string(),
             build_id: "content-v2:test".to_string(),
             source_commit: source_commit.map(str::to_string),
+            build_change: None,
+        }
+    }
+
+    /// A containing boot that changed builds, so it owes base camps a notice.
+    fn rebuilt_boot() -> RunnerBoot {
+        RunnerBoot {
+            build_change: Some(BuildChange {
+                from_version: "0.13.8".to_string(),
+                from_build_id: "content-v1:test".to_string(),
+                to_version: "0.13.9".to_string(),
+                to_build_id: "content-v2:test".to_string(),
+                booted_at: 1_800_000_000,
+            }),
+            ..boot(Some(CONTAINING))
         }
     }
 
@@ -2513,10 +2531,14 @@ mod rebuild {
         RebuildClause::new(RebuildTarget::parse(TARGET).unwrap(), "p")
     }
 
-    async fn pass(orch: &Orchestrator, commit: Option<&str>) -> RebuildPass {
-        evaluate_rebuild_wakes(orch, &boot(commit), &Graph, Duration::ZERO)
+    async fn pass_on(orch: &Orchestrator, boot: &RunnerBoot) -> RebuildPass {
+        evaluate_rebuild_wakes(orch, boot, &Graph, Duration::ZERO)
             .await
             .unwrap()
+    }
+
+    async fn pass(orch: &Orchestrator, commit: Option<&str>) -> RebuildPass {
+        pass_on(orch, &boot(commit)).await
     }
 
     async fn armed(orch: &Orchestrator, job_id: &str) -> usize {
@@ -2528,7 +2550,9 @@ mod rebuild {
             .count()
     }
 
+    /// The direct messages a run holds once the fact log's drain has run.
     async fn delivered(orch: &Orchestrator, run_id: &str) -> Vec<String> {
+        crate::routes::drain_fact_log(orch).await;
         orch.db
             .local
             .query_all(
@@ -2647,12 +2671,22 @@ mod rebuild {
         assert_eq!(
             pass(&orch, Some(CONTAINING)).await,
             RebuildPass {
-                delivered: 1,
+                fired: 1,
                 ..RebuildPass::default()
             }
         );
+        assert_eq!(
+            armed(&orch, fixture.job_id).await,
+            0,
+            "the firing spends it as its receipt is written"
+        );
         let messages = delivered(&orch, fixture.run_id).await;
         assert_eq!(messages.len(), 1);
+        assert!(
+            !messages[0].starts_with("From camp"),
+            "a boot with no camp fact is not framed as one: {}",
+            messages[0]
+        );
         for fact in [
             "booted with a build that contains",
             TARGET,
@@ -2757,7 +2791,7 @@ mod rebuild {
             1,
             "merged, but this boot does not contain the merge commit"
         );
-        assert_eq!(pass(&orch, Some(CONTAINING)).await.delivered, 1);
+        assert_eq!(pass(&orch, Some(CONTAINING)).await.fired, 1);
         let messages = delivered(&orch, fixture.run_id).await;
         assert!(
             messages[0].contains(&format!("cairn://p/p/2 (merged as `{TARGET}`)")),
@@ -2766,8 +2800,12 @@ mod rebuild {
         );
     }
 
+    /// (e) A closed thread cannot take the wake now. The firing is still
+    /// written and the subscription spent, so no later boot fires it again;
+    /// the receipt waits, listed on the thread's `/wakes`, and is delivered
+    /// once the thread reopens, and never again.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_closed_thread_takes_none_and_keeps_its_wake_armed() {
+    async fn a_closed_thread_s_firing_waits_queued_and_is_delivered_once_on_reopen() {
         let db = migrated_db().await;
         db.execute_script(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
@@ -2782,28 +2820,517 @@ mod rebuild {
             .await
             .unwrap();
         super::seed_run(&db, &job_id).await;
+        let run_id = format!("{job_id}-run");
         let orch = queueable_orchestrator(db);
         subscribe_rebuild_once(&orch, &job_id, &commit_clause(), "agent", None, &Graph)
             .await
             .unwrap();
 
         set_thread_status(&orch.db.local, "closed").await;
+        assert_eq!(pass(&orch, Some(CONTAINING)).await.fired, 1);
+        assert_eq!(armed(&orch, &job_id).await, 0, "never re-armed");
+        let now = || chrono::Utc::now().timestamp_millis();
         assert_eq!(
-            pass(&orch, Some(CONTAINING)).await,
-            RebuildPass {
-                held: 1,
-                ..RebuildPass::default()
-            },
-            "a closed thread is not a deliverable recipient"
+            crate::routes::flush_due_wakes(&orch, now()).await.unwrap(),
+            1
         );
+        assert!(delivered_now(&orch, &run_id).await.is_empty());
         assert_eq!(
-            armed(&orch, &job_id).await,
-            1,
-            "and the drop spends nothing"
+            crate::routes::flush_due_wakes(&orch, now()).await.unwrap(),
+            0,
+            "held, it is parked until its horizon, not polled"
+        );
+        let parked = orch
+            .db
+            .local
+            .query_opt_i64(
+                "SELECT deliver_after FROM fact_log_wakes WHERE delivered_at IS NULL",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            parked >= now() + crate::routes::HELD_HORIZON_MS - 60_000,
+            "{parked}"
+        );
+        let thread = cairn_attention::wakes::StableRecipient::Thread("thread".into());
+        let held = cairn_attention::wakes::overdue_receipts(
+            &orch.db.local,
+            &thread,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.len(), 1, "the held firing is visible on /wakes");
+        assert!(held[0].fact_key.starts_with(REBUILD_WAKE_KEY_PREFIX));
+        assert_eq!(
+            held[0].last_refusal.as_deref(),
+            Some("the thread is closed")
         );
 
-        set_thread_status(&orch.db.local, "active").await;
-        assert_eq!(pass(&orch, Some(CONTAINING)).await.delivered, 1);
-        assert_eq!(armed(&orch, &job_id).await, 0);
+        reopen(&orch, "thread").await;
+        assert_eq!(pass(&orch, Some(CONTAINING)).await, RebuildPass::default());
+        assert_eq!(
+            crate::routes::flush_due_wakes(&orch, now()).await.unwrap(),
+            1,
+            "reopening re-arms the held wake"
+        );
+        let messages = delivered_now(&orch, &run_id).await;
+        assert_eq!(messages.len(), 1, "delivered once it can be");
+        assert!(messages[0].contains("booted with a build that contains"));
+        crate::storage::recover_fact_log(&orch.db.local, i64::MAX / 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(delivered(&orch, &run_id).await.len(), 1, "and never again");
+    }
+
+    /// The direct messages a run holds now, without draining.
+    async fn delivered_now(orch: &Orchestrator, run_id: &str) -> Vec<String> {
+        orch.db
+            .local
+            .query_all(
+                "SELECT content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                params![run_id],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn reopen(orch: &Orchestrator, thread_id: &str) {
+        crate::threads::crud::update_with_lifecycle(
+            orch,
+            &orch.db.local,
+            crate::models::UpdateThread {
+                id: thread_id.to_string(),
+                name: None,
+                jurisdiction: None,
+                definition: None,
+                status: Some(crate::models::ThreadStatus::Active),
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A held firing whose thread never reopens is dropped at the horizon,
+    /// with its reason kept on the thread's `/wakes`, and never delivered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_firing_is_dropped_at_its_horizon_and_stays_listed() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p','w','P','P','/tmp',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES('thread','p','general','active','none',1,1);",
+        )
+        .await
+        .unwrap();
+        let job_id = crate::threads::ensure_thread_session(&db, "thread")
+            .await
+            .unwrap();
+        super::seed_run(&db, &job_id).await;
+        let run_id = format!("{job_id}-run");
+        let orch = queueable_orchestrator(db);
+        subscribe_rebuild_once(&orch, &job_id, &commit_clause(), "agent", None, &Graph)
+            .await
+            .unwrap();
+        set_thread_status(&orch.db.local, "closed").await;
+        assert_eq!(pass(&orch, Some(CONTAINING)).await.fired, 1);
+        let now = || chrono::Utc::now().timestamp_millis();
+        crate::routes::flush_due_wakes(&orch, now()).await.unwrap();
+
+        // The horizon passes with the thread still closed.
+        orch.db
+            .local
+            .execute_batch(&format!(
+                "UPDATE delivery_receipts SET created_at = created_at - {};
+                 UPDATE fact_log_wakes SET deliver_after = 0 WHERE delivered_at IS NULL;",
+                crate::routes::HELD_HORIZON_MS + 1_000
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::routes::flush_due_wakes(&orch, now()).await.unwrap(),
+            1
+        );
+        let (state, why) = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT state, last_refusal FROM delivery_receipts",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, "dropped");
+        assert_eq!(
+            why.as_deref(),
+            Some("held 7 days and never deliverable (the thread is closed); dropped")
+        );
+        let listed = cairn_attention::wakes::dropped_receipts(
+            &orch.db.local,
+            &cairn_attention::wakes::StableRecipient::Thread("thread".into()),
+            REBUILD_WAKE_KEY_PREFIX,
+            now() - crate::routes::HELD_HORIZON_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.len(), 1, "the drop stays visible on /wakes");
+
+        reopen(&orch, "thread").await;
+        assert!(
+            delivered(&orch, &run_id).await.is_empty(),
+            "never delivered"
+        );
+    }
+
+    /// Base camp with a `watch` participant, thread `n0`, beside the routes
+    /// fixture's thread `t` (base camp's lead). The project took no turns, so
+    /// it is outside the rebuild announcement's activity window.
+    async fn camp_fixture(temp: &std::path::Path) -> (Orchestrator, Arc<LocalDb>) {
+        let (orch, db) = crate::routes::fixture::orchestrator(temp, &[]).await;
+        db.execute_batch(
+            "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('n0','p','n0','active',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('n0-job','n0','p','running','thread',1,1);
+             INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('n0-run','n0-job','running',1,1);",
+        )
+        .await
+        .unwrap();
+        db.ensure_base_camp("p", "t", 1).await.unwrap();
+        (orch, db)
+    }
+
+    fn camp_clause() -> RebuildClause {
+        RebuildClause::new(RebuildTarget::parse(TARGET).unwrap(), "cairn")
+    }
+
+    async fn told(db: &LocalDb, run: &str) -> Vec<(String, String)> {
+        db.query_all(
+            "SELECT sender_name, content FROM messages WHERE recipient_run_id = ?1 ORDER BY rowid",
+            params![run],
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// How each wake owed to `n0` was delivered: (level, action).
+    async fn n0_wakes(db: &LocalDb) -> Vec<(String, Option<String>)> {
+        db.query_all(
+            "SELECT level, delivered_action FROM fact_log_wakes WHERE recipient_key = 'thread:n0' ORDER BY id",
+            (),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn count(db: &LocalDb, sql: &str) -> i64 {
+        db.query_opt_i64(sql, ()).await.unwrap().unwrap_or_default()
+    }
+
+    /// (d) Nothing more after delivery: a later boot finds nothing pending,
+    /// a repeated evaluator pass fires nothing, a restart's recovery delivers
+    /// nothing, and a firing re-attempted for the same subscription is
+    /// refused by its receipt.
+    async fn nothing_more_for_n0(orch: &Orchestrator, db: &LocalDb, subscription_id: &str) {
+        assert_eq!(pass_on(orch, &rebuilt_boot()).await, RebuildPass::default());
+        crate::storage::recover_fact_log(db, i64::MAX / 2, 0)
+            .await
+            .unwrap();
+        crate::routes::drain_fact_log(orch).await;
+        db.execute(
+            "INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, fact_kinds_json, state, created_by, created_at, updated_at, one_shot)
+             VALUES(?1, 'n0-job', ?2, ?3, ?4, 'active', 'agent', 1, 1, 1)",
+            params![
+                subscription_id,
+                SOURCE_KIND_FACT,
+                camp_clause().clause_ref().unwrap(),
+                fact_kinds_json(Some(&[RUNNER_BOOTED.to_string()]))
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pass_on(orch, &rebuilt_boot()).await,
+            RebuildPass::default(),
+            "the unique firing key refuses a second receipt"
+        );
+        crate::routes::drain_fact_log(orch).await;
+        assert_eq!(told(db, "n0-run").await.len(), 1, "nothing more");
+    }
+
+    async fn subscribe_n0(orch: &Orchestrator, boot: Option<&RunnerBoot>) -> String {
+        let outcome = subscribe_rebuild_once(orch, "n0-job", &camp_clause(), "agent", boot, &Graph)
+            .await
+            .unwrap();
+        if boot.is_none() {
+            assert_eq!(outcome, RebuildSubscribeOutcome::NoBootRecorded);
+        }
+        let db = orch.db.local.clone();
+        db.query_opt_text(
+            "SELECT fact_key FROM delivery_receipts WHERE fact_key LIKE 'rebuild-wake:%'
+             UNION ALL SELECT ?1 || id FROM wake_subscriptions WHERE job_id = 'n0-job' AND one_shot = 1",
+            params![REBUILD_WAKE_KEY_PREFIX],
+        )
+        .await
+        .unwrap()
+        .and_then(|key| key.strip_prefix(REBUILD_WAKE_KEY_PREFIX).map(str::to_owned))
+        .expect("the subscription or its firing")
+    }
+
+    /// (a) A boot firing for a base-camp `watch` participant is one message at
+    /// wake, framed by camp, when the camp fact was indexed first.
+    #[tokio::test]
+    async fn a_boot_firing_beside_an_indexed_camp_fact_is_one_camp_message_at_wake() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = camp_fixture(temp.path()).await;
+        let subscription = subscribe_n0(&orch, None).await;
+        let change = rebuilt_boot().build_change.unwrap();
+        crate::orchestrator::build_change::announce_project(&orch, &change, "p", "cairn")
+            .await
+            .unwrap()
+            .expect("the notice is new");
+        crate::routes::index_pass(&orch, &crate::routes::EventLogPolicy::default())
+            .await
+            .unwrap();
+
+        assert_eq!(pass_on(&orch, &rebuilt_boot()).await.fired, 1);
+        crate::routes::drain_fact_log(&orch).await;
+        let messages = told(&db, "n0-run").await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].0, BASE_CAMP);
+        assert!(messages[0].1.starts_with(WAKE_LINE), "{}", messages[0].1);
+        assert_eq!(
+            n0_wakes(&db).await,
+            [("wake".to_string(), Some("delivered".to_string()))]
+        );
+        nothing_more_for_n0(&orch, &db, &subscription).await;
+    }
+
+    /// (a) The other write order, delivered before the camp fact is even
+    /// indexed, and (f) a project outside the activity window still gets its
+    /// fact: the firing mints it.
+    #[tokio::test]
+    async fn a_boot_firing_delivered_before_its_camp_fact_is_indexed_is_still_one_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = camp_fixture(temp.path()).await;
+        let subscription = subscribe_n0(&orch, None).await;
+
+        assert_eq!(pass_on(&orch, &rebuilt_boot()).await.fired, 1);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'camp_notice'"
+            )
+            .await,
+            1,
+            "the subscriber's project is told though it took no turns"
+        );
+        crate::routes::flush_due_wakes(&orch, i64::MAX)
+            .await
+            .unwrap();
+        crate::routes::drain_fact_log(&orch).await;
+        let messages = told(&db, "n0-run").await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].1.starts_with(WAKE_LINE), "{}", messages[0].1);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM delivery_receipts WHERE recipient_id = 'n0' AND state = 'delivered'"
+            )
+            .await,
+            2,
+            "the camp fact's receipt was carried by the firing's message"
+        );
+        nothing_more_for_n0(&orch, &db, &subscription).await;
+    }
+
+    /// (b) Subscribing to a target the current boot already contains, after
+    /// the thread read the boot's camp fact passively: one more message, at
+    /// wake, with the camp framing.
+    #[tokio::test]
+    async fn a_subscribe_time_firing_after_a_passive_camp_line_is_one_camp_message_at_wake() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = camp_fixture(temp.path()).await;
+        let change = rebuilt_boot().build_change.unwrap();
+        crate::orchestrator::build_change::announce_project(&orch, &change, "p", "cairn")
+            .await
+            .unwrap();
+        crate::routes::drain_fact_log(&orch).await;
+        let passive = told(&db, "n0-run").await;
+        assert_eq!(passive.len(), 1);
+        assert!(
+            passive[0]
+                .1
+                .starts_with("From camp base (your role: watch): Cairn was rebuilt"),
+            "{}",
+            passive[0].1
+        );
+
+        let subscription = subscribe_n0(&orch, Some(&rebuilt_boot())).await;
+        crate::routes::drain_fact_log(&orch).await;
+        let messages = told(&db, "n0-run").await;
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[1].1.starts_with(WAKE_LINE), "{}", messages[1].1);
+        assert_eq!(
+            n0_wakes(&db).await,
+            [
+                ("passive".to_string(), Some("suppressed".to_string())),
+                ("wake".to_string(), Some("delivered".to_string()))
+            ]
+        );
+        let after = told(&db, "n0-run").await.len();
+        assert_eq!(
+            pass_on(&orch, &rebuilt_boot()).await,
+            RebuildPass::default()
+        );
+        crate::storage::recover_fact_log(&db, i64::MAX / 2, 0)
+            .await
+            .unwrap();
+        crate::routes::drain_fact_log(&orch).await;
+        assert_eq!(told(&db, "n0-run").await.len(), after);
+        assert!(!subscription.is_empty());
+    }
+
+    /// (c) Subscribing to an already-contained target on a boot with no camp
+    /// fact: one message at wake, in the firing's own words.
+    #[tokio::test]
+    async fn a_subscribe_time_firing_with_no_camp_fact_is_one_message_in_its_own_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = camp_fixture(temp.path()).await;
+        subscribe_n0(&orch, Some(&boot(Some(CONTAINING)))).await;
+        crate::routes::drain_fact_log(&orch).await;
+        let messages = told(&db, "n0-run").await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].0, "system");
+        assert!(
+            messages[0]
+                .1
+                .starts_with("[Rebuild] The runner's current boot already contains"),
+            "{}",
+            messages[0].1
+        );
+        // The firing's own wake holds the no-row sentinel, and nothing reads
+        // it as a row: no event line, no events range.
+        let sentinel = db
+            .query_opt(
+                "SELECT source, first_row_id, last_row_id FROM fact_log_wakes WHERE recipient_key = 'thread:n0'",
+                (),
+                |row| Ok((row.text(0)?, row.i64(1)?, row.i64(2)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sentinel,
+            (REBUILD_WAKE_SOURCE.to_string(), NO_FACT_ROW, NO_FACT_ROW)
+        );
+        assert!(
+            !messages[0].1.contains("[Event]") && !messages[0].1.contains("events"),
+            "{}",
+            messages[0].1
+        );
+        assert_eq!(
+            n0_wakes(&db).await,
+            [("wake".to_string(), Some("delivered".to_string()))]
+        );
+        assert_eq!(
+            pass_on(&orch, &boot(Some(CONTAINING))).await,
+            RebuildPass::default()
+        );
+        crate::routes::drain_fact_log(&orch).await;
+        assert_eq!(told(&db, "n0-run").await.len(), 1);
+    }
+
+    /// Boot-time firings are paced by the drain: each one's wake comes due a
+    /// spacing after the previous one's.
+    #[tokio::test]
+    async fn boot_firings_come_due_a_spacing_apart() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = camp_fixture(temp.path()).await;
+        subscribe_n0(&orch, None).await;
+        subscribe_rebuild_once(&orch, "watcher", &camp_clause(), "agent", None, &Graph)
+            .await
+            .unwrap();
+        let began = chrono::Utc::now().timestamp_millis();
+        let pass = evaluate_rebuild_wakes(
+            &orch,
+            &boot(Some(CONTAINING)),
+            &Graph,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pass.fired, 2);
+        let due: Vec<i64> = db
+            .query_all(
+                "SELECT deliver_after FROM fact_log_wakes ORDER BY deliver_after",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(due[0] < began + 3_000, "the first is due at once: {due:?}");
+        assert!(
+            due[1] >= began + 3_000,
+            "the second is due a spacing after the pass began: {due:?}"
+        );
+    }
+
+    /// The single-fact pin, extended to the rebuild notice and its firings:
+    /// however many threads wait on a rebuild, the boot is one base-camp fact
+    /// row, and each waiting thread gets exactly one message, at wake.
+    #[tokio::test]
+    async fn a_rebuild_is_one_camp_fact_beside_its_firings_at_any_size() {
+        for threads in [1usize, 3, 25] {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+            let mut seed = String::new();
+            for n in 0..threads {
+                seed.push_str(&format!(
+                    "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('n{n}','p','n{n}','active',1,1);
+                     INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('n{n}-job','n{n}','p','running','thread',1,1);
+                     INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('n{n}-run','n{n}-job','running',1,1);"
+                ));
+            }
+            db.execute_batch(&seed).await.unwrap();
+            db.ensure_base_camp("p", "t", 1).await.unwrap();
+            for n in 0..threads {
+                subscribe_rebuild_once(
+                    &orch,
+                    &format!("n{n}-job"),
+                    &camp_clause(),
+                    "agent",
+                    None,
+                    &Graph,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(pass_on(&orch, &rebuilt_boot()).await.fired, threads);
+            crate::routes::drain_fact_log(&orch).await;
+            assert_eq!(
+                count(
+                    &db,
+                    "SELECT COUNT(*) FROM fact_log WHERE source = 'camp_notice'"
+                )
+                .await,
+                1,
+                "{threads} threads"
+            );
+            for n in 0..threads {
+                let messages = told(&db, &format!("n{n}-run")).await;
+                assert_eq!(messages.len(), 1, "n{n} of {threads}: {messages:?}");
+                assert!(messages[0].1.starts_with(WAKE_LINE), "{}", messages[0].1);
+            }
+        }
     }
 }

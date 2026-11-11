@@ -193,16 +193,18 @@ fn within(content: &str, bound: Option<usize>, uri: &str) -> String {
 /// subscriber. [`PostForm`] is the only thing a surface varies.
 pub(crate) fn render_post(post: &Post, context: &PostContext, form: PostForm) -> String {
     let uri = format!("cairn://posts/{}", post.id);
-    let head = format!(
-        "## [{}]({uri})\n\n{}\n\n- Author: {}\n",
-        post.title.as_deref().unwrap_or("Untitled"),
-        within(&post.content, form.bound(), &uri),
-        context.author(&post.author, &post.appearance),
-    );
+    let title = post.title.as_deref().unwrap_or("Untitled");
+    let author = context.author(&post.author, &post.appearance);
+    let body = within(&post.content, form.bound(), &uri);
     match form {
-        PostForm::Wake => head,
+        // Handed to a recipient who did not go looking: the author's words,
+        // attributed and quoted, so they never read as the deliverer's.
+        PostForm::Wake => format!(
+            "[{title}]({uri})\n\n{}\n",
+            cairn_attention::message_render::render_quoted_authored(&author, &body)
+        ),
         PostForm::Read => format!(
-            "{head}- Scope: {}\n- Created: {}\n",
+            "## [{title}]({uri})\n\n{body}\n\n- Author: {author}\n- Scope: {}\n- Created: {}\n",
             context.scope(post.project_id.as_deref(), post.camp_id.as_deref()),
             crate::clock::age(post.created_at)
         ),
@@ -217,16 +219,17 @@ pub(crate) fn render_comment(
     form: PostForm,
 ) -> String {
     let uri = format!("cairn://posts/{}", comment.post_id);
-    let head = format!(
-        "### Comment {}\n\n{}\n\n- Author: {}\n",
-        comment.id,
-        within(&comment.content, form.bound(), &uri),
-        context.author(&comment.author, &comment.appearance),
-    );
+    let author = context.author(&comment.author, &comment.appearance);
+    let body = within(&comment.content, form.bound(), &uri);
     match form {
-        PostForm::Wake => head,
+        PostForm::Wake => format!(
+            "Comment {}\n\n{}\n",
+            comment.id,
+            cairn_attention::message_render::render_quoted_authored(&author, &body)
+        ),
         PostForm::Read => format!(
-            "{head}- Created: {}\n- Parent: {uri}\n",
+            "### Comment {}\n\n{body}\n\n- Author: {author}\n- Created: {}\n- Parent: {uri}\n",
+            comment.id,
             crate::clock::age(comment.created_at)
         ),
     }

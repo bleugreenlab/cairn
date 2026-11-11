@@ -800,17 +800,38 @@ async fn render_held_receipts(db: &LocalDb, job_id: &str) -> String {
         return String::new();
     };
     let now = chrono::Utc::now().timestamp_millis();
-    let held = match cairn_attention::wakes::overdue_receipts(
+    let held = cairn_attention::wakes::overdue_receipts(
         db,
         &recipient,
         now - cairn_attention::wakes::RECEIPT_OVERDUE_MS,
     )
     .await
-    {
-        Ok(held) if !held.is_empty() => held,
-        _ => return String::new(),
-    };
-    let mut out = String::from("## Held deliveries\n\nOwed to you and not yet delivered:\n\n");
+    .unwrap_or_default();
+    // A held firing dropped at its horizon stays listed for as long again.
+    let dropped = cairn_attention::wakes::dropped_receipts(
+        db,
+        &recipient,
+        crate::orchestrator::wakes::REBUILD_WAKE_KEY_PREFIX,
+        now - crate::routes::HELD_HORIZON_MS,
+    )
+    .await
+    .unwrap_or_default();
+    let mut out = String::new();
+    if !dropped.is_empty() {
+        out.push_str("## Dropped deliveries\n\nOwed to you and given up on:\n\n");
+        for receipt in &dropped {
+            out.push_str(&format!(
+                "- `{}`: {}\n",
+                receipt.fact_key,
+                receipt.last_refusal.as_deref().unwrap_or("dropped")
+            ));
+        }
+        out.push('\n');
+    }
+    if held.is_empty() {
+        return out;
+    }
+    out.push_str("## Held deliveries\n\nOwed to you and not yet delivered:\n\n");
     for receipt in held {
         let reasons = receipt
             .reasons

@@ -22,8 +22,9 @@
 //! unique per (fact, recipient), and the row is folded into that recipient's
 //! pending wake for the source (`fact_log_wakes`) in the same transaction.
 //! Wakes are **coalesced**: the tick delivers a wake once its settle window
-//! closes, so a 30-file commit is one wake carrying a count and an id range,
-//! not 30. The session a wake lands on is resolved at delivery.
+//! closes, so a 30-file commit is one wake, not 30, rendered from its
+//! receipts as one line per fact (bounded, the rest counted and pointed at).
+//! The session a wake lands on is resolved at delivery.
 //!
 //! Route dispatch is at-most-once: a row the runner was dispatching when it
 //! stopped becomes `interrupted` on restart and is never re-fired. Indexing
@@ -38,19 +39,21 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use cairn_attention::message_render::{render_camp_line, render_wake_lines};
 use cairn_attention::push::Wake;
 use cairn_attention::runtime::{DeliveryOutcome, DeliveryRequest};
 use cairn_attention::wakes::{
-    receipt_state, Admission, Candidate, DeferUntil, FactAudience, NewReceipt, Reason,
-    ReceiptWrite, SourceRef, StableRecipient,
+    receipt_state, Admission, Candidate, Coverage, DeferUntil, FactAudience, NewReceipt, Reason,
+    Receipt, ReceiptWrite, SourceRef, StableRecipient,
 };
 
 use super::log::{clauses_need_hydration, hydrate, stored_fact, Hydrated};
 use super::{matches, Audience, Fact, FactRegistry, RouteContext};
 use crate::models::DeliveryUrgency;
 use crate::orchestrator::wakes::{
-    Addressed, MutedDelivery, WakeSubscriptionState, ADDRESSED_FACT_REF_PREFIX,
-    CAMP_WATCH_FACT_REF_PREFIX, SOURCE_KIND_FACT,
+    render_rebuild_firing, Addressed, MutedDelivery, WakeSubscriptionState,
+    ADDRESSED_FACT_REF_PREFIX, CAMP_WATCH_FACT_REF_PREFIX, REBUILD_WAKE_KEY_PREFIX,
+    REBUILD_WAKE_ROLE, SOURCE_KIND_FACT,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{route_state, FactRow, FactWake, WakeMatch, WakeWindow};
@@ -687,22 +690,6 @@ fn wake_clause(
 /// reached at, so the delivered line can say which camp it came from and why.
 const CAMP_ROLE_SEPARATOR: &str = "@";
 
-/// The camp a delivered wake came through and the role it reached its
-/// recipient at, read back from the clause ref the index lane wrote.
-fn camp_delivery<'a>(clause_ref: &'a str, row: &FactRow) -> Option<(String, &'a str)> {
-    let rest = clause_ref
-        .strip_prefix(ADDRESSED_FACT_REF_PREFIX)
-        .or_else(|| clause_ref.strip_prefix(CAMP_WATCH_FACT_REF_PREFIX))?;
-    let (path, role) = rest.rsplit_once(CAMP_ROLE_SEPARATOR)?;
-    let field = path.rsplit_once('.')?.1;
-    let fields: HashMap<String, Value> = serde_json::from_str(&row.fields_json).ok()?;
-    let camp = fields.get(field)?.as_str()?;
-    match cairn_uri::parse_uri(camp)? {
-        cairn_uri::CairnResource::ProjectCamp { slug, .. } => Some((slug, role)),
-        _ => None,
-    }
-}
-
 /// The recipients whose own write a row is: the job that minted it, and the
 /// home the source's declared actor field names. Both are stable recipients,
 /// so a thread that rotated sessions between mint and indexing is not handed
@@ -783,6 +770,7 @@ async fn fold_wake(
         candidate,
         project_id: row.project_id.as_deref(),
         fact_row_id: Some(row.id),
+        fact_json: None,
     };
     let (action, wake) =
         match cairn_attention::wakes::queue_fact_receipt(&orch.db.local, &new, &matched, window)
@@ -909,6 +897,96 @@ pub(crate) async fn flush_due_wakes_with(
 /// How long a wake the recipient could not take waits before the next
 /// attempt.
 const WAKE_RETRY_MS: i64 = 30_000;
+
+/// How long a receipt is held across a reversible refusal before it is
+/// dropped. A held receipt is not polled: its wake is parked until the
+/// horizon and brought due by the reversal itself ([`rearm_held_wakes`], on a
+/// thread reopening). At the horizon it gets one last attempt, and a recipient
+/// still not deliverable then drops it, the drop listed on its `/wakes`.
+pub(crate) const HELD_HORIZON_MS: i64 = 7 * 24 * 60 * 60_000;
+
+/// Bring due now the pending wakes that carry `recipient`'s held receipts: the
+/// reversal they wait for (a thread reopened) has happened.
+pub(crate) async fn rearm_held_wakes(orch: &Orchestrator, recipient: &StableRecipient) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let rearmed = orch
+        .db
+        .local
+        .execute(
+            "UPDATE fact_log_wakes SET deliver_after = MIN(deliver_after, ?3)
+              WHERE delivered_at IS NULL AND id IN (
+                SELECT wake_id FROM delivery_receipts
+                 WHERE recipient_kind = ?1 AND recipient_id = ?2 AND state = 'queued'
+                   AND last_refusal IS NOT NULL AND wake_id IS NOT NULL)",
+            cairn_db::turso::params![recipient.kind(), recipient.id(), now],
+        )
+        .await;
+    match rearmed {
+        Ok(0) => {}
+        Ok(_) => orch.fact_log.notify.notify_one(),
+        Err(error) => log::warn!(
+            "could not re-arm held wakes of {}: {error}",
+            recipient.key()
+        ),
+    }
+}
+
+/// Whether a receipt waits out a reversible refusal instead of being dropped:
+/// a one-shot subscription's firing, which a closed thread keeps until it
+/// reopens. Every other fact a closed recipient was owed is not resurrected.
+fn waits_out_refusal(receipt: &Receipt) -> bool {
+    receipt.fact_key.starts_with(REBUILD_WAKE_KEY_PREFIX)
+}
+
+/// Refuse a wake's receipts: those that wait out a reversible refusal stay
+/// queued with the reason (listed on the recipient's `/wakes`) and the wake is
+/// asked again later, up to [`HELD_HORIZON_MS`]; every other receipt, and a
+/// held one past the horizon, is dropped and never resurrected.
+async fn refuse(
+    db: &crate::storage::LocalDb,
+    receipts: &[Receipt],
+    why: &str,
+    reversible: bool,
+    job_id: Option<String>,
+) -> WakeSettlement {
+    let now = chrono::Utc::now().timestamp_millis();
+    let (held, dropped): (Vec<&Receipt>, Vec<&Receipt>) = receipts
+        .iter()
+        .partition(|receipt| reversible && waits_out_refusal(receipt));
+    let (held, expired): (Vec<&Receipt>, Vec<&Receipt>) = held
+        .into_iter()
+        .partition(|receipt| now.saturating_sub(receipt.created_at) < HELD_HORIZON_MS);
+    let ids = |receipts: &[&Receipt]| -> Vec<String> {
+        receipts.iter().map(|receipt| receipt.id.clone()).collect()
+    };
+    let _ = cairn_attention::wakes::close_receipts(db, &ids(&dropped), receipt_state::DROPPED, why)
+        .await;
+    if !expired.is_empty() {
+        let expired = ids(&expired);
+        let _ = cairn_attention::wakes::unbind_receipts(db, &expired).await;
+        let reason = format!(
+            "held {} days and never deliverable ({why}); dropped",
+            HELD_HORIZON_MS / (24 * 60 * 60_000)
+        );
+        let _ =
+            cairn_attention::wakes::close_receipts(db, &expired, receipt_state::DROPPED, &reason)
+                .await;
+    }
+    if held.is_empty() {
+        return finished("dropped", job_id);
+    }
+    // Parked until the first held receipt's horizon, unless the reversal
+    // re-arms it sooner.
+    let horizon = held
+        .iter()
+        .map(|receipt| receipt.created_at.saturating_add(HELD_HORIZON_MS))
+        .min()
+        .unwrap_or(now);
+    let held = ids(&held);
+    let _ = cairn_attention::wakes::unbind_receipts(db, &held).await;
+    let _ = cairn_attention::wakes::note_receipt_refusal(db, &held, why).await;
+    WakeSettlement::Requeued { at_ms: horizon }
+}
 
 /// What delivering one claimed wake left it as.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1041,6 +1119,32 @@ async fn deliver_wake(
     if owed.is_empty() {
         return finished("withdrawn", None);
     }
+    // A receipt for a row this recipient was already told about at least as
+    // loudly (a firing delivered beside its camp fact, then the camp fact
+    // indexed) was carried by that message; it is settled, not sent again.
+    let mut uncovered = Vec::with_capacity(owed.len());
+    for receipt in owed {
+        match cairn_attention::wakes::receipt_coverage(db, &receipt).await {
+            Ok(Coverage::Owed) => uncovered.push(receipt),
+            Ok(Coverage::Covered(by)) => {
+                let _ = cairn_attention::wakes::settle_covered_receipt(db, &receipt.id, &by).await;
+            }
+            // The sibling is bound to its message; a failed settlement keeps
+            // it bound and retries at the wake retry, so ask no sooner.
+            Ok(Coverage::InFlight) => return retry,
+            Err(error) => {
+                log::warn!(
+                    "wake {}: could not judge a receipt's coverage: {error}",
+                    wake.id
+                );
+                return retry;
+            }
+        }
+    }
+    let owed = uncovered;
+    if owed.is_empty() {
+        return finished("delivered", wake.job_id.clone());
+    }
     let ids: Vec<String> = owed.iter().map(|receipt| receipt.id.clone()).collect();
     let level = owed
         .iter()
@@ -1050,11 +1154,7 @@ async fn deliver_wake(
 
     let job_id = match deliverable_job(orch, &recipient, level.wakes_idle()).await {
         Ok(Ok(job_id)) => job_id,
-        Ok(Err(why)) => {
-            let _ =
-                cairn_attention::wakes::close_receipts(db, &ids, receipt_state::DROPPED, why).await;
-            return finished("dropped", None);
-        }
+        Ok(Err(why)) => return refuse(db, &owed, why.describe(), why.is_reversible(), None).await,
         Err(error) => {
             let _ = cairn_attention::wakes::note_receipt_refusal(db, &ids, &error).await;
             return retry;
@@ -1065,14 +1165,12 @@ async fn deliver_wake(
         .unwrap_or_else(|_| db.clone());
     match crate::messages::delivery::delivery_refusal(&owning, &job_id).await {
         Ok(Some(refusal)) => {
-            let _ = cairn_attention::wakes::close_receipts(
-                db,
-                &ids,
-                receipt_state::DROPPED,
-                refusal.describe(),
-            )
-            .await;
-            return finished("dropped", Some(job_id));
+            use crate::messages::delivery::DeliveryRefusal;
+            let reversible = !matches!(
+                refusal,
+                DeliveryRefusal::Superseded | DeliveryRefusal::WorkflowRuntime
+            );
+            return refuse(db, &owed, refusal.describe(), reversible, Some(job_id)).await;
         }
         Ok(None) => {}
         Err(error) => {
@@ -1081,14 +1179,8 @@ async fn deliver_wake(
         }
     }
     if job_issue_is_resolved(&owning, &job_id).await {
-        let _ = cairn_attention::wakes::close_receipts(
-            db,
-            &ids,
-            receipt_state::DROPPED,
-            "its issue is resolved",
-        )
-        .await;
-        return finished("dropped", Some(job_id));
+        // A resolved issue can reopen, so a firing waits for it.
+        return refuse(db, &owed, "its issue is resolved", true, Some(job_id)).await;
     }
 
     let mut passive_now = false;
@@ -1161,24 +1253,21 @@ async fn send_wake(
     let ids: Vec<String> = bound.iter().map(|receipt| receipt.id.clone()).collect();
     let job_id = match deliverable_job(orch, recipient, level.wakes_idle()).await {
         Ok(Ok(job_id)) => job_id,
-        Ok(Err(why)) => {
-            let _ =
-                cairn_attention::wakes::close_receipts(db, &ids, receipt_state::DROPPED, why).await;
-            return finished("dropped", None);
-        }
+        Ok(Err(why)) => return refuse(db, bound, why.describe(), why.is_reversible(), None).await,
         Err(_) => {
             return WakeSettlement::Requeued {
                 at_ms: now.saturating_add(WAKE_RETRY_MS),
             }
         }
     };
-    let (message, _) = wake_message(orch, wake).await;
+    let text = wake_message(orch, wake, bound).await;
     let urgency = if passive_now {
         DeliveryUrgency::Passive
     } else {
         urgency_for(level)
     };
-    let mut request = DeliveryRequest::new(&job_id, &message, urgency);
+    let mut request = DeliveryRequest::new(&job_id, &text.message, urgency);
+    request.sender = text.sender.as_deref();
     request.message_id = Some(message_id);
     request.receipts = &ids;
     match crate::orchestrator::parent_wake::deliver_direct(orch, request).await {
@@ -1198,11 +1287,10 @@ async fn send_wake(
             };
             finished(action, Some(job_id))
         }
-        DeliveryOutcome::Refused(why) => {
-            let _ = cairn_attention::wakes::close_receipts(db, &ids, receipt_state::DROPPED, &why)
-                .await;
-            finished("dropped", Some(job_id))
-        }
+        // A settlement refusal carries no type to judge reversibility by; the
+        // reversible refusals (a closed thread, no session) were caught by
+        // `deliverable_job`'s typed gate above, so this one is final.
+        DeliveryOutcome::Refused(why) => refuse(db, bound, &why, false, Some(job_id)).await,
         DeliveryOutcome::Failed(why) => {
             log::warn!("wake {} to {}: {why}", wake.id, recipient.key());
             WakeSettlement::Requeued {
@@ -1219,7 +1307,7 @@ async fn deliverable_job(
     orch: &Orchestrator,
     recipient: &StableRecipient,
     establish: bool,
-) -> Result<Result<String, &'static str>, String> {
+) -> Result<Result<String, cairn_attention::wakes::Undeliverable>, String> {
     let db = crate::execution::routing::routing_db_for_id(&orch.db, recipient.id())
         .await
         .map_err(|error| error.to_string())?;
@@ -1290,49 +1378,176 @@ pub(crate) fn wake_deferral(
     None
 }
 
-/// A coalesced wake's message and detail URI: its header, then the writing the
-/// newest row points at when its source carries some.
-async fn wake_message(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
-    let (header, uri) = wake_header(orch, wake).await;
-    match wake_body(orch, wake).await {
-        Some(body) => (format!("{header}\n\n{body}"), uri),
-        None => (header, uri),
-    }
+/// What one wake says, and who says it.
+struct WakeText {
+    message: String,
+    /// The camp's URI when every line is that camp's: the direct is persisted
+    /// from the camp, so every surface leads with its camp line.
+    sender: Option<String>,
 }
 
-/// The content a wake carries inline, rendered from the canonical record the
-/// newest row points at: only that row is certain to be this recipient's
-/// match, since a range can interleave other recipients' rows. One arm per
-/// source whose record is writing a recipient classifies by reading; every
-/// other source's header is its whole message.
-async fn wake_body(orch: &Orchestrator, wake: &FactWake) -> Option<String> {
+/// A wake's message, rendered from the receipts it carries: one line per fact
+/// (a recipient's receipts for one row are one fact, at their loudest), then
+/// the writing the newest post row points at.
+///
+/// A fact a camp reached the recipient through reads as the camp's line, with
+/// the recipient's highest camp reason as its role; a rebuild firing beside
+/// its boot's camp fact reads as that fact with the role
+/// [`REBUILD_WAKE_ROLE`]. A firing with no camp fact reads in its own words,
+/// and any other row as an `[Event]` line. Past
+/// [`cairn_attention::message_render::MAX_WAKE_LINES`] the rest is counted and
+/// pointed at: the camp when one camp said everything, otherwise the events
+/// view holding the wake's rows.
+async fn wake_message(orch: &Orchestrator, wake: &FactWake, receipts: &[Receipt]) -> WakeText {
     use crate::orchestrator::wakes::{POST_COMMENTED, POST_CREATED};
-    if !matches!(wake.source.as_str(), POST_CREATED | POST_COMMENTED) {
-        return None;
-    }
-    let row = crate::storage::get_fact(&orch.db.local, wake.last_row_id)
-        .await
-        .ok()??;
-    crate::orchestrator::wakes::render_post_wake(&orch.db.local, &row.record_ref).await
-}
-
-/// A coalesced wake's header line and detail URI. One row reads as one event,
-/// citing the row; several cite the id range of the events view that holds
-/// them all.
-async fn wake_header(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
-    if wake.count == 1 {
-        if let Ok(Some(row)) = crate::storage::get_fact(&orch.db.local, wake.first_row_id).await {
-            let uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
-            let summary = row.summary.as_deref().unwrap_or(row.identity.as_str());
-            if let Some((camp, role)) = camp_delivery(&wake.clause_ref, &row) {
-                return (
-                    format!("From camp {camp} (your role: {role}): {summary} — {uri}"),
-                    uri,
-                );
-            }
-            return (format!("[Event] {summary} ({}): {uri}", row.source), uri);
+    let mut groups: Vec<(Option<i64>, Vec<&Receipt>)> = Vec::new();
+    for receipt in receipts {
+        let joined = receipt
+            .fact_row_id
+            .and_then(|row| groups.iter().position(|(id, _)| *id == Some(row)));
+        match joined {
+            Some(at) => groups[at].1.push(receipt),
+            None => groups.push((receipt.fact_row_id, vec![receipt])),
         }
     }
+    let mut lines = Vec::with_capacity(groups.len());
+    let mut camps = std::collections::BTreeSet::new();
+    let mut all_camp = !groups.is_empty();
+    let mut backfilled = false;
+    let mut newest_post: Option<FactRow> = None;
+    for (row_id, group) in &groups {
+        backfilled |= group.iter().any(|receipt| {
+            receipt
+                .reasons
+                .iter()
+                .any(|reached| matches!(reached.reason, Reason::Backfilled { .. }))
+        });
+        let firing = group
+            .iter()
+            .find(|receipt| receipt.fact_key.starts_with(REBUILD_WAKE_KEY_PREFIX))
+            .and_then(|receipt| receipt.fact_json.as_deref())
+            .and_then(render_rebuild_firing);
+        let row = match row_id {
+            Some(id) => crate::storage::get_fact(&orch.db.local, *id)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let Some(row) = row else {
+            all_camp = false;
+            lines.push(firing.unwrap_or_else(|| {
+                format!("[Event] {} (no longer in the event log)", group[0].fact_key)
+            }));
+            continue;
+        };
+        let uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
+        let summary = row.summary.as_deref().unwrap_or(row.identity.as_str());
+        let role = match &firing {
+            Some(_) => Some(REBUILD_WAKE_ROLE.to_string()),
+            None => camp_role(group),
+        };
+        match (row_camp(&row), role) {
+            (Some((camp, slug)), Some(role)) => {
+                lines.push(render_camp_line(&slug, &role, summary, &uri));
+                camps.insert(camp);
+            }
+            _ => {
+                all_camp = false;
+                lines.push(
+                    firing.unwrap_or_else(|| format!("[Event] {summary} ({}): {uri}", row.source)),
+                );
+            }
+        }
+        let post = matches!(row.source.as_str(), POST_CREATED | POST_COMMENTED);
+        if post && newest_post.as_ref().is_none_or(|newest| newest.id < row.id) {
+            newest_post = Some(row);
+        }
+    }
+    let camp = (all_camp && camps.len() == 1)
+        .then(|| camps.into_iter().next())
+        .flatten();
+    let more_link = match &camp {
+        Some(camp) => camp.clone(),
+        None => events_range_uri(orch, wake).await,
+    };
+    // A wake pending before receipts carries its rows under one receipt.
+    let hidden = if backfilled {
+        usize::try_from(wake.count)
+            .unwrap_or_default()
+            .saturating_sub(groups.len())
+    } else {
+        0
+    };
+    let mut message = render_wake_lines(&lines, hidden, &more_link);
+    if let Some(row) = newest_post {
+        if let Some(body) =
+            crate::orchestrator::wakes::render_post_wake(&orch.db.local, &row.record_ref).await
+        {
+            message = format!("{message}\n\n{body}");
+        }
+    }
+    WakeText {
+        message,
+        sender: camp,
+    }
+}
+
+/// The camp role a fact's receipts reach the recipient at, when a camp is
+/// what reaches it as loudly as anything: its highest camp reason (`lead`
+/// before `wake` before `confirm` before `watch` at one level). `None` when a
+/// louder route reached it, or a direct address at the same level, so the
+/// line names the route that actually woke it.
+fn camp_role(receipts: &[&Receipt]) -> Option<String> {
+    let reasons = || receipts.iter().flat_map(|receipt| receipt.reasons.iter());
+    let loudest = reasons().map(|reached| reached.level).max()?;
+    let rank = |role: &str| match role {
+        "lead" => 0,
+        "wake" => 1,
+        "confirm" => 2,
+        _ => 3,
+    };
+    let mut best: Option<(Wake, &str)> = None;
+    for reached in reasons() {
+        let role = match &reached.reason {
+            Reason::CampLead { .. } => "lead",
+            Reason::CampRole { role, .. } => role.as_str(),
+            Reason::Addressed { .. } if reached.level == loudest => return None,
+            _ => continue,
+        };
+        let better = best.is_none_or(|(level, held)| {
+            reached.level > level || (reached.level == level && rank(role) < rank(held))
+        });
+        if better {
+            best = Some((reached.level, role));
+        }
+    }
+    let (level, role) = best?;
+    (level == loudest).then(|| role.to_string())
+}
+
+/// The camp a row names, as (canonical URI, slug): its `camp` field, or else
+/// the first camp URI any field holds, a list field (`mentions`) included.
+fn row_camp(row: &FactRow) -> Option<(String, String)> {
+    fn camp_of(value: &Value) -> Option<(String, String)> {
+        if let Value::Array(values) = value {
+            return values.iter().find_map(camp_of);
+        }
+        let uri = value.as_str()?;
+        match cairn_uri::parse_uri(uri)? {
+            cairn_uri::CairnResource::ProjectCamp { slug, .. } => Some((uri.to_string(), slug)),
+            _ => None,
+        }
+    }
+    let fields: BTreeMap<String, Value> = serde_json::from_str(&row.fields_json).ok()?;
+    fields
+        .get("camp")
+        .and_then(camp_of)
+        .or_else(|| fields.values().find_map(camp_of))
+}
+
+/// The events view holding every row a wake folded.
+async fn events_range_uri(orch: &Orchestrator, wake: &FactWake) -> String {
     let project = match wake.project_id.clone() {
         Some(id) => orch
             .db
@@ -1343,24 +1558,13 @@ async fn wake_header(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
             .flatten(),
         None => None,
     };
-    let (events, scope) = match project.as_deref() {
-        Some(key) => (cairn_uri::build_project_events_uri(key), key.to_string()),
-        None => (
-            cairn_uri::build_workspace_events_uri(),
-            "the workspace".to_string(),
-        ),
+    let events = match project.as_deref() {
+        Some(key) => cairn_uri::build_project_events_uri(key),
+        None => cairn_uri::build_workspace_events_uri(),
     };
-    let uri = format!(
+    format!(
         "{events}?source={}&from={}&to={}",
         wake.source, wake.first_row_id, wake.last_row_id
-    );
-    let rows = if wake.count == 1 { "row" } else { "rows" };
-    (
-        format!(
-            "[Event] {} {} {rows} in {scope} (ids {}\u{2013}{}): {uri}",
-            wake.count, wake.source, wake.first_row_id, wake.last_row_id
-        ),
-        uri,
     )
 }
 
@@ -2914,12 +3118,32 @@ mod tests {
                 wake_rows(&db).await,
                 vec![("watcher".to_string(), 20, first, last)]
             );
+            let received = events_received(&db, "watcher-run").await;
             assert_eq!(
-                events_received(&db, "watcher-run").await,
-                vec![format!(
-                    "[Event] 20 github_comment rows in cairn (ids {first}\u{2013}{last}): cairn://p/cairn/events?source=github_comment&from={first}&to={last}"
-                )],
+                received.len(),
+                1,
                 "the thread's session receives the batch once"
+            );
+            let max = cairn_attention::message_render::MAX_WAKE_LINES;
+            let lines: Vec<&str> = received[0].lines().collect();
+            assert_eq!(lines.len(), max + 1, "{}", received[0]);
+            for (n, line) in lines[..max].iter().enumerate() {
+                assert_eq!(
+                    *line,
+                    format!(
+                        "[Event] GitHub mention {n} (github_comment): cairn://p/cairn/events/{}",
+                        ids[n]
+                    ),
+                    "one line per fact"
+                );
+            }
+            assert_eq!(
+                lines[max],
+                format!(
+                    "+{} more \u{2014} cairn://p/cairn/events?source=github_comment&from={first}&to={last}",
+                    20 - max
+                ),
+                "bounded, with the rest counted and pointed at"
             );
 
             let list = crate::resources::events::list(&orch, Some("cairn"), &[]).await;
@@ -3009,10 +3233,16 @@ mod tests {
             assert_eq!(flush_due_wakes(&orch, T0 + 120 * SECOND).await.unwrap(), 2);
             assert_eq!(flush_due_wakes(&orch, i64::MAX).await.unwrap(), 0);
 
-            let (first, last) = (ids[0], ids[4]);
-            let expected = vec![format!(
-                "[Event] 5 github_comment rows in cairn (ids {first}\u{2013}{last}): cairn://p/cairn/events?source=github_comment&from={first}&to={last}"
-            )];
+            let expected = vec![ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| {
+                    format!(
+                        "[Event] GitHub mention {n} (github_comment): cairn://p/cairn/events/{id}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")];
             assert_eq!(
                 events_received(&db, "watcher2-run").await,
                 expected,
@@ -3057,8 +3287,17 @@ mod tests {
             }
             let received = events_received(&db, "watcher-run").await;
             assert_eq!(received.len(), 1);
-            assert!(
-                received[0].starts_with("[Event] 3 github_comment rows"),
+            let mentions: Vec<&str> = received[0]
+                .lines()
+                .map(|line| line.split(" (github_comment)").next().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                mentions,
+                [
+                    "[Event] GitHub mention 1",
+                    "[Event] GitHub mention 3",
+                    "[Event] GitHub mention 5"
+                ],
                 "{received:?}"
             );
         }
@@ -3092,7 +3331,11 @@ mod tests {
             for run in ["watcher-run", "watcher2-run"] {
                 let received = events_received(&db, run).await;
                 assert_eq!(received.len(), 1, "{run}: {received:?}");
-                assert!(received[0].starts_with("[Event] 4 github_comment rows"));
+                assert_eq!(
+                    received[0].lines().count(),
+                    4,
+                    "one line per row: {received:?}"
+                );
             }
         }
     }

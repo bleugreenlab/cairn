@@ -389,6 +389,7 @@ async fn broadcast_receipt(
                         candidate: &candidate,
                         project_id: project_id.as_deref(),
                         fact_row_id: None,
+                        fact_json: None,
                     },
                 )
                 .await

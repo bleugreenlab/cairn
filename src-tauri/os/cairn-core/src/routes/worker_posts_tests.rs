@@ -620,11 +620,19 @@ async fn the_wake_carries_the_writing_and_the_row_holds_no_body() {
         received[0]
     );
     assert!(
-        received[0].contains(&format!("## [Wake legibility]({})", post_uri(&written))),
+        received[0].contains(&format!("[Wake legibility]({})", post_uri(&written))),
         "{}",
         received[0]
     );
-    assert!(received[0].contains("Test post to see if the wake works"));
+    // The author's words travel attributed and quoted, never as the
+    // deliverer's instruction.
+    assert!(
+        received[0].contains("wrote (quoted as written;")
+            && received[0].contains("> Test post to see if the wake works"),
+        "{}",
+        received[0]
+    );
+    assert!(!received[0].contains("follow-up"), "{}", received[0]);
 
     let replies = events_received(&db, "writer-run").await;
     assert_eq!(replies.len(), 1, "{replies:?}");
@@ -634,7 +642,7 @@ async fn the_wake_carries_the_writing_and_the_row_holds_no_body() {
         replies[0]
     );
     assert!(
-        replies[0].contains("A reply worth reading"),
+        replies[0].contains("> A reply worth reading"),
         "{}",
         replies[0]
     );
@@ -804,13 +812,19 @@ async fn two_comments_in_one_window_are_one_wake_carrying_the_newer() {
     );
     let received = events_received(&db, "writer-run").await;
     assert_eq!(received.len(), 1, "{received:?}");
+    let lines: Vec<&str> = received[0].lines().collect();
     assert!(
-        received[0].starts_with("[Event] 2 post_commented rows in cairn"),
-        "{}",
+        lines[0].starts_with("[Event] Comment on Design: first remark (post_commented): ")
+            && lines[1].starts_with("[Event] Comment on Design: second remark (post_commented): "),
+        "one line per comment: {}",
         received[0]
     );
-    assert!(received[0].contains("second remark"), "{}", received[0]);
-    assert!(!received[0].contains("first remark"), "{}", received[0]);
+    assert!(received[0].contains("> second remark"), "{}", received[0]);
+    assert!(
+        !received[0].contains("> first remark"),
+        "only the newer comment's writing is carried: {}",
+        received[0]
+    );
 }
 
 /// A comment has a canonical address of its own, which reads under its post.
@@ -1049,5 +1063,34 @@ async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outrank
             .iter()
             .any(|(job, _)| job == "outsider" || job == "writer"),
         "another project's thread and the writer itself are never reached"
+    );
+
+    // The watch participant reads the camp's line, from the camp, with the
+    // author's words quoted beneath it; the mentioned thread, reached louder
+    // by its mention, reads an event.
+    let (sender, told) = db
+        .query_opt(
+            "SELECT sender_name, content FROM messages WHERE recipient_run_id = 'reader-run' ORDER BY rowid DESC LIMIT 1",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap()
+        .expect("the watch participant was told");
+    assert_eq!(sender, "cairn://p/cairn/camps/base");
+    assert!(
+        told.starts_with("From camp base (your role: watch): Rebuild interface \u{2014} "),
+        "{told}"
+    );
+    assert!(
+        told.contains("> For cairn://p/cairn/camps/base, and cairn://p/cairn/ui specifically."),
+        "{told}"
+    );
+    let mentioned = events_received(&db, "watcher-run").await;
+    assert!(
+        mentioned
+            .iter()
+            .any(|line| line.starts_with("[Event] Rebuild interface (post_created): ")),
+        "{mentioned:?}"
     );
 }

@@ -652,19 +652,19 @@ pub async fn deliverable_job_conn(
     conn: &TrackedConnection,
     recipient: &StableRecipient,
     establish: bool,
-) -> DbResult<Result<String, &'static str>> {
+) -> DbResult<Result<String, Undeliverable>> {
     match recipient {
         StableRecipient::Thread(thread_id) => {
             let active = cairn_db::lineage::thread_status_conn(conn, thread_id)
                 .await?
                 .is_some_and(|status| status.is_active());
             if !active {
-                return Ok(Err("the thread is closed"));
+                return Ok(Err(Undeliverable::ThreadClosed));
             }
             match thread_session_conn(conn, thread_id).await? {
                 Some(job_id) => Ok(Ok(job_id)),
                 None if establish => host.ensure_thread_session(conn, thread_id).await.map(Ok),
-                None => Ok(Err("the thread has no session to ride along with")),
+                None => Ok(Err(Undeliverable::NoSessionToRideAlong)),
             }
         }
         StableRecipient::Job(job_id) => {
@@ -675,14 +675,44 @@ pub async fn deliverable_job_conn(
                 )
                 .await?;
             if rows.next().await?.is_none() {
-                return Ok(Err("the job no longer exists"));
+                return Ok(Err(Undeliverable::JobGone));
             }
             drop(rows);
             if host.job_is_fenced(conn, job_id).await? {
-                return Ok(Err("the job's execution was superseded"));
+                return Ok(Err(Undeliverable::Superseded));
             }
             Ok(Ok(job_id.clone()))
         }
+    }
+}
+
+/// Why a recipient has no job a delivery can land on now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Undeliverable {
+    /// The thread is closed; it may reopen.
+    ThreadClosed,
+    /// A passive line has no session to ride along with; one may start.
+    NoSessionToRideAlong,
+    /// The job no longer exists.
+    JobGone,
+    /// The job's execution was superseded; it never becomes canonical again.
+    Superseded,
+}
+
+impl Undeliverable {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::ThreadClosed => "the thread is closed",
+            Self::NoSessionToRideAlong => "the thread has no session to ride along with",
+            Self::JobGone => "the job no longer exists",
+            Self::Superseded => "the job's execution was superseded",
+        }
+    }
+
+    /// Whether the refusal can lift, so a receipt that waits out a
+    /// reversible refusal may be held rather than dropped.
+    pub fn is_reversible(self) -> bool {
+        matches!(self, Self::ThreadClosed | Self::NoSessionToRideAlong)
     }
 }
 

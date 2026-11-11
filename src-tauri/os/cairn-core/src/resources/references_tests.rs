@@ -75,6 +75,24 @@ fn quotation(entry: &ReferenceEntry) -> (&str, &str, Option<i64>, &str, bool) {
     }
 }
 
+/// A camp's wake recorded as a turn's input reads as the camp's in a rebuilt
+/// transcript, the same line it was delivered as, never as the operator's.
+#[test]
+fn a_camp_line_in_a_transcript_is_the_camp_s_not_the_operator_s() {
+    let line = cairn_attention::message_render::render_camp_line(
+        "base",
+        "wake",
+        "Cairn was rebuilt.",
+        "cairn://p/cairn/events/7",
+    );
+    let body = super::strip_turn_machinery(&format!("[Wed 02:17 PST \u{2014} resumed] {line}"));
+    assert_eq!(body, line);
+    assert_eq!(
+        super::attribute_user_input(&body),
+        ("camp base (a camp notice)".to_string(), line)
+    );
+}
+
 #[tokio::test]
 async fn a_chat_turn_quotes_the_operator_without_the_resume_machinery() {
     let orch = fixture(

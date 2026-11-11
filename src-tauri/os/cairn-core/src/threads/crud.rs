@@ -57,6 +57,15 @@ pub async fn update_with_lifecycle(
         crate::node_scratch::lifecycle::close_for_thread(orch, &outcome.thread.id).await;
         crate::scratch::residences::end_thread(orch, db, &outcome.thread.id).await;
     }
+    // Reopening is the reversal a held delivery (a rebuild firing a closed
+    // thread could not take) waits for.
+    if outcome.thread.status.is_active() && !outcome.previous.status.is_active() {
+        crate::routes::rearm_held_wakes(
+            orch,
+            &cairn_attention::wakes::StableRecipient::Thread(outcome.thread.id.clone()),
+        )
+        .await;
+    }
     if let Some(selection) = selection {
         let thread_id = outcome.thread.id.clone();
         let session_job_id = db

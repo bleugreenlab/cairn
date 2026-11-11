@@ -4,6 +4,11 @@
 //! project's base camp once, never to a list of threads: the fact log expands
 //! base camp to its participants by role (`crate::camps`), so a participant at
 //! `watch` reads it with its next run and one at `wake` is woken by it.
+//!
+//! A project outside the activity window is still told when a rebuild
+//! subscription of one of its threads fires on this boot: the firing
+//! (`orchestrator::wakes::rebuild`) mints that project's notice through
+//! [`announce_project`], so the subscriber's wake rides beside its camp fact.
 
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
@@ -152,16 +157,45 @@ pub struct Announced {
     pub failures: usize,
 }
 
+/// One project's notice identity: the obligation's (from, to) pair and the
+/// project, so an announcement retried at a later boot, or a firing that
+/// mints a project the announcement passed over, is the same one fact.
+pub fn notice_identity(change: &BuildChange, project_id: &str) -> String {
+    format!(
+        "build-change:{}:{}:{project_id}",
+        change.from_build_id, change.to_build_id
+    )
+}
+
+/// Tell one project's base camp about `change`: one fact, however many
+/// threads the project has. Returns the row id, or `None` when the project
+/// was already told.
+pub async fn announce_project(
+    orch: &Orchestrator,
+    change: &BuildChange,
+    project_id: &str,
+    project_key: &str,
+) -> Result<Option<i64>, String> {
+    crate::camps::notify_camp(
+        orch,
+        crate::camps::CampNotice {
+            project_id,
+            project_key,
+            camp_slug: crate::models::BASE_CAMP_SLUG,
+            kind: "rebuild",
+            identity: notice_identity(change, project_id),
+            summary: render(change),
+            detail_uri: None,
+        },
+    )
+    .await
+}
+
 /// Address one rebuild notice to the base camp of every active project in
 /// every open database, and settle the obligation only when nothing failed.
-/// Each project's notice identity is the obligation's (from, to) pair, so an
-/// announcement retried at a later boot mints only what it did not mint before.
+/// Each project's notice identity is [`notice_identity`], so an announcement
+/// retried at a later boot mints only what it did not mint before.
 pub async fn announce(orch: &Orchestrator, change: &BuildChange) -> Announced {
-    let summary = render(change);
-    let identity = format!(
-        "build-change:{}:{}",
-        change.from_build_id, change.to_build_id
-    );
     let mut minted = 0;
     let mut failures = 0;
     for db in orch.db.all_dbs().await {
@@ -174,16 +208,7 @@ pub async fn announce(orch: &Orchestrator, change: &BuildChange) -> Announced {
             }
         };
         for (project_id, project_key) in projects {
-            let notice = crate::camps::CampNotice {
-                project_id: &project_id,
-                project_key: &project_key,
-                camp_slug: crate::models::BASE_CAMP_SLUG,
-                kind: "rebuild",
-                identity: format!("{identity}:{project_id}"),
-                summary: summary.clone(),
-                detail_uri: None,
-            };
-            match crate::camps::notify_camp(orch, notice).await {
+            match announce_project(orch, change, &project_id, &project_key).await {
                 Ok(Some(_)) => minted += 1,
                 Ok(None) => {}
                 Err(error) => {

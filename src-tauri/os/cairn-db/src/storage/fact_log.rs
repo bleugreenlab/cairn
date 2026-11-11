@@ -680,6 +680,23 @@ pub async fn raise_wake_level_conn(
     Ok(())
 }
 
+/// Keep a still-pending wake from coming due before `not_before_ms`. Paces a
+/// burst whose deliveries would each launch a turn, such as the rebuild
+/// subscriptions one boot fires: the drain delivers them at their spaced
+/// instants rather than all at once.
+pub async fn hold_wake_until_conn(
+    conn: &super::TrackedConnection,
+    id: i64,
+    not_before_ms: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE fact_log_wakes SET deliver_after=MAX(deliver_after, ?2) WHERE id=?1 AND delivered_at IS NULL",
+        params![id, not_before_ms],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Claim the oldest wake due by `due_by_ms` for delivery, stamping it
 /// `delivering` at `now_ms`. One conditional UPDATE, so a wake is claimed once.
 pub async fn claim_due_wake(

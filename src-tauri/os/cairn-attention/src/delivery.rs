@@ -248,6 +248,7 @@ async fn push_to_audience_conn(
             candidate: &candidate,
             project_id: audience.project_id.as_deref(),
             fact_row_id: None,
+            fact_json: None,
         };
         let write = crate::wakes::upsert_receipt_conn(conn, &new).await?;
         let receipt = write.receipt().clone();
@@ -261,8 +262,13 @@ async fn push_to_audience_conn(
         {
             Ok(job_id) => job_id,
             Err(why) => {
-                crate::wakes::close_receipts_conn(conn, &[receipt.id], receipt_state::DROPPED, why)
-                    .await?;
+                crate::wakes::close_receipts_conn(
+                    conn,
+                    &[receipt.id],
+                    receipt_state::DROPPED,
+                    why.describe(),
+                )
+                .await?;
                 continue;
             }
         };

@@ -488,6 +488,79 @@ async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica(
     assert_eq!(reached, ["addressed:camp_notice.camp@lead"]);
 }
 
+/// A coalesced camp wake carrying several facts shows each fact's camp line,
+/// in one message from the camp, rather than a generic count of rows.
+#[tokio::test]
+async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
+    let temp = tempfile::tempdir().unwrap();
+    let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+    db.execute_batch(
+        "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('n0','p','n0','active',1,1);
+         INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('n0-job','n0','p','running','thread',1,1);
+         INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('n0-run','n0-job','running',1,1);",
+    )
+    .await
+    .unwrap();
+    db.ensure_base_camp("p", "t", 1).await.unwrap();
+    let mut rows = Vec::new();
+    for (identity, summary) in [
+        ("drain:a", "bgsrv-ub drains."),
+        ("drain:b", "bgsrv-ub is back."),
+    ] {
+        rows.push(
+            notify_camp(
+                &orch,
+                CampNotice {
+                    project_id: "p",
+                    project_key: "cairn",
+                    camp_slug: crate::models::BASE_CAMP_SLUG,
+                    kind: "drain",
+                    identity: identity.into(),
+                    summary: summary.into(),
+                    detail_uri: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    crate::routes::drain_fact_log(&orch).await;
+    let told = db
+        .query_all(
+            "SELECT sender_name, content FROM messages WHERE recipient_run_id = 'n0-run'",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(told.len(), 1, "one wake: {told:?}");
+    assert_eq!(told[0].0, "cairn://p/cairn/camps/base");
+    assert_eq!(
+        told[0].1,
+        format!(
+            "From camp base (your role: watch): bgsrv-ub drains. \u{2014} cairn://p/cairn/events/{}\nFrom camp base (your role: watch): bgsrv-ub is back. \u{2014} cairn://p/cairn/events/{}",
+            rows[0], rows[1]
+        )
+    );
+    // The persisted direct renders as its camp lines wherever it is shown.
+    let message = crate::models::Message {
+        id: "m".into(),
+        channel_type: crate::models::ChannelType::Direct,
+        channel_id: None,
+        sender_run_id: None,
+        sender_name: told[0].0.clone(),
+        recipient_run_id: Some("n0-run".into()),
+        content: told[0].1.clone(),
+        created_at: 1,
+        urgency: None,
+    };
+    assert_eq!(
+        cairn_attention::message_render::render_direct_message(&message),
+        told[0].1
+    );
+}
+
 /// Specimen 4: one base camp notice is one fact row and one receipt per
 /// participant, however many threads the project has, and neither a second
 /// drain nor a restart's recovery adds a message or loses a receipt.

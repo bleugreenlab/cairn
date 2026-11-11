@@ -38,6 +38,13 @@ pub struct CampNotice<'a> {
 /// fact log's to decide, by the camp's roles at indexing: the producer never
 /// names a recipient, and the notice is one row however many threads exist.
 /// Returns the row id, or `None` when the log already holds this identity.
+///
+/// **The producer contract.** A notice owed to every thread of a project is
+/// ONE base-camp fact per project, minted here. No producer enumerates
+/// threads or jobs to deliver it: the camp's participants, their roles and
+/// their sessions are resolved by the fact log, and a thread's own one-shot
+/// subscription on the same event (a rebuild wake) is its own fact whose
+/// receipt rides beside this one. See `docs/camps.md`.
 pub async fn notify_camp(
     orch: &crate::orchestrator::Orchestrator,
     notice: CampNotice<'_>,
