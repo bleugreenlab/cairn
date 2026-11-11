@@ -6272,104 +6272,6 @@ pinBumps:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn durability_group_observation_failure_still_writes_log_and_survives_successor() {
-        let steps = ReviewPersistenceSteps {
-            observation: std::sync::Arc::new(|_, _| Err("injected observation failure".into())),
-            ..ReviewPersistenceSteps::default()
-        };
-        let (recorder, logs) = durability_group_fixture(steps).await;
-        recorder.callback()(&durability_group_result()).await;
-        assert_eq!(durability_group_observation_count(&recorder.db).await, 0);
-        assert_eq!(
-            std::fs::read_to_string(logs.path().join("completed.log")).unwrap(),
-            "completed bytes\n"
-        );
-        let failures = turn_end_durability_errors(&recorder.db, "j-1")
-            .await
-            .unwrap();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].member, "completed");
-        assert_eq!(failures[0].step, "observation");
-        assert!(failures[0].error.contains("injected observation failure"));
-        assert!(recorder.outcomes.lock().unwrap()[&1].recorded.is_none());
-        // Neither the terminal reason nor a new wave's pointer erases the fact.
-        transition_turn_end_attempt(
-            &recorder.orch,
-            "j-1",
-            "durability-wave",
-            "cancelled",
-            Some("held sibling was cancelled"),
-        )
-        .unwrap();
-        recorder
-            .db
-            .execute_script(
-                "INSERT INTO turn_end_check_attempts
-             (id,job_id,state,plan_json,created_at,updated_at)
-             VALUES('successor-wave','j-1','submitted','{}',2,2);
-             UPDATE jobs SET turn_end_check_attempt_id='successor-wave' WHERE id='j-1';",
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            turn_end_durability_errors(&recorder.db, "j-1")
-                .await
-                .unwrap(),
-            failures
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn durability_group_log_failure_still_records_original_coordinate_and_reuses() {
-        let steps = ReviewPersistenceSteps {
-            log: std::sync::Arc::new(|_, _| Err("injected log failure".into())),
-            ..ReviewPersistenceSteps::default()
-        };
-        let (recorder, logs) = durability_group_fixture(steps).await;
-        recorder.callback()(&durability_group_result()).await;
-        assert_eq!(durability_group_observation_count(&recorder.db).await, 1);
-        assert!(!logs.path().join("completed.log").exists());
-        let failures = turn_end_durability_errors(&recorder.db, "j-1")
-            .await
-            .unwrap();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].step, "log");
-        assert_eq!(failures[0].member, "completed");
-        assert!(failures[0].error.contains("injected log failure"));
-        let coordinate = recorder
-            .db
-            .query_opt_text(
-                "SELECT commit_sha || ':' || defined_by_commit_sha || ':' || input_hash
-             FROM check_result_observations WHERE check_name='completed'",
-                (),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            coordinate,
-            "original-head:original-definition:input-completed"
-        );
-        let (plan, input) = &recorder.plans[1];
-        assert!(
-            crate::execution::checks::reusable_verdict_for_plan(
-                recorder.db.clone(),
-                "p",
-                plan,
-                input,
-                TURN_END_EFFECTIVE_ENV,
-            )
-            .is_some(),
-            "the next wave reuses the committed observation even if log writing failed"
-        );
-        assert!(
-            !recorder.outcomes.lock().unwrap().contains_key(&0),
-            "held original index untouched"
-        );
-        assert_eq!(recorder.board.snapshot()[0].state, "pending");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durability_group_dropping_callback_keeps_received_result_and_previous_logs() {
         let done = std::sync::Arc::new(tokio::sync::Notify::new());
         let completed = done.clone();
@@ -7255,6 +7157,10 @@ pinBumps:
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "checks_turn_end_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod capture_provenance_tests {

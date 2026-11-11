@@ -14059,7 +14059,7 @@ fn check_result_from_delivery(
     }
 }
 
-fn check_result_from_cell_outcome(
+pub(crate) fn check_result_from_cell_outcome(
     outcome: CellOutcome,
     account: &crate::fleet::CellAccount,
     publication: Option<crate::fleet::PublicationCoordination>,
