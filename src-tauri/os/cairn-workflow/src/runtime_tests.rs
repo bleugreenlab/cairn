@@ -235,23 +235,13 @@ fn racing_checkpoint_records_never_reuse_an_attempt_number() {
         stderr: String::new(),
     };
     for round in 0..100_i64 {
-        let barrier = std::sync::Barrier::new(2);
-        let mut attempts: Vec<i64> = std::thread::scope(|scope| {
-            let records: Vec<_> = (0..2)
-                .map(|_| {
-                    scope.spawn(|| {
-                        barrier.wait();
-                        crate::checkpoint_runs::record_checkpoint_run(
-                            &runtime, "job", "false", None, &output,
-                        )
-                    })
-                })
-                .collect();
-            records
-                .into_iter()
-                .map(|record| record.join().unwrap().unwrap())
-                .collect()
-        });
+        let (runtime, output) = (&runtime, &output);
+        let mut attempts: Vec<i64> = storage::race_on_threads((0..2).map(|_| {
+            move || {
+                crate::checkpoint_runs::record_checkpoint_run(runtime, "job", "false", None, output)
+                    .unwrap()
+            }
+        }));
         attempts.sort();
         assert_eq!(
             attempts,

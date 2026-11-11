@@ -157,6 +157,7 @@ pub struct OrchestratorBuilder {
     issue_list_cache: Arc<generation_cache::IssueListCache>,
     operator_notifications_cache: Arc<generation_cache::OperatorNotificationsCache>,
     pending_deliveries_cache: Arc<generation_cache::PendingDeliveriesCache>,
+    gate_inputs: Arc<generation_cache::GateInputGenerations>,
     hold_sources: Arc<crate::notifications::HoldRegistry>,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
@@ -427,6 +428,7 @@ impl OrchestratorBuilder {
             }),
             announce("issue_list"),
         );
+        let gate_inputs = Arc::new(generation_cache::GateInputGenerations::default());
         let services = Arc::new(Services {
             process: services.process.clone(),
             git: services.git.clone(),
@@ -438,6 +440,7 @@ impl OrchestratorBuilder {
                 issue_list_cache.clone(),
                 operator_notifications_cache.clone(),
                 pending_deliveries_cache.clone(),
+                gate_inputs.clone(),
             )),
             clock: services.clock.clone(),
             fs: services.fs.clone(),
@@ -481,6 +484,7 @@ impl OrchestratorBuilder {
             issue_list_cache,
             operator_notifications_cache,
             pending_deliveries_cache,
+            gate_inputs,
             hold_sources,
             api_config: ApiConfig::default(),
             effect_tx: None,
@@ -974,6 +978,7 @@ impl OrchestratorBuilder {
             issue_list_cache: self.issue_list_cache,
             operator_notifications_cache: self.operator_notifications_cache,
             pending_deliveries_cache: self.pending_deliveries_cache,
+            gate_inputs: self.gate_inputs,
             hold_sources: self.hold_sources,
             operator_requests: Arc::new(
                 crate::operator_requests::registry::RequestRegistry::default(),
@@ -1777,6 +1782,9 @@ pub struct Orchestrator {
     /// Per-job pending-delivery list (the composer's system chips), keyed by job
     /// id and announced per job, on the same terms.
     pub(crate) pending_deliveries_cache: Arc<generation_cache::PendingDeliveriesCache>,
+    /// What the channel router's gate sources key their staleness to, advanced
+    /// by the same `db-change` decorator on each kind's input tables.
+    pub(crate) gate_inputs: Arc<generation_cache::GateInputGenerations>,
     /// The producers of hold entries in the notification center.
     pub(crate) hold_sources: Arc<crate::notifications::HoldRegistry>,
     /// Closed, runner-owned adapter slots; never populated from agent input.

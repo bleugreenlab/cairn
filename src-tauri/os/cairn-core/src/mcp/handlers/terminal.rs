@@ -6468,43 +6468,30 @@ mod terminal_finalize_tests {
     #[test]
     fn racing_creates_of_one_slug_never_delete_the_running_row() {
         use crate::storage::RowExt;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = crate::storage::race_runtime();
         let db = runtime.block_on(crate::storage::migrated_test_db("term_slug_create_race.db"));
         runtime.block_on(seed(&db));
         for round in 0..100 {
             let slug = format!("race-{round}");
             let (target, _) = test_terminal_target(&slug);
-            let barrier = std::sync::Barrier::new(2);
-            let created: Vec<String> = std::thread::scope(|scope| {
-                let creates: Vec<_> = ["a", "b"]
-                    .into_iter()
-                    .map(|who| {
-                        let (db, target, barrier) = (&db, &target, &barrier);
-                        let (handle, session) = (runtime.handle().clone(), format!("{slug}-{who}"));
-                        scope.spawn(move || {
-                            barrier.wait();
-                            handle
-                                .block_on(insert_terminal_resource(
-                                    db,
-                                    target,
-                                    &session,
-                                    "sleep 100",
-                                    None,
-                                    None,
-                                ))
-                                .map(|()| session)
-                        })
-                    })
-                    .collect();
-                creates
-                    .into_iter()
-                    .filter_map(|create| create.join().unwrap().ok())
-                    .collect()
-            });
+            let (rt, db_ref, target_ref) = (&runtime, &db, &target);
+            let created: Vec<String> = crate::storage::race_on_threads(["a", "b"].map(|who| {
+                let session = format!("{slug}-{who}");
+                move || {
+                    rt.block_on(insert_terminal_resource(
+                        db_ref,
+                        target_ref,
+                        &session,
+                        "sleep 100",
+                        None,
+                        None,
+                    ))
+                    .map(|()| session)
+                }
+            }))
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect();
             let running = runtime
                 .block_on(db.query_all(
                     "SELECT session_id FROM job_terminals

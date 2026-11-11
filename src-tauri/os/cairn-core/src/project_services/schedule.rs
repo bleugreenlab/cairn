@@ -4,8 +4,18 @@
 //! A thread runs code without a turn only through a service (tenet 1313).
 //! On-demand code is a method call; scheduled code is a `schedule` entry
 //! naming a method; wakes stay attention. So this module never starts a turn
-//! and wakes the owner only once per failure streak ([`super::notify_owner`],
+//! and wakes the owner at most once per failure streak ([`super::notify_owner`],
 //! whose one other caller is a service whose always-on machine was lost).
+//!
+//! Streak notices coalesce. A notice opens a quiet window ([`NoticeWindow`],
+//! [`NOTICE_WINDOW_SECS`]): a later streak inside it whose failure kind (the
+//! call's error code) was already reported sends nothing, one of a new kind
+//! sends one notice naming every kind seen, and the owner acting on the
+//! service (a source or manifest write, or an explicit start, stop, or
+//! restart) ends the window, so the failure after a fix attempt is news. A
+//! substrate incident that alternates slow successes and failures then wakes
+//! the owner once per kind rather than once per streak. Every occurrence is
+//! still recorded on the row and in the log.
 //!
 //! Each declared entry is a `service_schedules` row holding its anchored
 //! recurrence and what its last occurrence did. [`sync`] keeps the rows in step
@@ -26,6 +36,7 @@
 //! `service_log` call row as any call.
 
 use cairn_db::turso::params;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::declaration::ScheduleEntry;
@@ -35,6 +46,121 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 /// Bound on how much of a failure the streak notice quotes; the service log
 /// keeps the call row and the status keeps the full last error.
 const NOTICE_ERROR_CHARS: usize = 1_500;
+
+/// How long a streak notice keeps later streaks of the kinds it reported quiet.
+pub(crate) const NOTICE_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// What one entry's failure notices have reported since the notice that
+/// opened the window, and every streak and failed occurrence since, the quiet
+/// ones included. Kept as the row's `notice_window` JSON, so a runner restart
+/// neither reopens nor forgets it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NoticeWindow {
+    /// Epoch seconds the opening notice was sent.
+    pub opened_at: i64,
+    /// Failure kinds the window's notices named, in the order they were seen.
+    pub kinds: Vec<String>,
+    pub streaks: i64,
+    pub failures: i64,
+    /// The service's source when the window opened: a different one is the
+    /// owner having rewritten it, its manifest included.
+    pub source_hash: Option<String>,
+    /// The owner explicitly started, stopped, or restarted the service.
+    pub closed: bool,
+}
+
+impl NoticeWindow {
+    pub(crate) fn closes_at(&self) -> i64 {
+        self.opened_at + NOTICE_WINDOW_SECS
+    }
+
+    /// Whether a streak beginning now, under `source_hash`, stays quiet when
+    /// its kind was already reported. An unknown source on either side is no
+    /// evidence of a rewrite.
+    pub(crate) fn quiet(&self, now: i64, source_hash: Option<&str>) -> bool {
+        !self.closed
+            && now < self.closes_at()
+            && match (self.source_hash.as_deref(), source_hash) {
+                (Some(then), Some(current)) => then == current,
+                _ => true,
+            }
+    }
+}
+
+/// The notice an occurrence's outcome calls for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Notice {
+    /// A streak began with no quiet window open, and opened `window`.
+    /// `previous` is the window before it when that one held more than one
+    /// streak, so the counts its quiet streaks gathered reach the owner.
+    Streak {
+        window: NoticeWindow,
+        previous: Option<NoticeWindow>,
+    },
+    /// A streak began inside a quiet window with a kind it had not reported.
+    NewKind { window: NoticeWindow },
+}
+
+/// The window once an occurrence has settled, and the notice it calls for.
+/// `prior_failures` is the length of the streak before this occurrence.
+fn next_window(
+    prior_failures: i64,
+    window: Option<NoticeWindow>,
+    outcome: &Outcome,
+    now: i64,
+    source_hash: Option<&str>,
+) -> (Option<NoticeWindow>, Option<Notice>) {
+    let Outcome::Failed { kind, .. } = outcome else {
+        return (window, None);
+    };
+    if prior_failures > 0 {
+        return (
+            window.map(|mut window| {
+                window.failures += 1;
+                window
+            }),
+            None,
+        );
+    }
+    match window {
+        Some(mut window) if window.quiet(now, source_hash) => {
+            window.streaks += 1;
+            window.failures += 1;
+            if window.kinds.contains(kind) {
+                return (Some(window), None);
+            }
+            window.kinds.push(kind.clone());
+            (Some(window.clone()), Some(Notice::NewKind { window }))
+        }
+        previous => {
+            let window = NoticeWindow {
+                opened_at: now,
+                kinds: vec![kind.clone()],
+                streaks: 1,
+                failures: 1,
+                source_hash: source_hash.map(str::to_string),
+                closed: false,
+            };
+            (
+                Some(window.clone()),
+                Some(Notice::Streak {
+                    window,
+                    previous: previous.filter(|previous| previous.streaks > 1),
+                }),
+            )
+        }
+    }
+}
+
+fn window_of(json: Option<String>) -> Option<NoticeWindow> {
+    json.and_then(|json| serde_json::from_str(&json).ok())
+}
+
+fn window_json(window: &Option<NoticeWindow>) -> Option<String> {
+    window
+        .as_ref()
+        .map(|window| serde_json::to_string(window).expect("a notice window serializes"))
+}
 
 /// One declared entry's cadence and last outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +177,7 @@ pub(crate) struct ScheduleRow {
     pub last_status: Option<String>,
     pub last_error: Option<String>,
     pub consecutive_failures: i64,
+    pub notice_window: Option<NoticeWindow>,
 }
 
 impl ScheduleRow {
@@ -83,7 +210,7 @@ pub(crate) fn every_text(every_ms: i64) -> String {
 
 const COLUMNS: &str =
     "entry_key, method, args_json, every_ms, anchor_at, last_fired_occurrence_at, \
-     last_run_at, last_status, last_error, consecutive_failures";
+     last_run_at, last_status, last_error, consecutive_failures, notice_window";
 
 fn row_of(row: &cairn_db::turso::Row) -> DbResult<ScheduleRow> {
     Ok(ScheduleRow {
@@ -97,6 +224,7 @@ fn row_of(row: &cairn_db::turso::Row) -> DbResult<ScheduleRow> {
         last_status: row.opt_text(7)?,
         last_error: row.opt_text(8)?,
         consecutive_failures: row.i64(9)?,
+        notice_window: window_of(row.opt_text(10)?),
     })
 }
 
@@ -394,14 +522,22 @@ pub(crate) async fn unclaim(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Ok,
-    Failed(String),
+    /// `kind` is the call's error code, which tells one cause of failure
+    /// from another; `error` is the full text recorded.
+    Failed {
+        kind: String,
+        error: String,
+    },
     /// Not called: the service was stopped explicitly. Neither a success nor a
     /// failure, so a streak neither ends nor grows.
     Skipped(String),
 }
 
-/// Record an occurrence's outcome. Answers whether it began a failure streak:
-/// a failure after a success, or the first one ever.
+/// Record an occurrence's outcome, under the service's current `source_hash`.
+/// Answers the notice it calls for: one only when it began a failure streak
+/// (a failure after a success, or the first one ever) that no quiet window
+/// covers, or whose kind the window has not reported.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn settle(
     db: &LocalDb,
     project_id: &str,
@@ -409,8 +545,9 @@ pub(crate) async fn settle(
     service: &str,
     entry_key: &str,
     outcome: &Outcome,
+    source_hash: Option<&str>,
     now: i64,
-) -> Result<bool, String> {
+) -> Result<Option<Notice>, String> {
     let key = (
         project_id.to_string(),
         owner.key().to_string(),
@@ -419,16 +556,17 @@ pub(crate) async fn settle(
     );
     let (status, error) = match outcome {
         Outcome::Ok => ("ok", None),
-        Outcome::Failed(error) => ("failed", Some(error.clone())),
+        Outcome::Failed { error, .. } => ("failed", Some(error.clone())),
         Outcome::Skipped(reason) => ("skipped", Some(reason.clone())),
     };
+    let (outcome, source_hash) = (outcome.clone(), source_hash.map(str::to_string));
     db.write(move |conn| {
         let (project_id, owner, service, entry_key) = key.clone();
-        let error = error.clone();
+        let (error, outcome, source_hash) = (error.clone(), outcome.clone(), source_hash.clone());
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT consecutive_failures FROM service_schedules
+                    "SELECT consecutive_failures, notice_window FROM service_schedules
                      WHERE project_id = ?1 AND owner_thread = ?2 AND service = ?3 AND entry_key = ?4",
                     params![
                         project_id.as_str(),
@@ -438,11 +576,14 @@ pub(crate) async fn settle(
                     ],
                 )
                 .await?;
-            let Some(prior) = rows.next().await?.map(|row| row.i64(0)).transpose()? else {
+            let Some(row) = rows.next().await? else {
                 // The entry was removed while its call ran.
-                return Ok(false);
+                return Ok(None);
             };
+            let (prior, window) = (row.i64(0)?, window_of(row.opt_text(1)?));
             drop(rows);
+            let (window, notice) =
+                next_window(prior, window, &outcome, now, source_hash.as_deref());
             let failures = match status {
                 "ok" => 0,
                 "failed" => prior + 1,
@@ -451,7 +592,7 @@ pub(crate) async fn settle(
             conn.execute(
                 "UPDATE service_schedules
                  SET last_run_at = ?5, last_status = ?6, last_error = ?7,
-                     consecutive_failures = ?8, updated_at = ?5
+                     consecutive_failures = ?8, notice_window = ?9, updated_at = ?5
                  WHERE project_id = ?1 AND owner_thread = ?2 AND service = ?3 AND entry_key = ?4",
                 params![
                     project_id.as_str(),
@@ -461,40 +602,147 @@ pub(crate) async fn settle(
                     now,
                     status,
                     error.as_deref(),
-                    failures
+                    failures,
+                    window_json(&window).as_deref()
                 ],
             )
             .await?;
-            Ok(status == "failed" && prior == 0)
+            Ok(notice)
         })
     })
     .await
     .map_err(|error| format!("Failed to record a scheduled outcome: {error}"))
 }
 
-/// The text of the one notice a failure streak sends its owning thread.
+/// The owner explicitly started, stopped, or restarted `service`: end every
+/// quiet window its entries hold, so the next streak is news whatever its
+/// kind. The windows keep their counts for the next notice to report.
+pub(crate) async fn end_notice_windows(
+    db: &LocalDb,
+    project_id: &str,
+    owner: &ServiceOwner,
+    service: &str,
+) -> Result<(), String> {
+    let (project_id, owner, service) = (
+        project_id.to_string(),
+        owner.key().to_string(),
+        service.to_string(),
+    );
+    db.write(move |conn| {
+        let (project_id, owner, service) = (project_id.clone(), owner.clone(), service.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT entry_key, notice_window FROM service_schedules
+                     WHERE project_id = ?1 AND owner_thread = ?2 AND service = ?3
+                       AND notice_window IS NOT NULL",
+                    params![project_id.as_str(), owner.as_str(), service.as_str()],
+                )
+                .await?;
+            let mut open = Vec::new();
+            while let Some(row) = rows.next().await? {
+                if let Some(window) = window_of(row.opt_text(1)?).filter(|window| !window.closed) {
+                    open.push((row.text(0)?, window));
+                }
+            }
+            drop(rows);
+            for (entry_key, mut window) in open {
+                window.closed = true;
+                conn.execute(
+                    "UPDATE service_schedules SET notice_window = ?5
+                     WHERE project_id = ?1 AND owner_thread = ?2 AND service = ?3 AND entry_key = ?4",
+                    params![
+                        project_id.as_str(),
+                        owner.as_str(),
+                        service.as_str(),
+                        entry_key.as_str(),
+                        window_json(&Some(window)).as_deref()
+                    ],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to end a schedule's quiet window: {error}"))
+}
+
+fn utc(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| secs.to_string())
+}
+
+fn kinds_text(kinds: &[String]) -> String {
+    kinds
+        .iter()
+        .map(|kind| format!("`{kind}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A window's counts as a notice or the status page reports them.
+pub(crate) fn window_summary(window: &NoticeWindow) -> String {
+    format!(
+        "{} streaks, {} failed occurrences since {} (kinds: {})",
+        window.streaks,
+        window.failures,
+        utc(window.opened_at),
+        kinds_text(&window.kinds)
+    )
+}
+
+/// The text of the notice a failure streak sends its owning thread, for the
+/// streak that began at occurrence `due` failing with `error`.
 pub(crate) fn streak_notice(
     home: &str,
     service: &str,
     row: &ScheduleRow,
     due: i64,
     error: &str,
+    notice: &Notice,
 ) -> String {
-    let at = chrono::DateTime::from_timestamp(due, 0)
-        .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| due.to_string());
+    let at = utc(due);
     let mut quoted: String = error.chars().take(NOTICE_ERROR_CHARS).collect();
     if error.chars().nth(NOTICE_ERROR_CHARS).is_some() {
         quoted.push('…');
     }
-    format!(
-        "Service `{service}`'s scheduled `{method}` (every {every}) started failing at the \
-         {at} occurrence: {quoted}\n\nThis is the only notice for this failure streak: later \
-         failures are recorded in {home}/log and on {home}/status without waking you, and the \
-         next success ends the streak.",
-        method = row.method,
-        every = every_text(row.every_ms),
-    )
+    let (method, every) = (&row.method, every_text(row.every_ms));
+    let ends = "writing, starting, stopping, or restarting the service ends the window";
+    match notice {
+        Notice::Streak { window, previous } => {
+            let mut text = format!(
+                "Service `{service}`'s scheduled `{method}` (every {every}) started failing at \
+                 the {at} occurrence: {quoted}\n\nThis is the only notice for this failure \
+                 streak: later failures are recorded in {home}/log and on {home}/status without \
+                 waking you, and the next success ends the streak. Until {closes}, a new streak \
+                 that fails with {kinds} again is recorded the same way with no notice; a \
+                 failure of another kind sends one, and {ends}.",
+                closes = utc(window.closes_at()),
+                kinds = kinds_text(&window.kinds),
+            );
+            if let Some(previous) = previous {
+                text.push_str(&format!(
+                    "\n\nThe window before this one held {}.",
+                    window_summary(previous)
+                ));
+            }
+            text
+        }
+        Notice::NewKind { window } => {
+            let kind = window.kinds.last().map(String::as_str).unwrap_or_default();
+            format!(
+                "Service `{service}`'s scheduled `{method}` (every {every}) started failing \
+                 again at the {at} occurrence, with a kind of failure not reported before, \
+                 `{kind}`: {quoted}\n\nThis window holds {summary}. Until {closes}, a new \
+                 streak of one of these kinds is recorded in {home}/log and on {home}/status \
+                 with no notice; a failure of another kind sends one, and {ends}.",
+                summary = window_summary(window),
+                closes = utc(window.closes_at()),
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -581,11 +829,17 @@ mod tests {
         assert!(list(&db, "p", &owner, "board").await.unwrap().is_empty());
     }
 
-    /// The first failure begins a streak; the next does not; a success ends
-    /// it; a skip neither grows nor ends it.
-    #[tokio::test]
-    async fn a_streak_begins_once() {
-        let db = crate::storage::migrated_test_db("service-schedule-streak.db").await;
+    fn failed(kind: &str) -> Outcome {
+        Outcome::Failed {
+            kind: kind.into(),
+            error: format!("it failed ({kind})"),
+        }
+    }
+
+    /// A `board` service with one `tick` entry every five minutes, and that
+    /// entry's key.
+    async fn board(name: &str) -> (LocalDb, String) {
+        let db = crate::storage::migrated_test_db(name).await;
         crate::project_services::testing::seed_project(&db).await;
         let owner = ServiceOwner::Project;
         sync(&db, "p", &owner, "board", &[entry("tick", 5 * 60_000)], 0)
@@ -594,21 +848,182 @@ mod tests {
         let key = list(&db, "p", &owner, "board").await.unwrap()[0]
             .entry_key
             .clone();
-        let settle_as = |outcome: Outcome, now: i64| {
-            let (db, owner, key) = (&db, owner.clone(), key.clone());
-            async move {
-                settle(db, "p", &owner, "board", &key, &outcome, now)
-                    .await
-                    .unwrap()
-            }
-        };
-        assert!(settle_as(Outcome::Failed("boom".into()), 300).await);
-        assert!(!settle_as(Outcome::Failed("boom".into()), 600).await);
-        assert!(!settle_as(Outcome::Skipped("stopped".into()), 900).await);
-        let row = &list(&db, "p", &owner, "board").await.unwrap()[0];
+        (db, key)
+    }
+
+    async fn settle_as(
+        db: &LocalDb,
+        key: &str,
+        outcome: Outcome,
+        source: &str,
+        now: i64,
+    ) -> Option<Notice> {
+        settle(
+            db,
+            "p",
+            &ServiceOwner::Project,
+            "board",
+            key,
+            &outcome,
+            Some(source),
+            now,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn board_row(db: &LocalDb) -> ScheduleRow {
+        list(db, "p", &ServiceOwner::Project, "board")
+            .await
+            .unwrap()
+            .remove(0)
+    }
+
+    /// The first failure begins a streak and notifies; the next does not; a
+    /// skip neither grows nor ends it; a success ends it.
+    #[tokio::test]
+    async fn a_streak_notifies_once() {
+        let (db, key) = board("service-schedule-streak.db").await;
+        let first = settle_as(&db, &key, failed("deadline"), "v1", 300).await;
+        assert!(
+            matches!(first, Some(Notice::Streak { previous: None, .. })),
+            "{first:?}"
+        );
+        assert_eq!(
+            settle_as(&db, &key, failed("deadline"), "v1", 600).await,
+            None
+        );
+        assert_eq!(
+            settle_as(&db, &key, Outcome::Skipped("stopped".into()), "v1", 900).await,
+            None
+        );
+        let row = board_row(&db).await;
         assert_eq!(row.consecutive_failures, 2);
         assert_eq!(row.last_status.as_deref(), Some("skipped"));
-        assert!(!settle_as(Outcome::Ok, 1_200).await);
-        assert!(settle_as(Outcome::Failed("again".into()), 1_500).await);
+        assert_eq!(settle_as(&db, &key, Outcome::Ok, "v1", 1_200).await, None);
+        assert_eq!(board_row(&db).await.consecutive_failures, 0);
+    }
+
+    /// Inside the window a new streak of a reported kind is quiet, a new kind
+    /// notifies naming every kind seen, and the window counts every streak
+    /// and every failed occurrence, the quiet ones included.
+    #[tokio::test]
+    async fn a_window_quiets_known_kinds_and_names_a_new_one() {
+        let (db, key) = board("service-schedule-window.db").await;
+        assert!(settle_as(&db, &key, failed("deadline"), "v1", 300)
+            .await
+            .is_some());
+        settle_as(&db, &key, failed("deadline"), "v1", 600).await;
+        settle_as(&db, &key, Outcome::Ok, "v1", 900).await;
+        assert_eq!(
+            settle_as(&db, &key, failed("deadline"), "v1", 1_200).await,
+            None,
+            "the same kind again is not news"
+        );
+        settle_as(&db, &key, Outcome::Ok, "v1", 1_500).await;
+        let Some(Notice::NewKind { window }) =
+            settle_as(&db, &key, failed("store"), "v1", 1_800).await
+        else {
+            panic!("a new kind is news");
+        };
+        assert_eq!(window.kinds, ["deadline", "store"]);
+        assert_eq!((window.streaks, window.failures), (3, 4));
+        assert_eq!(window.opened_at, 300);
+        settle_as(&db, &key, Outcome::Ok, "v1", 2_100).await;
+        assert_eq!(
+            settle_as(&db, &key, failed("store"), "v1", 2_400).await,
+            None
+        );
+        let row = board_row(&db).await;
+        let window = row.notice_window.unwrap();
+        assert_eq!((window.streaks, window.failures), (4, 5));
+        assert_eq!(row.consecutive_failures, 1);
+    }
+
+    /// Past the window, after a rewrite, or after an explicit start, stop, or
+    /// restart, a streak notifies afresh, carrying the counts of the window
+    /// before it when that held more than one streak.
+    #[tokio::test]
+    async fn a_window_ends_with_time_a_rewrite_or_an_owner_action() {
+        let (db, key) = board("service-schedule-window-end.db").await;
+        settle_as(&db, &key, failed("deadline"), "v1", 300).await;
+        settle_as(&db, &key, Outcome::Ok, "v1", 600).await;
+        settle_as(&db, &key, failed("deadline"), "v1", 900).await;
+        settle_as(&db, &key, Outcome::Ok, "v1", 1_200).await;
+
+        let late = 300 + NOTICE_WINDOW_SECS;
+        let Some(Notice::Streak { window, previous }) =
+            settle_as(&db, &key, failed("deadline"), "v1", late).await
+        else {
+            panic!("a streak past the window is news");
+        };
+        assert_eq!((window.opened_at, window.streaks), (late, 1));
+        let previous = previous.expect("the last window held two streaks");
+        assert_eq!((previous.streaks, previous.failures), (2, 2));
+        settle_as(&db, &key, Outcome::Ok, "v1", late + 300).await;
+
+        // A manifest or source write changes the service's source hash.
+        let rewritten = settle_as(&db, &key, failed("deadline"), "v2", late + 600).await;
+        assert!(
+            matches!(rewritten, Some(Notice::Streak { previous: None, .. })),
+            "{rewritten:?}"
+        );
+        settle_as(&db, &key, Outcome::Ok, "v2", late + 900).await;
+        assert_eq!(
+            settle_as(&db, &key, failed("deadline"), "v2", late + 1_200).await,
+            None
+        );
+        settle_as(&db, &key, Outcome::Ok, "v2", late + 1_500).await;
+
+        end_notice_windows(&db, "p", &ServiceOwner::Project, "board")
+            .await
+            .unwrap();
+        assert!(board_row(&db).await.notice_window.unwrap().closed);
+        let Some(Notice::Streak { previous, .. }) =
+            settle_as(&db, &key, failed("deadline"), "v2", late + 1_800).await
+        else {
+            panic!("a streak after the owner acted is news");
+        };
+        assert_eq!(previous.map(|previous| previous.streaks), Some(2));
+    }
+
+    #[test]
+    fn a_new_kind_notice_names_the_kind_and_the_counts() {
+        let row = ScheduleRow {
+            entry_key: "k".into(),
+            method: "refresh".into(),
+            args: Value::Null,
+            every_ms: 15 * 60_000,
+            anchor_at: 0,
+            last_fired_occurrence_at: None,
+            last_run_at: None,
+            last_status: None,
+            last_error: None,
+            consecutive_failures: 0,
+            notice_window: None,
+        };
+        let window = NoticeWindow {
+            opened_at: 0,
+            kinds: vec!["deadline".into(), "store".into()],
+            streaks: 3,
+            failures: 5,
+            source_hash: None,
+            closed: false,
+        };
+        let text = streak_notice(
+            "cairn://p/cairn/ux/services/releases",
+            "releases",
+            &row,
+            3_600,
+            "bearer expired (store)",
+            &Notice::NewKind { window },
+        );
+        assert!(text.contains("not reported before, `store`"), "{text}");
+        assert!(
+            text.contains("3 streaks, 5 failed occurrences since 1970-01-01 00:00:00 UTC"),
+            "{text}"
+        );
+        assert!(text.contains("(kinds: `deadline`, `store`)"), "{text}");
+        assert!(text.contains("Until 1970-01-02 00:00:00 UTC"), "{text}");
     }
 }

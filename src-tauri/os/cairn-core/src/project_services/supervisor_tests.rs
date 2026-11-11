@@ -42,6 +42,9 @@ pub(crate) struct FakeHost {
     probes: AtomicU64,
     /// The machines the supervisor sees, in place of the fleet's.
     machines: StdMutex<Option<Vec<machine::MachineView>>>,
+    /// What the next `scripted` calls answer, in order: a failure with the
+    /// error code, or `None` for success.
+    scripted: StdMutex<VecDeque<Option<&'static str>>>,
 }
 
 /// Ends a native resident: (exit code, whether the executor was lost).
@@ -220,6 +223,10 @@ impl ServiceHost for Arc<FakeHost> {
                                     return;
                                 }
                                 "hang" => {}
+                                "scripted" => match host.scripted.lock().unwrap().pop_front().flatten() {
+                                    None => out(&events, json!({"type": "result", "id": id, "ok": true, "value": {}})),
+                                    Some(code) => out(&events, json!({"type": "result", "id": id, "ok": false, "error": {"message": format!("scripted {code}"), "code": code}})),
+                                },
                                 "linger" => lingering.push(id),
                                 // What a real lease delivers when the machine
                                 // is lost and the service is placed elsewhere.
@@ -1736,6 +1743,157 @@ async fn the_first_failure_of_a_streak_wakes_the_thread_and_the_next_does_not() 
         .last_error
         .as_deref()
         .is_some_and(|error| error.contains("unknown_method")));
+}
+
+/// `tutor` scheduled to call `scripted`, each occurrence answering the next of
+/// `outcomes`, with a session run for its notices to wake. Answers the first
+/// due occurrence.
+async fn scripted_tutor(h: &Harness, outcomes: &[Option<&'static str>]) -> i64 {
+    h.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+             VALUES ('spanish-run', 'p', 'spanish-session', 'completed', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    h.host.scripted.lock().unwrap().extend(outcomes);
+    write_tutor(h, "spanish-session", scheduled("scripted"), false)
+        .await
+        .unwrap();
+    tutor_row(h).await.anchor_at
+}
+
+/// Run the occurrences from `first`, one per five-minute interval.
+async fn run_occurrences(h: &Harness, first: i64, from: usize, to: usize) {
+    for n in from..to {
+        assert_eq!(run_due(&h.orch, &tutor(), first + 300 * n as i64).await, 1);
+    }
+}
+
+async fn streak_notices(h: &Harness) -> Vec<String> {
+    use crate::storage::RowExt as _;
+    h.orch
+        .db
+        .local
+        .query_all(
+            "SELECT content FROM messages WHERE content LIKE '%started failing%' ORDER BY rowid",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap()
+}
+
+/// A known failure alternating with slow successes, as under a substrate
+/// incident, wakes the thread once per kind of failure rather than once per
+/// streak; the second notice names both kinds; the row counts every streak
+/// and every failed occurrence.
+#[tokio::test]
+async fn streaks_of_a_reported_kind_are_quiet_and_a_new_kind_is_news() {
+    let h = thread_harness().await;
+    let first = scripted_tutor(
+        &h,
+        &[
+            Some("deadline"),
+            None,
+            Some("deadline"),
+            Some("deadline"),
+            None,
+            Some("store"),
+        ],
+    )
+    .await;
+
+    run_occurrences(&h, first, 0, 4).await;
+    assert_eq!(
+        streak_notices(&h).await.len(),
+        1,
+        "fail, succeed, fail with the same kind is one notice"
+    );
+
+    run_occurrences(&h, first, 4, 6).await;
+    let notices = streak_notices(&h).await;
+    assert_eq!(notices.len(), 2, "a new kind is news: {notices:?}");
+    assert!(
+        notices[1].contains("not reported before, `store`"),
+        "{}",
+        notices[1]
+    );
+    assert!(
+        notices[1].contains("(kinds: `deadline`, `store`)"),
+        "{}",
+        notices[1]
+    );
+    assert!(
+        notices[1].contains("3 streaks, 4 failed occurrences"),
+        "{}",
+        notices[1]
+    );
+
+    let row = tutor_row(&h).await;
+    assert_eq!(row.consecutive_failures, 1);
+    let window = row.notice_window.unwrap();
+    assert_eq!((window.streaks, window.failures), (3, 4));
+    assert_eq!(
+        tutor_log(&h)
+            .await
+            .iter()
+            .filter(|text| text.contains("scripted"))
+            .count(),
+        6,
+        "every occurrence is still logged"
+    );
+}
+
+/// The owner acting on the service ends the quiet window: an explicit
+/// restart, and a manifest-only rewrite, each make the next streak of a
+/// reported kind news again.
+#[tokio::test]
+async fn an_owner_restart_or_rewrite_makes_the_next_streak_news() {
+    let h = thread_harness().await;
+    let first = scripted_tutor(
+        &h,
+        &[
+            Some("deadline"),
+            None,
+            Some("deadline"),
+            None,
+            Some("deadline"),
+            None,
+            Some("deadline"),
+        ],
+    )
+    .await;
+
+    run_occurrences(&h, first, 0, 2).await;
+    assert_eq!(streak_notices(&h).await.len(), 1);
+    restart(&h.orch, &tutor(), "cairn://p/cairn/spanish")
+        .await
+        .unwrap();
+    run_occurrences(&h, first, 2, 4).await;
+    let notices = streak_notices(&h).await;
+    assert_eq!(notices.len(), 2, "after a restart: {notices:?}");
+    assert!(
+        !notices[1].contains("The window before"),
+        "a one-streak window has nothing to add: {}",
+        notices[1]
+    );
+
+    // A manifest-only rewrite: the schedule entry, and so its row, is kept.
+    let mut rewritten = scheduled("scripted");
+    rewritten["description"] = json!("a longer call timeout");
+    write_tutor(&h, "spanish-session", rewritten, false)
+        .await
+        .unwrap();
+    run_occurrences(&h, first, 4, 5).await;
+    assert_eq!(streak_notices(&h).await.len(), 3, "after a manifest write");
+
+    // With nothing done since, the same kind is quiet again.
+    run_occurrences(&h, first, 5, 7).await;
+    assert_eq!(streak_notices(&h).await.len(), 3);
 }
 
 /// What comes next depends on whether the service is free to move, and the

@@ -352,6 +352,31 @@ async fn schedule_block(
             }
         }
     }
+    let source = status.and_then(|status| status.source_hash.as_deref());
+    for row in &rows {
+        // One streak is what its notice already said; more is what the window
+        // kept quiet, and the owner reads the count here.
+        let Some(window) = row
+            .notice_window
+            .as_ref()
+            .filter(|window| window.streaks > 1)
+        else {
+            continue;
+        };
+        let quiet = if window.quiet(now, source) {
+            format!(
+                "; a new streak of these kinds sends no notice until {}",
+                utc_seconds(window.closes_at())
+            )
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "\n`{}` failure notices: {}{quiet}\n",
+            row.method,
+            schedule::window_summary(window)
+        ));
+    }
     out
 }
 

@@ -3894,15 +3894,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn concurrent_observations_increment_without_lost_updates() {
-        let db =
-            Arc::new(crate::storage::migrated_test_db("resource-profile-concurrency.db").await);
-        let identity = CommandResourceIdentity {
-            version: 1,
-            key: "identity".into(),
-            suite: None,
-        };
+    /// Two observations of one profile at once both count. Looped, from OS
+    /// threads.
+    #[test]
+    fn concurrent_observations_increment_without_lost_updates() {
+        let runtime = crate::storage::race_runtime();
+        let db = Arc::new(runtime.block_on(crate::storage::migrated_test_db(
+            "resource-profile-concurrency.db",
+        )));
         let context = ProfileContext {
             executor_class: "device:executor".into(),
             os: "test-os".into(),
@@ -3937,34 +3936,36 @@ mod tests {
             stop: None,
             cell_origin: None,
         };
-        let (left, right) = tokio::join!(
-            update_profile(
-                db.clone(),
-                &identity,
-                &context,
-                metadata.finished_at_unix_ms,
-                metadata.peak_rss_bytes,
-                metadata.disk_delta_bytes,
-                metadata.duration_ms
-            ),
-            update_profile(
-                db.clone(),
-                &identity,
-                &context,
-                metadata.finished_at_unix_ms,
-                metadata.peak_rss_bytes,
-                metadata.disk_delta_bytes,
-                metadata.duration_ms
-            ),
-        );
-        left.unwrap();
-        right.unwrap();
-        let profile = load_profile(db, &identity, &context)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(profile.sample_count, 2);
-        assert_eq!(profile.upper_peak_rss_bytes, Some(100));
+        for round in 0..20 {
+            let identity = CommandResourceIdentity {
+                version: 1,
+                key: format!("identity-{round}"),
+                suite: None,
+            };
+            let (rt, db, identity, context, metadata) =
+                (&runtime, &db, &identity, &context, &metadata);
+            for observed in crate::storage::race_on_threads((0..2).map(|_| {
+                move || {
+                    rt.block_on(update_profile(
+                        db.clone(),
+                        identity,
+                        context,
+                        metadata.finished_at_unix_ms,
+                        metadata.peak_rss_bytes,
+                        metadata.disk_delta_bytes,
+                        metadata.duration_ms,
+                    ))
+                }
+            })) {
+                observed.unwrap();
+            }
+            let profile = runtime
+                .block_on(load_profile(db.clone(), identity, context))
+                .unwrap()
+                .unwrap();
+            assert_eq!(profile.sample_count, 2, "round {round}");
+            assert_eq!(profile.upper_peak_rss_bytes, Some(100));
+        }
     }
 
     #[tokio::test]

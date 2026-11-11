@@ -285,8 +285,9 @@ pub struct UpdateJobChangeset<'a> {
 /// `j.base_commit` into a coordinate struct. Neither is visible to the compiler,
 /// to a type, or to a doc comment, so neither could be prevented by any of them.
 ///
-/// **What this covers.** A string literal — regular or raw, in any case — that
-/// names `base_commit` and puts `jobs` in table position. Table position is the
+/// **What this covers.** A SQL statement in a string literal — regular or raw,
+/// in any case — that names `base_commit` and puts `jobs` in table position.
+/// Table position is the
 /// token after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE`, or a comma, so a join
 /// (`... FROM projects p JOIN jobs j ON ...`), a comma-separated `FROM` list, and
 /// a lowercase query are all caught, not just the three shapes that happened to
@@ -335,15 +336,12 @@ mod jobs_base_commit_sql_reach {
     ///   the original recorded cut to prove routed receipt consumption.
     /// - `execution/jobs/lifecycle.rs` — restart fixtures check that a refused
     ///   resume preserves the previously recorded anchor.
-    /// - `mcp/handlers/run/held.rs` — fixtures seed jobs and held-publication
-    ///   archival bases in one SQL batch; the latter is not a live job coordinate.
     const SANCTIONED_SQL_SITES: &[&str] = &[
         "os/cairn-core/src/effects/dag/delegation.rs",
         "os/cairn-workflow/src/advancement/job_creation.rs",
         "os/cairn-workflow/src/effects/dag/delegation.rs",
         "os/cairn-core/src/execution/jobs/persistence.rs",
         "os/cairn-core/src/execution/jobs/lifecycle.rs",
-        "os/cairn-core/src/mcp/handlers/run/held.rs",
         "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance.rs",
         "os/cairn-core/src/resources/mutations/dispatch/rebase/acceptance/tests.rs",
         "os/cairn-core/src/orchestrator/base_advance.rs",
@@ -454,15 +452,19 @@ mod jobs_base_commit_sql_reach {
         tokens
     }
 
-    /// Whether one string literal reads or writes `jobs.base_commit`.
+    /// Whether one string literal holds a statement that reads or writes
+    /// `jobs.base_commit`. Each `;`-separated statement is judged on its own, so
+    /// a batch seeding `jobs` beside another table's `base_commit` is not one.
+    /// The split is not lexical: a `;` inside a quoted value or comment cuts a
+    /// statement in two, which can hide a read only if neither half names both.
     fn literal_reads_jobs_base_commit(literal: &str) -> bool {
-        let tokens = sql_tokens(literal);
-        if !tokens.iter().any(|token| token == "base_commit") {
-            return false;
-        }
-        tokens
-            .windows(2)
-            .any(|pair| TABLE_POSITION.contains(&pair[0].as_str()) && pair[1] == "jobs")
+        literal.split(';').any(|statement| {
+            let tokens = sql_tokens(statement);
+            tokens.iter().any(|token| token == "base_commit")
+                && tokens
+                    .windows(2)
+                    .any(|pair| TABLE_POSITION.contains(&pair[0].as_str()) && pair[1] == "jobs")
+        })
     }
 
     fn names_jobs_base_commit_in_sql(source: &str) -> bool {
@@ -570,6 +572,27 @@ mod jobs_base_commit_sql_reach {
         ));
     }
 
+    /// The column is judged one statement at a time: the `mcp/handlers/run/held.rs`
+    /// drain fixtures seed `jobs` and `held_publications.base_commit` in one batch.
+    #[test]
+    fn the_detector_reads_each_statement_on_its_own() {
+        let jobs = "INSERT INTO jobs(id, project_id, status, branch) \
+                    VALUES('job', 'project', 'running', 'feature')";
+        let held = "INSERT INTO held_publications(attempt_id, job_id, base_commit, delta_commit) \
+                    VALUES('attempt', 'job', 'base', 'delta')";
+        for sql in [format!("{jobs};\n{held};"), format!("{held};\n{jobs};")] {
+            assert!(
+                !literal_reads_jobs_base_commit(&sql),
+                "no statement here reads jobs.base_commit, yet it was flagged: {sql}"
+            );
+        }
+        let sql = format!("{held}; SELECT base_commit FROM jobs WHERE id = 'job';");
+        assert!(
+            literal_reads_jobs_base_commit(&sql),
+            "this reads jobs.base_commit and was not flagged: {sql}"
+        );
+    }
+
     #[test]
     fn only_sanctioned_sites_name_jobs_base_commit_in_sql() {
         let root = src_tauri_root();
@@ -599,12 +622,14 @@ mod jobs_base_commit_sql_reach {
              stopped testing anything and the skip below hides a real file"
         );
 
+        // A file the scan cannot read is a file it has not cleared.
         let observed: BTreeSet<String> = files
             .iter()
             .filter(|path| {
-                std::fs::read_to_string(path)
-                    .map(|text| names_jobs_base_commit_in_sql(&text))
-                    .unwrap_or(false)
+                let text = std::fs::read_to_string(path).unwrap_or_else(|error| {
+                    panic!("the scan could not read {}: {error}", path.display())
+                });
+                names_jobs_base_commit_in_sql(&text)
             })
             .map(|path| {
                 path.strip_prefix(&root)

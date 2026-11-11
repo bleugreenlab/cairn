@@ -139,6 +139,58 @@ pub async fn migrated_test_db(name: &str) -> LocalDb {
     LocalDb::open_migrated_for_test(path).await.unwrap()
 }
 
+/// Runs every racer at once, each on its own OS thread, released together from
+/// one barrier, and returns their results in racer order. A racer's panic
+/// resumes on the caller, so an assertion inside a racer fails the test.
+///
+/// This is the harness for a test that races database writers: an async racer
+/// calls `block_on` on a shared multi-thread runtime ([`race_runtime`]) from
+/// inside its closure. Racers spawned as tasks or joined as futures on one test
+/// runtime are not enough, because their transactions mostly do not overlap:
+/// tests written that way stayed green with the guard they claim to test
+/// removed (docs/database.md, "Write skew"). Call it from a plain `#[test]`;
+/// `block_on` panics inside an async test.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn race_on_threads<T, F>(racers: impl IntoIterator<Item = F>) -> Vec<T>
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    let racers: Vec<F> = racers.into_iter().collect();
+    let barrier = std::sync::Barrier::new(racers.len());
+    std::thread::scope(|scope| {
+        let running: Vec<_> = racers
+            .into_iter()
+            .map(|racer| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    racer()
+                })
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|racer| {
+                racer
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+/// The multi-thread runtime a [`race_on_threads`] test sets up on and whose
+/// `block_on` its racers drive their futures with.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn race_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 /// The `EXPLAIN QUERY PLAN` detail lines for `sql` bound with `binds`, one step
 /// per line. Turso plans without statistics, and a weaker access path still
 /// returns the right rows, so only an assertion on this text witnesses a plan

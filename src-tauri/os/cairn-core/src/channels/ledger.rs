@@ -2258,59 +2258,63 @@ mod tests {
         assert_eq!(leases.iter().filter(|lease| lease.is_some()).count(), 1);
     }
 
-    #[tokio::test]
-    async fn concurrent_transports_share_one_winner_and_one_domain_lease() {
-        let db = migrated_test_db("all-surface-ask-race.db").await;
-        let (desktop, resource) = tokio::join!(
-            claim_ask_resolution(
-                &db,
-                "prompt:0",
-                "Desktop",
-                cairn_common::identity::AppearanceTransport::AuthenticatedDesktop,
-                None,
-                None,
-                None,
-                "question",
-                "prompt",
-                10,
-            ),
-            claim_ask_resolution(
-                &db,
-                "prompt:0",
-                "Resource",
-                cairn_common::identity::AppearanceTransport::ResourcePatch,
-                None,
-                None,
-                Some("cairn://p/CAIRN/1/1/builder"),
-                "question",
-                "prompt",
-                10,
-            ),
-        );
-        let claims = [desktop.unwrap(), resource.unwrap()];
-        assert_eq!(
-            claims
+    /// Two transports answering one ask share one winner, and two routers
+    /// leasing its action get one lease. Looped, from OS threads.
+    #[test]
+    fn concurrent_transports_share_one_winner_and_one_domain_lease() {
+        let runtime = crate::storage::race_runtime();
+        let db = runtime.block_on(migrated_test_db("all-surface-ask-race.db"));
+        for round in 0..20 {
+            let action = format!("prompt-{round}");
+            let binding = format!("{action}:0");
+            let (rt, db, action, binding) = (&runtime, &db, action.as_str(), binding.as_str());
+            let claims = crate::storage::race_on_threads(
+                [
+                    (
+                        "Desktop",
+                        cairn_common::identity::AppearanceTransport::AuthenticatedDesktop,
+                        None,
+                    ),
+                    (
+                        "Resource",
+                        cairn_common::identity::AppearanceTransport::ResourcePatch,
+                        Some("cairn://p/CAIRN/1/1/builder"),
+                    ),
+                ]
+                .map(|(answer, transport, actor)| {
+                    move || {
+                        rt.block_on(claim_ask_resolution(
+                            db, binding, answer, transport, None, None, actor, "question", action,
+                            10,
+                        ))
+                        .unwrap()
+                    }
+                }),
+            );
+            assert_eq!(
+                claims
+                    .iter()
+                    .filter(|claim| matches!(claim, AskClaim::Won(_)))
+                    .count(),
+                1,
+                "round {round}"
+            );
+            let answers = claims
                 .iter()
-                .filter(|claim| matches!(claim, AskClaim::Won(_)))
-                .count(),
-            1
-        );
-        let answers = claims
-            .iter()
-            .map(|claim| match claim {
-                AskClaim::Won(value) | AskClaim::Existing(value) => value.answer.as_str(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(answers[0], answers[1]);
+                .map(|claim| match claim {
+                    AskClaim::Won(value) | AskClaim::Existing(value) => value.answer.as_str(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(answers[0], answers[1]);
 
-        let (first, second) = tokio::join!(
-            try_lease_ask_action(&db, "prompt", 11, 100),
-            try_lease_ask_action(&db, "prompt", 11, 100),
-        );
-        assert_eq!(
-            [first.unwrap(), second.unwrap()].iter().flatten().count(),
-            1
-        );
+            let leases = crate::storage::race_on_threads((0..2).map(|_| {
+                move || {
+                    rt.block_on(try_lease_ask_action(db, action, 11, 100))
+                        .unwrap()
+                }
+            }));
+            assert_eq!(leases.iter().flatten().count(), 1, "round {round}");
+        }
     }
 
     #[tokio::test]

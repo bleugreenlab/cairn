@@ -1,0 +1,12 @@
+-- lineage: private
+-- cairn/6556: a schedule entry's failure notices coalesce. Under a substrate
+-- incident an entry can alternate slow successes and failures, so every
+-- failure begins a new streak; one notice per streak then wakes the owner
+-- every few occurrences for one cause it already knows. `notice_window` is the
+-- JSON record of what the entry's notices have reported since the last one
+-- that opened a quiet window: when it opened, the failure kinds (call error
+-- codes) named, the streaks and failed occurrences since, the service source
+-- it opened under, and whether the owner has since started, stopped, or
+-- restarted the service. `project_services/schedule.rs` is its one reader and
+-- writer. NULL until the entry's first failure.
+ALTER TABLE service_schedules ADD COLUMN notice_window TEXT;

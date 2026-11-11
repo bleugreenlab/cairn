@@ -232,6 +232,146 @@ const OPERATOR_NOTIFICATION_INPUT_TABLES: &[&str] = &[
     crate::notifications::HOLDS_TABLE,
 ];
 
+/// The channel router's three gate sources (`channels::router::shared_gates`).
+///
+/// Each is a fact about the workspace that every enabled provider reads, so
+/// each is computed once for the process and invalidated by its own input
+/// tables, listed below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateKind {
+    Question,
+    Permission,
+    Review,
+}
+
+impl GateKind {
+    pub(crate) const ALL: [GateKind; 3] = [Self::Question, Self::Permission, Self::Review];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Permission => "permission",
+            Self::Review => "review",
+        }
+    }
+
+    fn input_tables(self) -> &'static [&'static str] {
+        match self {
+            Self::Question => QUESTION_GATE_INPUT_TABLES,
+            Self::Permission => PERMISSION_GATE_INPUT_TABLES,
+            Self::Review => REVIEW_GATE_INPUT_TABLES,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Question => 0,
+            Self::Permission => 1,
+            Self::Review => 2,
+        }
+    }
+}
+
+/// The tables the question gate source reads.
+///
+/// `QUESTION_GATES_SQL` joins the prompt to its run, job, issue, project and
+/// execution; a job without an issue builds its question URI through
+/// `home_uri_for_job_conn`, which adds `threads`. Every gate is then stamped
+/// with its holder (`attention_push::asks_held_by_agent`), which reads the push
+/// rows, the holders' jobs and threads, and their `wake_subscriptions`.
+/// Routing a gate to a Discord surface reads issues, projects and threads,
+/// which every gate list already carries.
+const QUESTION_GATE_INPUT_TABLES: &[&str] = &[
+    "prompts",
+    "runs",
+    "jobs",
+    "issues",
+    "projects",
+    "executions",
+    "threads",
+    "attention_pushes",
+    "wake_subscriptions",
+];
+
+/// The tables the permission gate source reads: `PERMISSION_GATES_SQL`'s
+/// joins, which add the parent job to the question source's, and the same
+/// home-URI fallback and holder stamp.
+const PERMISSION_GATE_INPUT_TABLES: &[&str] = &[
+    "permission_requests",
+    "runs",
+    "jobs",
+    "issues",
+    "projects",
+    "executions",
+    "threads",
+    "attention_pushes",
+    "wake_subscriptions",
+];
+
+/// The tables the review gate source reads: the unretired review pushes, the
+/// issue titles they name (`issues`, `projects`), what decides each push's
+/// verdict (`attention_push::resolve_verdict_refs`: issue status, merge
+/// requests, and the artifacts reached through `jobs`), and the holder stamp
+/// (`jobs`, `threads`, `wake_subscriptions`).
+///
+/// `events` is absent, and so is every other high-volume table. Delivering a
+/// review stamps its push in the transaction of the event that carries it,
+/// which announces only `events`, and that is correct: delivery is not
+/// retirement, so a delivered review is still the same gate.
+const REVIEW_GATE_INPUT_TABLES: &[&str] = &[
+    "attention_pushes",
+    "issues",
+    "projects",
+    "merge_requests",
+    "jobs",
+    "artifacts",
+    "threads",
+    "wake_subscriptions",
+];
+
+/// One input generation per gate kind, advanced by [`ProjectionInvalidatingEmitter`].
+///
+/// The router's gate sources used to key their staleness to the database's
+/// global mutation counter, which every write advances: an executor heartbeat,
+/// a transcript event, the channel ledger's own bookkeeping, and the review
+/// loader's own retirements. Each of those recomputed the whole review backlog
+/// for nothing. These counters advance only on a committed write to a table
+/// the kind reads.
+///
+/// Unscoped on purpose. Advancing is free and work happens only on the next
+/// read, so there is nothing to save by placing a frame against a project, and
+/// a counter that can only over-invalidate cannot serve a stale gate.
+#[derive(Default)]
+pub(crate) struct GateInputGenerations {
+    generations: [AtomicU64; 3],
+}
+
+impl GateInputGenerations {
+    pub(crate) fn generation(&self, kind: GateKind) -> u64 {
+        self.generations[kind.index()].load(Ordering::Acquire)
+    }
+
+    /// A committed write to `table` moves every kind that reads it.
+    pub(crate) fn note_table(&self, table: &str) {
+        for kind in GateKind::ALL {
+            if kind.input_tables().contains(&table) {
+                self.advance(kind);
+            }
+        }
+    }
+
+    /// A team pull applies remote rows of any table at once.
+    pub(crate) fn note_all(&self) {
+        for kind in GateKind::ALL {
+            self.advance(kind);
+        }
+    }
+
+    fn advance(&self, kind: GateKind) {
+        self.generations[kind.index()].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Inputs whose rows are not owned by any one project, so a `db-change` for
 /// them legitimately carries no `projectId` and invalidates every key.
 #[cfg(test)]
@@ -270,6 +410,7 @@ pub(crate) struct ProjectionInvalidatingEmitter {
     issue_list: Arc<IssueListCache>,
     operator_notifications: Arc<OperatorNotificationsCache>,
     pending_deliveries: Arc<PendingDeliveriesCache>,
+    gate_inputs: Arc<GateInputGenerations>,
 }
 
 impl ProjectionInvalidatingEmitter {
@@ -280,6 +421,7 @@ impl ProjectionInvalidatingEmitter {
         issue_list: Arc<IssueListCache>,
         operator_notifications: Arc<OperatorNotificationsCache>,
         pending_deliveries: Arc<PendingDeliveriesCache>,
+        gate_inputs: Arc<GateInputGenerations>,
     ) -> Self {
         Self {
             inner,
@@ -288,6 +430,7 @@ impl ProjectionInvalidatingEmitter {
             issue_list,
             operator_notifications,
             pending_deliveries,
+            gate_inputs,
         }
     }
 
@@ -296,9 +439,11 @@ impl ProjectionInvalidatingEmitter {
             return;
         };
         if table == "team_sync" {
+            self.gate_inputs.note_all();
             self.note_team_sync(payload);
             return;
         }
+        self.gate_inputs.note_table(table);
         self.note_pending_delivery_input(table, payload);
         let thread_input = THREAD_STATUS_INPUT_TABLES.contains(&table);
         let issue_input = ISSUE_STATUS_INPUT_TABLES.contains(&table);
@@ -746,20 +891,25 @@ impl<V: Clone> GenerationCache<V> {
         reason: &'static str,
         stale: impl Fn(&V) -> bool,
     ) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        let Some(published) = state
+        self.invalidate_stale_because(key, |published| stale(published).then_some(reason))
+            .is_some()
+    }
+
+    /// [`Self::invalidate_stale`] for a policy with more than one reason to
+    /// replace a value: `stale` names the reason, or returns `None` to keep it.
+    /// Returns the reason this caller advanced the generation for.
+    pub(crate) fn invalidate_stale_because(
+        &self,
+        key: &str,
+        stale: impl Fn(&V) -> Option<&'static str>,
+    ) -> Option<&'static str> {
+        let mut state = self.state.lock().ok()?;
+        let published = state
             .settled(key, state.current_generation(key))
-            .and_then(|settled| settled.value.as_ref())
-        else {
-            return false;
-        };
-        if !stale(published) {
-            return false;
-        }
+            .and_then(|settled| settled.value.as_ref())?;
+        let reason = stale(published)?;
         Self::advance_locked(&mut state, self.label, key, reason);
-        true
+        Some(reason)
     }
 
     /// Read the published value for a key, computing it exactly once per
@@ -2484,6 +2634,7 @@ mod tests {
         list: Arc<IssueListCache>,
         notifications: Arc<OperatorNotificationsCache>,
         pending: Arc<PendingDeliveriesCache>,
+        gate_inputs: Arc<GateInputGenerations>,
         thread_jobs: Arc<Mutex<HashSet<String>>>,
         issue_jobs: Arc<Mutex<HashSet<String>>>,
         announced: Arc<Mutex<Vec<String>>>,
@@ -2549,6 +2700,7 @@ mod tests {
             rebuild_with(|_key| async { Ok(Arc::default()) }),
             recording(&announced, "pending_deliveries"),
         );
+        let gate_inputs = Arc::new(GateInputGenerations::default());
         let emitter = ProjectionInvalidatingEmitter::new(
             Arc::new(CapturingEmitter::new()),
             threads.clone(),
@@ -2556,9 +2708,11 @@ mod tests {
             list.clone(),
             notifications.clone(),
             pending.clone(),
+            gate_inputs.clone(),
         );
         Sidebar {
             emitter,
+            gate_inputs,
             threads,
             issues,
             list,
@@ -2921,6 +3075,61 @@ mod tests {
         for (table, want) in expected {
             assert_eq!(advances(table), want, "{table}: (thread, issue, list)");
         }
+    }
+
+    /// The channel router's gate sources, asserted the same way: each kind
+    /// advances on its own input tables, scoped or not, and on nothing else.
+    /// The high-volume tables that used to recompute the review backlog through
+    /// the database's global counter move none of them.
+    #[test]
+    fn each_gate_kind_advances_on_its_own_inputs_only() {
+        let advances = |frame: Value| {
+            let s = sidebar(STATUS_ROLLUP_FLOOR);
+            let before = GateKind::ALL.map(|kind| s.gate_inputs.generation(kind));
+            s.emit(frame);
+            let after = GateKind::ALL.map(|kind| s.gate_inputs.generation(kind));
+            (
+                after[0] > before[0],
+                after[1] > before[1],
+                after[2] > before[2],
+            )
+        };
+        // (question, permission, review)
+        let expected = [
+            ("prompts", (true, false, false)),
+            ("permission_requests", (false, true, false)),
+            ("runs", (true, true, false)),
+            ("executions", (true, true, false)),
+            ("merge_requests", (false, false, true)),
+            ("artifacts", (false, false, true)),
+            ("attention_pushes", (true, true, true)),
+            ("issues", (true, true, true)),
+            ("jobs", (true, true, true)),
+            ("threads", (true, true, true)),
+            ("wake_subscriptions", (true, true, true)),
+            ("events", (false, false, false)),
+            ("turns", (false, false, false)),
+            ("sessions", (false, false, false)),
+            ("executor_enrollments", (false, false, false)),
+            ("channel_outbound", (false, false, false)),
+        ];
+        for (table, want) in expected {
+            assert_eq!(
+                advances(serde_json::json!({"table": table, "projectId": "proj"})),
+                want,
+                "{table}: (question, permission, review)"
+            );
+            assert_eq!(
+                advances(serde_json::json!({"table": table})),
+                want,
+                "{table} unscoped: (question, permission, review)"
+            );
+        }
+        assert_eq!(
+            advances(serde_json::json!({"table": "team_sync", "projectIds": ["proj"]})),
+            (true, true, true),
+            "a team pull can have moved any table"
+        );
     }
 
     /// A scoped input change touches only its own project.

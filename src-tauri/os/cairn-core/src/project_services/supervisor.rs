@@ -1849,6 +1849,7 @@ async fn start_attached(
     actor: &str,
 ) -> Result<(), CallError> {
     let cell = target.cell(orch);
+    end_notice_windows(orch, &cell).await;
     {
         let mut state = cell.state.lock().unwrap();
         state.sticky_stop = false;
@@ -1877,6 +1878,7 @@ async fn stop_attached(
     actor: &str,
 ) -> Result<(), CallError> {
     let cell = target.cell(orch);
+    end_notice_windows(orch, &cell).await;
     let _ops = cell.ops.lock().await;
     let current = {
         let mut state = cell.state.lock().unwrap();
@@ -1913,6 +1915,7 @@ async fn restart_attached(
     actor: &str,
 ) -> Result<(), CallError> {
     let cell = target.cell(orch);
+    end_notice_windows(orch, &cell).await;
     let _ops = cell.ops.lock().await;
     {
         let mut state = cell.state.lock().unwrap();
@@ -1922,6 +1925,21 @@ async fn restart_attached(
     }
     let package = read_package(orch, &cell).await?;
     replace(orch, &cell, &package, actor).await
+}
+
+/// The owner explicitly started, stopped, or restarted the service, so its
+/// schedule's next failure streak is news whatever its kind. The supervisor's
+/// own restarts after a crash do not come through here and end nothing.
+async fn end_notice_windows(orch: &Orchestrator, cell: &Cell) {
+    let ended = match cell_db(orch, &cell.project_id).await {
+        Ok(db) => {
+            schedule::end_notice_windows(&db, &cell.project_id, &cell.owner, &cell.service).await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = ended {
+        tracing::warn!(%error, service = %cell.service, "could not end a schedule's quiet window");
+    }
 }
 
 /// Apply an owner's current source to every service it declares or this
@@ -2208,7 +2226,8 @@ fn occurrence_at(due: i64) -> String {
 }
 
 /// Claim occurrence `due` of one entry, call its method as the owner, record
-/// the outcome, and tell the owning thread if a failure streak begins.
+/// the outcome, and tell the owning thread if a failure streak begins that
+/// its schedule's quiet window does not cover.
 /// Answers false when the occurrence was deferred, unclaimed, to run later:
 /// before the project pass, or after a placement refusal.
 async fn fire_occurrence(
@@ -2286,38 +2305,56 @@ async fn fire_occurrence(
                     None => return false,
                     Some(first) => {
                         began_at = first;
-                        schedule::Outcome::Failed(error.to_string())
+                        schedule::Outcome::Failed {
+                            kind: error.code.clone(),
+                            error: error.to_string(),
+                        }
                     }
                 }
             }
-            Err(error) => schedule::Outcome::Failed(error.to_string()),
+            Err(error) => schedule::Outcome::Failed {
+                kind: error.code.clone(),
+                error: error.to_string(),
+            },
         }
+    };
+    // The newest source the owner gave the service, which a failed
+    // replacement leaves as the last one read rather than the one serving.
+    let source_hash = {
+        let state = cell.state.lock().unwrap();
+        state.last_source_hash.clone().or_else(|| {
+            state
+                .current
+                .as_ref()
+                .map(|current| current.source_hash.clone())
+        })
     };
     // However the occurrence settled, nothing of it is left to retry.
     cell.placement_retries
         .lock()
         .unwrap()
         .remove(&row.entry_key);
-    let began = match schedule::settle(
+    let notice = match schedule::settle(
         &db,
         project_id,
         owner,
         service,
         &row.entry_key,
         &outcome,
+        source_hash.as_deref(),
         now_secs(),
     )
     .await
     {
-        Ok(began) => began,
+        Ok(notice) => notice,
         Err(error) => {
             tracing::warn!(%error, service = %cell.service, "could not record a scheduled outcome");
-            false
+            None
         }
     };
-    if let (true, schedule::Outcome::Failed(error)) = (began, &outcome) {
+    if let (Some(notice), schedule::Outcome::Failed { error, .. }) = (&notice, &outcome) {
         let home = cell.home();
-        let content = schedule::streak_notice(&home, service, row, began_at, error);
+        let content = schedule::streak_notice(&home, service, row, began_at, error, notice);
         let key = format!("service-schedule:{home}:{}", row.entry_key);
         if let Err(error) = super::notify_owner(orch, &db, owner, &key, &content).await {
             tracing::warn!(%error, service = %cell.service, "could not send a schedule failure notice");

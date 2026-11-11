@@ -2008,12 +2008,13 @@ mod projection_tests {
         .unwrap()
     }
 
-    /// A resolution retires the pending review pushes naming its issue in the
-    /// same write, and nothing else: a delivered review, another issue's review,
-    /// and a question on the same issue are untouched. A reopen leaves the
-    /// retired row retired, and the reopened issue's next review is a new row.
+    /// A resolution retires every unretired review push naming its issue in the
+    /// same write, pending and delivered alike, and nothing else: another
+    /// issue's review and a question on the same issue are untouched. The
+    /// delivered row keeps its delivery record. A reopen leaves the retired rows
+    /// retired, and the reopened issue's next review is a new row.
     #[tokio::test]
-    async fn a_resolution_retires_its_issues_pending_review_pushes() {
+    async fn a_resolution_retires_its_issues_review_pushes() {
         use cairn_attention::push::{push, Boundary, Wake};
         let db = crate::storage::migrated_test_db("resolution-retires-reviews.db").await;
         // The project key is stored capitalized; push keys are canonical.
@@ -2050,8 +2051,9 @@ mod projection_tests {
             ),
             (
                 "delivered",
-                "ev-1::",
-                "a delivered review is history, not queue",
+                "ev-1:500:review_resolved",
+                "a delivered review is still an obligation the channel router \
+                 carries until it is retired, so resolution retires it too",
             ),
             ("sibling", "::", "another issue's review"),
             (

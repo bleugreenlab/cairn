@@ -986,18 +986,21 @@ pub async fn retire_resolved(
     .await
 }
 
-/// Retire every pending `review:` push naming `issue_uri`, inside the write that
-/// resolves the issue, returning how many rows it retired.
+/// Retire every unretired `review:` push naming `issue_uri`, inside the write
+/// that resolves the issue, returning how many rows it retired.
 ///
 /// A review push names an issue as awaiting review, and once the issue is merged
-/// or closed nothing is. The drain resolver cannot always prove that from the
-/// issue's artifacts: a merged issue whose `create-pr` artifact was written
-/// again after its PR opened reads as a rerun still waiting for its PR, which is
-/// `Suspended` rather than `Terminal`, so the push would stay pending forever.
-/// The resolution is the one write that knows the fact, so it records it.
+/// or closed nothing is. The resolution is the one write that knows the fact, so
+/// it records it rather than leaving the rows to a later sweep.
 ///
-/// Delivered rows are untouched. A reopen does not undo this: a retired row has
-/// left the supersede index, so the reopened issue's next review is a new row.
+/// Delivered rows retire too. Retirement is independent of delivery (0196): a
+/// delivered review is still an obligation the channel router carries until it
+/// resolves, and a delivered review on a resolved issue is exactly the history
+/// that sweep must not keep re-reading. A delivery stamp only ever lands on an
+/// unretired row, so this cannot race one into an inconsistent state.
+///
+/// A reopen does not undo this: a retired row has left the supersede index, so
+/// the reopened issue's next review is a new row.
 /// Only `review:` keys retire here. A `question:` or `permission:` push on a
 /// resolved issue is deliberately `Suspended`, because reopening restores it.
 ///
@@ -1014,7 +1017,7 @@ pub async fn retire_reviews_of_resolved_issue_conn(
         .execute(
             "UPDATE attention_pushes
                 SET retired_at=?1, retirement_reason=?2
-              WHERE \"key\"=?3 AND delivered_event_id IS NULL AND retired_at IS NULL",
+              WHERE \"key\"=?3 AND retired_at IS NULL",
             params![now, RetirementReason::ReviewResolved.as_str(), key.as_str()],
         )
         .await?;
@@ -1562,15 +1565,17 @@ fn subject_issues_sql(numbers: usize) -> String {
     )
 }
 
-/// A batch of issues' merge requests: whether each is open, and when it opened.
+/// A batch of issues' merge requests: whether each is open, when it opened, and
+/// which job opened it.
 ///
-/// `opened_at` rides along because the review generation test needs the newest
-/// merge request per issue. Reading it here is what lets that test be a
-/// comparison in Rust instead of a correlated subquery in SQL -- see
-/// [`review_artifact_facts_sql`] for why that distinction is load-bearing.
+/// `opened_at` and `job_id` ride along because the review generation test needs
+/// the newest merge request per issue and the set of jobs that already have one.
+/// Reading them here is what lets that test be a comparison in Rust instead of a
+/// correlated subquery in SQL -- see [`review_artifact_facts_sql`] for why that
+/// distinction is load-bearing.
 fn review_merge_requests_sql(issues: usize) -> String {
     format!(
-        "SELECT issue_id, status, opened_at FROM merge_requests WHERE issue_id IN ({})",
+        "SELECT issue_id, status, opened_at, job_id FROM merge_requests WHERE issue_id IN ({})",
         placeholders(issues)
     )
 }
@@ -1599,7 +1604,7 @@ fn review_merge_requests_sql(issues: usize) -> String {
 /// which is also why they can no longer drift apart: they read the same facts.
 fn review_artifact_facts_sql(issues: usize) -> String {
     format!(
-        "SELECT j.issue_id, a.artifact_type, a.confirmed, a.created_at
+        "SELECT j.issue_id, a.artifact_type, a.confirmed, a.created_at, a.job_id
            FROM jobs j JOIN artifacts a ON a.job_id = j.id
           WHERE j.issue_id IN ({})",
         placeholders(issues)
@@ -1648,9 +1653,9 @@ impl RetirementReason {
 /// deliverable exactly as before -- the predicate fails OPEN, because a push
 /// wrongly dropped produces no signal at all (CAIRN-2410).
 ///
-/// [`Verdict::is_live`] reproduces the previous boolean predicate exactly, term
-/// for term. Retirement is strictly additional information layered on top of
-/// unchanged delivery behavior.
+/// [`Verdict::is_live`] is the boolean predicate retirement was layered onto,
+/// with one deliberate change: a `review:` push on a merged or closed issue is
+/// terminal whatever its rows say, so it is no longer live either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Live,
@@ -1659,8 +1664,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// Whether this push is still worth delivering. Identical to the boolean the
-    /// predicate returned before retirement existed.
+    /// Whether this push is still worth delivering.
     pub fn is_live(self) -> bool {
         matches!(self, Verdict::Live)
     }
@@ -1994,6 +1998,9 @@ async fn resolve_subjects(
             let binds: Vec<Value> = numbers.iter().copied().map(Value::Integer).collect();
             let mut issue_id_of: HashMap<(String, i32), String> = HashMap::new();
             let mut terminal: HashSet<String> = HashSet::new();
+            // Merged or closed, without `failed`: a failed issue can be rerun,
+            // so its review is not over, while a resolved one's is.
+            let mut resolved: HashSet<String> = HashSet::new();
             let mut rows = conn.query(&sql, binds).await?;
             while let Some(row) = rows.next().await? {
                 let project_key = cairn_uri::canonical_project(row.text(0)?);
@@ -2005,12 +2012,13 @@ async fn resolve_subjects(
                 }
                 let number = row.i64(1)? as i32;
                 let issue_id = row.text(2)?;
+                let status = row.opt_text(3)?;
                 // Mirrors `crate::models::IssueStatus::is_terminal`.
-                if matches!(
-                    row.opt_text(3)?.as_deref(),
-                    Some("merged" | "closed" | "failed")
-                ) {
+                if matches!(status.as_deref(), Some("merged" | "closed" | "failed")) {
                     terminal.insert(issue_id.clone());
+                }
+                if matches!(status.as_deref(), Some("merged" | "closed")) {
+                    resolved.insert(issue_id.clone());
                 }
                 issue_id_of.insert((project_key, number), issue_id);
             }
@@ -2037,6 +2045,9 @@ async fn resolve_subjects(
             let mut open_mr = HashSet::new();
             let mut any_mr = HashSet::new();
             let mut newest_mr_opened_at: HashMap<String, i64> = HashMap::new();
+            // `merge_requests.job_id` is unique (`idx_mr_job`), so a job either
+            // opened exactly one PR or none.
+            let mut jobs_with_mr: HashSet<String> = HashSet::new();
             let mut unconfirmed_plan = HashSet::new();
             let mut any_plan = HashSet::new();
             let mut create_pr = HashSet::new();
@@ -2063,6 +2074,9 @@ async fn resolve_subjects(
                             .and_modify(|newest| *newest = (*newest).max(opened_at))
                             .or_insert(opened_at);
                     }
+                    if let Some(job_id) = row.opt_text(3)? {
+                        jobs_with_mr.insert(job_id);
+                    }
                     any_mr.insert(issue_id);
                 }
 
@@ -2086,12 +2100,16 @@ async fn resolve_subjects(
                         "create-pr" => {
                             // Which review GENERATION the evidence belongs to.
                             //
-                            // A `create-pr` artifact written AFTER the newest
-                            // merge request opened is a review that has not got
-                            // its PR row yet. Within one generation the order is
-                            // always artifact-then-PR (the artifact auto-confirms
-                            // on write and the PR opens milliseconds later), so a
-                            // newer artifact can only mean a NEW generation.
+                            // A generation is a job: `merge_requests.job_id` is
+                            // unique, so each run opens at most one PR. A
+                            // `create-pr` artifact is a review still waiting for
+                            // its PR row only when it is newer than the newest
+                            // merge request AND its job has none. Time alone is
+                            // not enough: a builder revises `create-pr` after its
+                            // PR opens (a review reply, a rebase), and those
+                            // revisions are the same run as the PR they follow.
+                            // Read by time alone, every such issue looked like a
+                            // rerun forever and its review never retired.
                             //
                             // This is what keeps a rerun deliverable. An issue
                             // whose earlier run merged carries a merged
@@ -2105,10 +2123,11 @@ async fn resolve_subjects(
                             // barred from reading TERMINAL.
                             let newest_mr =
                                 newest_mr_opened_at.get(&issue_id).copied().unwrap_or(0);
-                            if row
+                            let newer_than_newest_mr = row
                                 .opt_i64(3)?
-                                .is_some_and(|created_at| created_at > newest_mr)
-                            {
+                                .is_some_and(|created_at| created_at > newest_mr);
+                            let job_has_mr = jobs_with_mr.contains(&row.text(4)?);
+                            if newer_than_newest_mr && !job_has_mr {
                                 create_pr_awaiting_mr.insert(issue_id.clone());
                             }
                             create_pr.insert(issue_id);
@@ -2183,6 +2202,15 @@ async fn resolve_subjects(
                 // Every `Suspended` below is a case that reopening the referent
                 // makes deliverable again, which is why none of them may retire.
                 let verdict = match subject.referent {
+                    // A merged or closed issue has no review left to have,
+                    // whatever its artifacts and merge-request rows say: a
+                    // closed issue can leave a PR row `open`, and a merged one
+                    // can leave a plan unconfirmed. The minting write already
+                    // refuses a review on a resolved issue, and reopening
+                    // mints a fresh row, so retiring here destroys nothing.
+                    Referent::Review if resolved.contains(issue_id) => {
+                        Verdict::Terminal(RetirementReason::ReviewResolved)
+                    }
                     Referent::Review => {
                         if open_mr.contains(issue_id)
                             || unconfirmed_plan.contains(issue_id)
@@ -2765,21 +2793,23 @@ mod tests {
     #[tokio::test]
     async fn the_answerability_lookup_seeks_by_key() {
         let db = crate::storage::migrated_test_db("attention-push-held-plan.db").await;
-        let plan = query_plan(
-            &db,
-            &pushes_for_keys_sql(1),
-            vec![Value::Text("question:cairn://p/proj/2".into())],
-        )
-        .await;
-        assert!(
-            plan.contains("idx_attention_pushes_key"),
-            "the lookup is driven by the keys it was handed (migration 0233):\n{plan}"
-        );
-        assert!(
-            !plan.contains("SCAN attention_pushes"),
-            "a scan here is the whole push history re-read every five seconds \
-             per provider:\n{plan}"
-        );
+        // One key, and the live review population's width (cairn/6512).
+        for width in [1usize, 400] {
+            let keys = (0..width)
+                .map(|n| Value::Text(format!("review:cairn://p/proj/{n}")))
+                .collect();
+            let plan = query_plan(&db, &pushes_for_keys_sql(width), keys).await;
+            assert!(
+                plan.contains("idx_attention_pushes_key"),
+                "the lookup is driven by the keys it was handed (migration 0233), \
+                 at width {width}:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN attention_pushes") && !plan.contains("SCAN ap"),
+                "a scan here is the whole push history re-read every five seconds \
+                 per provider, at width {width}:\n{plan}"
+            );
+        }
     }
 
     fn sample_push(key: &str, content_ref: &str) -> Push {
@@ -2837,12 +2867,18 @@ mod tests {
     #[tokio::test]
     async fn subject_resolution_statements_stay_on_the_backlog() {
         let db = migrated_db().await;
-        const BATCH: usize = 64;
+        // 400 is the live review population's width (cairn/6512): the channel
+        // router resolves every unretired review push in one batch.
+        for batch in [64, 400] {
+            subject_resolution_plans_at(&db, batch).await;
+        }
+    }
 
+    async fn subject_resolution_plans_at(db: &LocalDb, batch: usize) {
         let issues = query_plan(
-            &db,
-            &subject_issues_sql(BATCH),
-            (0..BATCH as i64).map(Value::Integer).collect(),
+            db,
+            &subject_issues_sql(batch),
+            (0..batch as i64).map(Value::Integer).collect(),
         )
         .await;
         assert!(
@@ -2855,11 +2891,11 @@ mod tests {
              every project the backlog names, which is the workspace:\n{issues}"
         );
 
-        let ids: Vec<Value> = (0..BATCH)
+        let ids: Vec<Value> = (0..batch)
             .map(|n| Value::Text(format!("issue-{n}")))
             .collect();
 
-        let facts = query_plan(&db, &review_artifact_facts_sql(BATCH), ids.clone()).await;
+        let facts = query_plan(db, &review_artifact_facts_sql(batch), ids.clone()).await;
         assert!(
             facts.contains("SEARCH j USING INDEX idx_jobs_issue_id")
                 && facts.contains("SEARCH a USING INDEX idx_artifacts_job_id"),
@@ -2875,7 +2911,7 @@ mod tests {
              artifact_type:\n{facts}"
         );
 
-        let merge_requests = query_plan(&db, &review_merge_requests_sql(BATCH), ids).await;
+        let merge_requests = query_plan(db, &review_merge_requests_sql(batch), ids).await;
         assert!(
             merge_requests.contains("SEARCH merge_requests USING INDEX idx_mr_issue"),
             "the merge-request arm seeks by issue (migration 0195):\n{merge_requests}"
@@ -3920,10 +3956,10 @@ mod tests {
 
     /// The distinction retirement exists to respect. None of these referents is
     /// deliverable, and none of them is terminal: an unanswered question is
-    /// suppressed only by its issue's state, and a review push on an issue that
-    /// produced neither a merge request nor a plan has nothing to prove
+    /// suppressed only by its issue's state, and a review push on an open issue
+    /// that produced neither a merge request nor a plan has nothing to prove
     /// resolution with. Retiring either would destroy an obligation that
-    /// reopening the issue restores.
+    /// reopening the issue, or the run producing its PR, restores.
     #[tokio::test]
     async fn a_suppressed_or_unevidenced_referent_is_never_retired() {
         let db = migrated_db().await;
@@ -3931,7 +3967,9 @@ mod tests {
         db.execute_script(
             "INSERT INTO prompts(id, run_id, questions, response, created_at)
                VALUES('q','run-1','[]',NULL,1);
-             UPDATE issues SET status='closed' WHERE id='issue-1';",
+             UPDATE issues SET status='closed' WHERE id='issue-1';
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('issue-open','p',3,'Open','active','active','none',1,1);",
         )
         .await
         .unwrap();
@@ -3945,14 +3983,14 @@ mod tests {
         )
         .await
         .unwrap();
-        // A review push whose issue carries no merge request and no plan.
+        // A review push whose open issue carries no merge request and no plan.
         push(
             &db,
             "watcher",
-            ISSUE_URI,
+            "cairn://p/proj/3",
             Wake::Wake,
             Boundary::Event,
-            REVIEW_KEY,
+            "review:cairn://p/proj/3",
         )
         .await
         .unwrap();
@@ -4199,6 +4237,147 @@ mod tests {
             retirement_reason_of(&db, &id).await.as_deref(),
             Some("review_resolved"),
             "the generation guard defers retirement, it does not prevent it"
+        );
+    }
+
+    /// One verdict for the seeded issue's review key.
+    async fn review_verdict(db: &LocalDb) -> Verdict {
+        resolve_verdict_refs(db, &[(REVIEW_KEY, ISSUE_URI)])
+            .await
+            .unwrap()[0]
+    }
+
+    /// A builder revises its `create-pr` artifact after its PR opened -- a
+    /// review reply, a rebase. That revision is the same run as the PR, not a
+    /// rerun waiting for one, so once that PR merges the review is over. Read by
+    /// time alone this was `Suspended` forever, which is how almost every merged
+    /// issue's review stayed in the channel router's sweep.
+    #[tokio::test]
+    async fn a_create_pr_revised_after_its_own_pr_opened_does_not_hold_the_review() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-pr-1','child-job','create-pr',1,'{}',1,'create-pr',1,40,40),
+                   ('a-pr-2','child-job','create-pr',1,'{}',2,'create-pr',1,100,100);
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr','child-job','p','issue-1','t','b','main','merged',50,50);",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            review_verdict(&db).await,
+            Verdict::Terminal(RetirementReason::ReviewResolved),
+            "a revision from the job that opened the merged PR is not a new generation"
+        );
+    }
+
+    /// The rerun case read through the verdict directly: a newer `create-pr`
+    /// from a DIFFERENT job, one with no merge request, still defers retirement.
+    #[tokio::test]
+    async fn a_create_pr_from_a_job_without_a_pr_is_still_a_rerun() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "INSERT INTO jobs(id, project_id, issue_id, execution_id, node_name, uri_segment, status, current_session_id, created_at, updated_at)
+               VALUES('child-job-2','p','issue-1','exec-1','builder','builder','running','sess3',100,100);
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr','child-job','p','issue-1','t','b','main','merged',50,50);
+             INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-pr-1','child-job','create-pr',1,'{}',1,'create-pr',1,40,40),
+                   ('a-pr-2','child-job-2','create-pr',1,'{}',1,'create-pr',1,100,100);",
+        )
+        .await
+        .unwrap();
+        assert_eq!(review_verdict(&db).await, Verdict::Suspended);
+    }
+
+    /// A resolved issue ends its review whatever its rows say. Both of these
+    /// read `Live` before, because the verdict never looked at issue status,
+    /// and both are shapes the live workspace holds hundreds of.
+    #[tokio::test]
+    async fn a_resolved_issue_ends_its_review_whatever_its_rows_say() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // Merged, with a plan nobody confirmed.
+        db.execute_script(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-plan','child-job','plan',1,'{}',1,'plan',0,1,1);
+             UPDATE issues SET status='merged' WHERE id='issue-1';",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            review_verdict(&db).await,
+            Verdict::Terminal(RetirementReason::ReviewResolved)
+        );
+
+        // Closed, with a merge-request row that was never closed.
+        db.execute_script(
+            "DELETE FROM artifacts; UPDATE issues SET status='closed' WHERE id='issue-1';",
+        )
+        .await
+        .unwrap();
+        open_mr(&db).await;
+        assert_eq!(
+            review_verdict(&db).await,
+            Verdict::Terminal(RetirementReason::ReviewResolved)
+        );
+
+        // `failed` is not resolved: a failed issue can be rerun, so an open PR
+        // on one is still a review to have.
+        db.execute_script("UPDATE issues SET status='failed' WHERE id='issue-1';")
+            .await
+            .unwrap();
+        assert_eq!(review_verdict(&db).await, Verdict::Live);
+    }
+
+    /// Resolution retires the review rows it ends, delivered ones included.
+    /// Nearly every review row is delivered within seconds of being raised, so
+    /// a pending-only retirement retired almost nothing.
+    #[tokio::test]
+    async fn resolving_an_issue_retires_its_delivered_review() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        let (id, _) = push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stamp_delivered(&db, std::slice::from_ref(&id), "ev-1")
+                .await
+                .unwrap(),
+            1
+        );
+
+        let retired = db
+            .write(|conn| {
+                Box::pin(async move {
+                    retire_reviews_of_resolved_issue_conn(conn, ISSUE_URI, 500).await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retired, 1);
+        assert_eq!(
+            retirement_reason_of(&db, &id).await.as_deref(),
+            Some("review_resolved")
+        );
+        assert_eq!(
+            delivered_event(&db, &id).await,
+            Some("ev-1".to_string()),
+            "retiring keeps the delivery record"
         );
     }
 

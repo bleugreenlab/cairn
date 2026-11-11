@@ -20,7 +20,10 @@ use crate::routes::{ChannelSubmission, RouteFact};
 use crate::{
     mcp::handlers::permission::PermissionDecision,
     models::{ChannelInboundCapabilities, MessageClassPolicy},
-    orchestrator::{generation_cache::GenerationCache, Orchestrator},
+    orchestrator::{
+        generation_cache::{GateInputGenerations, GateKind, GenerationCache},
+        Orchestrator,
+    },
     storage::{LocalDb, RowExt},
 };
 
@@ -973,42 +976,63 @@ struct Gate {
     held_since: Option<i64>,
 }
 
-/// The three gate loads that depend only on the DATABASE.
+/// The shortest interval between two recomputations of one gate source while
+/// its inputs keep moving.
 ///
-/// A sweep belongs to one provider, but most of what it reads does not: the open
+/// The three gate loads ([`GateKind`]) depend only on the DATABASE: the open
 /// questions, the pending permissions, and the review backlog are facts about
-/// the workspace, and the provider only decides what to do with them. Every
-/// enabled provider nevertheless ran all three on its own five-second loop, so a
-/// workspace with three channels configured paid for the same expensive reads
-/// three times per tick, on three different threads (CAIRN-4208).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GateKind {
-    Question,
-    Permission,
-    Review,
-}
+/// the workspace, and a provider only decides what to do with them
+/// (CAIRN-4208). Their input tables are narrow, but `attention_pushes` is not:
+/// every push and every delivery of every kind writes it. So a source is
+/// stale only once its inputs have moved AND it is older than this floor, or
+/// than its own last computation if that took longer, which keeps a slow
+/// recompute on a starved host to at most half of one worker -- the rule
+/// `CadencedCache` applies to the sidebar rollups. Two seconds of staleness
+/// sits inside the five-second sweep.
+const GATE_SOURCE_FLOOR: Duration = Duration::from_secs(2);
 
-impl GateKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Question => "question",
-            Self::Permission => "permission",
-            Self::Review => "review",
-        }
-    }
-}
+/// A gate source older than this is recomputed whatever its inputs say.
+///
+/// The input generations are only as complete as the `db-change` frames that
+/// advance them. This bounds what a write site that forgets to announce itself
+/// can cost to a minute of delay, and keeps the review loader's retirement
+/// moving on a quiet workspace.
+const GATE_SOURCE_RECONCILE: Duration = Duration::from_secs(60);
 
-/// One kind's gates as of one database generation, plus the diagnostic counts
-/// the refresh log carries.
+/// One kind's gates as of one input generation, plus the diagnostic counts the
+/// refresh log carries.
 #[derive(Clone)]
 struct GateSourceSnapshot {
-    /// The database's mutation generation when this load STARTED. A reader whose
-    /// database has moved past it asks for a recomputation; a reader that
-    /// arrives while one is in flight joins it instead.
+    /// The kind's input generation when this load STARTED. A write racing the
+    /// load leaves the published snapshot behind the counter, so it is
+    /// recomputed once the floor allows rather than lost.
     generation: u64,
+    /// When this load finished, on tokio's clock so tests can pause it.
+    computed_at: tokio::time::Instant,
+    /// What this load cost, which raises the floor when it exceeds it.
+    duration: Duration,
     gates: Arc<Vec<Gate>>,
     backlog: usize,
     expired: usize,
+}
+
+/// Why a published gate source must be replaced, or `None` to keep it.
+fn gate_source_staleness(
+    snapshot: &GateSourceSnapshot,
+    observed: u64,
+    now: tokio::time::Instant,
+) -> Option<&'static str> {
+    let age = now.saturating_duration_since(snapshot.computed_at);
+    // The horizon is raised to the last load's own duration for the same reason
+    // the floor is: a load slower than the horizon would otherwise recompute on
+    // every sweep.
+    if age >= GATE_SOURCE_RECONCILE.max(snapshot.duration) {
+        return Some("reconcile-horizon");
+    }
+    if snapshot.generation != observed && age >= GATE_SOURCE_FLOOR.max(snapshot.duration) {
+        return Some("input-advanced");
+    }
+    None
 }
 
 /// Process-wide, so the sharing is between PROVIDERS and not merely between one
@@ -1040,7 +1064,7 @@ async fn load_source_gates(
 /// Here rather than inside each loader for two reasons. It keeps the loaders'
 /// admission shape intact -- they select the candidate population, this filters
 /// it, which is the CAIRN-4480 lesson about gate-shaped queries. And it sits
-/// inside `shared_gates`, so however many providers observe one database
+/// inside `shared_gates`, so however many providers observe one input
 /// generation, the predicate runs once for all of them.
 async fn stamp_agent_holders(db: &LocalDb, gates: &mut [Gate]) -> Result<(), String> {
     let keys: Vec<&str> = gates
@@ -1067,51 +1091,88 @@ async fn stamp_agent_holders(db: &LocalDb, gates: &mut [Gate]) -> Result<(), Str
     Ok(())
 }
 
-/// One kind's gates for one database, computed once per generation for the whole
-/// process however many providers ask for them.
-///
-/// The freshness rule is "no staler than when this reader asked", not "newer
-/// than anything": a reader that joins a flight already running accepts that
-/// flight's snapshot, and a reader whose database has advanced past what is
-/// published asks for a new one. Sharing therefore engages exactly when it is
-/// needed — under load, where sweeps are long and overlap, three providers
-/// collapse into one computation — and costs nothing at idle, where sweeps are
-/// short, never overlap, and each is a hit anyway.
-async fn shared_gates(db: &LocalDb, kind: GateKind) -> Result<GateSourceSnapshot, String> {
-    // The key carries the database's INSTANCE as well as its path: a handle
-    // reopened at the same path starts its generation again at zero, and a key
-    // that could not tell the two apart would hand the new database the old
-    // one's gates the moment its counter caught up.
-    let key = format!(
+/// The cache key for one kind's source on one database. It carries the
+/// database's INSTANCE as well as its path: a handle reopened at the same path
+/// is a different database, and a key that could not tell the two apart would
+/// hand the new one the old one's gates.
+fn gate_source_key(db: &LocalDb, kind: GateKind) -> String {
+    format!(
         "{}|{}|{}",
         db.instance(),
         db.path().display(),
         kind.as_str()
-    );
-    let observed = db.mutation_generation();
+    )
+}
+
+/// How many times each gate source has been computed, by cache key. The cache
+/// is a process-wide static, so a test reads its own key rather than counters
+/// every other test in the process also moves.
+#[cfg(test)]
+fn gate_source_computes() -> &'static Mutex<HashMap<String, u64>> {
+    static COMPUTES: std::sync::OnceLock<Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+    COMPUTES.get_or_init(Default::default)
+}
+
+/// One kind's gates for one database, computed once per input generation for
+/// the whole process however many providers ask for them.
+///
+/// The freshness rule is "no staler than when this reader asked, give or take
+/// the floor", not "newer than anything": a reader that joins a flight already
+/// running accepts that flight's snapshot, and a reader whose kind's inputs have
+/// advanced past what is published asks for a new one once
+/// [`GATE_SOURCE_FLOOR`] allows. Sharing therefore engages exactly when it is
+/// needed — under load, where sweeps are long and overlap, three providers
+/// collapse into one computation — and costs nothing at idle, where each sweep
+/// is a hit.
+///
+/// Staleness follows the kind's own input tables ([`GateInputGenerations`]),
+/// not the database's global mutation counter. That counter moved on every
+/// write in the workspace, including the review loader's own retirements and
+/// the channel ledger's per-sweep bookkeeping, so the review backlog was
+/// recomputed on nearly every sweep.
+async fn shared_gates(
+    db: &LocalDb,
+    inputs: &GateInputGenerations,
+    kind: GateKind,
+) -> Result<GateSourceSnapshot, String> {
+    let key = gate_source_key(db, kind);
+    let observed = inputs.generation(kind);
+    let now = tokio::time::Instant::now();
     // Deciding and advancing under one lock is the point: N providers observing
     // the same advance must produce ONE recomputation, where N unconditional
     // invalidations would each reject the readers already computing.
-    gate_sources().invalidate_stale(&key, "database-advanced", |snapshot| {
-        snapshot.generation != observed
+    let reason = gate_sources().invalidate_stale_because(&key, |snapshot| {
+        gate_source_staleness(snapshot, observed, now)
     });
     let failure = Mutex::new(None);
     let snapshot = gate_sources()
         .get_or_compute(&key, || async {
             // Read the generation BEFORE the load, so a write racing this
             // snapshot forces one follow-up refresh instead of being lost.
-            let generation = db.mutation_generation();
-            let started = Instant::now();
+            let generation = inputs.generation(kind);
+            let started = tokio::time::Instant::now();
+            #[cfg(test)]
+            {
+                *gate_source_computes()
+                    .lock()
+                    .expect("gate source compute counts poisoned")
+                    .entry(key.clone())
+                    .or_default() += 1;
+            }
             match load_source_gates(db, kind).await {
                 Ok((gates, backlog, expired)) => {
+                    let duration = started.elapsed();
                     log::info!(
-                        "channel gate source kind={} generation={generation} backlog={backlog} gates={} expired={expired} duration_ms={}",
+                        "channel gate source kind={} reason={} generation={generation} backlog={backlog} gates={} expired={expired} duration_ms={}",
                         kind.as_str(),
+                        reason.unwrap_or("unattributed"),
                         gates.len(),
-                        started.elapsed().as_millis()
+                        duration.as_millis()
                     );
                     Some(GateSourceSnapshot {
                         generation,
+                        computed_at: tokio::time::Instant::now(),
+                        duration,
                         gates: Arc::new(gates),
                         backlog,
                         expired,
@@ -1133,12 +1194,31 @@ async fn shared_gates(db: &LocalDb, kind: GateKind) -> Result<GateSourceSnapshot
     })
 }
 
+/// One router's routing of the gate sources, for one database.
+///
+/// Routing is a function of the source snapshots and the binding ledger, so it
+/// is keyed by exactly those: the identity of each source's published gates
+/// (one allocation per computation, held here so it cannot be reused) and the
+/// ledger's binding generation.
 #[derive(Default)]
 struct GateSnapshot {
-    generation: u64,
+    sources: Vec<Arc<Vec<Gate>>>,
     binding_generation: String,
     initialized: bool,
     routed: Vec<Gate>,
+}
+
+impl GateSnapshot {
+    fn routes(&self, sources: &[Arc<Vec<Gate>>], binding_generation: &str) -> bool {
+        self.initialized
+            && self.binding_generation == binding_generation
+            && self.sources.len() == sources.len()
+            && self
+                .sources
+                .iter()
+                .zip(sources)
+                .all(|(routed, source)| Arc::ptr_eq(routed, source))
+    }
 }
 
 pub struct ChannelRouter {
@@ -1151,6 +1231,17 @@ pub struct ChannelRouter {
     claims: ClaimSet,
     deferred_attention: Mutex<HashMap<String, DeferredAttention>>,
     gate_snapshots: Mutex<HashMap<std::path::PathBuf, GateSnapshot>>,
+    /// Delivery keys this router has claimed whose ledger row still owes a
+    /// send: a failed attempt waiting out its backoff, or a send skipped while
+    /// the provider was unavailable.
+    ///
+    /// A routing-cache hit offers only unclaimed and deferred gates, and the
+    /// cache now lives as long as the gate sources, which a delivery write does
+    /// not move. Without this a failed send would wait for the next source
+    /// recompute, up to the reconcile horizon, instead of its own backoff. Each
+    /// sweep that offers one of these reads its ledger row, and a final state
+    /// (sent, resolved, expired, or out of attempts) removes it.
+    unsent: Mutex<HashSet<String>>,
     /// Keyed by binding ref, so a fact re-submitted while its surface is still
     /// being created waits once.
     held_routes: Mutex<HashMap<String, HeldRoute>>,
@@ -1231,6 +1322,7 @@ impl ChannelRouter {
             claims: ClaimSet::default(),
             deferred_attention: Mutex::new(HashMap::new()),
             gate_snapshots: Mutex::new(HashMap::new()),
+            unsent: Mutex::new(HashSet::new()),
             held_routes: Mutex::new(HashMap::new()),
         }
     }
@@ -3142,6 +3234,16 @@ impl ChannelRouter {
             .iter()
             .map(|gate| gate.delivery_key(self.provider_id, &self.destination))
             .collect();
+        // A gate that left every source owes nothing more. The owed set spans
+        // every database this router sweeps, so it is pruned only against the
+        // union of their live gates, and only when every one of them loaded: a
+        // database that failed this sweep still owns its retries.
+        if snapshot_complete {
+            self.unsent
+                .lock()
+                .expect("unsent delivery set poisoned")
+                .retain(|key| live.contains(key));
+        }
         // Held and pending routes are presence-aware work outside `gates`, so
         // they need the operator's real presence as much as a live ask does.
         let route_work = !self
@@ -3291,51 +3393,17 @@ impl ChannelRouter {
         Ok(routed)
     }
 
-    /// Returns `(work, live)`: `work` contains gates whose database changed and
+    /// Returns `(work, live)`: `work` contains gates whose sources changed and
     /// need routing now; `live` is the complete cached identity set used for cleanup.
-    /// LocalDb's monotonic mutation generation makes the safety tick query-free at
-    /// idle while preserving a full live set for fencing and resolution cleanup.
+    /// A source that has not been recomputed is the same allocation it was, so
+    /// the safety tick is query-free at idle while preserving a full live set for
+    /// fencing and resolution cleanup.
     async fn load_routed_gates(
         &self,
         db: &LocalDb,
         binding_generation: &str,
     ) -> Result<(Vec<Gate>, Vec<Gate>), String> {
         let path = db.path().to_path_buf();
-        let generation = db.mutation_generation();
-        if let Some(snapshot) = self
-            .gate_snapshots
-            .lock()
-            .expect("gate snapshot cache poisoned")
-            .get(&path)
-            .filter(|snapshot| {
-                snapshot.initialized
-                    && snapshot.generation == generation
-                    && snapshot.binding_generation == binding_generation
-            })
-        {
-            let deferred = self
-                .deferred_attention
-                .lock()
-                .expect("deferred attention set poisoned");
-            let work = snapshot
-                .routed
-                .iter()
-                .filter(|gate| {
-                    let key = gate.delivery_key(self.provider_id, &self.destination);
-                    !self.claims.holds(&key) || deferred.contains_key(&key)
-                })
-                .cloned()
-                .collect();
-            return Ok((work, snapshot.routed.clone()));
-        }
-
-        // Capture generation before querying and store that exact value. A write
-        // racing this snapshot advances the database generation beyond the stored
-        // value and therefore forces one follow-up refresh instead of being lost.
-        // A shared source computed a moment earlier carries an older generation,
-        // and taking the OLDER of the two is what keeps that reuse from pinning
-        // this router to a snapshot it would otherwise have refreshed.
-        let started = Instant::now();
         let mut kinds = Vec::new();
         if self.route.question {
             kinds.push(GateKind::Question);
@@ -3346,14 +3414,47 @@ impl ChannelRouter {
         if self.route.notify {
             kinds.push(GateKind::Review);
         }
+        // A hit costs no database read: each source is the published snapshot
+        // unless its own inputs moved past the floor or it reached the
+        // reconcile horizon.
+        let mut sources = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            sources.push((kind, shared_gates(db, &self.orch.gate_inputs, kind).await?));
+        }
+        let source_gates: Vec<Arc<Vec<Gate>>> = sources
+            .iter()
+            .map(|(_, snapshot)| snapshot.gates.clone())
+            .collect();
+        if let Some(snapshot) = self
+            .gate_snapshots
+            .lock()
+            .expect("gate snapshot cache poisoned")
+            .get(&path)
+            .filter(|snapshot| snapshot.routes(&source_gates, binding_generation))
+        {
+            let deferred = self
+                .deferred_attention
+                .lock()
+                .expect("deferred attention set poisoned");
+            let unsent = self.unsent.lock().expect("unsent delivery set poisoned");
+            let work = snapshot
+                .routed
+                .iter()
+                .filter(|gate| {
+                    let key = gate.delivery_key(self.provider_id, &self.destination);
+                    !self.claims.holds(&key) || deferred.contains_key(&key) || unsent.contains(&key)
+                })
+                .cloned()
+                .collect();
+            return Ok((work, snapshot.routed.clone()));
+        }
+
+        let started = Instant::now();
         let mut gates = Vec::new();
         let mut review_pushes = 0;
         let mut review_backlog = 0;
         let mut expired = 0;
-        let mut generation = generation;
-        for kind in kinds {
-            let snapshot = shared_gates(db, kind).await?;
-            generation = generation.min(snapshot.generation);
+        for (kind, snapshot) in sources {
             review_backlog += snapshot.backlog;
             expired += snapshot.expired;
             if kind == GateKind::Review {
@@ -3367,7 +3468,7 @@ impl ChannelRouter {
         // costs what the BACKLOG costs, and a duration that grows while the
         // backlog does not means it has started paying for the workspace again.
         log::info!(
-            "channel gate refresh reason=generation dbs=1 backlog={} pushes={} gates={} expired={} duration_ms={}",
+            "channel gate refresh reason=sources dbs=1 backlog={} pushes={} gates={} expired={} duration_ms={}",
             review_backlog,
             review_pushes,
             routed.len(),
@@ -3380,7 +3481,7 @@ impl ChannelRouter {
             .insert(
                 path,
                 GateSnapshot {
-                    generation,
+                    sources: source_gates,
                     binding_generation: binding_generation.to_string(),
                     initialized: true,
                     routed: routed.clone(),
@@ -3540,10 +3641,18 @@ impl ChannelRouter {
                 {
                     self.send_claimed(record.id, gate, true).await
                 }
-                "failed" => Ok(false),
-                "expired" => Ok(true),
-                "sent" | "resolved" => Ok(false),
-                _ => Ok(false),
+                "failed" if record.attempts < MAX_ATTEMPTS => {
+                    self.mark_unsent(delivery_key, true);
+                    Ok(false)
+                }
+                "expired" => {
+                    self.mark_unsent(delivery_key, false);
+                    Ok(true)
+                }
+                _ => {
+                    self.mark_unsent(delivery_key, false);
+                    Ok(false)
+                }
             };
         }
         let Some(id) = self.claim(&gate).await? else {
@@ -3566,9 +3675,20 @@ impl ChannelRouter {
         self.send_claimed(id, gate, false).await
     }
 
+    /// Record whether a claimed delivery still owes a send (see `unsent`).
+    fn mark_unsent(&self, delivery_key: String, owed: bool) {
+        let mut unsent = self.unsent.lock().expect("unsent delivery set poisoned");
+        if owed {
+            unsent.insert(delivery_key);
+        } else {
+            unsent.remove(&delivery_key);
+        }
+    }
+
     /// Reports whether this call put something on the wire, so a sweep's batch
     /// bounds sends rather than gates examined.
     async fn send_claimed(&self, id: String, gate: Gate, retry: bool) -> Result<bool, String> {
+        let delivery_key = gate.delivery_key(self.provider_id, &self.destination);
         // An outage spends nothing: an unavailable provider is never called, so a
         // message cannot exhaust its attempts unseen while the provider is down.
         // A degraded provider is running and is called, and its failures spend.
@@ -3576,6 +3696,7 @@ impl ChannelRouter {
             self.provider.health(),
             super::ChannelHealth::Unavailable { .. }
         ) {
+            self.mark_unsent(delivery_key, true);
             return Ok(false);
         }
         let now = chrono::Utc::now().timestamp_millis();
@@ -3585,6 +3706,9 @@ impl ChannelRouter {
             ledger::begin_delivery(self.ledger(), &id, now).await?
         };
         if !claimed {
+            // Another sweep holds the attempt, or the row has moved on. The next
+            // offer reads the row and settles it either way.
+            self.mark_unsent(delivery_key, true);
             return Ok(false);
         }
         let options_json = match &gate.ask {
@@ -3626,6 +3750,7 @@ impl ChannelRouter {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
+                self.mark_unsent(delivery_key, false);
             }
             Err(error) => {
                 log::warn!(
@@ -3659,6 +3784,7 @@ impl ChannelRouter {
                         message.conversation,
                     );
                 }
+                self.mark_unsent(delivery_key, attempt < MAX_ATTEMPTS);
                 return Ok(false);
             }
         }
@@ -4692,11 +4818,20 @@ fn permission_ask_body(tool: &str, tool_input: &str, permission_uri: Option<&str
 /// Nothing else ever retires a delivered row, so without that the set would grow
 /// with the workspace's whole review history and every provider would re-resolve
 /// it every five seconds.
+///
+/// The prefix is a RANGE, not a `LIKE`. This planner does not turn `LIKE` into
+/// an index range, so `LIKE 'review:%'` walked every push of every kind (157k
+/// rows on the 11-09 workspace for 6k review rows). `;` is the character after
+/// `:`, so `[review:, review;)` is exactly the prefix, and it seeks
+/// `idx_attention_pushes_key` (0233). Retired review rows are still visited as
+/// index entries, which is bounded by review history rather than by the table.
+/// The `ORDER BY` stays: newest-first is what keeps one gate per key, and the
+/// sorter now sees only review rows.
 const REVIEW_BACKLOG_SQL: &str = "SELECT ap.id, ap.recipient, ap.content_ref, ap.\"key\",
                       ap.wake, ap.boundary, ap.created_at, ap.delivered_event_id
                FROM attention_pushes ap
               WHERE ap.retired_at IS NULL
-                AND ap.\"key\" LIKE 'review:%'
+                AND ap.\"key\" >= 'review:' AND ap.\"key\" < 'review;'
               ORDER BY ap.created_at DESC, ap.id DESC";
 
 /// The issue a review push is about, read out of the push's own content ref.
@@ -5305,6 +5440,15 @@ mod tests {
         .0
     }
 
+    /// A committed write announced the way its production write path announces
+    /// it, then the gate-source floor elapsed. The sources follow their input
+    /// tables' `db-change` frames, so a raw test write is invisible to them
+    /// until it is announced. Needs a paused clock.
+    async fn announce(router: &ChannelRouter, table: &str) {
+        router.orch.notifier.emit_change(table);
+        tokio::time::advance(GATE_SOURCE_FLOOR).await;
+    }
+
     async fn operator_carries_the_node_question(
         router: &ChannelRouter,
         db: &LocalDb,
@@ -5322,7 +5466,7 @@ mod tests {
     /// answerable for it. Withholding never strands anything: the moment the
     /// holder dies, or the operator mutes the child by hand, the next sweep
     /// finds the ask unheld and sends it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_operator_hears_a_child_ask_only_when_no_live_agent_holds_it() {
         let (orch, db) = route_test_orchestrator("channel-router-held-ask.db").await;
         seed_ask_shapes(&db).await;
@@ -5334,6 +5478,7 @@ mod tests {
         );
 
         let push_id = tell_watcher(&db, "watcher").await;
+        announce(&router, "attention_pushes").await;
         assert!(
             !operator_carries_the_node_question(&router, &db, "g1").await,
             "a live watcher was told, so its in-app attention IS the delivery"
@@ -5354,6 +5499,7 @@ mod tests {
         db.execute("UPDATE jobs SET status='complete' WHERE id='watcher'", ())
             .await
             .unwrap();
+        announce(&router, "jobs").await;
         assert!(
             operator_carries_the_node_question(&router, &db, "g3").await,
             "a watcher that finished without answering must not strand the ask"
@@ -5370,7 +5516,7 @@ mod tests {
     /// router entirely: withheld while the parent was alive, then invisible
     /// forever once it died. That is the stranding this whole rule forbids, and
     /// it is unreachable without stamping the push delivered first.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_drained_review_still_reaches_the_operator_when_its_watcher_dies() {
         let (orch, db) = route_test_orchestrator("channel-router-drained-review.db").await;
         seed_ask_shapes(&db).await;
@@ -5433,6 +5579,7 @@ mod tests {
         db.execute("UPDATE jobs SET status='complete' WHERE id='watcher'", ())
             .await
             .unwrap();
+        announce(&router, "jobs").await;
         assert!(
             carries("g2").await,
             "a review whose watcher died unresolved must still reach the operator"
@@ -5499,7 +5646,7 @@ mod tests {
     /// Muting a child is the thread role's explicit hand-off gesture: it means
     /// "this one is in the user's hands", so it has to flip delivery and not
     /// only wakes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn muting_a_child_hands_its_asks_back_to_the_operator() {
         let (orch, db) = route_test_orchestrator("channel-router-muted-child.db").await;
         seed_ask_shapes(&db).await;
@@ -5516,6 +5663,7 @@ mod tests {
         )
         .await
         .unwrap();
+        announce(&router, "wake_subscriptions").await;
         assert!(
             operator_carries_the_node_question(&router, &db, "g1").await,
             "the mute is read live, so it releases an ask raised before it"
@@ -5651,17 +5799,310 @@ mod tests {
             "the backlog statement reads the push table alone; a plan that reaches \
              the workspace is the cross product coming back:\n{backlog}"
         );
+        // Reading the push table alone is not enough: it holds every push of
+        // every kind, 157k rows for 6k review rows on the 11-09 workspace, and
+        // `LIKE 'review:%'` walked all of them.
+        assert!(
+            seeks_by(&backlog, "ap", "idx_attention_pushes_key"),
+            "the review prefix is a range over the key index (0233):\n{backlog}"
+        );
+        assert!(
+            !backlog.contains("SCAN attention_pushes") && !backlog.contains("SCAN ap"),
+            "a scan here is every push the workspace ever recorded:\n{backlog}"
+        );
 
-        let titles = query_plan(
-            &db,
-            &review_issue_titles_sql(1, 1),
-            vec![Value::Integer(1), Value::Text("cairn".into())],
-        )
-        .await;
+        // At the live review population's width, not at one: an `IN` list of a
+        // single value is the cardinality at which this planner picks a
+        // different path from the one it picks in production.
+        const WIDTH: usize = 400;
+        let mut binds: Vec<Value> = (0..WIDTH as i64).map(Value::Integer).collect();
+        binds.push(Value::Text("cairn".into()));
+        let titles = query_plan(&db, &review_issue_titles_sql(WIDTH, 1), binds).await;
         assert!(
             titles.contains("idx_issues_number"),
             "the batched lookup is driven by the backlog's issue numbers \
              (migration 0195), not by a scan:\n{titles}"
+        );
+        // The merge-request, artifact and answerability statements the same
+        // load runs are planned at this width beside their definitions in
+        // `cairn_attention::push`.
+    }
+
+    /// A review population shaped like the live workspace's on 11-09: every row
+    /// unretired and delivered, on open issues. Issues `1..=live` are live asks,
+    /// half with an open PR and half with an unconfirmed plan; the rest have
+    /// neither, so they read `Suspended`. Keys `1..=doubled` carry a second
+    /// watcher's row, which is still one gate. The watchers have finished, so
+    /// nothing is held and every live ask reaches the operator.
+    async fn seed_review_population(db: &LocalDb, issues: usize, live: usize, doubled: usize) {
+        let mut script = String::from(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','w','Proj','proj','/tmp/proj',1,1);
+             INSERT INTO jobs (id, project_id, status, created_at, updated_at) VALUES
+               ('watcher-a','p','complete',1,1),
+               ('watcher-b','p','complete',1,1),
+               ('watcher-c','p','complete',1,1);\n",
+        );
+        let rows = |range: std::ops::RangeInclusive<usize>, row: &dyn Fn(usize) -> String| {
+            range.map(row).collect::<Vec<_>>().join(",\n")
+        };
+        script.push_str(&format!(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES {};\n",
+            rows(1..=issues, &|n| format!("('issue-{n}','p',{n},'Issue {n}','active',1,1)"))
+        ));
+        script.push_str(&format!(
+            "INSERT INTO jobs (id, project_id, issue_id, status, created_at, updated_at) VALUES {};\n",
+            rows(1..=live, &|n| format!("('producer-{n}','p','issue-{n}','complete',1,1)"))
+        ));
+        let with_pr = live / 2;
+        script.push_str(&format!(
+            "INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES {};\n",
+            rows(1..=with_pr, &|n| format!(
+                "('mr-{n}','producer-{n}','p','issue-{n}','t','b-{n}','main','open',10,10)"
+            ))
+        ));
+        script.push_str(&format!(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES {};\n",
+            rows(with_pr + 1..=live, &|n| format!(
+                "('plan-{n}','producer-{n}','plan',1,'{{}}',1,'plan',0,10,10)"
+            ))
+        ));
+        let push = |n: usize, watcher: &str| {
+            format!(
+                "('push-{n}-{watcher}','watcher-{watcher}','cairn://p/proj/{n}','wake','event',
+                  'review:cairn://p/proj/{n}',{n},'ev-{n}-{watcher}')"
+            )
+        };
+        script.push_str(&format!(
+            "INSERT INTO attention_pushes
+               (id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id)
+             VALUES {},\n{};\n",
+            rows(1..=issues, &|n| push(n, "a")),
+            rows(1..=doubled, &|n| push(n, "b")),
+        ));
+        db.execute_batch(&script).await.unwrap();
+    }
+
+    /// What a steady-state review load costs is a constant number of
+    /// statements, whatever the size of the population it carries.
+    ///
+    /// Each step is one batched statement over the whole backlog: the backlog,
+    /// the issue titles, the subject issues, their merge requests, their
+    /// artifacts, the pushes filed under the live keys, and those pushes'
+    /// recipients. Nothing is retired, because every row is on an open issue,
+    /// and nothing is held, because every watcher has finished. A statement per
+    /// push, or per issue, shows up here as thousands.
+    #[tokio::test]
+    async fn a_steady_review_load_costs_a_fixed_number_of_statements() {
+        let db = migrated_test_db("channel-router-review-population.db").await;
+        seed_review_population(&db, 2900, 400, 100).await;
+
+        let before = db.statement_count();
+        let (gates, backlog, expired) = load_source_gates(&db, GateKind::Review).await.unwrap();
+        let statements = db.statement_count() - before;
+
+        assert_eq!(backlog, 3000, "every unretired review row is read");
+        assert_eq!(expired, 0);
+        assert_eq!(
+            gates.len(),
+            400,
+            "one gate per live ask: the suspended rows yield none, and a second \
+             watcher's row is the same ask"
+        );
+        assert!(gates.iter().all(|gate| !gate.held_by_agent()));
+        assert_eq!(
+            statements, 7,
+            "backlog, titles, subject issues, merge requests, artifacts, held \
+             pushes, recipients"
+        );
+    }
+
+    /// The review source recomputes when a table it reads moves, and not when
+    /// anything else does. Before this it was keyed to the database's global
+    /// mutation counter, which every write advances, so on the 11-08 production
+    /// log it recomputed a 3,000-row backlog on nearly every sweep.
+    ///
+    /// Driven through three providers' real sweeps. Those sweeps are
+    /// themselves the unrelated production writer that mattered: each delivery
+    /// writes the channel ledger, and those writes used to buy the next sweep a
+    /// recompute. The review push goes through its production caller,
+    /// `evaluate_review_readiness`, which mints and announces it.
+    #[tokio::test(start_paused = true)]
+    async fn the_review_source_recomputes_only_when_its_inputs_move() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+
+        let (orch, db) = route_test_orchestrator("channel-router-review-recompute.db").await;
+        seed_review_population(&db, 2900, 400, 100).await;
+        let key = gate_source_key(&db, GateKind::Review);
+        let computes = || {
+            gate_source_computes()
+                .lock()
+                .unwrap()
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+        };
+        // One recording provider behind all three routers, so the message ids
+        // it mints stay unique on the shared channel.
+        let provider = Arc::new(RecordingPollProvider::new());
+        let providers: Vec<_> = (0..3)
+            .map(|n| {
+                ChannelRouter::new_for_provider(
+                    orch.clone(),
+                    provider.clone(),
+                    "imessage",
+                    format!("+1555000000{n}"),
+                    MessageClassPolicy {
+                        question: false,
+                        permission: false,
+                        notify: true,
+                    },
+                    ChannelInboundCapabilities::default(),
+                )
+            })
+            .collect();
+        let sent = || async {
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM channel_outbound WHERE status = 'sent'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap_or(0)
+        };
+        let sweep = || async {
+            for provider in &providers {
+                provider.sweep_live_gates().await.unwrap();
+            }
+        };
+        // Away, so no notice is held back for presence and every sweep sends.
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+
+        sweep().await;
+        assert_eq!(computes(), 1, "three providers share the first load");
+
+        // (a) Sweeps delivering the backlog, a hundred notices per provider per
+        // sweep, plus one raw write that moves the global counter the source
+        // used to follow. None of it is an input.
+        let global = db.mutation_generation();
+        db.execute("UPDATE workspaces SET name = 'W2'", ())
+            .await
+            .unwrap();
+        let delivered = sent().await;
+        for _ in 0..4 {
+            tokio::time::advance(SWEEP_INTERVAL).await;
+            sweep().await;
+        }
+        assert!(db.mutation_generation() > global);
+        assert!(
+            sent().await > delivered,
+            "the sweeps kept writing the channel ledger"
+        );
+        assert_eq!(computes(), 1, "unrelated writes recompute nothing");
+
+        // (b) A review raised through its production caller.
+        crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, "issue-201").await;
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        sweep().await;
+        assert_eq!(
+            computes(),
+            2,
+            "one recompute, shared by all three providers"
+        );
+
+        // (c) Nothing moves for a minute: one reconcile.
+        tokio::time::advance(GATE_SOURCE_RECONCILE).await;
+        sweep().await;
+        assert_eq!(computes(), 3, "the reconcile horizon recomputes once");
+        sweep().await;
+        assert_eq!(computes(), 3);
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+    }
+
+    /// The review source's cost on a real database, five passes in a row.
+    ///
+    /// The first pass on a workspace carrying the old backlog is the one-time
+    /// retirement of every review whose issue resolved; the passes after it are
+    /// steady state. Each line reports the backlog the pass read, so the drop is
+    /// visible beside the duration. The load retires rows, so it WRITES the
+    /// database it is given: point it at a copy, taken per docs/database.md
+    /// "Taking a census", never at the live file. Run it with
+    /// `CAIRN_REVIEW_CLONE_DB=<copy>/cairn.db cargo test -p cairn-core --lib
+    /// review_load_timing -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real database copy via CAIRN_REVIEW_CLONE_DB"]
+    async fn review_load_timing_on_a_database_clone() {
+        let path = std::env::var("CAIRN_REVIEW_CLONE_DB")
+            .expect("set CAIRN_REVIEW_CLONE_DB to a copy of a real database set");
+        let db = LocalDb::open(&path).await.unwrap();
+        for pass in 1..=5 {
+            let statements = db.statement_count();
+            let started = std::time::Instant::now();
+            let (gates, backlog, expired) = load_source_gates(&db, GateKind::Review).await.unwrap();
+            println!(
+                "review load pass={pass} backlog={backlog} gates={} expired={expired} \
+                 statements={} duration_ms={}",
+                gates.len(),
+                db.statement_count() - statements,
+                started.elapsed().as_millis()
+            );
+        }
+    }
+
+    #[test]
+    fn a_gate_source_is_replaced_for_its_inputs_only_past_the_floor() {
+        let now = tokio::time::Instant::now();
+        let snapshot = |age: Duration, duration: Duration| GateSourceSnapshot {
+            generation: 4,
+            computed_at: now - age,
+            duration,
+            gates: Arc::default(),
+            backlog: 0,
+            expired: 0,
+        };
+        let quick = Duration::from_millis(5);
+        assert_eq!(
+            gate_source_staleness(&snapshot(Duration::ZERO, quick), 5, now),
+            None
+        );
+        assert_eq!(
+            gate_source_staleness(&snapshot(GATE_SOURCE_FLOOR, quick), 5, now),
+            Some("input-advanced")
+        );
+        assert_eq!(
+            gate_source_staleness(&snapshot(GATE_SOURCE_FLOOR, quick), 4, now),
+            None,
+            "unmoved inputs keep a source until the reconcile horizon"
+        );
+        // A load slower than the floor raises it to its own duration, so a
+        // starved host spends at most half its time recomputing.
+        let slow = Duration::from_secs(10);
+        assert_eq!(
+            gate_source_staleness(&snapshot(Duration::from_secs(9), slow), 5, now),
+            None
+        );
+        assert_eq!(
+            gate_source_staleness(&snapshot(slow, slow), 5, now),
+            Some("input-advanced")
+        );
+        assert_eq!(
+            gate_source_staleness(&snapshot(GATE_SOURCE_RECONCILE, quick), 4, now),
+            Some("reconcile-horizon")
+        );
+        // A load slower than the horizon waits out its own duration first.
+        let glacial = Duration::from_secs(90);
+        assert_eq!(
+            gate_source_staleness(&snapshot(GATE_SOURCE_RECONCILE, glacial), 4, now),
+            None
+        );
+        assert_eq!(
+            gate_source_staleness(&snapshot(glacial, glacial), 4, now),
+            Some("reconcile-horizon")
         );
     }
 
@@ -5972,17 +6413,20 @@ mod tests {
     /// Every enabled provider sweeps on its own five-second loop, but what the
     /// sweep READS is a fact about the workspace, not about the provider. Three
     /// channels configured used to mean the same expensive backlog reads three
-    /// times per tick on three threads; they are now computed once per database
+    /// times per tick on three threads; they are now computed once per input
     /// generation for the whole process, and a provider that arrives at an
     /// unchanged generation performs no database work at all.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_second_providers_gate_source_costs_no_database_reads() {
         let db = migrated_test_db("channel-router-gate-source-sharing.db").await;
+        let inputs = GateInputGenerations::default();
         seed_run(&db).await;
         seed_prompt(&db, "prompt-1", 100).await;
 
         let before = db.read_transaction_count();
-        let first = shared_gates(&db, GateKind::Question).await.unwrap();
+        let first = shared_gates(&db, &inputs, GateKind::Question)
+            .await
+            .unwrap();
         assert!(
             db.read_transaction_count() > before,
             "the first provider to ask pays for the load"
@@ -5990,7 +6434,9 @@ mod tests {
         assert_eq!(first.gates.len(), 1);
 
         let shared = db.read_transaction_count();
-        let second = shared_gates(&db, GateKind::Question).await.unwrap();
+        let second = shared_gates(&db, &inputs, GateKind::Question)
+            .await
+            .unwrap();
         assert_eq!(
             db.read_transaction_count(),
             shared,
@@ -6000,18 +6446,34 @@ mod tests {
         assert_eq!(second.gates.len(), 1);
         assert_eq!(second.generation, first.generation);
 
-        // A write is what makes a shared snapshot stale, and it costs exactly one
-        // recomputation however many providers observe it.
+        // A write to an input is what makes a shared snapshot stale, once the
+        // floor has passed, and it costs exactly one recomputation however many
+        // providers observe it.
         seed_prompt(&db, "prompt-2", 101).await;
+        inputs.note_table("prompts");
+        let early = db.read_transaction_count();
+        assert_eq!(
+            shared_gates(&db, &inputs, GateKind::Question)
+                .await
+                .unwrap()
+                .gates
+                .len(),
+            1,
+            "inside the floor the published snapshot still serves"
+        );
+        assert_eq!(db.read_transaction_count(), early);
+        tokio::time::advance(GATE_SOURCE_FLOOR).await;
         let stale = db.read_transaction_count();
-        let refreshed = shared_gates(&db, GateKind::Question).await.unwrap();
+        let refreshed = shared_gates(&db, &inputs, GateKind::Question)
+            .await
+            .unwrap();
         assert!(db.read_transaction_count() > stale);
         assert_eq!(refreshed.gates.len(), 2, "and it sees the new ask");
         assert_ne!(refreshed.generation, first.generation);
 
         let after = db.read_transaction_count();
         assert_eq!(
-            shared_gates(&db, GateKind::Question)
+            shared_gates(&db, &inputs, GateKind::Question)
                 .await
                 .unwrap()
                 .gates
@@ -6033,6 +6495,7 @@ mod tests {
     #[tokio::test]
     async fn a_reopened_database_does_not_inherit_the_previous_handles_gates() {
         let seed = migrated_test_db("channel-router-gate-source-reopen.db").await;
+        let inputs = GateInputGenerations::default();
         seed_run(&seed).await;
         seed_prompt(&seed, "prompt-1", 100).await;
         let path = seed.path().to_path_buf();
@@ -6042,7 +6505,7 @@ mod tests {
         let first = LocalDb::open(&path).await.unwrap();
         assert_eq!(first.mutation_generation(), 0);
         assert_eq!(
-            shared_gates(&first, GateKind::Question)
+            shared_gates(&first, &inputs, GateKind::Question)
                 .await
                 .unwrap()
                 .gates
@@ -6055,7 +6518,7 @@ mod tests {
         let reopened = LocalDb::open(&path).await.unwrap();
         assert_eq!(reopened.mutation_generation(), 0, "the collision");
         assert!(
-            shared_gates(&reopened, GateKind::Question)
+            shared_gates(&reopened, &inputs, GateKind::Question)
                 .await
                 .unwrap()
                 .gates
@@ -9140,6 +9603,145 @@ mod tests {
                 reason: "Discord bot is missing required guild permissions: MANAGE_MESSAGES".into(),
             }
         }
+    }
+
+    /// A gate whose send failed is retried on its own backoff, not on the gate
+    /// source's schedule.
+    ///
+    /// The routing cache now lives as long as the sources, and a delivery
+    /// writes only the channel ledger, which moves no gate input. A claimed gate
+    /// therefore has to be offered on a cache hit for as long as its row owes a
+    /// send; otherwise its retry waits for the reconcile horizon. This drives
+    /// whole sweeps through a provider whose sends fail.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_gate_send_retries_on_its_backoff_without_a_source_recompute() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+
+        let (orch, db) = route_test_orchestrator("channel-router-gate-retry.db").await;
+        seed_ask_shapes(&db).await;
+        let router = ChannelRouter::new_for_provider(
+            orch,
+            Arc::new(DegradedFailingProvider),
+            "imessage",
+            "+15551234567".into(),
+            MessageClassPolicy {
+                question: true,
+                permission: false,
+                notify: false,
+            },
+            ChannelInboundCapabilities::default(),
+        );
+        let source = gate_source_key(&db, GateKind::Question);
+        let computes = || {
+            gate_source_computes()
+                .lock()
+                .unwrap()
+                .get(&source)
+                .copied()
+                .unwrap_or(0)
+        };
+        let attempts = || async {
+            db.query_opt_i64(
+                "SELECT SUM(attempts) FROM channel_outbound WHERE kind = 'question'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap_or(0)
+        };
+        // Away, so presence never defers the asks and every offer is a send.
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+
+        router.sweep_live_gates().await.unwrap();
+        assert_eq!(attempts().await, 2, "both questions were tried once");
+        assert_eq!(computes(), 1);
+
+        // Inside the backoff: offered, read, and left alone.
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        router.sweep_live_gates().await.unwrap();
+        assert_eq!(attempts().await, 2);
+
+        // The backoff elapses. The ledger is the only thing that moved.
+        db.execute("UPDATE channel_outbound SET next_attempt_at = 0", ())
+            .await
+            .unwrap();
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        router.sweep_live_gates().await.unwrap();
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+
+        assert_eq!(
+            attempts().await,
+            4,
+            "each failed send is retried on the next sweep after its backoff"
+        );
+        assert_eq!(
+            computes(),
+            1,
+            "and retrying it recomputed no gate source: the sweeps were cache hits"
+        );
+    }
+
+    /// The owed-retry set belongs to the whole router, which sweeps the local
+    /// database and every team database, so one database's refresh must not
+    /// prune another's retries. A team database's failed sends are retried on
+    /// their backoff while only the local database's routing is refreshed.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_in_one_database_keeps_another_databases_retries() {
+        use crate::channels::{set_operator_presence_mode, OperatorPresenceMode};
+
+        let (orch, local) = route_test_orchestrator("channel-router-retry-local.db").await;
+        let team = Arc::new(migrated_test_db("channel-router-retry-team.db").await);
+        seed_ask_shapes(&team).await;
+        orch.db
+            .register_team_db_for_test("team-a".to_string(), team.clone())
+            .await;
+        let router = ChannelRouter::new_for_provider(
+            orch,
+            Arc::new(DegradedFailingProvider),
+            "imessage",
+            "+15551234567".into(),
+            MessageClassPolicy {
+                question: true,
+                permission: false,
+                notify: false,
+            },
+            ChannelInboundCapabilities::default(),
+        );
+        let attempts = || async {
+            local
+                .query_opt_i64(
+                    "SELECT SUM(attempts) FROM channel_outbound WHERE kind = 'question'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .unwrap_or(0)
+        };
+        set_operator_presence_mode(OperatorPresenceMode::Idle);
+
+        router.sweep_live_gates().await.unwrap();
+        assert_eq!(
+            attempts().await,
+            2,
+            "the team database's questions were tried"
+        );
+
+        // Their backoff elapses, and the local database's routing is refreshed
+        // while the team database's is a cache hit.
+        local
+            .execute("UPDATE channel_outbound SET next_attempt_at = 0", ())
+            .await
+            .unwrap();
+        router.gate_snapshots.lock().unwrap().remove(local.path());
+        tokio::time::advance(SWEEP_INTERVAL).await;
+        router.sweep_live_gates().await.unwrap();
+        set_operator_presence_mode(OperatorPresenceMode::Auto);
+
+        assert_eq!(
+            attempts().await,
+            4,
+            "a refresh of one database must not drop another database's retries"
+        );
     }
 
     #[tokio::test]

@@ -109,36 +109,45 @@ async fn view(db: &LocalDb, number: i64) -> TenetView {
 }
 
 /// Numbers are allocated inside the insert's own transaction, so proposals
-/// racing each other still take distinct, gapless numbers.
-#[tokio::test]
-async fn concurrent_proposals_take_distinct_gapless_numbers() {
-    let db = fixture("tenets-concurrency.db").await;
+/// racing each other still take distinct, gapless numbers. Looped, from OS
+/// threads.
+#[test]
+fn concurrent_proposals_take_distinct_gapless_numbers() {
+    let runtime = crate::storage::race_runtime();
+    let db = runtime.block_on(fixture("tenets-concurrency.db"));
     let who = design();
-    let emitter = CapturingEmitter::new();
-    let results = futures_util::future::join_all((0..8).map(|i| {
-        let db = &db;
-        let who = &who;
-        let emitter = &emitter;
-        async move {
-            propose(db, emitter, 10, who, proposal(&format!("question {i}")))
-                .await
+    for round in 0..20_i64 {
+        let emitter = CapturingEmitter::new();
+        let (rt, db, who, sink) = (&runtime, &db, &who, &emitter);
+        let mut numbers = crate::storage::race_on_threads((0..8).map(|i| {
+            move || {
+                rt.block_on(propose(
+                    db,
+                    sink,
+                    10,
+                    who,
+                    proposal(&format!("question {round} {i}")),
+                ))
                 .unwrap()
                 .number
-        }
-    }))
-    .await;
-    let mut numbers = results;
-    numbers.sort_unstable();
-    assert_eq!(numbers, (1..=8).collect::<Vec<i64>>());
-    assert_eq!(
-        emitter.events_named("db-change").len(),
-        8,
-        "every proposal announces itself"
-    );
-    assert!(emitter
-        .events_named("db-change")
-        .iter()
-        .all(|event| event["table"] == "tenets"));
+            }
+        }));
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (8 * round + 1..=8 * round + 8).collect::<Vec<i64>>(),
+            "round {round}"
+        );
+        assert_eq!(
+            emitter.events_named("db-change").len(),
+            8,
+            "every proposal announces itself"
+        );
+        assert!(emitter
+            .events_named("db-change")
+            .iter()
+            .all(|event| event["table"] == "tenets"));
+    }
 }
 
 #[tokio::test]

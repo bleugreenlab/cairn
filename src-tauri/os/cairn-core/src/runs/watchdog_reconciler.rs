@@ -237,39 +237,46 @@ mod tests {
         (db, identity)
     }
 
-    #[tokio::test]
-    async fn concurrent_reconcilers_produce_one_recovery_claim() {
-        let (db, identity) = fixture("boot-a").await;
-        let recovery = Arc::new(CountingRecovery {
-            calls: AtomicUsize::new(0),
-            db: db.clone(),
-        });
-        let first = reconcile_watchdog_leases(
-            &db,
-            ReconcileScope::Periodic,
-            300,
-            DEFAULT_HEARTBEAT_GRACE_SECS,
-            recovery.as_ref(),
-        );
-        let second = reconcile_watchdog_leases(
-            &db,
-            ReconcileScope::Periodic,
-            300,
-            DEFAULT_HEARTBEAT_GRACE_SECS,
-            recovery.as_ref(),
-        );
-        let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.unwrap().claimed + second.unwrap().claimed, 1);
-        assert_eq!(recovery.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            get_watchdog_lease(&db, "run", "session", "provider-turn")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            WatchdogLeaseState::Terminalized
-        );
-        assert_eq!(identity.run_id, "run");
+    /// Two reconcilers that both list one expired lease make one recovery
+    /// claim between them. Looped, from OS threads.
+    #[test]
+    fn concurrent_reconcilers_produce_one_recovery_claim() {
+        let runtime = crate::storage::race_runtime();
+        for round in 0..20 {
+            let (db, identity) = runtime.block_on(fixture("boot-a"));
+            let recovery = CountingRecovery {
+                calls: AtomicUsize::new(0),
+                db: db.clone(),
+            };
+            let (rt, db_ref, recovery_ref) = (&runtime, &db, &recovery);
+            let claimed: usize = crate::storage::race_on_threads((0..2).map(|_| {
+                move || {
+                    rt.block_on(reconcile_watchdog_leases(
+                        db_ref,
+                        ReconcileScope::Periodic,
+                        300,
+                        DEFAULT_HEARTBEAT_GRACE_SECS,
+                        recovery_ref,
+                    ))
+                    .unwrap()
+                    .claimed
+                }
+            }))
+            .into_iter()
+            .sum();
+            assert_eq!(claimed, 1, "round {round}");
+            assert_eq!(recovery.calls.load(Ordering::SeqCst), 1, "round {round}");
+            assert_eq!(
+                runtime
+                    .block_on(get_watchdog_lease(&db, "run", "session", "provider-turn"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                WatchdogLeaseState::Terminalized,
+                "round {round}"
+            );
+            assert_eq!(identity.run_id, "run");
+        }
     }
 
     #[tokio::test]

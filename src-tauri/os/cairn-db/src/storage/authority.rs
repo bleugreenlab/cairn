@@ -778,38 +778,44 @@ mod tests {
         assert!(elsewhere.is_empty());
     }
 
-    #[tokio::test]
-    async fn concurrent_use_of_a_once_grant_authorizes_exactly_one_mutation() {
-        let db = db().await;
-        insert_grant(
-            &db,
-            &grant(
-                "g-once",
-                tool_scope("linear"),
-                AuthorityLifetime::Once {
-                    request_id: "perm-1".to_string(),
-                },
-            ),
-        )
-        .await
-        .unwrap();
+    /// Both racers see an unconsumed grant; the conditional UPDATE is what
+    /// decides. Exactly one may win, or the whole single-use guarantee is a
+    /// suggestion. Looped, from OS threads.
+    #[test]
+    fn concurrent_use_of_a_once_grant_authorizes_exactly_one_mutation() {
+        let runtime = crate::storage::race_runtime();
+        let db = runtime.block_on(db());
+        for round in 0..20 {
+            let id = format!("g-once-{round}");
+            runtime
+                .block_on(insert_grant(
+                    &db,
+                    &grant(
+                        &id,
+                        tool_scope("linear"),
+                        AuthorityLifetime::Once {
+                            request_id: format!("perm-{round}"),
+                        },
+                    ),
+                ))
+                .unwrap();
 
-        // Both racers see an unconsumed grant; the conditional UPDATE is what
-        // decides. Exactly one may win, or the whole single-use guarantee is a
-        // suggestion.
-        let (first, second) = tokio::join!(
-            consume_grant(&db, "g-once", 2000),
-            consume_grant(&db, "g-once", 2000)
-        );
-        let winners = [first.unwrap(), second.unwrap()]
+            let (rt, db, id) = (&runtime, &db, id.as_str());
+            let winners = crate::storage::race_on_threads(
+                (0..2).map(|_| move || rt.block_on(consume_grant(db, id, 2000)).unwrap()),
+            )
             .into_iter()
             .filter(|won| *won)
             .count();
-        assert_eq!(winners, 1, "exactly one caller may consume a once grant");
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one caller may consume a once grant"
+            );
 
-        let after = get_grant(&db, "g-once").await.unwrap().unwrap();
-        assert!(after.consumed_at.is_some());
-        assert!(!after.matches(&request(tool_scope("linear")), &live_context(), 2001));
+            let after = runtime.block_on(get_grant(db, id)).unwrap().unwrap();
+            assert!(after.consumed_at.is_some());
+            assert!(!after.matches(&request(tool_scope("linear")), &live_context(), 2001));
+        }
     }
 
     fn live_context() -> AuthorityContext {
