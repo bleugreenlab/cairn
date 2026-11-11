@@ -1628,6 +1628,7 @@ mod tests {
             registry.source_names(),
             vec![
                 "attention",
+                "camp_notice",
                 "channel_message",
                 "executor_update_unreturned",
                 "file_changed",
