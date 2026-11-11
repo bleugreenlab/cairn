@@ -29,7 +29,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::executor_protocol::{Measurement, MeasurementGap, MeasurementReading};
+use crate::executor_protocol::{
+    CellAdmissionKind, CellPriority, Measurement, MeasurementGap, MeasurementReading,
+};
 
 /// Every probe write is this size, from the first one onward. A large first
 /// write can take the kernel's unconditional initial-allocation path and read
@@ -439,6 +441,47 @@ impl PipeAdmission {
     }
 }
 
+/// Which state a refusing floor is in, so a hold names it rather than the
+/// union of both. Derived from the assessment, never sent: the wire carries
+/// [`PipeAdmission`], whose enum older peers decode whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldPhase {
+    /// The latest reading is below [`DEGRADED_BELOW_BYTES`]: a fresh pipe is
+    /// too small for a short write right now.
+    Degraded,
+    /// The host is latched degraded but its latest reading is back at or above
+    /// the floor: the hysteresis is waiting for spaced recovery readings.
+    Recovering,
+    /// Evidence from a host that was never latched has expired; the bounded
+    /// stale hold waits for a current reading.
+    Stale,
+}
+
+/// What a piece of work asks of the floor. The distinction is lifetime: a
+/// short-lived agent command against everything that stays (terminals, REPLs,
+/// residencies, check lanes, sessions, servers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeFloorWork {
+    /// An agent's own command batch: one short shell, held only while a fresh
+    /// pipe reads below [`DEGRADED_BELOW_BYTES`]
+    /// ([`PipeHealthAssessment::admits_short_command`]).
+    ShortCommand,
+    /// Anything else that starts a process; the full floor applies.
+    Process,
+}
+
+impl PipeFloorWork {
+    /// The one classification both the executor and the runner's placement
+    /// apply: an agent-interactive command cell is a short command.
+    pub fn of(priority: CellPriority, kind: CellAdmissionKind) -> Self {
+        if priority == CellPriority::AgentInteractive && kind == CellAdmissionKind::Command {
+            Self::ShortCommand
+        } else {
+            Self::Process
+        }
+    }
+}
+
 /// The floor's answer at one instant, with the evidence behind it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -490,6 +533,42 @@ impl PipeHealthAssessment {
         self.admission.admits()
     }
 
+    /// Which state a refusing answer is in; `None` while it admits.
+    pub fn hold_phase(&self) -> Option<HoldPhase> {
+        if self.admits() {
+            return None;
+        }
+        let above_floor = self.latest_at_or_above_floor();
+        Some(match (above_floor, self.degraded_latch) {
+            (false, _) => HoldPhase::Degraded,
+            (true, true) => HoldPhase::Recovering,
+            (true, false) => HoldPhase::Stale,
+        })
+    }
+
+    /// Whether a short-lived agent command may start: everything the floor
+    /// admits, and also a hold whose latest reading is at or above
+    /// [`DEGRADED_BELOW_BYTES`]. Hysteresis exists to stop long-lived
+    /// processes accumulating; a seconds-long shell holding a handful of pipes
+    /// does not tip a host over, and it is the documented victim only while a
+    /// fresh pipe is actually below the floor.
+    pub fn admits_short_command(&self) -> bool {
+        self.admits() || self.latest_at_or_above_floor()
+    }
+
+    /// Whether this answer admits `work`.
+    pub fn admits_work(&self, work: PipeFloorWork) -> bool {
+        match work {
+            PipeFloorWork::ShortCommand => self.admits_short_command(),
+            PipeFloorWork::Process => self.admits(),
+        }
+    }
+
+    fn latest_at_or_above_floor(&self) -> bool {
+        self.capacity
+            .is_some_and(|capacity| capacity.accepted_bytes >= DEGRADED_BELOW_BYTES)
+    }
+
     /// One line naming the answer and its evidence, for refusals, notices and
     /// the executor page alike.
     pub fn describe(&self) -> String {
@@ -507,16 +586,12 @@ impl PipeHealthAssessment {
             PipeAdmission::Healthy => format!(
                 "pipe health: measured healthy; {reading} (degraded below {DEGRADED_BELOW_BYTES} B)"
             ),
-            PipeAdmission::Degraded => format!(
-                "pipe health: measured degraded; {reading}, below the {DEGRADED_BELOW_BYTES} B floor \
-                 or not yet recovered; new processes wait until {RECOVERY_SAMPLES} readings \
-                 {RECOVERY_SPACING_MS} ms apart reach {RECOVERED_AT_BYTES} B ({}/{RECOVERY_SAMPLES} so far)",
-                self.recovery_samples
-            ),
+            PipeAdmission::Degraded => self.describe_degraded(),
             PipeAdmission::StaleHold => format!(
                 "pipe health: bounded stale hold; {reading}, older than {FRESH_FOR_MS} ms; new \
                  processes wait {:.1}s more, then admit with a gap{}",
-                (FRESH_FOR_MS + STALE_HOLD_MS).saturating_sub(self.age_ms.unwrap_or_default()) as f64
+                (FRESH_FOR_MS + STALE_HOLD_MS).saturating_sub(self.age_ms.unwrap_or_default())
+                    as f64
                     / 1_000.0,
                 self.last_failure
                     .as_ref()
@@ -527,6 +602,47 @@ impl PipeHealthAssessment {
                 .gap
                 .clone()
                 .unwrap_or_else(|| "pipe health: not measured".into()),
+        }
+    }
+
+    /// The fresh, latched answer in whichever phase it is: below the floor,
+    /// or above it and waiting out the recovery hysteresis.
+    fn describe_degraded(&self) -> String {
+        let spacing_s = RECOVERY_SPACING_MS / 1_000;
+        let Some(capacity) = self.capacity.filter(|_| self.latest_at_or_above_floor()) else {
+            let reading = match (self.capacity, self.age_ms) {
+                (Some(capacity), Some(age)) => format!(
+                    "fresh pipe held {} {:.1} s ago",
+                    capacity.describe(),
+                    age as f64 / 1_000.0
+                ),
+                _ => "no reading".into(),
+            };
+            return format!(
+                "pipe health: degraded; {reading} (floor {DEGRADED_BELOW_BYTES} B); new processes \
+                 wait until {RECOVERY_SAMPLES} readings {spacing_s} s apart reach \
+                 {RECOVERED_AT_BYTES} B"
+            );
+        };
+        if capacity.accepted_bytes >= RECOVERED_AT_BYTES {
+            let next_in_s = SAMPLE_INTERVAL_MS
+                .saturating_sub(self.age_ms.unwrap_or_default())
+                .div_ceil(1_000);
+            format!(
+                "pipe health: recovering; pipe healthy again ({}), floor lifts after \
+                 {RECOVERY_SAMPLES} readings {spacing_s} s apart; {} of {RECOVERY_SAMPLES}, next in \
+                 ~{next_in_s} s",
+                capacity.describe(),
+                self.recovery_samples
+            )
+        } else {
+            format!(
+                "pipe health: recovering; fresh pipe held {}, above the {DEGRADED_BELOW_BYTES} B \
+                 floor but below the {RECOVERED_AT_BYTES} B recovery level; {} of \
+                 {RECOVERY_SAMPLES}",
+                capacity.describe(),
+                self.recovery_samples
+            )
         }
     }
 }
@@ -614,7 +730,10 @@ impl PipeHealthMonitor {
     /// Sample this host's fresh pipes every [`SAMPLE_INTERVAL_MS`] on a
     /// dedicated thread, calling `on_transition` whenever the admission answer
     /// changes, including when evidence ages from fresh into the stale hold and
-    /// out of it with no new sample.
+    /// out of it with no new sample. A hold that stays a hold also publishes
+    /// when its phase or recovery progress moves (degraded to recovering, 0 to
+    /// 1 of 2), so whoever shows the hold can say which state it is in; such a
+    /// transition has `from` equal to `to.admission`.
     ///
     /// A thread rather than a task: the probe is a handful of syscalls, but a
     /// host in trouble is exactly when syscalls stall, and a stalled probe
@@ -643,12 +762,19 @@ impl PipeHealthMonitor {
             .name("cairn-pipe-health".into())
             .spawn(move || {
                 let interval_ms = interval.as_millis().max(1) as u64;
+                let key = |answer: &PipeHealthAssessment| {
+                    (
+                        answer.admission,
+                        answer.hold_phase(),
+                        answer.recovery_samples,
+                    )
+                };
                 let mut previous = {
                     let Some(evidence) = evidence.upgrade() else {
                         return;
                     };
-                    let answer = evidence.lock().unwrap().assess(unix_time_ms()).admission;
-                    answer
+                    let answer = evidence.lock().unwrap().assess(unix_time_ms());
+                    key(&answer)
                 };
                 let mut next_sample = 0u64;
                 loop {
@@ -670,8 +796,9 @@ impl PipeHealthMonitor {
                         (health.assess(now), health.next_transition_at(now))
                     };
                     drop(shared);
-                    if current.admission != previous {
-                        let from = std::mem::replace(&mut previous, current.admission);
+                    let current_key = key(&current);
+                    if current_key != previous {
+                        let (from, _, _) = std::mem::replace(&mut previous, current_key);
                         on_transition(PipeHealthTransition { from, to: current });
                     }
                     let wake_at = wake_at.map_or(next_sample, |at| at.min(next_sample));
@@ -916,6 +1043,91 @@ mod tests {
     }
 
     #[test]
+    fn the_hold_sentence_names_its_phase() {
+        let mut health = PipeHealth::new(true);
+        health.observe(reading(0, 512));
+        let degraded = health.assess(3_500);
+        assert_eq!(degraded.hold_phase(), Some(HoldPhase::Degraded));
+        assert!(!degraded.admits_short_command());
+        assert_eq!(
+            degraded.describe(),
+            "pipe health: degraded; fresh pipe held 512 B 3.5 s ago (floor 4096 B); new processes \
+             wait until 2 readings 4 s apart reach 16384 B"
+        );
+
+        health.observe(reading(5_000, 65_536));
+        let recovering = health.assess(6_000);
+        assert_eq!(recovering.hold_phase(), Some(HoldPhase::Recovering));
+        assert!(recovering.admits_short_command());
+        assert!(!recovering.admits(), "long-lived processes still wait");
+        assert_eq!(
+            recovering.describe(),
+            "pipe health: recovering; pipe healthy again (65536 B), floor lifts after 2 readings \
+             4 s apart; 1 of 2, next in ~4 s"
+        );
+
+        health.observe(reading(10_000, 8_192));
+        let between = health.assess(10_000);
+        assert_eq!(between.hold_phase(), Some(HoldPhase::Recovering));
+        assert!(between.admits_short_command());
+        assert_eq!(
+            between.describe(),
+            "pipe health: recovering; fresh pipe held 8192 B, above the 4096 B floor but below \
+             the 16384 B recovery level; 0 of 2"
+        );
+
+        for answer in [&degraded, &recovering, &between] {
+            assert!(
+                !answer.describe().contains("or not yet recovered"),
+                "{}",
+                answer.describe()
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_hold_names_its_phase_and_admits_short_commands_only_above_the_floor() {
+        let mut low = PipeHealth::new(true);
+        low.observe(reading(0, 512));
+        let held = low.assess(FRESH_FOR_MS + 1);
+        assert_eq!(held.admission, PipeAdmission::StaleHold);
+        assert_eq!(held.hold_phase(), Some(HoldPhase::Degraded));
+        assert!(!held.admits_short_command());
+
+        let mut healthy = PipeHealth::new(true);
+        healthy.observe(reading(0, 65_536));
+        let held = healthy.assess(FRESH_FOR_MS + 1);
+        assert_eq!(held.hold_phase(), Some(HoldPhase::Stale));
+        assert!(held.admits_short_command());
+
+        assert_eq!(healthy.assess(0).hold_phase(), None);
+        assert!(PipeHealthAssessment::not_reported("x").admits_short_command());
+    }
+
+    #[test]
+    fn only_an_agent_command_cell_is_a_short_command() {
+        use CellAdmissionKind::{Command, Residency};
+        use CellPriority::{AgentInteractive, ReviewCheck, WriteCheck};
+        assert_eq!(
+            PipeFloorWork::of(AgentInteractive, Command),
+            PipeFloorWork::ShortCommand
+        );
+        for (priority, kind) in [
+            (AgentInteractive, Residency),
+            (ReviewCheck, Command),
+            (WriteCheck, Command),
+        ] {
+            assert_eq!(PipeFloorWork::of(priority, kind), PipeFloorWork::Process);
+        }
+        let mut health = PipeHealth::new(true);
+        health.observe(reading(0, 512));
+        health.observe(reading(5_000, 65_536));
+        let recovering = health.assess(5_000);
+        assert!(recovering.admits_work(PipeFloorWork::ShortCommand));
+        assert!(!recovering.admits_work(PipeFloorWork::Process));
+    }
+
+    #[test]
     fn duplicate_and_reordered_samples_change_nothing() {
         let mut health = PipeHealth::new(true);
         health.observe(reading(0, 512));
@@ -1056,6 +1268,33 @@ mod tests {
         let second = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(second.engaged());
         assert_eq!(monitor.assess_now().admission, PipeAdmission::Degraded);
+        drop(monitor);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_sampler_publishes_a_hold_moving_from_degraded_to_recovering() {
+        let monitor = PipeHealthMonitor::with_evidence(PipeHealth::new(true));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut bytes = vec![512u64].into_iter();
+        let handle = monitor
+            .spawn_sampler_with(
+                move |now| reading(now, bytes.next().unwrap_or(65_536)),
+                Duration::from_millis(20),
+                move |transition| {
+                    let _ = sender.send(transition);
+                },
+            )
+            .unwrap();
+        let engaged = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(engaged.engaged());
+        assert_eq!(engaged.to.hold_phase(), Some(HoldPhase::Degraded));
+        let moved = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(moved.from, PipeAdmission::Degraded);
+        assert_eq!(moved.to.admission, PipeAdmission::Degraded, "still held");
+        assert_eq!(moved.to.hold_phase(), Some(HoldPhase::Recovering));
+        assert!(!moved.engaged() && !moved.cleared());
+        assert!(moved.to.describe().starts_with("pipe health: recovering"));
         drop(monitor);
         handle.join().unwrap();
     }

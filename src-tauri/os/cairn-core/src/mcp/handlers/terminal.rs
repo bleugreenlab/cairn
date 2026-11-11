@@ -3701,6 +3701,50 @@ mod delivery_predicate_tests {
     }
 }
 
+/// Start `resource`'s terminal for job `job_id` inside the residency `fence`
+/// through the real spawn path, so it holds a live session, a lease, and the
+/// exit handler that settles its row. Returns its session id, which is also its
+/// process key on the executor.
+#[cfg(test)]
+pub(crate) async fn spawn_job_terminal_for_test(
+    orch: &Orchestrator,
+    resource: CairnResource,
+    job_id: &str,
+    command: &str,
+    fence: ResidencyFence,
+) -> Result<String, String> {
+    let target = TerminalResourceTarget {
+        slug: resource_slug(&resource),
+        job_id: Some(job_id.into()),
+        project_id: "p".into(),
+        run_id: None,
+        cwd: "/cell".into(),
+        branch: None,
+        repo_path: "/tmp/p".into(),
+        owner_ref: None,
+        lease: Some(fence),
+        selector: None,
+        created_by_run_id: None,
+        replaces: None,
+    };
+    spawn_terminal_session(
+        orch,
+        resource,
+        target,
+        command.into(),
+        None,
+        None,
+        None,
+        ResidentPtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod terminal_finalize_tests {
     use super::*;

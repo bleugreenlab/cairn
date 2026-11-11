@@ -81,6 +81,7 @@ use cairn_common::executor_protocol::{
     PriorDecline,
 };
 use cairn_common::executor_protocol::{HomeAffinity, ScratchSyncEstimate};
+use cairn_common::pipe_health::PipeFloorWork;
 use cairn_uri::normalize_executor_name;
 use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
@@ -5797,12 +5798,12 @@ impl Fleet {
             .map(|entry| entry.generation)
     }
 
-    /// Whether the colocated machine's fresh-pipe floor refuses new processes.
-    fn colocated_pipe_floor_refuses(&self, now_unix_ms: u64) -> bool {
+    /// Whether the colocated machine's fresh-pipe floor refuses `work`.
+    fn colocated_pipe_floor_refuses(&self, work: PipeFloorWork, now_unix_ms: u64) -> bool {
         self.lock_connections()
             .values()
             .find(|entry| entry.colocated)
-            .is_some_and(|entry| !pipe_health_assessment(entry, now_unix_ms).admits())
+            .is_some_and(|entry| !pipe_health_assessment(entry, now_unix_ms).admits_work(work))
     }
 
     /// One attached machine's fresh-pipe floor, assessed now. `None` when no
@@ -15265,7 +15266,7 @@ impl Fleet {
                         && now.saturating_sub(evidence.last_progress_unix_ms)
                             <= EXECUTOR_PROGRESS_FRESHNESS_MS
                 })
-                .filter(|_| !self.colocated_pipe_floor_refuses(now));
+                .filter(|_| !self.colocated_pipe_floor_refuses(pipe_floor_work(request), now));
             let targeted = request.pinned_executor_id.is_some()
                 || request
                     .executor
@@ -16138,6 +16139,17 @@ pub(crate) fn residency_queue_entry_id(holder: &ResidencyHolder) -> String {
 /// The holder an acquisition request places, read back from the request
 /// [`residency_placement_request`] builds: its attempt marks an acquisition
 /// and its command is the holder's storage key.
+/// A placement request as the fresh-pipe floor classifies it. An acquisition
+/// rides placement as a request too, and is a residency, never a command.
+fn pipe_floor_work(request: &CellRequest) -> PipeFloorWork {
+    let kind = if request.attempt_id == RESIDENCY_ACQUIRE_ATTEMPT_ID {
+        CellAdmissionKind::Residency
+    } else {
+        CellAdmissionKind::Command
+    };
+    PipeFloorWork::of(request.priority, kind)
+}
+
 fn acquired_residency_holder(request: &CellRequest) -> Option<ResidencyHolder> {
     (request.attempt_id == RESIDENCY_ACQUIRE_ATTEMPT_ID)
         .then(|| ResidencyHolder::parse_storage_key(&request.command))
@@ -16597,6 +16609,11 @@ pub(crate) struct PlacementScope<'a> {
     /// that environment, so without this a machine that cannot build the
     /// project got both (cairn/5909).
     pub(crate) compiles_rust: bool,
+    /// What the work asks of a machine's fresh-pipe floor: an agent's short
+    /// command passes recovery hysteresis, anything that stays does not. The
+    /// executor applies the same classification, so placement never rejects
+    /// what the machine would take.
+    pub(crate) pipe_floor: PipeFloorWork,
 }
 
 /// The opening of every refusal caused by a project config that cannot be
@@ -16667,6 +16684,7 @@ impl<'a> PlacementScope<'a> {
                     acquired_residency_holder(request),
                     Some(ResidencyHolder::Job { .. })
                 ),
+            pipe_floor: pipe_floor_work(request),
         }
     }
 
@@ -16815,7 +16833,7 @@ fn candidate_rejection(
         Some(PlacementRejectionReason::BuildVolumeAbsent {
             path: volume.root.clone(),
         })
-    } else if let Some(reason) = pipe_health_rejection(entry, now_unix_ms) {
+    } else if let Some(reason) = pipe_health_rejection(entry, scope.pipe_floor, now_unix_ms) {
         // Binds every pin, a residency's included, and an explicit name: a
         // process started there may block forever on its first pipe write, so
         // a pin is not a safety override. Structural, never waited on, so
@@ -16935,10 +16953,11 @@ fn pipe_health_assessment(
 
 fn pipe_health_rejection(
     entry: &ExecutorConnectionState,
+    work: PipeFloorWork,
     now_unix_ms: u64,
 ) -> Option<PlacementRejectionReason> {
     let assessment = pipe_health_assessment(entry, now_unix_ms);
-    (!assessment.admits()).then_some(PlacementRejectionReason::PipeDegraded { assessment })
+    (!assessment.admits_work(work)).then_some(PlacementRejectionReason::PipeDegraded { assessment })
 }
 
 /// Every machine that could structurally take this work, and every one that
@@ -32504,7 +32523,7 @@ mod tests {
             500 * 1024 * 1024 * 1024,
         );
         assert!(
-            pipe_health_rejection(&local, NOW).is_none(),
+            pipe_health_rejection(&local, PipeFloorWork::Process, NOW).is_none(),
             "no evidence is a named gap that admits"
         );
         pipes_reading(&mut local, NOW, 512);
@@ -32539,14 +32558,55 @@ mod tests {
 
         let local = &connections[COLOCATED_EXECUTOR_ID];
         assert!(matches!(
-            pipe_health_rejection(local, NOW + FRESH_FOR_MS + 1),
+            pipe_health_rejection(local, PipeFloorWork::Process, NOW + FRESH_FOR_MS + 1),
             Some(PlacementRejectionReason::PipeDegraded { assessment })
                 if assessment.admission == cairn_common::pipe_health::PipeAdmission::StaleHold
         ));
         assert!(
-            pipe_health_rejection(local, NOW + FRESH_FOR_MS + STALE_HOLD_MS).is_none(),
+            pipe_health_rejection(
+                local,
+                PipeFloorWork::Process,
+                NOW + FRESH_FOR_MS + STALE_HOLD_MS
+            )
+            .is_none(),
             "expired evidence admits with a gap rather than refusing forever"
         );
+    }
+
+    /// cairn/6440: placement mirrors the executor's short-command rule. An
+    /// agent's command batch is placed on a machine in recovery hysteresis and
+    /// refused while its pipe reads below the floor; a check lane and a
+    /// residency acquisition are refused in both phases.
+    #[test]
+    fn an_agent_command_passes_recovery_hysteresis_and_nothing_else_does() {
+        let (_, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        pipes_reading(&mut local, NOW, 512);
+        let mut command = spillable_request();
+        command.priority = CellPriority::AgentInteractive;
+        let mut check = spillable_request();
+        check.priority = CellPriority::ReviewCheck;
+        let mut acquisition = command.clone();
+        acquisition.attempt_id = RESIDENCY_ACQUIRE_ATTEMPT_ID.into();
+        assert_eq!(pipe_floor_work(&command), PipeFloorWork::ShortCommand);
+        assert_eq!(pipe_floor_work(&check), PipeFloorWork::Process);
+        assert_eq!(pipe_floor_work(&acquisition), PipeFloorWork::Process);
+
+        let rejected = |entry: &ExecutorConnectionState, request: &CellRequest, at| {
+            matches!(
+                candidate_rejection(entry, PlacementScope::of(request), at),
+                Some(PlacementRejectionReason::PipeDegraded { .. })
+            )
+        };
+        // Degraded: everything is refused.
+        for request in [&command, &check, &acquisition] {
+            assert!(rejected(&local, request, NOW));
+        }
+        // Recovering at 65536 B: only the short command is placed.
+        pipes_reading(&mut local, NOW + 5_000, 65_536);
+        let at = NOW + 5_000;
+        assert!(!rejected(&local, &command, at));
+        assert!(rejected(&local, &check, at));
+        assert!(rejected(&local, &acquisition, at));
     }
 
     /// A value measured long enough ago is history, and deciding on it would be
@@ -36402,6 +36462,7 @@ mod tests {
             project_requirements: &NO_PROJECT_REQUIREMENTS,
             work_class: PlacementWorkClass::ReviewChecks,
             compiles_rust: false,
+            pipe_floor: PipeFloorWork::Process,
         }
     }
 

@@ -212,6 +212,130 @@ pub fn census_process_group(process_group_id: u32, out: &mut Census) -> bool {
     true
 }
 
+/// `PROX_FDTYPE_PIPE` from the macOS SDK's sys/proc_info.h.
+const PROX_FDTYPE_PIPE: u32 = 6;
+/// `PROC_PIDPATHINFO_MAXSIZE` from libproc.h.
+const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+
+/// Every same-uid process's pipe and total descriptors: one `PROC_PIDLISTFDS`
+/// listing per process, stopping at `deadline`.
+pub fn fd_census_into(deadline: std::time::Instant, out: &mut crate::fd_census::FdCensus) -> bool {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        out.partial = true;
+        return true;
+    }
+    let mut pids = vec![0_i32; needed as usize + 64];
+    // SAFETY: the buffer holds `pids.len()` pids and the kernel is told so.
+    let count = unsafe {
+        libc::proc_listallpids(
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if count <= 0 {
+        out.partial = true;
+        return true;
+    }
+    out.partial |= count as usize >= pids.len();
+    for pid in pids.into_iter().take(count as usize).filter(|pid| *pid > 0) {
+        if std::time::Instant::now() >= deadline {
+            out.partial = true;
+            break;
+        }
+        // Another user's process may refuse; it is not this census's.
+        let Ok(info) = bsd_info(pid as u32, false) else {
+            continue;
+        };
+        if info.pbi_uid != uid || info.pbi_status == libc::SZOMB {
+            continue;
+        }
+        let (pipe_fds, total_fds) = match descriptor_counts(pid) {
+            Ok(counts) => counts,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+            Err(_) => {
+                out.unreadable += 1;
+                out.partial = true;
+                continue;
+            }
+        };
+        let name = crate::fd_census::c_name(&info.pbi_name);
+        out.processes.push(crate::fd_census::FdCensusRow {
+            pid: pid as u32,
+            start: StartKey(info.pbi_start_tvsec, info.pbi_start_tvusec),
+            parent_pid: info.pbi_ppid,
+            comm: if name.is_empty() {
+                crate::fd_census::c_name(&info.pbi_comm)
+            } else {
+                name
+            },
+            path_basename: executable_basename(pid),
+            pipe_fds,
+            total_fds,
+        });
+    }
+    true
+}
+
+/// (pipe descriptors, all descriptors) for one process.
+fn descriptor_counts(pid: i32) -> std::io::Result<(u32, u32)> {
+    let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks only for the size.
+    let needed =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if needed == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(0) | None => Ok((0, 0)),
+            _ => Err(error),
+        };
+    }
+    // Room for descriptors opened between the size query and the listing.
+    let capacity = needed as usize / entry_size + 32;
+    let mut entries: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
+    // SAFETY: the buffer has room for `capacity` entries and the kernel is
+    // told that many bytes.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            entries.as_mut_ptr().cast(),
+            (capacity * entry_size) as libc::c_int,
+        )
+    };
+    if filled <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel initialized `filled` bytes of whole entries.
+    unsafe { entries.set_len(filled as usize / entry_size) };
+    let pipes = entries
+        .iter()
+        .filter(|entry| entry.proc_fdtype == PROX_FDTYPE_PIPE)
+        .count();
+    Ok((pipes as u32, entries.len() as u32))
+}
+
+fn executable_basename(pid: i32) -> Option<String> {
+    let mut buffer = vec![0_u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: the buffer is as large as the kernel is told.
+    let length =
+        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    let path = String::from_utf8_lossy(&buffer).into_owned();
+    std::path::Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 #[cfg(target_os = "macos")]
 pub fn macos_task_info(pid: i32) -> Option<libc::proc_taskinfo> {
     let mut task: libc::proc_taskinfo = unsafe { std::mem::zeroed() };

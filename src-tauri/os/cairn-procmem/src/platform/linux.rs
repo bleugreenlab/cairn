@@ -241,6 +241,84 @@ pub fn census(out: &mut Census) -> bool {
     true
 }
 
+/// Every same-uid process's pipe and total descriptors from `/proc/<pid>/fd`,
+/// stopping at `deadline`. A pipe's link target reads `pipe:[inode]`.
+#[cfg(target_os = "linux")]
+pub fn fd_census_into(deadline: std::time::Instant, out: &mut crate::fd_census::FdCensus) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        out.partial = true;
+        return true;
+    };
+    for entry in entries {
+        if std::time::Instant::now() >= deadline {
+            out.partial = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            out.partial = true;
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !std::fs::metadata(entry.path()).is_ok_and(|meta| meta.uid() == uid) {
+            continue;
+        }
+        let process = match read_kernel_state(pid) {
+            KernelRead::Live(process) => process,
+            KernelRead::Gone => continue,
+            KernelRead::Unreadable => {
+                out.unreadable += 1;
+                out.partial = true;
+                continue;
+            }
+        };
+        let descriptors = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                out.unreadable += 1;
+                out.partial = true;
+                continue;
+            }
+        };
+        let (mut pipe_fds, mut total_fds) = (0_u32, 0_u32);
+        for descriptor in descriptors.flatten() {
+            total_fds += 1;
+            if std::fs::read_link(descriptor.path())
+                .is_ok_and(|target| target.to_string_lossy().starts_with("pipe:"))
+            {
+                pipe_fds += 1;
+            }
+        }
+        out.processes.push(crate::fd_census::FdCensusRow {
+            pid,
+            start: process.start,
+            parent_pid: process.parent_pid,
+            comm: std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .map(|comm| comm.trim_end().to_string())
+                .unwrap_or_default(),
+            path_basename: std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }),
+            pipe_fds,
+            total_fds,
+        });
+    }
+    true
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub fn ticks_to_ms(ticks: u64, ticks_per_second: u64) -> u64 {
     (u128::from(ticks) * 1_000)

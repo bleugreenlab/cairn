@@ -125,14 +125,17 @@ pub(crate) fn pipe_floor_line(
     assessment: &cairn_common::pipe_health::PipeHealthAssessment,
 ) -> String {
     use cairn_common::pipe_health::{
-        PipeAdmission, DEGRADED_BELOW_BYTES, RECOVERED_AT_BYTES, RECOVERY_SAMPLES,
+        HoldPhase, PipeAdmission, DEGRADED_BELOW_BYTES, RECOVERED_AT_BYTES, RECOVERY_SAMPLES,
     };
-    let headline = match assessment.admission {
-        PipeAdmission::Healthy if assessment.degraded_latch => "admitting",
-        PipeAdmission::Healthy => "admitting (measured)",
-        PipeAdmission::Degraded => "refusing new processes (measured degraded)",
-        PipeAdmission::StaleHold => "refusing new processes (bounded stale hold)",
-        PipeAdmission::Unmeasured => "admitting with a gap (not currently measured)",
+    let headline = match (assessment.admission, assessment.hold_phase()) {
+        (PipeAdmission::Healthy, _) if assessment.degraded_latch => "admitting",
+        (PipeAdmission::Healthy, _) => "admitting (measured)",
+        (PipeAdmission::Unmeasured, _) => "admitting with a gap (not currently measured)",
+        (PipeAdmission::StaleHold, _) => "refusing new processes (bounded stale hold)",
+        (_, Some(HoldPhase::Recovering)) => {
+            "refusing new processes (recovering; pipe healthy again)"
+        }
+        _ => "refusing new processes (degraded)",
     };
     let mut line = format!(
         "- New-work admission (fresh pipes): {headline}. {}",
@@ -146,9 +149,7 @@ pub(crate) fn pipe_floor_line(
     if let Some(failure) = &assessment.last_failure {
         line.push_str(&format!(". Latest attempt failed: {failure}"));
     }
-    line.push_str(
-        "\n  - Pipe-driven warm reclamation: not enabled; nothing has yet shown that releasing idle sessions recovers pipe capacity (cairn/6023)\n",
-    );
+    line.push('\n');
     line
 }
 
@@ -7971,15 +7972,14 @@ mod tests {
         executor.health.host.pipe_health = Some(evidence);
         let degraded = render_executor(&executor);
         assert!(
-            degraded.contains("refusing new processes (measured degraded)"),
+            degraded.contains("refusing new processes (degraded)"),
             "{degraded}"
         );
         assert!(
-            degraded.contains("fresh pipe held 512 B 2.0s ago"),
+            degraded.contains("fresh pipe held 512 B 2.0 s ago"),
             "{degraded}"
         );
         assert!(degraded.contains("recovers after 2 spaced readings of at least 16384 B"));
-        assert!(degraded.contains("Pipe-driven warm reclamation: not enabled"));
         assert!(
             degraded.contains("## Link"),
             "the link keeps its own section, untouched by pipe health"

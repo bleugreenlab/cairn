@@ -38,10 +38,12 @@ fn test_orchestrator(db: LocalDb, recovery_pending: bool) -> Orchestrator {
     }
 }
 
-/// A provider that records the prompt each launch carried and registers a
-/// process for it, so a cold continuation completes without spawning anything.
+/// A provider that records the prompt and session start each launch carried and
+/// registers a process for it, so a cold continuation completes without
+/// spawning anything.
 struct RecordingBackend {
     prompts: Arc<Mutex<Vec<String>>>,
+    starts: Arc<Mutex<Vec<crate::backends::SessionStart>>>,
 }
 
 impl crate::backends::AgentBackend for RecordingBackend {
@@ -82,6 +84,10 @@ impl crate::backends::AgentBackend for RecordingBackend {
         _admitted: crate::backends::Admitted,
     ) -> Result<(), String> {
         self.prompts.lock().unwrap().push(config.prompt.clone());
+        self.starts
+            .lock()
+            .unwrap()
+            .push(config.session_start.clone());
         let session_id = config.session_start.session_id().to_string();
         orch.process_state
             .register_process(
@@ -116,6 +122,21 @@ async fn host_with(
     Arc<Mutex<Vec<String>>>,
     crate::orchestrator::session::OrchestratorTestSessionBackend,
 ) {
+    let (orch, db, prompts, _starts, backend) = host_recording(name, recovery_pending).await;
+    (orch, db, prompts, backend)
+}
+
+/// [`host_with`], also handing back the session start each launch carried.
+async fn host_recording(
+    name: &str,
+    recovery_pending: bool,
+) -> (
+    Orchestrator,
+    Arc<LocalDb>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<crate::backends::SessionStart>>>,
+    crate::orchestrator::session::OrchestratorTestSessionBackend,
+) {
     let orch = test_orchestrator(migrated_test_db(name).await, recovery_pending);
     let db = orch.db.local.clone();
     db.execute_script(
@@ -125,14 +146,17 @@ async fn host_with(
     .await
     .unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
+    let starts = Arc::new(Mutex::new(Vec::new()));
     let recorded = prompts.clone();
+    let recorded_starts = starts.clone();
     let backend =
         crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, move || {
             Box::new(RecordingBackend {
                 prompts: recorded.clone(),
+                starts: recorded_starts.clone(),
             })
         });
-    (orch, db, prompts, backend)
+    (orch, db, prompts, starts, backend)
 }
 
 /// Builder job `job` on issue number `number` (in `issue_status`), its own
@@ -570,6 +594,355 @@ async fn a_wake_inside_the_recovery_window_is_held_and_becomes_the_one_resume() 
     assert_eq!(launched_runs(&db, "j").await, 1);
     assert_eq!(launched_turns(&db, "j").await.len(), 1);
     assert_eq!(prompts.lock().unwrap().len(), 1);
+}
+
+/// A cell held by job `job`'s residency, with no process in it yet.
+fn terminal_cell(job: &str) -> cairn_common::executor_protocol::PersistentCellState {
+    use cairn_common::executor_protocol::*;
+    PersistentCellState {
+        observed_head: None,
+        size_bytes: 0,
+        warm_command_classes: Vec::new(),
+        executor_id: String::new(),
+        executor_display_name: None,
+        project_id: "p".into(),
+        cell_id: "cell".into(),
+        path: "/cell".into(),
+        workspace_name: "cell".into(),
+        repository: "/tmp/p".into(),
+        checkout_kind: CellCheckoutKind::ExistingCheckout,
+        git_common_dir: None,
+        authority_path: "/cell/.authority".into(),
+        lifecycle: PersistentCellLifecycle::Active,
+        cell_epoch: 7,
+        last_sealed_commit: Some("base".into()),
+        last_distance: None,
+        quarantine_reason: None,
+        last_used_unix_ms: 1,
+        last_affinity_key: None,
+        preparation_fingerprint: None,
+        residency: Some(CellResidency {
+            holder: ResidencyHolder::Job { job_id: job.into() },
+            repository: RepositoryLocator::ExistingCheckout {
+                project_id: "p".into(),
+                repository_id: "p".into(),
+                absolute_path: "/tmp/p".into(),
+            },
+            owner_ref: None,
+            selector: None,
+            incarnation_id: "incarnation".into(),
+            current_base_commit: "base".into(),
+            phase: ResidencyPhase::Active,
+            last_heartbeat_unix_ms: 1,
+            reclaim_deadline_unix_ms: 0,
+            death_policy: OwnerDeathPolicy {
+                heartbeat_timeout_ms: 60_000,
+                reclaim_grace_ms: 60_000,
+            },
+            footprint: ResidencyFootprint {
+                memory_bytes: 1,
+                disk_growth_bytes: 1,
+            },
+            state_revision: 1,
+            events: Vec::new(),
+        }),
+        occupancy: CellOccupancy::default(),
+        seeded_from: None,
+    }
+}
+
+/// Attach a colocated executor reporting `cell`, and answer every residency
+/// operation that reaches its link the way an executor does: a start puts a
+/// terminal process named `slug` in the cell, and a stop reports the cell and
+/// then the process's exit. Each operation is logged by name, a start or stop
+/// as `StartProcess:<process key>` / `StopProcess:<process key>`.
+fn attach_answering_executor(
+    orch: &Orchestrator,
+    mut cell: cairn_common::executor_protocol::PersistentCellState,
+    slug: &str,
+) -> Arc<Mutex<Vec<String>>> {
+    use cairn_common::executor_protocol::*;
+    let fleet = orch.fleet.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let generation = fleet.attach_executor(sender);
+    assert!(fleet.set_executor_snapshot(
+        crate::fleet::COLOCATED_EXECUTOR_ID,
+        generation,
+        FleetSnapshot {
+            cells: vec![cell.clone()],
+            ..Default::default()
+        },
+        ExecutorSubstrateReport::default(),
+    ));
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let log = operations.clone();
+    let slug = slug.to_string();
+    tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            let ExecutorMessage::ResidencyRequest {
+                correlation_id,
+                operation,
+                ..
+            } = message
+            else {
+                continue;
+            };
+            let stopped = match &operation {
+                ResidencyOperation::StartProcess { process_key, .. } => {
+                    log.lock()
+                        .unwrap()
+                        .push(format!("StartProcess:{process_key}"));
+                    cell.occupancy.processes.insert(
+                        process_key.clone(),
+                        ResidentProcess {
+                            generation: 1,
+                            kind: ResidentProcessKind::Terminal { slug: slug.clone() },
+                            spec: None,
+                            status: ResidentProcessStatus::Starting,
+                            reservation: None,
+                            live_usage: None,
+                            charge: None,
+                        },
+                    );
+                    assert!(fleet.set_executor_snapshot(
+                        crate::fleet::COLOCATED_EXECUTOR_ID,
+                        generation,
+                        FleetSnapshot {
+                            cells: vec![cell.clone()],
+                            ..Default::default()
+                        },
+                        ExecutorSubstrateReport::default(),
+                    ));
+                    None
+                }
+                ResidencyOperation::StopProcess { fence, process_key } => {
+                    log.lock()
+                        .unwrap()
+                        .push(format!("StopProcess:{process_key}"));
+                    Some((fence.clone(), process_key.clone()))
+                }
+                other => {
+                    let name = format!("{other:?}");
+                    log.lock()
+                        .unwrap()
+                        .push(name.split([' ', '{']).next().unwrap_or_default().into());
+                    None
+                }
+            };
+            fleet.handle_executor_message(
+                crate::fleet::COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::ResidencyResponse {
+                    correlation_id,
+                    result: ResidencyResult::State { cell: cell.clone() },
+                },
+            );
+            if let Some((fence, process_key)) = stopped {
+                fleet.handle_executor_message(
+                    crate::fleet::COLOCATED_EXECUTOR_ID,
+                    generation,
+                    ExecutorMessage::ResidentProcessEvent {
+                        event: ResidentProcessEvent {
+                            holder: fence.holder,
+                            incarnation_id: fence.incarnation_id,
+                            cell_epoch: fence.cell_epoch,
+                            process_key,
+                            process_generation: 1,
+                            event: ResidentProcessEventKind::State {
+                                status: ResidentProcessStatus::Exited {
+                                    finished_at_unix_ms: 2,
+                                    exit_code: Some(143),
+                                    restartable: true,
+                                    executor_lost: false,
+                                },
+                            },
+                        },
+                    },
+                );
+            }
+        }
+    });
+    operations
+}
+
+/// cairn/6440: retiring an idle warm process under pipe pressure is a release,
+/// not a stop. The job's dev-server terminal, bound to a live process on an
+/// executor, receives no stop and keeps running; the next message is delivered
+/// through the ordinary continuation and resumes the same persisted session.
+/// An operator Stop of the same job is the control: it does send the
+/// terminal's process a stop, and the terminal ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pipe_pressure_release_keeps_the_bound_terminal_and_the_next_message_resumes_the_session()
+{
+    use crate::orchestrator::lifecycle::{
+        kill_session_with_reason, retire_unowned_idle, RetireCause, RetireGrounds, TerminalPolicy,
+    };
+    let (mut orch, db, prompts, starts, _backend) =
+        host_recording("pipe-release-composed", false).await;
+    orch.warm_gc = Some(Arc::new(crate::agent_process::gc::WarmProcessGC::new(6)));
+    seed_node_job(&db, "j", 1, "active").await;
+    seed_turn(
+        &db,
+        "turn-j",
+        "j",
+        Some("r-j"),
+        1,
+        "complete",
+        "initial",
+        None,
+    )
+    .await;
+
+    // The dev server, started through the terminal spawn path on an executor
+    // holding the job's cell: a live session whose lease names that cell's
+    // process, and the exit handler that settles its row.
+    let operations = attach_answering_executor(&orch, terminal_cell("j"), "dev");
+    let terminal = crate::mcp::handlers::terminal::spawn_job_terminal_for_test(
+        &orch,
+        cairn_uri::CairnResource::NodeTerminal {
+            project: "p".into(),
+            number: 1,
+            exec_seq: 1,
+            node_id: "builder".into(),
+            slug: "dev".into(),
+        },
+        "j",
+        "bun dev",
+        cairn_common::executor_protocol::ResidencyFence {
+            holder: cairn_common::executor_protocol::ResidencyHolder::Job { job_id: "j".into() },
+            incarnation_id: "incarnation".into(),
+            cell_epoch: 7,
+        },
+    )
+    .await
+    .expect("the dev server starts");
+    assert_eq!(
+        *operations.lock().unwrap(),
+        [format!("StartProcess:{terminal}")]
+    );
+    let terminal_status = || {
+        text(
+            &db,
+            "SELECT status FROM job_terminals WHERE session_id = ?1",
+            &terminal,
+        )
+    };
+    assert_eq!(terminal_status().await.as_deref(), Some("running"));
+    let stops = || {
+        operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation.starts_with("StopProcess"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    orch.process_state
+        .register_process("r-j".into(), RunHandle::test_handle(Some("s-j"), Some("j")))
+        .unwrap();
+    orch.process_state.transition_to_warm("r-j");
+
+    let releasing = orch.clone();
+    let retired = tokio::task::spawn_blocking(move || {
+        retire_unowned_idle(&releasing, "r-j", RetireGrounds::PipePressure)
+    })
+    .await
+    .unwrap()
+    .expect("idle, unowned and unprotected");
+    assert_eq!(retired.cause, RetireCause::PipePressure);
+    assert!(!orch.process_state.has_process("r-j").unwrap_or(false));
+    assert_eq!(
+        text(&db, "SELECT exit_reason FROM runs WHERE id = ?1", "r-j")
+            .await
+            .as_deref(),
+        Some("pipe_pressure_release")
+    );
+
+    let woken = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::execution::jobs::continue_job_impl(&woken, "j", Some("next message"), None, None)
+    })
+    .await
+    .unwrap()
+    .expect("the message is delivered");
+    await_prompts(&prompts, 1).await;
+    let prompt = launch_prompts(&db, &prompts, "j").await;
+    assert!(prompt.contains("next message"), "{prompt}");
+    assert_eq!(
+        *starts.lock().unwrap(),
+        [crate::backends::SessionStart::Resume {
+            session_id: "s-j".into(),
+            backend_id: "handle-j".into(),
+        }],
+        "the delivery resumes the persisted session natively"
+    );
+    assert_eq!(
+        text(&db, "SELECT status FROM sessions WHERE id = ?1", "s-j")
+            .await
+            .as_deref(),
+        Some("open")
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT current_session_id FROM jobs WHERE id = ?1",
+            "j"
+        )
+        .await
+        .as_deref(),
+        Some("s-j")
+    );
+
+    // Nothing the release or the delivery did reached the terminal's process.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(stops().is_empty(), "{:?}", operations.lock().unwrap());
+    assert_eq!(
+        terminal_status().await.as_deref(),
+        Some("running"),
+        "the dev server survives the release"
+    );
+    assert!(orch
+        .pty_state
+        .sessions
+        .lock()
+        .unwrap()
+        .contains_key(&terminal));
+
+    // The control: an operator Stop of the resumed run ends the job's work.
+    let resumed = text(
+        &db,
+        "SELECT id FROM runs WHERE job_id = ?1 AND id != 'r-j'",
+        "j",
+    )
+    .await
+    .expect("the delivery launched a run");
+    let stopping = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        kill_session_with_reason(&stopping, &resumed, "user_stop", TerminalPolicy::Finalize)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    // The Stop's own stop goes out first; the exit it produces settles the
+    // terminal, whose handler then releases the exited process with another.
+    let expected = format!("StopProcess:{terminal}");
+    let sent = stops();
+    assert!(
+        !sent.is_empty() && sent.iter().all(|stop| *stop == expected),
+        "{sent:?}"
+    );
+    for _ in 0..500 {
+        if terminal_status().await.as_deref() != Some("running") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        terminal_status().await.as_deref(),
+        Some("exited"),
+        "the operator's Stop ends the terminal"
+    );
 }
 
 /// A `run` call held open on its socket past grace (cairn/4887), as a host
@@ -2328,6 +2701,7 @@ fn reboot(
         crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, move || {
             Box::new(RecordingBackend {
                 prompts: prompts.clone(),
+                starts: Arc::default(),
             })
         });
     (orch, backend)

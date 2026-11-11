@@ -39,41 +39,116 @@ struct LifetimeFacts {
     last_provider_request_at: Option<i64>,
 }
 
+/// Why an idle provider process was retired, recorded as its run's exit
+/// reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StopCause {
+pub(crate) enum RetireCause {
     SessionClosed,
     JobCancelled,
     IdlePastHorizon,
+    /// The managed CLI the process runs was replaced.
+    CliReplaced,
+    /// The host's fresh pipes read below the floor (cairn/6440).
+    PipePressure,
 }
 
-impl StopCause {
+impl RetireCause {
     fn exit_reason(self) -> &'static str {
         match self {
             Self::SessionClosed => "session_closed",
             Self::JobCancelled => "job_cancelled",
             Self::IdlePastHorizon => "cache_horizon_idle",
+            Self::CliReplaced => crate::orchestrator::models::MANAGED_CLI_SWAP_EXIT_REASON,
+            Self::PipePressure => "pipe_pressure_release",
         }
     }
 }
 
-fn lifetime_verdict(facts: &LifetimeFacts, process_idle_secs: u64, now: i64) -> Option<StopCause> {
+/// The grounds a caller retires an idle provider on. Every one requires the
+/// same thing first: the run is warm under the job's launch lock, and facts
+/// read under that lock show no work in its process. The grounds then add
+/// their own condition and name the cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetireGrounds {
+    /// The lifetime sweep: the session closed, the job was cancelled, or the
+    /// provider's prefix cache went cold, judged at the sweep's own `now`.
+    Lifetime { now: i64 },
+    /// A managed-CLI swap: the process runs a CLI that has been replaced.
+    CliReplaced,
+    /// The fresh-pipe floor's release experiment. Also requires that the warm
+    /// collector, reading its metadata now, does not protect the run (live
+    /// delegated children, a pending memory review, an unresolved database).
+    PipePressure,
+}
+
+/// Why a retire did not happen. None of these is an error: each is a fence
+/// doing its job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NotRetired {
+    /// The run has no job, or its job could not be read.
+    NoJob,
+    /// A launch or resume holds the job's launch lock.
+    LaunchHeld,
+    /// The process is no longer registered idle.
+    NotIdle,
+    /// Its facts could not be read under the lock: unknown state never
+    /// authorizes a stop.
+    FactsUnknown,
+    /// A turn is pending or running, or a `run` call is held open inline.
+    WorkInProcess,
+    /// The warm collector protects it.
+    Protected,
+    /// The lifetime grounds found no cause once re-read under the lock.
+    NoCause,
+    TeardownFailed(String),
+}
+
+impl NotRetired {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::NoJob => "its run has no readable job".into(),
+            Self::LaunchHeld => "a launch or resume holds its job".into(),
+            Self::NotIdle => "it is no longer idle".into(),
+            Self::FactsUnknown => "its facts could not be read".into(),
+            Self::WorkInProcess => "work is in its process".into(),
+            Self::Protected => "the warm collector protects it".into(),
+            Self::NoCause => "nothing retires it any more".into(),
+            Self::TeardownFailed(error) => format!("its teardown failed: {error}"),
+        }
+    }
+}
+
+/// A retired run and what it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Retired {
+    pub cause: RetireCause,
+    pub session_id: String,
+    pub job_id: String,
+    pub backend: String,
+}
+
+fn lifetime_verdict(
+    facts: &LifetimeFacts,
+    process_idle_secs: u64,
+    now: i64,
+) -> Option<RetireCause> {
     if facts.work_in_process {
         return None;
     }
     if facts.session_status != "open" {
-        return Some(StopCause::SessionClosed);
+        return Some(RetireCause::SessionClosed);
     }
     if facts.job_status == "cancelled" {
-        return Some(StopCause::JobCancelled);
+        return Some(RetireCause::JobCancelled);
     }
     let backend = ResumeBackend::from_key(&facts.backend);
     match prefix_cache_state(backend, facts.last_provider_request_at, now) {
-        PrefixCacheState::Cold => Some(StopCause::IdlePastHorizon),
+        PrefixCacheState::Cold => Some(RetireCause::IdlePastHorizon),
         PrefixCacheState::Unknown
             if prompt_cache_horizon_secs(backend)
                 .is_some_and(|horizon| process_idle_secs >= horizon as u64) =>
         {
-            Some(StopCause::IdlePastHorizon)
+            Some(RetireCause::IdlePastHorizon)
         }
         _ => None,
     }
@@ -81,26 +156,20 @@ fn lifetime_verdict(facts: &LifetimeFacts, process_idle_secs: u64, now: i64) -> 
 
 /// Read each owning database once. An unresolved route, absent row, or failed
 /// lookup supplies no verdict: unknown state never authorizes a stop.
-async fn load_lifetime_facts(
-    dbs: &DbState,
-    warm: &[WarmProcess],
-) -> HashMap<String, LifetimeFacts> {
+async fn load_lifetime_facts(dbs: &DbState, run_ids: &[String]) -> HashMap<String, LifetimeFacts> {
     let mut groups: Vec<(Arc<LocalDb>, Vec<String>)> = Vec::new();
-    for process in warm {
-        let db = match routing_db_for_id(dbs, &process.run_id).await {
+    for run_id in run_ids {
+        let db = match routing_db_for_id(dbs, run_id).await {
             Ok(db) => db,
             Err(error) => {
-                log::warn!(
-                    "Process lifetime sweep: cannot route run {}: {error}",
-                    process.run_id
-                );
+                log::warn!("Process lifetime sweep: cannot route run {run_id}: {error}");
                 continue;
             }
         };
         if let Some((_, runs)) = groups.iter_mut().find(|(owner, _)| Arc::ptr_eq(owner, &db)) {
-            runs.push(process.run_id.clone());
+            runs.push(run_id.clone());
         } else {
-            groups.push((db, vec![process.run_id.clone()]));
+            groups.push((db, vec![run_id.clone()]));
         }
     }
 
@@ -165,7 +234,7 @@ pub(crate) fn sweep_process_lifetimes(orch: &Orchestrator) {
     let warm = orch.process_state.warm_processes();
     let inspected = warm.len();
     let dbs = orch.db.clone();
-    let candidates = warm.clone();
+    let candidates: Vec<String> = warm.iter().map(|process| process.run_id.clone()).collect();
     let facts = run_db_blocking(move || async move {
         Ok::<_, String>(load_lifetime_facts(&dbs, &candidates).await)
     })
@@ -184,77 +253,20 @@ pub(crate) fn sweep_process_lifetimes(orch: &Orchestrator) {
         if lifetime_verdict(facts, process.seconds_since_activity, now).is_none() {
             continue;
         }
-        let launch_lock = orch.job_launch_lock(&facts.job_id);
-        let Ok(guard) = launch_lock.try_lock() else {
-            continue;
-        };
-        if !orch.process_state.is_warm(&process.run_id) {
-            continue;
-        }
-        // A delivery can finish or yield between the batch read and this lock,
-        // leaving the process idle again. Neither its owner nor its cache age
-        // may be inferred from the old snapshot.
-        let dbs = orch.db.clone();
-        let candidate = process.clone();
-        let refreshed = run_db_blocking(move || async move {
-            Ok::<_, String>(
-                load_lifetime_facts(&dbs, std::slice::from_ref(&candidate))
-                    .await
-                    .remove(&candidate.run_id),
-            )
-        });
-        let facts = match refreshed {
-            Ok(Some(facts)) => facts,
-            Ok(None) => continue,
-            Err(error) => {
-                log::warn!(
-                    "Process lifetime sweep: cannot revalidate {}: {error}",
-                    process.run_id
-                );
-                continue;
-            }
-        };
-        let idle_secs = orch
-            .process_state
-            .processes
-            .lock()
-            .ok()
-            .and_then(|processes| {
-                processes.get(&process.run_id).and_then(|handle| {
-                    handle
-                        .is_warm()
-                        .then(|| handle.last_activity.elapsed().as_secs())
-                })
-            });
-        let Some(cause) = idle_secs.and_then(|idle| lifetime_verdict(&facts, idle, now)) else {
-            continue;
-        };
-        if let Err(error) = teardown_process(orch, &process.run_id, TerminalPolicy::Keep) {
-            log::warn!(
+        match retire_unowned_idle(orch, &process.run_id, RetireGrounds::Lifetime { now }) {
+            Ok(retired) => match retired.cause {
+                RetireCause::SessionClosed => session_closed += 1,
+                RetireCause::JobCancelled => job_cancelled += 1,
+                RetireCause::IdlePastHorizon => cache_horizon_idle += 1,
+                RetireCause::CliReplaced | RetireCause::PipePressure => {}
+            },
+            Err(NotRetired::TeardownFailed(error)) => log::warn!(
                 "Process lifetime sweep: could not stop run {} on session {}: {error}",
                 process.run_id,
                 facts.session_id
-            );
-            continue;
+            ),
+            Err(_) => {}
         }
-        // Finalization can re-derive the job and launch its next turn. The launch
-        // lock is not reentrant; only physical teardown belongs under it.
-        drop(guard);
-        match cause {
-            StopCause::SessionClosed => session_closed += 1,
-            StopCause::JobCancelled => job_cancelled += 1,
-            StopCause::IdlePastHorizon => cache_horizon_idle += 1,
-        }
-        if let Err(error) = set_exit_reason(orch, &process.run_id, cause.exit_reason()) {
-            log::error!(
-                "Process lifetime sweep: failed to record exit for {}: {error}",
-                process.run_id
-            );
-        }
-        // The physical process is already gone. A failed metadata write must
-        // not leave its run live for the reaper to misclassify as a crash;
-        // not every provider finalizes an idle run from its EOF callback.
-        finalize_run(orch, &process.run_id, RunStatus::Exited);
     }
     // An all-zero tick is the positive control that the sweep is alive.
     log::info!(
@@ -262,38 +274,125 @@ pub(crate) fn sweep_process_lifetimes(orch: &Orchestrator) {
     );
 }
 
-/// Retire `run_id`'s provider process because the CLI it runs was replaced
-/// (a managed-CLI swap), if it is still idle.
+/// Retire `run_id`'s idle provider process on `grounds`: the one fenced
+/// teardown every caller that stops an idle provider while its job continues
+/// shares, so all of them agree on what "retirable" means.
 ///
-/// The same discipline as the lifetime sweep: the job's launch lock is taken
-/// without waiting (a job whose launch or resume holds it is left alone, so
-/// a process a message is resuming is never torn down mid-turn), idleness is
-/// checked again under it, only the provider process is torn down (the
-/// job's terminals keep running), and the run is finalized outside the lock.
-/// Returns whether it was retired.
-pub(crate) fn retire_idle_provider(orch: &Orchestrator, run_id: &str, exit_reason: &str) -> bool {
-    let Some(job_id) = super::common::job_id_for_run(orch, run_id) else {
-        return false;
-    };
+/// The job's launch lock is taken without waiting (a job whose launch or
+/// resume holds it is left alone, so a process a message is resuming is never
+/// torn down mid-turn). Under it the run must still be warm, and its facts are
+/// re-read: a turn that started, or a `run` held open inline, since any
+/// earlier snapshot keeps the process. Only the provider process is torn down
+/// (`TerminalPolicy::Keep`: the job's terminals keep running, its session
+/// stays open and its next delivery resumes it), and the run is finalized
+/// outside the lock, because finalization can launch the job's next turn and
+/// the lock is not reentrant.
+pub(crate) fn retire_unowned_idle(
+    orch: &Orchestrator,
+    run_id: &str,
+    grounds: RetireGrounds,
+) -> Result<Retired, NotRetired> {
+    let job_id = super::common::job_id_for_run(orch, run_id).ok_or(NotRetired::NoJob)?;
     let launch_lock = orch.job_launch_lock(&job_id);
     let Ok(guard) = launch_lock.try_lock() else {
-        return false;
+        return Err(NotRetired::LaunchHeld);
     };
     if !orch.process_state.is_warm(run_id) {
-        return false;
+        return Err(NotRetired::NotIdle);
     }
+    let dbs = orch.db.clone();
+    let ids = vec![run_id.to_string()];
+    let refreshed =
+        run_db_blocking(
+            move || async move { Ok::<_, String>(load_lifetime_facts(&dbs, &ids).await) },
+        );
+    let facts = match refreshed.map(|mut facts| facts.remove(run_id)) {
+        Ok(Some(facts)) => facts,
+        Ok(None) => return Err(NotRetired::FactsUnknown),
+        Err(error) => {
+            log::warn!("Cannot revalidate idle run {run_id} before retiring it: {error}");
+            return Err(NotRetired::FactsUnknown);
+        }
+    };
+    if facts.work_in_process {
+        return Err(NotRetired::WorkInProcess);
+    }
+    let cause = match grounds {
+        RetireGrounds::Lifetime { now } => {
+            let idle_secs = orch
+                .process_state
+                .processes
+                .lock()
+                .ok()
+                .and_then(|processes| {
+                    processes.get(run_id).and_then(|handle| {
+                        handle
+                            .is_warm()
+                            .then(|| handle.last_activity.elapsed().as_secs())
+                    })
+                })
+                .ok_or(NotRetired::NotIdle)?;
+            lifetime_verdict(&facts, idle_secs, now).ok_or(NotRetired::NoCause)?
+        }
+        RetireGrounds::CliReplaced => RetireCause::CliReplaced,
+        RetireGrounds::PipePressure => {
+            if warm_collector_protects(orch, run_id, &job_id) {
+                return Err(NotRetired::Protected);
+            }
+            RetireCause::PipePressure
+        }
+    };
     if let Err(error) = teardown_process(orch, run_id, TerminalPolicy::Keep) {
-        log::warn!("Could not retire idle run {run_id}: {error}");
-        return false;
+        return Err(NotRetired::TeardownFailed(error.to_string()));
     }
-    // Finalization can launch the job's next turn, and the launch lock is not
-    // reentrant.
     drop(guard);
-    if let Err(error) = set_exit_reason(orch, run_id, exit_reason) {
+    if let Err(error) = set_exit_reason(orch, run_id, cause.exit_reason()) {
         log::error!("Failed to record exit for retired run {run_id}: {error}");
     }
+    // The physical process is already gone. A failed metadata write must not
+    // leave its run live for the reaper to misclassify as a crash; not every
+    // provider finalizes an idle run from its EOF callback.
     finalize_run(orch, run_id, RunStatus::Exited);
-    true
+    Ok(Retired {
+        cause,
+        session_id: facts.session_id,
+        job_id: facts.job_id,
+        backend: facts.backend,
+    })
+}
+
+/// Whether the warm collector protects `run_id`, from metadata it reads now.
+/// No collector, or a read that fails, protects: unknown state never
+/// authorizes a stop.
+fn warm_collector_protects(orch: &Orchestrator, run_id: &str, job_id: &str) -> bool {
+    let Some(gc) = orch.warm_gc.clone() else {
+        return true;
+    };
+    let dbs = orch.db.clone();
+    let process = WarmProcess {
+        run_id: run_id.to_string(),
+        pid: None,
+        seconds_since_activity: 0,
+        job_id: Some(job_id.to_string()),
+    };
+    run_db_blocking(move || async move { Ok::<_, String>(gc.protects(&dbs, &process).await) })
+        .unwrap_or(true)
+}
+
+/// Each run's session and backend, for the runs whose facts read. A run
+/// whose facts did not read is absent.
+pub(crate) fn run_sessions(
+    orch: &Orchestrator,
+    run_ids: Vec<String>,
+) -> HashMap<String, (String, String)> {
+    let dbs = orch.db.clone();
+    run_db_blocking(
+        move || async move { Ok::<_, String>(load_lifetime_facts(&dbs, &run_ids).await) },
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(run_id, facts)| (run_id, (facts.session_id, facts.backend)))
+    .collect()
 }
 
 /// Whether a launch still waiting on its CLI's install still wants it: its

@@ -2883,6 +2883,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "rebuilds",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // cairn/6440: this install's fresh-pipe floor engagements, their
+    // descriptor census and the idle sessions released under them. About this
+    // install's hosts, so never synced.
+    (
+        "pipe_floor_engagements",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "pipe_floor_releases",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "pending_injections",
         TableScope::Private(PrivateReason::RunnerTransient),

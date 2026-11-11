@@ -5833,6 +5833,16 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6440 does not move the number. The fresh-pipe floor now holds an
+/// agent-interactive command cell only while the latest reading is below
+/// the degraded floor, not through recovery hysteresis, and both peers apply
+/// it from fields every peer already sends (`priority`, `admissionKind`,
+/// `pipeHealth`). The hold's phase is derived locally and never serialized;
+/// `PipeAdmission` gains no variant. What a runner gets wrong talking to an
+/// older executor: it may offer a short command to a recovering host, which
+/// the older executor declines with the `pressure` reason it already sends,
+/// and the runner places it elsewhere as before.
+///
 /// cairn/6631 does not move the number. The runner now prices placement's
 /// sync cost and cache distance from a cache filled off the placement path,
 /// and shares a cached commit tree in `cache_distance` instead of cloning it.

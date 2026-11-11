@@ -1276,6 +1276,59 @@ mod tests {
         assert!(notices(db).await.contains(&notice_sentence(&lost)));
     }
 
+    /// cairn/6440: a session whose detached batch is running is releasable
+    /// under pipe pressure, and the batch's completion still reaches the job
+    /// as a notice, with the session open and the job's terminal running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_batch_still_reports_to_its_job_after_its_idle_process_is_released() {
+        let mut orch = orch_with_job().await;
+        orch.warm_gc = Some(std::sync::Arc::new(
+            crate::agent_process::gc::WarmProcessGC::new(6),
+        ));
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('session','job','claude','open',1,1,1);
+             INSERT INTO runs(id, job_id, session_id, status, created_at, updated_at)
+               VALUES('run','job','session','live',1,1);
+             INSERT INTO job_terminals(id,job_id,session_id,command,status,created_at,slug)
+               VALUES('terminal','job','terminal-session','sleep 100','running',1,'dev');",
+        )
+        .await
+        .unwrap();
+        insert(&db, &running("req-1")).await.unwrap();
+        let mut handle =
+            crate::agent_process::process::RunHandle::test_handle(Some("session"), Some("job"));
+        handle.transition_to_warm();
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run".into(), handle);
+        let released = crate::orchestrator::lifecycle::retire_unowned_idle(
+            &orch,
+            "run",
+            crate::orchestrator::lifecycle::RetireGrounds::PipePressure,
+        );
+        assert!(released.is_ok(), "{released:?}");
+
+        assert!(settle_and_deliver(&orch, &db, "req-1", "succeeded", "ok").await);
+        let settled = load(&db, "req-1").await.unwrap().unwrap();
+        assert!(notices(&db).await.contains(&notice_sentence(&settled)));
+        for (sql, expected) in [
+            ("SELECT status FROM sessions WHERE id='session'", "open"),
+            (
+                "SELECT status FROM job_terminals WHERE id='terminal'",
+                "running",
+            ),
+        ] {
+            assert_eq!(
+                db.query_opt_text(sql, ()).await.unwrap().as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
     /// A batch a machine finished while Cairn was down settles from the
     /// completion it lists, and says what was lost with the old process.
     #[test]

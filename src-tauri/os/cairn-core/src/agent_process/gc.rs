@@ -267,6 +267,34 @@ impl WarmProcessGC {
         choose_unit_eviction(self.scored_candidates(dbs, &warm).await)
     }
 
+    /// Whether this collector protects `process` now, from metadata read now
+    /// rather than from any earlier scoring pass.
+    pub(crate) async fn protects(&self, dbs: &DbState, process: &WarmProcess) -> bool {
+        let metadata = self
+            .load_relevance_metadata(dbs, std::slice::from_ref(process))
+            .await;
+        metadata.is_protected(&process.run_id, process.job_id.as_deref())
+    }
+
+    /// How many of `warm` this collector protects now.
+    pub(crate) async fn protected_count(&self, dbs: &DbState, warm: &[WarmProcess]) -> usize {
+        let metadata = self.load_relevance_metadata(dbs, warm).await;
+        warm.iter()
+            .filter(|process| metadata.is_protected(&process.run_id, process.job_id.as_deref()))
+            .count()
+    }
+
+    /// The unprotected runs among `warm`, least relevant first: the order
+    /// eviction would take them in, with memory headroom left out.
+    pub(crate) async fn release_order(&self, dbs: &DbState, warm: &[WarmProcess]) -> Vec<String> {
+        let mut candidates = self.scored_candidates(dbs, warm).await;
+        candidates.sort_by_key(|candidate| candidate.score);
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.run_id)
+            .collect()
+    }
+
     /// Score every unprotected process in `warm` and measure its RSS.
     async fn scored_candidates(&self, dbs: &DbState, warm: &[WarmProcess]) -> Vec<ScoredCandidate> {
         let metadata = self.load_relevance_metadata(dbs, warm).await;

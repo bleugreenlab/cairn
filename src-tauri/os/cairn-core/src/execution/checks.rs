@@ -4331,6 +4331,7 @@ pub(crate) async fn plan_infra_scopes(
                 project_requirements: &project_requirements,
                 work_class: inputs.work_class,
                 compiles_rust: placement.compiles_rust,
+                pipe_floor: cairn_common::pipe_health::PipeFloorWork::Process,
             };
             let environments: Vec<(String, String)> = orch
                 .fleet
@@ -4401,6 +4402,7 @@ pub(crate) fn review_placement_occupancy(
         project_requirements: &project_requirements,
         work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
         compiles_rust: placement.compiles_rust,
+        pipe_floor: cairn_common::pipe_health::PipeFloorWork::Process,
     })
 }
 
@@ -4609,6 +4611,7 @@ impl CheckPatience {
             // The class the batch's request is placed with.
             compiles_rust:
                 crate::execution::wire::batch_command_class(&batch.items).compiles_rust(),
+            pipe_floor: cairn_common::pipe_health::PipeFloorWork::Process,
         }))
     }
 }

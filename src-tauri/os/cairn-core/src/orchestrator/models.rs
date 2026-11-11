@@ -329,11 +329,12 @@ impl Orchestrator {
                 let retired = warm
                     .iter()
                     .filter(|run_id| {
-                        crate::orchestrator::lifecycle::retire_idle_provider(
+                        crate::orchestrator::lifecycle::retire_unowned_idle(
                             self,
                             run_id,
-                            MANAGED_CLI_SWAP_EXIT_REASON,
+                            crate::orchestrator::lifecycle::RetireGrounds::CliReplaced,
                         )
+                        .is_ok()
                     })
                     .count();
                 if !warm.is_empty() {

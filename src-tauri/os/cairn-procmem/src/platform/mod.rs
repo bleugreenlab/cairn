@@ -33,6 +33,11 @@ pub fn read_start_token(pid: u32) -> Option<String> {
 pub fn census(_: &mut crate::census::Census) -> bool {
     false
 }
+/// No descriptor census off macOS and Linux: the result says unsupported.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn fd_census_into(_: std::time::Instant, _: &mut crate::fd_census::FdCensus) -> bool {
+    false
+}
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn read_kernel_state(_: u32) -> KernelRead {
     KernelRead::Unreadable

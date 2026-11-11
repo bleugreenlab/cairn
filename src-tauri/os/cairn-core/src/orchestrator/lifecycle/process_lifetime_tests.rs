@@ -1,5 +1,5 @@
-use super::sweep_process_lifetimes;
 use super::warm_completion_tests::test_orchestrator;
+use super::{retire_unowned_idle, sweep_process_lifetimes, NotRetired, RetireGrounds};
 use crate::agent_process::process::RunHandle;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{migrated_test_db, RowExt};
@@ -536,11 +536,7 @@ async fn managed_swap_retires_an_idle_provider_and_keeps_its_terminal() {
         .unwrap();
     register(&orch, 0);
 
-    assert!(super::retire_idle_provider(
-        &orch,
-        "run",
-        "managed_cli_swap"
-    ));
+    assert!(retire_unowned_idle(&orch, "run", RetireGrounds::CliReplaced).is_ok());
 
     assert!(!orch.process_state.is_warm("run"));
     assert_eq!(
@@ -569,11 +565,7 @@ async fn managed_swap_leaves_a_process_being_resumed_alone() {
     register(&orch, 0);
     let lock = orch.job_launch_lock("job");
     let guard = lock.lock().unwrap();
-    assert!(!super::retire_idle_provider(
-        &orch,
-        "run",
-        "managed_cli_swap"
-    ));
+    assert!(!retire_unowned_idle(&orch, "run", RetireGrounds::CliReplaced).is_ok());
     assert!(orch.process_state.is_warm("run"), "a held launch keeps it");
     drop(guard);
 
@@ -585,11 +577,7 @@ async fn managed_swap_leaves_a_process_being_resumed_alone() {
         .lock()
         .unwrap()
         .register("run".into(), handle);
-    assert!(!super::retire_idle_provider(
-        &orch,
-        "run",
-        "managed_cli_swap"
-    ));
+    assert!(!retire_unowned_idle(&orch, "run", RetireGrounds::CliReplaced).is_ok());
     assert_eq!(run_state(&orch).await, ("live".into(), None));
     assert!(orch
         .process_state
@@ -598,4 +586,90 @@ async fn managed_swap_leaves_a_process_being_resumed_alone() {
         .unwrap()
         .get("run")
         .is_some());
+}
+
+/// A managed-CLI swap leaves alone a process that holds a `run` call open on
+/// its socket (an inline-hold wait), as the lifetime sweep does: the work is
+/// in that process, so tearing it down would cut it.
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_swap_leaves_a_process_holding_an_inline_run_alone() {
+    let orch = fixture("swap-inline-hold", "codex", "open", "running").await;
+    seed_yield(&orch, "inline_hold").await;
+    register(&orch, 0);
+    assert_eq!(
+        retire_unowned_idle(&orch, "run", RetireGrounds::CliReplaced).map(|_| ()),
+        Err(NotRetired::WorkInProcess)
+    );
+    assert!(orch.process_state.is_warm("run"), "the inline run keeps it");
+    assert_eq!(run_state(&orch).await, ("live".into(), None));
+}
+
+fn with_collector(orch: &mut Orchestrator) {
+    orch.warm_gc = Some(std::sync::Arc::new(
+        crate::agent_process::gc::WarmProcessGC::new(6),
+    ));
+}
+
+/// cairn/6440's eligibility is one rule: cairn/6514's work-in-process test
+/// plus the warm collector's protection, both read under the launch lock. A
+/// `run` held open inline and a pending turn keep the process; a live
+/// delegated child is protected; a parked wait and a running detached batch
+/// do not keep it, because each continues the job without this process.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipe_pressure_release_is_the_owner_test_plus_the_collector_protection() {
+    for (owner, expected) in [
+        ("inline_hold", Err(NotRetired::WorkInProcess)),
+        ("child", Err(NotRetired::Protected)),
+        ("parked_wait", Ok(())),
+        ("detached_batch", Ok(())),
+    ] {
+        let mut orch = fixture("pipe-release-fence", "claude", "open", "running").await;
+        with_collector(&mut orch);
+        seed_yield(&orch, owner).await;
+        register(&orch, 0);
+        let outcome = retire_unowned_idle(&orch, "run", RetireGrounds::PipePressure).map(|_| ());
+        assert_eq!(outcome, expected, "{owner}");
+        let expected_state = if expected.is_ok() {
+            (
+                "exited".to_string(),
+                Some("pipe_pressure_release".to_string()),
+            )
+        } else {
+            ("live".to_string(), None)
+        };
+        assert_eq!(run_state(&orch).await, expected_state, "{owner}");
+        assert_eq!(
+            orch.process_state.is_warm("run"),
+            expected.is_err(),
+            "{owner}"
+        );
+    }
+
+    let mut orch = fixture("pipe-release-pending", "claude", "open", "running").await;
+    with_collector(&mut orch);
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO turns (id, job_id, session_id, run_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('turn', 'job', 'session', 'run', 1, 'pending', 'initial', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    register(&orch, 0);
+    assert_eq!(
+        retire_unowned_idle(&orch, "run", RetireGrounds::PipePressure).map(|_| ()),
+        Err(NotRetired::WorkInProcess),
+        "a delivery stamped into a pending turn keeps its process"
+    );
+
+    // Without a collector to ask, protection is unknown, and unknown state
+    // never authorizes a stop.
+    let orch = fixture("pipe-release-no-collector", "claude", "open", "running").await;
+    register(&orch, 0);
+    assert_eq!(
+        retire_unowned_idle(&orch, "run", RetireGrounds::PipePressure).map(|_| ()),
+        Err(NotRetired::Protected)
+    );
+    assert!(orch.process_state.is_warm("run"));
 }

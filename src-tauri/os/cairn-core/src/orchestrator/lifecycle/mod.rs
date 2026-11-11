@@ -52,8 +52,11 @@ pub(crate) use finalize::{
     LAUNCH_ATTACH_FAILED_EXIT_REASON,
 };
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
+#[cfg(test)]
+pub(crate) use process_lifetime::RetireCause;
 pub(crate) use process_lifetime::{
-    launch_still_wanted, retire_idle_provider, sweep_process_lifetimes,
+    launch_still_wanted, retire_unowned_idle, run_sessions, sweep_process_lifetimes, NotRetired,
+    RetireGrounds,
 };
 pub(crate) use review_push::{
     arm_turn_end_successor, arm_turn_end_successor_now, spawn_review_wave_unless_in_flight,

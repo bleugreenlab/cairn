@@ -519,6 +519,11 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "one row per install rebuild, including its bounded phase journal and receipts; a handful a month on the Mac that rebuilds itself",
     ),
     keep("inference_models", CONFIG),
+    keep(
+        "pipe_floor_engagements",
+        "one row per fresh-pipe floor engagement on this install's hosts, each with a census of a few kilobytes; engagements are rare host events",
+    ),
+    owned("pipe_floor_releases", "pipe_floor_engagements"),
     owned_by(
         "inference_verifications",
         "cairn-core orchestrator::inference_verify",

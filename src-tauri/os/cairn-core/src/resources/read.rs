@@ -2410,6 +2410,7 @@ async fn render_resource_body(
                     rendered.push_str(&crate::resources::executors::render_runner_pipe_floor(
                         &orch.process_floor(),
                     ));
+                    rendered.push_str(&orch.pipe_floor_record().await);
                     let lanes = match orch.private_lane_budgets().await {
                         Ok(sessions) => crate::execution::jobs::call_lane_budgets(orch)
                             .await
@@ -2517,6 +2518,8 @@ async fn render_resource_body(
                                 None,
                             ));
                             if executor.colocated {
+                                rendered.push_str("\n## Fresh-pipe floor engagements\n\n");
+                                rendered.push_str(&orch.pipe_floor_record().await);
                                 if let Some(diagnostic) = orch.fleet.memory_diagnostic(
                                     executor.health.connection_generation, captured_at,
                                 ) {

@@ -711,6 +711,20 @@ pub struct WarmProcess {
     pub job_id: Option<String>,
 }
 
+/// One registered agent process as a descriptor census sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredProcess {
+    pub run_id: String,
+    pub job_id: Option<String>,
+    /// Backend name; `None` is Claude.
+    pub backend: Option<String>,
+    /// Live and idle: a warm process.
+    pub warm: bool,
+    pub leader: Option<ProcessAnchor>,
+    /// A thread on a shared Codex app-server: no process of its own.
+    pub pooled: bool,
+}
+
 /// A live agent process tree to measure: its run and its leader's identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveTree {
@@ -1334,6 +1348,25 @@ impl AgentProcessState {
         warm.sort_by_key(|w| w.seconds_since_activity);
 
         warm
+    }
+
+    /// Every registered process, warm or working, with what a descriptor
+    /// census attributes to it. Reads no process.
+    pub fn registered_processes(&self) -> Vec<RegisteredProcess> {
+        let Ok(processes) = self.processes.lock() else {
+            return Vec::new();
+        };
+        processes
+            .iter()
+            .map(|(run_id, process)| RegisteredProcess {
+                run_id: run_id.clone(),
+                job_id: process.job_id.clone(),
+                backend: process.backend.clone(),
+                warm: process.is_warm(),
+                leader: process.leader.clone(),
+                pooled: process.pooled_thread.is_some(),
+            })
+            .collect()
     }
 
     /// Every registered process with an attached child, warm or working, by

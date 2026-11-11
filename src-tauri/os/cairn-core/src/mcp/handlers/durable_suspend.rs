@@ -6449,6 +6449,63 @@ mod tests {
         assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
     }
 
+    /// cairn/6440: a session whose only claim is a parked wait is releasable
+    /// under pipe pressure, and the owed wake still lands. Firing the wait
+    /// after the release mints its successor turn on the same job, while the
+    /// session stays open and the job's terminal keeps running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_wait_still_lands_after_its_idle_process_is_released() {
+        let (mut orch, record, _) = durable_env().await;
+        orch.warm_gc = Some(Arc::new(crate::agent_process::gc::WarmProcessGC::new(6)));
+        insert(&orch.db.local, &record).await.unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO job_terminals(id,job_id,session_id,command,status,created_at,slug)
+                 VALUES('terminal','job-1','terminal-session','sleep 100','running',1,'dev')",
+                (),
+            )
+            .await
+            .unwrap();
+        register_warm(&orch);
+        let released = crate::orchestrator::lifecycle::retire_unowned_idle(
+            &orch,
+            "run-1",
+            crate::orchestrator::lifecycle::RetireGrounds::PipePressure,
+        );
+        assert!(released.is_ok(), "{released:?}");
+        assert!(!orch.process_state.is_warm("run-1"));
+
+        let resolved = resolve(&orch, &orch.db.local, &record, ELAPSED, false).await;
+        let successors = wait_resolved_turns(&orch).await;
+        assert_eq!(successors.len(), 1, "the wake lands ({resolved:?})");
+        let successor = successors[0].0.clone();
+        let text = |sql: &'static str, id: String| {
+            let db = orch.db.local.clone();
+            async move { db.query_one(sql, (id,), |row| row.text(0)).await.unwrap() }
+        };
+        assert_eq!(
+            text("SELECT job_id FROM turns WHERE id=?1", successor).await,
+            "job-1"
+        );
+        assert_eq!(
+            text(
+                "SELECT status FROM sessions WHERE id=?1",
+                "session-1".into()
+            )
+            .await,
+            "open"
+        );
+        assert_eq!(
+            text(
+                "SELECT status FROM job_terminals WHERE id=?1",
+                "terminal".into()
+            )
+            .await,
+            "running"
+        );
+    }
+
     async fn wait_resolved_turns(orch: &Orchestrator) -> Vec<(String, String)> {
         orch.db
             .local
