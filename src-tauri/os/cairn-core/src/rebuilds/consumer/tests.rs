@@ -877,6 +877,28 @@ fn the_runner_bundle_and_plist_are_read_exactly() {
     assert!(signing_identity_of(r#"{"bundle":{"macOS":{"signingIdentity":"-"}}}"#).is_err());
 }
 
+const REPO_TAURI_CONF: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tauri.conf.json"
+));
+
+#[test]
+fn the_bundle_identifier_constant_matches_the_repo_tauri_conf() {
+    let value: Value = serde_json::from_str(REPO_TAURI_CONF).unwrap();
+    assert_eq!(value["identifier"].as_str(), Some(CAIRN_BUNDLE_IDENTIFIER));
+}
+
+#[test]
+fn the_repo_tauri_conf_is_recognised_as_building_cairn() {
+    assert!(builds_cairn(REPO_TAURI_CONF));
+
+    let mut other: Value = serde_json::from_str(REPO_TAURI_CONF).unwrap();
+    other["identifier"] = json!("com.example.other");
+    assert!(!builds_cairn(&other.to_string()));
+
+    assert!(!builds_cairn("not json {"));
+}
+
 #[tokio::test]
 async fn a_runner_outside_an_installed_bundle_cannot_offer_rebuilds() {
     let f = fixture().await;

@@ -194,6 +194,17 @@ pub(crate) fn signing_identity_of(tauri_conf: &str) -> Result<String, String> {
     }
 }
 
+/// The bundle identifier of the Cairn app, which is what makes a checkout the
+/// one that builds Cairn. `productName` is only a display string; the
+/// identifier carries signing, updates and keychain/TCC grants, so it does not
+/// drift casually.
+pub(crate) const CAIRN_BUNDLE_IDENTIFIER: &str = "com.cairn.desktop";
+
+pub(crate) fn builds_cairn(tauri_conf: &str) -> bool {
+    serde_json::from_str::<Value>(tauri_conf)
+        .is_ok_and(|value| value["identifier"].as_str() == Some(CAIRN_BUNDLE_IDENTIFIER))
+}
+
 #[async_trait]
 impl SourceStore for ProjectStores {
     async fn resolve(&self, orch: &Orchestrator) -> Result<Source, String> {
@@ -214,15 +225,13 @@ impl SourceStore for ProjectStores {
             let Ok(text) = tokio::fs::read_to_string(&conf).await else {
                 continue;
             };
-            let builds_cairn = serde_json::from_str::<Value>(&text)
-                .is_ok_and(|value| value["productName"].as_str() == Some("Cairn"));
-            if builds_cairn {
+            if builds_cairn(&text) {
                 found.push((id, key, PathBuf::from(repo)));
             }
         }
         let (project_id, project_key, checkout) = match found.len() {
             1 => found.remove(0),
-            0 => return Err("no project on this install builds Cairn (no checkout's src-tauri/tauri.conf.json has productName \"Cairn\")".into()),
+            0 => return Err(format!("no project on this install builds Cairn (no checkout's src-tauri/tauri.conf.json has identifier {CAIRN_BUNDLE_IDENTIFIER:?})")),
             _ => return Err(format!(
                 "several projects build Cairn ({}); the rebuild source is ambiguous",
                 found.iter().map(|(_, key, _)| key.as_str()).collect::<Vec<_>>().join(", ")
