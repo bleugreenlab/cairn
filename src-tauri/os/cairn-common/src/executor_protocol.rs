@@ -4058,9 +4058,13 @@ pub const MACHINE_READING_STALE_AFTER_MS: u64 = CPU_ADMISSION_BLIND_AFTER_MS;
 /// The brake is one mechanism with named instruments rather than one brake per
 /// signal, so every instrument shares the tracker, the blindness rule, the
 /// placement hold and the page's rendering. CPU saturation and memory stall
-/// (PSI `full`) gate admission today (tenet 1309). I/O stall is priced, never
-/// gated (tenet 1139); it is the next instrument only once that tenet moves
-/// (cairn/5658), and adding it is one more variant and one more field.
+/// (PSI `full`) gate admission (tenet 1309). Write stall on the build volume
+/// gates compile-class admission (tenet 1438, which supersedes tenet 1139's
+/// "I/O stall is priced, never gated" for this one measurement): a drive that
+/// collapses under sustained writes turns every additional compile into a
+/// longer stall for all of them, and price alone did not stop a machine whose
+/// cores read idle from being chosen (cairn/5658). Machine-wide I/O stall is
+/// still only priced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StallInstrument {
     /// Non-idle share of processor time.
@@ -4068,10 +4072,13 @@ pub enum StallInstrument {
     /// Share of wall time every non-idle task was stalled on memory at once
     /// (PSI `full` avg10).
     Memory,
+    /// Write saturation of the build volume's device, read by two arms
+    /// ([`DiskWriteArm`]). It holds compile-class work only.
+    DiskWrite,
 }
 
 impl StallInstrument {
-    pub const ALL: [Self; 2] = [Self::Cpu, Self::Memory];
+    pub const ALL: [Self; 3] = [Self::Cpu, Self::Memory, Self::DiskWrite];
 
     /// The reading this instrument is, in the vocabulary blindness is
     /// reported in.
@@ -4079,6 +4086,7 @@ impl StallInstrument {
         match self {
             Self::Cpu => MachineMeasurement::Cpu,
             Self::Memory => MachineMeasurement::Memory,
+            Self::DiskWrite => MachineMeasurement::DiskWrite,
         }
     }
 
@@ -4086,8 +4094,172 @@ impl StallInstrument {
         match self {
             Self::Cpu => "CPU",
             Self::Memory => "Memory",
+            Self::DiskWrite => "Build volume write",
         }
     }
+
+    /// Whether this instrument holds work of `class`. CPU and memory stall
+    /// slow every command; a saturated build device slows the commands that
+    /// write build output, and holding a test runner or a typecheck for it
+    /// would only idle a machine that can still serve them.
+    pub fn holds_class(self, class: CellCommandClass) -> bool {
+        match self {
+            Self::Cpu | Self::Memory => true,
+            Self::DiskWrite => class.is_compile_class(),
+        }
+    }
+}
+
+/// The two readings [`StallInstrument::DiskWrite`] is drawn from. Each is a
+/// tracker of its own with its own bars; the instrument is pressured when
+/// either arm is ([`combine_disk_write_arms`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum DiskWriteArm {
+    /// PSI `io full` avg60, counted only while the stall is the build
+    /// device's: it is the slowest device, or at least a quarter busy, or
+    /// stalled. Read as zero while the build device is idle, because a stall
+    /// on another device must not hold builds.
+    Stall,
+    /// The build device's mean write latency in milliseconds, on a
+    /// non-rotational device only: a spinning disk's seeks are its healthy
+    /// latency, not a collapse.
+    Latency,
+}
+
+impl DiskWriteArm {
+    pub const ALL: [Self; 2] = [Self::Stall, Self::Latency];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stall => "write stall",
+            Self::Latency => "write latency",
+        }
+    }
+}
+
+/// One tracker of the host-stall brake: the single reading of a one-arm
+/// instrument, or one arm of [`StallInstrument::DiskWrite`]. Each gauge has
+/// its own [`StallInstrumentPolicy`] and its own hysteresis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StallGauge {
+    Cpu,
+    Memory,
+    DiskWrite(DiskWriteArm),
+}
+
+impl StallGauge {
+    pub const ALL: [Self; 4] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::DiskWrite(DiskWriteArm::Stall),
+        Self::DiskWrite(DiskWriteArm::Latency),
+    ];
+
+    pub fn instrument(self) -> StallInstrument {
+        match self {
+            Self::Cpu => StallInstrument::Cpu,
+            Self::Memory => StallInstrument::Memory,
+            Self::DiskWrite(_) => StallInstrument::DiskWrite,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Memory => "Memory",
+            Self::DiskWrite(DiskWriteArm::Stall) => "Build volume write stall",
+            Self::DiskWrite(DiskWriteArm::Latency) => "Build volume write latency",
+        }
+    }
+
+    /// Whether this gauge reads milliseconds rather than a fraction from 0
+    /// to 1, which changes what bars are valid for it.
+    pub fn reads_milliseconds(self) -> bool {
+        self == Self::DiskWrite(DiskWriteArm::Latency)
+    }
+}
+
+/// The [`StallInstrument::DiskWrite`] verdict from its two arms: pressured if
+/// either arm is, accepting only when every arm that has measured accepts, and
+/// unknown when neither has measured, which fails open (tenets 1309, 302).
+///
+/// The combined reading is the stall arm's, the one fraction the instrument
+/// has; which arm tripped and both readings are on the arms themselves.
+///
+/// A verdict is only as fresh as the evidence that establishes it. A
+/// pressured instrument takes `measured_at_unix_ms` from its pressured arms
+/// alone, so an arm that entered pressure and then stopped measuring goes
+/// blind on its own time, and a healthy reading from the other arm can never
+/// renew it into current saturation. An instrument that is not pressured
+/// takes the newer arm's time, so it goes blind only when both have stopped.
+pub fn combine_disk_write_arms(
+    stall: &StallInstrumentHealth,
+    latency: &StallInstrumentHealth,
+) -> StallInstrumentHealth {
+    let arms = [stall, latency];
+    let pressured: Vec<&StallInstrumentHealth> = arms
+        .iter()
+        .copied()
+        .filter(|arm| arm.state == StallInstrumentState::Pressured)
+        .collect();
+    let measured: Vec<&StallInstrumentHealth> = arms
+        .iter()
+        .copied()
+        .filter(|arm| arm.state != StallInstrumentState::Unknown)
+        .collect();
+    let state = if !pressured.is_empty() {
+        StallInstrumentState::Pressured
+    } else if !measured.is_empty() {
+        StallInstrumentState::Accepting
+    } else {
+        StallInstrumentState::Unknown
+    };
+    // A pressured instrument has been pressured since its earliest pressured
+    // arm; an accepting one since its latest arm returned to accepting.
+    let state_since_unix_ms = match state {
+        StallInstrumentState::Pressured => pressured
+            .iter()
+            .filter_map(|arm| arm.state_since_unix_ms)
+            .min(),
+        StallInstrumentState::Accepting => measured
+            .iter()
+            .filter_map(|arm| arm.state_since_unix_ms)
+            .max(),
+        StallInstrumentState::Unknown => None,
+    };
+    let evidence: &[&StallInstrumentHealth] = if pressured.is_empty() {
+        &arms
+    } else {
+        &pressured
+    };
+    StallInstrumentHealth {
+        state,
+        reading: stall.reading,
+        state_since_unix_ms,
+        measured_at_unix_ms: evidence
+            .iter()
+            .filter_map(|arm| arm.measured_at_unix_ms)
+            .max(),
+    }
+}
+
+/// Both arms of the build-volume write instrument, as their trackers hold
+/// them, and the device they read. [`HostHealth::disk_write_admission`] is the
+/// verdict drawn from these.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskWriteArms {
+    #[serde(default)]
+    pub stall: StallInstrumentHealth,
+    /// Its reading is milliseconds, not a fraction.
+    #[serde(default)]
+    pub latency: StallInstrumentHealth,
+    /// When an arm was last pressured, kept across its release: the machine
+    /// page recommends a remedy for a volume that saturated recently, not
+    /// only for one saturated now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pressured_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -7453,7 +7625,27 @@ pub struct LearnedResourceEstimate {
 /// an unacknowledged result is resent, and an acknowledgement for an unknown
 /// key is a no-op. No frame, variant, or field changes, so a runner talking
 /// to an older executor gets nothing wrong.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
+///
+/// Version 168 (cairn/5658) makes write saturation of the build volume a
+/// measured admission brake and a storage-pressure cause. It adds
+/// [`StallInstrument::DiskWrite`] with its two [`DiskWriteArm`]s,
+/// [`HostPressureCondition::DiskWriteStall`] inside admission refusals and
+/// host-pressure evidence, [`MachineMeasurement::DiskWrite`] in blindness
+/// reports, [`StoragePressureCause`] on the pressure report, the device's
+/// identity ([`VolumeDevice`]) and live load ([`DeviceLoad`]), and four
+/// runtime-policy fields: the two arms' bars and the storage lines' volume
+/// fractions. None of those enums carries `#[serde(other)]` and a peer decodes
+/// a snapshot or report frame whole, so a runner older than its executor
+/// would fail to decode every frame that carries the new condition or cause,
+/// and would drop the machine's snapshots exactly while it is stalled: the
+/// blindness this change exists to end. A runner newer than its executor would
+/// decode everything (each new field is `#[serde(default)]`, and an absent
+/// verdict is `Unknown`, which fails open), but would ship a policy the
+/// executor does not apply and read its silence as "not stalled". It also
+/// changes what a runner concludes about admission on the machine (tenet
+/// 541). The handshake refuses mixed versions and the self-repair path
+/// updates the executor, so neither pairing attaches.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 168;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -9813,6 +10005,12 @@ pub struct OfferSummary {
     /// fresh work rather than trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_residency: Option<ResidencyFence>,
+    /// The offered command's class, as the runner classified it for the
+    /// queue ([`CellRequest::command_class`]). The build-volume write brake
+    /// holds compile-class work only, and this is the one classification
+    /// both ends of admission judge by.
+    #[serde(default)]
+    pub command_class: CellCommandClass,
 }
 
 /// Why a machine would not take work it was offered.
@@ -10818,6 +11016,30 @@ pub enum HostPressureCondition {
         full_avg10_millis: u32,
         entry_millis: u32,
         clear_millis: u32,
+        stalled_since_unix_ms: u64,
+        measured_at_unix_ms: u64,
+    },
+    /// The host-stall brake's build-volume write instrument holds
+    /// compile-class work: one of its arms ([`DiskWriteArm`]) has stayed at
+    /// or above its entry bar for the entry window. `entry` and `clear` are
+    /// in the arm's unit: a fraction for the stall arm, milliseconds for the
+    /// latency arm. The device figures are the last window's, each `None`
+    /// when it was not measured.
+    DiskWriteStall {
+        device: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        arm: DiskWriteArm,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_avg60_millis: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mean_write_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        busy_permille: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_bytes_per_sec: Option<u64>,
+        entry: f64,
+        clear: f64,
         stalled_since_unix_ms: u64,
         measured_at_unix_ms: u64,
     },
@@ -13796,6 +14018,8 @@ pub enum MachineMeasurement {
     ProcessPhysicalFootprint,
     ProcessVirtual,
     ProcessAllocator,
+    /// The build volume's write-saturation instrument.
+    DiskWrite,
 }
 
 impl MachineMeasurement {
@@ -13821,7 +14045,12 @@ impl MachineMeasurement {
             | Self::ProcessResident
             | Self::ProcessPhysicalFootprint
             | Self::ProcessVirtual
-            | Self::ProcessAllocator => false,
+            | Self::ProcessAllocator
+            // Unmeasurable by construction off Linux and on a volume whose
+            // device cannot be resolved, and it holds compile-class work
+            // only: like physical footprint, a permanent gap here must not
+            // hold a healthy machine at unknown.
+            | Self::DiskWrite => false,
         }
     }
 
@@ -13835,6 +14064,7 @@ impl MachineMeasurement {
             Self::ProcessPhysicalFootprint => "processPhysicalFootprint",
             Self::ProcessVirtual => "processVirtual",
             Self::ProcessAllocator => "processAllocator",
+            Self::DiskWrite => "diskWrite",
         }
     }
 }
@@ -13925,6 +14155,13 @@ pub struct HostHealth {
     /// which fails open.
     #[serde(default)]
     pub memory_admission: StallInstrumentHealth,
+    /// The host-stall brake's build-volume write verdict, drawn from
+    /// [`Self::disk_write_arms`]. Defaulted, so an executor that predates it
+    /// reads as never having measured, which fails open.
+    #[serde(default)]
+    pub disk_write_admission: StallInstrumentHealth,
+    #[serde(default)]
+    pub disk_write_arms: DiskWriteArms,
     pub logical_cores: Option<usize>,
     pub tokio_worker_count: Option<usize>,
     pub tokio_alive_tasks: Option<usize>,
@@ -14050,6 +14287,10 @@ pub struct MachineSample {
     pub cpu_admission: StallInstrumentHealth,
     #[serde(default)]
     pub memory_admission: StallInstrumentHealth,
+    #[serde(default)]
+    pub disk_write_admission: StallInstrumentHealth,
+    #[serde(default)]
+    pub disk_write_arms: DiskWriteArms,
     /// What each executing command attempt and each resident process is using
     /// now, from the process-tree sampler's last window. A platform with no
     /// tree sampler (Windows) reports [`MeasurementGap::UnsupportedPlatform`]
@@ -14078,6 +14319,8 @@ impl MachineSample {
             gpus: report.host.gpus.clone(),
             cpu_admission: report.host.cpu_admission.clone(),
             memory_admission: report.host.memory_admission.clone(),
+            disk_write_admission: report.host.disk_write_admission.clone(),
+            disk_write_arms: report.host.disk_write_arms.clone(),
             live_usage: Measurement::default(),
             pipe_health: report.host.pipe_health.clone(),
         }
@@ -14087,6 +14330,7 @@ impl MachineSample {
         match instrument {
             StallInstrument::Cpu => &self.cpu_admission,
             StallInstrument::Memory => &self.memory_admission,
+            StallInstrument::DiskWrite => &self.disk_write_admission,
         }
     }
 }
@@ -14097,6 +14341,7 @@ impl HostHealth {
         match instrument {
             StallInstrument::Cpu => &self.cpu_admission,
             StallInstrument::Memory => &self.memory_admission,
+            StallInstrument::DiskWrite => &self.disk_write_admission,
         }
     }
 
@@ -14104,6 +14349,7 @@ impl HostHealth {
         match instrument {
             StallInstrument::Cpu => &mut self.cpu_admission,
             StallInstrument::Memory => &mut self.memory_admission,
+            StallInstrument::DiskWrite => &mut self.disk_write_admission,
         }
     }
 
@@ -14439,6 +14685,11 @@ pub struct IoPressure {
     /// or `None` before a window exists or when no device wrote or held I/O.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slowest_device: Option<DeviceWriteLatency>,
+    /// The build volume's device across the same window, or `None` before a
+    /// window exists, when the device could not be resolved, or from an
+    /// executor that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_device: Option<DeviceLoad>,
 }
 
 impl IoPressure {
@@ -14489,6 +14740,69 @@ pub struct DeviceWriteLatency {
     /// I/Os in progress on the device when the window closed.
     pub in_flight: u64,
     pub window_ms: u64,
+}
+
+/// The live load of one whole block device across a sample window, from the
+/// same two `/proc/diskstats` readings [`DeviceWriteLatency`] is drawn from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLoad {
+    pub device: String,
+    /// Thousandths of the window the device had any I/O in progress.
+    pub busy_permille: u32,
+    pub write_bytes_per_sec: u64,
+    /// Mean milliseconds each write completed in the window took; `None` when
+    /// none completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_write_ms: Option<u64>,
+    /// Busy for nearly the whole window while completing no I/O at all.
+    #[serde(default)]
+    pub stalled: bool,
+    pub in_flight: u64,
+    pub window_ms: u64,
+}
+
+/// How a block device is attached, as far as sysfs says.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum VolumeTransport {
+    Nvme,
+    Sata,
+    Usb,
+    Virtio,
+    #[default]
+    Unknown,
+}
+
+impl VolumeTransport {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Nvme => "NVMe",
+            Self::Sata => "SATA",
+            Self::Usb => "USB",
+            Self::Virtio => "virtio",
+            Self::Unknown => "unknown transport",
+        }
+    }
+}
+
+/// The whole device under the build volume, read once from sysfs.
+///
+/// There is deliberately no cell-type field. Sysfs cannot tell a QLC drive
+/// from a TLC one, and a table of vendor models would rot; what the page shows
+/// is the model and the device's measured write behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeDevice {
+    /// The whole device's kernel name (`nvme0n1`).
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `queue/rotational`; `None` when it could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotational: Option<bool>,
+    #[serde(default)]
+    pub transport: VolumeTransport,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -14847,6 +15161,18 @@ pub struct DiskHealth {
     /// pressure tier reclaims toward it.
     #[serde(default)]
     pub pressure_free_bytes: u64,
+    /// The share of the volume, in thousandths, that set `pressure_free_bytes`
+    /// when the fraction rather than the absolute floor governs; `None` when
+    /// the floor does, or from a peer that predates fraction lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_line_fraction_permille: Option<u32>,
+    /// The same for `critical_free_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_line_fraction_permille: Option<u32>,
+    /// The whole device under the build volume, or `None` when it could not
+    /// be resolved (off Linux, or an unreadable mount table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<VolumeDevice>,
     /// The last pressure pass, or `None` when none has run since this executor
     /// started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -15027,6 +15353,11 @@ pub struct WithheldProcess {
 pub struct StoragePressureReport {
     pub at_unix_ms: u64,
     pub band: StoragePressureBand,
+    /// Why the pass ran: free space under a line, or a write-saturated build
+    /// volume under the saturation fraction. `FreeBytes` from a peer that
+    /// predates the distinction.
+    #[serde(default)]
+    pub cause: StoragePressureCause,
     /// The deficit the pass reclaimed toward: the pressure line plus slack,
     /// less free space when it started.
     pub target_bytes: u64,
@@ -15052,6 +15383,57 @@ pub struct StoragePressureReport {
     /// the operator whether the remaining relief is Cairn's or theirs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withheld: Vec<StorageWithheld>,
+}
+
+/// Why a pressure pass ran.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum StoragePressureCause {
+    /// Free space at or below the pressure line.
+    #[default]
+    FreeBytes,
+    /// The build volume's write instrument is pressured while free space is
+    /// at or below [`WRITE_SATURATION_FREE_FRACTION_PERMILLE`] of the volume,
+    /// above the byte lines. A drive whose write cache shrinks as it fills
+    /// collapses near full, so free space is the relief even when there is
+    /// plenty of it in bytes. The figures are the window the pass saw.
+    WriteSaturation {
+        device: VolumeDevice,
+        arm: DiskWriteArm,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        busy_permille: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_bytes_per_sec: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mean_write_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full_avg60_millis: Option<u32>,
+    },
+}
+
+/// The share of the build volume, in thousandths, that must be free before a
+/// write-saturated volume stops being storage pressure. Consumer drives with a
+/// shrinking SLC cache degrade sharply past about 80% full, which is where
+/// fedora's sustained writes collapsed to 56 MB/s (cairn/5658). Derived, not
+/// configured (tenet 1000).
+pub const WRITE_SATURATION_FREE_FRACTION_PERMILLE: u32 = 200;
+
+/// A storage line on a volume of `total_bytes`: the larger of its absolute
+/// floor and its fraction of the volume. Fractions are thousandths; zero
+/// leaves the floor alone. A 3.6 TiB volume at a 10% pressure line reclaims
+/// at 368 GiB free where a 64 GiB floor would wait until it was 98% full;
+/// a small volume keeps the floor.
+pub fn effective_storage_line(floor_bytes: u64, fraction_permille: u32, total_bytes: u64) -> u64 {
+    floor_bytes.max(fraction_of(total_bytes, fraction_permille))
+}
+
+/// `permille` thousandths of `bytes`, without overflow.
+pub fn fraction_of(bytes: u64, permille: u32) -> u64 {
+    ((u128::from(bytes) * u128::from(permille)) / 1_000) as u64
 }
 
 /// One class of Cairn-held bytes a pressure pass left in place.
@@ -15134,6 +15516,9 @@ impl Default for DiskHealth {
             watermark_bytes: 0,
             critical_free_bytes: 0,
             pressure_free_bytes: 0,
+            pressure_line_fraction_permille: None,
+            critical_line_fraction_permille: None,
+            device: None,
             pressure: None,
             quarantine_targets_stripped: Vec::new(),
             occupancy_lineage: None,
@@ -15184,6 +15569,23 @@ pub struct ExecutorRuntimePolicy {
     /// written before the memory instrument loads with its defaults.
     #[serde(default = "default_memory_admission")]
     pub memory_admission: StallInstrumentPolicy,
+    /// The build-volume write instrument's stall-arm bars, a fraction of wall
+    /// time (PSI `io full` avg60).
+    #[serde(default = "default_disk_write_stall")]
+    pub disk_write_stall: StallInstrumentPolicy,
+    /// The build-volume write instrument's latency-arm bars, in milliseconds
+    /// of mean write latency.
+    #[serde(default = "default_disk_write_latency")]
+    pub disk_write_latency: StallInstrumentPolicy,
+    /// The pressure line as a share of the build volume, in thousandths: the
+    /// effective line is the larger of this and
+    /// `idle_retention_pressure_free_bytes` ([`effective_storage_line`]).
+    #[serde(default = "default_pressure_free_fraction_permille")]
+    pub pressure_free_fraction_permille: u32,
+    /// The critical line as a share of the build volume, in thousandths,
+    /// against `storage_critical_free_bytes` the same way.
+    #[serde(default = "default_critical_free_fraction_permille")]
+    pub critical_free_fraction_permille: u32,
 }
 
 pub fn default_cpu_admission() -> StallInstrumentPolicy {
@@ -15194,19 +15596,62 @@ pub fn default_memory_admission() -> StallInstrumentPolicy {
     StallInstrumentPolicy::MEMORY_DEFAULT
 }
 
+pub fn default_disk_write_stall() -> StallInstrumentPolicy {
+    StallInstrumentPolicy::DISK_WRITE_STALL_DEFAULT
+}
+
+pub fn default_disk_write_latency() -> StallInstrumentPolicy {
+    StallInstrumentPolicy::DISK_WRITE_LATENCY_DEFAULT
+}
+
+/// The pressure line's default share of the volume: 10%.
+pub const PRESSURE_FREE_FRACTION_PERMILLE: u32 = 100;
+
+/// The critical line's default share of the volume: 2%.
+pub const CRITICAL_FREE_FRACTION_PERMILLE: u32 = 20;
+
+const fn default_pressure_free_fraction_permille() -> u32 {
+    PRESSURE_FREE_FRACTION_PERMILLE
+}
+
+const fn default_critical_free_fraction_permille() -> u32 {
+    CRITICAL_FREE_FRACTION_PERMILLE
+}
+
 impl ExecutorRuntimePolicy {
-    /// The bars `instrument` is held to.
-    pub fn stall_policy(&self, instrument: StallInstrument) -> StallInstrumentPolicy {
-        match instrument {
-            StallInstrument::Cpu => self.cpu_admission,
-            StallInstrument::Memory => self.memory_admission,
+    /// The bars `gauge` is held to.
+    pub fn stall_policy(&self, gauge: StallGauge) -> StallInstrumentPolicy {
+        match gauge {
+            StallGauge::Cpu => self.cpu_admission,
+            StallGauge::Memory => self.memory_admission,
+            StallGauge::DiskWrite(DiskWriteArm::Stall) => self.disk_write_stall,
+            StallGauge::DiskWrite(DiskWriteArm::Latency) => self.disk_write_latency,
         }
+    }
+
+    /// The effective pressure and critical lines on a volume of
+    /// `total_bytes`, each the larger of its floor and its fraction.
+    pub fn storage_lines(&self, total_bytes: u64) -> (u64, u64) {
+        (
+            effective_storage_line(
+                self.idle_retention_pressure_free_bytes,
+                self.pressure_free_fraction_permille,
+                total_bytes,
+            ),
+            effective_storage_line(
+                self.storage_critical_free_bytes,
+                self.critical_free_fraction_permille,
+                total_bytes,
+            ),
+        )
     }
 }
 
-/// One instrument's bars: the brake engages once the reading has stayed at or
+/// One gauge's bars: the brake engages once the reading has stayed at or
 /// above `entry` for `entry_window_ms`, and releases once it has stayed at or
-/// below `clear` for `clear_window_ms`. Readings are fractions from 0 to 1.
+/// below `clear` for `clear_window_ms`. Readings are fractions from 0 to 1,
+/// except the build-volume latency arm's, which are milliseconds
+/// ([`StallGauge::reads_milliseconds`]).
 ///
 /// The bars serialize as `entryUtilization` and `clearUtilization`, the names
 /// they carried while CPU was the only instrument, for every instrument: one
@@ -15242,17 +15687,77 @@ impl StallInstrumentPolicy {
         clear_window_ms: 30_000,
     };
 
-    pub fn validate(&self, instrument: StallInstrument) -> Result<(), String> {
-        let name = instrument.label();
-        if !self.entry.is_finite() || !(0.0..=1.0).contains(&self.entry) {
-            return Err(format!(
-                "{name} brake entry must be a finite fraction in [0, 1]"
-            ));
-        }
-        if !self.clear.is_finite() || !(0.0..=1.0).contains(&self.clear) {
-            return Err(format!(
-                "{name} brake clear must be a finite fraction in [0, 1]"
-            ));
+    /// Build-volume write stall: hold compile-class work once PSI `io full`
+    /// avg60, attributed to the build device, has stayed at or above 8% for
+    /// 120 s; release after 300 s at or below 3%.
+    ///
+    /// Tenet 1438 sets the bar on the volume class it governs, measured
+    /// before it is set. The record on cairn/5658 is that measurement:
+    ///
+    /// | Specimen                    | Reading                         | Caught by          |
+    /// |-----------------------------|---------------------------------|--------------------|
+    /// | Issue body, 10-30 22:26     | 54% avg60, 82% busy             | stall arm          |
+    /// | Comment 1, 11-04            | 28.3% / 25.0% avg60, 187 ms     | both arms          |
+    /// | Comment 3, 11-04 22:14      | 22.8% avg60                     | stall arm          |
+    /// | Comment 4, 11-04 23:30      | 37.4% avg60, 3.0 s mean write   | both arms          |
+    /// | Comment 5, 11-05 07:13      | 48.3% avg60                     | stall arm          |
+    /// | Comment 6, 11-06 05:4x      | 6.6% avg60, 48 ms, 0 in flight  | latency arm only   |
+    /// | Comment 7, 11-07 01:00Z     | 10.2% avg60 (avg10 8.6)         | stall arm, at 8%   |
+    /// | Comment 9, 11-09 14:1x      | 29.5% avg60, 150 ms             | both arms          |
+    /// | Healthy bbs                 | 0.1%                            | not held (correct) |
+    ///
+    /// Healthy reads sit more than an order of magnitude under both bars. The
+    /// two-minute entry window absorbs a single flush; the five-minute clear
+    /// window is deliberately long, because the pile-up re-forms as soon as
+    /// admission resumes after a brief dip (comments 3 and 5). What this does
+    /// not catch: any stall shorter than 120 s, by design, and a volume whose
+    /// fsync tail is multi-second while its mean write stays under 40 ms and
+    /// its stall under 8%. That case is left to the fraction lines and to
+    /// pricing.
+    pub const DISK_WRITE_STALL_DEFAULT: Self = Self {
+        entry: 0.08,
+        clear: 0.03,
+        entry_window_ms: 120_000,
+        clear_window_ms: 300_000,
+    };
+
+    /// Build-volume write latency, in milliseconds of mean write on a
+    /// non-rotational device: hold at 40 ms for 120 s, release after 300 s at
+    /// or below 15 ms. A healthy NVMe's mean write is single-digit
+    /// milliseconds. This arm is the one that sees comment 6's specimen
+    /// (6.6% stall, 48 ms mean), which the stall arm alone misses; the
+    /// evidence table is on [`Self::DISK_WRITE_STALL_DEFAULT`].
+    pub const DISK_WRITE_LATENCY_DEFAULT: Self = Self {
+        entry: 40.0,
+        clear: 15.0,
+        entry_window_ms: 120_000,
+        clear_window_ms: 300_000,
+    };
+
+    pub fn validate(&self, gauge: StallGauge) -> Result<(), String> {
+        let name = gauge.label();
+        if gauge.reads_milliseconds() {
+            if !self.entry.is_finite() || self.entry <= 0.0 {
+                return Err(format!(
+                    "{name} brake entry must be a finite, positive number of milliseconds"
+                ));
+            }
+            if !self.clear.is_finite() || self.clear < 0.0 {
+                return Err(format!(
+                    "{name} brake clear must be a finite, non-negative number of milliseconds"
+                ));
+            }
+        } else {
+            if !self.entry.is_finite() || !(0.0..=1.0).contains(&self.entry) {
+                return Err(format!(
+                    "{name} brake entry must be a finite fraction in [0, 1]"
+                ));
+            }
+            if !self.clear.is_finite() || !(0.0..=1.0).contains(&self.clear) {
+                return Err(format!(
+                    "{name} brake clear must be a finite fraction in [0, 1]"
+                ));
+            }
         }
         if self.clear >= self.entry {
             return Err(format!("{name} brake clear must be below its entry"));
@@ -15427,14 +15932,33 @@ impl Default for ExecutorRuntimePolicy {
             slot_target_max_bytes: default_slot_target_max_bytes(),
             cpu_admission: StallInstrumentPolicy::CPU_DEFAULT,
             memory_admission: StallInstrumentPolicy::MEMORY_DEFAULT,
+            disk_write_stall: StallInstrumentPolicy::DISK_WRITE_STALL_DEFAULT,
+            disk_write_latency: StallInstrumentPolicy::DISK_WRITE_LATENCY_DEFAULT,
+            pressure_free_fraction_permille: PRESSURE_FREE_FRACTION_PERMILLE,
+            critical_free_fraction_permille: CRITICAL_FREE_FRACTION_PERMILLE,
         }
     }
 }
 
 impl ExecutorRuntimePolicy {
     pub fn validate(&self) -> Result<(), String> {
-        for instrument in StallInstrument::ALL {
-            self.stall_policy(instrument).validate(instrument)?;
+        for gauge in StallGauge::ALL {
+            self.stall_policy(gauge).validate(gauge)?;
+        }
+        if self.pressure_free_fraction_permille > 1_000
+            || self.critical_free_fraction_permille > 1_000
+        {
+            return Err("executor storage line fractions must be at most 1000 permille".into());
+        }
+        // The byte lines are already ordered, so the effective lines stay
+        // ordered on every volume exactly when the fractions are: zero for
+        // both leaves the byte lines governing alone.
+        if self.critical_free_fraction_permille > 0
+            && self.critical_free_fraction_permille >= self.pressure_free_fraction_permille
+        {
+            return Err(
+                "executor storage critical fraction must be below the pressure fraction".into(),
+            );
         }
         if self.concurrency_units == 0 {
             return Err("executor concurrency units must be greater than zero".into());
@@ -17437,6 +17961,13 @@ pub enum AdmissionHoldEvidence {
         cpu_pressured: bool,
         #[serde(default)]
         memory_stalled: bool,
+        /// The build-volume write instrument holds, and this request is
+        /// compile-class.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        disk_write_stalled: bool,
+        /// The device that instrument reads, when it holds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disk_write_device: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_memory_bytes: Option<u64>,
         #[serde(default)]
@@ -17492,6 +18023,8 @@ impl AdmissionHoldEvidence {
             Self::Pressure {
                 cpu_pressured,
                 memory_stalled,
+                disk_write_stalled,
+                disk_write_device,
                 available_memory_bytes,
                 owed_memory_bytes,
                 memory_floor_bytes,
@@ -17520,6 +18053,10 @@ impl AdmissionHoldEvidence {
                     .then(|| "sustained CPU pressure".to_string())
                     .into_iter()
                     .chain(memory_stalled.then(|| "memory stall".to_string()))
+                    .chain(disk_write_stalled.then(|| match disk_write_device {
+                        Some(device) => format!("build volume write stall on {device}"),
+                        None => "build volume write stall".to_string(),
+                    }))
                     .chain(memory)
                     .collect();
                 format!("held: {}", parts.join(", "))
@@ -21992,6 +22529,7 @@ mod tests {
                     waiting_since_unix_ms: request.waiting_since_unix_ms,
                     wait_horizon_unix_ms: request.wait_horizon_unix_ms,
                     predicted_cost_ms: Some(4_000),
+                    command_class: CellCommandClass::CargoTest,
                     execution_residency: Some(ResidencyFence {
                         holder: sample_holder(),
                         incarnation_id: "incarnation".into(),
@@ -22562,6 +23100,7 @@ mod tests {
             wait_horizon_unix_ms: request.wait_horizon_unix_ms,
             predicted_cost_ms: None,
             execution_residency: None,
+            command_class: CellCommandClass::Other,
         };
         let json = serde_json::to_value(&fresh).unwrap();
         assert!(json.get("executionResidency").is_none());
@@ -23784,6 +24323,27 @@ mod tests {
                 state_since_unix_ms: Some(3),
                 measured_at_unix_ms: Some(4),
             },
+            disk_write_admission: StallInstrumentHealth {
+                state: StallInstrumentState::Pressured,
+                reading: Some(0.102),
+                state_since_unix_ms: Some(3),
+                measured_at_unix_ms: Some(4),
+            },
+            disk_write_arms: DiskWriteArms {
+                stall: StallInstrumentHealth {
+                    state: StallInstrumentState::Pressured,
+                    reading: Some(0.102),
+                    state_since_unix_ms: Some(3),
+                    measured_at_unix_ms: Some(4),
+                },
+                latency: StallInstrumentHealth {
+                    state: StallInstrumentState::Accepting,
+                    reading: Some(12.0),
+                    state_since_unix_ms: Some(1),
+                    measured_at_unix_ms: Some(4),
+                },
+                last_pressured_unix_ms: Some(3),
+            },
             logical_cores: Some(10),
             pipe_health: Some({
                 let mut evidence = crate::pipe_health::PipeHealth::new(true);
@@ -23810,6 +24370,15 @@ mod tests {
                         writes: 10,
                         in_flight: 4,
                         window_ms: 15_000,
+                    }),
+                    build_device: Some(DeviceLoad {
+                        device: "nvme0n1".into(),
+                        busy_permille: 820,
+                        write_bytes_per_sec: 56_000_000,
+                        mean_write_ms: Some(150),
+                        stalled: false,
+                        in_flight: 12,
+                        window_ms: 5_000,
                     }),
                 },
             ),
@@ -24025,9 +24594,30 @@ mod tests {
             watermark_bytes: 2,
             critical_free_bytes: 16,
             pressure_free_bytes: 64,
+            pressure_line_fraction_permille: Some(100),
+            critical_line_fraction_permille: None,
+            device: Some(VolumeDevice {
+                name: "nvme0n1".into(),
+                model: Some("CT4000P3PSSD8".into()),
+                rotational: Some(false),
+                transport: VolumeTransport::Nvme,
+            }),
             pressure: Some(StoragePressureReport {
                 at_unix_ms: 9,
                 band: StoragePressureBand::Critical,
+                cause: StoragePressureCause::WriteSaturation {
+                    device: VolumeDevice {
+                        name: "nvme0n1".into(),
+                        model: Some("CT4000P3PSSD8".into()),
+                        rotational: Some(false),
+                        transport: VolumeTransport::Nvme,
+                    },
+                    arm: DiskWriteArm::Stall,
+                    busy_permille: Some(820),
+                    write_bytes_per_sec: Some(56_000_000),
+                    mean_write_ms: Some(150),
+                    full_avg60_millis: Some(295),
+                },
                 target_bytes: 100,
                 free_bytes_before: 1,
                 free_bytes_after: 5,
@@ -25733,11 +26323,105 @@ mod tests {
         assert!(ExecutorRuntimePolicy::default().validate().is_ok());
 
         let mut legacy = serde_json::to_value(ExecutorRuntimePolicy::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("cpuAdmission");
-        legacy.as_object_mut().unwrap().remove("memoryAdmission");
+        for field in [
+            "cpuAdmission",
+            "memoryAdmission",
+            "diskWriteStall",
+            "diskWriteLatency",
+            "pressureFreeFractionPermille",
+            "criticalFreeFractionPermille",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
         let decoded: ExecutorRuntimePolicy = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.cpu_admission, cpu);
         assert_eq!(decoded.memory_admission, memory);
+        assert_eq!(
+            decoded.disk_write_stall,
+            StallInstrumentPolicy::DISK_WRITE_STALL_DEFAULT
+        );
+        assert_eq!(
+            decoded.disk_write_latency,
+            StallInstrumentPolicy::DISK_WRITE_LATENCY_DEFAULT
+        );
+        assert_eq!(decoded.pressure_free_fraction_permille, 100);
+        assert_eq!(decoded.critical_free_fraction_permille, 20);
+    }
+
+    /// The pressure line is a fraction of a large volume and the floor on a
+    /// small one; fedora's 3.6 TiB volume reclaims at about 368 GiB free, not
+    /// at 64 GiB.
+    #[test]
+    fn the_pressure_line_is_a_fraction_of_a_large_volume_and_a_floor_on_a_small_one() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let policy = ExecutorRuntimePolicy::default();
+        let fedora = 3_686 * GIB;
+        let (pressure, critical) = policy.storage_lines(fedora);
+        assert_eq!(pressure, fedora / 10);
+        assert_eq!(critical, fedora / 50);
+        assert!(pressure > 360 * GIB && pressure < 370 * GIB, "{pressure}");
+
+        let small = 256 * GIB;
+        assert_eq!(
+            policy.storage_lines(small),
+            (
+                IDLE_RETENTION_PRESSURE_FREE_BYTES,
+                STORAGE_CRITICAL_FREE_BYTES
+            )
+        );
+
+        let absolute = ExecutorRuntimePolicy {
+            pressure_free_fraction_permille: 0,
+            critical_free_fraction_permille: 0,
+            ..policy
+        };
+        assert!(absolute.validate().is_ok());
+        assert_eq!(
+            absolute.storage_lines(fedora),
+            (
+                IDLE_RETENTION_PRESSURE_FREE_BYTES,
+                STORAGE_CRITICAL_FREE_BYTES
+            )
+        );
+
+        let inverted = ExecutorRuntimePolicy {
+            critical_free_fraction_permille: 100,
+            ..ExecutorRuntimePolicy::default()
+        };
+        assert!(inverted.validate().is_err());
+    }
+
+    /// Either arm pressured is the instrument pressured; both unmeasured is
+    /// unknown, which fails open; the instrument is as fresh as its newer arm.
+    #[test]
+    fn the_disk_write_verdict_combines_its_arms() {
+        let at = |state, since, measured| StallInstrumentHealth {
+            state,
+            reading: Some(0.1),
+            state_since_unix_ms: Some(since),
+            measured_at_unix_ms: Some(measured),
+        };
+        let unknown = StallInstrumentHealth::default();
+        assert_eq!(
+            combine_disk_write_arms(&unknown, &unknown).state,
+            StallInstrumentState::Unknown
+        );
+        let accepting = at(StallInstrumentState::Accepting, 10, 50);
+        let pressured = at(StallInstrumentState::Pressured, 20, 40);
+        let combined = combine_disk_write_arms(&accepting, &pressured);
+        assert_eq!(combined.state, StallInstrumentState::Pressured);
+        assert_eq!(combined.state_since_unix_ms, Some(20));
+        assert_eq!(
+            combined.measured_at_unix_ms,
+            Some(40),
+            "a pressured verdict is as fresh as its pressured arm, never the healthy one"
+        );
+        let combined = combine_disk_write_arms(&accepting, &unknown);
+        assert_eq!(combined.state, StallInstrumentState::Accepting);
+        assert_eq!(combined.measured_at_unix_ms, Some(50));
+        assert!(StallInstrument::DiskWrite.holds_class(CellCommandClass::CargoTest));
+        assert!(!StallInstrument::DiskWrite.holds_class(CellCommandClass::Vitest));
+        assert!(StallInstrument::Memory.holds_class(CellCommandClass::Vitest));
     }
 
     /// The CPU bars keep the serialized names they had while CPU was the only
@@ -25763,19 +26447,30 @@ mod tests {
     #[test]
     fn stall_instrument_policy_rejects_invalid_bars_and_windows() {
         for (instrument, valid) in [
-            (StallInstrument::Cpu, StallInstrumentPolicy::CPU_DEFAULT),
+            (StallGauge::Cpu, StallInstrumentPolicy::CPU_DEFAULT),
+            (StallGauge::Memory, StallInstrumentPolicy::MEMORY_DEFAULT),
             (
-                StallInstrument::Memory,
-                StallInstrumentPolicy::MEMORY_DEFAULT,
+                StallGauge::DiskWrite(DiskWriteArm::Stall),
+                StallInstrumentPolicy::DISK_WRITE_STALL_DEFAULT,
+            ),
+            (
+                StallGauge::DiskWrite(DiskWriteArm::Latency),
+                StallInstrumentPolicy::DISK_WRITE_LATENCY_DEFAULT,
             ),
         ] {
+            assert!(valid.validate(instrument).is_ok(), "{instrument:?}");
+            let out_of_range = if instrument.reads_milliseconds() {
+                -1.0
+            } else {
+                1.01
+            };
             for invalid in [
                 StallInstrumentPolicy {
                     entry: f64::NAN,
                     ..valid
                 },
                 StallInstrumentPolicy {
-                    entry: 1.01,
+                    entry: out_of_range,
                     ..valid
                 },
                 StallInstrumentPolicy {
@@ -25800,9 +26495,13 @@ mod tests {
             }
             let mut policy = ExecutorRuntimePolicy::default();
             match instrument {
-                StallInstrument::Cpu => policy.cpu_admission.clear = policy.cpu_admission.entry,
-                StallInstrument::Memory => {
-                    policy.memory_admission.clear = policy.memory_admission.entry
+                StallGauge::Cpu => policy.cpu_admission.clear = policy.cpu_admission.entry,
+                StallGauge::Memory => policy.memory_admission.clear = policy.memory_admission.entry,
+                StallGauge::DiskWrite(DiskWriteArm::Stall) => {
+                    policy.disk_write_stall.clear = policy.disk_write_stall.entry
+                }
+                StallGauge::DiskWrite(DiskWriteArm::Latency) => {
+                    policy.disk_write_latency.clear = policy.disk_write_latency.entry
                 }
             }
             assert!(policy.validate().is_err());

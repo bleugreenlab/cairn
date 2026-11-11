@@ -1118,9 +1118,9 @@ impl FleetConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.drains.validate()?;
         self.cpu_admission
-            .validate(cairn_common::executor_protocol::StallInstrument::Cpu)?;
+            .validate(cairn_common::executor_protocol::StallGauge::Cpu)?;
         self.memory_admission
-            .validate(cairn_common::executor_protocol::StallInstrument::Memory)?;
+            .validate(cairn_common::executor_protocol::StallGauge::Memory)?;
         self.machine_services.validate()?;
         for (executor_id, policy) in &self.executor_policies {
             policy

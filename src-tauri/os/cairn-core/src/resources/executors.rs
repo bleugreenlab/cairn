@@ -215,7 +215,9 @@ use cairn_common::executor_protocol::{
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
 use crate::fleet::pools::{derive_pools, FAST_LINK_FLOOR_GBPS};
 use cairn_common::executor_protocol::ProjectCapability;
-use cairn_common::executor_protocol::{HostHealth, Interconnect};
+use cairn_common::executor_protocol::{
+    DiskWriteArm, ExecutorRuntimePolicy, HostHealth, Interconnect, StallGauge,
+};
 
 /// The runner's own abnormal restart, when it had one.
 ///
@@ -503,6 +505,14 @@ pub(crate) fn render_executors(
         }
         out.push_str(&owned_drain_lines(&executor.drain_state));
         out.push_str(&model_residents_line(&executor.health.model_residents));
+        if let Some(recommendation) =
+            write_saturation_recommendation(&executor.health, executor.captured_at_unix_ms)
+        {
+            out.push_str(&format!(
+                "- Build volume: write-saturated ({}); see the recommendation on its page\n",
+                recommendation.flag
+            ));
+        }
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
             executor.occupancy.executing_requests.len(),
@@ -1703,16 +1713,27 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     // fact the Admission section owes its reader. A machine that stopped
     // measuring reads as idle everywhere else on this page.
     for instrument in StallInstrument::ALL {
-        out.push_str(&format!(
-            "- {} brake: {}\n",
-            instrument.label(),
-            stall_brake_summary(
-                instrument,
-                health.host.stall(instrument),
-                health.applied_policy.stall_policy(instrument),
+        let summary = match instrument {
+            StallInstrument::DiskWrite => disk_write_brake_summary(
+                &health.host,
+                &health.applied_policy,
                 executor.captured_at_unix_ms,
-            )
-        ));
+            ),
+            StallInstrument::Cpu | StallInstrument::Memory => {
+                let gauge = if instrument == StallInstrument::Cpu {
+                    StallGauge::Cpu
+                } else {
+                    StallGauge::Memory
+                };
+                stall_brake_summary(
+                    gauge,
+                    health.host.stall(instrument),
+                    health.applied_policy.stall_policy(gauge),
+                    executor.captured_at_unix_ms,
+                )
+            }
+        };
+        out.push_str(&format!("- {} brake: {summary}\n", instrument.label()));
     }
     if let Some(owed) = health.admission.owed_memory_bytes {
         let owing = &health.admission.owing;
@@ -2265,11 +2286,17 @@ fn render_storage(executor: &ExecutorInspection) -> String {
     let machine = &health.machine;
     let captured = executor.captured_at_unix_ms;
     let mut out = String::from("## Storage\n");
+    let line_source = |fraction: Option<u32>| match fraction {
+        Some(permille) => format!(" ({}% of volume)", permille / 10),
+        None => String::new(),
+    };
     let thresholds = if disk.pressure_free_bytes > 0 {
         format!(
-            " (pressure line {}, critical {}, admission floor {})",
+            " (pressure line {}{}, critical {}{}, admission floor {})",
             bytes(disk.pressure_free_bytes),
+            line_source(disk.pressure_line_fraction_permille),
             bytes(disk.critical_free_bytes),
+            line_source(disk.critical_line_fraction_permille),
             bytes(disk.watermark_bytes)
         )
     } else {
@@ -2277,9 +2304,12 @@ fn render_storage(executor: &ExecutorInspection) -> String {
     };
     let free_of = |volume: &cairn_common::executor_protocol::MachineVolume| {
         format!(
-            "{} free of {}",
+            "{} free of {}{}",
             bytes(volume.free_bytes),
-            bytes(volume.total_bytes)
+            bytes(volume.total_bytes),
+            percent_full(volume)
+                .map(|full| format!(", {full}% full"))
+                .unwrap_or_default()
         )
     };
     // While a build root apart from the home is here, the verdict and its
@@ -2323,6 +2353,14 @@ fn render_storage(executor: &ExecutorInspection) -> String {
             disk.status,
         ));
     }
+    out.push_str(&device_line(
+        disk.device.as_ref(),
+        &health.host.io_pressure,
+        captured,
+    ));
+    if let Some(recommendation) = write_saturation_recommendation(health, captured) {
+        out.push_str(&format!("- Recommendation: {}\n", recommendation.text));
+    }
     render_holdings(
         &mut out,
         "",
@@ -2331,6 +2369,176 @@ fn render_storage(executor: &ExecutorInspection) -> String {
         captured,
     );
     out
+}
+
+/// How full a volume is, in whole percent, or `None` for a volume of no size.
+fn percent_full(volume: &cairn_common::executor_protocol::MachineVolume) -> Option<u64> {
+    (volume.total_bytes > 0).then(|| {
+        (u128::from(volume.total_bytes.saturating_sub(volume.free_bytes)) * 100
+            / u128::from(volume.total_bytes)) as u64
+    })
+}
+
+/// `82% busy, 56 MB/s written, mean write 150 ms (5 s window)`.
+fn device_load_text(load: &cairn_common::executor_protocol::DeviceLoad) -> String {
+    let mean = if load.stalled {
+        format!(
+            "stalled: nothing completed in {} while busy throughout",
+            refresh_duration(load.window_ms)
+        )
+    } else {
+        match load.mean_write_ms {
+            Some(mean) => format!("mean write {}", refresh_duration(mean)),
+            None => "no writes completed".to_string(),
+        }
+    };
+    format!(
+        "{}% busy, {} MB/s written, {mean} ({} window)",
+        load.busy_permille / 10,
+        load.write_bytes_per_sec / 1_000_000,
+        refresh_duration(load.window_ms)
+    )
+}
+
+/// `nvme0n1 (CT4000P3PSSD8)`.
+fn device_name(device: &cairn_common::executor_protocol::VolumeDevice) -> String {
+    match &device.model {
+        Some(model) => format!("{} ({model})", device.name),
+        None => device.name.clone(),
+    }
+}
+
+/// The device under the build volume and its live load, or the named reason
+/// it is unmeasured.
+fn device_line(
+    device: Option<&cairn_common::executor_protocol::VolumeDevice>,
+    io: &Measurement<cairn_common::executor_protocol::IoPressure>,
+    captured: u64,
+) -> String {
+    let Some(device) = device else {
+        return "- Device: unmeasured — the build volume's block device was not resolved (off Linux, or an unreadable mount table); its write instrument cannot engage\n".to_string();
+    };
+    let rotation = match device.rotational {
+        Some(true) => "rotational",
+        Some(false) => "non-rotational",
+        None => "rotation unknown",
+    };
+    let identity = [
+        Some(device.name.clone()),
+        device.model.clone(),
+        Some(device.transport.label().to_string()),
+        Some(rotation.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    let load = match io
+        .value()
+        .and_then(|pressure| pressure.build_device.as_ref())
+    {
+        Some(load) => format!(
+            "{}, measured {}",
+            device_load_text(load),
+            age(io.age_ms(captured))
+        ),
+        None => "load not yet measured".to_string(),
+    };
+    format!("- Device: {identity}; {load}\n")
+}
+
+/// How long after the build-volume write instrument was last pressured the
+/// machine page still recommends a remedy.
+const WRITE_SATURATION_RECOMMENDATION_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// A recommendation derived from a measured write saturation (tenet 1000:
+/// derived, never configured).
+struct WriteSaturationRecommendation {
+    /// `nvme0n1, 93% full`, for the fleet row.
+    flag: String,
+    text: String,
+}
+
+/// The remedy for a build volume that saturated under writes within the
+/// last day, or whose last pressure pass ran for that cause, on a
+/// non-rotational device: built from the device's own numbers.
+fn write_saturation_recommendation(
+    health: &cairn_common::executor_protocol::ExecutorHealthSnapshot,
+    captured: u64,
+) -> Option<WriteSaturationRecommendation> {
+    use cairn_common::executor_protocol::StoragePressureCause;
+    let device = health.disk.device.as_ref()?;
+    if device.rotational != Some(false) {
+        return None;
+    }
+    let recently = health
+        .host
+        .disk_write_arms
+        .last_pressured_unix_ms
+        .is_some_and(|at| captured.saturating_sub(at) <= WRITE_SATURATION_RECOMMENDATION_WINDOW_MS);
+    let cause = health
+        .disk
+        .pressure
+        .as_ref()
+        .map(|pass| &pass.cause)
+        .filter(|cause| matches!(cause, StoragePressureCause::WriteSaturation { .. }));
+    if !recently && cause.is_none() {
+        return None;
+    }
+    let volume = health
+        .machine
+        .build_volume
+        .as_ref()
+        .and_then(|volume| volume.value())
+        .or_else(|| health.machine.volume.value());
+    let full = volume.and_then(percent_full);
+    // The live window when the device is loaded now; otherwise the window
+    // the last saturation pass saw.
+    let live = health
+        .host
+        .io_pressure
+        .value()
+        .and_then(|pressure| pressure.build_device.clone());
+    let (busy, rate) = match (&live, cause) {
+        (Some(load), _) if load.busy_permille > 0 => {
+            (Some(load.busy_permille), Some(load.write_bytes_per_sec))
+        }
+        (
+            _,
+            Some(StoragePressureCause::WriteSaturation {
+                busy_permille,
+                write_bytes_per_sec,
+                ..
+            }),
+        ) => (*busy_permille, *write_bytes_per_sec),
+        _ => (None, None),
+    };
+    let load = match (rate, busy) {
+        (Some(rate), Some(busy)) => format!(
+            " ({} MB/s sustained at {}% busy)",
+            rate / 1_000_000,
+            busy / 10
+        ),
+        _ => String::new(),
+    };
+    let fullness = full
+        .map(|full| format!(" at {full}% full"))
+        .unwrap_or_default();
+    Some(WriteSaturationRecommendation {
+        flag: match full {
+            Some(full) => format!("{}, {full}% full", device.name),
+            None => device.name.clone(),
+        },
+        text: format!(
+            "the build volume {} {} write-saturated{fullness}{load}. Consumer drives with a shrinking SLC cache (QLC) collapse like this near full: keep this volume under about 80% full, or move the build root to a TLC or enterprise device.",
+            device_name(device),
+            if health.host.disk_write_admission.holds(captured) {
+                "is"
+            } else {
+                "was recently"
+            },
+        ),
+    })
 }
 
 /// The build root, its volume, and whether it is here, in words.
@@ -2840,6 +3048,32 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                     ))
                     .unwrap_or_default()
             ));
+            }
+            if let cairn_common::executor_protocol::StoragePressureCause::WriteSaturation {
+                device,
+                arm,
+                busy_permille,
+                write_bytes_per_sec,
+                mean_write_ms,
+                full_avg60_millis,
+            } = &pressure.cause
+            {
+                let figures = [
+                    full_avg60_millis
+                        .map(|millis| format!("{:.1}% full avg60", f64::from(millis) / 10.0)),
+                    busy_permille.map(|busy| format!("{}% busy", busy / 10)),
+                    write_bytes_per_sec.map(|rate| format!("{} MB/s written", rate / 1_000_000)),
+                    mean_write_ms.map(|mean| format!("mean write {}", refresh_duration(mean))),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+                out.push_str(&format!(
+                    "- Pressure cause: the build volume {} is write-saturated ({} arm: {figures}); the pass reclaimed toward a fifth of the volume free, above the byte lines\n",
+                    device_name(device),
+                    arm.label(),
+                ));
             }
             for withheld in &pressure.withheld {
                 out.push_str(&format!("- Not reclaimed: {}\n", withheld_line(withheld)));
@@ -3715,30 +3949,49 @@ fn allocator_split(state: &AllocatorState) -> String {
 /// when the sampler runs, and a sampler that has stopped cannot report that it
 /// stopped.
 fn stall_brake_summary(
-    instrument: StallInstrument,
+    gauge: StallGauge,
     health: &StallInstrumentHealth,
     policy: StallInstrumentPolicy,
     captured_at_unix_ms: u64,
 ) -> String {
+    let held = if gauge.instrument() == StallInstrument::DiskWrite {
+        "compile-class"
+    } else {
+        "non-interactive"
+    };
     let Some(measured_at) = health.measured_at_unix_ms else {
-        return "never measured on this machine — the brake cannot engage".to_string();
+        return match gauge {
+            StallGauge::DiskWrite(DiskWriteArm::Latency) => {
+                "unmeasured — this arm reads a non-rotational build device only".to_string()
+            }
+            _ => "never measured on this machine — the brake cannot engage".to_string(),
+        };
     };
     let age_ms = captured_at_unix_ms.saturating_sub(measured_at);
     if age_ms > CPU_ADMISSION_BLIND_AFTER_MS {
         return format!(
-            "BLIND — last reading {}, past the {}s bound; non-interactive admission is held",
+            "BLIND — last reading {}, past the {}s bound; {held} admission is held",
             age(age_ms),
             CPU_ADMISSION_BLIND_AFTER_MS / 1_000
         );
     }
-    let percent = |fraction: f64| match instrument {
+    let percent = |value: f64| match gauge {
         // A stall share is small where it matters, so it keeps a decimal.
-        StallInstrument::Memory => format!("{:.1}%", fraction * 100.0),
-        StallInstrument::Cpu => format!("{:.0}%", fraction * 100.0),
+        StallGauge::Memory | StallGauge::DiskWrite(DiskWriteArm::Stall) => {
+            format!("{:.1}%", value * 100.0)
+        }
+        StallGauge::Cpu => format!("{:.0}%", value * 100.0),
+        StallGauge::DiskWrite(DiskWriteArm::Latency) => format!("{value:.0} ms"),
     };
-    let reading = match (health.reading, instrument) {
-        (Some(value), StallInstrument::Cpu) => percent(value),
-        (Some(value), StallInstrument::Memory) => format!("{} full (avg10)", percent(value)),
+    let reading = match (health.reading, gauge) {
+        (Some(value), StallGauge::Cpu) => percent(value),
+        (Some(value), StallGauge::Memory) => format!("{} full (avg10)", percent(value)),
+        (Some(value), StallGauge::DiskWrite(DiskWriteArm::Stall)) => {
+            format!("{} full (avg60)", percent(value))
+        }
+        (Some(value), StallGauge::DiskWrite(DiskWriteArm::Latency)) => {
+            format!("{} mean write", percent(value))
+        }
         (None, _) => "unreported".to_string(),
     };
     let seconds = |ms: u64| format!("{} s", ms / 1_000);
@@ -3754,21 +4007,63 @@ fn stall_brake_summary(
     );
     match health.state {
         StallInstrumentState::Pressured => {
-            let verb = match instrument {
-                StallInstrument::Cpu => "pressured",
-                StallInstrument::Memory => "stalled",
+            let verb = match gauge {
+                StallGauge::Cpu => "pressured",
+                StallGauge::Memory | StallGauge::DiskWrite(DiskWriteArm::Stall) => "stalled",
+                StallGauge::DiskWrite(DiskWriteArm::Latency) => "slow",
             };
             let since = health
                 .state_since_unix_ms
                 .map(|since| format!(" for {}", age(captured_at_unix_ms.saturating_sub(since))))
                 .unwrap_or_default();
             format!(
-                "{verb} at {reading}{since} — holding new non-interactive work (measured {}; {entry}, {clear})",
+                "{verb} at {reading}{since} — holding new {held} work (measured {}; {entry}, {clear})",
                 age(age_ms)
             )
         }
         _ => format!("accepting at {reading} (measured {}; {entry})", age(age_ms)),
     }
+}
+
+/// The build-volume write instrument: its combined verdict, then each arm
+/// against its own bars, so a reader sees which arm tripped and what the
+/// other one reads.
+fn disk_write_brake_summary(
+    host: &HostHealth,
+    policy: &ExecutorRuntimePolicy,
+    captured_at_unix_ms: u64,
+) -> String {
+    let arm = |arm: DiskWriteArm| {
+        let health = match arm {
+            DiskWriteArm::Stall => &host.disk_write_arms.stall,
+            DiskWriteArm::Latency => &host.disk_write_arms.latency,
+        };
+        let gauge = StallGauge::DiskWrite(arm);
+        stall_brake_summary(
+            gauge,
+            health,
+            policy.stall_policy(gauge),
+            captured_at_unix_ms,
+        )
+    };
+    let combined = &host.disk_write_admission;
+    let head = match combined.state {
+        StallInstrumentState::Unknown => {
+            "never measured on this machine (no build device resolved, or no PSI) — the brake cannot engage"
+                .to_string()
+        }
+        StallInstrumentState::Pressured if combined.fresh(captured_at_unix_ms) => {
+            "pressured — holding new compile-class work; spill-eligible work places elsewhere"
+                .to_string()
+        }
+        StallInstrumentState::Pressured => "pressured on a stale reading".to_string(),
+        StallInstrumentState::Accepting => "accepting".to_string(),
+    };
+    format!(
+        "{head}\n  - Write stall arm: {}\n  - Write latency arm: {}",
+        arm(DiskWriteArm::Stall),
+        arm(DiskWriteArm::Latency)
+    )
 }
 
 /// What the runner's supervisor is doing about the colocated executor, or the
@@ -4614,6 +4909,13 @@ fn render_io_pressure(pressure: &cairn_common::executor_protocol::IoPressure) ->
                 device.in_flight
             ),
         });
+    }
+    if let Some(load) = &pressure.build_device {
+        line.push_str(&format!(
+            "; build device {} {}",
+            load.device,
+            device_load_text(load)
+        ));
     }
     line
 }
@@ -6353,6 +6655,7 @@ mod storage_section_tests {
         let at = executor.captured_at_unix_ms;
         let rung = |rung, bytes, count| StorageRungReclaim { rung, bytes, count };
         executor.health.disk.pressure = Some(StoragePressureReport {
+            cause: Default::default(),
             at_unix_ms: at - 180_000,
             band: StoragePressureBand::Pressure,
             target_bytes: 74 * GIB,
@@ -6444,6 +6747,7 @@ mod storage_section_tests {
             withheld(StorageWithheldReason::CachesOwnerRetained, GIB, 1),
         ];
         executor.health.disk.pressure = Some(StoragePressureReport {
+            cause: Default::default(),
             at_unix_ms: at - 60_000,
             band: StoragePressureBand::Critical,
             target_bytes: 127 * GIB,
@@ -6542,6 +6846,7 @@ mod storage_section_tests {
             ),
         ];
         executor.health.disk.pressure = Some(StoragePressureReport {
+            cause: Default::default(),
             at_unix_ms: at - 60_000,
             band: StoragePressureBand::Pressure,
             target_bytes: 10 * GIB,
@@ -7679,6 +7984,110 @@ mod tests {
             degraded.contains("## Link"),
             "the link keeps its own section, untouched by pipe health"
         );
+    }
+
+    /// fedora's shape: a 3.6 TiB NVMe at 93% full whose writes saturated.
+    fn saturated_fedora() -> ExecutorInspection {
+        use cairn_common::executor_protocol::{
+            DeviceLoad, DiskWriteArm, IoPressure, StoragePressureBand, StoragePressureCause,
+            VolumeDevice, VolumeTransport,
+        };
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut executor = inspection("fedora", false);
+        let at = executor.captured_at_unix_ms;
+        let device = VolumeDevice {
+            name: "nvme0n1".into(),
+            model: Some("CT4000P3PSSD8".into()),
+            rotational: Some(false),
+            transport: VolumeTransport::Nvme,
+        };
+        executor.health.disk.device = Some(device.clone());
+        executor.health.disk.watermark_bytes = 2 * GIB;
+        executor.health.disk.critical_free_bytes = 74 * GIB;
+        executor.health.disk.pressure_free_bytes = 368 * GIB;
+        executor.health.disk.pressure_line_fraction_permille = Some(100);
+        executor.health.disk.critical_line_fraction_permille = Some(20);
+        executor.health.machine.volume = Measurement::measured(
+            at,
+            MachineVolume {
+                total_bytes: 3_686 * GIB,
+                free_bytes: 258 * GIB,
+            },
+        );
+        executor.health.host.io_pressure = Measurement::measured(
+            at,
+            IoPressure {
+                full_avg10_millis: 290,
+                full_avg60_millis: 295,
+                slowest_device: None,
+                build_device: Some(DeviceLoad {
+                    device: "nvme0n1".into(),
+                    busy_permille: 820,
+                    write_bytes_per_sec: 56_000_000,
+                    mean_write_ms: Some(150),
+                    stalled: false,
+                    in_flight: 12,
+                    window_ms: 5_000,
+                }),
+            },
+        );
+        executor.health.host.disk_write_arms.last_pressured_unix_ms = Some(at - 60_000);
+        executor.health.disk.pressure = Some(StoragePressureReport {
+            at_unix_ms: at - 30_000,
+            band: StoragePressureBand::Pressure,
+            cause: StoragePressureCause::WriteSaturation {
+                device,
+                arm: DiskWriteArm::Stall,
+                busy_permille: Some(820),
+                write_bytes_per_sec: Some(56_000_000),
+                mean_write_ms: Some(150),
+                full_avg60_millis: Some(295),
+            },
+            target_bytes: 480 * GIB,
+            free_bytes_before: 258 * GIB,
+            free_bytes_after: 300 * GIB,
+            reclaimed_by_rung: Vec::new(),
+            outcome: StoragePressureOutcome::Yielded,
+            rearm_below_free_bytes: None,
+            held_bytes: 0,
+            occupied_skips: Vec::new(),
+            withheld: Vec::new(),
+        });
+        executor
+    }
+
+    #[test]
+    fn a_write_saturated_build_volume_renders_its_device_cause_and_recommendation() {
+        let executor = saturated_fedora();
+        let rendered = render_executor(&executor);
+        for expected in [
+            "- Device: nvme0n1, CT4000P3PSSD8, NVMe, non-rotational; 82% busy, 56 MB/s written, mean write",
+            "pressure line 368.0 GiB (10% of volume)",
+            "93% full",
+            "- Pressure cause: the build volume nvme0n1 (CT4000P3PSSD8) is write-saturated (write stall arm: 29.5% full avg60, 82% busy, 56 MB/s written",
+            "- Recommendation: the build volume nvme0n1 (CT4000P3PSSD8) was recently write-saturated at 93% full (56 MB/s sustained at 82% busy). Consumer drives with a shrinking SLC cache (QLC) collapse like this near full",
+            "; build device nvme0n1 82% busy",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected:?} in:\n{rendered}");
+        }
+        let fleet = render_executors(&[executor], &[], &[], None, 0, false);
+        assert!(
+            fleet.contains("- Build volume: write-saturated (nvme0n1, 93% full)"),
+            "{fleet}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_build_device_renders_unmeasured_and_recommends_nothing() {
+        let mut executor = saturated_fedora();
+        executor.health.disk.device = None;
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("- Device: unmeasured"), "{rendered}");
+        assert!(!rendered.contains("- Recommendation:"), "{rendered}");
+        // A spinning disk's latency is not a collapse, so it gets no remedy.
+        let mut spinning = saturated_fedora();
+        spinning.health.disk.device.as_mut().unwrap().rotational = Some(true);
+        assert!(!render_executor(&spinning).contains("- Recommendation:"));
     }
 
     pub(super) fn inspection(name: &str, colocated: bool) -> ExecutorInspection {
@@ -9995,6 +10404,7 @@ mod tests {
         executor.health.host.io_pressure = Measurement::measured(
             CAPTURED_AT - 3_000,
             IoPressure {
+                build_device: None,
                 full_avg10_millis: 230,
                 full_avg60_millis: 190,
                 slowest_device: Some(DeviceWriteLatency {
@@ -10017,6 +10427,7 @@ mod tests {
         executor.health.host.io_pressure = Measurement::measured(
             CAPTURED_AT - 3_000,
             IoPressure {
+                build_device: None,
                 full_avg10_millis: 990,
                 full_avg60_millis: 700,
                 slowest_device: Some(DeviceWriteLatency {

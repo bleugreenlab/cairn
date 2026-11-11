@@ -29,8 +29,8 @@ use std::borrow::Cow;
 use cairn_common::executor_protocol::{
     admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence,
     CellPriority, CellRequest, DeclineReason, DiskHealthStatus, ExecutorSubstrateReport,
-    FleetSnapshot, ProvisioningHold, RepositoryLocator, ResidencyFence, StallInstrumentState,
-    StoragePressureOutcome, StorageSweepStatus,
+    FleetSnapshot, ProvisioningHold, RepositoryLocator, ResidencyFence, StallInstrument,
+    StallInstrumentState, StoragePressureOutcome, StorageSweepStatus,
 };
 
 /// How the executor will judge one piece of work: the facts the offer carries
@@ -153,6 +153,8 @@ pub(crate) fn posted_hold(
             let AdmissionHoldEvidence::Pressure {
                 cpu_pressured,
                 memory_stalled,
+                disk_write_stalled,
+                disk_write_device,
                 available_memory_bytes,
                 owed_memory_bytes,
                 memory_floor_bytes,
@@ -162,10 +164,14 @@ pub(crate) fn posted_hold(
             };
             *cpu_pressured &= health.host.cpu_admission.fresh(now_unix_ms);
             *memory_stalled &= health.host.memory_admission.fresh(now_unix_ms);
+            *disk_write_stalled &= health.host.disk_write_admission.fresh(now_unix_ms);
+            if !*disk_write_stalled {
+                *disk_write_device = None;
+            }
             let short = available_memory_bytes.is_some_and(|available| {
                 memory_short(available, *owed_memory_bytes, *memory_floor_bytes)
             });
-            if *cpu_pressured || *memory_stalled || short {
+            if *cpu_pressured || *memory_stalled || *disk_write_stalled || short {
                 return Some(reading.into_hold(DeclineReason::Pressure, true));
             }
         }
@@ -331,6 +337,11 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
     let health = machine.health;
     let cpu_pressured = health.host.cpu_admission.state == StallInstrumentState::Pressured;
     let memory_stalled = health.host.memory_admission.state == StallInstrumentState::Pressured;
+    // The executor holds compile-class work only on its build volume's write
+    // instrument, by the class the queue gave the request, which is the class
+    // the offer carries to it.
+    let disk_write_stalled = StallInstrument::DiskWrite.holds_class(request.command_class)
+        && health.host.disk_write_admission.state == StallInstrumentState::Pressured;
     let floor = admission_memory_floor(request.resource_reservation.memory_bytes);
     let owed = owed_memory_bytes(machine);
     let available = health
@@ -339,15 +350,26 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
         .value()
         .map(|memory| memory.available_bytes);
     let memory_short = available.is_some_and(|available| memory_short(available, owed, floor));
-    (cpu_pressured || memory_stalled || memory_short).then_some(Reading {
+    (cpu_pressured || memory_stalled || disk_write_stalled || memory_short).then(|| Reading {
         condition: PostedCondition::Pressure {
             cpu_pressured,
             memory_stalled,
+            disk_write_stalled,
             memory_short,
         },
         evidence: AdmissionHoldEvidence::Pressure {
             cpu_pressured,
             memory_stalled,
+            disk_write_stalled,
+            disk_write_device: disk_write_stalled
+                .then(|| {
+                    health
+                        .disk
+                        .device
+                        .as_ref()
+                        .map(|device| device.name.clone())
+                })
+                .flatten(),
             available_memory_bytes: available,
             owed_memory_bytes: owed,
             memory_floor_bytes: floor,
@@ -358,12 +380,14 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
 /// The part of a machine's posted state that a decline reason depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PostedCondition {
-    /// The machine's sustained CPU and memory-stall verdicts, and whether its
-    /// posted free memory, less what admitted work still owes, is below the
-    /// floor this request would have to leave.
+    /// The machine's sustained CPU and memory-stall verdicts, its build-volume
+    /// write verdict for a compile-class request, and whether its posted free
+    /// memory, less what admitted work still owes, is below the floor this
+    /// request would have to leave.
     Pressure {
         cpu_pressured: bool,
         memory_stalled: bool,
+        disk_write_stalled: bool,
         memory_short: bool,
     },
     /// The machine's disk verdict, the state of the work that could relieve
@@ -724,6 +748,7 @@ mod tests {
         assert_eq!(
             condition(DeclineReason::Pressure, &request(), &snapshot, &fine),
             Some(PostedCondition::Pressure {
+                disk_write_stalled: false,
                 cpu_pressured: false,
                 memory_stalled: false,
                 memory_short: true
@@ -1047,6 +1072,7 @@ mod tests {
         assert_eq!(
             recorded,
             PostedCondition::Pressure {
+                disk_write_stalled: false,
                 cpu_pressured: false,
                 memory_stalled: true,
                 memory_short: false,
@@ -1098,6 +1124,93 @@ mod tests {
         machine.host.memory_admission.measured_at_unix_ms =
             Some(NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1);
         assert_eq!(hold(&batch, &request, &snapshot, &machine), None);
+    }
+
+    fn with_disk_write_stall(
+        mut health: ExecutorSubstrateReport,
+        state: StallInstrumentState,
+    ) -> ExecutorSubstrateReport {
+        health.host.disk_write_admission = StallInstrumentHealth {
+            state,
+            measured_at_unix_ms: Some(NOW),
+            ..StallInstrumentHealth::default()
+        };
+        health.disk.device = Some(cairn_common::executor_protocol::VolumeDevice {
+            name: "nvme0n1".into(),
+            model: Some("CT4000P3PSSD8".into()),
+            rotational: Some(false),
+            transport: cairn_common::executor_protocol::VolumeTransport::Nvme,
+        });
+        health
+    }
+
+    /// A posted build-volume write stall holds compile-class work, names the
+    /// device, and is self-relieving: the queued writes drain as the compiles
+    /// issuing them finish.
+    #[test]
+    fn a_posted_write_stall_holds_compile_class_work_and_names_the_device() {
+        let mut compile = request();
+        compile.command = "bun run test:rust".into();
+        compile.command_class =
+            cairn_common::executor_protocol::CellCommandClass::classify(&compile.command);
+        let snapshot = FleetSnapshot::default();
+        let machine = with_disk_write_stall(health(), StallInstrumentState::Pressured);
+        let batch = AdmissionView::of_request(&compile);
+        let held = hold(&batch, &compile, &snapshot, &machine).expect("a write stall holds");
+        assert_eq!(held.reason, DeclineReason::Pressure);
+        assert!(held.relieves_itself);
+        assert!(matches!(
+            held.evidence,
+            AdmissionHoldEvidence::Pressure {
+                disk_write_stalled: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            held.evidence.describe_at(NOW),
+            "held: build volume write stall on nvme0n1"
+        );
+        assert_eq!(
+            condition(DeclineReason::Pressure, &compile, &snapshot, &machine),
+            Some(PostedCondition::Pressure {
+                cpu_pressured: false,
+                memory_stalled: false,
+                disk_write_stalled: true,
+                memory_short: false,
+            })
+        );
+    }
+
+    /// The same stall does not hold a test runner, interactive work, or a
+    /// verdict that has gone stale.
+    #[test]
+    fn a_write_stall_holds_neither_other_classes_nor_interactive_work_nor_a_stale_verdict() {
+        let snapshot = FleetSnapshot::default();
+        let mut machine = with_disk_write_stall(health(), StallInstrumentState::Pressured);
+        let mut vitest = request();
+        vitest.command = "bunx vitest run".into();
+        vitest.command_class =
+            cairn_common::executor_protocol::CellCommandClass::classify(&vitest.command);
+        assert_eq!(
+            hold(
+                &AdmissionView::of_request(&vitest),
+                &vitest,
+                &snapshot,
+                &machine
+            ),
+            None
+        );
+        let mut compile = request();
+        compile.command_class = cairn_common::executor_protocol::CellCommandClass::CargoCheck;
+        let batch = AdmissionView::of_request(&compile);
+        let interactive = AdmissionView {
+            interactive: true,
+            ..batch.clone()
+        };
+        assert_eq!(hold(&interactive, &compile, &snapshot, &machine), None);
+        machine.host.disk_write_admission.measured_at_unix_ms =
+            Some(NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+        assert_eq!(hold(&batch, &compile, &snapshot, &machine), None);
     }
 
     /// An executor that predates the memory instrument posts none. Its health
@@ -1190,6 +1303,8 @@ mod tests {
         assert_eq!(
             held.evidence,
             AdmissionHoldEvidence::Pressure {
+                disk_write_device: None,
+                disk_write_stalled: false,
                 cpu_pressured: false,
                 memory_stalled: false,
                 available_memory_bytes: Some(10 * GIB),

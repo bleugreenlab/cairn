@@ -30600,6 +30600,7 @@ mod tests {
             Measurement::measured(
                 NOW,
                 IoPressure {
+                    build_device: None,
                     full_avg10_millis,
                     full_avg60_millis,
                     slowest_device: None,
@@ -30752,6 +30753,7 @@ mod tests {
         host.io_pressure = Measurement::measured(
             measured_at_unix_ms,
             IoPressure {
+                build_device: None,
                 full_avg10_millis: io_full_millis,
                 full_avg60_millis: io_full_millis,
                 slowest_device: Some(DeviceWriteLatency {
@@ -46940,6 +46942,7 @@ mod load_context_tests {
             io_pressure: Measurement::measured(
                 1,
                 IoPressure {
+                    build_device: None,
                     full_avg10_millis: 235,
                     full_avg60_millis: 190,
                     slowest_device: None,

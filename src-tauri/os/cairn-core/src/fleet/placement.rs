@@ -155,6 +155,10 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
             // A memory stall ends as the work thrashing the host finishes or
             // is killed, which is the machine being busy, not broken.
             | HostPressureCondition::MemoryStall { .. }
+            // So does a saturated build device: the writes queued on it drain
+            // as the compiles issuing them finish, and the brake holds only
+            // compile-class work meanwhile.
+            | HostPressureCondition::DiskWriteStall { .. }
             // Telemetry goes blind when the machine is too loaded to sample
             // itself, so the work already running is what clears it: the
             // sampler gets its turn back as that work drains. Waiting is the

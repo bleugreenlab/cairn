@@ -320,6 +320,7 @@ impl QueueEntry {
             wait_horizon_unix_ms: attempt.wait_horizon_unix_ms,
             predicted_cost_ms,
             execution_residency: self.execution_residency.clone(),
+            command_class: attempt.command_class,
         }
     }
 
@@ -3070,6 +3071,7 @@ pub(super) mod tests {
 
     fn cpu_pressured() -> PostedCondition {
         PostedCondition::Pressure {
+            disk_write_stalled: false,
             cpu_pressured: true,
             memory_stalled: false,
             memory_short: false,
@@ -3110,6 +3112,7 @@ pub(super) mod tests {
         );
 
         *posted.borrow_mut() = PostedCondition::Pressure {
+            disk_write_stalled: false,
             cpu_pressured: false,
             memory_stalled: false,
             memory_short: false,
