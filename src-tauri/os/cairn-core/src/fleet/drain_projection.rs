@@ -653,6 +653,7 @@ mod tests {
                 }],
             }],
             &[],
+            &[],
         )
         .unwrap();
         let PlacementOutcome::Waiting { diagnostic } = decision.outcome else {

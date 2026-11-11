@@ -4866,6 +4866,7 @@ impl DispatchNarrator {
             CheckDispatchPhase::Placing {
                 since_unix_ms,
                 declines,
+                turn,
             } => {
                 if let Some(first) = self.first_forecast {
                     if now_unix_ms.saturating_sub(first.at_unix_ms)
@@ -4887,7 +4888,14 @@ impl DispatchNarrator {
                     ),
                     (false, _) => format!("{}; parked since {since}", self.wait.description),
                 };
-                let held_by = describe_declines(declines);
+                // Main's cadence turn is what holds a lane passed over behind
+                // it as surely as a decline is, and it is what the cadence
+                // lane itself waits for, so it is named beside the declines.
+                let held: Vec<String> = [describe_declines(declines), turn.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let held_by = (!held.is_empty()).then(|| held.join("; "));
                 if let Some(declined) = &held_by {
                     diagnostic.push_str("; ");
                     diagnostic.push_str(declined);
@@ -15902,6 +15910,7 @@ mod tests {
         let held = crate::fleet::CheckDispatch {
             phase: crate::fleet::CheckDispatchPhase::Placing {
                 since_unix_ms: PARKED_AT,
+                turn: None,
                 declines: vec![crate::fleet::CheckDispatchDecline {
                     executor_name: "local".into(),
                     reason: cairn_common::executor_protocol::DeclineReason::Pressure,
@@ -21681,6 +21690,7 @@ cairn-common = { path = "../cairn-common" }
             phase: crate::fleet::CheckDispatchPhase::Placing {
                 since_unix_ms,
                 declines: Vec::new(),
+                turn: None,
             },
             joined: None,
         }
@@ -21827,6 +21837,7 @@ cairn-common = { path = "../cairn-common" }
         let dispatch = crate::fleet::CheckDispatch {
             phase: crate::fleet::CheckDispatchPhase::Placing {
                 since_unix_ms: PARKED_AT,
+                turn: None,
                 declines: vec![crate::fleet::CheckDispatchDecline {
                     executor_name: "colocated".into(),
                     reason: cairn_common::executor_protocol::DeclineReason::Disk,

@@ -877,6 +877,70 @@ fn the_runner_bundle_and_plist_are_read_exactly() {
     assert!(signing_identity_of(r#"{"bundle":{"macOS":{"signingIdentity":"-"}}}"#).is_err());
 }
 
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// A non-bare repository whose one commit holds `files`; returns the commit.
+fn working_tree_with(dir: &Path, files: &[(&str, &str)]) -> String {
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    for (path, content) in files {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    git_in(dir, &["add", "-A"]);
+    git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    git_in(dir, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn the_signing_identity_is_read_at_a_commit_of_a_working_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = working_tree_with(
+        dir.path(),
+        &[(
+            "src-tauri/tauri.conf.json",
+            r#"{"bundle":{"macOS":{"signingIdentity":"Developer ID Application: X (TEAM)"}}}"#,
+        )],
+    );
+    // The working tree itself, whose git dir is `<path>/.git`, is what the
+    // project resolution hands over as the object repository.
+    assert_eq!(
+        signing_identity_at(dir.path(), &head).unwrap(),
+        "Developer ID Application: X (TEAM)"
+    );
+}
+
+#[test]
+fn an_absent_tauri_conf_names_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = working_tree_with(dir.path(), &[("README.md", "hi")]);
+    let error = signing_identity_at(dir.path(), &head).unwrap_err();
+    assert!(
+        error.contains("is absent at") && error.contains(&head),
+        "{error}"
+    );
+}
+
 const REPO_TAURI_CONF: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tauri.conf.json"

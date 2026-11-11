@@ -106,6 +106,16 @@ impl PurposeKey {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The suite and platform of a main-cadence question, or `None` for a key
+    /// that names some other question. Read from the end, because a project
+    /// id is the one part a caller does not choose the shape of.
+    pub(crate) fn main_cadence_lane(&self) -> Option<(&str, &str)> {
+        let rest = self.0.strip_prefix("main-cadence:")?;
+        let (rest, platform) = rest.rsplit_once(':')?;
+        let (_, check) = rest.rsplit_once(':')?;
+        Some((check, platform))
+    }
 }
 
 impl std::fmt::Display for PurposeKey {
@@ -698,6 +708,28 @@ impl PurposeRegistry {
                 .filter(|live| &live.request == request)
                 .map(|_| key)
         })
+    }
+
+    /// Every item that is the live answer to a main-cadence question, keyed by
+    /// its request identity.
+    ///
+    /// These are the lanes that hold precedence for a machine's freed room
+    /// (see `queue::ExecutionQueue::ahead_for_room`). A lane is live here only
+    /// because the cadence's own ledger read found no complete row for its tip
+    /// before dispatching it (`checks_main::attempt_lane`; a covered tip is
+    /// answered without a run), and a key has at most one live item, so this
+    /// is one lane per suite and platform for an unobserved tip. The cadence
+    /// arms a newer tip's run only after the live one records, so a queued
+    /// successor is never in this set beside its predecessor.
+    pub(crate) fn main_cadence_holders(&self) -> HashMap<RequestIdentity, PurposeKey> {
+        self.items
+            .iter()
+            .filter(|(key, _)| key.main_cadence_lane().is_some())
+            .filter_map(|(key, state)| {
+                let live = state.live.as_ref()?;
+                Some((live.request.clone(), key.clone()))
+            })
+            .collect()
     }
 
     /// How many displaced items this question is still waiting on.
@@ -1982,5 +2014,34 @@ mod tests {
             PurposeKey::main_cadence("project", "rust-tests", "linux"),
             "the same question asked twice is one key"
         );
+        assert_eq!(key.main_cadence_lane(), Some(("rust-tests", "linux")));
+        assert_eq!(
+            PurposeKey::main_cadence("a:b", "rust-tests", "macos").main_cadence_lane(),
+            Some(("rust-tests", "macos"))
+        );
+        assert_eq!(
+            PurposeKey::from_persisted("other:x".into()).main_cadence_lane(),
+            None
+        );
+    }
+
+    /// Only the live item answers for its question: a displaced one is a debt
+    /// and holds no precedence, and the item that displaced it does.
+    #[test]
+    fn main_cadence_holders_are_the_live_items_only() {
+        let mut registry = PurposeRegistry::default();
+        let rust = PurposeKey::main_cadence("p", "rust-tests", "linux");
+        let lint = PurposeKey::main_cadence("p", "lint", "linux");
+        registry.admit(rust.clone(), request("old"), 1);
+        registry.admit(lint.clone(), request("lint"), 1);
+        assert!(matches!(
+            registry.admit(rust.clone(), request("new"), 2),
+            Admission::Replaced { .. }
+        ));
+        let holders = registry.main_cadence_holders();
+        assert_eq!(holders.len(), 2, "{holders:?}");
+        assert_eq!(holders.get(&request("new")), Some(&rust));
+        assert_eq!(holders.get(&request("lint")), Some(&lint));
+        assert!(!holders.contains_key(&request("old")));
     }
 }

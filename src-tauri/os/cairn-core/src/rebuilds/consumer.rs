@@ -168,21 +168,22 @@ pub(crate) trait SourceStore: Send + Sync {
 /// checkout builds a product named Cairn.
 struct ProjectStores;
 
-async fn git(args: &[&str]) -> Result<String, String> {
-    let mut command = tokio::process::Command::new("git");
-    command.args(args).kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(20), command.output()).await {
-        Ok(Ok(output)) if output.status.success() => {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        Ok(Ok(output)) => Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Ok(Err(error)) => Err(format!("git could not run: {error}")),
-        Err(_) => Err(format!("git {} timed out", args.join(" "))),
-    }
+/// The signing identity `src-tauri/tauri.conf.json` names at `commit`, read
+/// from the project's object repository (a working tree or a bare store).
+pub(crate) fn signing_identity_at(
+    object_repository: &Path,
+    commit: &str,
+) -> Result<String, String> {
+    const TAURI_CONF: &str = "src-tauri/tauri.conf.json";
+    let bytes = crate::mcp::handlers::read::file_at_commit(
+        object_repository.to_path_buf(),
+        commit.to_string(),
+        TAURI_CONF,
+    )?
+    .ok_or_else(|| format!("{TAURI_CONF} is absent at {commit}"))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|error| format!("{TAURI_CONF} at {commit} is not UTF-8: {error}"))?;
+    signing_identity_of(&text)
 }
 
 pub(crate) fn signing_identity_of(tauri_conf: &str) -> Result<String, String> {
@@ -324,11 +325,12 @@ impl SourceStore for ProjectStores {
             "main",
         )
         .await?;
-        let git_dir = store.object_repository_path.display().to_string();
-        let spec = format!("{commit}:src-tauri/tauri.conf.json");
-        signing_identity_of(
-            &git(["--git-dir", git_dir.as_str(), "show", spec.as_str()].as_slice()).await?,
-        )
+        let commit = commit.to_string();
+        tokio::task::spawn_blocking(move || {
+            signing_identity_at(&store.object_repository_path, &commit)
+        })
+        .await
+        .map_err(|error| format!("reading tauri.conf.json did not finish: {error}"))?
     }
 
     async fn object_repository(

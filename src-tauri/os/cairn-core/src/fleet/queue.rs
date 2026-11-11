@@ -250,6 +250,11 @@ impl QueueEntry {
         self.queued_at_unix_ms
     }
 
+    /// The latest placement decision journaled for this entry.
+    pub(crate) fn latest_placement(&self) -> Option<&super::PlacementDecision> {
+        self.latest_placement.as_ref()
+    }
+
     /// Where this entry stands in a line for something one machine does for
     /// one request at a time. Larger is earlier: standing work first, then the
     /// executor's own admission order.
@@ -269,9 +274,35 @@ impl QueueEntry {
     /// project's provisioning hold on `generation`. See
     /// [`ExecutionQueue::ahead_in_provisioning_line`].
     fn in_provisioning_line(&self, executor_id: &str, generation: u64, now_unix_ms: u64) -> bool {
-        let Some(decline) = self.declined.get(executor_id).filter(|decline| {
-            decline.generation == generation && decline.reason == DeclineReason::ProjectProvisioning
-        }) else {
+        self.in_line(executor_id, generation, now_unix_ms, |reason| {
+            reason == DeclineReason::ProjectProvisioning
+        })
+    }
+
+    /// Whether this entry is waiting for `executor_id`, on `generation`, to
+    /// free room: the machine refused it for room, and it is still waiting for
+    /// that machine rather than gone elsewhere. See
+    /// [`ExecutionQueue::ahead_for_room`].
+    fn in_room_line(&self, executor_id: &str, generation: u64, now_unix_ms: u64) -> bool {
+        self.in_line(executor_id, generation, now_unix_ms, waits_for_room)
+    }
+
+    /// Whether this entry holds a place in a line on `executor_id` resting on
+    /// that machine's own refusal of it, on `generation`, for a reason
+    /// `waits_for` accepts: offered there now, or queued without having let
+    /// its turn pass (see [`EntryDecline::keeps_place_in_line`]).
+    fn in_line(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+        waits_for: impl Fn(DeclineReason) -> bool,
+    ) -> bool {
+        let Some(decline) = self
+            .declined
+            .get(executor_id)
+            .filter(|decline| decline.generation == generation && waits_for(decline.reason))
+        else {
             return false;
         };
         match &self.state {
@@ -423,16 +454,46 @@ impl EntryDecline {
         }
     }
 
-    /// Whether a queued entry refused for a provisioning hold is still waiting
-    /// for that hold at `now_unix_ms`: the refusal stands, or the entry has not
-    /// yet had [`PROVISIONING_TURN_GRACE_MS`] to take the machine since it
-    /// became offerable again.
+    /// Whether a queued entry refused for something one machine frees (its
+    /// provisioning hold, or room) is still waiting for it at `now_unix_ms`:
+    /// the refusal stands, or the entry has not yet had
+    /// [`PROVISIONING_TURN_GRACE_MS`] to take the machine since it became
+    /// offerable again.
     fn keeps_place_in_line(&self, now_unix_ms: u64) -> bool {
         let offerable_from = self
             .offerable_from_unix_ms()
             .max(self.superseded_at_unix_ms.unwrap_or(0));
         now_unix_ms < offerable_from.saturating_add(PROVISIONING_TURN_GRACE_MS)
     }
+}
+
+/// Whether a machine's refusal for `reason` says it has no room for the work
+/// now: its budget is spent, or a host-pressure floor (memory above all) would
+/// be crossed. Both clear as the work running there finishes, which is the
+/// room a main-cadence lane takes first.
+pub(crate) fn waits_for_room(reason: DeclineReason) -> bool {
+    matches!(reason, DeclineReason::Capacity | DeclineReason::Pressure)
+}
+
+/// The main-cadence lanes that hold precedence for freed room, keyed by
+/// request identity: [`super::purpose::PurposeRegistry::main_cadence_holders`].
+pub(crate) type CadencePrecedence = HashMap<RequestIdentity, super::purpose::PurposeKey>;
+
+/// The main-cadence lane a request waits behind for one machine's freed room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CadenceAhead {
+    pub(crate) request_id: String,
+    pub(crate) waiting_since_unix_ms: u64,
+    pub(crate) key: super::purpose::PurposeKey,
+}
+
+/// One machine's room line: the main-cadence lanes waiting for its freed
+/// room, front first, and how many other requests' latest placement passed
+/// the machine over behind one of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RoomLine {
+    pub(crate) holders: Vec<CadenceAhead>,
+    pub(crate) behind: usize,
 }
 
 /// Where a request no machine has claimed stands: since when it has waited,
@@ -1191,6 +1252,145 @@ impl ExecutionQueue {
                 request_id: front.request.request_id.clone(),
                 waiting_since_unix_ms: front.queued_at_unix_ms,
             })
+    }
+
+    /// The main-cadence lane this entry waits behind for `executor_id`'s
+    /// freed room on `generation`, when there is one.
+    ///
+    /// Aging saturates every waiting request at the top tier within ten
+    /// seconds, so without this a machine's freed room went to whichever
+    /// parked request's placement pass reached an offer first. Among those,
+    /// a main-cadence lane for a tip with no complete row (`precedence`)
+    /// takes the room first: the default branch's own observation is what
+    /// every branch verdict is compared against, and a burst of branch lanes
+    /// must not keep it unobserved. A tiebreak inside the top tier, not a
+    /// tier of its own:
+    ///
+    /// - interactive work never waits behind it (it is offered as before);
+    /// - another precedence lane never waits behind it either, so each suite
+    ///   and platform has its own lane at the front;
+    /// - a lane holds its place only while it waits for this machine, on the
+    ///   machine's own refusal of it for room (see [`waits_for_room`] and
+    ///   [`EntryDecline::keeps_place_in_line`]); one offered elsewhere, or one
+    ///   that let its turn pass, holds none;
+    /// - nothing running is touched: this only withholds an offer.
+    ///
+    /// When several precedence lanes wait for one machine, the answer is the
+    /// one that has waited longest, by the same rank every line uses.
+    pub(crate) fn ahead_for_room(
+        &self,
+        entry_id: &str,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+        precedence: &CadencePrecedence,
+    ) -> Option<CadenceAhead> {
+        if precedence.is_empty() {
+            return None;
+        }
+        let state = self.entries.lock().unwrap();
+        let asker = state.entries.get(entry_id)?;
+        if asker.interactive || precedence.contains_key(&asker.identity()) {
+            return None;
+        }
+        Self::room_holders(&state, executor_id, generation, now_unix_ms, precedence)
+            .into_iter()
+            .next()
+    }
+
+    /// The machines, among `generations` (executor id to its current link
+    /// generation), whose freed room the precedence lane queued as `identity`
+    /// takes first. Empty for any other request.
+    pub(crate) fn room_taken_first_on(
+        &self,
+        identity: &RequestIdentity,
+        generations: &HashMap<String, u64>,
+        now_unix_ms: u64,
+        precedence: &CadencePrecedence,
+    ) -> Vec<String> {
+        if !precedence.contains_key(identity) {
+            return Vec::new();
+        }
+        let state = self.entries.lock().unwrap();
+        let Some(entry) = state
+            .by_identity
+            .get(identity)
+            .and_then(|id| state.entries.get(id))
+        else {
+            return Vec::new();
+        };
+        let mut machines: Vec<String> = generations
+            .iter()
+            .filter(|(executor_id, generation)| {
+                entry.in_room_line(executor_id, **generation, now_unix_ms)
+            })
+            .map(|(executor_id, _)| executor_id.clone())
+            .collect();
+        machines.sort();
+        machines
+    }
+
+    /// `executor_id`'s room line on `generation`: see [`RoomLine`].
+    pub(crate) fn room_line(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+        precedence: &CadencePrecedence,
+    ) -> RoomLine {
+        let state = self.entries.lock().unwrap();
+        let holders = Self::room_holders(&state, executor_id, generation, now_unix_ms, precedence);
+        if holders.is_empty() {
+            return RoomLine::default();
+        }
+        let behind = state
+            .entries
+            .values()
+            .filter(|entry| !matches!(entry.state, EntryState::Claimed { .. }))
+            .filter(|entry| {
+                entry.latest_placement.as_ref().is_some_and(|decision| {
+                    matches!(decision.outcome, super::PlacementOutcome::Waiting { .. })
+                        && decision.rejected.iter().any(|row| {
+                            row.executor_id == executor_id
+                                && matches!(
+                                    row.reason,
+                                    cairn_common::executor_protocol::PlacementRejectionReason::CadenceTurn { .. }
+                                )
+                        })
+                })
+            })
+            .count();
+        RoomLine { holders, behind }
+    }
+
+    /// Every precedence lane waiting for `executor_id`'s freed room on
+    /// `generation`, front first.
+    fn room_holders(
+        state: &QueueState,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+        precedence: &CadencePrecedence,
+    ) -> Vec<CadenceAhead> {
+        let mut holders: Vec<_> = state
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let key = precedence.get(&entry.identity())?;
+                entry
+                    .in_room_line(executor_id, generation, now_unix_ms)
+                    .then(|| (entry.line_rank(now_unix_ms), entry, key))
+            })
+            .collect();
+        holders.sort_by(|(left, _, _), (right, _, _)| right.cmp(left));
+        holders
+            .into_iter()
+            .map(|(_, entry, key)| CadenceAhead {
+                request_id: entry.request.request_id.clone(),
+                waiting_since_unix_ms: entry.queued_at_unix_ms,
+                key: key.clone(),
+            })
+            .collect()
     }
 }
 

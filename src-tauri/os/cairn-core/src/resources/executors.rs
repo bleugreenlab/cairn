@@ -615,6 +615,42 @@ pub(crate) fn render_held_lanes(
     out
 }
 
+/// The `## Room line` section of one machine's page: the main-cadence lanes
+/// that take its next freed room, and how many requests wait behind them, or
+/// nothing when no such lane waits for it.
+pub(crate) fn render_room_line(
+    line: &crate::fleet::queue::RoomLine,
+    machine: &str,
+    captured_at_unix_ms: u64,
+) -> String {
+    if line.holders.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n## Room line\n\nMain's cadence lanes below have a default-branch tip with no complete row for their suite, so the next room {machine} frees goes to them first. Interactive work is offered as before, and nothing running is displaced.\n\n"
+    );
+    for holder in &line.holders {
+        let (check, platform) = holder
+            .key
+            .main_cadence_lane()
+            .unwrap_or((holder.key.as_str(), "?"));
+        out.push_str(&format!(
+            "- main cadence, tip unobserved: {check} on {platform}, request {}, waiting {}; takes the next freed room on {machine}\n",
+            holder.request_id,
+            age(captured_at_unix_ms.saturating_sub(holder.waiting_since_unix_ms)),
+        ));
+    }
+    if line.behind > 0 {
+        out.push_str(&format!(
+            "- {} other request{} wait{} behind them for this machine\n",
+            line.behind,
+            if line.behind == 1 { "" } else { "s" },
+            if line.behind == 1 { "s" } else { "" },
+        ));
+    }
+    out
+}
+
 /// The fleet-wide line for machines refused on protocol that this runner
 /// cannot repair, or nothing when there are none.
 ///

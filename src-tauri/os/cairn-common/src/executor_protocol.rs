@@ -6803,6 +6803,14 @@ pub struct LearnedResourceEstimate {
 /// send carry the same fields as before. What a runner gets wrong talking to
 /// an older executor: nothing.
 ///
+/// cairn/6497 does not move the number. [`PlacementRejectionReason::CadenceTurn`]
+/// is, like `ProvisioningTurn`, a runner-side placement record that never
+/// crosses to an executor: the runner withholds an offer of non-interactive
+/// work to a machine while a main-cadence lane for an unobserved tip waits for
+/// that machine's room, and the offers it does send carry the same fields and
+/// priorities as before. What a runner gets wrong talking to an older
+/// executor: nothing.
+///
 /// cairn/5562 does not move the number. [`ResidentProcessSpec`] gains an
 /// optional, defaulted `relay` ([`ResidentRelayGrant`]) the runner sets on a
 /// resident process it places on a machine other than its own, and the
@@ -19332,6 +19340,18 @@ pub enum PlacementRejectionReason {
         ahead_request_id: String,
         ahead_waiting_since_unix_ms: u64,
     },
+    /// This machine refused a main-cadence lane for room, that lane's tip has
+    /// no complete row for its suite on its platform, and the room this
+    /// machine frees goes to it first. The runner's own rule, not the
+    /// machine's answer: interactive work and other such lanes are offered as
+    /// before, and nothing running is displaced. Waited for like a decline;
+    /// the machine is offered this work once the lane has had its turn.
+    CadenceTurn {
+        check: String,
+        platform: String,
+        ahead_request_id: String,
+        ahead_waiting_since_unix_ms: u64,
+    },
     /// The project's setup commands, which every cell for the project runs
     /// before its first command, invoke a toolchain this machine does not
     /// advertise. A fact about the machine and the project, not the batch: a
@@ -19552,6 +19572,15 @@ impl PlacementRejectionReason {
                 ahead_waiting_since_unix_ms,
             } => format!(
                 "in line: this machine provisions one cell of project {project_id} at a time, and request {ahead_request_id}, waiting since {}, is ahead of this one for it",
+                describe_age(*ahead_waiting_since_unix_ms)
+            ),
+            Self::CadenceTurn {
+                check,
+                platform,
+                ahead_request_id,
+                ahead_waiting_since_unix_ms,
+            } => format!(
+                "in line: behind main's cadence lane for {check} on {platform} (request {ahead_request_id}, waiting since {}); the default branch's tip has no complete {check} row, so this machine's next freed room goes to it first",
                 describe_age(*ahead_waiting_since_unix_ms)
             ),
             Self::GithubCredentialMissing { reason, .. } => format!(

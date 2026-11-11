@@ -895,6 +895,10 @@ pub(crate) enum CheckDispatchPhase {
         since_unix_ms: u64,
         /// The latest answer from each machine that declined it.
         declines: Vec<CheckDispatchDecline>,
+        /// Main's cadence turn for freed room, when it bears on this request:
+        /// the machines whose next freed room it takes first, when it is that
+        /// lane, or the machines its latest pass waited behind that lane for.
+        turn: Option<String>,
     },
     /// A machine claimed it at `since_unix_ms`, so it is running there.
     Running {
@@ -7343,10 +7347,14 @@ impl Fleet {
                     )
                 })
                 .collect();
+            let waited_behind = entry
+                .latest_placement()
+                .filter(|decision| matches!(decision.outcome, PlacementOutcome::Waiting { .. }))
+                .and_then(|decision| describe_cadence_turns(&decision.rejected));
             (
                 entry.state.clone(),
                 entry.queued_at_unix_ms(),
-                declines,
+                (declines, waited_behind),
                 entry
                     .request
                     .owner
@@ -7371,7 +7379,13 @@ impl Fleet {
                 },
                 owner,
             ),
-            Some((_, since_unix_ms, raw_declines, owner)) => {
+            Some((_, since_unix_ms, (raw_declines, waited_behind), owner)) => {
+                let takes_room_on = self.room_taken_first_on(identity, unix_time_ms());
+                let turn = if takes_room_on.is_empty() {
+                    waited_behind
+                } else {
+                    Some(describe_room_taken_first(&takes_room_on))
+                };
                 let mut declines: Vec<_> = raw_declines
                     .into_iter()
                     .map(
@@ -7392,6 +7406,7 @@ impl Fleet {
                     CheckDispatchPhase::Placing {
                         since_unix_ms,
                         declines,
+                        turn,
                     },
                     owner,
                 )
@@ -15215,20 +15230,30 @@ impl Fleet {
                     self.update_wait_sentence(&rejection.executor_id, &rejection.executor_name, now)
                 })
                 .collect();
-            if let Some(mut waiting) = wait_decision(request, policy, &rejected, &updates) {
-                let mut signature: Vec<(String, String)> = rejected
+            let takes_room_on = match entry_id {
+                Some(_) => self.room_taken_first_on(
+                    &(request.request_id.clone(), request.attempt_id.clone()),
+                    now,
+                ),
+                None => Vec::new(),
+            };
+            if let Some(mut waiting) =
+                wait_decision(request, policy, &rejected, &updates, &takes_room_on)
+            {
+                let mut signature: Vec<(String, String)> = takes_room_on
                     .iter()
-                    .map(|rejection| {
-                        (
-                            rejection.executor_id.clone(),
-                            format!(
-                                "{}:{:?}",
-                                placement_rejection_signature(&rejection.reason),
-                                rejection.drain_blockers
-                            ),
-                        )
-                    })
+                    .map(|name| (name.clone(), "takesRoomFirst".to_string()))
                     .collect();
+                signature.extend(rejected.iter().map(|rejection| {
+                    (
+                        rejection.executor_id.clone(),
+                        format!(
+                            "{}:{:?}",
+                            placement_rejection_signature(&rejection.reason),
+                            rejection.drain_blockers
+                        ),
+                    )
+                }));
                 signature.sort();
                 if recorded_wait.as_ref() != Some(&signature) {
                     if let Some(entry_id) = entry_id {
@@ -15324,7 +15349,8 @@ impl Fleet {
         // unavailable home is the most important case for the counterfactual.
         let actual_survey =
             survey_candidates(&connections, &unattached, request, now, declined, view)
-                .map(|survey| self.defer_to_provisioning_lines(survey, request, now));
+                .map(|survey| self.defer_to_provisioning_lines(survey, request, now))
+                .map(|survey| self.defer_to_cadence_lanes(survey, now));
         let shadow_request = hermetic_shadow_request(request);
         let shadow_survey = shadow_request.as_ref().and_then(|shadow| {
             survey_candidates(&connections, &unattached, shadow, now, declined, view).ok()
@@ -15642,6 +15668,117 @@ impl Fleet {
         });
         survey.rejected.extend(deferred);
         survey
+    }
+
+    /// The main-cadence lanes that hold precedence for a machine's freed room
+    /// now. The purpose registry's lock is released before the queue's is
+    /// taken, so the two are never held together.
+    fn cadence_precedence(&self) -> queue::CadencePrecedence {
+        self.purposes.lock().unwrap().main_cadence_holders()
+    }
+
+    /// Pass over every usable machine whose freed room a main-cadence lane
+    /// for an unobserved tip is waiting for (see
+    /// [`queue::ExecutionQueue::ahead_for_room`]), unless this entry is
+    /// interactive or is such a lane itself.
+    ///
+    /// Like the provisioning line, passing a machine over is not a refusal and
+    /// withholds nothing already running: work free to go elsewhere does, and
+    /// work that cannot waits until the lane has had its turn.
+    fn defer_to_cadence_lanes<'a>(
+        &self,
+        mut survey: CandidateSurvey<'a>,
+        now_unix_ms: u64,
+    ) -> CandidateSurvey<'a> {
+        let Some(entry_id) = survey.view.entry_id.clone() else {
+            return survey;
+        };
+        let precedence = self.cadence_precedence();
+        if precedence.is_empty() {
+            return survey;
+        }
+        let mut deferred = Vec::new();
+        survey.usable.retain(|machine| {
+            let Some(ahead) = self.queue.ahead_for_room(
+                &entry_id,
+                &machine.identity.executor_id,
+                machine.generation,
+                now_unix_ms,
+                &precedence,
+            ) else {
+                return true;
+            };
+            let Some((check, platform)) = ahead.key.main_cadence_lane() else {
+                return true;
+            };
+            deferred.push(PlacementRejection {
+                drain_blockers: Vec::new(),
+                prediction: None,
+                executor_name: executor_public_name(machine),
+                executor_id: machine.identity.executor_id.clone(),
+                reason: PlacementRejectionReason::CadenceTurn {
+                    check: check.to_string(),
+                    platform: platform.to_string(),
+                    ahead_request_id: ahead.request_id,
+                    ahead_waiting_since_unix_ms: ahead.waiting_since_unix_ms,
+                },
+            });
+            false
+        });
+        survey.rejected.extend(deferred);
+        survey
+    }
+
+    /// The public names of the machines whose freed room the request queued
+    /// as `identity` takes first, because it is main's cadence lane for a tip
+    /// with no complete row and it waits for those machines' room. Empty for
+    /// every other request.
+    pub(crate) fn room_taken_first_on(
+        &self,
+        identity: &RequestIdentity,
+        now_unix_ms: u64,
+    ) -> Vec<String> {
+        let precedence = self.cadence_precedence();
+        if !precedence.contains_key(identity) {
+            return Vec::new();
+        }
+        let machines: HashMap<String, (u64, String)> = self
+            .lock_connections()
+            .iter()
+            .map(|(executor_id, entry)| {
+                (
+                    executor_id.clone(),
+                    (entry.generation, executor_public_name(entry)),
+                )
+            })
+            .collect();
+        let generations = machines
+            .iter()
+            .map(|(executor_id, (generation, _))| (executor_id.clone(), *generation))
+            .collect();
+        let mut names: Vec<String> = self
+            .queue
+            .room_taken_first_on(identity, &generations, now_unix_ms, &precedence)
+            .into_iter()
+            .filter_map(|executor_id| machines.get(&executor_id).map(|(_, name)| name.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `executor_id`'s room line on its current link: the main-cadence lanes
+    /// that take its next freed room, and how many requests wait behind them.
+    pub(crate) fn room_line(&self, executor_id: &str, now_unix_ms: u64) -> queue::RoomLine {
+        let Some(generation) = self
+            .lock_connections()
+            .get(executor_id)
+            .map(|entry| entry.generation)
+        else {
+            return queue::RoomLine::default();
+        };
+        let precedence = self.cadence_precedence();
+        self.queue
+            .room_line(executor_id, generation, now_unix_ms, &precedence)
     }
 
     #[cfg(test)]
@@ -17154,6 +17291,7 @@ fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
             | PlacementRejectionReason::UpdatePending
             | PlacementRejectionReason::ModelResident { .. }
             | PlacementRejectionReason::ProvisioningTurn { .. }
+            | PlacementRejectionReason::CadenceTurn { .. }
     )
 }
 
@@ -17433,6 +17571,33 @@ fn process_demand_record(
 
 /// The machines a pass passed over because the work cannot run there, each
 /// with its reason, or `None` when memory kept the work off no machine.
+/// What main's cadence lane for an unobserved tip is told about the machines
+/// whose freed room it takes first, by public name.
+pub(crate) fn describe_room_taken_first(machines: &[String]) -> String {
+    format!(
+        "main cadence, tip unobserved: takes the next freed room on {}",
+        machines.join(", ")
+    )
+}
+
+/// The machines this pass passed over behind main's cadence lane, one
+/// sentence each, or `None` when it passed none over.
+fn describe_cadence_turns(rejected: &[PlacementRejection]) -> Option<String> {
+    let rows: Vec<String> = rejected
+        .iter()
+        .filter_map(|rejection| match &rejection.reason {
+            PlacementRejectionReason::CadenceTurn {
+                check, platform, ..
+            } => Some(format!(
+                "{}: behind main's cadence lane for {check} on {platform}",
+                rejection.executor_name
+            )),
+            _ => None,
+        })
+        .collect();
+    (!rows.is_empty()).then(|| rows.join("; "))
+}
+
 fn describe_memory_rejections(rejected: &[PlacementRejection]) -> Option<String> {
     let rows: Vec<String> = rejected
         .iter()
@@ -17490,15 +17655,22 @@ fn describe_drain_blockers(rejected: &[PlacementRejection]) -> Option<String> {
 }
 
 /// The record of a pass that placed work nowhere for a reason that ends on its
-/// own (machines it cannot run on for memory, or a machine being emptied for
-/// its executor update), so the queue view and each named machine's page show
-/// why the request is pending. `updates` describes each update it waits on.
+/// own (machines it cannot run on for memory, a machine being emptied for its
+/// executor update, or machines whose freed room main's cadence lane takes
+/// first), so the queue view and each named machine's page show why the
+/// request is pending. `updates` describes each update it waits on;
+/// `takes_room_on` names the machines whose next freed room this request
+/// takes first, because it is that cadence lane.
 fn wait_decision(
     request: &CellRequest,
     policy: &ActivePlacementPolicy,
     rejected: &[PlacementRejection],
     updates: &[String],
+    takes_room_on: &[String],
 ) -> Option<PlacementDecision> {
+    let precedence = (!takes_room_on.is_empty())
+        .then(|| format!("{}.", describe_room_taken_first(takes_room_on)));
+    let turns = describe_cadence_turns(rejected).map(|turns| format!("{turns}."));
     let memory = describe_memory_rejections(rejected)
         .map(|memory| format!("not placed where it cannot run: {memory}."));
     let waiting_on_update =
@@ -17516,7 +17688,7 @@ fn wait_decision(
         .collect();
     let drains = describe_drain_blockers(&others)
         .map(|drains| format!("held from new admission: {drains}."));
-    let reasons: Vec<String> = [memory, drains, waiting_on_update]
+    let reasons: Vec<String> = [precedence, turns, memory, drains, waiting_on_update]
         .into_iter()
         .flatten()
         .collect();
@@ -18159,6 +18331,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
             return format!("held:{}", evidence.as_str())
         }
         PlacementRejectionReason::ProvisioningTurn { .. } => "provisioningTurn",
+        PlacementRejectionReason::CadenceTurn { .. } => "cadenceTurn",
         PlacementRejectionReason::PreparationToolchainMissing { .. } => {
             "preparationToolchainMissing"
         }
@@ -18183,7 +18356,8 @@ fn placement_rejection_log_level(rejection: &PlacementRejection) -> log::Level {
     match rejection.reason {
         PlacementRejectionReason::Declined { .. }
         | PlacementRejectionReason::Held { .. }
-        | PlacementRejectionReason::ProvisioningTurn { .. } => log::Level::Debug,
+        | PlacementRejectionReason::ProvisioningTurn { .. }
+        | PlacementRejectionReason::CadenceTurn { .. } => log::Level::Debug,
         // A standing fact about the machine and the project, restated on every
         // placement for as long as it holds; the refusal itself was logged
         // at WARN when it was recorded, and the placement record keeps it.
@@ -25470,6 +25644,7 @@ mod tests {
             Some(CheckDispatch {
                 phase: CheckDispatchPhase::Placing {
                     since_unix_ms: 1_000,
+                    turn: None,
                     declines: vec![CheckDispatchDecline {
                         executor_name: "fedora".into(),
                         reason: DeclineReason::Pressure,
@@ -25538,6 +25713,7 @@ mod tests {
             pool.request_dispatch_phase(&key),
             Some(CheckDispatchPhase::Placing {
                 since_unix_ms: 1_000,
+                turn: None,
                 declines: vec![CheckDispatchDecline {
                     executor_name: "local".into(),
                     reason: DeclineReason::Pressure,
@@ -28703,6 +28879,319 @@ mod tests {
             .placed()
             .expect("the junior's turn");
         assert_eq!(placed.selected.executor_id, "fedora");
+    }
+
+    /// One request parked on fedora for room: `(request id, how long it has
+    /// waited, whether it is interactive)`.
+    struct Parked {
+        id: &'static str,
+        waited_ms: u64,
+        interactive: bool,
+    }
+
+    const fn parked(id: &'static str, waited_ms: u64) -> Parked {
+        Parked {
+            id,
+            waited_ms,
+            interactive: false,
+        }
+    }
+
+    /// fedora refused every request in `parked` for memory pressure five
+    /// seconds ago, past its re-offer backoff, and has since posted the room
+    /// back. Returns the pool, each request, and its queue entry, in order.
+    fn room_freed_on_fedora(parked: &[Parked]) -> (Fleet, Vec<(CellRequest, String)>) {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let (fedora_id, mut fedora) = fleet_entry_at("fedora", "linux", 0, &[], now);
+        measured_at(&mut fedora, 0.01, 8_000_000_000, 8_000_000_000, now);
+        let generation = fedora.generation;
+        *pool.lock_connections() = HashMap::from([(fedora_id, fedora)]);
+        let declined_at = now - 5_000;
+        let mut entries = Vec::new();
+        for parked in parked {
+            let mut request = spillable_request();
+            request.request_id = parked.id.into();
+            request.attempt_id = format!("{}-attempt", parked.id);
+            request.waiting_since_unix_ms = now - parked.waited_ms;
+            request.wait_horizon_unix_ms = now + 600_000;
+            if parked.interactive {
+                request.priority = CellPriority::AgentInteractive;
+            }
+            let (entry, _waiter) = pool
+                .queue
+                .enqueue(
+                    queue::NewEntry {
+                        request: request.clone(),
+                        admission_kind: CellAdmissionKind::Command,
+                        interactive: parked.interactive,
+                        execution_residency: None,
+                        standing: false,
+                    },
+                    declined_at,
+                )
+                .unwrap();
+            assert!(pool
+                .queue
+                .offer(&entry, "fedora", "fedora", generation, declined_at));
+            pool.queue.decline(
+                &entry,
+                "fedora",
+                generation,
+                DeclineReason::Pressure,
+                Some("memory floor".into()),
+                None,
+                None,
+                declined_at,
+            );
+            entries.push((request, entry));
+        }
+        assert!(pool
+            .queue
+            .supersede_declines_for("fedora", now, |_, _, _| false));
+        (pool, entries)
+    }
+
+    /// Make `request` the live answer to main's rust-tests question on linux:
+    /// what the cadence does once its ledger read finds no complete row for
+    /// the tip.
+    fn arm_main_cadence(pool: &Fleet, request: &CellRequest, armed_at_unix_ms: u64) {
+        pool.purposes.lock().unwrap().admit(
+            purpose::PurposeKey::main_cadence("cairn", "rust-tests", "linux"),
+            (request.request_id.clone(), request.attempt_id.clone()),
+            armed_at_unix_ms,
+        );
+    }
+
+    fn cadence_turn_ahead(selection: Selection) -> String {
+        let Selection::Waiting { rejected } = selection else {
+            panic!("placed ahead of main's cadence lane");
+        };
+        let row = rejected
+            .iter()
+            .find(|row| row.executor_id == "fedora")
+            .expect("fedora is on the record");
+        assert!(waits_on_machine(&row.reason), "{:?}", row.reason);
+        match &row.reason {
+            PlacementRejectionReason::CadenceTurn {
+                check,
+                platform,
+                ahead_request_id,
+                ..
+            } => {
+                assert_eq!((check.as_str(), platform.as_str()), ("rust-tests", "linux"));
+                ahead_request_id.clone()
+            }
+            other => panic!("not a cadence turn: {other:?}"),
+        }
+    }
+
+    /// cairn/6497: main's Linux rust-tests lane, parked on fedora for memory
+    /// behind an older branch lane, takes the room fedora frees first; the
+    /// branch lane is passed over naming it, and has its turn once the main
+    /// lane has claimed.
+    #[tokio::test]
+    async fn main_cadence_lane_for_an_unobserved_tip_takes_freed_room_first() {
+        let (pool, entries) =
+            room_freed_on_fedora(&[parked("branch", 300_000), parked("main", 1_000)]);
+        let (branch, branch_entry) = &entries[0];
+        let (main, main_entry) = &entries[1];
+        arm_main_cadence(&pool, main, 1);
+
+        let ahead = cadence_turn_ahead(select_entry(&pool, branch, branch_entry).await);
+        assert_eq!(ahead, "main");
+        let placed = select_entry(&pool, main, main_entry)
+            .await
+            .placed()
+            .expect("main's cadence lane takes the room");
+        assert_eq!(placed.selected.executor_id, "fedora");
+
+        let generation = pool.lock_connections()["fedora"].generation;
+        let now = unix_time_ms();
+        assert!(pool
+            .queue
+            .offer(main_entry, "fedora", "fedora", generation, now));
+        assert_eq!(
+            pool.queue.claim(main_entry, "fedora", generation, now),
+            queue::ClaimVerdict::Granted
+        );
+        let placed = select_entry(&pool, branch, branch_entry)
+            .await
+            .placed()
+            .expect("the branch lane's turn once main has claimed");
+        assert_eq!(placed.selected.executor_id, "fedora");
+    }
+
+    /// A main tip that already has a complete row is answered by the cadence
+    /// without a run, so no lane of its holds the question live, and freed
+    /// room goes by the ordinary order.
+    #[tokio::test]
+    async fn without_a_live_cadence_question_freed_room_goes_by_arrival_order() {
+        let (pool, entries) =
+            room_freed_on_fedora(&[parked("branch", 300_000), parked("main", 1_000)]);
+        let (branch, branch_entry) = &entries[0];
+        let placed = select_entry(&pool, branch, branch_entry)
+            .await
+            .placed()
+            .expect("no cadence lane holds precedence");
+        assert_eq!(placed.selected.executor_id, "fedora");
+    }
+
+    /// Two main lanes for one suite and platform: the one that displaced the
+    /// other holds the question, and only it jumps. The displaced lane waits
+    /// behind it like any other.
+    #[tokio::test]
+    async fn only_one_main_lane_per_suite_and_platform_takes_precedence() {
+        let (pool, entries) = room_freed_on_fedora(&[
+            parked("branch", 300_000),
+            parked("main-old", 200_000),
+            parked("main-new", 1_000),
+        ]);
+        let (branch, branch_entry) = &entries[0];
+        let (old, old_entry) = &entries[1];
+        let (new, new_entry) = &entries[2];
+        arm_main_cadence(&pool, old, 1);
+        arm_main_cadence(&pool, new, 2);
+
+        assert_eq!(
+            cadence_turn_ahead(select_entry(&pool, branch, branch_entry).await),
+            "main-new"
+        );
+        assert_eq!(
+            cadence_turn_ahead(select_entry(&pool, old, old_entry).await),
+            "main-new",
+            "the displaced lane holds no precedence"
+        );
+        assert!(select_entry(&pool, new, new_entry).await.placed().is_some());
+    }
+
+    /// Interactive work is never passed over behind the cadence lane, and the
+    /// rule withholds offers only: work already claimed stays where it runs.
+    #[tokio::test]
+    async fn interactive_and_running_work_are_unaffected_by_the_cadence_turn() {
+        let (pool, entries) = room_freed_on_fedora(&[
+            Parked {
+                id: "agent",
+                waited_ms: 1_000,
+                interactive: true,
+            },
+            parked("running", 400_000),
+            parked("main", 1_000),
+        ]);
+        let (agent, agent_entry) = &entries[0];
+        let (_, running_entry) = &entries[1];
+        let (main, _) = &entries[2];
+        let generation = pool.lock_connections()["fedora"].generation;
+        let now = unix_time_ms();
+        assert!(pool
+            .queue
+            .offer(running_entry, "fedora", "fedora", generation, now));
+        assert_eq!(
+            pool.queue.claim(running_entry, "fedora", generation, now),
+            queue::ClaimVerdict::Granted
+        );
+        arm_main_cadence(&pool, main, 1);
+
+        let placed = select_entry(&pool, agent, agent_entry)
+            .await
+            .placed()
+            .expect("interactive work is offered as before");
+        assert_eq!(placed.selected.executor_id, "fedora");
+        assert!(matches!(
+            pool.queue.state_of(running_entry),
+            Some(queue::EntryState::Claimed { .. })
+        ));
+    }
+
+    /// The decision text on both sides of the turn: the parked-request
+    /// decision, the lane's dispatch phase, and the machine's room line.
+    #[tokio::test]
+    async fn the_cadence_turn_is_told_on_both_sides() {
+        let (pool, entries) =
+            room_freed_on_fedora(&[parked("branch", 300_000), parked("main", 1_000)]);
+        let (branch, branch_entry) = &entries[0];
+        let (main, _) = &entries[1];
+        arm_main_cadence(&pool, main, 1);
+        let policy = ActivePlacementPolicy::default_profile();
+        let now = unix_time_ms();
+        let main_identity = (main.request_id.clone(), main.attempt_id.clone());
+        let branch_identity = (branch.request_id.clone(), branch.attempt_id.clone());
+
+        let takes_room_on = pool.room_taken_first_on(&main_identity, now);
+        assert_eq!(takes_room_on, vec!["fedora".to_string()]);
+        let PlacementOutcome::Waiting { diagnostic } =
+            wait_decision(main, &policy, &[], &[], &takes_room_on)
+                .expect("the cadence lane's wait is recorded")
+                .outcome
+        else {
+            unreachable!("a wait");
+        };
+        assert_eq!(
+            diagnostic,
+            "main cadence, tip unobserved: takes the next freed room on fedora."
+        );
+        assert!(pool.room_taken_first_on(&branch_identity, now).is_empty());
+
+        let Selection::Waiting { rejected } = select_entry(&pool, branch, branch_entry).await
+        else {
+            panic!("placed ahead of main's cadence lane");
+        };
+        let waiting = wait_decision(branch, &policy, &rejected, &[], &[])
+            .expect("the branch lane's wait is recorded");
+        let PlacementOutcome::Waiting { diagnostic } = &waiting.outcome else {
+            unreachable!("a wait");
+        };
+        assert!(
+            diagnostic.starts_with("fedora: behind main's cadence lane for rust-tests on linux."),
+            "{diagnostic}"
+        );
+        let row = rejected
+            .iter()
+            .find(|row| row.executor_id == "fedora")
+            .unwrap();
+        assert!(
+            row.reason.describe().starts_with(
+                "in line: behind main's cadence lane for rust-tests on linux (request main, waiting since "
+            ),
+            "{}",
+            row.reason.describe()
+        );
+        pool.queue.record_placement(&waiting);
+
+        let turn = |identity: &RequestIdentity| match pool.request_dispatch_phase(identity) {
+            Some(CheckDispatchPhase::Placing { turn, .. }) => turn,
+            other => panic!("not placing: {other:?}"),
+        };
+        assert_eq!(
+            turn(&main_identity).as_deref(),
+            Some("main cadence, tip unobserved: takes the next freed room on fedora")
+        );
+        assert_eq!(
+            turn(&branch_identity).as_deref(),
+            Some("fedora: behind main's cadence lane for rust-tests on linux")
+        );
+
+        let line = pool.room_line("fedora", unix_time_ms());
+        assert_eq!(line.behind, 1);
+        assert_eq!(
+            line.holders
+                .iter()
+                .map(|holder| holder.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main"]
+        );
+        let page = crate::resources::executors::render_room_line(&line, "fedora", unix_time_ms());
+        assert!(page.contains("## Room line"), "{page}");
+        assert!(
+            page.contains(
+                "- main cadence, tip unobserved: rust-tests on linux, request main, waiting "
+            ) && page.contains("; takes the next freed room on fedora\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("- 1 other request waits behind them for this machine\n"),
+            "{page}"
+        );
     }
 
     /// [`ceiling_fleet`], where the second machine may state no budget and may
@@ -45864,7 +46353,7 @@ mod tests {
                 && matches!(rejection.reason, PlacementRejectionReason::Declined { .. })
         }));
         let waiting =
-            wait_decision(&request, &policy, &rejected, &[]).expect("the wait is recorded");
+            wait_decision(&request, &policy, &rejected, &[], &[]).expect("the wait is recorded");
         let PlacementOutcome::Waiting { diagnostic } = waiting.outcome else {
             unreachable!("a memory wait is a waiting decision");
         };

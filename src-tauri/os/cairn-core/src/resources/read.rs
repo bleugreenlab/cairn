@@ -2509,6 +2509,11 @@ async fn render_resource_body(
                     Some(executor) => match (view, request_id) {
                         (None, _) => {
                             let mut rendered = crate::resources::executors::render_executor(executor);
+                            rendered.push_str(&crate::resources::executors::render_room_line(
+                                &orch.fleet.room_line(&executor.health.identity.executor_id, captured_at),
+                                &executor.name,
+                                captured_at,
+                            ));
                             rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &executor.name));
                             rendered.push_str(&crate::resources::executors::render_blocked_questions(
                                 &orch.fleet.blocked_questions(
