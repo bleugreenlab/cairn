@@ -3,6 +3,15 @@
 use super::*;
 use crate::storage::{check_lane_adoptions as store, LocalDb};
 
+/// How long a retained remote check result waits before retrying a durable
+/// write the store refused. The result stays held (no acknowledgement, no
+/// cancellation) until the same write commits. Test builds keep the interval
+/// short so a recovered store is observed promptly rather than waited out.
+#[cfg(not(test))]
+pub(crate) const RETAINED_RESULT_RETRY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+pub(crate) const RETAINED_RESULT_RETRY: Duration = Duration::from_millis(20);
+
 #[derive(Default)]
 pub(super) struct CheckAdoptions {
     pub(super) db: Option<Arc<LocalDb>>,
@@ -112,7 +121,7 @@ impl Drop for CheckConsumerGuard {
                     Ok(()) => return,
                     Err(error) => log::error!("check_lane_adoption_waiters exact consumer withdrawal failed: {error}; no acknowledgement is authorized; retrying"),
                 }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(RETAINED_RESULT_RETRY).await;
                 }
             },
             || {
@@ -697,7 +706,7 @@ impl Fleet {
                         Ok(()) => return,
                         Err(error) => log::error!("cadence purpose consumer withdrawal failed: {error}; no acknowledgement is authorized; retrying"),
                     }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::time::sleep(RETAINED_RESULT_RETRY).await;
                     }
                 },
                 || {
@@ -882,7 +891,7 @@ impl Fleet {
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(RETAINED_RESULT_RETRY).await;
                 }
             },
             || {
@@ -1228,7 +1237,7 @@ impl Fleet {
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(RETAINED_RESULT_RETRY).await;
                 }
             },
             || {

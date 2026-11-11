@@ -88,7 +88,7 @@ async fn cross_commit(crash: bool, abort_consumer: bool) {
     std::fs::create_dir_all(repo.join(".cairn")).unwrap();
     std::fs::write(repo.join("checked.txt"), "unchanged check input\n").unwrap();
     std::fs::write(repo.join(".cairn/config.yaml"),
-        "checks:\n  smoke:\n    command: echo smoke\n    impact: [checked.txt]\n    executor: {os: linux}\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n"
+        "checks:\n  smoke:\n    command: echo smoke\n    impact: [checked.txt]\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n"
     ).unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "physical A"]);

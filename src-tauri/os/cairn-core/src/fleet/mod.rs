@@ -5,7 +5,7 @@
 //! mutation sealing exist only in the executor process.
 
 mod check_adoptions;
-pub(crate) use check_adoptions::CheckConsumerGuard;
+pub(crate) use check_adoptions::{CheckConsumerGuard, RETAINED_RESULT_RETRY};
 mod coalescing;
 mod drain_projection;
 pub use drain_projection::AdmissionFenceToken;

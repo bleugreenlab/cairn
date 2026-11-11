@@ -704,7 +704,7 @@ async fn shared_manual_batch(
     init_project(&repo);
     std::fs::create_dir_all(repo.join(".cairn")).unwrap();
     std::fs::write(repo.join(".cairn/config.yaml"),
-        "checks:\n  first:\n    command: echo first\n    executor: {os: linux}\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n  second:\n    command: echo second\n    executor: {os: linux}\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n  third:\n    command: echo third {changedFiles}\n    fullCommand: echo third --all\n    executor: {os: linux}\n"
+        "checks:\n  first:\n    command: echo first\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n  second:\n    command: echo second\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n    mainCadence:\n      platforms: [linux]\n      notify: testing\n  third:\n    command: echo third {changedFiles}\n    fullCommand: echo third --all\n    executor: {os: linux}\n    verdictPlatforms: [linux]\n"
     ).unwrap();
     git(&repo, &["add", "-A"]);
     git(
@@ -1059,6 +1059,25 @@ async fn shared_manual_batch(
     .expect("shutdown releases old runner waiters without cancelling their remote grant");
     assert_no_release(&mut frames);
 
+    // Faults are installed while no runner is writing: the restarted runner's
+    // own adoption work holds write transactions, and DDL issued alongside it
+    // waits out the pool's busy timeout. Neither trigger can fire before the
+    // driver below, since nothing records an observation or finalizes the
+    // physical claim until then.
+    if reject_second {
+        local.execute_script(
+            "CREATE TRIGGER reject_second_observation BEFORE INSERT ON check_result_observations
+             WHEN NEW.check_name='second' BEGIN
+             SELECT RAISE(ABORT,'fixture rejects second observation'); END;"
+        ).await.unwrap();
+    }
+    if reject_finalization {
+        local.execute_script(
+            "CREATE TRIGGER reject_physical_finalization BEFORE UPDATE OF state ON check_lane_adoptions
+             WHEN NEW.state='recorded' BEGIN
+             SELECT RAISE(ABORT,'fixture rejects physical finalization'); END;"
+        ).await.unwrap();
+    }
     let restarted_home = home.path().join("restarted-shared");
     std::fs::create_dir_all(&restarted_home).unwrap();
     let mut restarted = boot(&restarted_home, local.clone()).await;
@@ -1254,20 +1273,6 @@ async fn shared_manual_batch(
     let waiters = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
     let (_retry_guard, mut retries) =
         observe_retry(format!("remote-check:{REQUEST}:{ATTEMPT}:second"));
-    if reject_second {
-        local.execute_script(
-            "CREATE TRIGGER reject_second_observation BEFORE INSERT ON check_result_observations
-             WHEN NEW.check_name='second' BEGIN
-             SELECT RAISE(ABORT,'fixture rejects second observation'); END;"
-        ).await.unwrap();
-    }
-    if reject_finalization {
-        local.execute_script(
-            "CREATE TRIGGER reject_physical_finalization BEFORE UPDATE OF state ON check_lane_adoptions
-             WHEN NEW.state='recorded' BEGIN
-             SELECT RAISE(ABORT,'fixture rejects physical finalization'); END;"
-        ).await.unwrap();
-    }
     let driver_orch = restarted.clone();
     let driver_claim = physical.clone();
     let driver = tokio::spawn(async move {

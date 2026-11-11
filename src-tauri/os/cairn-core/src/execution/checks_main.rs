@@ -1000,7 +1000,7 @@ async fn lose_adoption(orch: &Orchestrator, claim: &Claim, checks: &[String], ca
             Ok(()) => return,
             Err(error) => {
                 log::error!("main cadence adoption {} cannot durably record loss: {error}; retaining the debt and retrying", claim.request_id);
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
         }
     }
@@ -1271,7 +1271,7 @@ async fn current_cadence_item_waiters(
             }
             Err(error) => {
                 log::error!("cannot read current cadence consumers for {}: {error}; retaining the result and retrying", claim.request_id);
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
         }
     }
@@ -1340,7 +1340,7 @@ async fn record_adopted_batch(
                 Ok(row) => break row,
                 Err(error) => {
                     log::error!("adopted observation {} could not be read: {error}; retaining the debt and retrying before delivery", observations[index]);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                 }
             }
         };
@@ -1372,7 +1372,7 @@ async fn record_adopted_batch(
                 Ok(()) => break,
                 Err(error) => {
                     log::error!("adopted cadence report failed: {error}; retaining the waiter and retrying before acknowledgement");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                 }
             }
         }
@@ -1400,7 +1400,7 @@ async fn record_adopted_batch(
                     log::error!("could not durably deliver adopted cadence waiter {}: {error}; retaining the debt and retrying", waiter.consumer_ref);
                     #[cfg(test)]
                     crate::execution::checks::notify_adoption_retry(&observations[index], &error);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                 }
             }
         }
@@ -1433,7 +1433,7 @@ async fn adopt_at_boot(orch: &Orchestrator) {
                 Ok(waiters) => break waiters,
                 Err(error) => {
                     log::error!("main cadence cannot read check adoption waiters for {}: {error}; retaining the debt and retrying", claim.request_id);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                 }
             }
         };
@@ -1972,7 +1972,7 @@ async fn report_live_lane(
                 log::error!(
                     "live cadence report failed: {error}; retaining its consumer until delivery"
                 );
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
         }
     }
@@ -2012,7 +2012,7 @@ async fn report_live_lane(
             Ok(()) => break,
             Err(error) => {
                 log::error!("could not confirm live cadence delivery: {error}; retaining its consumer and retrying");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
         }
     }
@@ -2268,7 +2268,7 @@ async fn attempt_lane(
             Ok(row) => return attempt(lane.verdict.classify(row), false),
             Err(error) if attempted.consumer_guard.is_some() => {
                 log::error!("live cadence observation {observation_id} could not be read: {error}; retaining the consumer and retrying before reporting");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
             Err(error) => {
                 return attempt(

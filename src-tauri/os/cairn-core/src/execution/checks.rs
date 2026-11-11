@@ -6006,7 +6006,7 @@ async fn lose_check_claim(orch: &Orchestrator, identity: &(String, String), evid
             }
             Err(error) => {
                 log::error!("could not settle check claim {}: {error}; retaining the result and retrying without acknowledgement", identity.0);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
             }
         }
     }
@@ -12838,7 +12838,7 @@ where
                                         &observation.id,
                                         error,
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                                     continue;
                                 }
                             }
@@ -12909,7 +12909,7 @@ where
                             Ok(()) => break,
                             Err(error) if retry_projection => {
                                 log::error!("check observation {} is durable, but consumer projection failed: {error}; retaining the result and retrying", source.id);
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                             }
                             Err(error) => {
                                 not_recorded = Some(error);
@@ -12960,7 +12960,7 @@ where
                                 log::error!("check observation {} committed, but claim settlement failed: {error}; retaining the result and retrying without acknowledgement", recorded.id);
                                 #[cfg(test)]
                                 adoption_tests::notify_observation_retry(&recorded.id, &error);
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                tokio::time::sleep(crate::fleet::RETAINED_RESULT_RETRY).await;
                             }
                         }
                     }
