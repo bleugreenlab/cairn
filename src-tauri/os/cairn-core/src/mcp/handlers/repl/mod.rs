@@ -297,6 +297,52 @@ pub(crate) enum ReplSendResult {
     Protocol(String),
 }
 
+/// The most of an interpreter's stderr a session keeps to explain its death.
+const DEATH_STDERR_TAIL: usize = 2 * 1024;
+
+/// What a session heard of its interpreter's end: the exit, and the last of
+/// its stderr. An interpreter that cannot start — a sandbox that refuses to
+/// apply, a missing `uv` — says why only on stderr and in its exit code, and
+/// without these a dead REPL could only report that it was gone.
+///
+/// The stderr bytes reach the listener already scrubbed: the fleet settles
+/// every resident stream through the runner's output guard, and drains each
+/// stream's withheld tail before the exit is delivered.
+#[derive(Debug, Default)]
+struct ReplDeath {
+    /// `Some` once the process exited; the inner value is its exit code, which
+    /// a signal-killed process does not have.
+    exit: Option<Option<i32>>,
+    /// The newest [`DEATH_STDERR_TAIL`] bytes of stderr, oldest dropped first.
+    stderr_tail: Vec<u8>,
+}
+
+impl ReplDeath {
+    fn hear_stderr(&mut self, data: &[u8]) {
+        self.stderr_tail.extend_from_slice(data);
+        let excess = self.stderr_tail.len().saturating_sub(DEATH_STDERR_TAIL);
+        self.stderr_tail.drain(..excess);
+    }
+
+    /// One sentence naming the exit and its last stderr, or `None` when the
+    /// interpreter neither exited nor said anything.
+    fn describe(&self) -> Option<String> {
+        let stderr = String::from_utf8_lossy(&self.stderr_tail);
+        let stderr = stderr.trim();
+        let exit = match self.exit {
+            Some(Some(code)) => format!("The interpreter exited with code {code}"),
+            Some(None) => "The interpreter exited without an exit code".to_string(),
+            None if stderr.is_empty() => return None,
+            None => "The interpreter wrote to stderr".to_string(),
+        };
+        Some(if stderr.is_empty() {
+            format!("{exit}.")
+        } else {
+            format!("{exit}: `{stderr}`.")
+        })
+    }
+}
+
 /// A live eval-server session held behind an `Arc` in [`ReplState`]. One session
 /// is one *generation* of the durable REPL identified by `repl_id`.
 pub struct ReplSession {
@@ -330,6 +376,9 @@ pub struct ReplSession {
     /// stream loses protocol sync, shared rather than copied so a desync after
     /// spawn reads as dead at once instead of waiting out a send.
     alive: Arc<AtomicBool>,
+    /// How the interpreter ended, recorded by [`protocol_listener`] before it
+    /// clears `alive`, so a send that finds the session dead can say why.
+    death: Arc<Mutex<ReplDeath>>,
     /// Keeps [`protocol_listener`] registered for exactly this session's life.
     _events: crate::fleet::ResidentProcessSubscription,
     created_at: SystemTime,
@@ -366,6 +415,11 @@ impl ReplSession {
     /// True while the child is still running (non-blocking).
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Why the interpreter died, as far as it said.
+    fn death_reason(&self) -> Option<String> {
+        self.death.lock().ok()?.describe()
     }
 
     /// True while a send holds `send_lock` (an exchange is in flight).
@@ -943,6 +997,7 @@ pub async fn spawn_session(
     // missed; the generation it filters on is named once the start returns.
     let (tx, rx) = mpsc::sync_channel(2);
     let alive = Arc::new(AtomicBool::new(true));
+    let death = Arc::new(Mutex::new(ReplDeath::default()));
     let started_generation = Arc::new(AtomicU64::new(0));
     let events = orch
         .fleet
@@ -951,6 +1006,7 @@ pub async fn spawn_session(
             key.clone(),
             started_generation.clone(),
             alive.clone(),
+            death.clone(),
             tx,
         ));
     let started = orch
@@ -1009,6 +1065,7 @@ pub async fn spawn_session(
         process_generation: generation,
         responses: Mutex::new(rx),
         alive,
+        death,
         _events: events,
         created_at: SystemTime::now(),
         send_lock: tokio::sync::Mutex::new(()),
@@ -1039,7 +1096,9 @@ pub async fn spawn_session(
 /// lines on `lines`, and `alive` cleared the moment the stream can no longer be
 /// trusted — the process exited, a frame outgrew [`FRAME_CAP`], or a line could
 /// not be queued. Once a line is lost, every later response would answer the
-/// wrong request, so the session is dead rather than merely slow.
+/// wrong request, so the session is dead rather than merely slow. Stderr and
+/// the exit code go to `death`, recorded before `alive` clears so whoever sees
+/// the session dead also sees why.
 ///
 /// Events for any other process are ignored, and so, once `generation` is
 /// non-zero, are events from any other generation of this one: a process
@@ -1050,6 +1109,7 @@ fn protocol_listener(
     process_key: String,
     generation: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
+    death: Arc<Mutex<ReplDeath>>,
     lines: mpsc::SyncSender<String>,
 ) -> impl Fn(ResidentProcessEvent) + Send + Sync + 'static {
     let buffer = Mutex::new(Vec::<u8>::new());
@@ -1092,10 +1152,20 @@ fn protocol_listener(
                 stream: ResidentProcessStream::Stderr,
                 data,
                 ..
-            } => tracing::debug!(diagnostic=%String::from_utf8_lossy(&data),"REPL stderr"),
+            } => {
+                tracing::debug!(diagnostic=%String::from_utf8_lossy(&data),"REPL stderr");
+                if let Ok(mut death) = death.lock() {
+                    death.hear_stderr(&data);
+                }
+            }
             ResidentProcessEventKind::State {
-                status: ResidentProcessStatus::Exited { .. },
-            } => alive.store(false, Ordering::Release),
+                status: ResidentProcessStatus::Exited { exit_code, .. },
+            } => {
+                if let Ok(mut death) = death.lock() {
+                    death.exit = Some(exit_code);
+                }
+                alive.store(false, Ordering::Release);
+            }
             _ => {}
         }
     }
@@ -1298,6 +1368,12 @@ pub async fn send_recorded(
             bindings = response.vars;
         }
         ReplSendResult::Dead => {
+            // Read before the stop below, whose own exit would otherwise be
+            // reported as the cause of a death it did not cause.
+            let reason = session
+                .death_reason()
+                .map(|reason| format!(" {reason}"))
+                .unwrap_or_default();
             // Unregister only if this is still the live session: a close+recreate
             // during the send may have installed a new generation under this slug,
             // which this obsolete outcome must not evict.
@@ -1306,7 +1382,7 @@ pub async fn send_recorded(
             exit_reason = Some(ReplExitReason::Died);
             exchange.status = ReplExchangeStatus::Died;
             exchange.error = Some(format!(
-                "REPL '{slug}' died — its namespace is gone. The transcript is kept; \
+                "REPL '{slug}' died — its namespace is gone.{reason} The transcript is kept; \
                  create the slug again to resume it with an empty namespace."
             ));
         }
@@ -1543,6 +1619,7 @@ mod protocol_listener_tests {
         feed: Box<dyn Fn(ResidentProcessEvent)>,
         generation: Arc<AtomicU64>,
         alive: Arc<AtomicBool>,
+        death: Arc<Mutex<ReplDeath>>,
         lines: mpsc::Receiver<String>,
     }
 
@@ -1550,17 +1627,20 @@ mod protocol_listener_tests {
         let (tx, lines) = mpsc::sync_channel(2);
         let generation = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
+        let death = Arc::new(Mutex::new(ReplDeath::default()));
         let feed = protocol_listener(
             repl_fence(),
             "repl:py".into(),
             generation.clone(),
             alive.clone(),
+            death.clone(),
             tx,
         );
         Listener {
             feed: Box::new(feed),
             generation,
             alive,
+            death,
             lines,
         }
     }
@@ -1598,11 +1678,19 @@ mod protocol_listener_tests {
         }
     }
 
-    fn exited() -> ResidentProcessEventKind {
+    fn stderr(data: &[u8]) -> ResidentProcessEventKind {
+        ResidentProcessEventKind::Output {
+            sequence: 1,
+            stream: ResidentProcessStream::Stderr,
+            data: data.to_vec(),
+        }
+    }
+
+    fn exited(exit_code: i32) -> ResidentProcessEventKind {
         ResidentProcessEventKind::State {
             status: ResidentProcessStatus::Exited {
                 finished_at_unix_ms: 1,
-                exit_code: Some(0),
+                exit_code: Some(exit_code),
                 restartable: false,
                 executor_lost: false,
             },
@@ -1646,12 +1734,26 @@ mod protocol_listener_tests {
 
         l.generation.store(3, Ordering::Release);
         (l.feed)(repl_event(2, stdout(b"stale\n")));
-        (l.feed)(repl_event(2, exited()));
+        (l.feed)(repl_event(2, stderr(b"stale stderr\n")));
+        (l.feed)(repl_event(2, exited(1)));
         assert!(l.lines.try_recv().is_err());
         assert!(l.alive.load(Ordering::Acquire));
+        assert_eq!(l.death.lock().unwrap().describe(), None);
 
-        (l.feed)(repl_event(3, exited()));
+        // Its own death is kept, so a send that finds it dead can say why.
+        (l.feed)(repl_event(
+            3,
+            stderr(b"sandbox-exec: sandbox_apply: Operation not permitted\n"),
+        ));
+        (l.feed)(repl_event(3, exited(71)));
         assert!(!l.alive.load(Ordering::Acquire));
+        assert_eq!(
+            l.death.lock().unwrap().describe().as_deref(),
+            Some(
+                "The interpreter exited with code 71: \
+                 `sandbox-exec: sandbox_apply: Operation not permitted`."
+            )
+        );
     }
 }
 

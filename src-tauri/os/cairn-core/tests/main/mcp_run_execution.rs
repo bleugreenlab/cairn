@@ -1585,10 +1585,6 @@ async fn a_repl_ships_only_cairn_identity_to_its_executor() {
     assert!(spec.args.windows(2).any(|pair| pair == ["--with", "numpy"]));
 }
 
-// State persists across two separate `handle_run` calls routed into the same
-// live REPL session: `x = 41` then `x + 1` returns `42`. Guarded to skip if no
-// interpreter is available to spawn the eval-server.
-
 // A REPL answers every send even when a registered secret begins with a
 // newline.
 //
@@ -1603,6 +1599,12 @@ async fn a_repl_ships_only_cairn_identity_to_its_executor() {
 async fn repl_answers_when_a_registered_secret_begins_with_a_newline() {
     use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
     use cairn_core::security::{registry, SecretCategory, SecretId, SecretMaterial};
+
+    if cairn_sandbox::skip_without_nested_sandbox(
+        "repl_answers_when_a_registered_secret_begins_with_a_newline",
+    ) {
+        return;
+    }
 
     let _leading_newline = registry()
         .register(
@@ -1646,7 +1648,7 @@ async fn repl_answers_when_a_registered_secret_begins_with_a_newline() {
     .await;
     assert!(
         first.contains("41") && !first.contains("timed out"),
-        "a response frame was held back by the scrubber: {first}"
+        "the first send did not answer (a timeout here means the newline was held back; a death names its exit): {first}"
     );
 
     let second = handle_run(
@@ -1708,10 +1710,6 @@ async fn repl_typescript_rejects_deps() {
     };
     assert!(err.contains("python-only"), "got: {err}");
 }
-
-// The typescript/bun eval-server persists state across separate `handle_run`
-// calls exactly like python: `x = 41` then `x + 1` returns `42`. Skips if bun is
-// unavailable to spawn the eval-server.
 
 // Build a REPL run context matching a job seeded by `seed_run`.
 fn repl_ctx(run_id: &str, _cwd: &str) -> cairn_core::internal::mcp::handlers::RunContext {
@@ -2641,10 +2639,6 @@ async fn repl_registry_guards_close_recreate_during_inflight() {
     assert!(orch.repl_state.remove_if(&ctx.job_id, "fn", &b));
     b.stop_and_release(&orch).await;
 }
-
-// A send into a session whose child already exited settles as `Died`,
-// unregisters the session, and emits a session-ending `repl-state` `exited`.
-// Guarded to skip if no python interpreter is available.
 
 // ---- A workflow run across waves (CAIRN-5367) -----------------------------
 
