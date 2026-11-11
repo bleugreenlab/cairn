@@ -74,7 +74,9 @@ pub fn current_draft(generation: &GenerationRow, inventory: &Inventory) -> Resul
         .get(&InferenceProfileId::from(profile))
         .and_then(runnable_surface)
         .ok_or_else(|| {
-            format!("the draft {profile} is no longer a container profile in the inventory")
+            format!(
+                "the draft {profile} is no longer a container or native profile in the inventory"
+            )
         })?;
     let digest = surface_digest(&surface);
     Ok(Draft {

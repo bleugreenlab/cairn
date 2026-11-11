@@ -154,6 +154,11 @@ pub fn weight_files(
     };
     let files = match server {
         Server::Vllm => pick(WeightFormat::Safetensors),
+        Server::MlxLm => {
+            return Err(
+                "MLX runs natively on Apple silicon, and a compose service is a container".into(),
+            )
+        }
         Server::LlamaCpp => {
             let all = pick(WeightFormat::Gguf);
             match gguf_file {
@@ -346,7 +351,7 @@ pub async fn resolve(
             }
             .gguf_quantization()
         }),
-        Server::Vllm => read
+        Server::Vllm | Server::MlxLm => read
             .facts
             .quantization
             .clone()
@@ -357,6 +362,7 @@ pub async fn resolve(
             &model.name,
             quantization.as_deref(),
             server,
+            None,
             compiled.machines,
         )
     });
@@ -368,7 +374,7 @@ pub async fn resolve(
             weights,
             // vLLM reads these beside the weights; a GGUF file holds them.
             config_files: match server {
-                Server::Vllm => read.config_files.clone(),
+                Server::Vllm | Server::MlxLm => read.config_files.clone(),
                 Server::LlamaCpp => Vec::new(),
             },
         },
@@ -1008,8 +1014,25 @@ mod tests {
     #[test]
     fn profile_ids_name_the_model_quant_server_and_machines() {
         assert_eq!(
-            profile_id("Qwen/Qwen3-Embedding-4B", Some("q8_0"), Server::LlamaCpp, 1),
+            profile_id(
+                "Qwen/Qwen3-Embedding-4B",
+                Some("q8_0"),
+                Server::LlamaCpp,
+                None,
+                1
+            ),
             "qwen3-embedding-4b-q8_0-llamacpp-x1"
+        );
+        assert_eq!(
+            profile_id(
+                "Qwen/Qwen3-Embedding-4B",
+                Some("q8_0"),
+                Server::LlamaCpp,
+                Some(cairn_inference::AcceleratorRuntime::Metal),
+                1
+            ),
+            "qwen3-embedding-4b-q8_0-llamacpp-metal-x1",
+            "a native profile names its runtime"
         );
     }
 }

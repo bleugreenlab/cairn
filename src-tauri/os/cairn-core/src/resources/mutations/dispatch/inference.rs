@@ -310,8 +310,9 @@ pub(crate) fn inference_records_authority(
         // A generation's draft (`generated`) does not cross it either: the
         // operator's own start of the generation is the authority, and the
         // door is narrow. Only that generation's bound agent node may write
-        // through it, only a digest-pinned container profile of its model, and
-        // never over a profile that is not its own draft.
+        // through it, only a digest-pinned container or hash-pinned native
+        // profile of its model, and never over a profile that is not its own
+        // draft.
         //
         // Previewing an import (`import.preview:true`) writes nothing: it
         // compiles and pins as an import does and answers the candidate, so

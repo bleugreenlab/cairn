@@ -39,7 +39,7 @@ use cairn_db::turso::params;
 use cairn_inference::control::{Phase, START_REPORT_BOUND_SECS, STOP_REPORT_BOUND_SECS};
 use cairn_inference::verify::{self, ChatSample, EmbedSample, Speeds, Stage};
 use cairn_inference::{
-    unknown_address, AcceleratorFamily, Address, Addresses, Deployment, DeploymentId, Engine,
+    unknown_address, AcceleratorFamily, Address, Addresses, Deployment, DeploymentId,
     InferenceProfile, InferenceProfileId, Inventory, MachineName, Network, ProfileOrigin,
     RecordSource, Server,
 };
@@ -272,10 +272,10 @@ pub struct Planned {
 }
 
 fn port_for(profile: &InferenceProfile) -> u16 {
-    match &profile.engine {
-        Engine::Container(container) if container.server == Server::LlamaCpp => 8090,
-        _ => 8000,
-    }
+    profile
+        .engine
+        .server()
+        .map_or(Server::Vllm.default_port(), Server::default_port)
 }
 
 /// The running row a verification claims its pool with, the deployment rows
@@ -451,9 +451,9 @@ pub async fn begin(
             format!("there is no profile {profile_id}; cairn://inference/profiles lists them")
         })?
         .clone();
-    if !matches!(profile.engine, Engine::Container(_)) {
+    if !profile.engine.is_runnable_form() {
         return Err(format!(
-            "profile {profile_id} is a {} profile; verification measures container profiles",
+            "profile {profile_id} is a {} profile; verification measures container and native profiles",
             profile.engine.kind()
         ));
     }
@@ -954,7 +954,7 @@ pub fn candidates(
         .profiles
         .values()
         .filter(|r| r.model.name.trim().eq_ignore_ascii_case(model.trim()))
-        .filter(|r| matches!(r.engine, Engine::Container(_)))
+        .filter(|r| r.engine.is_runnable_form())
         .filter(|r| r.requirements.machines as usize <= size)
         .filter(|r| match (family, r.requirements.accelerator) {
             (Some(family), Some(accelerator)) => accelerator.family == family,
@@ -2133,7 +2133,7 @@ machines:
         let db = seeded("inference-verify-render").await;
         let mut inventory = load_inventory(&db).await.unwrap();
         let mut linked = inventory.profiles[&InferenceProfileId::from("chat")].clone();
-        if let Engine::Container(container) = &mut linked.engine {
+        if let cairn_inference::Engine::Container(container) = &mut linked.engine {
             container.args.push("{self.link}".into());
         }
         inventory.insert_profile(linked);

@@ -11,16 +11,20 @@
 //! - [`fit`]: whether weights of a size fit a pool, on how many machines, and
 //!   with how much context. A prediction; verification decides. Each of `k`
 //!   machines carries `weights / k × 1.05` plus a reserve for activations, in
-//!   the memory an engine may use there: 0.90 of a discrete card's VRAM or
-//!   0.85 of a unified machine's memory. More than one machine needs a linked
+//!   the memory an engine may use there: 0.90 of a discrete card's VRAM, 0.85
+//!   of a unified machine's memory, or on Apple silicon what Metal lets its GPU
+//!   wire ([`APPLE_USABLE`]). That is a bound, never a claim: an engine that
+//!   sizes itself (llama.cpp, MLX) needs only its weights, KV cache and the
+//!   reserve, on unified memory as anywhere (tenet 1363). More than one machine needs a linked
 //!   pool, and `k` must divide the attention heads. The context is the
 //!   model's, clamped to what the memory left over holds in KV cache when the
 //!   model's KV geometry is known, and floored to a multiple of 1024; below
 //!   8192 nothing fits. With the geometry unknown nothing is clamped here, and
 //!   verification clamps to the cache the engine measures.
 //! - [`templates`] (`templates.yaml`): engines known to work, each an image
-//!   pinned by digest with the server it runs, the hardware it serves and the
-//!   weight formats it reads, and [`starting_profile`], one of them made into
+//!   pinned by digest or, where no container reaches the GPU (Apple), a
+//!   native artifact pinned by hash, with the server it runs, the hardware it
+//!   serves and the weight formats it reads, and [`starting_profile`], one of them made into
 //!   a whole profile for a weight source on a pool, which the agent may take
 //!   as it is or change. A template serves a pool only on the pool's
 //!   accelerator ([`PoolHw::accelerator`], read from its machines' hardware
@@ -32,13 +36,13 @@ use std::sync::OnceLock;
 use cairn_models_types::catalog::Modality;
 use serde::{Deserialize, Serialize};
 
-use crate::hf::{AuxiliaryFile, WeightSource};
+use crate::hf::{AuxiliaryFile, WeightFormat, WeightSource};
 use crate::machine::MachineName;
 use crate::model::Model;
 use crate::profile::{
-    Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,
-    InferenceProfile, Interconnect, MemoryPerMachine, ModelRef, Mount, MountSource, ProfileOrigin,
-    Requirements, Server, SystemRamBytes, VramBytes, WeightFile,
+    Accelerator, AcceleratorFamily, AcceleratorRuntime, Artifact, Container, Engine, HostOptions,
+    InferenceProfile, Interconnect, MemoryPerMachine, ModelRef, Mount, MountSource, Native,
+    ProfileOrigin, Requirements, Server, SystemRamBytes, VramBytes, WeightFile,
 };
 
 const GIB: u64 = 1 << 30;
@@ -47,6 +51,12 @@ const GIB: u64 = 1 << 30;
 pub const RESERVE_BYTES: u64 = 2 * GIB;
 pub const DISCRETE_USABLE: f64 = 0.90;
 pub const UNIFIED_USABLE: f64 = 0.85;
+/// What Metal lets an Apple silicon GPU wire of the machine's memory, its
+/// `recommendedMaxWorkingSetSize`: 110100 MiB of a 128 GiB M4 Max on macOS 26
+/// (llama.cpp b12283's `--list-devices`, 11-11). A load past it fails rather
+/// than pages. Raising it (`iogpu.wired_limit_mb`) is the operator's call,
+/// never Cairn's.
+pub const APPLE_USABLE: f64 = 0.84;
 pub const WEIGHT_OVERHEAD: f64 = 1.05;
 pub const MIN_CONTEXT: u64 = 8_192;
 
@@ -61,8 +71,14 @@ pub struct Template {
     /// `None` serves either CPU architecture.
     #[serde(default)]
     pub arch: Option<Arch>,
-    pub image: String,
-    pub formats: Vec<Format>,
+    /// A container template's image, pinned by digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// A native template's artifact, which `command`'s first word is the
+    /// program of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
+    pub formats: Vec<WeightFormat>,
     pub command: Vec<String>,
     /// What the research behind the template found worth knowing when running
     /// it: the GPUs its image is built for, known issues and their workarounds.
@@ -98,13 +114,23 @@ impl Template {
         }
         Ok(())
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    Safetensors,
-    Gguf,
+    /// Whether this template's server reads weights of `format`, or why not.
+    pub fn reads(&self, format: WeightFormat) -> Result<(), String> {
+        if self.formats.contains(&format) {
+            return Ok(());
+        }
+        Err(format!(
+            "template {} reads {} weights, and the source is {}",
+            self.id,
+            self.formats
+                .iter()
+                .map(|format| format.as_str())
+                .collect::<Vec<_>>()
+                .join(" or "),
+            format.as_str()
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,9 +215,10 @@ impl MachineHw {
 
     /// The share of [`Self::memory_bytes`] an engine may take.
     pub fn usable_fraction(&self) -> f64 {
-        match self.memory {
-            HwMemory::Unified { .. } => UNIFIED_USABLE,
-            HwMemory::Discrete { .. } => DISCRETE_USABLE,
+        match (self.family, self.memory) {
+            (AcceleratorFamily::Apple, _) => APPLE_USABLE,
+            (_, HwMemory::Unified { .. }) => UNIFIED_USABLE,
+            (_, HwMemory::Discrete { .. }) => DISCRETE_USABLE,
         }
     }
 
@@ -258,11 +285,15 @@ pub struct Predicted {
     pub kv_tokens: Option<u64>,
 }
 
-/// A profile id from what distinguishes it: `<model>-<quant>-<server>-x<k>`.
+/// A profile id from what distinguishes it: `<model>-<quant>-<server>-x<k>`,
+/// with the runtime after the server for an engine that runs natively
+/// (`-llamacpp-metal-`), since the same server and weights also run in a
+/// container.
 pub fn profile_id(
     model: &str,
     quantization: Option<&str>,
     server: Server,
+    native: Option<AcceleratorRuntime>,
     machines: u32,
 ) -> String {
     let name = model.rsplit('/').next().unwrap_or(model);
@@ -274,8 +305,15 @@ pub fn profile_id(
     let server = match server {
         Server::Vllm => "vllm",
         Server::LlamaCpp => "llamacpp",
+        Server::MlxLm => "mlxlm",
     };
-    id.push_str(&format!("-{server}-x{machines}"));
+    id.push('-');
+    id.push_str(server);
+    if let Some(runtime) = native {
+        id.push('-');
+        id.push_str(runtime.as_str());
+    }
+    id.push_str(&format!("-x{machines}"));
     id
 }
 
@@ -297,7 +335,13 @@ pub fn precision(label: &str) -> u32 {
         32
     } else if ["bf16", "fp16", "f16"].contains(&label.as_str()) {
         16
-    } else if label == "fp8" || label.starts_with("q8") {
+    } else if let Some(bits) = label
+        .strip_suffix("bit")
+        .and_then(|bits| bits.parse::<u32>().ok())
+    {
+        // MLX's affine quantizations (`4bit`, `8bit`).
+        bits
+    } else if label == "fp8" || label == "mxfp8" || label.starts_with("q8") {
         8
     } else if label.starts_with("q6") {
         6
@@ -399,8 +443,11 @@ fn embeds(model: &Model) -> bool {
 /// `template` made into a whole profile for `source` on `pool` as `fit`
 /// predicted it. On llama.cpp a `projector` is pinned beside the weights and
 /// passed as `--mmproj`; without one the profile takes text alone, so it
-/// never claims an image input it cannot serve. Every shard of a split source
-/// is pinned and `-m` names the first, which llama.cpp loads the rest beside.
+/// never claims an image input it cannot serve. MLX's server takes text
+/// alone. Every shard of a split source is pinned and `-m` names the first,
+/// which llama.cpp loads the rest beside. A native template makes a native
+/// profile, which reads the pinned files from the machine's own Hugging Face
+/// cache (`{cache}`); a container template mounts them.
 pub fn starting_profile(
     template: &Template,
     source: &WeightSource,
@@ -413,9 +460,10 @@ pub fn starting_profile(
     let machine = &pool.machines[0];
     let mut command = template.command.clone();
     let embed = embeds(model);
-    let mount_to = match template.server {
-        Server::Vllm => "/root/.cache/huggingface",
-        Server::LlamaCpp => "/models",
+    let mount_to = match (&template.artifact, template.server) {
+        (Some(_), _) => "{cache}",
+        (None, Server::Vllm) => "/root/.cache/huggingface",
+        (None, _) => "/models",
     };
     let mut weights: Vec<WeightFile> = source
         .files
@@ -464,7 +512,98 @@ pub fn starting_profile(
                 weights.push(file);
             }
         }
+        // MLX sizes its KV cache by each request and takes no context limit.
+        Server::MlxLm => {}
     }
+    let need = match template.server {
+        // vLLM takes its whole memory share up front.
+        Server::Vllm => machine.usable_bytes(),
+        Server::LlamaCpp | Server::MlxLm => {
+            predicted.per_machine_bytes
+                + projector.map_or(0, |p| p.file.size)
+                + kv_bytes_per_token(model, k).map_or(0, |per_token| per_token * predicted.context)
+        }
+    };
+    let memory = match machine.memory {
+        HwMemory::Unified { .. } => MemoryPerMachine::Unified {
+            system: SystemRamBytes(need),
+        },
+        HwMemory::Discrete { .. } => MemoryPerMachine::Discrete {
+            vram: VramBytes(need),
+            host: SystemRamBytes(0),
+        },
+    };
+    let mut modalities = model.facts.modalities.clone();
+    let text_only = match template.server {
+        Server::LlamaCpp => projector.is_none(),
+        Server::MlxLm => true,
+        Server::Vllm => false,
+    };
+    if text_only {
+        if let Some(modalities) = modalities.as_mut() {
+            modalities.input.retain(|m| *m == Modality::Text);
+        }
+    }
+    let engine = match &template.artifact {
+        Some(artifact) => {
+            let mut words = command.into_iter();
+            Engine::Native(Native {
+                server: template.server,
+                artifact: artifact.clone(),
+                program: words.next().unwrap_or_default(),
+                args: words.collect(),
+                env: BTreeMap::new(),
+            })
+        }
+        None => container_engine(template, command, k, mount_to),
+    };
+    InferenceProfile {
+        id: profile_id(
+            &model.name,
+            Some(&source.quantization),
+            template.server,
+            template.artifact.as_ref().map(|_| template.runtime),
+            k,
+        )
+        .into(),
+        source: Default::default(),
+        model: ModelRef {
+            name: model.name.clone(),
+            weights,
+            config_files: match template.server {
+                Server::Vllm | Server::MlxLm => source.config_files.clone(),
+                Server::LlamaCpp => Vec::new(),
+            },
+        },
+        served_name: model.name.clone(),
+        upstream_id: None,
+        verbs: model.facts.verbs.clone(),
+        modalities,
+        quantization: Some(source.quantization.clone()),
+        origin: ProfileOrigin::Generated {
+            run: None,
+            model_revision: model.revision.clone().unwrap_or_default(),
+            starting_template: Some(template.id.clone()),
+            sources: Vec::new(),
+            answers: Vec::new(),
+        },
+        engine,
+        requirements: Requirements {
+            machines: k,
+            accelerator: Some(Accelerator {
+                family: template.family,
+                runtime: template.runtime,
+            }),
+            interconnect: (k > 1).then_some(Interconnect::Rdma),
+            memory: Some(memory),
+        },
+        notes: template.notes.clone(),
+    }
+}
+
+/// A container template's engine running `command`, with the rendezvous of a
+/// profile spanning `k` machines.
+fn container_engine(template: &Template, command: Vec<String>, k: u32, mount_to: &str) -> Engine {
     let (entrypoint, args, ranks) = if k > 1 {
         let quoted: Vec<String> = command
             .iter()
@@ -494,86 +633,28 @@ pub fn starting_profile(
     } else {
         (Some(Vec::new()), command, Vec::new())
     };
-    let need = match template.server {
-        // vLLM takes its whole memory share up front.
-        Server::Vllm => machine.usable_bytes(),
-        Server::LlamaCpp => {
-            predicted.per_machine_bytes
-                + projector.map_or(0, |p| p.file.size)
-                + kv_bytes_per_token(model, k).map_or(0, |per_token| per_token * predicted.context)
-        }
-    };
-    let memory = match machine.memory {
-        HwMemory::Unified { .. } => MemoryPerMachine::Unified {
-            system: SystemRamBytes(need),
+    Engine::Container(Container {
+        image: template.image.clone().unwrap_or_default(),
+        server: template.server,
+        entrypoint,
+        args,
+        env: BTreeMap::new(),
+        mounts: vec![Mount {
+            from: MountSource::HfCache,
+            to: mount_to.into(),
+            read_only: true,
+        }],
+        host: HostOptions {
+            ipc_host: true,
+            network_host: true,
+            shm_size: None,
+            gpus: true,
+            devices: Vec::new(),
+            ulimits: BTreeMap::new(),
         },
-        HwMemory::Discrete { .. } => MemoryPerMachine::Discrete {
-            vram: VramBytes(need),
-            host: SystemRamBytes(0),
-        },
-    };
-    let mut modalities = model.facts.modalities.clone();
-    if template.server == Server::LlamaCpp && projector.is_none() {
-        if let Some(modalities) = modalities.as_mut() {
-            modalities.input.retain(|m| *m == Modality::Text);
-        }
-    }
-    InferenceProfile {
-        id: profile_id(&model.name, Some(&source.quantization), template.server, k).into(),
-        source: Default::default(),
-        model: ModelRef {
-            name: model.name.clone(),
-            weights,
-            config_files: match template.server {
-                Server::Vllm => source.config_files.clone(),
-                Server::LlamaCpp => Vec::new(),
-            },
-        },
-        served_name: model.name.clone(),
-        upstream_id: None,
-        verbs: model.facts.verbs.clone(),
-        modalities,
-        quantization: Some(source.quantization.clone()),
-        origin: ProfileOrigin::Generated {
-            run: None,
-            model_revision: model.revision.clone().unwrap_or_default(),
-            starting_template: Some(template.id.clone()),
-            sources: Vec::new(),
-            answers: Vec::new(),
-        },
-        engine: Engine::Container(Container {
-            image: template.image.clone(),
-            server: template.server,
-            entrypoint,
-            args,
-            env: BTreeMap::new(),
-            mounts: vec![Mount {
-                from: MountSource::HfCache,
-                to: mount_to.into(),
-                read_only: true,
-            }],
-            host: HostOptions {
-                ipc_host: true,
-                network_host: true,
-                shm_size: None,
-                gpus: true,
-                devices: Vec::new(),
-                ulimits: BTreeMap::new(),
-            },
-            files: None,
-            ranks,
-        }),
-        requirements: Requirements {
-            machines: k,
-            accelerator: Some(Accelerator {
-                family: template.family,
-                runtime: template.runtime,
-            }),
-            interconnect: (k > 1).then_some(Interconnect::Rdma),
-            memory: Some(memory),
-        },
-        notes: template.notes.clone(),
-    }
+        files: None,
+        ranks,
+    })
 }
 
 /// The share of a device's memory vLLM pre-allocates when the profile sets no
@@ -675,6 +756,7 @@ impl PredictedNeed {
 enum Runs {
     Vllm,
     LlamaCpp,
+    MlxLm,
     Sglang,
     Unknown,
 }
@@ -728,8 +810,8 @@ fn flag<T: std::str::FromStr>(words: &[&str], names: &[&str]) -> Option<T> {
 }
 
 /// The words of what a profile runs (a container's entrypoint, arguments and
-/// environment, a native artifact's arguments, a command's start line) and the
-/// free text describing it, if any.
+/// environment, a native engine's program, arguments and environment, a
+/// command's start line) and the free text describing it, if any.
 fn engine_words(profile: &InferenceProfile) -> (Vec<&str>, Option<&str>) {
     match &profile.engine {
         Engine::Container(container) => (
@@ -743,9 +825,10 @@ fn engine_words(profile: &InferenceProfile) -> (Vec<&str>, Option<&str>) {
                 .collect(),
             None,
         ),
-        Engine::Native { artifact, args, .. } => (
-            std::iter::once(artifact)
-                .chain(args)
+        Engine::Native(native) => (
+            std::iter::once(&native.program)
+                .chain(&native.args)
+                .chain(native.env.values())
                 .flat_map(|text| words_of(text))
                 .collect(),
             None,
@@ -795,8 +878,10 @@ fn weight_size(profile: &InferenceProfile, model: Option<&Model>) -> Option<(u64
 /// unrecognised take their weights split across the machines times
 /// [`WEIGHT_OVERHEAD`], plus [`RESERVE_BYTES`]; llama.cpp adds the KV cache for
 /// its `-c` context (the total its `--parallel` slots share), or the model's
-/// trained context when it sets none. The engine is a container's server, else
-/// one its start line or arguments name, else one its description names.
+/// trained context when it sets none, and MLX, which takes no context limit,
+/// the model's trained context. The engine is a container's or native
+/// engine's server, else one its start line or arguments name, else one its
+/// description names.
 ///
 /// Refused, naming what is missing, when the profile shows neither a share
 /// nor a size for its weights.
@@ -805,12 +890,11 @@ pub fn predict_need(
     model: Option<&Model>,
 ) -> Result<PredictedNeed, String> {
     let (words, description) = engine_words(profile);
-    let runs = match &profile.engine {
-        Engine::Container(container) => match container.server {
-            Server::Vllm => Runs::Vllm,
-            Server::LlamaCpp => Runs::LlamaCpp,
-        },
-        _ => named_engine(words.iter().copied())
+    let runs = match profile.engine.server() {
+        Some(Server::Vllm) => Runs::Vllm,
+        Some(Server::LlamaCpp) => Runs::LlamaCpp,
+        Some(Server::MlxLm) => Runs::MlxLm,
+        None => named_engine(words.iter().copied())
             .or_else(|| description.and_then(|text| named_engine(words_of(text))))
             .unwrap_or(Runs::Unknown),
     };
@@ -835,7 +919,7 @@ pub fn predict_need(
                 });
             }
         }
-        Runs::LlamaCpp | Runs::Unknown => {}
+        Runs::LlamaCpp | Runs::MlxLm | Runs::Unknown => {}
     }
     let Some((weight_bytes, weights_from)) = weight_size(profile, model) else {
         return Err(
@@ -845,7 +929,7 @@ pub fn predict_need(
     };
     let machines = profile.requirements.machines.max(1);
     let kv = match (runs, model) {
-        (Runs::LlamaCpp, Some(model)) => flag::<u64>(&words, &["-c", "--ctx-size"])
+        (Runs::LlamaCpp | Runs::MlxLm, Some(model)) => flag::<u64>(&words, &["-c", "--ctx-size"])
             .filter(|tokens| *tokens > 0)
             .or(model.facts.context)
             .zip(kv_bytes_per_token(model, machines))
@@ -952,18 +1036,222 @@ mod tests {
     }
 
     fn args(profile: &InferenceProfile) -> &[String] {
-        let Engine::Container(container) = &profile.engine else {
-            unreachable!()
-        };
-        &container.args
+        profile.engine.args()
+    }
+
+    /// A Mac Studio: an M5 Ultra's 256 GiB, all of it the GPU's to share.
+    fn studio() -> PoolHw {
+        PoolHw {
+            machines: vec![MachineHw {
+                name: "studio".into(),
+                family: AcceleratorFamily::Apple,
+                gpu: "Apple M5 Ultra".into(),
+                memory: HwMemory::Unified { total: 256 * GIB },
+                arch: Arch::Aarch64,
+            }],
+            linked: false,
+        }
     }
 
     #[test]
-    fn the_templates_parse_and_pin_their_images() {
-        assert_eq!(templates().len(), 6);
-        assert!(templates()
+    fn the_templates_parse_and_pin_their_engines() {
+        assert_eq!(templates().len(), 8);
+        for template in templates() {
+            match (&template.image, &template.artifact) {
+                (Some(image), None) => {
+                    assert!(crate::profile::is_pinned_image(image), "{}", template.id);
+                    assert_ne!(template.family, AcceleratorFamily::Apple, "{}", template.id);
+                }
+                (None, Some(artifact)) => {
+                    assert_eq!(artifact.problem(), None, "{}", template.id);
+                    assert_eq!(template.family, AcceleratorFamily::Apple, "{}", template.id);
+                }
+                _ => panic!(
+                    "template {} names exactly one of image and artifact",
+                    template.id
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_apple_pool_is_served_natively_within_metal_s_working_set() {
+        assert_eq!(ids(&studio()), vec!["llamacpp-metal", "mlxlm-metal"]);
+        assert_eq!(
+            template("llamacpp-cuda").serves(&studio()).unwrap_err(),
+            "template llamacpp-cuda runs on nvidia (cuda), and the pool's accelerator is apple"
+        );
+        let mac = &studio().machines[0];
+        assert_eq!(mac.usable_fraction(), APPLE_USABLE);
+        assert_eq!(mac.usable_bytes(), (256.0 * 0.84 * GIB as f64) as u64);
+        assert_eq!(
+            template("vllm-ngc").reads(WeightFormat::Mlx).unwrap_err(),
+            "template vllm-ngc reads safetensors weights, and the source is mlx"
+        );
+        template("mlxlm-metal").reads(WeightFormat::Mlx).unwrap();
+    }
+
+    /// Tenet 1363 on unified memory: the embedder's need is what it loads,
+    /// a few GiB of a 256 GiB machine, never a share of it.
+    #[test]
+    fn the_embedder_on_a_mac_is_native_llama_cpp_needing_only_what_it_loads() {
+        let own = repo!("Qwen--Qwen3-Embedding-4B");
+        let gguf = repo!("Qwen--Qwen3-Embedding-4B-GGUF", no_config);
+        let model = model_of(&own);
+        let files = files(&model, &[own, gguf]);
+        let q8 = files.source("Qwen/Qwen3-Embedding-4B-GGUF@q8_0").unwrap();
+        let predicted = fit(&model, q8.bytes(), &studio()).unwrap();
+        assert_eq!(predicted.machines, 1);
+        let metal = template("llamacpp-metal");
+        metal.reads(q8.format).unwrap();
+        let profile = starting_profile(metal, q8, &model, &studio(), &predicted, None);
+        assert_eq!(profile.problems(), vec![]);
+        assert_eq!(
+            profile.id.as_str(),
+            "qwen3-embedding-4b-q8_0-llamacpp-metal-x1",
+            "apart from the container profile of the same weights"
+        );
+        let Engine::Native(native) = &profile.engine else {
+            panic!("{:?}", profile.engine)
+        };
+        assert_eq!(native.program, "llama-b12283/llama-server");
+        assert_eq!(&native.args[..2], ["-m", "{weights}"]);
+        assert!(native.args.windows(2).any(|w| w == ["--pooling", "last"]));
+        assert!(profile.model.config_files.is_empty(), "a GGUF holds them");
+        let Some(MemoryPerMachine::Unified { system }) = profile.requirements.memory else {
+            panic!("{:?}", profile.requirements.memory)
+        };
+        let kv = kv_bytes_per_token(&model, 1).unwrap() * predicted.context;
+        assert_eq!(system.0, predicted.per_machine_bytes + kv);
+        assert!(system.0 < 16 * GIB, "{} bytes", system.0);
+        assert_eq!(
+            predict_need(&unstated(profile.clone()), Some(&model))
+                .unwrap()
+                .bytes_on(Some(256 * GIB)),
+            Some(system.0),
+            "the need placement predicts is the one generation states"
+        );
+
+        let deployment = crate::deployment::Deployment {
+            id: "embed".into(),
+            source: Default::default(),
+            profile: profile.id.clone(),
+            machines: vec!["studio".into()],
+            head: "studio".into(),
+            api_port: 8090,
+            api_path: "/v1".into(),
+            health_path: "/v1/models".into(),
+        };
+        let start = crate::render::render(
+            &profile,
+            &deployment,
+            &[crate::render::MachineAt {
+                name: "studio".into(),
+                address: None,
+                link: None,
+            }],
+        )
+        .unwrap()
+        .start;
+        assert!(start.contains("\"$art\"/'llama-b12283/llama-server' '-m' \"$hf\"'/hub/models--Qwen--Qwen3-Embedding-4B-GGUF/snapshots/"));
+        assert!(start.contains(metal.artifact.as_ref().unwrap().sha256.as_str()));
+    }
+
+    #[test]
+    fn qwen36_on_a_mac_runs_mlx_s_4bit_as_text_in_text_out() {
+        let base = repo!("Qwen--Qwen3.6-35B-A3B");
+        let mlx = repo!("mlx-community--Qwen3.6-35B-A3B-4bit");
+        let model = model_of(&base);
+        let files = files(&model, &[mlx]);
+        let source = files
+            .source("mlx-community/Qwen3.6-35B-A3B-4bit@4bit")
+            .unwrap();
+        assert_eq!(source.format, WeightFormat::Mlx);
+        let predicted = fit(&model, source.bytes(), &studio()).unwrap();
+        let profile = starting_profile(
+            template("mlxlm-metal"),
+            source,
+            &model,
+            &studio(),
+            &predicted,
+            None,
+        );
+        assert_eq!(profile.problems(), vec![]);
+        assert_eq!(profile.id.as_str(), "qwen3.6-35b-a3b-4bit-mlxlm-metal-x1");
+        assert_eq!(profile.quantization.as_deref(), Some("4bit"));
+        assert_eq!(
+            args(&profile),
+            [
+                "--model",
+                "{snapshot}",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "{port}"
+            ],
+            "MLX takes no context limit"
+        );
+        assert!(
+            !profile.model.config_files.is_empty(),
+            "MLX reads its config and tokenizer beside the weights"
+        );
+        assert_eq!(
+            profile.modalities.unwrap().input,
+            vec![Modality::Text],
+            "mlx_lm.server takes no images"
+        );
+        let PredictedNeed::Sized {
+            kv: Some((tokens, _)),
+            ..
+        } = predict_need(
+            &unstated(starting_profile(
+                template("mlxlm-metal"),
+                source,
+                &model,
+                &studio(),
+                &predicted,
+                None,
+            )),
+            Some(&model),
+        )
+        .unwrap()
+        else {
+            panic!("an MLX profile is sized");
+        };
+        assert_eq!(Some(tokens), model.facts.context, "its trained context");
+    }
+
+    #[test]
+    fn a_native_projector_is_read_from_the_machine_s_own_cache() {
+        let base = repo!("Qwen--Qwen3.6-35B-A3B");
+        let gguf = repo!("ggml-org--Qwen3.6-35B-A3B-GGUF", no_config);
+        let model = model_of(&base);
+        let files = files(&model, &[gguf]);
+        let q8 = files
+            .sources
             .iter()
-            .all(|t| crate::profile::is_pinned_image(&t.image)));
+            .find(|source| source.quantization == "q8_0")
+            .unwrap();
+        let predicted = fit(&model, q8.bytes(), &studio()).unwrap();
+        let profile = starting_profile(
+            template("llamacpp-metal"),
+            q8,
+            &model,
+            &studio(),
+            &predicted,
+            files.projector_for(q8),
+        );
+        assert_eq!(profile.problems(), vec![]);
+        let mmproj = args(&profile)
+            .windows(2)
+            .find(|w| w[0] == "--mmproj")
+            .map(|w| w[1].clone())
+            .unwrap();
+        assert!(
+            mmproj.starts_with("{cache}/hub/models--ggml-org--Qwen3.6-35B-A3B-GGUF/snapshots/"),
+            "{mmproj}"
+        );
+        assert_eq!(profile.modalities, model.facts.modalities);
     }
 
     fn ids(pool: &PoolHw) -> Vec<&'static str> {
@@ -1087,7 +1375,7 @@ mod tests {
             .contains("if [ \"$rt\" = docker ]; then gpu=(--group-add video); else gpu=(); fi"));
         assert!(start.contains("--group-add keep-groups"), "podman's own");
         assert!(!start.contains("--gpus") && !start.contains("nvidia.com"));
-        assert!(start.contains(&format!("'{}'", rocm.image)));
+        assert!(start.contains(&format!("'{}'", rocm.image.as_deref().unwrap())));
     }
 
     #[test]

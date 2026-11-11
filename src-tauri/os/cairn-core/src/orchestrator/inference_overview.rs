@@ -26,7 +26,7 @@ use cairn_inference::metrics::EngineSummary;
 use cairn_inference::served::{self, EngineMeasure};
 use cairn_inference::{
     AcceleratorFamily, DeploymentId, Engine, InferenceProfile, InferenceProfileId, Inventory,
-    MemoryPerMachine, Model, Server, ValidationError, WeightFile,
+    MemoryPerMachine, Model, ValidationError, WeightFile,
 };
 use cairn_models::types::catalog::Modality;
 use serde::Serialize;
@@ -391,11 +391,8 @@ fn same_model(a: &str, b: &str) -> bool {
 
 fn engine_label(engine: &Engine) -> String {
     match engine {
-        Engine::Container(container) => match container.server {
-            Server::Vllm => "vLLM",
-            Server::LlamaCpp => "llama.cpp",
-        }
-        .to_string(),
+        Engine::Container(container) => container.server.label().to_string(),
+        Engine::Native(native) => format!("{} (native)", native.server.label()),
         other => other.kind().to_string(),
     }
 }
@@ -1046,7 +1043,7 @@ impl Sources<'_> {
                             origin: profile.origin.label().to_string(),
                             provenance: provenance(&profile.origin),
                             in_use: in_use.contains(profile.id.as_str()),
-                            verifiable: matches!(profile.engine, Engine::Container(_)),
+                            verifiable: profile.engine.is_runnable_form(),
                             edited: self.edited.contains(profile.id.as_str()),
                             regenerable: self.regenerable.contains(profile.id.as_str()),
                             fit: self.profile_fit(profile),
@@ -1083,9 +1080,12 @@ impl Sources<'_> {
         let measure = self.measures.get(deployment);
         let runs = match &profile.engine {
             Engine::Container(container) => Some(container.image.clone()),
-            Engine::Native {
-                artifact, version, ..
-            } => Some(format!("{artifact} {version}")),
+            Engine::Native(native) => Some(format!(
+                "{} {} ({})",
+                native.server.label(),
+                native.artifact.version,
+                native.artifact.url
+            )),
             Engine::Command { description, .. } => description.clone(),
         };
         Some(RunningDetail {
@@ -1401,7 +1401,8 @@ fn problem_field(
         | V::UnpinnedWeights { profile }
         | V::BadWeightFile { profile, .. }
         | V::BadImageDigest { profile, .. }
-        | V::BadArtifactSha { profile }
+        | V::BadArtifact { profile, .. }
+        | V::NativeSpansMachines { profile, .. }
         | V::EmptyStart { profile }
         | V::UnknownPlaceholder { profile, .. }
         | V::RanksMismatch { profile, .. }
@@ -1418,18 +1419,22 @@ fn problem_field(
         V::BadWeightFile { index, .. } => format!("weights.{index}"),
         V::UnknownPlaceholder { placeholder, .. } => {
             let braced = format!("{{{placeholder}}}");
-            match &profile.engine {
-                Engine::Container(container)
-                    if container.args.iter().any(|arg| arg.contains(&braced)) =>
-                {
-                    "args".into()
-                }
-                Engine::Container(container)
-                    if container.env.values().any(|value| value.contains(&braced)) =>
-                {
-                    "env".into()
-                }
-                _ => "yaml".into(),
+            let env = match &profile.engine {
+                Engine::Container(container) => Some(&container.env),
+                Engine::Native(native) => Some(&native.env),
+                Engine::Command { .. } => None,
+            };
+            if profile
+                .engine
+                .args()
+                .iter()
+                .any(|arg| arg.contains(&braced))
+            {
+                "args".into()
+            } else if env.is_some_and(|env| env.values().any(|value| value.contains(&braced))) {
+                "env".into()
+            } else {
+                "yaml".into()
             }
         }
         _ => "yaml".into(),

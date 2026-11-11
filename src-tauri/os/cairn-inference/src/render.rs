@@ -19,6 +19,25 @@
 //! Stop and the failed-start cleanup remove every rank's container, which is
 //! idempotent.
 //!
+//! A native profile runs on its one machine as a process of the executor's
+//! account: the only way to Apple silicon's GPU. Its start fetches and
+//! verifies the pinned files as a container's does, into the machine's own
+//! Hugging Face cache, which `{cache}`, `{snapshot}` and `{weights}` name.
+//! It fetches the pinned artifact into
+//! `~/.cairn/inference/artifacts/<sha256>`, checks it against its hash and
+//! makes it runnable there once: an archive unpacked whole, a wheel installed
+//! with its dependencies into an environment of its own by the `uv` Cairn
+//! provisions, resolving them only to releases published before the pin's
+//! cutoff. It then stops any server left under the deployment's name, starts
+//! the server detached with its pid in `~/.cairn/inference/run/<name>.pid`,
+//! and waits for health, failing with the server's error lines if it exits
+//! first. Stop signals that pid, and only while it is still the artifact's
+//! process. The server runs offline (`HF_HUB_OFFLINE=1`). Unlike a
+//! container it can read whatever its account can, the machine's Hugging Face
+//! token included, which is why its artifact is pinned by hash and its
+//! runnable surface approved before a generated profile runs. The scripts
+//! use nothing beyond what macOS's bash 3.2 has.
+//!
 //! Every value placed in a script is single-quoted by [`quote`], so no profile
 //! field reaches the shell as syntax. An argument or env value may span lines
 //! (a published compose command often does); a peer's script travels in a
@@ -34,7 +53,7 @@ use crate::inventory::ValidationError;
 use crate::machine::MachineName;
 use crate::profile::{
     placeholders, secret_references, AcceleratorFamily, AcceleratorRuntime, Container, Engine,
-    InferenceProfile, MountSource, Server, WeightFile,
+    InferenceProfile, MountSource, Native, Packaging, Server, WeightFile,
 };
 
 /// What the head runs for one deployment.
@@ -83,6 +102,18 @@ pub fn container_name(deployment: &str, rank: usize) -> String {
 /// Where the renderer checks out a profile's pinned source files, under the
 /// executor account's home.
 const SOURCES: &str = "$HOME/.cairn/inference/sources";
+
+/// Where a native profile's artifacts are made runnable, one directory per
+/// artifact hash, under the executor account's home.
+const ARTIFACTS: &str = "$HOME/.cairn/inference/artifacts";
+
+/// Where a native server's pid and output are kept, by its name.
+const RUN: &str = "$HOME/.cairn/inference/run";
+
+/// What `{cache}` fills in for a native engine before quoting: a mark that
+/// [`native_word`] turns into the script's `"$hf"`, the machine's Hugging
+/// Face cache, which only the running script knows.
+const CACHE_MARK: &str = "\u{1}hf\u{1}";
 
 /// A repository's directory within a Hugging Face cache: everything the hub
 /// library keeps of it (`blobs/`, `refs/`, `snapshots/`), and all a container
@@ -134,11 +165,45 @@ pub fn render(
             stop: stop.clone(),
             cleanup: stop.clone(),
         }),
-        Engine::Native { .. } => Err(Refusal(format!(
-            "profile {} uses a native engine, which Cairn cannot start yet",
-            profile.id
-        ))),
+        Engine::Native(native) => {
+            if profile.requirements.machines != 1 {
+                return Err(Refusal(format!(
+                    "profile {} runs a native engine on {} machines; a native engine runs on one machine",
+                    profile.id, profile.requirements.machines
+                )));
+            }
+            if let Some(problem) = native
+                .artifact
+                .problem()
+                .or_else(|| native.program_problem())
+            {
+                return Err(Refusal(format!(
+                    "profile {} native artifact: {problem}",
+                    profile.id
+                )));
+            }
+            if native.server == Server::MlxLm && profile.model.config_files.is_empty() {
+                return Err(Refusal(format!(
+                    "profile {} runs MLX on the pinned weights alone: it pins none of its repository's configuration, tokenizer and chat-template files (model.configFiles), and MLX loads the snapshot directory they belong in. Generate the profile again, which pins them",
+                    profile.id
+                )));
+            }
+            let ranks = Ranks::of(profile, deployment, machines)?;
+            let start = native_start_script(profile, native, deployment, &ranks)?;
+            let stop = native_stop_script(native, deployment);
+            Ok(Rendered {
+                start,
+                stop: Some(stop.clone()),
+                cleanup: Some(stop),
+            })
+        }
         Engine::Container(container) => {
+            if container.server == Server::MlxLm {
+                return Err(Refusal(format!(
+                    "profile {} runs MLX in a container; MLX runs natively, on Apple silicon",
+                    profile.id
+                )));
+            }
             if container.server == Server::Vllm
                 && mounts_cache(container)
                 && profile.model.config_files.is_empty()
@@ -209,22 +274,38 @@ impl<'a> Ranks<'a> {
     }
 }
 
-/// The values placeholders fill in for one rank.
+/// Where a container reads the Hugging Face cache: its cache mount's path.
+fn container_cache(container: &Container) -> Option<&str> {
+    container
+        .mounts
+        .iter()
+        .find(|mount| matches!(mount.from, MountSource::HfCache))
+        .map(|mount| mount.to.as_str())
+}
+
+/// The values placeholders fill in for one rank, with the Hugging Face cache
+/// at `cache` as the server reads it.
 fn values(
     profile: &InferenceProfile,
-    container: &Container,
+    cache: Option<&str>,
     deployment: &Deployment,
     ranks: &Ranks<'_>,
     rank: usize,
 ) -> BTreeMap<&'static str, Option<String>> {
     let (model, revision) = profile.model.weights_source();
-    let weights = container
-        .mounts
-        .iter()
-        .find(|mount| matches!(mount.from, MountSource::HfCache))
-        .zip(profile.model.weights.first())
-        .map(|(mount, weight)| cached_weight_path(&mount.to, weight));
+    let first = cache.zip(profile.model.weights.first());
+    let weights = first.map(|(cache, weight)| cached_weight_path(cache, weight));
+    let snapshot = first.map(|(cache, weight)| {
+        format!(
+            "{}/{}/snapshots/{}",
+            cache.trim_end_matches('/'),
+            cache_dir(&weight.repo),
+            weight.revision
+        )
+    });
     BTreeMap::from([
+        ("cache", cache.map(str::to_string)),
+        ("snapshot", snapshot),
         ("port", Some(deployment.api_port.to_string())),
         ("servedName", Some(profile.served_name.clone())),
         ("model", Some(model.to_string())),
@@ -248,7 +329,10 @@ fn why_unfilled(name: &str, ranks: &Ranks<'_>, rank: usize) -> String {
             "machine {} has no link address: it reports no fast link joining it to a pool",
             ranks.machines[rank].name
         ),
-        "weights" => "the profile mounts no Hugging Face cache or pins no weight file".into(),
+        "weights" | "snapshot" => {
+            "the profile mounts no Hugging Face cache or pins no weight file".into()
+        }
+        "cache" => "the profile mounts no Hugging Face cache".into(),
         _ => "it has no value".into(),
     }
 }
@@ -310,6 +394,51 @@ const HF_GET: &str = r#"hf_get() { if [ -z "${HF_TOKEN:-}" ] && [ -s "$hf/token"
 
 const RUNTIME: &str = r#"if command -v docker >/dev/null 2>&1; then rt=docker; elif command -v podman >/dev/null 2>&1; then rt=podman; else echo "neither docker nor podman is installed on $(hostname)" >&2; exit 1; fi"#;
 
+/// `$hf`, the machine's Hugging Face cache, and [`HF_GET`].
+fn cache_prelude(out: &mut String) {
+    out.push_str("hf=\"${HF_HOME:-$HOME/.cache/huggingface}\"\n");
+    out.push_str(HF_GET);
+    out.push('\n');
+}
+
+/// Fetch every pinned file into `$hf` before the server starts, each
+/// verified against its pin and landing whole or not at all, and make each
+/// pinned repository's directory there.
+fn fetch_pinned(out: &mut String, profile: &InferenceProfile) {
+    let fetch = |out: &mut String, repo: &str, revision: &str, path: &str, verify: String| {
+        let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{path}");
+        let _ = writeln!(
+            out,
+            "f=\"$hf\"/{}\nif [ ! -f \"$f\" ]; then mkdir -p \"$(dirname \"$f\")\"; hf_get {} \"$f.part\"; {verify}; mv \"$f.part\" \"$f\"; fi",
+            quote(cached_path("", repo, revision, path).trim_start_matches('/')),
+            quote(&url),
+        );
+    };
+    for file in &profile.model.config_files {
+        let verify = match (&file.sha256, &file.git_blob) {
+            (Some(sha256), _) => {
+                format!("echo {}\"  $f.part\" | sha256sum -c --quiet -", quote(sha256))
+            }
+            (None, Some(blob)) => format!(
+                "[ \"$({{ printf 'blob %d\\0' \"$(wc -c <\"$f.part\")\"; cat \"$f.part\"; }} | sha1sum | cut -d ' ' -f 1)\" = {} ] || {{ echo \"$f.part does not match its pinned git blob\" >&2; exit 1; }}",
+                quote(blob)
+            ),
+            (None, None) => unreachable!("checked by ConfigFile::problem"),
+        };
+        fetch(out, &file.repo, &file.revision, &file.path, verify);
+    }
+    for weight in &profile.model.weights {
+        let verify = format!(
+            "echo {}\"  $f.part\" | sha256sum -c --quiet -",
+            quote(&weight.sha256)
+        );
+        fetch(out, &weight.repo, &weight.revision, &weight.path, verify);
+    }
+    for repo in profile.model.repos() {
+        let _ = writeln!(out, "mkdir -p \"$hf\"/{}", quote(&cache_dir(repo)));
+    }
+}
+
 /// The script one rank runs on its own machine.
 fn rank_script(
     profile: &InferenceProfile,
@@ -318,7 +447,7 @@ fn rank_script(
     ranks: &Ranks<'_>,
     rank: usize,
 ) -> Result<String, Refusal> {
-    let values = values(profile, container, deployment, ranks, rank);
+    let values = values(profile, container_cache(container), deployment, ranks, rank);
     let fill = |text: &str| fill(profile, text, &values, ranks, rank);
     let name = container_name(deployment.id.as_str(), rank);
     let mut out = String::new();
@@ -327,9 +456,7 @@ fn rank_script(
     out.push('\n');
     let cache = mounts_cache(container);
     if cache {
-        out.push_str("hf=\"${HF_HOME:-$HOME/.cache/huggingface}\"\n");
-        out.push_str(HF_GET);
-        out.push('\n');
+        cache_prelude(&mut out);
     }
 
     if let Some(files) = &container.files {
@@ -344,47 +471,9 @@ fn rank_script(
     }
 
     // Cairn fetches every pinned file before the container starts, since
-    // the container reaches the cache only read-only; each is verified
-    // against its pin and lands whole or not at all.
+    // the container reaches the cache only read-only.
     if cache {
-        let fetch = |out: &mut String, repo: &str, revision: &str, path: &str, verify: String| {
-            let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{path}");
-            let _ = writeln!(
-                out,
-                "f=\"$hf\"/{}\nif [ ! -f \"$f\" ]; then mkdir -p \"$(dirname \"$f\")\"; hf_get {} \"$f.part\"; {verify}; mv \"$f.part\" \"$f\"; fi",
-                quote(cached_path("", repo, revision, path).trim_start_matches('/')),
-                quote(&url),
-            );
-        };
-        for file in &profile.model.config_files {
-            let verify = match (&file.sha256, &file.git_blob) {
-                (Some(sha256), _) => {
-                    format!("echo {}\"  $f.part\" | sha256sum -c --quiet -", quote(sha256))
-                }
-                (None, Some(blob)) => format!(
-                    "[ \"$({{ printf 'blob %d\\0' \"$(wc -c <\"$f.part\")\"; cat \"$f.part\"; }} | sha1sum | cut -d ' ' -f 1)\" = {} ] || {{ echo \"$f.part does not match its pinned git blob\" >&2; exit 1; }}",
-                    quote(blob)
-                ),
-                (None, None) => unreachable!("checked by ConfigFile::problem"),
-            };
-            fetch(&mut out, &file.repo, &file.revision, &file.path, verify);
-        }
-        for weight in &profile.model.weights {
-            let verify = format!(
-                "echo {}\"  $f.part\" | sha256sum -c --quiet -",
-                quote(&weight.sha256)
-            );
-            fetch(
-                &mut out,
-                &weight.repo,
-                &weight.revision,
-                &weight.path,
-                verify,
-            );
-        }
-        for repo in profile.model.repos() {
-            let _ = writeln!(out, "mkdir -p \"$hf\"/{}", quote(&cache_dir(repo)));
-        }
+        fetch_pinned(&mut out, profile);
     }
 
     let _ = writeln!(
@@ -615,6 +704,205 @@ fn start_script(
     Ok(out)
 }
 
+/// How an MLX server is started: `mlx_lm.server` itself, changed in two ways
+/// before it listens. It loads its model first, since otherwise it listens at
+/// once and loads in the background while its health already answers, so a
+/// start would be reported healthy, and its load timed, before the model is
+/// in memory. And it answers to the profile's served name as the model it
+/// loaded, since otherwise it takes a request's model as one to go and
+/// fetch. Both reach into `mlx_lm.server`'s module as the pinned mlx-lm
+/// 0.32.2 has it, so a profile pinning another release is verified before it
+/// is trusted, like any change. The served name is its first argument.
+const MLX_LAUNCHER: &str = "import sys
+import mlx_lm.server as server
+served = sys.argv.pop(1)
+serve = server.run
+
+def run(host, port, provider, *rest, **named):
+    for table in (provider._model_map, provider._adapter_map, provider._draft_model_map):
+        table[served] = table['default_model']
+    provider.load_default()
+    return serve(host, port, provider, *rest, **named)
+
+server.run = run
+sys.argv[0] = 'mlx_lm.server'
+server.main()
+";
+
+/// `uv`: the one Cairn provisions in its home, else one on the PATH.
+const UV: &str = r#"if [ -x "${CAIRN_HOME:-$HOME/.cairn}/bin/uv" ]; then uv="${CAIRN_HOME:-$HOME/.cairn}/bin/uv"; elif command -v uv >/dev/null 2>&1; then uv=uv; else echo "uv is not installed on $(hostname): Cairn provisions it with the executor, so update the executor" >&2; exit 1; fi"#;
+
+/// `value` single-quoted, with a filled-in `{cache}` turned into the script's
+/// `"$hf"`.
+fn native_word(value: &str) -> String {
+    let word = quote(value).replace(CACHE_MARK, "'\"$hf\"'");
+    match word.strip_prefix("''\"") {
+        Some(rest) => format!("\"{rest}"),
+        None => word,
+    }
+}
+
+/// `$art`, `$run` and `$name`, which a native start and stop share, and
+/// `stop_server`, which stops what runs under `$name` if it is still the
+/// artifact's process: a pid whose process has since exited may have been
+/// reused by something else of the account's.
+fn native_prelude(out: &mut String, native: &Native, deployment: &Deployment) {
+    let _ = writeln!(
+        out,
+        "art=\"{ARTIFACTS}\"/{}\nrun=\"{RUN}\"\nname={}",
+        quote(&native.artifact.sha256),
+        quote(&container_name(deployment.id.as_str(), 0)),
+    );
+    out.push_str(
+        r#"stop_server() {
+  if [ ! -f "$run/$name.pid" ]; then return 0; fi
+  pid="$(cat "$run/$name.pid")"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command" in
+      ""|*"$art"*)
+        kill -TERM "$pid" 2>/dev/null || true
+        waited=0
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+        kill -KILL "$pid" 2>/dev/null || true
+        ;;
+      *) echo "pid $pid is no longer $name, so it was left running" ;;
+    esac
+  fi
+  rm -f "$run/$name.pid"
+}
+"#,
+    );
+}
+
+/// Fetch the artifact into `$art`, check its hash and make it runnable, once:
+/// `$art/.complete` marks one that was.
+fn install_artifact(out: &mut String, native: &Native) {
+    let artifact = &native.artifact;
+    let file = format!("\"$art\"/{}", quote(artifact.file_name()));
+    let _ = writeln!(
+        out,
+        "if [ ! -f \"$art/.complete\" ]; then\n  rm -rf \"$art\"\n  mkdir -p \"$art\"\n  curl -fsSL --retry 3 -o {file} {url}\n  echo {sha}\"  \"{file} | sha256sum -c --quiet -",
+        url = quote(&artifact.url),
+        sha = quote(&artifact.sha256),
+    );
+    match &artifact.packaging {
+        Packaging::Archive => {
+            let _ = writeln!(out, "  tar -xzf {file} -C \"$art\"\n  rm -f {file}");
+        }
+        Packaging::Wheel {
+            python,
+            resolved_before,
+        } => {
+            let _ = writeln!(
+                out,
+                "  {UV}\n  \"$uv\" venv -q --python {} \"$art/env\"\n  VIRTUAL_ENV=\"$art/env\" \"$uv\" pip install -q --exclude-newer {} {file}",
+                quote(python),
+                quote(resolved_before),
+            );
+        }
+    }
+    out.push_str("  touch \"$art/.complete\"\nfi\n");
+}
+
+fn native_start_script(
+    profile: &InferenceProfile,
+    native: &Native,
+    deployment: &Deployment,
+    ranks: &Ranks<'_>,
+) -> Result<String, Refusal> {
+    let values = values(profile, Some(CACHE_MARK), deployment, ranks, 0);
+    let fill = |text: &str| fill(profile, text, &values, ranks, 0);
+    let mut out = format!(
+        "#!/usr/bin/env bash\n# Rendered by Cairn from profile {} for deployment {}: {} {}, run natively.\nset -euo pipefail\n",
+        profile.id,
+        deployment.id,
+        native.server.label(),
+        native.artifact.version.replace(['\n', '\r'], " "),
+    );
+    cache_prelude(&mut out);
+    fetch_pinned(&mut out, profile);
+    native_prelude(&mut out, native, deployment);
+    install_artifact(&mut out, native);
+
+    // The server starts from an empty environment, never the executor's: that
+    // carries the Hugging Face token `hf_get` reads, provider keys and the
+    // executor's own settings, none of which a server is given in a container.
+    let mut command: Vec<String> = [
+        "nohup",
+        "env",
+        "-i",
+        "'HOME='\"$HOME\"",
+        "'PATH=/usr/bin:/bin:/usr/sbin:/sbin'",
+        "'TMPDIR='\"${TMPDIR:-/tmp}\"",
+    ]
+    .map(String::from)
+    .to_vec();
+    for (key, value) in &native.env {
+        no_newline(profile, key)?;
+        // Validation refuses this too; a record written before it did must
+        // still not start a server holding a reference as its credential.
+        if let Some(reference) = secret_references(value).first() {
+            return Err(Refusal(
+                ValidationError::UnresolvedSecret {
+                    profile: profile.id.clone(),
+                    key: key.clone(),
+                    rank: None,
+                    reference: reference.to_string(),
+                }
+                .to_string(),
+            ));
+        }
+        command.push(native_word(&format!("{key}={}", fill(value)?)));
+    }
+    // Last, so the profile's env cannot undo them: every pinned file is
+    // already in the cache, and the server fetches nothing.
+    command.push("'HF_HOME='\"$hf\"".to_string());
+    command.push(quote("HF_HUB_OFFLINE=1"));
+    match (&native.artifact.packaging, native.server) {
+        (Packaging::Wheel { .. }, Server::MlxLm) => {
+            command.push("\"$art/env/bin/python\"".into());
+            command.push("-c".into());
+            command.push(quote(MLX_LAUNCHER));
+            command.push(quote(&profile.served_name));
+        }
+        (Packaging::Wheel { .. }, _) => {
+            command.push(format!("\"$art/env/bin\"/{}", quote(&native.program)));
+        }
+        (Packaging::Archive, _) => {
+            command.push(format!("\"$art\"/{}", quote(&native.program)));
+        }
+    }
+    for arg in &native.args {
+        command.push(native_word(&fill(arg)?));
+    }
+    no_newline(profile, &deployment.health_path)?;
+    let health = quote(&format!(
+        "http://127.0.0.1:{}{}",
+        deployment.api_port, deployment.health_path
+    ));
+    let _ = writeln!(
+        out,
+        "stop_server\nmkdir -p \"$run\"\ncd \"$run\"\n{} >\"$run/$name.log\" 2>&1 </dev/null &\npid=$!\necho \"$pid\" >\"$run/$name.pid\"",
+        command.join(" "),
+    );
+    let _ = writeln!(
+        out,
+        "while true; do\n  if curl -fsS -o /dev/null --max-time 5 {health}; then exit 0; fi\n  if ! kill -0 \"$pid\" 2>/dev/null; then\n    echo \"server $name exited before it was healthy; its last errors:\"\n    grep -E 'Error|error|Exception' \"$run/$name.log\" | tail -n 6 || tail -n 10 \"$run/$name.log\"\n    rm -f \"$run/$name.pid\"\n    exit 1\n  fi\n  sleep {HEALTH_POLL_SECS}\ndone"
+    );
+    Ok(out)
+}
+
+fn native_stop_script(native: &Native, deployment: &Deployment) -> String {
+    let mut out = format!(
+        "#!/usr/bin/env bash\n# Rendered by Cairn for deployment {}: stop its native server.\nset -uo pipefail\n",
+        deployment.id
+    );
+    native_prelude(&mut out, native, deployment);
+    out.push_str("stop_server\nexit 0\n");
+    out
+}
+
 fn stop_script(ranks: &Ranks<'_>, deployment: &Deployment) -> String {
     let mut out = format!(
         "#!/usr/bin/env bash\n# Rendered by Cairn for deployment {}: remove every rank's container.\nset -uo pipefail\n{RUNTIME}\n",
@@ -650,8 +938,8 @@ fn stop_script(ranks: &Ranks<'_>, deployment: &Deployment) -> String {
 mod tests {
     use super::*;
     use crate::profile::{
-        Accelerator, ConfigFile, HostOptions, ModelRef, Mount, ProfileOrigin, Requirements,
-        SourcePin,
+        Accelerator, Artifact, ConfigFile, HostOptions, ModelRef, Mount, ProfileOrigin,
+        Requirements, SourcePin, MLX_PROGRAM,
     };
     use crate::record::RecordSource;
 
@@ -1361,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_profile_passes_through_and_native_is_refused() {
+    fn a_command_profile_passes_through() {
         let profile = crate::fixture::command_profile("r", 1);
         let rendered = render(
             &profile,
@@ -1375,16 +1663,243 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.start, "./start.sh");
         assert_eq!(rendered.stop.as_deref(), Some("./stop.sh"));
-        let mut native = profile;
-        native.engine = Engine::Native {
-            artifact: "a".into(),
-            version: "1".into(),
-            sha256: "0".repeat(64),
-            args: vec![],
+    }
+
+    fn apple_metal() -> Option<Accelerator> {
+        Some(Accelerator {
+            family: AcceleratorFamily::Apple,
+            runtime: AcceleratorRuntime::Metal,
+        })
+    }
+
+    /// The embedder on a Mac: llama.cpp's own macOS build, run natively.
+    fn metal_embedder() -> InferenceProfile {
+        let mut profile = embedder();
+        profile.id = "qwen3-embedding-4b-q8_0-llamacpp-metal-x1".into();
+        profile.requirements.accelerator = apple_metal();
+        profile.engine = Engine::Native(Native {
+            server: Server::LlamaCpp,
+            artifact: Artifact {
+                url: "https://github.com/ggml-org/llama.cpp/releases/download/b12283/llama-b12283-bin-macos-arm64.tar.gz".into(),
+                version: "b12283".into(),
+                sha256: SHA.into(),
+                packaging: Packaging::Archive,
+            },
+            program: "llama-b12283/llama-server".into(),
+            args: [
+                "-m",
+                "{weights}",
+                "--alias",
+                "{servedName}",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "{port}",
+                "--embeddings",
+                "--pooling",
+                "last",
+            ]
+            .map(String::from)
+            .to_vec(),
+            env: BTreeMap::new(),
+        });
+        profile
+    }
+
+    /// Qwen3.6 from mlx-community's 4-bit quantization, served by MLX.
+    fn mlx_chat() -> InferenceProfile {
+        let mut profile = metal_embedder();
+        profile.id = "qwen3.6-35b-a3b-4bit-mlxlm-metal-x1".into();
+        let repo = "mlx-community/Qwen3.6-35B-A3B-4bit";
+        profile.model = ModelRef {
+            name: "Qwen/Qwen3.6-35B-A3B".into(),
+            weights: vec![
+                weight(repo, "model-00001-of-00004.safetensors"),
+                weight(repo, "model-00002-of-00004.safetensors"),
+            ],
+            config_files: vec![ConfigFile {
+                repo: repo.into(),
+                revision: "6821d6ad3681a4b137b066b76094fa82ebd0a380".into(),
+                path: "config.json".into(),
+                sha256: None,
+                git_blob: Some("8b4b87fc69023e7a224eb6563753aaf3223d8b98".into()),
+                size: Some(23_591),
+            }],
         };
-        assert!(render(&native, &deployment("r", &["sp1"], 8000), &[])
-            .unwrap_err()
-            .0
-            .contains("native engine"));
+        profile.served_name = "Qwen/Qwen3.6-35B-A3B".into();
+        profile.engine = Engine::Native(Native {
+            server: Server::MlxLm,
+            artifact: Artifact {
+                url: "https://files.pythonhosted.org/packages/d1/4f/000eefdeb41388782b47e7f39904cf2d9e7e49a60df5e172097c358dba8e/mlx_lm-0.32.2-py3-none-any.whl".into(),
+                version: "0.32.2".into(),
+                sha256: SHA.into(),
+                packaging: Packaging::Wheel {
+                    python: "3.12".into(),
+                    resolved_before: "2026-10-17T00:00:00Z".into(),
+                },
+            },
+            program: MLX_PROGRAM.into(),
+            args: ["--model", "{snapshot}", "--host", "0.0.0.0", "--port", "{port}"]
+                .map(String::from)
+                .to_vec(),
+            env: BTreeMap::new(),
+        });
+        profile
+    }
+
+    fn studio() -> Vec<MachineAt> {
+        vec![MachineAt {
+            name: "studio".into(),
+            address: Some("10.20.20.60".into()),
+            link: None,
+        }]
+    }
+
+    /// `bash -n` of each script: it parses as the shell that runs it will.
+    #[cfg(unix)]
+    fn parses(scripts: &[&str]) {
+        for script in scripts {
+            let output = std::process::Command::new("bash")
+                .arg("-n")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{script}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn a_native_llama_cpp_fetches_its_build_and_runs_detached_under_its_name() {
+        let rendered = render(
+            &metal_embedder(),
+            &deployment("embed", &["studio"], 8090),
+            &studio(),
+        )
+        .unwrap();
+        let (start, stop) = (&rendered.start, rendered.stop.as_deref().unwrap());
+        snapshot("llamacpp-metal-start.sh", start);
+        snapshot("native-stop.sh", stop);
+        assert_eq!(rendered.cleanup.as_deref(), Some(stop));
+        #[cfg(unix)]
+        parses(&[start, stop]);
+
+        assert!(
+            !start.contains("$rt") && !start.contains("ssh "),
+            "no container runtime and no peers"
+        );
+        assert!(start.contains("art=\"$HOME/.cairn/inference/artifacts\"/'a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8'"));
+        assert!(start.contains("| sha256sum -c --quiet -"));
+        assert!(
+            start.contains("tar -xzf \"$art\"/'llama-b12283-bin-macos-arm64.tar.gz' -C \"$art\"")
+        );
+        assert!(
+            start.contains("hf_get 'https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/Qwen3-Embedding-4B-Q8_0.gguf'"),
+            "the weights are fetched and verified as a container's are"
+        );
+        assert!(
+            start.contains("\"$art\"/'llama-b12283/llama-server' '-m' \"$hf\"'/hub/models--Qwen--Qwen3-Embedding-4B-GGUF/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380/Qwen3-Embedding-4B-Q8_0.gguf' '--alias' 'Qwen/Qwen3-Embedding-4B'"),
+            "{start}"
+        );
+        assert!(start.contains("'HF_HOME='\"$hf\" 'HF_HUB_OFFLINE=1'"));
+        assert!(
+            start.contains("nohup env -i 'HOME='\"$HOME\" 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' 'TMPDIR='\"${TMPDIR:-/tmp}\" 'HF_HOME='"),
+            "the server inherits nothing of the executor's environment, its token included"
+        );
+        assert!(start.contains("name='cairn-embed-r0'"));
+        assert!(start.contains("echo \"$pid\" >\"$run/$name.pid\""));
+        assert!(
+            start.contains("curl -fsS -o /dev/null --max-time 5 'http://127.0.0.1:8090/v1/models'")
+        );
+        assert!(
+            start.find("stop_server\n").unwrap() < start.find("nohup env").unwrap(),
+            "a server left under the name is stopped first"
+        );
+        assert!(stop.contains("kill -TERM \"$pid\"") && stop.contains("*\"$art\"*)"));
+        assert!(
+            !start.contains("[@]"),
+            "no arrays: macOS's bash 3.2 refuses an empty one under set -u"
+        );
+    }
+
+    #[test]
+    fn an_mlx_server_is_installed_by_uv_and_starts_loaded_under_its_served_name() {
+        let rendered = render(
+            &mlx_chat(),
+            &deployment("chat", &["studio"], 8080),
+            &studio(),
+        )
+        .unwrap();
+        let start = &rendered.start;
+        snapshot("mlxlm-metal-start.sh", start);
+        #[cfg(unix)]
+        parses(&[start, rendered.stop.as_deref().unwrap()]);
+        assert!(start.contains("curl -fsSL --retry 3 -o \"$art\"/'mlx_lm-0.32.2-py3-none-any.whl'"));
+        assert!(start.contains("\"$uv\" venv -q --python '3.12' \"$art/env\""));
+        assert!(start.contains("pip install -q --exclude-newer '2026-10-17T00:00:00Z' \"$art\"/'mlx_lm-0.32.2-py3-none-any.whl'"));
+        assert!(
+            start.contains("hf_get 'https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/config.json'"),
+            "MLX reads its repository's config beside the weights"
+        );
+        assert!(start.contains("\"$art/env/bin/python\" -c 'import sys"));
+        assert!(start.contains("provider.load_default()"));
+        assert!(
+            start.contains("server.main()\n' 'Qwen/Qwen3.6-35B-A3B' '--model' \"$hf\"'/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/6821d6ad3681a4b137b066b76094fa82ebd0a380' '--host'"),
+            "{start}"
+        );
+        assert!(!start.contains("tar -xzf"));
+    }
+
+    #[test]
+    fn mlx_in_a_container_and_a_native_gang_are_refused() {
+        let mut gang = metal_embedder();
+        gang.requirements.machines = 2;
+        let refusal = render(
+            &gang,
+            &deployment("embed", &["studio", "studio2"], 8090),
+            &studio(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.0,
+            "profile qwen3-embedding-4b-q8_0-llamacpp-metal-x1 runs a native engine on 2 machines; a native engine runs on one machine"
+        );
+
+        let mut contained = embedder();
+        if let Engine::Container(container) = &mut contained.engine {
+            container.server = Server::MlxLm;
+        }
+        let refusal = render(
+            &contained,
+            &deployment("embed", &["fedora"], 8090),
+            &fedora(),
+        )
+        .unwrap_err();
+        assert!(refusal.0.contains("MLX runs natively"), "{}", refusal.0);
+
+        let mut bare = mlx_chat();
+        bare.model.config_files.clear();
+        let refusal = render(&bare, &deployment("chat", &["studio"], 8080), &studio()).unwrap_err();
+        assert!(refusal.0.contains("model.configFiles"), "{}", refusal.0);
+
+        let mut unpinned = metal_embedder();
+        if let Engine::Native(native) = &mut unpinned.engine {
+            native.artifact.sha256 = "latest".into();
+        }
+        let refusal = render(
+            &unpinned,
+            &deployment("embed", &["studio"], 8090),
+            &studio(),
+        )
+        .unwrap_err();
+        assert!(
+            refusal.0.contains("native artifact: sha256"),
+            "{}",
+            refusal.0
+        );
     }
 }

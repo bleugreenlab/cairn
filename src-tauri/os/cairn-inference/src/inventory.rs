@@ -66,21 +66,29 @@ pub enum ValidationError {
         profile: InferenceProfileId,
         image: String,
     },
-    BadArtifactSha {
+    /// A native engine whose artifact pin or program a script could not
+    /// safely fetch or run.
+    BadArtifact {
         profile: InferenceProfileId,
+        problem: &'static str,
+    },
+    /// A native engine asked to span machines, which only containers do.
+    NativeSpansMachines {
+        profile: InferenceProfileId,
+        machines: u32,
     },
     EmptyStart {
         profile: InferenceProfileId,
     },
-    /// A container's args or env name a placeholder the renderer does not
-    /// fill.
+    /// A container's or native engine's args or env name a placeholder the
+    /// renderer does not fill.
     UnknownPlaceholder {
         profile: InferenceProfileId,
         placeholder: String,
     },
-    /// A container's env (`rank` `None`) or one rank's env reading a
-    /// secret-named variable that nothing fills in at container start. Names
-    /// the key and the reference, never the value.
+    /// An engine's env (`rank` `None`) or one rank's env reading a
+    /// secret-named variable that nothing fills in at start. Names the key
+    /// and the reference, never the value.
     UnresolvedSecret {
         profile: InferenceProfileId,
         key: String,
@@ -170,9 +178,12 @@ impl fmt::Display for ValidationError {
                 f,
                 "profile {profile} image {image} is not pinned by digest (@sha256:<64 hex>)"
             ),
-            Self::BadArtifactSha { profile } => write!(
+            Self::BadArtifact { profile, problem } => {
+                write!(f, "profile {profile} native artifact: {problem}")
+            }
+            Self::NativeSpansMachines { profile, machines } => write!(
                 f,
-                "profile {profile} native artifact sha256 is not 64 lowercase hex digits"
+                "profile {profile} runs a native engine on {machines} machines; a native engine runs on one machine"
             ),
             Self::EmptyStart { profile } => write!(f, "profile {profile} has an empty start command"),
             Self::UnknownPlaceholder {
@@ -188,7 +199,7 @@ impl fmt::Display for ValidationError {
                 let at = rank.map(|rank| format!("rank {rank} ")).unwrap_or_default();
                 write!(
                     f,
-                    "profile {profile} {at}env {key} reads ${{{reference}}}, a secret-named variable nothing fills in at container start: Cairn hands env to the container as written, so it would get that text where a credential should be. Remove the entry or give it a value that is not a secret"
+                    "profile {profile} {at}env {key} reads ${{{reference}}}, a secret-named variable nothing fills in at start: Cairn hands env to the engine as written, so it would get that text where a credential should be. Remove the entry or give it a value that is not a secret"
                 )?;
                 let upper = reference.to_ascii_uppercase();
                 if upper.starts_with("HF_") || upper.contains("HUGGING") {

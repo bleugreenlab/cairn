@@ -13,6 +13,12 @@
 # and, when it names one, its CPU `arch`. The container's GPU options follow
 # from family and runtime when the profile is rendered (`render.rs`): NVIDIA
 # through the container runtime's GPU support, AMD through its device nodes.
+#
+# No container reaches an Apple GPU, so Apple's templates are native: an
+# `artifact` pinned by URL, version and sha256 instead of an `image`, and a
+# `command` whose first word is the program in it (a path inside an archive,
+# or a console script of a wheel). Their arguments read the pinned files from
+# the machine's own Hugging Face cache (`{cache}`, `{snapshot}`, `{weights}`).
 
 # vLLM on DGX Spark (GB10, aarch64): NVIDIA's NGC build, the one bginf's
 # Qwen3.6 ran. nvcr.io/nvidia/vllm:26.05.post1-py3.
@@ -95,3 +101,51 @@
     and older releases hung in graph capture (vllm-project/vllm#32180): if a
     load stalls there, add --enforce-eager. On Strix Halo llama.cpp is usually
     the faster engine for one stream.
+
+# llama.cpp's server on Apple silicon through Metal, for GGUF weights, run
+# natively: upstream's macOS arm64 release build b12283, which carries its
+# Metal library beside the binary (`llama-b12283/`).
+- id: llamacpp-metal
+  server: llamaCpp
+  family: apple
+  runtime: metal
+  arch: aarch64
+  artifact:
+    url: https://github.com/ggml-org/llama.cpp/releases/download/b12283/llama-b12283-bin-macos-arm64.tar.gz
+    version: b12283
+    sha256: bbc2abe2001293687540fb274bf4114b27b56af1fc166ee76730f64996d68b00
+    packaging: {kind: archive}
+  formats: [gguf]
+  command: [llama-b12283/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
+  notes: >-
+    Metal lets the GPU wire about 84% of the machine's memory on macOS 26 (a
+    128 GiB M4 Max reports 110100 MiB to `llama-server --list-devices`); a
+    model past that fails to load rather than paging. The server listens on
+    every interface as the executor's account, so if macOS's application
+    firewall is on it must allow llama-server once. This is the engine for an
+    embedding model on Apple, and for a vision model's image input (with its
+    projector), since MLX's server serves neither.
+
+# MLX on Apple silicon: mlx-lm's server, for the MLX quantizations
+# mlx-community publishes. The mlx-lm 0.32.2 wheel from PyPI, installed by
+# Cairn's uv on Python 3.12 with its dependencies (mlx among them) resolved as
+# PyPI stood on 2026-10-17.
+- id: mlxlm-metal
+  server: mlxLm
+  family: apple
+  runtime: metal
+  arch: aarch64
+  artifact:
+    url: https://files.pythonhosted.org/packages/d1/4f/000eefdeb41388782b47e7f39904cf2d9e7e49a60df5e172097c358dba8e/mlx_lm-0.32.2-py3-none-any.whl
+    version: 0.32.2
+    sha256: 5c0991248cfff5872503d74f466d2532dd8cb7fb3670cb9be7a06d7305dadc04
+    packaging: {kind: wheel, python: "3.12", resolvedBefore: "2026-10-17T00:00:00Z"}
+  formats: [mlx]
+  command: [mlx_lm.server, --model, "{snapshot}", --host, 0.0.0.0, --port, "{port}"]
+  notes: >-
+    mlx_lm.server serves chat and text completions only: no embeddings and no
+    image input, which on Apple are llama.cpp's. It takes no context limit
+    and sizes its KV cache by each request; its default answer length is 512
+    tokens unless a request asks for more (--max-tokens changes it). Cairn
+    starts it through a launcher that loads the model before it listens and
+    answers to the served name, both of which the bare server does not do.

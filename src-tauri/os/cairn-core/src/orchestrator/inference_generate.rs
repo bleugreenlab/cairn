@@ -450,7 +450,25 @@ pub fn starting_profile(
     let source = files
         .source(source)
         .ok_or_else(|| unknown_source(files, source))?;
+    template.reads(source.format)?;
+    let embeds = model
+        .facts
+        .verbs
+        .as_ref()
+        .is_some_and(|verbs| verbs.contains(&cairn_models::types::catalog::VerbKind::Embed));
+    if template.server == cairn_inference::Server::MlxLm && embeds {
+        return Err(format!(
+            "{} embeds, and MLX's server serves no embeddings; on Apple an embedding model runs on llama.cpp (llamacpp-metal) from GGUF weights",
+            model.name
+        ));
+    }
     let predicted = fit::fit(model, source.bytes(), hardware)?;
+    if template.artifact.is_some() && predicted.machines > 1 {
+        return Err(format!(
+            "{}'s weights need {} machines, and template {} runs natively on one",
+            source.key, predicted.machines, template.id
+        ));
+    }
     let projector = match projector {
         Some(path) => Some(
             files
@@ -676,13 +694,30 @@ pub(crate) async fn insert_generation_in(
     Ok(())
 }
 
-/// What a container profile runs on its machines: everything that decides
-/// what code executes there and what of the host it reaches. The operator
-/// approves this before a generated draft is verified, since verifying runs
-/// it on the fleet.
+/// What a container or native profile runs on its machines: everything that
+/// decides what code executes there and what of the host it reaches. The
+/// operator approves this before a generated draft is verified, since
+/// verifying runs it on the fleet. A container's surface is unchanged by the
+/// native one's arrival, so approvals and promotions recorded against it
+/// still hold.
 pub fn runnable_surface(profile: &InferenceProfile) -> Option<Value> {
-    let Engine::Container(container) = &profile.engine else {
-        return None;
+    let container = match &profile.engine {
+        Engine::Container(container) => container,
+        Engine::Native(native) => {
+            return Some(serde_json::json!({
+                "schema": 2,
+                "engine": "native",
+                "weights": profile.model.weights,
+                "configFiles": profile.model.config_files,
+                "server": native.server,
+                "accelerator": profile.requirements.accelerator,
+                "artifact": native.artifact,
+                "program": native.program,
+                "args": native.args,
+                "env": native.env,
+            }))
+        }
+        Engine::Command { .. } => return None,
     };
     Some(serde_json::json!({
         "schema": 2,
@@ -872,32 +907,43 @@ async fn write_generated_held(
     if profile.requirements.memory.is_none() {
         return Err("a generated profile states requirements.memory from the fit tool".into());
     }
-    let Engine::Container(container) = &profile.engine else {
-        return Err(format!(
-            "a generated profile runs a digest-pinned container; a {} engine is the operator's to write at cairn://inference",
-            profile.engine.kind()
-        ));
-    };
-    if !container.host.devices.is_empty() {
-        return Err(format!(
-            "a generated profile passes no host devices beyond the GPUs ({}); one that needs them is the operator's to write in its editor",
-            container.host.devices.join(", ")
-        ));
-    }
-    if let Some(files) = &container.files {
-        return Err(format!(
-            "a generated profile checks out no source repository ({}); one that needs it is the operator's to write in its editor",
-            files.url
-        ));
-    }
-    if container.server == cairn_inference::Server::Vllm
-        && container
-            .mounts
-            .iter()
-            .any(|mount| mount.from == cairn_inference::MountSource::HfCache)
-        && profile.model.config_files.is_empty()
-    {
-        return Err("a generated vLLM profile pins its repository's configuration, tokenizer and chat-template files (model.configFiles), as its starting profile does: its container reaches only the pinned files, read-only".into());
+    match &profile.engine {
+        Engine::Container(container) => {
+            if !container.host.devices.is_empty() {
+                return Err(format!(
+                    "a generated profile passes no host devices beyond the GPUs ({}); one that needs them is the operator's to write in its editor",
+                    container.host.devices.join(", ")
+                ));
+            }
+            if let Some(files) = &container.files {
+                return Err(format!(
+                    "a generated profile checks out no source repository ({}); one that needs it is the operator's to write in its editor",
+                    files.url
+                ));
+            }
+            if container.server == cairn_inference::Server::Vllm
+                && container
+                    .mounts
+                    .iter()
+                    .any(|mount| mount.from == cairn_inference::MountSource::HfCache)
+                && profile.model.config_files.is_empty()
+            {
+                return Err("a generated vLLM profile pins its repository's configuration, tokenizer and chat-template files (model.configFiles), as its starting profile does: its container reaches only the pinned files, read-only".into());
+            }
+        }
+        Engine::Native(native) => {
+            if native.server == cairn_inference::Server::MlxLm
+                && profile.model.config_files.is_empty()
+            {
+                return Err("a generated MLX profile pins its repository's configuration, tokenizer and chat-template files (model.configFiles), as its starting profile does: MLX loads the snapshot directory they are in".into());
+            }
+        }
+        Engine::Command { .. } => {
+            return Err(format!(
+                "a generated profile runs a digest-pinned container or a hash-pinned native artifact; a {} engine is the operator's to write at cairn://inference",
+                profile.engine.kind()
+            ))
+        }
     }
     let inventory = load_inventory(db).await?;
     let model = inventory

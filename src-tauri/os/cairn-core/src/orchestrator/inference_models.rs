@@ -23,8 +23,10 @@ use crate::storage::LocalDb;
 pub const HUGGING_FACE: &str = "https://huggingface.co";
 
 /// Organisations whose quantized derivatives of a model are offered as its
-/// weights, besides the model's own organisation.
-const TRUSTED_QUANTIZERS: &[&str] = &["nvidia", "ggml-org"];
+/// weights, besides the model's own organisation: NVIDIA's FP4 and FP8
+/// builds, llama.cpp's own GGUFs, and the MLX community's quantizations,
+/// which are what Apple silicon runs under MLX.
+const TRUSTED_QUANTIZERS: &[&str] = &["nvidia", "ggml-org", "mlx-community"];
 
 pub type Fetched<'a> = Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + 'a>>;
 
@@ -249,6 +251,10 @@ pub fn describe(model: &Model) -> String {
 /// quantized derivatives its own organisation or a trusted quantizer
 /// publishes, each read at its current revision. A derivative that cannot be
 /// read is left out, with why.
+///
+/// Derivatives are listed per owner. A popular model has hundreds of
+/// derivatives across Hugging Face, so one listing of all of them, cut at a
+/// page, would leave out a trusted quantizer's at random.
 pub async fn weight_sources(
     hub: &dyn Hub,
     model: &Model,
@@ -258,28 +264,35 @@ pub async fn weight_sources(
     let mut skipped = Vec::new();
     let base = hub.base().trim_end_matches('/');
     let org = model.name.split('/').next().unwrap_or_default();
-    let listed = hub
-        .get(format!(
-            "{base}/api/models?filter=base_model:quantized:{}&limit=100",
-            model.name
-        ))
-        .await?
-        .unwrap_or_else(|| "[]".into());
-    let mut candidates: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&listed)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .get("id")
-                .or_else(|| entry.get("modelId"))?
-                .as_str()
-                .map(str::to_string)
-        })
-        .filter(|id| {
-            let owner = id.split('/').next().unwrap_or_default();
-            owner == org || TRUSTED_QUANTIZERS.contains(&owner)
-        })
-        .collect();
+    let mut candidates: Vec<String> = Vec::new();
+    for owner in std::iter::once(org).chain(
+        TRUSTED_QUANTIZERS
+            .iter()
+            .copied()
+            .filter(|owner| *owner != org),
+    ) {
+        let listed = hub
+            .get(format!(
+                "{base}/api/models?author={owner}&filter=base_model:quantized:{}&limit=100",
+                model.name
+            ))
+            .await?
+            .unwrap_or_else(|| "[]".into());
+        candidates.extend(
+            serde_json::from_str::<Vec<serde_json::Value>>(&listed)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("id")
+                        .or_else(|| entry.get("modelId"))?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                // The listing is asked for one owner; take nobody else's.
+                .filter(|id| id.split('/').next() == Some(owner)),
+        );
+    }
     // A GGUF repository often names the model's own base as its base, so the
     // filter misses it: look for it by name.
     let gguf = format!("{}-GGUF", model.name);
@@ -409,9 +422,35 @@ pub(crate) mod tests {
                 fixture!("Qwen--Qwen3-Embedding-4B-GGUF"),
                 None,
             );
+            hub.add(
+                "mlx-community/Qwen3.6-35B-A3B-4bit",
+                fixture!("mlx-community--Qwen3.6-35B-A3B-4bit"),
+                Some(fixture!("mlx-community--Qwen3.6-35B-A3B-4bit", config)),
+            );
+            hub.add(
+                "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
+                fixture!("mlx-community--Qwen3-Embedding-4B-4bit-DWQ"),
+                Some(fixture!(
+                    "mlx-community--Qwen3-Embedding-4B-4bit-DWQ",
+                    config
+                )),
+            );
+            let listing = |owner: &str, model: &str| {
+                format!("{HUGGING_FACE}/api/models?author={owner}&filter=base_model:quantized:{model}&limit=100")
+            };
             hub.bodies.insert(
-                format!("{HUGGING_FACE}/api/models?filter=base_model:quantized:Qwen/Qwen3.6-35B-A3B&limit=100"),
-                r#"[{"id":"nvidia/Qwen3.6-35B-A3B-NVFP4"},{"id":"someone/Qwen3.6-35B-A3B-Q2"}]"#.into(),
+                listing("nvidia", "Qwen/Qwen3.6-35B-A3B"),
+                r#"[{"id":"nvidia/Qwen3.6-35B-A3B-NVFP4"}]"#.into(),
+            );
+            hub.bodies.insert(
+                listing("mlx-community", "Qwen/Qwen3.6-35B-A3B"),
+                // An answer naming someone else's repository is not taken
+                // as that owner's.
+                r#"[{"id":"mlx-community/Qwen3.6-35B-A3B-4bit"},{"id":"someone/Qwen3.6-35B-A3B-Q2"}]"#.into(),
+            );
+            hub.bodies.insert(
+                listing("mlx-community", "Qwen/Qwen3-Embedding-4B"),
+                r#"[{"id":"mlx-community/Qwen3-Embedding-4B-4bit-DWQ"}]"#.into(),
             );
             hub
         }
@@ -508,15 +547,24 @@ pub(crate) mod tests {
         let repos: Vec<&str> = sources.iter().map(|s| s.repo.as_str()).collect();
         assert_eq!(
             repos,
-            vec!["Qwen/Qwen3.6-35B-A3B", "nvidia/Qwen3.6-35B-A3B-NVFP4"],
+            vec![
+                "Qwen/Qwen3.6-35B-A3B",
+                "nvidia/Qwen3.6-35B-A3B-NVFP4",
+                "mlx-community/Qwen3.6-35B-A3B-4bit"
+            ],
             "someone/... is not a trusted quantizer"
         );
+        assert!(sources[2].mlx, "the MLX community's weights are MLX's");
         let embedder = Model::named("Qwen/Qwen3-Embedding-4B");
         let (sources, _) = weight_sources(&hub, &embedder).await.unwrap();
         let repos: Vec<&str> = sources.iter().map(|s| s.repo.as_str()).collect();
         assert_eq!(
             repos,
-            vec!["Qwen/Qwen3-Embedding-4B", "Qwen/Qwen3-Embedding-4B-GGUF"]
+            vec![
+                "Qwen/Qwen3-Embedding-4B",
+                "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
+                "Qwen/Qwen3-Embedding-4B-GGUF"
+            ]
         );
     }
 }

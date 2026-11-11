@@ -198,6 +198,33 @@ fn fenced(out: &mut String, label: &str, text: &str) {
     out.push_str("    ```\n\n");
 }
 
+fn native_lines(out: &mut String, native: &cairn_inference::Native) {
+    let artifact = &native.artifact;
+    let _ = writeln!(out, "  - server: {}", native.server.as_str());
+    let _ = writeln!(
+        out,
+        "  - artifact: {} (version {}, sha256 {})",
+        artifact.url, artifact.version, artifact.sha256
+    );
+    let _ = match &artifact.packaging {
+        cairn_inference::Packaging::Archive => writeln!(out, "  - packaging: a .tar.gz unpacked whole"),
+        cairn_inference::Packaging::Wheel {
+            python,
+            resolved_before,
+        } => writeln!(
+            out,
+            "  - packaging: a wheel installed by uv on Python {python}, its dependencies as published before {resolved_before}"
+        ),
+    };
+    let _ = writeln!(out, "  - program: {}", native.program);
+    if !native.args.is_empty() {
+        let _ = writeln!(out, "  - args: {}", native.args.join(" "));
+    }
+    for (key, value) in &native.env {
+        let _ = writeln!(out, "  - env {key}={value}");
+    }
+}
+
 fn container_lines(out: &mut String, container: &cairn_inference::Container) {
     let _ = writeln!(out, "  - image: {}", container.image);
     let _ = writeln!(out, "  - server: {}", container.server.as_str());
@@ -361,17 +388,7 @@ fn profile_section(out: &mut String, profile: &InferenceProfile) {
     let _ = writeln!(out, "- engine: {}", profile.engine.kind());
     match &profile.engine {
         Engine::Container(container) => container_lines(out, container),
-        Engine::Native {
-            artifact,
-            version,
-            sha256,
-            args,
-        } => {
-            let _ = writeln!(out, "  - artifact: {artifact} {version} (sha256 {sha256})");
-            if !args.is_empty() {
-                let _ = writeln!(out, "  - args: {}", args.join(" "));
-            }
-        }
+        Engine::Native(native) => native_lines(out, native),
         Engine::Command {
             start,
             stop,
@@ -1016,8 +1033,9 @@ fn model_line(model: &cairn_inference::Model) -> String {
 
 fn profile_summary(profile: &InferenceProfile) -> String {
     let server = match &profile.engine {
-        Engine::Container(container) => container.server.as_str(),
-        other => other.kind(),
+        Engine::Container(container) => container.server.as_str().to_string(),
+        Engine::Native(native) => format!("{} native", native.server.as_str()),
+        other => other.kind().to_string(),
     };
     format!(
         "{}, {server}, x{}, {}",

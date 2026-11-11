@@ -321,9 +321,17 @@ fn fit_line(out: &mut String, fit: &FitAnswer) {
 }
 
 fn template_lines(out: &mut String, template: &Template) {
+    let runs = match (&template.image, &template.artifact) {
+        (Some(image), _) => format!("image: `{image}`"),
+        (None, Some(artifact)) => format!(
+            "native artifact: `{}` (version {}, sha256 {}), run on the machine itself",
+            artifact.url, artifact.version, artifact.sha256
+        ),
+        (None, None) => "runs: unknown".into(),
+    };
     let _ = writeln!(
         out,
-        "## {}\n\n- server: {}\n- hardware: {} on {}{}\n- weights: {:?}\n- image: `{}`\n- command: `{}`{}\n",
+        "## {}\n\n- server: {}\n- hardware: {} on {}{}\n- weights: {}\n- {runs}\n- command: `{}`{}\n",
         template.id,
         template.server.as_str(),
         template.family.as_str(),
@@ -332,8 +340,12 @@ fn template_lines(out: &mut String, template: &Template) {
             .arch
             .map(|arch| format!(", {} only", arch.as_str()))
             .unwrap_or_default(),
-        template.formats,
-        template.image,
+        template
+            .formats
+            .iter()
+            .map(|format| format.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         template.command.join(" "),
         template
             .notes

@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{Engine, InferenceProfile};
+use crate::profile::InferenceProfile;
 
 /// How far a verification got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,12 +151,10 @@ const CONTEXT_FLAGS: &[&str] = &["--max-model-len", "-c", "--ctx-size"];
 
 /// The context a profile's engine is told to hold.
 pub fn context_of(profile: &InferenceProfile) -> Option<u64> {
-    let Engine::Container(container) = &profile.engine else {
-        return None;
-    };
-    container.args.iter().enumerate().find_map(|(i, arg)| {
+    let args = profile.engine.args();
+    args.iter().enumerate().find_map(|(i, arg)| {
         if CONTEXT_FLAGS.contains(&arg.as_str()) {
-            return container.args.get(i + 1)?.parse().ok();
+            return args.get(i + 1)?.parse().ok();
         }
         CONTEXT_FLAGS.iter().find_map(|flag| {
             let words: Vec<&str> = arg.split_whitespace().collect();
@@ -175,17 +173,13 @@ pub fn clamp_context(profile: &InferenceProfile, tokens: u64) -> Option<Inferenc
         return None;
     }
     let mut revised = profile.clone();
-    let Engine::Container(container) = &mut revised.engine else {
-        return None;
-    };
+    let args = revised.engine.args_mut()?;
     let from = current.to_string();
     let to = clamped.to_string();
     let mut changed = false;
-    for i in 0..container.args.len() {
-        if CONTEXT_FLAGS.contains(&container.args[i].as_str())
-            && container.args.get(i + 1) == Some(&from)
-        {
-            container.args[i + 1] = to.clone();
+    for i in 0..args.len() {
+        if CONTEXT_FLAGS.contains(&args[i].as_str()) && args.get(i + 1) == Some(&from) {
+            args[i + 1] = to.clone();
             changed = true;
         }
         for flag in CONTEXT_FLAGS {
@@ -193,8 +187,8 @@ pub fn clamp_context(profile: &InferenceProfile, tokens: u64) -> Option<Inferenc
                 (format!("{flag} {from}"), format!("{flag} {to}")),
                 (format!("'{flag}' '{from}'"), format!("'{flag}' '{to}'")),
             ] {
-                if container.args[i].contains(&old) {
-                    container.args[i] = container.args[i].replace(&old, &new);
+                if args[i].contains(&old) {
+                    args[i] = args[i].replace(&old, &new);
                     changed = true;
                 }
             }
@@ -233,7 +227,9 @@ pub fn embed_batch() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{Container, HostOptions, ModelRef, ProfileOrigin, Requirements, Server};
+    use crate::profile::{
+        Container, Engine, HostOptions, ModelRef, ProfileOrigin, Requirements, Server,
+    };
     use std::collections::BTreeMap;
 
     fn profile(args: Vec<&str>) -> InferenceProfile {

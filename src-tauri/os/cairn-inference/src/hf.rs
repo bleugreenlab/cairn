@@ -12,7 +12,8 @@
 //! tags as `base_model:quantized:`. The host takes the first that exists.
 //!
 //! [`classify`] sorts the files of a model's repositories into what can run
-//! it: weight sources (every safetensors file of a repository; each GGUF
+//! it: weight sources (every safetensors file of a repository, which is MLX
+//! weights when the repository says it is an MLX one; each GGUF
 //! quantization, its split shards `-NNNNN-of-MMMMM` grouped into one source),
 //! vision projectors (`mmproj-*`, which llama.cpp loads with `--mmproj`), and
 //! speculative-decoding draft heads (`mtp-*`, `dflash-*`, `*draft*`). A
@@ -23,18 +24,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_models_types::catalog::{Modalities, Modality, VerbKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ModelFacts;
 use crate::profile::{is_commit_sha, is_sha256_hex, ConfigFile};
 
-/// What a weight file holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+/// What a weight source holds, which decides the servers that read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WeightFormat {
     Safetensors,
     Gguf,
+    /// Safetensors files in MLX's own layout and quantization (an
+    /// `mlx-community` repository), which only MLX reads.
+    Mlx,
+}
+
+impl WeightFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Safetensors => "safetensors",
+            Self::Gguf => "gguf",
+            Self::Mlx => "mlx",
+        }
+    }
 }
 
 /// One file Hugging Face stores in LFS, with its content hash.
@@ -46,6 +60,8 @@ pub struct HfFile {
 }
 
 impl HfFile {
+    /// The file's format by its name; an MLX repository's safetensors files
+    /// are MLX weights, which only [`HfRepo::mlx`] says.
     pub fn format(&self) -> Option<WeightFormat> {
         if self.path.ends_with(".safetensors") {
             Some(WeightFormat::Safetensors)
@@ -151,7 +167,8 @@ pub struct WeightSource {
     pub quantization: String,
     pub files: Vec<HfFile>,
     /// The repository's configuration, tokenizer and chat-template files,
-    /// which a safetensors server reads beside the weights. None for GGUF.
+    /// which a safetensors or MLX server reads beside the weights. None for
+    /// GGUF.
     pub config_files: Vec<ConfigFile>,
 }
 
@@ -215,7 +232,7 @@ impl RepoFiles {
 /// Sort `repos` (a model's own repository and its quantized derivatives) into
 /// weight sources and the files beside them. A safetensors source's
 /// quantization is its repository's quantization config, else its dtype, else
-/// `model_dtype`.
+/// `model_dtype`; it is an MLX source when its repository is an MLX one.
 pub fn classify(repos: &[HfRepo], model_dtype: Option<&str>) -> RepoFiles {
     let mut files = RepoFiles::default();
     for repo in repos {
@@ -243,7 +260,11 @@ pub fn classify(repos: &[HfRepo], model_dtype: Option<&str>) -> RepoFiles {
                 key: String::new(),
                 repo: repo.repo.clone(),
                 revision: repo.revision.clone(),
-                format: WeightFormat::Safetensors,
+                format: if repo.mlx {
+                    WeightFormat::Mlx
+                } else {
+                    WeightFormat::Safetensors
+                },
                 quantization,
                 files: safetensors,
                 config_files: repo.config_files.clone(),
@@ -335,6 +356,9 @@ pub struct HfRepo {
     /// Set when this repository is a quantized derivative of another model:
     /// the models it may quantize, best guess first.
     pub base_candidates: Vec<String>,
+    /// Whether the repository says it holds MLX weights (its library is
+    /// `mlx`, or it is tagged so), whose safetensors only MLX reads.
+    pub mlx: bool,
 }
 
 impl HfRepo {
@@ -461,10 +485,17 @@ pub fn parse(api: &str, config: Option<&str>) -> Result<HfRepo, String> {
         || weights
             .iter()
             .any(|w| w.format() == Some(WeightFormat::Gguf));
-    let config_quantization = config
-        .as_ref()
-        .and_then(|config| config.get("quantization_config"))
-        .and_then(quantization_label);
+    let mlx =
+        api.get("library_name").and_then(Value::as_str) == Some("mlx") || tags.contains(&"mlx");
+    let config_quantization = config.as_ref().and_then(|config| {
+        if mlx {
+            mlx_quantization_label(config.get("quantization")?)
+        } else {
+            config
+                .get("quantization_config")
+                .and_then(quantization_label)
+        }
+    });
 
     let mut base_candidates = Vec::new();
     let quantized = is_gguf || !quantized_tags.is_empty();
@@ -521,7 +552,20 @@ pub fn parse(api: &str, config: Option<&str>) -> Result<HfRepo, String> {
         weights,
         config_files,
         base_candidates,
+        mlx,
     })
+}
+
+/// An MLX config's `quantization` as a label: `4bit` for MLX's affine
+/// quantization at 4 bits, else its mode (`mxfp4`, `nvfp4`, `mxfp8`).
+fn mlx_quantization_label(quantization: &Value) -> Option<String> {
+    match quantization.get("mode").and_then(Value::as_str) {
+        None | Some("affine") => {
+            let bits = quantization.get("bits")?.as_u64()?;
+            Some(format!("{bits}bit"))
+        }
+        Some(mode) => Some(mode.to_ascii_lowercase()),
+    }
 }
 
 /// The verbs and modalities a pipeline tag says a model serves.
@@ -959,10 +1003,68 @@ mod tests {
             ],
             config_files: vec![],
             base_candidates: vec![],
+            mlx: false,
         };
         let files = classify(&[repo], None);
         assert!(files.sources.is_empty());
         assert_eq!(files.other.len(), 2);
+    }
+
+    #[test]
+    fn an_mlx_community_repo_is_mlx_weights_labelled_by_its_quantization() {
+        let repo = read(
+            fixture!("mlx-community--Qwen3.6-35B-A3B-4bit"),
+            Some(fixture!("mlx-community--Qwen3.6-35B-A3B-4bit", config)),
+        );
+        assert!(repo.mlx);
+        assert!(repo
+            .base_candidates
+            .contains(&"Qwen/Qwen3.6-35B-A3B".to_string()));
+        assert_eq!(
+            repo.facts.quantization.as_deref(),
+            Some("4bit"),
+            "its quantization, not its checkpoint's bf16"
+        );
+        let files = classify(std::slice::from_ref(&repo), Some("bfloat16"));
+        let source = files
+            .source("mlx-community/Qwen3.6-35B-A3B-4bit@4bit")
+            .unwrap();
+        assert_eq!(source.format, WeightFormat::Mlx);
+        assert_eq!(source.files.len(), 4);
+        assert_eq!(
+            source.bytes(),
+            5_288_196_018 + 5_368_472_749 + 5_368_324_139 + 4_377_211_365
+        );
+        assert!(
+            source
+                .config_files
+                .iter()
+                .any(|file| file.path == "tokenizer.json" && file.sha256.is_some()),
+            "MLX reads its tokenizer beside the weights"
+        );
+
+        let embedder = read(
+            fixture!("mlx-community--Qwen3-Embedding-4B-4bit-DWQ"),
+            Some(fixture!(
+                "mlx-community--Qwen3-Embedding-4B-4bit-DWQ",
+                config
+            )),
+        );
+        assert!(embedder.mlx);
+        assert_eq!(embedder.facts.quantization.as_deref(), Some("4bit"));
+        assert!(embedder
+            .base_candidates
+            .contains(&"Qwen/Qwen3-Embedding-4B".to_string()));
+
+        let mode = |text: &str| mlx_quantization_label(&serde_json::from_str(text).unwrap());
+        assert_eq!(
+            mode(r#"{"group_size":32,"bits":4,"mode":"mxfp4"}"#).as_deref(),
+            Some("mxfp4")
+        );
+        assert_eq!(
+            mode(r#"{"group_size":64,"bits":8,"mode":"affine"}"#).as_deref(),
+            Some("8bit")
+        );
     }
 
     #[test]

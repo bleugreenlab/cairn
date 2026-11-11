@@ -136,8 +136,8 @@ pub struct ModelRef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<WeightFile>,
     /// The other files of the weights' repository a server reads beside
-    /// them: vLLM's configuration, tokenizer and chat template. A GGUF file
-    /// holds all of that itself, so a llama.cpp profile pins none.
+    /// them: vLLM's and MLX's configuration, tokenizer and chat template. A
+    /// GGUF file holds all of that itself, so a llama.cpp profile pins none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_files: Vec<ConfigFile>,
 }
@@ -279,14 +279,9 @@ fn location_problem(repo: &str, revision: &str, path: &str) -> Option<&'static s
 pub enum Engine {
     /// A container image pinned by digest, and everything needed to run it.
     Container(Container),
-    /// A pinned native artifact.
-    Native {
-        artifact: String,
-        version: String,
-        sha256: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        args: Vec<String>,
-    },
+    /// A pinned artifact run as a process on the machine itself: the only
+    /// way to Apple silicon's GPU, which no container reaches.
+    Native(Native),
     /// An operator's raw start and stop shell, run on the head as its
     /// executor's account. Every profile adopted from bginf is one;
     /// `description` is free text saying what the shell runs.
@@ -303,11 +298,213 @@ impl Engine {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Container(_) => "container",
-            Self::Native { .. } => "native",
+            Self::Native(_) => "native",
             Self::Command { .. } => "command",
         }
     }
+
+    /// The serving program, for the engines whose record names it.
+    pub fn server(&self) -> Option<Server> {
+        match self {
+            Self::Container(container) => Some(container.server),
+            Self::Native(native) => Some(native.server),
+            Self::Command { .. } => None,
+        }
+    }
+
+    /// The arguments the serving program is given; none for a command.
+    pub fn args(&self) -> &[String] {
+        match self {
+            Self::Container(container) => &container.args,
+            Self::Native(native) => &native.args,
+            Self::Command { .. } => &[],
+        }
+    }
+
+    pub fn args_mut(&mut self) -> Option<&mut Vec<String>> {
+        match self {
+            Self::Container(container) => Some(&mut container.args),
+            Self::Native(native) => Some(&mut native.args),
+            Self::Command { .. } => None,
+        }
+    }
+
+    /// Whether Cairn renders it and verification can measure it: a
+    /// container or native engine, never an operator's opaque command.
+    pub fn is_runnable_form(&self) -> bool {
+        !matches!(self, Self::Command { .. })
+    }
 }
+
+/// A native profile's complete runnable form: what [`crate::render`] turns
+/// into the start and stop scripts its machine runs. Native profiles run on
+/// one machine.
+///
+/// `args` and `env` may hold the placeholders in [`PLACEHOLDERS`]. Every
+/// pinned file is read from the machine's own Hugging Face cache, which
+/// `{cache}`, `{snapshot}` and `{weights}` name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Native {
+    pub server: Server,
+    pub artifact: Artifact,
+    /// The serving program: a path inside an unpacked archive
+    /// (`llama-b12283/llama-server`), or a console script of an installed
+    /// wheel (`mlx_lm.server`).
+    pub program: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A downloadable build of a serving program, pinned by its content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    /// An `https` URL whose last path segment is the file's name.
+    pub url: String,
+    /// The upstream release it is (`b12283`, `0.32.2`), as its publisher
+    /// names it.
+    pub version: String,
+    /// Lowercase hex SHA-256 of the file.
+    pub sha256: String,
+    pub packaging: Packaging,
+}
+
+/// What the artifact file is, which says how it becomes runnable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Packaging {
+    /// A `.tar.gz` unpacked whole; [`Native::program`] is a path inside it.
+    Archive,
+    /// A Python wheel installed, with its dependencies, into an environment
+    /// of its own by the `uv` Cairn provisions on every executor. The wheel
+    /// is pinned by its hash; its dependencies resolve only to releases
+    /// published before `resolvedBefore`, so the same profile installs the
+    /// same environment wherever it runs.
+    #[serde(rename_all = "camelCase")]
+    Wheel {
+        /// The Python version the environment is built on (`3.12`).
+        python: String,
+        /// A date (`2026-10-17`) or UTC instant (`2026-10-17T00:00:00Z`).
+        resolved_before: String,
+    },
+}
+
+impl Artifact {
+    /// The file's name: the URL's last path segment.
+    pub fn file_name(&self) -> &str {
+        let path = self.url.split(['?', '#']).next().unwrap_or(&self.url);
+        path.rsplit('/').next().unwrap_or(path)
+    }
+
+    /// What is lexically wrong with the pin, so a script never fetches from
+    /// or writes to somewhere it should not.
+    pub(crate) fn problem(&self) -> Option<&'static str> {
+        if !is_sha256_hex(&self.sha256) {
+            return Some("sha256 is not 64 lowercase hex digits");
+        }
+        if !self.url.starts_with("https://")
+            || self
+                .url
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\'' | '"' | '\\'))
+        {
+            return Some(
+                "url must be https, with no whitespace, quote, backslash or control character",
+            );
+        }
+        let name = self.file_name();
+        if name.is_empty()
+            || name.starts_with('.')
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+        {
+            return Some(
+                "the url's last segment must be a file name of letters, digits, ., _, - and +",
+            );
+        }
+        if self.version.trim().is_empty() || self.version.chars().any(char::is_control) {
+            return Some("version must be the upstream release's name");
+        }
+        match &self.packaging {
+            Packaging::Archive if !(name.ends_with(".tar.gz") || name.ends_with(".tgz")) => {
+                Some("an archive artifact is a .tar.gz")
+            }
+            Packaging::Wheel { .. } if !name.ends_with(".whl") => {
+                Some("a wheel artifact's file name ends in .whl, which uv needs to install it")
+            }
+            Packaging::Wheel { python, .. }
+                if !python.split_once('.').is_some_and(|(major, minor)| {
+                    [major, minor].iter().all(|part| {
+                        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                    })
+                }) =>
+            {
+                Some("a wheel's python is a version like 3.12")
+            }
+            Packaging::Wheel {
+                resolved_before, ..
+            } if !is_cutoff(resolved_before) => Some(
+                "a wheel's resolvedBefore is a date (2026-10-17) or a UTC instant (2026-10-17T00:00:00Z)",
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SSZ`: what `uv --exclude-newer` takes.
+fn is_cutoff(value: &str) -> bool {
+    let shape = |text: &str, pattern: &str| {
+        text.len() == pattern.len()
+            && text.bytes().zip(pattern.bytes()).all(|(c, p)| match p {
+                b'9' => c.is_ascii_digit(),
+                _ => c == p,
+            })
+    };
+    shape(value, "9999-99-99") || shape(value, "9999-99-99T99:99:99Z")
+}
+
+impl Native {
+    /// Every string the renderer fills placeholders in.
+    fn templated(&self) -> impl Iterator<Item = &str> {
+        self.args
+            .iter()
+            .chain(self.env.values())
+            .map(String::as_str)
+    }
+
+    /// What is wrong with the program the artifact runs.
+    pub(crate) fn program_problem(&self) -> Option<&'static str> {
+        let segment_ok = |part: &str| {
+            !matches!(part, "" | "." | "..")
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+        };
+        if !self.program.split('/').all(segment_ok) {
+            return Some("program must be a relative path of letters, digits, ., _, - and +, with no empty, . or .. segment");
+        }
+        match (&self.artifact.packaging, self.server) {
+            (Packaging::Wheel { .. }, _) if self.program.contains('/') => {
+                Some("a wheel's program is one of its console scripts, a name with no /")
+            }
+            (Packaging::Wheel { .. }, Server::MlxLm) if self.program != MLX_PROGRAM => {
+                Some("an mlxLm server runs mlx_lm.server")
+            }
+            (Packaging::Archive, Server::MlxLm) => {
+                Some("an mlxLm server comes as the mlx-lm wheel")
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The console script an MLX server runs, which the renderer starts through
+/// a launcher of its own ([`crate::render`]).
+pub const MLX_PROGRAM: &str = "mlx_lm.server";
 
 /// A container profile's complete runnable form: what
 /// [`crate::render`] turns into the start and stop scripts its head runs.
@@ -341,13 +538,15 @@ pub struct Container {
     pub ranks: Vec<BTreeMap<String, String>>,
 }
 
-/// The serving program inside the image, which says how it is health-checked
-/// and benchmarked.
+/// The serving program an engine runs, which says how it is started,
+/// health-checked and benchmarked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Server {
     Vllm,
     LlamaCpp,
+    /// `mlx_lm.server`, Apple's MLX: native only, on Apple silicon.
+    MlxLm,
 }
 
 impl Server {
@@ -355,6 +554,25 @@ impl Server {
         match self {
             Self::Vllm => "vllm",
             Self::LlamaCpp => "llamaCpp",
+            Self::MlxLm => "mlxLm",
+        }
+    }
+
+    /// Its name as people write it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vllm => "vLLM",
+            Self::LlamaCpp => "llama.cpp",
+            Self::MlxLm => "MLX",
+        }
+    }
+
+    /// The port a deployment of it serves on unless placed otherwise.
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Vllm => 8000,
+            Self::LlamaCpp => 8090,
+            Self::MlxLm => 8080,
         }
     }
 }
@@ -444,11 +662,15 @@ pub struct SourcePin {
     pub commit: String,
 }
 
-/// The placeholders a container's args and env may hold, filled in when it
-/// is rendered: the deployment's API port, the profile's served name, the
-/// weights' repository and revision, the rank and machine count, the fast-link
-/// address of the head and of the machine itself, and the in-container path of
-/// the first weight file.
+/// The placeholders a container's or native engine's args and env may hold,
+/// filled in when it is rendered: the deployment's API port, the profile's
+/// served name, the weights' repository and revision, the rank and machine
+/// count, the fast-link address of the head and of the machine itself, and
+/// where the server reads the pinned files: the Hugging Face cache
+/// (`{cache}`, the cache mount's path in a container, the machine's own
+/// cache natively), the weights' snapshot directory in it (`{snapshot}`,
+/// which a server loading a whole repository takes), and the first weight
+/// file (`{weights}`).
 pub const PLACEHOLDERS: &[&str] = &[
     "port",
     "servedName",
@@ -458,6 +680,8 @@ pub const PLACEHOLDERS: &[&str] = &[
     "machines",
     "head.link",
     "self.link",
+    "cache",
+    "snapshot",
     "weights",
 ];
 
@@ -524,9 +748,9 @@ pub fn is_secret_name(name: &str) -> bool {
 /// `${NAME}`, `${NAME:-word}` and the other operators, nested words
 /// included), skipping the `$$` escape.
 ///
-/// The renderer passes a container's env to the runtime as written and
-/// nothing at container start expands it, so such a reference in an env
-/// value is the reference's own text standing where a credential should be.
+/// The renderer passes an engine's env as written and nothing at start
+/// expands it, so such a reference in an env value is the reference's own
+/// text standing where a credential should be.
 /// Only env is read: a container's args are shell text its own shell may
 /// expand from its env, so `${HF_TOKEN}` there is deliberate.
 pub fn secret_references(value: &str) -> Vec<&str> {
@@ -737,11 +961,7 @@ impl InferenceProfile {
             Engine::Container(container) => {
                 problems.extend(self.container_problems(container));
             }
-            Engine::Native { sha256, .. } => {
-                if !is_sha256_hex(sha256) {
-                    problems.push(ValidationError::BadArtifactSha { profile: profile() });
-                }
-            }
+            Engine::Native(native) => problems.extend(self.native_problems(native)),
             Engine::Command { start, .. } => {
                 if start.trim().is_empty() {
                     problems.push(ValidationError::EmptyStart { profile: profile() });
@@ -759,6 +979,57 @@ impl InferenceProfile {
         problems
     }
 
+    fn unknown_placeholders<'a>(
+        &self,
+        texts: impl Iterator<Item = &'a str>,
+    ) -> impl Iterator<Item = ValidationError> + '_ {
+        let mut unknown = BTreeSet::new();
+        for text in texts {
+            for name in placeholders(text) {
+                if !PLACEHOLDERS.contains(&name) {
+                    unknown.insert(name.to_string());
+                }
+            }
+        }
+        unknown
+            .into_iter()
+            .map(|placeholder| ValidationError::UnknownPlaceholder {
+                profile: self.id.clone(),
+                placeholder,
+            })
+    }
+
+    fn native_problems(&self, native: &Native) -> Vec<ValidationError> {
+        let profile = || self.id.clone();
+        let mut problems: Vec<ValidationError> =
+            [native.artifact.problem(), native.program_problem()]
+                .into_iter()
+                .flatten()
+                .map(|problem| ValidationError::BadArtifact {
+                    profile: profile(),
+                    problem,
+                })
+                .collect();
+        problems.extend(self.unknown_placeholders(native.templated()));
+        for (key, value) in &native.env {
+            for reference in secret_references(value) {
+                problems.push(ValidationError::UnresolvedSecret {
+                    profile: profile(),
+                    key: key.clone(),
+                    rank: None,
+                    reference: reference.to_string(),
+                });
+            }
+        }
+        if self.requirements.machines > 1 {
+            problems.push(ValidationError::NativeSpansMachines {
+                profile: profile(),
+                machines: self.requirements.machines,
+            });
+        }
+        problems
+    }
+
     fn container_problems(&self, container: &Container) -> Vec<ValidationError> {
         let mut problems = Vec::new();
         let profile = || self.id.clone();
@@ -768,20 +1039,7 @@ impl InferenceProfile {
                 image: container.image.clone(),
             });
         }
-        let mut unknown = BTreeSet::new();
-        for text in container.templated() {
-            for name in placeholders(text) {
-                if !PLACEHOLDERS.contains(&name) {
-                    unknown.insert(name.to_string());
-                }
-            }
-        }
-        for placeholder in unknown {
-            problems.push(ValidationError::UnknownPlaceholder {
-                profile: profile(),
-                placeholder,
-            });
-        }
+        problems.extend(self.unknown_placeholders(container.templated()));
         for (rank, key, value) in container.env_entries() {
             for reference in secret_references(value) {
                 problems.push(ValidationError::UnresolvedSecret {
@@ -1073,24 +1331,138 @@ mod tests {
         assert_eq!(gang.problems(), vec![]);
     }
 
+    fn llama_metal() -> Native {
+        Native {
+            server: Server::LlamaCpp,
+            artifact: Artifact {
+                url: "https://github.com/ggml-org/llama.cpp/releases/download/b12283/llama-b12283-bin-macos-arm64.tar.gz".into(),
+                version: "b12283".into(),
+                sha256: SHA.into(),
+                packaging: Packaging::Archive,
+            },
+            program: "llama-b12283/llama-server".into(),
+            args: vec!["-m".into(), "{weights}".into(), "--port".into(), "{port}".into()],
+            env: BTreeMap::new(),
+        }
+    }
+
+    fn mlx() -> Native {
+        Native {
+            server: Server::MlxLm,
+            artifact: Artifact {
+                url: "https://files.pythonhosted.org/packages/d1/4f/000eefdeb41388782b47e7f39904cf2d9e7e49a60df5e172097c358dba8e/mlx_lm-0.32.2-py3-none-any.whl".into(),
+                version: "0.32.2".into(),
+                sha256: SHA.into(),
+                packaging: Packaging::Wheel {
+                    python: "3.12".into(),
+                    resolved_before: "2026-10-17T00:00:00Z".into(),
+                },
+            },
+            program: MLX_PROGRAM.into(),
+            args: vec!["--model".into(), "{snapshot}".into()],
+            env: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn malformed_shas_are_refused() {
-        let native = profile(
-            Engine::Native {
-                artifact: "llama-server".into(),
-                version: "b1".into(),
-                sha256: SHA.to_uppercase(),
-                args: vec![],
-            },
-            vec![weight("short")],
-        );
+        let mut engine = llama_metal();
+        engine.artifact.sha256 = SHA.to_uppercase();
+        let native = profile(Engine::Native(engine), vec![weight("short")]);
         let problems = native.problems();
-        assert!(problems
-            .iter()
-            .any(|p| matches!(p, ValidationError::BadArtifactSha { .. })));
+        assert!(problems.iter().any(|p| matches!(
+            p,
+            ValidationError::BadArtifact {
+                problem: "sha256 is not 64 lowercase hex digits",
+                ..
+            }
+        )));
         assert!(problems
             .iter()
             .any(|p| matches!(p, ValidationError::BadWeightFile { index: 0, .. })));
+    }
+
+    #[test]
+    fn a_native_engine_pins_a_fetchable_artifact_and_runs_on_one_machine() {
+        assert_eq!(
+            profile(Engine::Native(llama_metal()), vec![weight(SHA)]).problems(),
+            vec![]
+        );
+        assert_eq!(
+            profile(Engine::Native(mlx()), vec![weight(SHA)]).problems(),
+            vec![]
+        );
+        let said = |native: Native| -> Vec<String> {
+            profile(Engine::Native(native), vec![weight(SHA)])
+                .problems()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let mut plain = llama_metal();
+        plain.artifact.url = "http://example.com/llama.tar.gz".into();
+        assert_eq!(
+            said(plain),
+            ["profile r native artifact: url must be https, with no whitespace, quote, backslash or control character"]
+        );
+        let mut zipped = llama_metal();
+        zipped.artifact.url = "https://example.com/llama.zip".into();
+        assert_eq!(
+            said(zipped),
+            ["profile r native artifact: an archive artifact is a .tar.gz"]
+        );
+        let mut escaping = llama_metal();
+        escaping.program = "../../bin/sh".into();
+        assert_eq!(
+            said(escaping),
+            ["profile r native artifact: program must be a relative path of letters, digits, ., _, - and +, with no empty, . or .. segment"]
+        );
+        let mut unpinned = mlx();
+        unpinned.artifact.packaging = Packaging::Wheel {
+            python: "3.12".into(),
+            resolved_before: "latest".into(),
+        };
+        assert_eq!(
+            said(unpinned),
+            ["profile r native artifact: a wheel's resolvedBefore is a date (2026-10-17) or a UTC instant (2026-10-17T00:00:00Z)"]
+        );
+        let mut elsewhere = mlx();
+        elsewhere.program = "python".into();
+        assert_eq!(
+            said(elsewhere),
+            ["profile r native artifact: an mlxLm server runs mlx_lm.server"]
+        );
+        let mut odd = llama_metal();
+        odd.args.push("{gpuCount}".into());
+        odd.env.insert("HF_TOKEN".into(), "${HF_TOKEN}".into());
+        let problems = said(odd);
+        assert_eq!(problems[0], "profile r uses unknown placeholder {gpuCount}");
+        assert!(problems[1].starts_with("profile r env HF_TOKEN reads ${HF_TOKEN}"));
+
+        let mut gang = profile(Engine::Native(llama_metal()), vec![weight(SHA)]);
+        gang.requirements.machines = 2;
+        assert_eq!(
+            gang.problems()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["profile r runs a native engine on 2 machines; a native engine runs on one machine"]
+        );
+    }
+
+    #[test]
+    fn the_native_form_round_trips_through_yaml() {
+        let profile = profile(Engine::Native(mlx()), vec![weight(SHA)]);
+        let yaml = serde_yaml::to_string(&profile).unwrap();
+        assert!(yaml.contains("kind: native"), "{yaml}");
+        assert!(yaml.contains("server: mlxLm"), "{yaml}");
+        assert!(yaml.contains("kind: wheel"), "{yaml}");
+        assert!(yaml.contains("resolvedBefore:"), "{yaml}");
+        assert_eq!(
+            serde_yaml::from_str::<InferenceProfile>(&yaml).unwrap(),
+            profile
+        );
+        assert_eq!(mlx().artifact.file_name(), "mlx_lm-0.32.2-py3-none-any.whl");
     }
 
     #[test]
