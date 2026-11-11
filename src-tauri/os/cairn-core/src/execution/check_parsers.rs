@@ -813,16 +813,29 @@ fn reconcile_nextest_summary(mut parsed: ParsedCheckResult, output: &str) -> Par
         .iter()
         .filter(|test| test.status == "skipped" && test.skip_reason.is_some())
         .count();
+    // nextest tallies a test its filter left out as skipped but reports no row
+    // for it; the producer names those as its passes' `filteredSkips`.
+    let filtered_skips: usize = parsed.accounting.as_ref().map_or(0, |accounting| {
+        accounting
+            .passes
+            .iter()
+            .map(|pass| pass.filtered_skips)
+            .sum()
+    });
     let matched = parsed.passed.checked_add(self_skipped) == Some(summary.passed)
         && parsed.failed == summary.failed + summary.timed_out
-        && parsed.skipped.checked_sub(self_skipped) == Some(summary.skipped)
+        && parsed
+            .skipped
+            .checked_sub(self_skipped)
+            .and_then(|skipped| skipped.checked_add(filtered_skips))
+            == Some(summary.skipped)
         && parsed.deferred == 0;
     if !matched {
         parsed.complete = false;
         let diagnostic = format!(
-            "nextest Summary/enumeration mismatch: runner {} passed, {} failed, {} skipped, {} timed out; persisted enumeration {} passed, {} failed, {} skipped, {} deferred; {} self-skip pass-to-skip transfers",
+            "nextest Summary/enumeration mismatch: runner {} passed, {} failed, {} skipped, {} timed out; persisted enumeration {} passed, {} failed, {} skipped, {} deferred; {} self-skip pass-to-skip transfers; {} filtered skips",
             summary.passed, summary.failed, summary.skipped, summary.timed_out,
-            parsed.passed, parsed.failed, parsed.skipped, parsed.deferred, self_skipped
+            parsed.passed, parsed.failed, parsed.skipped, parsed.deferred, self_skipped, filtered_skips
         );
         parsed.report = Some(head_chars(
             &format!("{diagnostic}\n{}", parsed.report.as_deref().unwrap_or("")),
@@ -2796,6 +2809,30 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
             .report
             .unwrap()
             .contains("Summary/enumeration mismatch"));
+
+        // A test the filter left out is in the Summary's skipped tally with no
+        // row; the producer's named `filteredSkips` transfer accounts for it.
+        let filtered_summary = "Summary [ 1s] 2 tests run: 2 passed, 2 skipped";
+        let mut filtered = value.clone();
+        filtered["report"] = filtered_summary.into();
+        let output = |artifact: &serde_json::Value| {
+            format!("{filtered_summary}\n{RESULT_ARTIFACT_JSON_MARKER}{artifact}")
+        };
+        assert!(
+            !parse_check_output("bun run test:rust", &output(&filtered))
+                .unwrap()
+                .complete
+        );
+        filtered["accounting"] = serde_json::json!({
+            "version": 1,
+            "inventory": {"state": "unavailable", "reason": "x"},
+            "passes": [{"pass": "full", "filteredSkips": 1}],
+        });
+        assert!(
+            parse_check_output("bun run test:rust", &output(&filtered))
+                .unwrap()
+                .complete
+        );
     }
 
     #[test]
