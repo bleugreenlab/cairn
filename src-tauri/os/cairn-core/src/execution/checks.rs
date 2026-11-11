@@ -10165,7 +10165,8 @@ pub(crate) async fn load_checks_contract_at_commit(
 
 /// The subset of planned checks that both apply to the change set AND run at the
 /// TURN-END cadence. `when:review` (including the `idle` legacy alias) runs at
-/// every turn-end; `when:write` never runs here (it is the mid-turn cadence). An
+/// every turn-end; `when:write` never runs here (it is the mid-turn cadence),
+/// and neither does `when:main`, which no branch wave runs. An
 /// impact-scoped check that no changed file matches has `applies == false`. Pure,
 /// so the cadence gate is unit-tested.
 pub(crate) fn applicable_turn_end_checks(
@@ -10182,7 +10183,7 @@ pub(crate) fn applicable_turn_end_checks(
                 .get(&plan.name)
                 .is_some_and(|check| match check.when {
                     CheckWhen::Review => true,
-                    CheckWhen::Write => false,
+                    CheckWhen::Write | CheckWhen::Main => false,
                 })
         })
         .collect()
@@ -17713,10 +17714,9 @@ cairn-common = { path = "../cairn-common" }
                 | "tls-sole-loader"
                 | "plan-audit"
                 | "workspace-compile"
+                | "source-scans"
                 | "third-party-notices" => &["bun", "rust"],
-                "executor-windows-check" | "executor-linux-check" | "executor-macos-check" => {
-                    &["rust"]
-                }
+                "executor-windows-check" | "executor-macos-check" => &["rust"],
                 _ if check
                     .command
                     .split_whitespace()
@@ -17734,7 +17734,7 @@ cairn-common = { path = "../cairn-common" }
     }
 
     #[test]
-    fn repository_executor_compile_checks_cover_linux_and_windows_all_targets() {
+    fn repository_executor_compile_checks_cover_macos_and_windows_all_targets() {
         let config = include_str!("../../../../../.cairn/config.yaml");
         let (settings, _) = crate::config::project_settings::parse_project_settings(config)
             .expect("repository project config must parse");
@@ -17742,7 +17742,7 @@ cairn-common = { path = "../cairn-common" }
             .expect("repository must declare checks");
 
         for (name, target, platform) in [
-            ("executor-linux-check", None, "linux"),
+            ("executor-macos-check", None, "macos"),
             (
                 "executor-windows-check",
                 Some("x86_64-pc-windows-msvc"),
@@ -17753,10 +17753,14 @@ cairn-common = { path = "../cairn-common" }
                 .checks
                 .get(name)
                 .unwrap_or_else(|| panic!("{name} exists"));
+            assert_eq!(check.when, CheckWhen::Main, "{name} runs on main only");
             assert_eq!(
-                check.when,
-                CheckWhen::Review,
-                "{name} runs at review cadence"
+                check
+                    .main_cadence
+                    .as_ref()
+                    .map(|cadence| cadence.platforms.as_slice()),
+                Some(&[platform.to_string()][..]),
+                "{name} has one main lane, on its native platform"
             );
             assert_eq!(
                 check.verdict_platforms.as_deref(),
@@ -17773,7 +17777,7 @@ cairn-common = { path = "../cairn-common" }
                         .command
                         .split_whitespace()
                         .any(|word| word == "--target"),
-                    "{name} must use the executor's native Linux architecture"
+                    "{name} must use the executor's native architecture"
                 ),
             }
             assert!(
@@ -18704,7 +18708,23 @@ cairn-common = { path = "../cairn-common" }
             "r".to_string(),
             check("run-r", Some(&["src/**"]), CheckWhen::Review),
         );
+        checks.insert(
+            "m".to_string(),
+            check("run-m", Some(&["src/**"]), CheckWhen::Main),
+        );
         checks
+    }
+
+    #[test]
+    fn no_branch_wave_runs_a_main_only_check() {
+        let checks = cadence_checks();
+        let changed = [change("src/App.tsx")];
+        let write: Vec<String> =
+            applicable_write_checks(&checks, &inputs(&checks), &changed, Path::new("/repo"))
+                .into_iter()
+                .map(|plan| plan.name)
+                .collect();
+        assert_eq!(write, vec!["w"]);
     }
 
     #[test]

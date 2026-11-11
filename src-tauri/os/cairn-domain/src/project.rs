@@ -592,6 +592,13 @@ pub enum CheckWhen {
     /// silently disabling every check for that project.
     #[serde(alias = "idle")]
     Review,
+    /// Main cadence only: never planned into a branch's write or turn-end
+    /// wave. The check runs from its `mainCadence` block after merges, and on
+    /// demand through a manual run. Validation refuses it without a
+    /// `mainCadence` block, since nothing would ever run it, and refuses it
+    /// with `policy: gate`, since a gate bites only through a verdict on the
+    /// exact branch tip, which this cadence never produces.
+    Main,
 }
 
 fn default_check_policy() -> CheckPolicy {
@@ -649,6 +656,7 @@ impl CheckWhen {
         match self {
             CheckWhen::Write => "write",
             CheckWhen::Review => "review",
+            CheckWhen::Main => "main",
         }
     }
 }
@@ -958,7 +966,7 @@ mod check_vocabulary_tests {
         assert_eq!(vocabulary.policy, ["advisory", "gate"]);
         // `idle` is the legacy alias of `review`; the vocabulary must accept
         // exactly what the deserializer does, alias included.
-        assert_eq!(vocabulary.when, ["write", "idle", "review"]);
+        assert_eq!(vocabulary.when, ["write", "idle", "review", "main"]);
         assert_eq!(vocabulary.resource_class, ["shared", "exclusive"]);
         assert_eq!(vocabulary.tree, ["full", "impact"]);
         assert_eq!(vocabulary.verdict_platforms, ["macos", "linux", "windows"]);
@@ -1025,11 +1033,11 @@ mod check_vocabulary_tests {
         };
         assert_eq!(unsupported.field, "when");
         assert_eq!(unsupported.value, "landing");
-        assert_eq!(unsupported.known, ["write", "idle", "review"]);
+        assert_eq!(unsupported.known, ["write", "idle", "review", "main"]);
         assert_eq!(
             unsupported.notice,
             "needs a newer Cairn: `when: landing` is not understood by this build \
-             (it knows write, idle, review)"
+             (it knows write, idle, review, main)"
         );
         assert_eq!(unsupported.declared, declared);
     }

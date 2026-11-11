@@ -3111,6 +3111,14 @@ fn push_check_lines(
                     None => out.push_str(&format!("- {}: pending\n", status.name)),
                 },
             },
+            NodeCheckState::NotApplicable
+                if status.when == crate::config::project_settings::CheckWhen::Main.as_str() =>
+            {
+                out.push_str(&format!(
+                    "- {}: main cadence only, not run on this branch\n",
+                    status.name
+                ));
+            }
             NodeCheckState::NotApplicable => {
                 out.push_str(&format!("- {}: not applicable\n", status.name));
             }

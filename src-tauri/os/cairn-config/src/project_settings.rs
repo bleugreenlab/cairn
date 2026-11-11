@@ -627,18 +627,18 @@ fn parse_project_settings_under(
     if let Some(declared) = legacy.checks {
         let mut supported = HashMap::with_capacity(declared.len());
         for (name, entry) in declared {
+            let refused = |error: &dyn std::fmt::Display| {
+                format!("Failed to parse project config file: checks.{name}: {error}")
+            };
             match read_declared_check(entry, vocabulary) {
                 Ok(DeclaredCheck::Supported(check)) => {
+                    validate_check_cadence(&check).map_err(|error| refused(&error))?;
                     supported.insert(name, *check);
                 }
                 Ok(DeclaredCheck::Unsupported(unsupported)) => {
                     unsupported_checks.insert(name, unsupported);
                 }
-                Err(error) => {
-                    return Err(format!(
-                        "Failed to parse project config file: checks.{name}: {error}"
-                    ))
-                }
+                Err(error) => return Err(refused(&error)),
             }
         }
         checks = Some(supported);
@@ -678,6 +678,26 @@ fn parse_project_settings_under(
     }
 
     Ok((settings, needs_migration))
+}
+
+const MAIN_ONLY_UNRUN: &str = "`when: main` needs a `mainCadence` block: no branch wave \
+     runs a main-only check, so without one nothing would ever run it";
+const MAIN_ONLY_GATE: &str = "`policy: gate` cannot be `when: main`: a gate bites only \
+     through a verdict on the exact branch tip, and a main-only check never produces one";
+
+/// The cadence rules the deserializer cannot express, because each relates two
+/// fields of one check.
+fn validate_check_cadence(check: &CheckCommand) -> Result<(), String> {
+    if check.when != CheckWhen::Main {
+        return Ok(());
+    }
+    if check.main_cadence.is_none() {
+        return Err(MAIN_ONLY_UNRUN.to_string());
+    }
+    if check.policy == CheckPolicy::Gate {
+        return Err(MAIN_ONLY_GATE.to_string());
+    }
+    Ok(())
 }
 
 /// Log each unsupported check once per process. The config is parsed on every
@@ -1994,7 +2014,7 @@ checks:
             .expect("landing-compile is listed as unsupported");
         assert_eq!(unsupported.field, "when");
         assert_eq!(unsupported.value, "landing");
-        assert_eq!(unsupported.known, ["write", "idle", "review"]);
+        assert_eq!(unsupported.known, ["write", "idle", "review", "main"]);
         assert_eq!(settings.unsupported_checks.len(), 1);
         let checks = settings.checks.as_ref().unwrap();
         assert!(!checks.contains_key("landing-compile"));
@@ -2182,6 +2202,28 @@ checks:
         assert_eq!(
             settings.checks.unwrap().get("frontend").unwrap().when,
             CheckWhen::Review
+        );
+    }
+
+    #[test]
+    fn a_main_only_check_needs_a_main_cadence_and_cannot_gate() {
+        let main_only = "checks:\n  compile:\n    command: cargo check\n    when: main\n    \
+                         mainCadence:\n      platforms: [windows]\n      notify: testing\n";
+        let (settings, _) = parse_project_settings(main_only).expect("a main-only check parses");
+        assert_eq!(settings.checks.unwrap()["compile"].when, CheckWhen::Main);
+
+        let unrun = "checks:\n  compile:\n    command: cargo check\n    when: main\n";
+        let error = parse_project_settings(unrun).expect_err("nothing would run it");
+        assert!(
+            error.contains("checks.compile") && error.contains("mainCadence"),
+            "{error}"
+        );
+
+        let gate = format!("{main_only}    policy: gate\n");
+        let error = parse_project_settings(&gate).expect_err("a gate needs a tip verdict");
+        assert!(
+            error.contains("checks.compile") && error.contains("policy: gate"),
+            "{error}"
         );
     }
 

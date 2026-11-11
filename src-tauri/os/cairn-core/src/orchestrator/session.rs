@@ -1422,7 +1422,20 @@ fn build_project_checks_section(
          (with test counts) are appended to the committing tool result.\n\
          - `when: review` checks run in the background at every turn-end, re-running the \
          fuller suites. A failing turn-end check wakes this session with the results inlined; \
-         passing results ride along passively into your next turn.\n\n\
+         passing results ride along passively into your next turn.\n",
+    );
+    if checks
+        .values()
+        .any(|check| check.when == crate::config::project_settings::CheckWhen::Main)
+    {
+        out.push_str(
+            "- `when: main` checks never run on your branch: they run on the default branch \
+             after merges, and `cairn check run <suite> --branch <revision>` answers one on \
+             demand.\n",
+        );
+    }
+    out.push_str(
+        "\n\
          Trust the cadence: a green verdict with a test count covers the diff, so the per-suite \
          commands exist for iterating on a failure a check surfaced, not for re-verifying a \
          finished diff. When a suite verdict on another revision is genuinely the question — is \

@@ -1919,8 +1919,11 @@ fn assemble_statuses(
 
             // A review check does not apply when the impact gate excluded it
             // from this tree's plan; it will never run, so it is neither
-            // running nor pending.
-            let not_applicable = applicable_names.is_some_and(|names| !names.contains(&name));
+            // running nor pending. No branch wave runs a main-only check, so
+            // without a row it is not applicable here either, and says why.
+            let main_only = check.when == CheckWhen::Main;
+            let not_applicable =
+                main_only || applicable_names.is_some_and(|names| !names.contains(&name));
 
             // `LaneEvidence::Recorded` outranks everything below, and this
             // returns before the `started` probe so a lane that already holds
@@ -1979,6 +1982,7 @@ fn assemble_statuses(
             });
 
             let executor = wave_board.and_then(|board| board.lane_phase(&name).executor);
+            let notice = main_only.then(|| main_only_notice(&name));
             NodeCheckStatus {
                 observation_id: None,
                 job_id: job_id.to_string(),
@@ -2004,7 +2008,7 @@ fn assemble_statuses(
                 suppressed_after: None,
                 executor,
                 verified_on: None,
-                notice: None,
+                notice,
                 declared_unverified: None,
                 progress,
                 base_attribution: None,
@@ -2013,6 +2017,14 @@ fn assemble_statuses(
             }
         })
         .collect()
+}
+
+/// What a main-only lane with no verdict on this head says in place of one.
+pub(crate) fn main_only_notice(name: &str) -> String {
+    format!(
+        "main cadence only: runs on the default branch after merges; \
+         `cairn check run {name} --branch <ref>` answers it on demand"
+    )
 }
 
 // Review logs are retained across waves and replaced only when a placement
@@ -5675,6 +5687,30 @@ mod complete_input_projection_tests {
                 owes_a_review_wave(&stopped),
                 "the waiter must still demand current evidence"
             );
+        }
+    }
+
+    /// No branch wave runs a main-only check, so with no row on the head its
+    /// lane must neither hold a wait open nor read as a missing verdict.
+    #[tokio::test]
+    async fn a_main_only_lane_without_a_row_reads_as_main_only() {
+        let mut f = Fixture::new("compile").await;
+        f.checks.insert(
+            "compile".into(),
+            serde_yaml::from_str(
+                "command: cargo check\nwhen: main\nmainCadence: {platforms: [linux], notify: testing}\n",
+            )
+            .unwrap(),
+        );
+        for running in [true, false] {
+            let snapshot = f.snapshot(None, running);
+            let lane = &snapshot.statuses[0];
+            assert_eq!(lane.state, NodeCheckState::NotApplicable);
+            assert_eq!(lane.when, "main");
+            let annotation = format_status_annotation(lane).unwrap();
+            assert!(annotation.contains("main cadence only"), "{annotation}");
+            assert_eq!(snapshot.verdict(), "not_applicable");
+            assert!(!owes_a_review_wave(&snapshot));
         }
     }
 
