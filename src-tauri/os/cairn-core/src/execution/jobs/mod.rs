@@ -42,10 +42,10 @@ mod ordinary_admission;
 mod persistence;
 mod private_lane;
 pub(crate) use private_lane::{
-    call_lane_budgets, describe_call_lane, describe_job_launch, describe_lane, describe_shortfall,
-    private_lane_budgets, private_lane_budgets_from, promote_private_lanes_blocking,
-    spawn_produced_first_output, spawn_reports_first_output, withdraw_orphaned_ordinary_admissions,
-    CallLaneBudget, PrivateLaneLedger,
+    boot_ramp_active, call_lane_budgets, describe_call_lane, describe_job_launch, describe_lane,
+    describe_shortfall, private_lane_budgets, private_lane_budgets_from,
+    promote_private_lanes_blocking, spawn_produced_first_output, spawn_reports_first_output,
+    withdraw_orphaned_ordinary_admissions, CallLaneBudget, PrivateLaneLedger, BOOT_RAMP_HORIZON,
 };
 /// Drive queued private admission deterministically without a scheduler task.
 #[cfg(any(test, feature = "test-utils"))]

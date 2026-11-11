@@ -1,4 +1,5 @@
-use super::matching::{matching_subscription, matching_subscriptions_for_source};
+use super::child::{issue_recipients, issue_watchers};
+use super::matching::matching_subscription;
 use super::routing::child_attention_message;
 use super::types::FACT_KIND_MESSAGE;
 
@@ -74,7 +75,7 @@ async fn a_thread_child_establishes_and_reaches_its_thread_session() {
         .unwrap()
         .expect("a dormant thread acquires a session before child attention is routed");
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec![recipient.clone()]
     );
     assert_eq!(
@@ -137,7 +138,7 @@ async fn a_thread_childs_recorded_filer_never_steers_its_attention() {
             "filer {filer}: the thread session coordinates its child"
         );
         assert_eq!(
-            watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+            issue_watchers(&db, CHILD_URI).await.unwrap(),
             vec![session.clone()],
             "filer {filer}"
         );
@@ -215,7 +216,7 @@ async fn a_closed_thread_stops_coordinating_its_children_without_silencing_them(
         .await
         .unwrap();
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j-watcher".to_string()],
         "the child's own watchers keep receiving what it produces"
     );
@@ -256,7 +257,7 @@ async fn a_closed_thread_stops_coordinating_its_children_without_silencing_them(
         .unwrap()
         .expect("reopening restores the thread as its children's coordinator");
     assert!(
-        watcher_jobs_for_issue(&db, CHILD_URI)
+        issue_watchers(&db, CHILD_URI)
             .await
             .unwrap()
             .contains(&recipient),
@@ -282,6 +283,7 @@ async fn a_targeted_wake_to_a_closed_thread_is_dropped_and_spends_nothing() {
     let job_id = crate::threads::ensure_thread_session(&db, "thread")
         .await
         .unwrap();
+    seed_run(&db, &job_id).await;
     super::store::subscribe_one_shot(
         &db,
         &job_id,
@@ -312,6 +314,7 @@ async fn a_targeted_wake_to_a_closed_thread_is_dropped_and_spends_nothing() {
         },
         urgency: DeliveryUrgency::Queue,
         muted: MutedDelivery::Drop,
+        fact_key: None,
     };
 
     set_thread_status(&orch.db.local, "closed").await;
@@ -384,6 +387,7 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
     let job_id = write_thread_definition(&db, "thread", &definition)
         .await
         .unwrap();
+    seed_run(&db, &job_id).await;
 
     let derived = list_subscriptions_for_job(&db, &job_id)
         .await
@@ -420,6 +424,7 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
             },
             urgency: DeliveryUrgency::Queue,
             muted: MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await
@@ -580,6 +585,17 @@ fn test_orchestrator_with_services(
     Orchestrator::builder(db_state, Arc::new(services), config_dir).build()
 }
 
+/// A run for `job_id`, so a delivery to it persists a direct message rather
+/// than cold-starting an agent: these tests assert routing, not launches.
+async fn seed_run(db: &LocalDb, job_id: &str) {
+    db.execute(
+        "INSERT INTO runs(id, project_id, job_id, created_at, updated_at) VALUES(?1, 'p', ?2, 1, 1)",
+        params![format!("{job_id}-run"), job_id.to_string()],
+    )
+    .await
+    .unwrap();
+}
+
 async fn seed_job(db: &LocalDb) {
     db.execute_script(
             "
@@ -587,6 +603,7 @@ async fn seed_job(db: &LocalDb) {
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
             INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j','p','i','complete','s',1,1);
+            INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at) VALUES('j-run','p','j','i',1,1);
             ",
         )
         .await
@@ -800,6 +817,7 @@ async fn queueable_node_fixture_can_drive_issue_wakes_without_tribal_setup() {
             },
             urgency: DeliveryUrgency::Queue,
             muted: MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await
@@ -859,6 +877,116 @@ async fn subscribe_one_shot_sets_flag_and_persists() {
     assert!(listed
         .iter()
         .any(|s| s.one_shot && s.source_ref.as_deref() == Some("run-1")));
+}
+
+/// The cairn/4820 specimen: one settlement routed by all three callers (the
+/// edge, the subscribe-time fire and the verdictless confirm) is one message
+/// per watcher, a persistent subscriber and a one-shot one alike. A new
+/// actionable verdict on the same lanes is a second message; routing the
+/// unchanged settlement again after it is none.
+#[tokio::test(flavor = "current_thread")]
+async fn one_checks_settlement_is_one_message_per_watcher_however_often_routed() {
+    use crate::execution::checks_settlement::{classify, ChecksSnapshot};
+    use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+    use crate::messages::delivery::HeadTurn;
+
+    let db = migrated_db().await;
+    seed_job(&db).await;
+    seed_second_job(&db).await;
+    seed_run(&db, "j2").await;
+    let orch = test_orchestrator(db);
+    let uri = "cairn://p/p/1/1/builder/checks";
+    let kinds = ["checks_settled".to_string()];
+    subscribe(
+        &orch.db.local,
+        "j",
+        "condition",
+        Some(uri),
+        Some(&kinds),
+        "agent",
+    )
+    .await
+    .unwrap();
+    subscribe_one_shot(
+        &orch.db.local,
+        "j2",
+        "condition",
+        Some(uri),
+        Some(&kinds),
+        "agent",
+    )
+    .await
+    .unwrap();
+    let snapshot = |observation: &str| {
+        let statuses = vec![NodeCheckStatus {
+            observation_id: Some(observation.to_string()),
+            job_id: "job".to_string(),
+            request_id: None,
+            name: "rust-tests".to_string(),
+            state: NodeCheckState::Failed,
+            policy: "advisory".to_string(),
+            when: "review".to_string(),
+            cached: None,
+            duration_ms: None,
+            ran_at: None,
+            passed: Some(38),
+            failed: Some(2),
+            skipped: None,
+            deferred: None,
+            parser: None,
+            complete: None,
+            selection: None,
+            suite_failures: None,
+            failure_names: Vec::new(),
+            output_tail: None,
+            failure_kind: None,
+            suppressed_after: None,
+            executor: None,
+            verified_on: None,
+            notice: None,
+            declared_unverified: None,
+            progress: None,
+            base_attribution: None,
+            evidence: None,
+            plan_audit_note: None,
+        }];
+        ChecksSnapshot {
+            settlement: classify(&statuses, HeadTurn::Idle, false),
+            statuses,
+            terminal_reason: None,
+            retired: None,
+        }
+    };
+    let told = |run: &'static str| {
+        let db = orch.db.local.clone();
+        async move {
+            db.query_one(
+                "SELECT COUNT(*) FROM messages WHERE recipient_run_id = ?1 AND content LIKE '[Checks%'",
+                (run.to_string(),),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let first = snapshot("obs-1");
+    for _caller in ["edge", "subscribe-time fire", "verdictless confirm"] {
+        route_checks_settled(&orch, "builder", uri, &first)
+            .await
+            .unwrap();
+    }
+    assert_eq!(told("j-run").await, 1, "the persistent subscriber");
+    assert_eq!(told("j2-run").await, 1, "the one-shot subscriber");
+
+    route_checks_settled(&orch, "builder", uri, &snapshot("obs-2"))
+        .await
+        .unwrap();
+    assert_eq!(told("j-run").await, 2, "a new verdict is a new settlement");
+    route_checks_settled(&orch, "builder", uri, &snapshot("obs-2"))
+        .await
+        .unwrap();
+    assert_eq!(told("j-run").await, 2, "and routing it again is not");
 }
 
 /// A settled-checks subscription is keyed on the node's canonical `/checks`
@@ -1440,7 +1568,7 @@ async fn narrow_mute_downgrades_only_the_facts_it_names() {
     .unwrap();
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j".to_string()],
         "a muted coordinator still watches its child"
     );
@@ -1546,6 +1674,7 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
             },
             urgency: DeliveryUrgency::Queue,
             muted: MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await
@@ -1575,6 +1704,7 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
             },
             urgency: DeliveryUrgency::Interrupt,
             muted: MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await
@@ -1601,6 +1731,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
             },
             urgency: DeliveryUrgency::Passive,
             muted: MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await
@@ -1629,6 +1760,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
             },
             urgency: DeliveryUrgency::Interrupt,
             muted: MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await
@@ -1658,7 +1790,7 @@ async fn a_parented_child_reaches_its_coordinator_with_no_subscription_row() {
         Some("j".to_string())
     );
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j".to_string()]
     );
     assert!(
@@ -1681,7 +1813,7 @@ async fn a_new_coordinator_execution_takes_over_the_parents_children() {
     seed_second_job(&db).await;
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j2".to_string()],
         "the newest coordinator receives the child's gates, and only it"
     );
@@ -1723,7 +1855,7 @@ async fn a_child_filed_by_another_issues_job_reaches_the_parents_coordinator() {
     stamp_spawning_node(&db, "filer").await;
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j".to_string()],
         "a spawner on another issue never enters the child's watcher set"
     );
@@ -1742,7 +1874,7 @@ async fn a_spawned_child_reaches_the_node_that_filed_it_not_its_upstream() {
     stamp_spawning_node(&db, "coordinator").await;
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["coordinator".to_string()]
     );
     assert_eq!(
@@ -1782,7 +1914,7 @@ async fn a_superseded_spawner_hands_its_children_to_the_new_execution() {
         .unwrap();
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["coordinator-2".to_string()],
         "a retired coordinator does not keep the children it filed"
     );
@@ -1809,7 +1941,7 @@ async fn a_dead_spawner_falls_through_to_the_parents_driver() {
     .unwrap();
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["planner".to_string()]
     );
 }
@@ -1833,7 +1965,7 @@ async fn the_derived_driver_is_the_node_that_started_last() {
     .await
     .unwrap();
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["coordinator".to_string()],
         "a started coordinator outranks the finished planner it came from"
     );
@@ -1847,7 +1979,7 @@ async fn the_derived_driver_is_the_node_that_started_last() {
     .await
     .unwrap();
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["planner".to_string()],
         "a pending coordinator never outranks the node still running"
     );
@@ -1870,10 +2002,7 @@ async fn a_coordinator_started_after_the_child_still_receives_it() {
         .unwrap();
     seed_child_issue(&db).await;
 
-    assert!(watcher_jobs_for_issue(&db, CHILD_URI)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(issue_watchers(&db, CHILD_URI).await.unwrap().is_empty());
 
     db.execute(
             "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
@@ -1884,7 +2013,7 @@ async fn a_coordinator_started_after_the_child_still_receives_it() {
         .unwrap();
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["late".to_string()]
     );
 }
@@ -1907,7 +2036,7 @@ async fn a_delegated_sub_task_never_coordinates_a_child() {
         .unwrap();
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j".to_string()]
     );
 }
@@ -1931,7 +2060,7 @@ async fn a_failed_or_never_run_parent_job_does_not_coordinate() {
         .unwrap();
 
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["j".to_string()]
     );
 }
@@ -1954,10 +2083,7 @@ async fn an_unparented_issue_has_no_derived_watcher() {
             .unwrap(),
         None
     );
-    assert!(watcher_jobs_for_issue(&db, CHILD_URI)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(issue_watchers(&db, CHILD_URI).await.unwrap().is_empty());
 }
 
 /// Opting out of a derived watch has no row to flip, so the refusal is recorded
@@ -1976,10 +2102,7 @@ async fn an_explicit_unsubscribe_opts_a_coordinator_out_of_its_derived_watch() {
         1
     );
     assert!(
-        watcher_jobs_for_issue(&db, CHILD_URI)
-            .await
-            .unwrap()
-            .is_empty(),
+        issue_watchers(&db, CHILD_URI).await.unwrap().is_empty(),
         "a recorded refusal survives the derivation"
     );
 }
@@ -2004,7 +2127,7 @@ async fn manual_watchers_and_the_derived_coordinator_both_watch() {
     // derived coordinator; its explicit row is what governs it, and no duplicate
     // recipient appears.
     assert_eq!(
-        watcher_jobs_for_issue(&db, CHILD_URI).await.unwrap(),
+        issue_watchers(&db, CHILD_URI).await.unwrap(),
         vec!["manual".to_string()]
     );
 }
@@ -2017,12 +2140,21 @@ async fn broadcast_child_facts_match_the_derived_coordinator() {
     seed_job(&db).await;
     seed_child_issue(&db).await;
 
-    let matched = matching_subscriptions_for_source(&db, "issue", Some(CHILD_URI), "message")
-        .await
-        .unwrap();
+    let matched = issue_recipients(&db, CHILD_URI, "message").await.unwrap();
     assert_eq!(matched.len(), 1);
-    assert_eq!(matched[0].job_id, "j");
-    assert_eq!(matched[0].state, WakeSubscriptionState::Active);
+    assert_eq!(
+        matched[0].recipient,
+        cairn_attention::wakes::StableRecipient::Job("j".into())
+    );
+    assert_eq!(
+        matched[0].reasons,
+        vec![cairn_attention::wakes::Reached {
+            reason: cairn_attention::wakes::Reason::Parent {
+                issue: CHILD_URI.into()
+            },
+            level: Wake::Wake,
+        }]
+    );
 
     // The derived watch carries exactly the fact vocabulary the seeded default
     // carried, so what the broadcast router reaches is unchanged. Notably
@@ -2031,7 +2163,7 @@ async fn broadcast_child_facts_match_the_derived_coordinator() {
     // subscription, which the derivation deliberately does not widen.
     for outside in ["terminal_exit", "external_message_reply"] {
         assert!(
-            matching_subscriptions_for_source(&db, "issue", Some(CHILD_URI), outside)
+            issue_recipients(&db, CHILD_URI, outside)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2225,16 +2357,24 @@ async fn source_matching_returns_best_subscription_for_every_subscriber() {
     .await
     .unwrap();
 
-    let matches =
-        matching_subscriptions_for_source(&db, "issue", Some("cairn://p/p/2"), "pr_state_change")
-            .await
-            .unwrap();
+    // One candidate per subscriber, each reached through its own best row: a
+    // mute keeps its subscriber, passively.
+    let matches = issue_recipients(&db, "cairn://p/p/2", "pr_state_change")
+        .await
+        .unwrap();
     assert_eq!(matches.len(), 2);
-    let j = matches.iter().find(|sub| sub.job_id == "j").unwrap();
-    assert_eq!(j.state, WakeSubscriptionState::Active);
-    let j2 = matches.iter().find(|sub| sub.job_id == "j2").unwrap();
-    assert_eq!(j2.state, WakeSubscriptionState::Muted);
-    assert_eq!(j2.fact_kinds.as_ref().unwrap(), &routine);
+    let reached = |job: &str| {
+        matches
+            .iter()
+            .find(|candidate| {
+                candidate.recipient == cairn_attention::wakes::StableRecipient::Job(job.into())
+            })
+            .unwrap()
+    };
+    assert_eq!(reached("j").level, Wake::Wake);
+    assert!(!reached("j").only_muted());
+    assert_eq!(reached("j2").level, Wake::Passive);
+    assert!(reached("j2").only_muted());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2641,6 +2781,7 @@ mod rebuild {
         let job_id = crate::threads::ensure_thread_session(&db, "thread")
             .await
             .unwrap();
+        super::seed_run(&db, &job_id).await;
         let orch = queueable_orchestrator(db);
         subscribe_rebuild_once(&orch, &job_id, &commit_clause(), "agent", None, &Graph)
             .await

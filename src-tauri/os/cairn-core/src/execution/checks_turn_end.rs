@@ -2028,6 +2028,15 @@ async fn run_turn_end_checks_inner(
             .map(|&index| {
                 let (plan, input_hash) = &to_run[index];
                 PlannedCheckBatchItem {
+                    recording_plan: Some(
+                        crate::execution::checks::CheckAdoptionRecordingPlan::new(
+                            plan,
+                            &recorder.sealed_coordinates[index],
+                            job_id,
+                            &checks_tool_id,
+                            &extra_env,
+                        ),
+                    ),
                     index,
                     name: plan.name.clone(),
                     input_hash: input_hash.clone(),
@@ -2464,6 +2473,7 @@ async fn run_pin_bump_lane(
         db,
         contract,
         CheckRunProducer {
+            adopt: None,
             tool_use_id: format!(
                 "turn-checks:{}:pin-bump:{}:{}",
                 scope.job_id, lane.check, lane.platform
@@ -3584,6 +3594,8 @@ impl ReviewGroupRecorder {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .entry(index)
                 .or_insert(CheckOutcome {
+                    left_running: None,
+                    consumer_guard: None,
                     name: member,
                     passed: false,
                     exit_code: None,
@@ -4483,6 +4495,8 @@ mod tests {
         output: &str,
     ) -> CheckOutcome {
         CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: name.to_string(),
             passed,
             exit_code: if passed { Some(0) } else { Some(1) },

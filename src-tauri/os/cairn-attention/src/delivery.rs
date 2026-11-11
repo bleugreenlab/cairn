@@ -70,105 +70,56 @@ pub(crate) async fn create_resolved_push_async(
     };
     let fingerprint = format!("status:{final_status}:{identity}");
     let key = format!("resolved:{}", event.issue_uri);
-    let watchers =
-        crate::wakes::watcher_jobs_for_issue(runtime.host.clone(), &db, &event.issue_uri).await?;
-    let parent =
-        crate::wakes::coordinating_job_for_child_issue(runtime.host.clone(), &db, &event.issue_uri)
-            .await?;
-    let updated_at = event.updated_at;
+    // A failed resolution wakes every watcher; any other wakes only the
+    // coordinator and rides along for the rest.
+    let watcher_level = if final_status == crate::models::IssueStatus::Failed {
+        Wake::Wake
+    } else {
+        Wake::Passive
+    };
+    let mut audience = crate::wakes::FactAudience::new("resolved", watcher_level, Wake::Wake);
+    audience.source = Some(crate::wakes::SourceRef::issue(&event.issue_uri));
+    audience.exclude.subject_issue_jobs = true;
+    let push = AudiencePush {
+        // The resolution's own identity (instant and generation): reopening
+        // and resolving again is a new fact, a replay of this one is not.
+        fact_key: format!("{key}#{fingerprint}"),
+        content: PushContent::Fixed(event.issue_uri.clone()),
+        boundary: Boundary::Event,
+        key,
+        fingerprint: Some(fingerprint.clone()),
+        guard: PushGuard::Resolution {
+            issue_id: event.issue_id.clone(),
+            status: final_status.to_string(),
+            fingerprint,
+            fallback_instant: event.updated_at,
+        },
+    };
+    let deliveries = push_to_audience(runtime.host.clone(), &db, &audience, &push).await?;
     let mut created = 0;
-    for recipient in watchers {
-        if job_belongs_to_issue(&db, &recipient, &event.issue_id).await? {
-            continue;
-        }
-        let requested = if final_status == crate::models::IssueStatus::Failed
-            || parent.as_deref() == Some(recipient.as_str())
-        {
-            Wake::Wake
-        } else {
-            Wake::Passive
-        };
-        let wake = super::push::source_mute_downgrade(&db, &recipient, &key, requested)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (eligible, inserted) = db
-            .write(|conn| {
-                let issue_id = event.issue_id.clone();
-                let issue_uri = event.issue_uri.clone();
-                let status = final_status.to_string();
-                let fingerprint = fingerprint.clone();
-                let key = key.clone();
-                let recipient = recipient.clone();
-                Box::pin(async move {
-                    // Reopening and replay serialize with insertion, including
-                    // delivered history. A stale event cannot mark a chapter.
-                    let mut rows = conn
-                        .query(
-                            "SELECT status,
-                            CASE status WHEN 'merged' THEN merged_at WHEN 'closed' THEN closed_at
-                                ELSE completed_at END,
-                            resolution_generation, quiet_failure_generation
-                         FROM issues WHERE id=?1",
-                            (issue_id.as_str(),),
-                        )
-                        .await?;
-                    let Some(row) = rows.next().await? else {
-                        return Ok((false, None));
-                    };
-                    let generation = row.i64(2)?;
-                    if row.text(0)? != status
-                        || (status == "failed" && row.opt_i64(3)? == Some(generation))
-                    {
-                        return Ok((false, None));
-                    }
-                    let current = format!(
-                        "status:{status}:{}:{generation}",
-                        row.opt_i64(1)?.unwrap_or(updated_at)
-                    );
-                    if current != fingerprint {
-                        return Ok((false, None));
-                    }
-                    drop(rows);
-                    super::push::push_fingerprinted_conn(
-                        conn,
-                        &recipient,
-                        &issue_uri,
-                        wake,
-                        Boundary::Event,
-                        &key,
-                        Some(&fingerprint),
-                        true,
-                    )
-                    .await
-                    .map(|inserted| (true, inserted))
-                })
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        if !eligible {
-            continue;
-        }
+    for delivery in &deliveries {
         // Chapter bookkeeping is idempotent and also runs on replay: a crash
         // after push commit but before this mark is repaired by the next boot.
         runtime
             .host
             .mark_thread_chapter(
                 &db,
-                &recipient,
+                &delivery.job_id,
                 &event.issue_id,
                 &event.issue_uri,
                 &final_status.to_string(),
             )
             .await;
-        if let Some((_, effective)) = inserted {
-            created += 1;
-            if effective.wakes_idle() {
-                if let Err(error) = runtime
-                    .host
-                    .nudge(&recipient, cairn_domain::DeliveryUrgency::Steer)
-                {
-                    log::warn!("resolved push wake for {recipient} failed: {error}");
-                }
+        if !delivery.fresh {
+            continue;
+        }
+        created += 1;
+        if delivery.wake.wakes_idle() {
+            if let Err(error) = runtime
+                .host
+                .nudge(&delivery.job_id, cairn_domain::DeliveryUrgency::Steer)
+            {
+                log::warn!("resolved push wake for {} failed: {error}", delivery.job_id);
             }
         }
     }
@@ -176,6 +127,248 @@ pub(crate) async fn create_resolved_push_async(
         runtime.host.emit_change("attention_pushes", None);
     }
     Ok(created)
+}
+
+/// What one push carries to each recipient it reaches.
+#[derive(Clone, Debug)]
+pub enum PushContent {
+    /// The same referent for everyone.
+    Fixed(String),
+    /// A catch-up window over `child_uri`'s chat, from each recipient's own
+    /// read cursor for `child_job_id`, or one turn of lead-in before `tail`.
+    Catchup {
+        child_uri: String,
+        child_job_id: String,
+        tail: i64,
+    },
+}
+
+/// A condition the push re-checks inside its own transaction, so a stale
+/// caller can never authorize it.
+#[derive(Clone, Debug)]
+pub enum PushGuard {
+    None,
+    /// A review: only while its issue is unresolved.
+    UnresolvedIssue(String),
+    /// A resolution notice: only while the issue still holds this resolution.
+    Resolution {
+        issue_id: String,
+        status: String,
+        fingerprint: String,
+        fallback_instant: i64,
+    },
+}
+
+/// One issue-sourced push owed to everyone the resolver finds.
+#[derive(Clone, Debug)]
+pub struct AudiencePush {
+    /// The receipt key. It must tell a genuine recurrence from a retry: an
+    /// ask id, a fingerprint naming the reviewed head or the episode, a
+    /// resolution identity, a catch-up occurrence.
+    pub fact_key: String,
+    pub content: PushContent,
+    pub boundary: Boundary,
+    /// The push key, which supersedes an undelivered push of the same key.
+    pub key: String,
+    pub fingerprint: Option<String>,
+    pub guard: PushGuard,
+}
+
+/// One recipient a push reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushDelivery {
+    pub recipient: crate::wakes::StableRecipient,
+    /// The session job (or job) that holds the push.
+    pub job_id: String,
+    pub wake: Wake,
+    /// `false` when the receipt was already delivered (a retry or a replay):
+    /// nothing new was pushed and nobody should be woken for it.
+    pub fresh: bool,
+}
+
+/// Push `push` to every recipient `audience` resolves to, writing each
+/// recipient's receipt in the same transaction as its push: for a push,
+/// receipt creation is the delivery. A receipt already consumed is never
+/// pushed again; a closed or fenced recipient's receipt is `dropped`.
+/// Callers nudge the fresh deliveries that wake.
+pub async fn push_to_audience(
+    host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
+    db: &LocalDb,
+    audience: &crate::wakes::FactAudience,
+    push: &AudiencePush,
+) -> Result<Vec<PushDelivery>, String> {
+    let key = push.key.clone();
+    let audience = audience.clone();
+    let push = push.clone();
+    db.write(move |conn| {
+        let host = host.clone();
+        let audience = audience.clone();
+        let push = push.clone();
+        Box::pin(async move { push_to_audience_conn(host, conn, &audience, &push).await })
+    })
+    .await
+    .map_err(|error| format!("Failed to push {key}: {error}"))
+}
+
+async fn push_to_audience_conn(
+    host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
+    conn: &cairn_db::storage::TrackedConnection,
+    audience: &crate::wakes::FactAudience,
+    push: &AudiencePush,
+) -> crate::storage::DbResult<Vec<PushDelivery>> {
+    use crate::wakes::{receipt_state, NewReceipt};
+    if !push_guard_holds_conn(conn, &push.guard).await? {
+        return Ok(Vec::new());
+    }
+    let candidates = crate::wakes::resolve_recipients_conn(host.clone(), conn, audience)
+        .await?
+        .into_candidates();
+    let mut deliveries = Vec::new();
+    for candidate in candidates {
+        if let Some(existing) =
+            crate::wakes::receipt_conn(conn, &push.fact_key, &candidate.recipient).await?
+        {
+            if existing.state != receipt_state::QUEUED {
+                if let (true, Some(job_id)) = (
+                    existing.state == receipt_state::DELIVERED,
+                    existing.delivered_job_id,
+                ) {
+                    deliveries.push(PushDelivery {
+                        recipient: candidate.recipient.clone(),
+                        job_id,
+                        wake: existing.level,
+                        fresh: false,
+                    });
+                }
+                continue;
+            }
+        }
+        let new = NewReceipt {
+            fact_key: &push.fact_key,
+            candidate: &candidate,
+            project_id: audience.project_id.as_deref(),
+            fact_row_id: None,
+        };
+        let write = crate::wakes::upsert_receipt_conn(conn, &new).await?;
+        let receipt = write.receipt().clone();
+        let job_id = match crate::wakes::deliverable_job_conn(
+            host.clone(),
+            conn,
+            &candidate.recipient,
+            true,
+        )
+        .await?
+        {
+            Ok(job_id) => job_id,
+            Err(why) => {
+                crate::wakes::close_receipts_conn(conn, &[receipt.id], receipt_state::DROPPED, why)
+                    .await?;
+                continue;
+            }
+        };
+        let content_ref = push_content_ref_conn(conn, &push.content, &job_id).await?;
+        let pushed = super::push::push_fingerprinted_conn(
+            conn,
+            &job_id,
+            &content_ref,
+            receipt.level,
+            push.boundary,
+            &push.key,
+            push.fingerprint.as_deref(),
+            push.fingerprint.is_some(),
+        )
+        .await?;
+        crate::wakes::settle_receipts_conn(
+            conn,
+            std::slice::from_ref(&receipt.id),
+            &job_id,
+            None,
+            pushed.as_ref().map(|(id, _)| id.as_str()),
+        )
+        .await?;
+        deliveries.push(PushDelivery {
+            recipient: candidate.recipient,
+            job_id,
+            wake: receipt.level,
+            // An identical fingerprint already pushed (before receipts existed)
+            // is the same fact: settled, but not pushed or woken again.
+            fresh: pushed.is_some(),
+        });
+    }
+    Ok(deliveries)
+}
+
+async fn push_guard_holds_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    guard: &PushGuard,
+) -> crate::storage::DbResult<bool> {
+    match guard {
+        PushGuard::None => Ok(true),
+        PushGuard::UnresolvedIssue(issue_id) => {
+            Ok(super::push::review_issue_eligible_conn(conn, issue_id).await? > 0)
+        }
+        PushGuard::Resolution {
+            issue_id,
+            status,
+            fingerprint,
+            fallback_instant,
+        } => {
+            // Reopening and replay serialize with insertion, including
+            // delivered history. A stale event cannot push or mark a chapter.
+            let mut rows = conn
+                .query(
+                    "SELECT status,
+                        CASE status WHEN 'merged' THEN merged_at WHEN 'closed' THEN closed_at
+                            ELSE completed_at END,
+                        resolution_generation, quiet_failure_generation
+                     FROM issues WHERE id=?1",
+                    (issue_id.as_str(),),
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(false);
+            };
+            let generation = row.i64(2)?;
+            if row.text(0)? != *status
+                || (status == "failed" && row.opt_i64(3)? == Some(generation))
+            {
+                return Ok(false);
+            }
+            let current = format!(
+                "status:{status}:{}:{generation}",
+                row.opt_i64(1)?.unwrap_or(*fallback_instant)
+            );
+            Ok(current == *fingerprint)
+        }
+    }
+}
+
+async fn push_content_ref_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    content: &PushContent,
+    job_id: &str,
+) -> crate::storage::DbResult<String> {
+    match content {
+        PushContent::Fixed(content_ref) => Ok(content_ref.clone()),
+        PushContent::Catchup {
+            child_uri,
+            child_job_id,
+            tail,
+        } => {
+            let mut rows = conn
+                .query(
+                    "SELECT position FROM attention_read_cursors
+                     WHERE recipient=?1 AND source=?2 LIMIT 1",
+                    params![job_id, child_job_id.as_str()],
+                )
+                .await?;
+            let start = match rows.next().await? {
+                Some(row) => row.i64(0)?,
+                None => (tail - 1).max(0),
+            };
+            Ok(format!("{child_uri}/chat?offset={start}"))
+        }
+    }
 }
 
 /// Recover failed resolutions committed before their attention emit. Existing
@@ -293,39 +486,14 @@ async fn resolution_key(
     .map_err(|error| error.to_string())
 }
 
-pub async fn job_belongs_to_issue(
-    db: &LocalDb,
-    job_id: &str,
-    issue_id: &str,
-) -> Result<bool, String> {
-    let job_id = job_id.to_string();
-    let issue_id = issue_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let issue_id = issue_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM jobs WHERE id=?1 AND issue_id=?2 LIMIT 1",
-                    params![job_id.as_str(), issue_id.as_str()],
-                )
-                .await?;
-            Ok(rows.next().await?.is_some())
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// Push to every watcher of `issue_uri`, optionally excluding the producing
-/// node. The shared creator for question and permission push sources; review and
-/// resolved pushes each have outcome-specific creators.
-/// Supersede-by-key collapses repeats to one undelivered row per recipient; the
-/// delivery layer drains, lazy-resolves, and stamps each push.
+/// Push an ask (a question or a permission) to everyone the resolver finds
+/// for `issue_uri`, excluding the producing node, which is self-suspended on
+/// its own ask. The ask's own URI is its fact key: one ask is one fact.
 ///
-/// Returns the recipients that received a push, so a `wake`/`interrupt` caller
-/// can wake each through `delivery::nudge_job_for_urgency` (CAIRN-1889). Passive
-/// callers ignore the list.
+/// Returns the jobs a fresh push should rouse, so a `wake`/`interrupt` caller
+/// can wake each through `delivery::nudge_job_for_urgency` (CAIRN-1889). A
+/// recipient that muted this source holds a `Passive` ride-along row and is
+/// not handed back (CAIRN-1900).
 #[expect(
     clippy::too_many_arguments,
     reason = "watcher routing and push delivery fields are independent parts of this boundary"
@@ -340,23 +508,24 @@ pub async fn push_to_issue_watchers(
     boundary: Boundary,
     key: &str,
 ) -> Result<Vec<String>, String> {
-    let watchers = crate::wakes::watcher_jobs_for_issue(host.clone(), db, issue_uri).await?;
-    let mut pushed = Vec::new();
-    for recipient in watchers {
-        if Some(recipient.as_str()) == exclude_job {
-            continue;
-        }
-        let (_, effective) = super::push::push(db, &recipient, content_ref, wake, boundary, key)
-            .await
-            .map_err(|e| e.to_string())?;
-        // Only hand rousing recipients back for nudging. A recipient that muted
-        // this source gets a `Passive` ride-along row (created by the central
-        // downgrade in `push`) and must NOT be woken (CAIRN-1900).
-        if effective.wakes_idle() {
-            pushed.push(recipient);
-        }
-    }
-    Ok(pushed)
+    let fact_kind = key.split_once(':').map_or(key, |(prefix, _)| prefix);
+    let mut audience = crate::wakes::FactAudience::new(fact_kind, wake, wake);
+    audience.source = Some(crate::wakes::SourceRef::issue(issue_uri));
+    audience.exclude.jobs = exclude_job.map(str::to_owned).into_iter().collect();
+    let push = AudiencePush {
+        fact_key: key.to_string(),
+        content: PushContent::Fixed(content_ref.to_string()),
+        boundary,
+        key: key.to_string(),
+        fingerprint: None,
+        guard: PushGuard::None,
+    };
+    Ok(push_to_audience(host, db, &audience, &push)
+        .await?
+        .into_iter()
+        .filter(|delivery| delivery.fresh && delivery.wake.wakes_idle())
+        .map(|delivery| delivery.job_id)
+        .collect())
 }
 
 /// Create the passive `catchup:{child-job}` push for the watching parent at the
@@ -410,33 +579,28 @@ pub async fn create_catchup_push(
     Ok(())
 }
 
-/// Create the passive catch-up push for **every job that watches** the issue the
-/// addressed node belongs to (CAIRN-3342), for a message the **operator** sent
-/// that node: the composer's queued text, an answer to a question, or a direct
-/// message with no sending run. Agent-to-agent traffic inside a child never
-/// comes through here; [`create_catchup_push`] is the per-recipient primitive
-/// underneath it.
+/// Create the passive catch-up push for everyone the resolver finds for the
+/// issue the addressed node belongs to (CAIRN-3342), for a message the
+/// **operator** sent that node: the composer's queued text, an answer to a
+/// question, or a direct message with no sending run. Agent-to-agent traffic
+/// inside a child never comes through here; [`create_catchup_push`] is the
+/// per-recipient primitive underneath it.
 ///
-/// The recipient set is derived, never materialized: [`watcher_jobs_for_issue`]
-/// resolves the issue's current coordinator on every call, plus any explicit
-/// subscription rows. A new coordinator execution therefore inherits its
-/// children's operator traffic with no hand-off step, and a superseded one stops
-/// receiving it. The message path used to resolve its single recipient through
-/// `parent_wake::load_parent_job`, which prefers the `issues.parent_job_id`
-/// spawning snapshot — the same cache CAIRN-3293 removed from every other
-/// child-attention route, and which in practice addressed catch-up to a
-/// coordinator that had already been superseded.
+/// The recipient set is derived, never materialized: the resolver finds the
+/// issue's current coordinator on every call, plus explicit subscriptions and
+/// the issue's camp. A new coordinator execution therefore inherits its
+/// children's operator traffic with no hand-off step, and a superseded one
+/// stops receiving it.
 ///
-/// Jobs on the addressed node's own issue are excluded, so a node never receives
-/// catch-up for its own chat. Mute composes rather than suppresses: the row is
-/// created `Passive`, which is exactly what a mute would downgrade a wake to, so
-/// a muted child's operator traffic still rides along on the watcher's next run.
-///
-/// [`watcher_jobs_for_issue`]: crate::wakes::watcher_jobs_for_issue
+/// `occurrence` names the operator message, so each message is its own fact
+/// while a retry of one is not. Jobs on the addressed node's own issue are
+/// excluded, so a node never receives catch-up for its own chat. Catch-up is
+/// always passive: a muted watcher's ride-along is what a mute would leave it.
 pub async fn create_catchup_pushes_for_watchers(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     db: &LocalDb,
     child_uri: &str,
+    occurrence: &str,
 ) -> Result<usize, String> {
     let Some(parsed) = cairn_uri::parse_uri(child_uri) else {
         return Ok(0);
@@ -447,23 +611,40 @@ pub async fn create_catchup_pushes_for_watchers(
     ) else {
         return Ok(0);
     };
-    let issue_uri = cairn_uri::build_issue_uri(&project_key, number);
-    let watchers = crate::wakes::watcher_jobs_for_issue(host.clone(), db, &issue_uri).await?;
-    if watchers.is_empty() {
+    let Some(child_job_id) = job_id_for_child_uri(db, child_uri).await else {
+        // The URI did not resolve to an agent job (a stale or not-yet-persisted
+        // node/task, or a non-node/task URI); skip rather than mis-scope the
+        // cursor.
+        log::warn!("catch-up push: no job for {child_uri}");
         return Ok(0);
-    }
-    let issue_id = issue_id_for_issue_uri(db, &issue_uri).await?;
-    let mut created = 0usize;
-    for recipient in watchers {
-        if let Some(issue_id) = issue_id.as_deref() {
-            if job_belongs_to_issue(db, &recipient, issue_id).await? {
-                continue;
-            }
-        }
-        create_catchup_push(db, &recipient, child_uri).await?;
-        created += 1;
-    }
-    Ok(created)
+    };
+    let issue_uri = cairn_uri::build_issue_uri(&project_key, number);
+    let tail = count_job_chat_turns(db, &child_job_id).await;
+    let key = format!("catchup:{child_job_id}");
+    let mut audience = crate::wakes::FactAudience::new(
+        crate::wakes::FACT_KIND_MESSAGE,
+        Wake::Passive,
+        Wake::Passive,
+    );
+    audience.source = Some(crate::wakes::SourceRef::issue(&issue_uri));
+    audience.exclude.subject_issue_jobs = true;
+    let push = AudiencePush {
+        fact_key: format!("{key}#{occurrence}"),
+        content: PushContent::Catchup {
+            child_uri: child_uri.to_string(),
+            child_job_id,
+            tail,
+        },
+        boundary: Boundary::Event,
+        key,
+        fingerprint: None,
+        guard: PushGuard::None,
+    };
+    Ok(push_to_audience(host, db, &audience, &push)
+        .await?
+        .into_iter()
+        .filter(|delivery| delivery.fresh)
+        .count())
 }
 
 /// The node/task URI of `job_id`, then [`create_catchup_pushes_for_watchers`] on
@@ -473,6 +654,7 @@ pub async fn create_catchup_pushes_for_job(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     db: &LocalDb,
     child_job_id: &str,
+    occurrence: &str,
 ) -> Result<usize, String> {
     let Some(child_uri) = cairn_db::lineage::home_uri_for_job(db, child_job_id)
         .await
@@ -480,21 +662,7 @@ pub async fn create_catchup_pushes_for_job(
     else {
         return Ok(0);
     };
-    create_catchup_pushes_for_watchers(host, db, &child_uri).await
-}
-
-async fn issue_id_for_issue_uri(db: &LocalDb, issue_uri: &str) -> Result<Option<String>, String> {
-    let issue_uri = issue_uri.to_string();
-    db.read(|conn| {
-        let issue_uri = issue_uri.clone();
-        Box::pin(async move {
-            Ok(cairn_db::relations::resolve_issue_uri(conn, &issue_uri)
-                .await?
-                .map(|issue| issue.issue_id))
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
+    create_catchup_pushes_for_watchers(host, db, &child_uri, occurrence).await
 }
 
 /// Resolve the agent job whose `{node|task}/chat` a catch-up push renders, from

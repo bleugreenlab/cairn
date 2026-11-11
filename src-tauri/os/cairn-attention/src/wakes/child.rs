@@ -25,13 +25,11 @@
 //! [`DEFAULT_CHILD_FACT_KINDS`]); only the recipient varies, so the recipient is
 //! the only thing resolved live. A node that wants to opt out writes an explicit
 //! row (`mute` or `unsubscribe`), and an explicit row always wins over the
-//! derived watch — see [`subscriptions_governing_issue`].
+//! derived watch — see the parent edge in [`super::recipients`].
 
 use cairn_db::turso::params;
 
 use crate::storage::{DbResult, LocalDb, RowExt};
-
-use super::types::*;
 
 /// The node that currently owns `child_issue_uri`'s attention, or `None` when
 /// the issue has no parent edge (a root issue, or one orphaned by a patch) and
@@ -155,71 +153,21 @@ pub async fn gate_owner_for_child_conn(
     }
 }
 
-/// The jobs that watch `issue_uri` — the recipient set for every issue-sourced
-/// attention push (question, permission, review, resolved).
-///
-/// The derived parent-axis coordinator plus every job holding an explicit
-/// non-`unsubscribed` row. Order is explicit rows first, then the derived
-/// coordinator, deduplicated by job.
-pub async fn watcher_jobs_for_issue(
-    host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
-    db: &LocalDb,
-    issue_uri: &str,
-) -> Result<Vec<String>, String> {
-    let mut jobs: Vec<String> = Vec::new();
-    for subscription in subscriptions_governing_issue(host.clone(), db, issue_uri).await? {
-        if subscription.state == WakeSubscriptionState::Unsubscribed
-            || jobs.contains(&subscription.job_id)
-        {
-            continue;
-        }
-        jobs.push(subscription.job_id);
-    }
-    Ok(jobs)
-}
-
-/// Every subscription governing `issue_uri`: the persisted rows for that source,
-/// plus the derived parent-axis watch when the coordinating node holds no row of
-/// its own.
-///
-/// A node's own explicit row is authoritative for that node, whatever its state
-/// or fact scope. That is what makes `mute` and `unsubscribe` work against a
-/// derived watch: a narrowed row cannot be widened back by the default, and an
-/// `unsubscribed` row keeps the derivation from re-adding the node.
-pub async fn subscriptions_governing_issue(
-    host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
-    db: &LocalDb,
-    issue_uri: &str,
-) -> Result<Vec<WakeSubscription>, String> {
-    let mut subscriptions =
-        super::matching::subscriptions_for_source(db, SOURCE_KIND_ISSUE, Some(issue_uri)).await?;
-    let Some(coordinator) = coordinating_job_for_child_issue(host, db, issue_uri).await? else {
-        return Ok(subscriptions);
-    };
-    if subscriptions
-        .iter()
-        .any(|subscription| subscription.job_id == coordinator)
-    {
-        return Ok(subscriptions);
-    }
-    subscriptions.push(derived_child_subscription(&coordinator, issue_uri));
-    Ok(subscriptions)
-}
-
 /// The child issues `job_id` currently coordinates, as canonical issue URIs.
 ///
-/// The exact inverse of [`coordinating_job_for_child`], for the `/wakes` read
+/// The exact inverse of the resolver's parent edge, for the `/wakes` read
 /// projection: since the derived watch has no row, this is the only way a node
-/// can see the child attention it is subscribed to. It asks the same question of
-/// each child of the job's own issue or thread, so a node sees precisely the
-/// children whose facts would reach it.
+/// can see the child attention it is subscribed to. It asks the same question
+/// of each child of the job's own issue or thread ([`gate_owner_for_child_conn`],
+/// compared as stable recipients), so a node sees precisely the children whose
+/// facts would reach it, and asking never establishes a session.
 pub async fn coordinated_child_issue_uris_for_job(
     host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Vec<String>, String> {
     let job_id = job_id.to_string();
-    db.write(|conn| {
+    db.read(move |conn| {
         let host = host.clone();
         let job_id = job_id.clone();
         Box::pin(async move {
@@ -244,13 +192,20 @@ pub async fn coordinated_child_issue_uris_for_job(
                     cairn_uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
                 ));
             }
+            let me = super::recipients::stable_recipient_for_job_conn(conn, &job_id).await?;
             let mut uris = Vec::new();
             for (child_issue_id, child_uri) in children {
-                if coordinating_job_for_child(host.clone(), conn, &child_issue_id)
-                    .await?
-                    .as_deref()
-                    == Some(job_id.as_str())
-                {
+                let owner =
+                    match gate_owner_for_child_conn(host.clone(), conn, &child_issue_id).await? {
+                        GateOwner::Thread(thread_id) => {
+                            Some(super::recipients::StableRecipient::Thread(thread_id))
+                        }
+                        GateOwner::Job(owner) => Some(
+                            super::recipients::stable_recipient_for_job_conn(conn, &owner).await?,
+                        ),
+                        GateOwner::Operator => None,
+                    };
+                if owner.as_ref() == Some(&me) {
                     uris.push(child_uri);
                 }
             }

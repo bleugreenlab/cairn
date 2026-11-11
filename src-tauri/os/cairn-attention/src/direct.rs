@@ -57,6 +57,74 @@ pub async fn insert_system_direct_push_with_key_conn(
     .await
 }
 
+/// Write one direct delivery idempotently inside the caller's transaction:
+/// the `messages` row under `message_id` and its `direct:` push, each only if
+/// absent. A settlement re-driven after a crash, or after a partial commit in
+/// another database, writes nothing twice. Returns the push id and its wake.
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_direct_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    recipient_job_id: &str,
+    recipient_run_id: &str,
+    sender_name: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    message_id: &str,
+    operator_message_id: Option<&str>,
+) -> Result<(String, crate::push::Wake), DbError> {
+    use crate::push::Boundary;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT OR IGNORE INTO messages (
+            id, channel_type, channel_id, sender_run_id, sender_name,
+            recipient_run_id, content, created_at, urgency
+         ) VALUES (?1, 'direct', NULL, NULL, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            message_id,
+            sender_name,
+            recipient_run_id,
+            content,
+            now,
+            urgency.as_str()
+        ],
+    )
+    .await?;
+    let wake = direct_wake_for_urgency(urgency);
+    let key = crate::push::direct_push_key(message_id, operator_message_id);
+    let mut rows = conn
+        .query(
+            "SELECT id FROM attention_pushes WHERE recipient = ?1 AND key = ?2 LIMIT 1",
+            params![recipient_job_id, key.as_str()],
+        )
+        .await?;
+    if let Some(row) = rows.next().await? {
+        return Ok((cairn_db::storage::RowExt::text(&row, 0)?, wake));
+    }
+    drop(rows);
+    let content_ref = node_uri_for_job_conn(conn, recipient_job_id)
+        .await?
+        .unwrap_or_else(|| recipient_job_id.to_string());
+    let push_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO attention_pushes
+           (id, recipient, content_ref, wake, boundary, key, created_at, fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            push_id.as_str(),
+            recipient_job_id,
+            content_ref.as_str(),
+            wake.as_str(),
+            Boundary::Event.as_str(),
+            key.as_str(),
+            now,
+            message_id
+        ],
+    )
+    .await?;
+    Ok((push_id, wake))
+}
+
 /// [`insert_system_direct_push_with_key_conn`] with a caller-chosen message id,
 /// for a caller whose message row is its own durable delivery record: the push
 /// can be dismissed (deleted) while pending, the message row is not.

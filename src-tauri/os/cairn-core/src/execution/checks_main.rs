@@ -26,9 +26,10 @@
 //! a fixed interval, so a tip that never got a complete row is retried and a
 //! lane that has gone quiet says so.
 //!
-//! A pass the runner's own restart cuts short is neither a death nor a failure:
-//! it is announced as **cancelled by restart**, recorded, and cited by the pass
-//! the next boot arms, so a restart never leaves main with no pass at all.
+//! Remote main-cadence lanes survive a restart through durable grant claims.
+//! Boot reserves each old lane before arming its single successor, rebuilds the
+//! original contract, and binds the old attempt to the existing recorder.
+//! Colocated lanes still read **cancelled by restart** and are re-armed at boot.
 //!
 //! A lane that does not produce a complete verdict is announced louder than any
 //! red, with its cause class: **death** (the lane died: placement, capacity,
@@ -79,13 +80,17 @@ use crate::execution::check_parsers::{
 };
 use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
-    execute_check_contract, host_ended_compile, load_checks_contract_at_commit_detailed,
-    resolve_check_contract_at_commit, CheckRunProducer, CheckRunTarget, CommitChecksContract,
+    execute_adopted_check_item, execute_check_contract, host_ended_compile,
+    load_checks_contract_at_commit_detailed, resolve_check_contract_at_commit,
+    CheckContractSnapshot, CheckRunProducer, CheckRunTarget, CommitChecksContract,
     CommitChecksContractError, HostEnding, MAIN_CADENCE_STREAM_PREFIX, NO_VERDICT_SUPPRESSED,
 };
 use crate::fleet::PURPOSE_OWES_DEATH;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::{
+    check_lane_adoptions::{self, Claim, Waiter},
+    LocalDb, RowExt,
+};
 
 /// A burst of merges settles into one pass.
 const SETTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -213,9 +218,18 @@ struct Arming {
 
 /// One lane's run in flight, and at most one successor.
 struct LaneRun {
+    adopted: Option<AdoptedLane>,
     commit: String,
     armed_at_unix_ms: i64,
     queued: Option<(Trigger, Tip)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AdoptedLane {
+    pub(crate) request_id: String,
+    pub(crate) machine: String,
+    pub(crate) adopted_at_unix_ms: i64,
+    pub(crate) awaiting_report: bool,
 }
 
 /// A lane pass the runner's own restart cancelled: recorded as the runner
@@ -264,6 +278,7 @@ pub(crate) struct LaneInFlight {
     pub(crate) armed_at_unix_ms: i64,
     /// Whether a successor on a newer tip is owed when it ends.
     pub(crate) queued: bool,
+    pub(crate) adopted: Option<AdoptedLane>,
 }
 
 /// What a lane last reported, kept so the project overview names every lane's
@@ -310,6 +325,8 @@ struct Attempted {
     inputs: Option<String>,
     suppressed: bool,
     event_id: String,
+    /// The live subscriber remains owned through reporting and durable delivery.
+    consumer_guard: Option<Arc<crate::fleet::CheckConsumerGuard>>,
 }
 
 impl Default for Attempted {
@@ -318,6 +335,7 @@ impl Default for Attempted {
             inputs: None,
             suppressed: false,
             event_id: uuid::Uuid::new_v4().to_string(),
+            consumer_guard: None,
         }
     }
 }
@@ -398,6 +416,41 @@ pub(crate) struct CadenceSlots {
 }
 
 impl CadenceSlots {
+    /// Reserve the old attempt before startup can offer this lane a new tip.
+    fn adopt(&mut self, claim: &Claim, item_index: usize, boot_at: i64) -> bool {
+        if cadence_claim_check(claim, item_index).is_err() {
+            return false;
+        }
+        let key = (
+            claim.project_id.clone(),
+            (
+                claim.check_names[item_index].clone(),
+                claim.platform.clone(),
+            ),
+        );
+        if let Some(run) = self.lanes.get(&key) {
+            return run
+                .adopted
+                .as_ref()
+                .is_some_and(|adopted| adopted.request_id == claim.request_id);
+        }
+        self.lanes.insert(
+            key,
+            LaneRun {
+                adopted: Some(AdoptedLane {
+                    request_id: claim.request_id.clone(),
+                    machine: claim.machine.clone(),
+                    adopted_at_unix_ms: boot_at,
+                    awaiting_report: true,
+                }),
+                commit: claim.commit_sha.clone(),
+                armed_at_unix_ms: claim.granted_at_ms,
+                queued: None,
+            },
+        );
+        true
+    }
+
     /// Claim the one waiter for `key`'s settlement. `false` when one is
     /// already waiting.
     fn watch_debt(&mut self, key: &crate::fleet::purpose::PurposeKey) -> bool {
@@ -613,6 +666,7 @@ impl CadenceSlots {
                 self.lanes.insert(
                     key,
                     LaneRun {
+                        adopted: None,
                         commit: tip.commit.clone(),
                         armed_at_unix_ms: now,
                         queued: None,
@@ -635,6 +689,7 @@ impl CadenceSlots {
         let run = self.lanes.get_mut(&key)?;
         match run.queued.take() {
             Some((trigger, tip)) => {
+                run.adopted = None;
                 run.commit = tip.commit.clone();
                 run.armed_at_unix_ms = now;
                 Some((trigger, tip))
@@ -661,6 +716,7 @@ impl CadenceSlots {
                 commit: run.commit.clone(),
                 armed_at_unix_ms: run.armed_at_unix_ms,
                 queued: run.queued.is_some(),
+                adopted: run.adopted.clone(),
             })
             .collect();
         lanes.sort_by(|a, b| (&a.check, &a.platform).cmp(&(&b.check, &b.platform)));
@@ -681,7 +737,73 @@ impl CadenceSlots {
 /// While a lane runs the store holds no row of its for the new tip, so this is
 /// what tells "pending" from "never ran" (CAIRN-3823).
 pub(crate) fn in_flight(orch: &Orchestrator, project_id: &str) -> Option<InFlight> {
-    orch.main_cadence.lock().unwrap().in_flight(project_id)
+    let mut flight = orch.main_cadence.lock().unwrap().in_flight(project_id)?;
+    for lane in &mut flight.lanes {
+        if let Some(adopted) = &mut lane.adopted {
+            adopted.awaiting_report =
+                orch.fleet
+                    .purpose_owes(&crate::fleet::purpose::PurposeKey::main_cadence(
+                        project_id,
+                        &lane.check,
+                        &lane.platform,
+                    ));
+        }
+    }
+    Some(flight)
+}
+
+/// The same debt clause appears on the project overview and the machine page.
+pub(crate) fn render_adopted_lane(lane: &LaneInFlight) -> Option<String> {
+    let adopted = lane.adopted.as_ref()?;
+    let status = if adopted.awaiting_report {
+        format!(
+            "awaiting adoption on {} since {}; the lane re-arms when the machine reports or is removed; the operator may authorize the overlap (authorize_overlap)",
+            adopted.machine, stamp(lane.armed_at_unix_ms)
+        )
+    } else {
+        format!(
+            "running on {} since {}",
+            adopted.machine,
+            stamp(lane.armed_at_unix_ms)
+        )
+    };
+    Some(format!(
+        "- {} on {} at `{}`: {status}; adopted from the previous runner at {} (request {}). Live output streaming is not reattached; the output tail arrives with the result.{}\n",
+        lane.check, lane.platform, short_commit(&lane.commit), stamp(adopted.adopted_at_unix_ms), adopted.request_id,
+        if lane.queued { " One successor is queued for the current tip." } else { "" },
+    ))
+}
+
+pub(crate) fn render_machine_adoptions(orch: &Orchestrator, machine: &str) -> String {
+    let projects: BTreeSet<_> = orch
+        .main_cadence
+        .lock()
+        .unwrap()
+        .lanes
+        .keys()
+        .map(|(project, _)| project.clone())
+        .collect();
+    let mut lines = String::new();
+    for project in projects {
+        if let Some(flight) = in_flight(orch, &project) {
+            for lane in flight.lanes {
+                if lane
+                    .adopted
+                    .as_ref()
+                    .is_some_and(|adopted| adopted.machine == machine)
+                {
+                    if let Some(line) = render_adopted_lane(&lane) {
+                        lines.push_str(&line);
+                    }
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines
+    } else {
+        format!("## Adopted main cadence lanes\n\n{lines}\n")
+    }
 }
 
 /// Each lane's last report for `project_id` since this runner started, in lane
@@ -806,6 +928,9 @@ fn start_lane(orch: &Orchestrator, tip: Tip, lane: CadenceLane, trigger: Trigger
                 );
                 announce_lane_death(&orch, &tip, &lane, cause).await;
             }
+            if orch.fleet.runner_stopping_since().is_some() {
+                break;
+            }
             let next =
                 orch.main_cadence
                     .lock()
@@ -843,6 +968,519 @@ pub(crate) async fn spawn_all_current(orch: &Orchestrator, trigger: Trigger) {
     }
 }
 
+fn cadence_claim_check(claim: &Claim, index: usize) -> Result<&str, String> {
+    if claim.check_names.len() != claim.input_hashes.len() || index >= claim.check_names.len() {
+        return Err(format!(
+            "cadence adoption {} has invalid item {index}: {} checks and {} hashes",
+            claim.request_id,
+            claim.check_names.len(),
+            claim.input_hashes.len()
+        ));
+    }
+    Ok(&claim.check_names[index])
+}
+
+fn verify_adoption_inputs(claim: &Claim, index: usize, rebuilt: &str) -> Result<(), String> {
+    cadence_claim_check(claim, index)?;
+    if claim.input_hashes[index] == rebuilt {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot adopt request {} at {}: granted input hash {} differs from rebuilt input hash {rebuilt}",
+            claim.request_id, claim.commit_sha, claim.input_hashes[index]
+        ))
+    }
+}
+
+/// The decision must commit before any Cancel or held-result acknowledgement.
+/// Store failures leave the debt intact and retry; they are not evidence of loss.
+async fn lose_adoption(orch: &Orchestrator, claim: &Claim, checks: &[String], cause: &str) {
+    loop {
+        match try_lose_adoption(orch, claim, checks, cause).await {
+            Ok(()) => return,
+            Err(error) => {
+                log::error!("main cadence adoption {} cannot durably record loss: {error}; retaining the debt and retrying", claim.request_id);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+fn adoption_interruptions(claim: &Claim, checks: &[String]) -> Vec<Interruption> {
+    checks
+        .iter()
+        .map(|check| Interruption {
+            check: check.clone(),
+            platform: claim.platform.clone(),
+            commit: claim.commit_sha.clone(),
+            // The durable timestamp is stable across abrupt-stop resends.
+            stopped_at_unix_ms: claim.stopped_at_ms.unwrap_or(claim.updated_ms),
+        })
+        .collect()
+}
+
+/// Persist cadence repair before fleet loss makes the claim terminal or releases
+/// its binding. Boot must find the repair even if its open-claim scan runs later.
+pub(crate) async fn record_adoption_interruptions(
+    db: &LocalDb,
+    claim: &Claim,
+    checks: &[String],
+) -> Result<(), String> {
+    for interruption in adoption_interruptions(claim, checks) {
+        record_interruption(db, &claim.project_id, &interruption).await?;
+    }
+    Ok(())
+}
+
+/// One settlement attempt, also used by the serial unbound-result dispatcher.
+/// A store failure must yield to its retry queue, not block unrelated results.
+pub(crate) async fn try_lose_adoption(
+    orch: &Orchestrator,
+    claim: &Claim,
+    checks: &[String],
+    cause: &str,
+) -> Result<(), String> {
+    let current =
+        check_lane_adoptions::lookup(&orch.db.local, &claim.request_id, &claim.attempt_id)
+            .await
+            .map_err(|error| error.to_string())?;
+    if current
+        .as_ref()
+        .is_some_and(|current| current.state == "recorded")
+    {
+        return Ok(());
+    }
+    let already_lost = current
+        .as_ref()
+        .is_some_and(|current| current.state == "lost");
+    record_adoption_interruptions(&orch.db.local, claim, checks).await?;
+    if !already_lost {
+        check_lane_adoptions::settle_failure(
+            &orch.db.local,
+            &claim.request_id,
+            &claim.attempt_id,
+            "lost",
+            cause,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    for interruption in adoption_interruptions(claim, checks) {
+        orch.main_cadence
+            .lock()
+            .unwrap()
+            .interrupted(&claim.project_id, interruption);
+    }
+    if !already_lost {
+        orch.fleet
+            .cancel_adopted(&claim.request_id, &claim.attempt_id, &claim.executor_id);
+    }
+    let cause = current
+        .as_ref()
+        .filter(|current| current.state == "lost")
+        .and_then(|current| current.evidence.as_deref())
+        .unwrap_or(cause);
+    log::warn!(
+        "main cadence adoption {} on {} lost: {cause}",
+        claim.request_id,
+        claim.machine
+    );
+    Ok(())
+}
+
+async fn adoption_tip(
+    orch: &Orchestrator,
+    claim: &Claim,
+    index: usize,
+) -> Result<(Tip, CadenceLane), String> {
+    let check = cadence_claim_check(claim, index)?;
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, &claim.project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (repo_path, default_branch) = db
+        .query_all(
+            "SELECT repo_path, default_branch FROM projects WHERE id = ?1",
+            (claim.project_id.clone(),),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("adoption project {} no longer exists", claim.project_id))?;
+    let declared = tip_lanes(
+        &orch.main_cadence,
+        &claim.project_id,
+        &claim.commit_sha,
+        || load_checks_contract_at_commit_detailed(Path::new(&repo_path), &claim.commit_sha),
+    )
+    .await?;
+    let lane = declared
+        .into_iter()
+        .find(|lane| lane.check == check && lane.platform == claim.platform)
+        .ok_or_else(|| {
+            format!(
+                "{} on {} is not declared at {}",
+                check, claim.platform, claim.commit_sha
+            )
+        })?;
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let repository =
+        crate::jj::coordinate_repository(&jj, &orch.config_dir, Path::new(&repo_path))?;
+    Ok((
+        Tip {
+            project_id: claim.project_id.clone(),
+            project_key: project_key(&db, &claim.project_id).await?,
+            repo_path,
+            default_branch,
+            repository,
+            commit: claim.commit_sha.clone(),
+        },
+        lane,
+    ))
+}
+
+fn cadence_waiter_indices(claim: &Claim, waiters: &[Waiter]) -> Result<Vec<usize>, String> {
+    let mut indices = BTreeSet::new();
+    for waiter in waiters.iter().filter(|waiter| waiter.is_cadence_adopter()) {
+        let check = cadence_claim_check(claim, waiter.item_index)?;
+        if waiter.request_id != claim.request_id
+            || waiter.attempt_id != claim.attempt_id
+            || waiter.check_name != check
+        {
+            return Err(format!(
+                "cadence waiter for {} does not match physical request {} item {}",
+                waiter.check_name, claim.request_id, waiter.item_index
+            ));
+        }
+        indices.insert(waiter.item_index);
+    }
+    Ok(indices.into_iter().collect())
+}
+
+fn reserve_adoption_slots(
+    orch: &Orchestrator,
+    claim: &Claim,
+    indices: &[usize],
+) -> Result<(), String> {
+    let mut slots = orch.main_cadence.lock().unwrap();
+    for index in indices {
+        if !slots.adopt(claim, *index, now_ms()) {
+            return Err(format!(
+                "another physical request owns {} on {}",
+                claim.check_names[*index], claim.platform
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn finish_adoption_slots(orch: &Orchestrator, claim: &Claim, indices: &[usize]) {
+    if orch.fleet.runner_stopping_since().is_some() {
+        return;
+    }
+    for index in indices {
+        let key = (
+            claim.project_id.clone(),
+            (claim.check_names[*index].clone(), claim.platform.clone()),
+        );
+        let queued = {
+            let mut slots = orch.main_cadence.lock().unwrap();
+            if !slots
+                .lanes
+                .get(&key)
+                .and_then(|run| run.adopted.as_ref())
+                .is_some_and(|adopted| adopted.request_id == claim.request_id)
+            {
+                continue;
+            }
+            slots.lanes.remove(&key).and_then(|run| run.queued)
+        };
+        if let Some((trigger, tip)) = queued {
+            arm(
+                orch,
+                tip.project_id,
+                tip.repo_path,
+                tip.default_branch,
+                trigger,
+                LaneScope::Only(BTreeSet::from([key.1])),
+            );
+        }
+    }
+}
+
+/// One physical recorder per item, then fan out the resulting observations to
+/// cadence consumers. Manual/review siblings retain their original sealed plans.
+pub(crate) async fn adopt_check_batch(orch: &Orchestrator, claim: &Claim, waiters: Vec<Waiter>) {
+    let indices = match cadence_waiter_indices(claim, &waiters) {
+        Ok(indices) => indices,
+        Err(error) => {
+            let checks: Vec<_> = waiters
+                .iter()
+                .filter(|w| w.consumer == "main_cadence")
+                .map(|w| w.check_name.clone())
+                .collect();
+            lose_adoption(orch, claim, &checks, &error).await;
+            return;
+        }
+    };
+    if indices.is_empty() {
+        return;
+    }
+    let checks: Vec<_> = indices
+        .iter()
+        .map(|i| claim.check_names[*i].clone())
+        .collect();
+    if let Err(error) = reserve_adoption_slots(orch, claim, &indices) {
+        lose_adoption(orch, claim, &checks, &error).await;
+        finish_adoption_slots(orch, claim, &indices);
+        return;
+    }
+    let work = tokio::spawn({
+        let orch = orch.clone();
+        let claim = claim.clone();
+        let indices = indices.clone();
+        async move { record_adopted_batch(&orch, &claim, &indices).await }
+    })
+    .await;
+    let error = match work {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(format!("cadence batch adopter panicked: {error}")),
+    };
+    if let Some(error) = error {
+        lose_adoption(orch, claim, &checks, &error).await;
+    }
+    finish_adoption_slots(orch, claim, &indices);
+}
+
+async fn current_cadence_item_waiters(
+    orch: &Orchestrator,
+    claim: &Claim,
+    index: usize,
+) -> Vec<Waiter> {
+    loop {
+        match check_lane_adoptions::waiters(&orch.db.local, &claim.request_id, &claim.attempt_id)
+            .await
+        {
+            Ok(waiters) => {
+                return waiters
+                    .into_iter()
+                    .filter(|waiter| waiter.item_index == index && waiter.is_cadence_adopter())
+                    .collect()
+            }
+            Err(error) => {
+                log::error!("cannot read current cadence consumers for {}: {error}; retaining the result and retrying", claim.request_id);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn record_adopted_batch(
+    orch: &Orchestrator,
+    claim: &Claim,
+    indices: &[usize],
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, &claim.project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut cadence = Vec::new();
+    for index in indices {
+        let (tip, lane) = adoption_tip(orch, claim, *index).await?;
+        let contract =
+            resolve_lane_contract(orch, db.clone(), &tip.context(Trigger::Startup), &lane).await?;
+        verify_adoption_inputs(claim, *index, &contract.context.input_hash)?;
+        cadence.push((*index, tip, lane));
+    }
+    log::info!("main cadence adopting physical request {} on {} at original commit {} ({} suites, {} cadence lanes)",
+        claim.request_id, claim.machine, claim.commit_sha, claim.check_names.len(), cadence.len());
+    let mut observations = Vec::new();
+    for index in 0..claim.check_names.len() {
+        let result = execute_adopted_check_item(orch, db.clone(), claim, index).await?;
+        if let Some(left) = result.left_running {
+            for (_, tip, lane) in &cadence {
+                report_lane(
+                    orch,
+                    &db,
+                    &tip.project_id,
+                    &tip.project_key,
+                    Some(&tip.repository),
+                    lane,
+                    Some(&tip.commit),
+                    CadenceVerdict::AwaitingAdoption {
+                        machine: left.machine.clone(),
+                        request_id: left.request_id.clone(),
+                        stopped_at_unix_ms: i64::try_from(left.stopped_at_ms).unwrap_or(i64::MAX),
+                    },
+                    &Attempted::default(),
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        let id = result.observation_id.ok_or_else(|| {
+            format!(
+                "adopted request {} suite {} recorded no observation: {:?}",
+                claim.request_id, claim.check_names[index], result.no_verdict
+            )
+        })?;
+        observations.push(id);
+    }
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
+    'cadence: for (index, tip, lane) in cadence {
+        let row = loop {
+            if current_cadence_item_waiters(orch, claim, index)
+                .await
+                .is_empty()
+            {
+                continue 'cadence;
+            }
+            match load_row(&db, &tip.project_key, &observations[index], &names).await {
+                Ok(row) => break row,
+                Err(error) => {
+                    log::error!("adopted observation {} could not be read: {error}; retaining the debt and retrying before delivery", observations[index]);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        };
+        let verdict = lane.verdict.classify(row);
+        let attempted = Attempted {
+            inputs: Some(claim.input_hashes[index].clone()),
+            ..Default::default()
+        };
+        loop {
+            if current_cadence_item_waiters(orch, claim, index)
+                .await
+                .is_empty()
+            {
+                continue 'cadence;
+            }
+            match try_report_lane(
+                orch,
+                &db,
+                &tip.project_id,
+                &tip.project_key,
+                Some(&tip.repository),
+                &lane,
+                Some(&tip.commit),
+                verdict.clone(),
+                &attempted,
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    log::error!("adopted cadence report failed: {error}; retaining the waiter and retrying before acknowledgement");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+        let mut confirmed = HashSet::new();
+        loop {
+            let pending = current_cadence_item_waiters(orch, claim, index)
+                .await
+                .into_iter()
+                .find(|waiter| !confirmed.contains(&waiter.consumer_ref));
+            let Some(waiter) = pending else { break };
+            // Re-read after every failed delivery: a concurrent withdrawal is
+            // terminal evidence, not a reason to retry an obsolete receipt.
+            match orch
+                .fleet
+                .deliver_check_waiter(&waiter, &observations[index])
+                .await
+            {
+                Ok(()) => {
+                    confirmed.insert(waiter.consumer_ref);
+                }
+                Err(error) => {
+                    // The receipt may already be delivered while the physical
+                    // claim write failed. Only successful API completion proves
+                    // its finalization edge ran; retry delivered receipts too.
+                    log::error!("could not durably deliver adopted cadence waiter {}: {error}; retaining the debt and retrying", waiter.consumer_ref);
+                    #[cfg(test)]
+                    crate::execution::checks::notify_adoption_retry(&observations[index], &error);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn adopt_at_boot(orch: &Orchestrator) {
+    orch.fleet.await_restart_adoptions_loaded().await;
+    let claims = match check_lane_adoptions::open(&orch.db.local).await {
+        Ok(claims) => claims,
+        Err(error) => {
+            log::error!("main cadence cannot load check_lane_adoptions at boot: {error}; remote lanes cannot be adopted");
+            return;
+        }
+    };
+    if let Err(error) = check_lane_adoptions::prune(&orch.db.local).await {
+        log::warn!("check_lane_adoptions terminal-row pruning failed: {error}");
+    }
+    let mut batches = Vec::new();
+    for claim in claims {
+        let waiters = loop {
+            match check_lane_adoptions::waiters(
+                &orch.db.local,
+                &claim.request_id,
+                &claim.attempt_id,
+            )
+            .await
+            {
+                Ok(waiters) => break waiters,
+                Err(error) => {
+                    log::error!("main cadence cannot read check adoption waiters for {}: {error}; retaining the debt and retrying", claim.request_id);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        };
+        match cadence_waiter_indices(&claim, &waiters) {
+            Ok(indices) if !indices.is_empty() => {
+                let identity = (claim.request_id.clone(), claim.attempt_id.clone());
+                if !orch.fleet.is_check_adoption_reloaded(&identity) {
+                    let checks: Vec<_> = indices
+                        .iter()
+                        .map(|index| claim.check_names[*index].clone())
+                        .collect();
+                    // A recovered store read cannot undo the fleet's boot Cancel
+                    // decision or manufacture ownership of that physical grant.
+                    lose_adoption(
+                        orch,
+                        &claim,
+                        &checks,
+                        "boot preload failed; the fleet cancelled it",
+                    )
+                    .await;
+                    continue;
+                }
+                if let Err(error) = reserve_adoption_slots(orch, &claim, &indices) {
+                    log::error!("main cadence cannot reserve adopted lane: {error}");
+                }
+                batches.push((claim, waiters));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let checks: Vec<_> = waiters
+                    .iter()
+                    .filter(|w| w.consumer == "main_cadence")
+                    .map(|w| w.check_name.clone())
+                    .collect();
+                lose_adoption(orch, &claim, &checks, &error).await;
+            }
+        }
+    }
+    // Reserve every old lane before any batch or startup arm can race it.
+    for (claim, waiters) in batches {
+        let orch = orch.clone();
+        tokio::spawn(async move {
+            adopt_check_batch(&orch, &claim, waiters).await;
+        });
+    }
+}
+
 /// The boot repair edge: arm every project at once and start the heartbeat.
 ///
 /// Runs as the runner comes up, not behind its gated maintenance. Behind it,
@@ -854,6 +1492,7 @@ pub(crate) async fn spawn_all_current(orch: &Orchestrator, trigger: Trigger) {
 /// complete row already covers is not re-run. A hand baseline already running
 /// on the same inputs is joined by the fleet's coalescing, not run twice.
 pub(crate) async fn arm_at_boot(orch: &Orchestrator) {
+    adopt_at_boot(orch).await;
     match take_interruptions(&orch.db.local).await {
         Ok(interrupted) => {
             let mut slots = orch.main_cadence.lock().unwrap();
@@ -1239,6 +1878,7 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
                 slots.take_interruption(context.project_id, lane)
             };
             if let Some(interruption) = rearmed {
+                forget_interruption(&orch.db.local, context.project_id, &interruption).await;
                 log::info!(
                     "main cadence: {} is answered by {}, which already covers `{}`",
                     interruption.describe(),
@@ -1255,18 +1895,125 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
             if matches!(verdict, CadenceVerdict::Death { .. }) {
                 rearm_on_debt_settlement(orch, context, lane);
             }
-            report_lane(
-                orch,
-                &db,
+            report_live_lane(orch, &db, context, lane, verdict, &attempted).await;
+            drop(attempted.consumer_guard);
+        }
+    }
+}
+
+async fn main_cadence_delivery_requests(
+    db: &LocalDb,
+    project: &str,
+    lane: &CadenceLane,
+    observation: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let purpose =
+        crate::fleet::purpose::PurposeKey::main_cadence(project, &lane.check, &lane.platform)
+            .to_string();
+    db.query_all(
+        "SELECT w.request_id,w.attempt_id FROM check_lane_adoption_waiters w
+           JOIN check_lane_adoptions c ON c.request_id=w.request_id AND c.attempt_id=w.attempt_id
+          WHERE c.project_id=?1 AND c.platform=?2 AND w.check_name=?3
+            AND w.consumer='main_cadence' AND w.consumer_ref=?4 AND w.observation_id=?5
+            AND w.state IN ('recorded','delivered')",
+        (
+            project.to_string(),
+            lane.platform.clone(),
+            lane.check.clone(),
+            purpose,
+            observation.to_string(),
+        ),
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn report_live_lane(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    context: &PassContext<'_>,
+    lane: &CadenceLane,
+    verdict: CadenceVerdict,
+    attempted: &Attempted,
+) {
+    let observation = verdict.row().map(|row| row.id.clone());
+    let Some(observation) = observation else {
+        report_lane(
+            orch,
+            db,
+            context.project_id,
+            context.project_key,
+            Some(context.repository),
+            lane,
+            Some(context.commit),
+            verdict,
+            attempted,
+        )
+        .await;
+        return;
+    };
+    loop {
+        match try_report_lane(
+            orch,
+            db,
+            context.project_id,
+            context.project_key,
+            Some(context.repository),
+            lane,
+            Some(context.commit),
+            verdict.clone(),
+            attempted,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(error) => {
+                log::error!(
+                    "live cadence report failed: {error}; retaining its consumer until delivery"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+    let purpose = crate::fleet::purpose::PurposeKey::main_cadence(
+        context.project_id,
+        &lane.check,
+        &lane.platform,
+    )
+    .to_string();
+    loop {
+        let delivered = async {
+            if let Some(guard) = &attempted.consumer_guard {
+                return guard.deliver(&observation).await;
+            }
+            for identity in main_cadence_delivery_requests(
+                &orch.db.local,
                 context.project_id,
-                context.project_key,
-                Some(context.repository),
                 lane,
-                Some(context.commit),
-                verdict,
-                &attempted,
+                &observation,
             )
-            .await;
+            .await?
+            {
+                orch.fleet
+                    .deliver_check_consumer(
+                        &identity,
+                        &lane.check,
+                        "main_cadence",
+                        &purpose,
+                        &observation,
+                    )
+                    .await?;
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        match delivered {
+            Ok(()) => break,
+            Err(error) => {
+                log::error!("could not confirm live cadence delivery: {error}; retaining its consumer and retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         }
     }
 }
@@ -1309,6 +2056,68 @@ fn rearm_on_debt_settlement(orch: &Orchestrator, context: &PassContext<'_>, lane
     });
 }
 
+async fn resolve_lane_contract(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    context: &PassContext<'_>,
+    lane: &CadenceLane,
+) -> Result<CheckContractSnapshot, String> {
+    let placement = CheckPlacementOverride::new(
+        ExecutorSelector {
+            os: Some(lane.platform.clone()),
+            ..Default::default()
+        },
+        CheckSelectorSource::Explicit,
+    )
+    .map_err(|error| {
+        format!(
+            "mainCadence platform {:?} is not placeable: {error}",
+            lane.platform
+        )
+    })?;
+    resolve_check_contract_at_commit(
+        orch,
+        db,
+        CheckRunTarget {
+            job_id: cadence_owner(context.project_id),
+            project_id: context.project_id.to_string(),
+            project_key: context.project_key.to_string(),
+            repository_path: context.repo_path.to_string(),
+            attribution_target: context.default_branch.to_string(),
+            attribution_commit: None,
+        },
+        context.commit.to_string(),
+        &lane.check,
+        Some(&placement),
+    )
+    .await
+}
+
+async fn accepted_cadence_observations(
+    orch: &Orchestrator,
+    project: &str,
+    lane: &CadenceLane,
+) -> Result<Vec<String>, String> {
+    orch.db
+        .local
+        .query_all(
+            "SELECT DISTINCT w.observation_id FROM check_lane_adoption_waiters w
+           JOIN check_lane_adoptions c ON c.request_id=w.request_id AND c.attempt_id=w.attempt_id
+          WHERE c.project_id=?1 AND c.platform=?2 AND w.check_name=?3
+            AND w.consumer='main_cadence' AND w.observation_id IS NOT NULL
+            AND w.state IN ('recorded','delivered')
+          ORDER BY w.updated_ms DESC LIMIT 64",
+            (
+                project.to_string(),
+                lane.platform.clone(),
+                lane.check.clone(),
+            ),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn attempt_lane(
     orch: &Orchestrator,
     db: Arc<LocalDb>,
@@ -1321,40 +2130,7 @@ async fn attempt_lane(
             Attempted::default(),
         )
     };
-    let placement = match CheckPlacementOverride::new(
-        ExecutorSelector {
-            os: Some(lane.platform.clone()),
-            ..Default::default()
-        },
-        CheckSelectorSource::Explicit,
-    ) {
-        Ok(placement) => placement,
-        Err(error) => {
-            return death(format!(
-                "mainCadence platform {:?} is not a placeable platform: {error}",
-                lane.platform
-            ))
-        }
-    };
-    let contract = match resolve_check_contract_at_commit(
-        orch,
-        db.clone(),
-        CheckRunTarget {
-            job_id: cadence_owner(context.project_id),
-            project_id: context.project_id.to_string(),
-            project_key: context.project_key.to_string(),
-            repository_path: context.repo_path.to_string(),
-            // The fork point of the tip with its own branch is the tip, so a
-            // whole-suite run carries no changed-file attribution.
-            attribution_target: context.default_branch.to_string(),
-            attribution_commit: None,
-        },
-        context.commit.to_string(),
-        &lane.check,
-        Some(&placement),
-    )
-    .await
-    {
+    let contract = match resolve_lane_contract(orch, db.clone(), context, lane).await {
         Ok(contract) => contract,
         Err(error) => return death(error),
     };
@@ -1363,38 +2139,43 @@ async fn attempt_lane(
         suppressed: false,
         ..Default::default()
     };
-    let attempt = |verdict: CadenceVerdict, suppressed: bool| {
-        LaneAttempt::Verdict(
-            verdict,
-            Attempted {
-                suppressed,
-                ..attempted.clone()
-            },
-        )
-    };
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
-    // A complete row on any executor of the platform covers these inputs: the
-    // question is whether a verdict is owed, not what to diff against.
-    match latest_complete_row(
-        &db,
-        context.project_id,
-        context.project_key,
-        lane,
-        RowFilter {
-            input_hash: Some(&contract.context.input_hash),
-            ..RowFilter::default()
-        },
-        &names,
-    )
-    .await
+    // A complete row on any executor of the platform covers these inputs:
+    // physical execution can have served a manual/review and cadence waiter.
+    let adopted = accepted_cadence_observations(orch, context.project_id, lane).await.unwrap_or_else(|error| {
+        log::warn!("could not read cadence waiter coverage: {error}; using ordinary whole-suite rows only");
+        Vec::new()
+    });
+    let chain = main_chain(orch, context.repository, context.commit).unwrap_or_else(|error| {
+        log::warn!(
+            "cadence coverage ancestry unavailable: {error}; checking the resolved tip only"
+        );
+        MainChain::from_log(context.commit)
+    });
     {
-        Ok(Some(row)) => return LaneAttempt::Covered(row),
-        Ok(None) => {}
-        Err(error) => log::warn!(
-            "main cadence {} on {}: coverage lookup failed, running anyway: {error}",
-            lane.check,
-            lane.platform
-        ),
+        match latest_complete_row(
+            &db,
+            context.project_id,
+            context.project_key,
+            lane,
+            RowFilter {
+                input_hash: Some(&contract.context.input_hash),
+                main_chain: Some(&chain),
+                adopted_observations: Some(&adopted),
+                ..RowFilter::default()
+            },
+            &names,
+        )
+        .await
+        {
+            Ok(Some(row)) => return LaneAttempt::Covered(row),
+            Ok(None) => {}
+            Err(error) => log::warn!(
+                "main cadence {} on {}: coverage lookup failed, running anyway: {error}",
+                lane.check,
+                lane.platform
+            ),
+        }
     }
     let short = short_commit(context.commit);
     let result = match execute_check_contract(
@@ -1408,6 +2189,7 @@ async fn attempt_lane(
             ),
             node_kind: format!("main-cadence {} @ {short}", lane.platform),
             owner_job_id: None,
+            adopt: None,
             purpose: Some(crate::fleet::purpose::PurposeKey::main_cadence(
                 context.project_id,
                 &lane.check,
@@ -1422,15 +2204,38 @@ async fn attempt_lane(
     {
         Ok(result) => result,
         Err(error) => {
-            return attempt(
+            return LaneAttempt::Verdict(
                 CadenceVerdict::Death {
                     row: None,
                     cause: error,
                 },
-                false,
+                attempted,
             )
         }
     };
+    let attempted = Attempted {
+        consumer_guard: result.consumer_guard.clone(),
+        ..attempted
+    };
+    let attempt = |verdict: CadenceVerdict, suppressed: bool| {
+        LaneAttempt::Verdict(
+            verdict,
+            Attempted {
+                suppressed,
+                ..attempted.clone()
+            },
+        )
+    };
+    if let Some(left) = result.left_running.as_ref() {
+        return attempt(
+            CadenceVerdict::AwaitingAdoption {
+                machine: left.machine.clone(),
+                request_id: left.request_id.clone(),
+                stopped_at_unix_ms: i64::try_from(left.stopped_at_ms).unwrap_or(i64::MAX),
+            },
+            false,
+        );
+    }
     if let Some(no_verdict) = result.no_verdict.as_ref() {
         return attempt(
             CadenceVerdict::Death {
@@ -1458,15 +2263,25 @@ async fn attempt_lane(
             false,
         );
     };
-    match load_row(&db, context.project_key, observation_id, &names).await {
-        Ok(row) => attempt(lane.verdict.classify(row), false),
-        Err(error) => attempt(
-            CadenceVerdict::NoVerdict {
-                row: None,
-                cause: format!("observation {observation_id} could not be read back: {error}"),
-            },
-            false,
-        ),
+    loop {
+        match load_row(&db, context.project_key, observation_id, &names).await {
+            Ok(row) => return attempt(lane.verdict.classify(row), false),
+            Err(error) if attempted.consumer_guard.is_some() => {
+                log::error!("live cadence observation {observation_id} could not be read: {error}; retaining the consumer and retrying before reporting");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(error) => {
+                return attempt(
+                    CadenceVerdict::NoVerdict {
+                        row: None,
+                        cause: format!(
+                            "observation {observation_id} could not be read back: {error}"
+                        ),
+                    },
+                    false,
+                )
+            }
+        }
     }
 }
 
@@ -1482,6 +2297,35 @@ async fn report_lane(
     verdict: CadenceVerdict,
     attempted: &Attempted,
 ) {
+    if let Err(error) = try_report_lane(
+        orch,
+        db,
+        project_id,
+        project_key,
+        repository,
+        lane,
+        commit,
+        verdict,
+        attempted,
+    )
+    .await
+    {
+        log::error!("main cadence report failed: {error}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_report_lane(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    repository: Option<&Path>,
+    lane: &CadenceLane,
+    commit: Option<&str>,
+    verdict: CadenceVerdict,
+    attempted: &Attempted,
+) -> Result<(), String> {
     let captured_at = now_ms();
     let source = incident_sources::capture(
         db,
@@ -1494,7 +2338,9 @@ async fn report_lane(
     )
     .await;
     if let Err(error) = &source {
-        log::error!("main incident source capture failed: {error}; outcome: {verdict:?}");
+        return Err(format!(
+            "main incident source capture failed: {error}; outcome: {verdict:?}"
+        ));
     }
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
     // Without the chain (a pass that failed before resolving the tip, or an
@@ -1609,12 +2455,22 @@ async fn report_lane(
             lane.check,
             lane.platform
         ),
-        CadenceVerdict::Cancelled { .. } => log::info!("{content}"),
+        CadenceVerdict::Cancelled { .. } | CadenceVerdict::AwaitingAdoption { .. } => {
+            log::info!("{content}")
+        }
         CadenceVerdict::NoVerdict { .. } | CadenceVerdict::Death { .. } => {
             log::error!("{content}")
         }
     }
     let observed = observe(lane.verdict, &verdict, &comparison, commit, attempted);
+    let lane_key = (project_id.to_string(), lane.key());
+    let (previous_standing, previous_filing_notice) = {
+        let slots = orch.main_cadence.lock().unwrap();
+        (
+            slots.standing.get(&lane_key).cloned(),
+            slots.filing_notices.get(project_id).copied(),
+        )
+    };
     let wake = orch
         .main_cadence
         .lock()
@@ -1628,18 +2484,50 @@ async fn report_lane(
     } else {
         wake
     };
-    match wake {
-        Wake::Announce => deliver(orch, db, project_id, &lane.notify, &content).await,
+    let delivered = match wake {
+        Wake::Announce => try_deliver(orch, db, project_id, &lane.notify, &content).await,
         Wake::StillHeld { since_ms } => {
             let still = render_still_held(&report, since_ms);
-            deliver(orch, db, project_id, &lane.notify, &still).await;
+            try_deliver(orch, db, project_id, &lane.notify, &still).await
         }
-        Wake::Quiet => log::info!(
-            "main cadence {} on {}: identical to its predecessor, so recorded and not posted",
-            lane.check,
-            lane.platform
-        ),
+        Wake::Quiet => {
+            log::info!(
+                "main cadence {} on {}: identical to its predecessor, so recorded and not posted",
+                lane.check,
+                lane.platform
+            );
+            Ok(())
+        }
+    };
+    if let Err(error) = delivered {
+        // An attempted send is not an announcement. A retry must not turn a
+        // failed Announce into Quiet, or discard the interruption it should cite.
+        let mut slots = orch.main_cadence.lock().unwrap();
+        match previous_standing {
+            Some(standing) => {
+                slots.standing.insert(lane_key, standing);
+            }
+            None => {
+                slots.standing.remove(&lane_key);
+            }
+        }
+        match previous_filing_notice {
+            Some(at) => {
+                slots.filing_notices.insert(project_id.to_string(), at);
+            }
+            None => {
+                slots.filing_notices.remove(project_id);
+            }
+        }
+        if let Some(interruption) = rearmed {
+            slots.interrupted(project_id, interruption);
+        }
+        return Err(error);
     }
+    if let Some(interruption) = &rearmed {
+        forget_interruption(&orch.db.local, project_id, interruption).await;
+    }
+    Ok(())
 }
 
 fn filing_notice_due(orch: &Orchestrator, project_id: &str, note: &str, now: i64) -> bool {
@@ -1886,6 +2774,12 @@ fn observe(
         }
         CadenceVerdict::NoVerdict { cause, .. } => ("no-verdict", cause),
         CadenceVerdict::Death { cause, .. } => ("death", cause),
+        CadenceVerdict::AwaitingAdoption { request_id, .. } => {
+            return Observed::Unobserved {
+                identity: format!("awaiting-adoption\n{request_id}"),
+                reminds: false,
+            };
+        }
         CadenceVerdict::Cancelled {
             stopped_at_unix_ms, ..
         } => {
@@ -2093,36 +2987,30 @@ async fn announce_pass_failure(
 }
 
 async fn deliver(orch: &Orchestrator, db: &LocalDb, project_id: &str, thread: &str, content: &str) {
-    let thread_id = match db
+    if let Err(error) = try_deliver(orch, db, project_id, thread, content).await {
+        log::error!("{error}; undelivered:\n{content}");
+    }
+}
+
+async fn try_deliver(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    thread: &str,
+    content: &str,
+) -> Result<(), String> {
+    let thread_id = db
         .query_opt_text(
             "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2 LIMIT 1",
             (project_id.to_string(), thread.to_string()),
         )
         .await
-    {
-        Ok(Some(thread_id)) => thread_id,
-        Ok(None) => {
-            log::error!(
-                "main cadence notify thread {thread:?} does not exist; undelivered:\n{content}"
-            );
-            return;
-        }
-        Err(error) => {
-            log::error!(
-                "main cadence notify thread lookup failed: {error}; undelivered:\n{content}"
-            );
-            return;
-        }
-    };
-    if let Err(error) = crate::messages::delivery::append_thread_message(
-        orch, db, &thread_id, None, SENDER, content,
-    )
-    .await
-    {
-        log::error!(
-            "main cadence delivery to thread {thread:?} failed: {error}; undelivered:\n{content}"
-        );
-    }
+        .map_err(|error| format!("main cadence notify thread lookup failed: {error}"))?
+        .ok_or_else(|| format!("main cadence notify thread {thread:?} does not exist"))?;
+    crate::messages::delivery::append_thread_message(orch, db, &thread_id, None, SENDER, content)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("main cadence delivery to thread {thread:?} failed: {error}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,6 +3195,12 @@ pub(crate) enum CadenceVerdict {
         row: Option<CadenceRow>,
         cause: String,
     },
+    /// A remote lane survived shutdown and owes its answer to the next runner.
+    AwaitingAdoption {
+        machine: String,
+        request_id: String,
+        stopped_at_unix_ms: i64,
+    },
     /// The runner began stopping while the lane ran, and the lane ended
     /// without a result: see [`cancelled_by_restart`].
     Cancelled {
@@ -2322,7 +3216,7 @@ impl CadenceVerdict {
             CadenceVerdict::NoVerdict { row, .. } | CadenceVerdict::Death { row, .. } => {
                 row.as_ref()
             }
-            CadenceVerdict::Cancelled { .. } => None,
+            CadenceVerdict::Cancelled { .. } | CadenceVerdict::AwaitingAdoption { .. } => None,
         }
     }
     fn is_complete(&self) -> bool {
@@ -2390,6 +3284,11 @@ fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
             "the run exited {} having selected nothing to check, so it measured nothing",
             row.exit_code
         ))
+    } else if matches!(row.selection.as_deref(), Some("partial" | "filtered")) {
+        Some(
+            "the run measured a selected slice, not the whole command this cadence lane observes"
+                .to_string(),
+        )
     } else {
         None
     };
@@ -2492,6 +3391,15 @@ async fn record_interruption(
     .await
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+async fn forget_interruption(db: &LocalDb, project_id: &str, interruption: &Interruption) {
+    if let Err(error) = db.execute(
+        "DELETE FROM main_cadence_interruptions WHERE project_id=?1 AND check_name=?2 AND platform=?3 AND commit_sha=?4 AND stopped_at=?5",
+        (project_id, interruption.check.as_str(), interruption.platform.as_str(), interruption.commit.as_str(), interruption.stopped_at_unix_ms),
+    ).await {
+        log::warn!("could not retire cited cadence interruption: {error}");
+    }
 }
 
 /// Every recorded restart cancel, removed as it is read: one boot cites each.
@@ -2758,6 +3666,9 @@ struct RowFilter<'a> {
     /// the nearest tree wins. Without it only the cadence's own rows qualify,
     /// newest finish first.
     main_chain: Option<&'a MainChain>,
+    /// Rows a durable cadence waiter accepted from a shared physical grant.
+    /// The claims live in the runner store, which may differ from this row's DB.
+    adopted_observations: Option<&'a [String]>,
     /// Only rows on `main_chain`, the cadence's own included. Set when the
     /// chain was read from a base rather than main's tip: a cadence row off it
     /// observed a tree main held after the base.
@@ -2812,11 +3723,19 @@ async fn latest_complete_row(
     use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
     use cairn_db::turso::Value as SqlValue;
 
+    let adopted = filter.adopted_observations.unwrap_or_default();
     let whole_suite = match lane.verdict {
-        LaneVerdict::PerTest => PER_TEST_WHOLE_SUITE,
+        LaneVerdict::PerTest => PER_TEST_WHOLE_SUITE.to_string(),
         LaneVerdict::Exit => {
-            "COALESCE(selection, '') != 'empty' AND COALESCE(deferred_count, 0) = 0
-                AND cadence IN ('main', 'manual')"
+            let authority = if adopted.is_empty() {
+                "cadence IN ('main', 'manual')".to_string()
+            } else {
+                format!(
+                    "(cadence IN ('main', 'manual') OR id IN ({}))",
+                    placeholders(adopted.len())
+                )
+            };
+            format!("COALESCE(selection, '') NOT IN ('empty', 'partial', 'filtered') AND COALESCE(deferred_count, 0) = 0 AND {authority}")
         }
     };
     let mut narrowing = format!(
@@ -2828,6 +3747,9 @@ async fn latest_complete_row(
         SqlValue::Text(lane.check.clone()),
         SqlValue::Text(lane.platform.clone()),
     ];
+    if lane.verdict == LaneVerdict::Exit {
+        params.extend(adopted.iter().cloned().map(SqlValue::Text));
+    }
     for (clause, value) in [
         (" AND id != ?", filter.excluding),
         (" AND input_hash = ?", filter.input_hash),
@@ -3895,6 +4817,10 @@ fn outcome_summary(kind: LaneVerdict, verdict: &CadenceVerdict) -> String {
         CadenceVerdict::NoVerdict { .. } => "did not complete (no-verdict)".to_string(),
         CadenceVerdict::Death { .. } => "did not complete (death)".to_string(),
         CadenceVerdict::Cancelled { .. } => "cancelled by restart".to_string(),
+        CadenceVerdict::AwaitingAdoption { machine, request_id, stopped_at_unix_ms } => format!(
+            "the runner stopped at {} while this lane ran on {machine} (request {request_id}); awaiting adoption",
+            stamp(*stopped_at_unix_ms)
+        ),
     }
 }
 
@@ -5256,6 +6182,14 @@ pub(crate) fn render_report(report: &CadenceReport<'_>) -> String {
     let mut out = String::new();
     match report.verdict {
         CadenceVerdict::Complete(row) => render_complete(&mut out, report, row),
+        CadenceVerdict::AwaitingAdoption { .. } => {
+            out.push_str(&format!(
+                "**MAIN CADENCE · {} · {}** — {}.\n",
+                report.check,
+                report.platform,
+                outcome_summary(report.kind, report.verdict)
+            ));
+        }
         CadenceVerdict::NoVerdict { row, cause } => render_incomplete(
             &mut out,
             report,
@@ -5300,9 +6234,9 @@ fn render_still_held(report: &CadenceReport<'_>, since_ms: i64) -> String {
     let (class, cause) = match report.verdict {
         CadenceVerdict::NoVerdict { cause, .. } => ("no-verdict", cause),
         CadenceVerdict::Death { cause, .. } => ("death", cause),
-        CadenceVerdict::Complete(_) | CadenceVerdict::Cancelled { .. } => {
-            return render_report(report)
-        }
+        CadenceVerdict::Complete(_)
+        | CadenceVerdict::Cancelled { .. }
+        | CadenceVerdict::AwaitingAdoption { .. } => return render_report(report),
     };
     let tip = report
         .commit
@@ -5728,6 +6662,7 @@ mod tests {
                         commit: "t4".into(),
                         armed_at_unix_ms: 6,
                         queued: false,
+                        adopted: None,
                     },
                     LaneInFlight {
                         check: "rust-tests".into(),
@@ -5735,6 +6670,7 @@ mod tests {
                         commit: "t1".into(),
                         armed_at_unix_ms: 1,
                         queued: true,
+                        adopted: None,
                     },
                 ],
                 rearming: Vec::new(),
@@ -6009,6 +6945,939 @@ mod tests {
         assert_eq!(slots.finish("p", 7), Some((Trigger::Merge, LaneScope::All)));
         assert_eq!(slots.finish("p", 8), None);
         assert!(slots.in_flight("p").is_none());
+    }
+
+    fn adoption_claim(state: &str) -> Claim {
+        Claim {
+            request_id: "remote-request".into(),
+            attempt_id: "attempt".into(),
+            project_id: "p".into(),
+            check_names: vec!["rust-tests".into()],
+            input_hashes: vec!["original-inputs".into()],
+            recording_plans: Vec::new(),
+            platform: "linux".into(),
+            commit_sha: "original-commit".into(),
+            consumer: "main_cadence".into(),
+            consumer_ref: "main:p:rust-tests:linux".into(),
+            executor_id: "remote".into(),
+            machine: "fedora".into(),
+            granted_at_ms: HOUR,
+            state: state.into(),
+            stopped_at_ms: (state != "running").then_some(2 * HOUR),
+            evidence: None,
+            observation_id: None,
+            updated_ms: 2 * HOUR,
+        }
+    }
+
+    #[test]
+    fn cadence_adoption_reserves_running_awaiting_and_joined_claims_before_startup() {
+        let lane = linux_lane();
+        for state in ["running", "awaiting_adoption", "joined"] {
+            let claim = adoption_claim(state);
+            let mut slots = CadenceSlots::default();
+            assert!(slots.adopt(&claim, 0, 3 * HOUR));
+            assert!(
+                slots.adopt(&claim, 0, 3 * HOUR),
+                "reserving the same identity is idempotent"
+            );
+            assert!(!slots.offer(&lane, &tip("p", "startup-tip"), Trigger::Startup, 4 * HOUR));
+            assert!(!slots.offer(&lane, &tip("p", "newest-tip"), Trigger::Merge, 5 * HOUR));
+            let flight = slots.in_flight("p").unwrap();
+            assert_eq!(flight.lanes.len(), 1);
+            assert_eq!(flight.lanes[0].commit, "original-commit");
+            assert_eq!(flight.lanes[0].armed_at_unix_ms, HOUR);
+            assert!(flight.lanes[0].queued);
+            let rendered = render_adopted_lane(&flight.lanes[0]).unwrap();
+            for text in [
+                "awaiting adoption on fedora",
+                "authorize_overlap",
+                "the machine reports or is removed",
+                "Live output streaming is not reattached",
+            ] {
+                assert!(rendered.contains(text), "{rendered}");
+            }
+            assert_eq!(
+                slots.lane_finished("p", &lane, 6 * HOUR),
+                Some((Trigger::Merge, tip("p", "newest-tip")))
+            );
+            assert!(slots.in_flight("p").unwrap().lanes[0].adopted.is_none());
+            assert_eq!(slots.lane_finished("p", &lane, 7 * HOUR), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_failed_thread_write_remains_retryable_not_quiet() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(cadence_db(&root).await);
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(db.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        let lane = linux_lane();
+        let verdict = CadenceVerdict::AwaitingAdoption {
+            machine: "fedora".into(),
+            request_id: "retained".into(),
+            stopped_at_unix_ms: HOUR,
+        };
+        let attempted = Attempted::default();
+        let missing = try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("commit"),
+            verdict.clone(),
+            &attempted,
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.contains("does not exist"), "{missing}");
+        db.execute_script(
+            "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at)
+               VALUES('testing','p','testing','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,node_name,uri_segment,status,created_at,updated_at)
+               VALUES('thread-job','testing','p','thread','thread','idle',1,1);
+             CREATE TRIGGER reject_cadence_delivery BEFORE INSERT ON messages
+               WHEN NEW.sender_name='main cadence'
+               BEGIN SELECT RAISE(FAIL,'injected cadence delivery rejection'); END;"
+        ).await.unwrap();
+        for _ in 0..2 {
+            let error = try_report_lane(
+                &orch,
+                &db,
+                "p",
+                "cairn",
+                None,
+                &lane,
+                Some("commit"),
+                verdict.clone(),
+                &attempted,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.contains("injected cadence delivery rejection"),
+                "{error}"
+            );
+        }
+        db.execute_script("DROP TRIGGER reject_cadence_delivery;")
+            .await
+            .unwrap();
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("commit"),
+            verdict.clone(),
+            &attempted,
+        )
+        .await
+        .unwrap();
+        let count = db.query_all(
+            "SELECT COUNT(*) FROM messages WHERE channel_id='testing' AND sender_name='main cadence'",
+            (), |row| row.i64(0),
+        ).await.unwrap()[0];
+        assert_eq!(
+            count, 1,
+            "failed sends are retried rather than mistaken for prior delivery"
+        );
+        // A genuine Quiet decision is successful and attempts no second write.
+        db.execute_script(
+            "CREATE TRIGGER reject_duplicate_delivery BEFORE INSERT ON messages
+             WHEN NEW.sender_name='main cadence'
+             BEGIN SELECT RAISE(FAIL,'quiet must not send'); END;",
+        )
+        .await
+        .unwrap();
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("commit"),
+            verdict,
+            &attempted,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_live_confirmation_is_fenced_to_purpose_and_observation() {
+        let db = crate::storage::migrated_test_db("cadence-live-confirmation").await;
+        let lane = linux_lane();
+        let mut claim = adoption_claim("running");
+        claim.consumer = "manual".into();
+        let purpose =
+            crate::fleet::purpose::PurposeKey::main_cadence("p", &lane.check, &lane.platform)
+                .to_string();
+        check_lane_adoptions::insert(&db, &claim).await.unwrap();
+        let exact = Waiter {
+            request_id: claim.request_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            check_name: lane.check.clone(),
+            item_index: 0,
+            consumer: "main_cadence".into(),
+            consumer_ref: purpose.clone(),
+            state: "recorded".into(),
+            observation_id: Some("observation".into()),
+            evidence: None,
+            updated_ms: HOUR,
+        };
+        for waiter in [
+            exact.clone(),
+            Waiter {
+                consumer_ref: "another-purpose".into(),
+                ..exact.clone()
+            },
+            Waiter {
+                consumer: "manual".into(),
+                ..exact.clone()
+            },
+        ] {
+            check_lane_adoptions::insert_waiter(&db, &waiter)
+                .await
+                .unwrap();
+        }
+        let expected = vec![(claim.request_id.clone(), claim.attempt_id.clone())];
+        assert_eq!(
+            main_cadence_delivery_requests(&db, "p", &lane, "observation")
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(
+            main_cadence_delivery_requests(&db, "p", &lane, "wrong-observation")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            main_cadence_delivery_requests(&db, "other-project", &lane, "observation")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut other_platform = lane.clone();
+        other_platform.platform = "macos".into();
+        assert!(
+            main_cadence_delivery_requests(&db, "p", &other_platform, "observation")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cadence_adoption_joined_waiter_selects_its_item_not_the_grants_initiator() {
+        let mut claim = adoption_claim("running");
+        claim.consumer = "manual".into();
+        claim.check_names = vec!["lint".into(), "rust-tests".into(), "typecheck".into()];
+        claim.input_hashes = vec![
+            "lint-inputs".into(),
+            "original-inputs".into(),
+            "type-inputs".into(),
+        ];
+        let mut waiter = Waiter {
+            request_id: claim.request_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            check_name: "rust-tests".into(),
+            item_index: 1,
+            consumer: "main_cadence".into(),
+            consumer_ref: "main:p:rust-tests:linux".into(),
+            state: "joined".into(),
+            observation_id: None,
+            evidence: None,
+            updated_ms: 2 * HOUR,
+        };
+        let indices = cadence_waiter_indices(&claim, &[waiter.clone()]).unwrap();
+        assert_eq!(indices, vec![1]);
+        assert!(verify_adoption_inputs(&claim, indices[0], "original-inputs").is_ok());
+        let mut slots = CadenceSlots::default();
+        assert!(slots.adopt(&claim, indices[0], 3 * HOUR));
+        assert_eq!(slots.in_flight("p").unwrap().lanes[0].check, "rust-tests");
+        waiter.item_index = 0;
+        assert!(cadence_waiter_indices(&claim, &[waiter]).is_err());
+    }
+
+    #[test]
+    fn cadence_adoption_left_running_is_neither_cancelled_nor_a_death() {
+        let verdict = cancelled_by_restart(
+            CadenceVerdict::AwaitingAdoption {
+                machine: "fedora".into(),
+                request_id: "remote-request".into(),
+                stopped_at_unix_ms: 2 * HOUR,
+            },
+            Some((2 * HOUR) as u64),
+        );
+        assert!(matches!(verdict, CadenceVerdict::AwaitingAdoption { .. }));
+        assert!(verdict.row().is_none());
+        let report = render_report(&CadenceReport {
+            check: "rust-tests",
+            platform: "linux",
+            kind: LaneVerdict::PerTest,
+            commit: Some("original-commit"),
+            verdict: &verdict,
+            comparison: &Comparison::Baseline,
+            bracket: &Bracket::default(),
+            now_ms: 3 * HOUR,
+            rearmed: None,
+        });
+        assert!(
+            report.contains(
+                "while this lane ran on fedora (request remote-request); awaiting adoption"
+            ),
+            "{report}"
+        );
+        assert!(!report.contains("cancelled by restart"), "{report}");
+        assert!(matches!(
+            observe(
+                LaneVerdict::PerTest,
+                &verdict,
+                &Comparison::Baseline,
+                None,
+                &Attempted::default()
+            ),
+            Observed::Unobserved { reminds: false, .. }
+        ));
+    }
+
+    #[test]
+    fn cadence_adoption_validates_each_multicheck_item_and_rejects_changed_hashes() {
+        let mut claim = adoption_claim("running");
+        assert!(verify_adoption_inputs(&claim, 0, "original-inputs").is_ok());
+        let error = verify_adoption_inputs(&claim, 0, "changed-inputs").unwrap_err();
+        for text in ["original-commit", "original-inputs", "changed-inputs"] {
+            assert!(error.contains(text), "{error}");
+        }
+        claim.check_names.push("lint".into());
+        claim.input_hashes.push("lint-inputs".into());
+        assert_eq!(cadence_claim_check(&claim, 1).unwrap(), "lint");
+        assert!(verify_adoption_inputs(&claim, 1, "lint-inputs").is_ok());
+        let mut slots = CadenceSlots::default();
+        assert!(slots.adopt(&claim, 1, 3 * HOUR));
+        assert_eq!(slots.in_flight("p").unwrap().lanes[0].check, "lint");
+        assert!(verify_adoption_inputs(&claim, 2, "absent").is_err());
+        claim.check_names.clear();
+        claim.input_hashes.clear();
+        assert!(verify_adoption_inputs(&claim, 0, "anything").is_err());
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_failed_preload_recovers_as_loss_not_infrastructure_verdict() {
+        failed_preload_recovery(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_failed_preload_retries_rejected_loss_after_interruption() {
+        failed_preload_recovery(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_result_first_failed_interruption_yields_to_unrelated_result() {
+        failed_preload_recovery(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_result_first_failed_loss_yields_to_unrelated_result() {
+        failed_preload_recovery(true, true).await;
+    }
+
+    async fn failed_preload_recovery(result_first: bool, reject_loss: bool) {
+        use crate::mcp::handlers::run::adopted::{adopt, Adoption};
+        use cairn_common::executor_protocol::{CellOutcome, ExecutorMessage};
+
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::migrated_test_db("cadence-preload-failure").await);
+        let claim = adoption_claim("awaiting_adoption");
+        let waiter = Waiter {
+            request_id: claim.request_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            check_name: "rust-tests".into(),
+            item_index: 0,
+            consumer: "main_cadence".into(),
+            consumer_ref: claim.consumer_ref.clone(),
+            state: "awaiting_adoption".into(),
+            observation_id: None,
+            evidence: None,
+            updated_ms: 2 * HOUR,
+        };
+        check_lane_adoptions::insert_grant(&db, &claim, &[waiter])
+            .await
+            .unwrap();
+        // Fail the real preload query, then recover before cadence's read.
+        db.execute_script(
+            "ALTER TABLE check_lane_adoptions RENAME TO unavailable_check_lane_adoptions;",
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(db.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        orch.fleet.await_restart_adoptions_loaded().await;
+        db.execute_script(
+            "ALTER TABLE unavailable_check_lane_adoptions RENAME TO check_lane_adoptions;",
+        )
+        .await
+        .unwrap();
+        let trigger = if reject_loss {
+            "CREATE TRIGGER reject_preload_recovery BEFORE UPDATE OF state ON check_lane_adoptions
+             WHEN NEW.state='lost' AND NEW.request_id='remote-request'
+             BEGIN SELECT RAISE(ABORT,'fixture rejects loss'); END;"
+        } else {
+            "CREATE TRIGGER reject_preload_recovery BEFORE INSERT ON main_cadence_interruptions
+             WHEN NEW.project_id='p' AND NEW.check_name='rust-tests'
+             BEGIN SELECT RAISE(ABORT,'fixture rejects interruption'); END;"
+        };
+        db.execute_script(trigger).await.unwrap();
+        assert!(!orch
+            .fleet
+            .is_check_adoption_reloaded(&(claim.request_id.clone(), claim.attempt_id.clone(),)));
+        let mut frames = orch
+            .fleet
+            .attach_unreported_machine_for_test(&claim.executor_id);
+        let result = crate::fleet::UnboundResult {
+            executor_id: claim.executor_id.clone(),
+            machine: claim.machine.clone(),
+            request_id: claim.request_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            outcome: CellOutcome::Cancelled {
+                request_id: claim.request_id.clone(),
+                attempt_id: claim.attempt_id.clone(),
+            },
+        };
+        let mut driver = None;
+        if result_first {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), adopt(&orch, result.clone()))
+                    .await
+                    .expect("a failed write must yield, not block the serial dispatcher"),
+                Adoption::Undecided
+            );
+            // The serial dispatcher can decide another identity immediately.
+            let unrelated = crate::fleet::UnboundResult {
+                request_id: "unrelated-result".into(),
+                attempt_id: "unrelated-attempt".into(),
+                outcome: CellOutcome::Cancelled {
+                    request_id: "unrelated-result".into(),
+                    attempt_id: "unrelated-attempt".into(),
+                },
+                ..result.clone()
+            };
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), adopt(&orch, unrelated))
+                    .await
+                    .expect("unrelated result is not held behind the rejected write"),
+                Adoption::Unclaimed
+            );
+            assert!(matches!(
+                frames.try_recv().unwrap(),
+                ExecutorMessage::ResultAck { request_id, .. } if request_id == "unrelated-result"
+            ));
+            // A resend of the still-open claim must also yield without ACK.
+            assert_eq!(adopt(&orch, result.clone()).await, Adoption::Undecided);
+        } else {
+            let mut boot = tokio::spawn({
+                let orch = orch.clone();
+                async move { adopt_at_boot(&orch).await }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), &mut boot)
+                    .await
+                    .is_err(),
+                "boot recovery must retain the debt while its durable write fails"
+            );
+            driver = Some(boot);
+        }
+        assert_eq!(
+            check_lane_adoptions::lookup(&db, &claim.request_id, &claim.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "awaiting_adoption"
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "no Cancel or ACK before both writes commit"
+        );
+        assert!(orch.main_cadence.lock().unwrap().in_flight("p").is_none());
+        assert_eq!(
+            db.query_all("SELECT COUNT(*) FROM main_cadence_interruptions", (), |r| r
+                .i64(0))
+                .await
+                .unwrap(),
+            vec![i64::from(reject_loss)],
+            "interruption must precede the terminal loss write"
+        );
+        db.execute_script("DROP TRIGGER reject_preload_recovery;")
+            .await
+            .unwrap();
+        if let Some(driver) = driver {
+            tokio::time::timeout(Duration::from_secs(10), driver)
+                .await
+                .expect("boot retries the failed write")
+                .unwrap();
+        } else {
+            assert_eq!(adopt(&orch, result).await, Adoption::Unclaimed);
+            // The later boot read must not re-adopt or recreate the repair.
+            adopt_at_boot(&orch).await;
+        }
+        let lost = check_lane_adoptions::lookup(&db, &claim.request_id, &claim.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lost.state, "lost");
+        assert_eq!(
+            lost.evidence.as_deref(),
+            Some("boot preload failed; the fleet cancelled it")
+        );
+        assert_eq!(
+            check_lane_adoptions::waiters(&db, &claim.request_id, &claim.attempt_id)
+                .await
+                .unwrap()[0]
+                .state,
+            "lost"
+        );
+        assert!(matches!(
+            frames.try_recv().unwrap(),
+            ExecutorMessage::Cancel { .. }
+        ));
+        if result_first {
+            assert!(matches!(
+                frames.try_recv().unwrap(),
+                ExecutorMessage::ResultAck { request_id, .. } if request_id == claim.request_id
+            ));
+        }
+        assert!(
+            frames.try_recv().is_err(),
+            "one final acknowledgement, no duplicate release"
+        );
+        assert_eq!(
+            db.query_all("SELECT COUNT(*) FROM check_result_observations", (), |r| r
+                .i64(0))
+                .await
+                .unwrap(),
+            vec![0],
+            "preload cancellation is not an infrastructure answer about the original commit"
+        );
+        let interrupted = take_interruptions(&db).await.unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].1.commit, claim.commit_sha);
+        assert_eq!(
+            interrupted[0].1.stopped_at_unix_ms,
+            claim.stopped_at_ms.unwrap()
+        );
+        assert!(take_interruptions(&db).await.unwrap().is_empty());
+        let lane = linux_lane();
+        let mut slots = orch.main_cadence.lock().unwrap();
+        assert!(slots.take_interruption("p", &lane).is_some());
+        assert!(slots.take_interruption("p", &lane).is_none());
+        assert!(slots.offer(&lane, &tip("p", "current-tip"), Trigger::Startup, 3 * HOUR));
+        assert!(!slots.offer(&lane, &tip("p", "current-tip"), Trigger::Startup, 3 * HOUR));
+        assert_eq!(slots.in_flight("p").unwrap().lanes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_omitted_account_before_bind_records_loss_not_verdict() {
+        fleet_loss_recovery(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_omitted_account_pending_bind_rearms_after_startup() {
+        fleet_loss_recovery(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_removed_machine_pending_bind_rearms_after_startup() {
+        fleet_loss_recovery(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_omitted_account_before_boot_scan_keeps_durable_repair() {
+        fleet_loss_recovery(false, false, true).await;
+    }
+
+    async fn fleet_loss_recovery(pending_bind: bool, removed: bool, before_boot_scan: bool) {
+        use crate::execution::checks::CheckAdoptionRecordingPlan;
+        use crate::execution::selection::{CheckPlan, CheckScope};
+
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::migrated_test_db("cadence-fleet-loss").await);
+        db.execute_script(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('p','default','P','P','/fixture',1,1);",
+        )
+        .await
+        .unwrap();
+        let mut claim = adoption_claim("awaiting_adoption");
+        let plan = CheckPlan {
+            name: "rust-tests".into(),
+            applies: true,
+            command: "echo passed".into(),
+            scope: CheckScope::Full,
+            resource_class: crate::config::project_settings::CheckResourceClass::Shared,
+            verdict_environment_names: vec![],
+            verdict_executor_ids: None,
+            config_error: None,
+            verdict_platforms: vec!["linux".into()],
+            verdict_runtime: vec![],
+        };
+        let coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+            &claim.commit_sha,
+            &claim.commit_sha,
+            "original-tree",
+            &claim.input_hashes[0],
+        );
+        claim.recording_plans = vec![serde_json::to_value(CheckAdoptionRecordingPlan::new(
+            &plan,
+            &coordinate,
+            "main:p",
+            "main-cadence:p:rust-tests:linux",
+            &[],
+        ))
+        .unwrap()];
+        let waiter = Waiter {
+            request_id: claim.request_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            check_name: plan.name.clone(),
+            item_index: 0,
+            consumer: "main_cadence".into(),
+            consumer_ref: claim.consumer_ref.clone(),
+            state: "awaiting_adoption".into(),
+            observation_id: None,
+            evidence: None,
+            updated_ms: 2 * HOUR,
+        };
+        check_lane_adoptions::insert_grant(&db, &claim, &[waiter])
+            .await
+            .unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(db.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        orch.fleet.await_restart_adoptions_loaded().await;
+        let key = (claim.request_id.clone(), claim.attempt_id.clone());
+        let mut frames = orch
+            .fleet
+            .attach_unreported_machine_for_test(&claim.executor_id);
+        let lane = linux_lane();
+        if !before_boot_scan {
+            assert!(orch.main_cadence.lock().unwrap().adopt(&claim, 0, 3 * HOUR));
+            assert!(
+                take_interruptions(&db).await.unwrap().is_empty(),
+                "startup has already drained interruptions before this late loss"
+            );
+        }
+        let driver = if pending_bind {
+            let driver = tokio::spawn({
+                let orch = orch.clone();
+                let db = db.clone();
+                let claim = claim.clone();
+                async move { execute_adopted_check_item(&orch, db, &claim, 0).await }
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !orch.fleet.has_pending_adopted_binder(&key) {
+                    assert!(
+                        !driver.is_finished(),
+                        "the recorder must reach the real pending binding"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("adopted recorder registers its binding before the loss");
+            Some(driver)
+        } else {
+            None
+        };
+        if removed {
+            orch.fleet
+                .remove_machine_for_check_adoption_test(&claim.executor_id, "enrollment removed");
+        } else {
+            orch.fleet.apply_executor_snapshot(
+                &claim.executor_id,
+                1,
+                Default::default(),
+                Default::default(),
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = check_lane_adoptions::lookup(&db, &key.0, &key.1)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current.state == "lost" && orch.fleet.check_claim(&key).is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the actual fleet loss commits before releasing the binding");
+        let lost = check_lane_adoptions::lookup(&db, &key.0, &key.1)
+            .await
+            .unwrap()
+            .unwrap();
+        let evidence = lost.evidence.clone().unwrap();
+        assert!(evidence.contains(&claim.machine), "{evidence}");
+        assert!(
+            evidence.contains(if removed {
+                "was removed"
+            } else {
+                "generation 1"
+            }),
+            "{evidence}"
+        );
+        if !removed {
+            assert!(evidence.contains("resent no result"), "{evidence}");
+        }
+        let error = if let Some(driver) = driver {
+            tokio::time::timeout(Duration::from_secs(10), driver)
+                .await
+                .unwrap()
+                .unwrap()
+                .err()
+                .unwrap()
+        } else {
+            execute_adopted_check_item(&orch, db.clone(), &claim, 0)
+                .await
+                .err()
+                .unwrap()
+        };
+        assert_eq!(
+            error, evidence,
+            "fleet loss never becomes a synthetic infrastructure answer"
+        );
+        let mut cancels = 0;
+        while let Ok(frame) = frames.try_recv() {
+            match frame {
+                cairn_common::executor_protocol::ExecutorMessage::Cancel { .. } => cancels += 1,
+                cairn_common::executor_protocol::ExecutorMessage::ResultAck { .. } => {
+                    panic!("no result was resent, so there is nothing to acknowledge")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(cancels, 1);
+        if before_boot_scan {
+            adopt_at_boot(&orch).await;
+            assert!(orch.main_cadence.lock().unwrap().in_flight("p").is_none());
+            let repairs = take_interruptions(&db).await.unwrap();
+            assert_eq!(
+                repairs.len(),
+                1,
+                "fleet persists repair before the open scan can miss its lost claim"
+            );
+            for (project, interruption) in repairs {
+                orch.main_cadence
+                    .lock()
+                    .unwrap()
+                    .interrupted(&project, interruption);
+            }
+        } else {
+            // The batch driver's error edge must recover an already-lost claim
+            // into memory, without rewriting authoritative fleet evidence/release.
+            db.execute_script(
+                "CREATE TRIGGER reject_repeated_loss BEFORE UPDATE ON check_lane_adoptions
+                 BEGIN SELECT RAISE(ABORT,'already-lost claims must not be rewritten'); END;",
+            )
+            .await
+            .unwrap();
+            try_lose_adoption(&orch, &claim, std::slice::from_ref(&lane.check), &error)
+                .await
+                .unwrap();
+            assert!(
+                frames.try_recv().is_err(),
+                "already-lost recovery does not release twice"
+            );
+            assert_eq!(
+                check_lane_adoptions::lookup(&db, &key.0, &key.1)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .evidence,
+                Some(evidence)
+            );
+        }
+        assert_eq!(
+            db.query_all("SELECT COUNT(*) FROM check_result_observations", (), |r| r
+                .i64(0))
+                .await
+                .unwrap(),
+            vec![0],
+        );
+        assert_eq!(
+            db.query_all("SELECT COUNT(*) FROM check_result_cache", (), |r| r.i64(0))
+                .await
+                .unwrap(),
+            vec![0],
+            "neither verdict cache nor infrastructure-suppression projection is written",
+        );
+        let citation = {
+            let mut slots = orch.main_cadence.lock().unwrap();
+            if !before_boot_scan {
+                assert!(!slots.offer(&lane, &tip("p", "successor"), Trigger::Startup, 4 * HOUR));
+                assert_eq!(
+                    slots.lane_finished("p", &lane, 5 * HOUR),
+                    Some((Trigger::Startup, tip("p", "successor")))
+                );
+            } else {
+                assert!(slots.offer(&lane, &tip("p", "successor"), Trigger::Startup, 4 * HOUR));
+            }
+            assert_eq!(slots.in_flight("p").unwrap().lanes.len(), 1);
+            let citation = slots.take_interruption("p", &lane).unwrap();
+            assert!(slots.take_interruption("p", &lane).is_none());
+            citation
+        };
+        assert_eq!(citation.commit, claim.commit_sha);
+        let rendered = render_report(&CadenceReport {
+            check: &lane.check,
+            platform: &lane.platform,
+            kind: LaneVerdict::PerTest,
+            commit: Some("successor"),
+            verdict: &CadenceVerdict::NoVerdict {
+                row: None,
+                cause: "fixture successor".into(),
+            },
+            comparison: &Comparison::Baseline,
+            bracket: &Bracket::default(),
+            now_ms: 6 * HOUR,
+            rearmed: Some(&citation),
+        });
+        assert!(rendered.contains(&citation.describe()), "{rendered}");
+        forget_interruption(&db, "p", &citation).await;
+        assert!(
+            take_interruptions(&db).await.unwrap().is_empty(),
+            "a subsequent boot must not discover a stale repair and phantom rearm"
+        );
+        adopt_at_boot(&orch).await;
+        assert!(take_interruptions(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cadence_adoption_loss_is_durable_and_cited_only_once() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::migrated_test_db("cadence-adoption-loss").await);
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(db.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        let claim = adoption_claim("running");
+        check_lane_adoptions::insert(&db, &claim).await.unwrap();
+        let pending = Waiter {
+            request_id: claim.request_id.clone(),
+            attempt_id: claim.attempt_id.clone(),
+            check_name: "rust-tests".into(),
+            item_index: 0,
+            consumer: "main_cadence".into(),
+            consumer_ref: claim.consumer_ref.clone(),
+            state: "recorded".into(),
+            observation_id: Some("committed-before-loss".into()),
+            evidence: None,
+            updated_ms: 2 * HOUR,
+        };
+        let unresolved = Waiter {
+            consumer: "manual".into(),
+            consumer_ref: "handle".into(),
+            state: "running".into(),
+            observation_id: None,
+            ..pending.clone()
+        };
+        check_lane_adoptions::insert_waiter(&db, &pending)
+            .await
+            .unwrap();
+        check_lane_adoptions::insert_waiter(&db, &unresolved)
+            .await
+            .unwrap();
+        assert!(orch.main_cadence.lock().unwrap().adopt(&claim, 0, 3 * HOUR));
+        let lane = linux_lane();
+        assert!(!orch.main_cadence.lock().unwrap().offer(
+            &lane,
+            &tip("p", "next"),
+            Trigger::Startup,
+            4 * HOUR
+        ));
+        let cause =
+            "fedora's first report generation 9 omitted remote-request and resent no result";
+        lose_adoption(&orch, &claim, std::slice::from_ref(&lane.check), cause).await;
+        let lost = check_lane_adoptions::lookup(&db, &claim.request_id, &claim.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lost.state, "lost");
+        assert_eq!(lost.evidence.as_deref(), Some(cause));
+        let waiters = check_lane_adoptions::waiters(&db, &claim.request_id, &claim.attempt_id)
+            .await
+            .unwrap();
+        let cadence = waiters
+            .iter()
+            .find(|w| w.consumer == "main_cadence")
+            .unwrap();
+        assert_eq!(cadence.state, "recorded_undelivered");
+        assert_eq!(
+            cadence.observation_id.as_deref(),
+            Some("committed-before-loss")
+        );
+        assert_eq!(
+            waiters
+                .iter()
+                .find(|w| w.consumer == "manual")
+                .unwrap()
+                .state,
+            "lost"
+        );
+        assert_eq!(
+            orch.main_cadence
+                .lock()
+                .unwrap()
+                .lane_finished("p", &lane, 5 * HOUR),
+            Some((Trigger::Startup, tip("p", "next")))
+        );
+        let interrupted = orch
+            .main_cadence
+            .lock()
+            .unwrap()
+            .take_interruption("p", &lane)
+            .unwrap();
+        assert!(orch
+            .main_cadence
+            .lock()
+            .unwrap()
+            .take_interruption("p", &lane)
+            .is_none());
+        forget_interruption(&db, "p", &interrupted).await;
+        assert!(take_interruptions(&db).await.unwrap().is_empty());
     }
 
     #[test]
@@ -8724,6 +10593,7 @@ mod tests {
             insert("review-green", "typecheck", 3, "review", "unknown"),
             insert("empty", "typecheck", 4, "main", "empty"),
             insert("other-check", "typecheck-ui", 5, "main", "unknown"),
+            insert("partial", "typecheck", 6, "review", "partial"),
         ]
         .concat();
         db.execute_script(script).await.unwrap();
@@ -8731,7 +10601,7 @@ mod tests {
         // Main's first-parent chain, tip first: the review and empty rows sit
         // nearest the tip, and neither may stand in.
         let chain = MainChain::from_log(
-            "c-other-check\nc-empty\nc-review-green\nc-manual-green\nc-main-green\n",
+            "c-partial\nc-other-check\nc-empty\nc-review-green\nc-manual-green\nc-main-green\n",
         );
         let newest = latest_complete_row(
             &db,
@@ -8749,6 +10619,30 @@ mod tests {
         .expect("a whole-command row on main qualifies");
         assert_eq!(newest.id, "manual-green");
 
+        // This review execution also served a cadence waiter, whose durable
+        // acceptance proves it answered the whole-command question.
+        let accepted = vec!["review-green".to_string(), "partial".to_string()];
+        let shared = latest_complete_row(
+            &db,
+            "p",
+            "cairn",
+            &typecheck_lane(),
+            RowFilter {
+                main_chain: Some(&chain),
+                adopted_observations: Some(&accepted),
+                ..RowFilter::default()
+            },
+            &names,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(shared.id, "review-green");
+        assert_eq!(
+            shared.cadence, "review",
+            "the original producer is never relabelled"
+        );
+
         // Without the chain only the cadence's own rows can be placed on main.
         let unchained = latest_complete_row(
             &db,
@@ -8763,8 +10657,27 @@ mod tests {
         .expect("the cadence's own row qualifies");
         assert_eq!(unchained.id, "main-green");
 
-        // The per-test lane over the same rows finds nothing: none is a
-        // full per-test selection.
+        // Accepting only the partial row still cannot promote a selected slice
+        // into a whole-command observation. All rows stay immutable.
+        let accepted_partial = vec!["partial".to_string()];
+        let partial = latest_complete_row(
+            &db,
+            "p",
+            "cairn",
+            &typecheck_lane(),
+            RowFilter {
+                main_chain: Some(&chain),
+                adopted_observations: Some(&accepted_partial),
+                ..RowFilter::default()
+            },
+            &names,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(partial.id, "manual-green");
+
+        // None of these rows is a full per-test selection.
         let mut as_tests = typecheck_lane();
         as_tests.verdict = LaneVerdict::PerTest;
         assert!(latest_complete_row(

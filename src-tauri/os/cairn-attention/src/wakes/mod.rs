@@ -1,10 +1,12 @@
 pub mod child;
 pub mod matching;
+pub mod recipients;
 pub mod side_channel;
 pub mod store;
 pub mod types;
 pub use child::*;
 pub use matching::*;
+pub use recipients::*;
 pub use side_channel::*;
 pub use store::*;
 pub use types::*;

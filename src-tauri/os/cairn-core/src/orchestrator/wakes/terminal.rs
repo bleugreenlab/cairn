@@ -78,6 +78,7 @@ fn terminal_exit_event(
         },
         urgency: DeliveryUrgency::Queue,
         muted: MutedDelivery::Drop,
+        fact_key: None,
     }
 }
 
@@ -156,6 +157,7 @@ fn terminal_output_event(
         },
         urgency: DeliveryUrgency::Queue,
         muted: MutedDelivery::Drop,
+        fact_key: None,
     }
 }
 

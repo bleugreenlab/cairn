@@ -1616,7 +1616,7 @@ async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     // adopted parent, so it gains nothing. The child's attention is addressed by
     // the parent edge alone, and this parent has no execution on it yet.
     assert!(
-        crate::orchestrator::wakes::watcher_jobs_for_issue(
+        crate::orchestrator::wakes::issue_watchers(
             &orch.db.local,
             &format!("cairn://p/cairn/{child_num}")
         )
@@ -1638,7 +1638,7 @@ async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     )
     .await;
     assert_eq!(
-        crate::orchestrator::wakes::watcher_jobs_for_issue(
+        crate::orchestrator::wakes::issue_watchers(
             &orch.db.local,
             &format!("cairn://p/cairn/{child_num}")
         )
@@ -1815,7 +1815,7 @@ async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
     .unwrap();
 
     assert_eq!(
-        crate::orchestrator::wakes::watcher_jobs_for_issue(
+        crate::orchestrator::wakes::issue_watchers(
             &orch.db.local,
             &format!("cairn://p/cairn/{child_num}")
         )
@@ -1890,7 +1890,7 @@ async fn an_issue_filed_from_a_thread_defaults_to_that_thread() {
     // same way an adopted child's does — creation mints no subscription either.
     let child_uri = format!("cairn://p/cairn/{child_num}");
     assert_eq!(
-        crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, &child_uri)
+        crate::orchestrator::wakes::issue_watchers(&orch.db.local, &child_uri)
             .await
             .unwrap(),
         vec![session.clone()]

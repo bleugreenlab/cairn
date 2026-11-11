@@ -1480,60 +1480,41 @@ async fn create_review_push_rows(
         return Ok(Vec::new());
     };
     let key = format!("review:{issue_uri}");
-    let watchers = crate::orchestrator::wakes::watcher_jobs_for_issue(db, &issue_uri).await?;
     log::debug!(
-        "review push: job={} content_ref={} fp={} watchers={}",
+        "review push: job={} content_ref={} fp={}",
         &producing_job_id[..producing_job_id.len().min(8)],
         content_ref,
         fingerprint,
-        watchers.len()
     );
-    let mut pushed = Vec::new();
-    for recipient in watchers {
-        // Never push to the producing node itself.
-        if recipient == producing_job_id {
-            continue;
-        }
-        // CAIRN-1889 change-trigger: skip when the latest review push to this
-        // recipient (delivered OR undelivered) already carries this fingerprint —
-        // the reviewable state is unchanged, so re-firing would spuriously
-        // re-wake. A changed fingerprint creates a new push; supersede-by-key
-        // still collapses an undelivered older-fingerprint row to the newest.
-        if let Some(Some(prev)) =
-            crate::orchestrator::attention_push::latest_push_fingerprint(db, &recipient, &key)
-                .await
-                .map_err(|e| e.to_string())?
-        {
-            if prev == fingerprint {
-                log::debug!(
-                    "review push: recipient {} deduped (fingerprint unchanged)",
-                    &recipient[..recipient.len().min(8)]
-                );
-                continue;
-            }
-        }
-        let Some((_, effective)) =
-            crate::orchestrator::attention_push::push_review_with_fingerprint(
-                db,
-                issue_id,
-                &recipient,
-                &content_ref,
-                &key,
-                &fingerprint,
-            )
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            continue;
-        };
-        // A watcher that muted this issue gets a `Passive` review row that rides
-        // along on its next run; it is not handed back to `wake_review_recipients`
-        // so an idle muted watcher is never woken (CAIRN-1900).
-        if effective.wakes_idle() {
-            pushed.push(recipient);
-        }
-    }
-    Ok(pushed)
+    // Everyone the resolver finds for the issue except the producing node.
+    // The receipt key carries the change fingerprint, which names the
+    // reviewed head (CAIRN-1889 change-trigger): an unchanged reviewable state
+    // is the same fact and never re-fires, a new round on a new head is a new
+    // one. A watcher that muted this issue holds a `Passive` row that rides
+    // along and is not handed back to be woken (CAIRN-1900).
+    use cairn_attention::push::Wake;
+    let mut audience = cairn_attention::wakes::FactAudience::new("review", Wake::Wake, Wake::Wake);
+    audience.source = Some(cairn_attention::wakes::SourceRef::issue(&issue_uri));
+    audience.exclude.jobs = vec![producing_job_id.to_string()];
+    let push = cairn_attention::delivery::AudiencePush {
+        fact_key: format!("{key}#{fingerprint}"),
+        content: cairn_attention::delivery::PushContent::Fixed(content_ref),
+        boundary: cairn_attention::push::Boundary::Event,
+        key,
+        fingerprint: Some(fingerprint),
+        guard: cairn_attention::delivery::PushGuard::UnresolvedIssue(issue_id.to_string()),
+    };
+    Ok(cairn_attention::delivery::push_to_audience(
+        std::sync::Arc::new(crate::attention_host::CoreRecipients),
+        db,
+        &audience,
+        &push,
+    )
+    .await?
+    .into_iter()
+    .filter(|delivery| delivery.fresh && delivery.wake.wakes_idle())
+    .map(|delivery| delivery.job_id)
+    .collect())
 }
 
 /// Wake each watcher that received a fresh review push so an already-idle one

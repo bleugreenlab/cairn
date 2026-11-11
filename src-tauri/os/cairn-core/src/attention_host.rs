@@ -220,21 +220,10 @@ impl AttentionHost for CoreAttentionHost {
             None => self.0.notifier.emit_change(table),
         }
     }
-    fn deliver(
+    async fn deliver(
         &self,
-        job_id: &str,
-        sender: Option<&str>,
-        message: &str,
-        urgency: DeliveryUrgency,
-        operator_message_id: Option<&str>,
-    ) {
-        crate::orchestrator::parent_wake::queue_or_resume_parent(
-            &self.0,
-            job_id,
-            sender,
-            message,
-            urgency,
-            operator_message_id,
-        );
+        request: cairn_attention::runtime::DeliveryRequest<'_>,
+    ) -> cairn_attention::runtime::DeliveryOutcome {
+        crate::orchestrator::parent_wake::deliver_direct(&self.0, request).await
     }
 }

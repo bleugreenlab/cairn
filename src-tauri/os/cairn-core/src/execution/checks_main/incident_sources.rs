@@ -12,7 +12,10 @@ pub(super) async fn capture(
     attempted: &Attempted,
     at: i64,
 ) -> DbResult<Option<String>> {
-    if matches!(verdict, CadenceVerdict::Cancelled { .. }) {
+    if matches!(
+        verdict,
+        CadenceVerdict::Cancelled { .. } | CadenceVerdict::AwaitingAdoption { .. }
+    ) {
         return Ok(None);
     }
     let event = verdict

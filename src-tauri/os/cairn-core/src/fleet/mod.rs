@@ -4,6 +4,8 @@
 //! the cached UI snapshot. Scheduling, workspaces, processes, cancellation, and
 //! mutation sealing exist only in the executor process.
 
+mod check_adoptions;
+pub(crate) use check_adoptions::CheckConsumerGuard;
 mod coalescing;
 mod drain_projection;
 pub use drain_projection::AdmissionFenceToken;
@@ -624,9 +626,27 @@ impl Drop for CoalescedLeaderCompletionGuard {
         ) {
             self.pool.purpose_quiesced.notify_waiters();
         }
+        let settlement = if !std::thread::panicking() {
+            self.pool
+                .left_running_attempt(&self.leader)
+                .map(|left_running| LeaderSettlement::Settled {
+                    outcome: self.pool.stopped_outcome(
+                        left_running.stopped_at_ms,
+                        &self.leader,
+                        Some(&left_running.executor_id),
+                    ),
+                    account: CellAccount {
+                        left_running: Some(left_running),
+                        ..CellAccount::default()
+                    },
+                })
+                .unwrap_or(LeaderSettlement::Vanished)
+        } else {
+            LeaderSettlement::Vanished
+        };
         for key in &self.keys {
             self.pool
-                .complete_coalesced_for_leader(key, LeaderSettlement::Vanished);
+                .complete_coalesced_for_leader(key, settlement.clone());
         }
     }
 }
@@ -648,6 +668,9 @@ impl Drop for PurposeAdmissionGuard {
     fn drop(&mut self) {
         if !self.armed {
             return;
+        }
+        if !std::thread::panicking() {
+            self.pool.withdraw_joiner_check_consumers(&self.item);
         }
         lock_through_poison(&self.pool.purpose_joiners).remove(&self.item);
         lock_through_poison(&self.pool.cancelled_leaders).remove(&self.item);
@@ -836,12 +859,13 @@ impl InFlightRegistry {
         for identity in subscribers.keys() {
             self.subscriber_keys.insert(identity.clone(), key.clone());
         }
+        let publication = PublicationCoordination::for_request(key.leader.clone());
         self.by_key.insert(
             key.clone(),
             InFlightExecution {
                 demand,
                 subscribers,
-                publication: PublicationCoordination::new(),
+                publication,
             },
         );
         key
@@ -889,11 +913,13 @@ pub(crate) struct CheckDispatchDecline {
 #[derive(Clone, Debug)]
 pub(crate) struct PublicationCoordination {
     state: Arc<PublicationState>,
+    consumer: Option<Arc<CheckConsumerGuard>>,
 }
 
 #[derive(Debug)]
 struct PublicationState {
     id: String,
+    request_identity: std::sync::OnceLock<RequestIdentity>,
     claimed: AtomicBool,
     published: AtomicBool,
     /// What the publisher recorded, so every coalesced sibling can name the same
@@ -1042,6 +1068,24 @@ pub(crate) struct CellAccount {
     /// The machine that claimed the request, once one did. Without it a lost
     /// result cannot honestly be blamed on a lost machine: no machine had it.
     pub placement: Option<CellPlacement>,
+    /// The runner stopped without cancelling a durably claimed remote lane.
+    pub left_running: Option<LeftRunningAttempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeftRunningAttempt {
+    pub(crate) machine: String,
+    pub(crate) request_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) executor_id: String,
+    pub(crate) stopped_at_ms: u64,
+}
+
+/// The durable consumer that can own an execution after this runner stops.
+/// Additional claim kinds register here rather than adding shutdown exceptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptionOwner {
+    MainCadence,
 }
 
 /// One eligible machine placement cannot decide on right now, because a
@@ -1196,16 +1240,37 @@ impl PublicationCoordination {
         Self {
             state: Arc::new(PublicationState {
                 id: uuid::Uuid::new_v4().to_string(),
+                request_identity: std::sync::OnceLock::new(),
                 claimed: AtomicBool::new(false),
                 published: AtomicBool::new(false),
                 observation: std::sync::Mutex::new(None),
                 notify: Notify::new(),
             }),
+            consumer: None,
         }
+    }
+
+    pub(crate) fn with_consumer_guard(mut self, guard: Arc<CheckConsumerGuard>) -> Self {
+        self.consumer = Some(guard);
+        self
+    }
+
+    pub(crate) fn consumer_guard(&self) -> Option<Arc<CheckConsumerGuard>> {
+        self.consumer.clone()
     }
 
     pub(crate) fn id(&self) -> &str {
         &self.state.id
+    }
+
+    pub(crate) fn for_request(identity: RequestIdentity) -> Self {
+        let publication = Self::new();
+        let _ = publication.state.request_identity.set(identity);
+        publication
+    }
+
+    pub(crate) fn request_identity(&self) -> Option<RequestIdentity> {
+        self.state.request_identity.get().cloned()
     }
 
     pub(crate) async fn acquire(&self) -> PublicationRole {
@@ -1788,10 +1853,13 @@ pub struct Fleet {
     /// Results that arrived for no binding this process holds, for the
     /// orchestrator's adoption to decide (`run::adopted`).
     unbound_results: Arc<Mutex<UnboundResults>>,
+    check_adoptions: Arc<Mutex<check_adoptions::CheckAdoptions>>,
     /// Run batches whose results this process acknowledges only once the
     /// batch's own settlement is done with them, by request id, with each
     /// attempt and machine a result for it arrived from.
     deferred_acks: Arc<Mutex<HashMap<String, DeferredAttempts>>>,
+    #[cfg(test)]
+    result_ack_probe: Arc<Mutex<Option<ResultAckProbe>>>,
     /// Reauthorization answers awaited, by attempt.
     reauthorizations: Arc<Mutex<HashMap<RequestIdentity, ReauthorizationWaiter>>>,
     /// Requests an unsettled durable row of an earlier runner process still
@@ -1804,6 +1872,8 @@ pub struct Fleet {
 /// The `(attempt_id, executor_id)` of each result a run batch's settlement
 /// acknowledges once it is done with them.
 type DeferredAttempts = Vec<(String, String)>;
+#[cfg(test)]
+type ResultAckProbe = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 type ReauthorizationWaiter =
     oneshot::Sender<Vec<cairn_common::executor_protocol::ReauthorizedTransfer>>;
@@ -1835,10 +1905,34 @@ struct UnboundResults {
 pub(crate) struct DeferredResultAck {
     fleet: Fleet,
     request_id: String,
+    retain: bool,
+}
+
+impl DeferredResultAck {
+    /// A failed recorder has not earned an acknowledgement.
+    pub(crate) fn retain(mut self) {
+        self.retain = true;
+    }
 }
 
 impl Drop for DeferredResultAck {
     fn drop(&mut self) {
+        if self.retain || std::thread::panicking() {
+            return;
+        }
+        // A check grant owns its acknowledgement until every observation and
+        // consumer delivery is durable, even if one caller's guard ends early.
+        if self
+            .fleet
+            .check_adoptions
+            .lock()
+            .unwrap()
+            .claims
+            .keys()
+            .any(|identity| identity.0 == self.request_id)
+        {
+            return;
+        }
         let delivered = self
             .fleet
             .deferred_acks
@@ -1846,13 +1940,6 @@ impl Drop for DeferredResultAck {
             .unwrap()
             .remove(&self.request_id)
             .unwrap_or_default();
-        if std::thread::panicking() {
-            log::warn!(
-                "run batch {} unwound before its answer landed; its results stay on their machines",
-                self.request_id
-            );
-            return;
-        }
         for (attempt_id, executor_id) in delivered {
             self.fleet
                 .send_result_ack(&executor_id, &self.request_id, &attempt_id);
@@ -3076,6 +3163,8 @@ impl Fleet {
         self.purpose_debts_loaded.0.send_replace(false);
         self.purposes.lock().unwrap().expect_reload();
         let boot_unix_ms = unix_time_ms();
+        self.check_adoptions.lock().unwrap().db = Some(db.clone());
+        let check_adoptions = self.check_adoptions.clone();
         // Weak on purpose: the registry owns the journal's sender, so a task
         // that held it would keep its own channel, and the database, open for
         // as long as the process lived.
@@ -3089,8 +3178,10 @@ impl Fleet {
         crate::orchestrator::spawn_onto(
             tokio::runtime::Handle::try_current().ok().as_ref(),
             async move {
+                check_adoptions::preload(&check_adoptions, &db).await;
                 match purpose::load_rows(&db).await {
-                    Ok(rows) => {
+                    Ok(mut rows) => {
+                        rows.extend(check_adoptions::purpose_rows(&check_adoptions));
                         if !rows.is_empty() {
                             log::warn!(
                                 "reloaded {} purpose debt(s) a previous runner process left on machines; each blocks its question until that machine accounts for it",
@@ -3112,7 +3203,10 @@ impl Fleet {
                     Err(error) => {
                         log::error!("{error}");
                         if let Some(registry) = registry.upgrade() {
-                            registry.lock().unwrap().reload(Vec::new(), boot_unix_ms);
+                            registry.lock().unwrap().reload(
+                                check_adoptions::purpose_rows(&check_adoptions),
+                                boot_unix_ms,
+                            );
                         }
                         if let Some(errors) = errors.upgrade() {
                             *errors.lock().unwrap() = Some(error);
@@ -4223,6 +4317,11 @@ impl Drop for EntryDropGuard {
         };
         self.pool.queue.withdraw(&identity, cause, unix_time_ms());
         self.pool.binding_changed.notify_waiters();
+        if let Some(stopped_at) = stopped_at {
+            if self.granted_to.is_some() && self.pool.check_shutdown(&identity, stopped_at) {
+                return;
+            }
+        }
         if let Some((executor_id, generation)) = claimed_by {
             let message = if self.granted_to.as_deref() == Some(executor_id.as_str()) {
                 ExecutorMessage::Cancel {
@@ -6021,6 +6120,7 @@ impl Fleet {
                 ),
             },
             account: CellAccount {
+                left_running: None,
                 cancel_cause: None,
                 placement: Some(CellPlacement {
                     executor_id: executor_id.to_string(),
@@ -6312,6 +6412,22 @@ impl Fleet {
                     return false;
                 }
                 let key = (request_id, attempt_id);
+                if self.adoption_owner(&key).is_some()
+                    && self
+                        .check_claim(&key)
+                        .is_some_and(|claim| claim.executor_id == executor_id)
+                    && self.queue.binding_of(&key).is_none()
+                {
+                    scrub_cell_outcome(&mut outcome);
+                    self.hold_check_adoption(UnboundResult {
+                        executor_id: executor_id.to_owned(),
+                        machine: self.executor_name_for_text(executor_id),
+                        request_id: key.0,
+                        attempt_id: key.1,
+                        outcome,
+                    });
+                    return false;
+                }
                 // The result has to come from the machine this entry is bound to,
                 // on the link it is bound on or one the binding was carried
                 // forward to. A redial that replaces an unclosed link rebinds the
@@ -6986,6 +7102,11 @@ impl Fleet {
     fn waiting_request_ids(&self, executor_id: &str, generation: u64) -> Vec<String> {
         let mut ids = self.queue.waiting_request_ids(executor_id, generation);
         ids.extend(self.adopting.lock().unwrap().iter().cloned());
+        ids.extend(
+            self.check_claims_for_machine(executor_id)
+                .into_iter()
+                .map(|(key, _)| key.0),
+        );
         ids.sort();
         ids.dedup();
         ids
@@ -8922,12 +9043,23 @@ impl Fleet {
             let delivery = match &settlement {
                 LeaderSettlement::Settled { outcome, account } => Ok(CoalescedCellOutcome {
                     outcome: restamp_outcome(outcome, &identity),
-                    publication: execution.publication.clone(),
+                    publication: PublicationCoordination {
+                        state: execution.publication.state.clone(),
+                        consumer: self.take_check_consumer_guard(&identity),
+                    },
                     account: account.clone(),
                 }),
-                LeaderSettlement::Vanished => Err(CoalescedWaitError::LeaderVanished),
+                LeaderSettlement::Vanished => {
+                    drop(self.take_check_consumer_guard(&identity));
+                    Err(CoalescedWaitError::LeaderVanished)
+                }
             };
             let _ = subscriber.waiter.send(delivery);
+        }
+        if !leader_still_active
+            && matches!(&settlement, LeaderSettlement::Settled { account, .. } if account.left_running.is_none())
+        {
+            self.check_leader_completed(&key.leader);
         }
         true
     }
@@ -9030,6 +9162,18 @@ impl Fleet {
     /// formed a network hop away from the processes it describes is exactly the
     /// stale copy of a remote truth this design exists to abolish.
     fn retire_item(&self, request: &RequestIdentity, cause: CancelCause) {
+        let keys: Vec<_> = self
+            .purposes
+            .lock()
+            .unwrap()
+            .debts()
+            .into_iter()
+            .filter(|debt| &debt.request == request)
+            .map(|debt| debt.key)
+            .collect();
+        for key in keys {
+            self.withdraw_check_purpose(&key, request);
+        }
         self.cancelled_leaders
             .lock()
             .unwrap()
@@ -9071,6 +9215,7 @@ impl Fleet {
     /// may already be on a machine; the question then owes that execution's
     /// death in the item's place.
     fn detach_purpose_joiner(&self, request: &RequestIdentity, cause: CancelCause) {
+        self.withdraw_joiner_check_consumers(request);
         let Some((key, subscribers)) = self.purpose_joiners.lock().unwrap().remove(request) else {
             return;
         };
@@ -9156,7 +9301,20 @@ impl Fleet {
     /// Settle every debt bound to `executor_id`, because the runner knows that
     /// machine's work is gone.
     fn settle_purpose_debts_for_lost_machine(&self, executor_id: &str, evidence: &str) {
-        let settled = self.purposes.lock().unwrap().machine_lost(executor_id);
+        let protected = self
+            .check_claims_for_machine(executor_id)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<HashSet<_>>();
+        self.check_machine_lost(executor_id, evidence);
+        let settled = if protected.is_empty() {
+            self.purposes.lock().unwrap().machine_lost(executor_id)
+        } else {
+            self.purposes
+                .lock()
+                .unwrap()
+                .settle_on_machine(executor_id, |key, _| !protected.contains(key))
+        };
         self.note_purpose_settlements(&settled, evidence);
     }
 
@@ -9201,16 +9359,20 @@ impl Fleet {
             .iter()
             .map(|completion| identify(&completion.request_id, &completion.attempt_id))
             .collect();
+        let protected_checks = self.protected_check_claims(executor_id);
         let (post_boot, completions, superseded) = {
             let mut registry = self.purposes.lock().unwrap();
             let post_boot = registry.post_boot_account(executor_id, generation, |request| {
-                listed.contains(request) && !completed.contains(request)
+                protected_checks.contains(request)
+                    || (listed.contains(request) && !completed.contains(request))
             });
-            let completions =
-                registry.settle_on_machine(executor_id, |request, _| completed.contains(request));
+            let completions = registry.settle_on_machine(executor_id, |request, _| {
+                !protected_checks.contains(request) && completed.contains(request)
+            });
             let superseded = if first_of_connection {
                 registry.settle_on_machine(executor_id, |request, placement| {
-                    !placement.awaiting_post_boot_account
+                    !protected_checks.contains(request)
+                        && !placement.awaiting_post_boot_account
                         && placement.generation < generation
                         && !listed.contains(request)
                 })
@@ -9232,7 +9394,11 @@ impl Fleet {
                 "the first report of the machine's newer connection (generation {generation}) does not list it"
             ),
         );
+        self.account_check_claims(executor_id, generation, &listed, &completed);
         for request in post_boot.still_running {
+            if protected_checks.contains(&request) || self.check_claim(&request).is_some() {
+                continue;
+            }
             log::warn!(
                 "request {} attempt {} is still running on {} although the runner that granted it restarted; cancelling it, and its question stays owed until the machine reports it ended",
                 request.0,
@@ -9274,7 +9440,13 @@ impl Fleet {
             return "this runner ends its own attempt, which it does as soon as the retirement reaches it".to_string();
         };
         let machine = self.executor_name_for_text(&placement.executor_id);
-        let escape = "or an operator authorizes the overlap from the app";
+        let escape = "or an operator authorizes the overlap with authorize_overlap from the app";
+        if let Some(claim) = self
+            .check_claim(&debt.request)
+            .filter(|_| self.adoption_owner(&debt.request).is_some())
+        {
+            return format!("awaiting adoption on {} since {}; the lane re-arms when the machine reports or is removed; the operator may authorize the overlap with authorize_overlap", claim.machine, purpose::stamp(claim.granted_at_ms as u64));
+        }
         if placement.awaiting_post_boot_account {
             return format!(
                 "{machine} next reports without it or reports it ended, or {machine} is removed; {escape}"
@@ -9439,6 +9611,30 @@ impl Fleet {
         executor_id: Option<&str>,
         operator: &str,
     ) -> Result<purpose::PurposeDebtView, String> {
+        if self.adoption_owner(request).is_some() {
+            let debt = self
+                .purposes
+                .lock()
+                .unwrap()
+                .debts_for(key)
+                .into_iter()
+                .find(|debt| {
+                    &debt.request == request
+                        && debt.placement.as_ref().map(|p| p.executor_id.as_str()) == executor_id
+                })
+                .ok_or_else(|| "the named adoption debt is no longer outstanding".to_string())?;
+            self.authorize_check_release(request);
+            self.settle_check_claim(
+                request,
+                "lost",
+                format!(
+                    "operator {operator} authorized the overlap at {}",
+                    purpose::stamp(unix_time_ms())
+                ),
+                true,
+            );
+            return Ok(debt);
+        }
         let settled = self
             .purposes
             .lock()
@@ -9467,6 +9663,7 @@ impl Fleet {
         identity: &RequestIdentity,
         on_behalf: Option<CancelCause>,
     ) -> Detachment {
+        drop(self.take_check_consumer_guard(identity));
         let remaining;
         let removed;
         let leader_to_cancel = {
@@ -9509,6 +9706,10 @@ impl Fleet {
         let Some(leader) = leader_to_cancel else {
             return Detachment::Released { remaining };
         };
+        if self.runner_stop.at().is_some() && self.adoption_owner(&leader).is_some() {
+            self.cancelled_leaders.lock().unwrap().remove(&leader);
+            return Detachment::Released { remaining };
+        }
         // A leader nobody waits on any more ends now if it was never granted,
         // rather than whenever a machine happens to claim it.
         self.retirements.notify_waiters();
@@ -12282,10 +12483,20 @@ impl Fleet {
             .await
             .map_err(CoalescedWaitError::refused)?;
         let public_identity = (request.request_id.clone(), request.attempt_id.clone());
+        let (adoption_gate, metadata) = {
+            let state = self.check_adoptions.lock().unwrap();
+            (
+                state.mutation.clone(),
+                state.templates.get(&public_identity).cloned(),
+            )
+        };
+        let adoption_admission = adoption_gate.lock().await;
+        let check_name = result_identity.check_name.clone();
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let (tx, rx) = oneshot::channel();
         let mut leader_request = None;
         let demand = PlacementDemand::of(&request);
+        let admission_work_class = request.placement_work_class;
         let key = {
             let mut registry = self.in_flight.lock().unwrap();
             if registry.subscriber_keys.contains_key(&public_identity) {
@@ -12313,6 +12524,52 @@ impl Fleet {
             }
             key
         };
+        let admission_subscriber = CoalescedSubscriberDropGuard {
+            pool: self.clone(),
+            identity: public_identity.clone(),
+            armed: true,
+        };
+        let mut admission_leader = CoalescedLeaderCompletionGuard {
+            pool: self.clone(),
+            leader: public_identity.clone(),
+            work_class: admission_work_class,
+            keys: vec![key.clone()],
+            runner_context_id: None,
+            armed: leader_request.is_some(),
+        };
+        if let Some(metadata) = metadata {
+            self.track_check_consumer(
+                public_identity.clone(),
+                key.leader.clone(),
+                &check_name,
+                &metadata,
+            );
+            if let Err(error) = self
+                .register_check_join_locked(&key.leader, &check_name, &metadata)
+                .await
+            {
+                self.detach_coalesced_subscriber(&public_identity, None);
+                if leader_request.is_some() {
+                    self.complete_coalesced_for_leader(&key, executor_unavailable(error.clone()));
+                }
+                self.check_adoptions
+                    .lock()
+                    .unwrap()
+                    .templates
+                    .remove(&public_identity);
+                return Err(CoalescedWaitError::refused(executor_unavailable(format!(
+                    "persist configured check consumer JOIN: {error}"
+                ))));
+            }
+        }
+        if leader_request.is_none() {
+            self.check_adoptions
+                .lock()
+                .unwrap()
+                .templates
+                .remove(&public_identity);
+        }
+        drop(adoption_admission);
         if let Some(mut request) = leader_request {
             if let Some(priority) =
                 self.in_flight
@@ -12370,8 +12627,12 @@ impl Fleet {
                 completion_guard.disarm();
             });
         }
-        self.await_coalesced(public_identity, wait_horizon_unix_ms, rx)
-            .await
+        admission_leader.disarm();
+        let delivery = self
+            .await_coalesced(public_identity, wait_horizon_unix_ms, rx)
+            .await;
+        drop(admission_subscriber);
+        delivery
     }
 
     #[allow(clippy::result_large_err)]
@@ -12637,6 +12898,17 @@ impl Fleet {
                 }
             }
         }
+        let (adoption_gate, joining_metadata) = {
+            let state = self.check_adoptions.lock().unwrap();
+            (
+                state.mutation.clone(),
+                state.templates.get(&leader).cloned(),
+            )
+        };
+        // The durable JOIN boundary and the recorder's final acknowledgement
+        // share this gate; admitting a join cannot race ahead of its row.
+        let adoption_admission = adoption_gate.lock().await;
+        let mut consumer_sources = Vec::new();
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let mut receivers = Vec::with_capacity(items.len());
         let mut newly_claimed = Vec::new();
@@ -12668,6 +12940,13 @@ impl Fleet {
                     let publication = &registry.by_key[&key].publication;
                     manual_publications.push((handle.to_string(), publication.id().to_string()));
                 }
+                consumer_sources.push((
+                    public_identity.clone(),
+                    key.leader.clone(),
+                    item.result_identity.check_name.clone(),
+                    crate::execution::checks::manual_check_handle(&item.process.stream_id)
+                        .map(str::to_owned),
+                ));
                 if opened {
                     keys.push(key);
                     newly_claimed.push(item);
@@ -12682,6 +12961,96 @@ impl Fleet {
                 receivers.push((public_identity, rx));
             }
         }
+        let admission_subscribers: Vec<_> = receivers
+            .iter()
+            .map(|(identity, _)| CoalescedSubscriberDropGuard {
+                pool: self.clone(),
+                identity: identity.clone(),
+                armed: true,
+            })
+            .collect();
+        let mut admission_leader = CoalescedLeaderCompletionGuard {
+            pool: self.clone(),
+            leader: leader.clone(),
+            work_class: request.placement_work_class,
+            keys: keys.clone(),
+            runner_context_id: None,
+            armed: !keys.is_empty(),
+        };
+        if let Some(source) = &joining_metadata {
+            for (subscriber, physical, name, manual_handle) in consumer_sources {
+                let mut source = source.clone();
+                if source.consumer == "manual" {
+                    if let Some(handle) = manual_handle {
+                        source.consumer_ref = handle;
+                    }
+                }
+                self.track_check_consumer(subscriber, physical.clone(), &name, &source);
+                if let Err(error) = self
+                    .register_check_join_locked(&physical, &name, &source)
+                    .await
+                {
+                    let diagnostic = format!("persist configured check consumer JOIN: {error}");
+                    for (identity, _) in &receivers {
+                        self.detach_coalesced_subscriber(identity, None);
+                    }
+                    for key in &keys {
+                        self.complete_coalesced_for_leader(
+                            key,
+                            executor_unavailable(diagnostic.clone()),
+                        );
+                    }
+                    self.check_adoptions
+                        .lock()
+                        .unwrap()
+                        .templates
+                        .remove(&leader);
+                    return receivers
+                        .into_iter()
+                        .map(|_| {
+                            Err(CoalescedWaitError::refused(executor_unavailable(
+                                diagnostic.clone(),
+                            )))
+                        })
+                        .collect();
+                }
+            }
+        }
+        // Only newly opened items run in this physical grant. Joined items
+        // are recorded against their existing leader's claim instead.
+        {
+            let mut adoptions = self.check_adoptions.lock().unwrap();
+            if newly_claimed.is_empty() {
+                adoptions.templates.remove(&leader);
+            } else if let Some(template) = adoptions.templates.get_mut(&leader) {
+                let indices: Vec<_> = newly_claimed
+                    .iter()
+                    .filter_map(|item| {
+                        template
+                            .check_names
+                            .iter()
+                            .zip(&template.input_hashes)
+                            .position(|(name, hash)| {
+                                name == &item.result_identity.check_name
+                                    && hash == &item.result_identity.input_hash
+                            })
+                    })
+                    .collect();
+                template.recording_plans = indices
+                    .iter()
+                    .filter_map(|index| template.recording_plans.get(*index).cloned())
+                    .collect();
+                template.check_names = newly_claimed
+                    .iter()
+                    .map(|item| item.result_identity.check_name.clone())
+                    .collect();
+                template.input_hashes = newly_claimed
+                    .iter()
+                    .map(|item| item.result_identity.input_hash.clone())
+                    .collect();
+            }
+        }
+        drop(adoption_admission);
         // Admission records the actual shared execution before this caller can
         // wait for it. The publisher may already be committing its source; recovery
         // joins this identity even if we never receive its direct observation ID.
@@ -12937,6 +13306,7 @@ impl Fleet {
                 completion_guard.disarm();
             });
         }
+        admission_leader.disarm();
         let outcomes = futures_util::future::join_all(
             receivers
                 .into_iter()
@@ -12946,6 +13316,7 @@ impl Fleet {
         // Still armed only for an item that led nothing: its subscriptions
         // have ended, and with them its stake in the fleet.
         drop(admission_guard);
+        drop(admission_subscribers);
         outcomes
     }
 
@@ -13902,6 +14273,8 @@ impl Fleet {
         let setup_identity = request.project_requirements.setup_identity.clone();
         let runs_in_home = request.pinned_executor_id.is_some();
         let granted_at_unix_ms = unix_time_ms();
+        self.claim_check_at_grant(&key, &selected, granted_at_unix_ms)
+            .await;
         let admission_request = request.clone();
         let admission = self.send_new_admission(
             &selected,
@@ -13939,6 +14312,12 @@ impl Fleet {
         }
         if !sent {
             let refusal = admission.expect_err("an unsent grant has an admission error");
+            self.settle_check_claim(
+                &key,
+                "cancelled",
+                "the executor grant was not delivered".into(),
+                true,
+            );
             withdraw_claim(&selected, &entry_id);
             self.queue
                 .take(&key, queue::TerminalState::Cancelled, unix_time_ms());
@@ -14076,6 +14455,7 @@ impl Fleet {
                 abandoned_grant,
                 above_ceiling: claimed_above_ceiling,
                 account: CellAccount {
+                    left_running: self.left_running_attempt(&key),
                     cancel_cause: None,
                     placement: Some(placement),
                 },
@@ -14252,6 +14632,7 @@ impl Fleet {
             abandoned_grant,
             above_ceiling: claimed_above_ceiling,
             account: CellAccount {
+                left_running: None,
                 cancel_cause: None,
                 placement: Some(placement),
             },
@@ -15369,10 +15750,19 @@ impl Fleet {
     /// Tell a machine the runner holds one of its results, on whatever link it
     /// is attached on now. A machine not attached keeps the result and sends it
     /// again when it is, and the decision is simply made again.
+    #[cfg(test)]
+    pub(crate) fn set_result_ack_probe_for_test(&self, probe: ResultAckProbe) {
+        *self.result_ack_probe.lock().unwrap() = Some(probe);
+    }
+
     pub(crate) fn send_result_ack(&self, executor_id: &str, request_id: &str, attempt_id: &str) {
         let Some(generation) = self.link_generation(executor_id) else {
             return;
         };
+        #[cfg(test)]
+        if let Some(probe) = self.result_ack_probe.lock().unwrap().clone() {
+            probe(request_id, attempt_id);
+        }
         if let Err(error) = self.send_to(
             executor_id,
             generation,
@@ -15391,7 +15781,10 @@ impl Fleet {
         {
             let mut deferred = self.deferred_acks.lock().unwrap();
             if let Some(delivered) = deferred.get_mut(&key.0) {
-                delivered.push((key.1.clone(), executor_id.to_string()));
+                let attempt = (key.1.clone(), executor_id.to_string());
+                if !delivered.contains(&attempt) {
+                    delivered.push(attempt);
+                }
                 return;
             }
         }
@@ -15409,6 +15802,7 @@ impl Fleet {
         DeferredResultAck {
             fleet: self.clone(),
             request_id: request_id.to_string(),
+            retain: false,
         }
     }
 
@@ -27689,12 +28083,24 @@ mod tests {
         /// Attach one machine that has reported its account once, listing
         /// `granted` as attempts it still holds, and hand back every frame this
         /// runner sends it.
+        pub(crate) fn attach_unreported_machine_for_test(
+            &self,
+            id: &str,
+        ) -> mpsc::UnboundedReceiver<ExecutorMessage> {
+            let (id, mut connection) = fleet_entry(id, "linux", 0, &[]);
+            let (sender, receiver) = mpsc::unbounded_channel();
+            connection.sender = sender;
+            connection.snapshots_received = 0;
+            self.lock_connections().insert(id, connection);
+            receiver
+        }
+
         pub(crate) fn attach_reported_machine_for_test(
             &self,
             id: &str,
             granted: &[(&str, &str)],
         ) -> mpsc::UnboundedReceiver<ExecutorMessage> {
-            let (id, mut connection) = fleet_entry(id, "linux", 0, &[]);
+            let (id, mut connection) = fleet_entry_at(id, "linux", 0, &[], unix_time_ms());
             let (sender, receiver) = mpsc::unbounded_channel();
             connection.sender = sender;
             connection.snapshots_received = 1;
@@ -39886,6 +40292,7 @@ mod tests {
 
         // What the leader's task does when its cancelled outcome comes back.
         let account = CellAccount {
+            left_running: None,
             cancel_cause: pool.cancel_causes.lock().unwrap().take(&leader),
             placement: None,
         };

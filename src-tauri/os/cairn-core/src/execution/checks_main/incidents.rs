@@ -516,7 +516,10 @@ pub(super) async fn record(
     delivery: Option<(&str, i64)>,
     names: ExecutorNames<'_>,
 ) -> DbResult<Recorded> {
-    if matches!(report.verdict, CadenceVerdict::Cancelled { .. }) {
+    if matches!(
+        report.verdict,
+        CadenceVerdict::Cancelled { .. } | CadenceVerdict::AwaitingAdoption { .. }
+    ) {
         return Ok(Recorded::default());
     }
     let row = report.verdict.row();
@@ -879,6 +882,8 @@ mod tests {
         observation_at(db, id, host, &format!("commit-{id}"), &tests).await
     }
 
+    type TimedTest<'a> = (&'a str, &'a str, &'a str, Option<(i64, i64)>);
+
     /// A row on `commit`, each test optionally dated on the lane's timeline
     /// as `(started_offset_ms, duration_ms)`.
     async fn observation_at(
@@ -886,7 +891,7 @@ mod tests {
         id: &str,
         host: &str,
         commit: &str,
-        tests: &[(&str, &str, &str, Option<(i64, i64)>)],
+        tests: &[TimedTest<'_>],
     ) -> CadenceRow {
         let failed = tests.iter().any(|(_, status, ..)| *status == "failed");
         let observed_at = (count(db, "check_result_observations").await + 1) * 1000;
@@ -2641,7 +2646,7 @@ mod tests {
         assert_eq!(count(&db, "issues").await, 1);
         // A second open issue naming the test leaves no unique prose owner, as
         // the duplicates themselves did on main.
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO issues(id,project_id,number,title,status,parent_thread_id,created_at,updated_at)
              VALUES('human','p',2,'Fix failing `{test}`','backlog','feature-thread',1,1);
              UPDATE projects SET next_issue_number=3 WHERE id='p';"

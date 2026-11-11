@@ -430,6 +430,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("todos", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("workflow_progress", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("attention_pushes", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("delivery_receipts", "project_id = ?1 OR (recipient_kind = 'thread' AND recipient_id IN (SELECT id FROM threads WHERE project_id = ?1)) OR (recipient_kind = 'job' AND recipient_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("attention_read_cursors", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1) OR source IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("event_read_tokens", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     spec("event_vibes", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),

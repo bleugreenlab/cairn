@@ -79,38 +79,6 @@ pub async fn matching_subscription(
     ))
 }
 
-pub async fn matching_subscriptions_for_source(
-    host: std::sync::Arc<dyn crate::runtime::RecipientHost>,
-    db: &LocalDb,
-    source_kind: &str,
-    source_ref: Option<&str>,
-    fact_kind: &str,
-) -> Result<Vec<WakeSubscription>, String> {
-    // An `issue` source carries the derived parent-axis watch alongside its
-    // persisted rows, so a broadcast child fact reaches the node currently
-    // driving the parent even though no row was ever minted for it (CAIRN-3293).
-    let subscriptions = match (source_kind, source_ref) {
-        (SOURCE_KIND_ISSUE, Some(issue_uri)) => {
-            super::child::subscriptions_governing_issue(host, db, issue_uri).await?
-        }
-        _ => subscriptions_for_source(db, source_kind, source_ref).await?,
-    };
-    let mut by_job: std::collections::BTreeMap<String, Vec<WakeSubscription>> =
-        std::collections::BTreeMap::new();
-    for subscription in subscriptions {
-        by_job
-            .entry(subscription.job_id.clone())
-            .or_default()
-            .push(subscription);
-    }
-    Ok(by_job
-        .into_values()
-        .filter_map(|subscriptions| {
-            best_matching_subscription(subscriptions, source_kind, source_ref, fact_kind)
-        })
-        .collect())
-}
-
 /// Every persisted subscription on one source, unfiltered by fact kind and
 /// ungrouped. A ref-less row of a standing-watch kind watches every reference of
 /// that kind, so it is included for any reference of it — see
@@ -157,7 +125,9 @@ pub async fn subscriptions_for_source(
     .map_err(|error| format!("Failed to list matching wake subscriptions: {error}"))
 }
 
-fn best_matching_subscription(
+/// The one subscription that governs `fact_kind` on a source for one
+/// recipient: the most specific row a node chose for itself.
+pub(crate) fn best_matching_subscription(
     subscriptions: Vec<WakeSubscription>,
     source_kind: &str,
     source_ref: Option<&str>,

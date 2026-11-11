@@ -7,7 +7,6 @@ use crate::storage::LocalDb;
 use crate::storage::RowExt;
 #[cfg(test)]
 use cairn_attention::delivery::create_catchup_push;
-pub(crate) use cairn_attention::delivery::job_belongs_to_issue;
 #[cfg(test)]
 use cairn_attention::delivery::{
     catchup_operator_digest, CATCHUP_DIGEST_CHARS, CATCHUP_DIGEST_MESSAGES,
@@ -39,25 +38,30 @@ pub(crate) async fn push_to_issue_watchers(
     )
     .await
 }
+/// `occurrence` names the operator message the catch-up is for.
 pub(crate) async fn create_catchup_pushes_for_watchers(
     db: &LocalDb,
     child_uri: &str,
+    occurrence: &str,
 ) -> Result<usize, String> {
     cairn_attention::delivery::create_catchup_pushes_for_watchers(
         Arc::new(crate::attention_host::CoreRecipients),
         db,
         child_uri,
+        occurrence,
     )
     .await
 }
 pub(crate) async fn create_catchup_pushes_for_job(
     db: &LocalDb,
     child_job_id: &str,
+    occurrence: &str,
 ) -> Result<usize, String> {
     cairn_attention::delivery::create_catchup_pushes_for_job(
         Arc::new(crate::attention_host::CoreRecipients),
         db,
         child_job_id,
+        occurrence,
     )
     .await
 }
@@ -851,7 +855,8 @@ mod tests {
         // come from a fresh creation.
         db.execute_script(
             "DELETE FROM wake_subscriptions WHERE id = 'seeded';
-             DELETE FROM attention_pushes;",
+             DELETE FROM attention_pushes;
+             DELETE FROM delivery_receipts;",
         )
         .await
         .unwrap();
@@ -1482,7 +1487,7 @@ mod tests {
         add_chat_turn(&db, "t1", 1).await;
 
         assert_eq!(
-            super::create_catchup_pushes_for_watchers(&db, &child_node_uri())
+            super::create_catchup_pushes_for_watchers(&db, &child_node_uri(), "operator-message")
                 .await
                 .unwrap(),
             1,
@@ -1811,9 +1816,10 @@ mod tests {
         .unwrap();
         add_chat_turn(&db, "t1", 1).await;
 
-        let created = create_catchup_pushes_for_watchers(&db, &child_node_uri())
-            .await
-            .unwrap();
+        let created =
+            create_catchup_pushes_for_watchers(&db, &child_node_uri(), "operator-message")
+                .await
+                .unwrap();
 
         assert_eq!(created, 1);
         let successor = pending_catchup(&db, "successor").await;
@@ -1839,7 +1845,7 @@ mod tests {
         add_issue_sub(&db, "child-job").await;
         add_chat_turn(&db, "t1", 1).await;
 
-        create_catchup_pushes_for_watchers(&db, &child_node_uri())
+        create_catchup_pushes_for_watchers(&db, &child_node_uri(), "operator-message")
             .await
             .unwrap();
 
@@ -1856,7 +1862,7 @@ mod tests {
         seed(&db, "muted", None, None).await;
         add_chat_turn(&db, "t1", 1).await;
 
-        create_catchup_pushes_for_watchers(&db, &child_node_uri())
+        create_catchup_pushes_for_watchers(&db, &child_node_uri(), "operator-message")
             .await
             .unwrap();
 
@@ -1910,7 +1916,7 @@ mod tests {
         add_chat_turn(&db, "t1", 1).await;
         queue_operator_message(&db, "q-1", 300, "also ship the trusted producer").await;
 
-        create_catchup_pushes_for_watchers(&db, &child_node_uri())
+        create_catchup_pushes_for_watchers(&db, &child_node_uri(), "operator-message")
             .await
             .unwrap();
         let digest = catchup_operator_digest(&db, "watcher", "child-job")
@@ -2222,7 +2228,7 @@ mod tests {
         )
         .await;
 
-        let created = create_catchup_pushes_for_watchers(&db, CHILD_NODE)
+        let created = create_catchup_pushes_for_watchers(&db, CHILD_NODE, "operator-message")
             .await
             .unwrap();
         assert_eq!(

@@ -1596,6 +1596,10 @@ fn render_main_in_flight(
         ));
     }
     for lane in &in_flight.lanes {
+        if let Some(line) = crate::execution::checks_main::render_adopted_lane(lane) {
+            out.push_str(&line);
+            continue;
+        }
         out.push_str(&format!(
             "- {} on {}: a whole-suite run over `{}`, armed {} ago{}.\n",
             lane.check,

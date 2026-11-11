@@ -6,10 +6,12 @@
 //! every `crate::storage::…` path — including the `events`, `content_store`, and
 //! `render` child modules and the `TeamId` alias — keeps resolving unchanged.
 //!
-//! `team_sync` is the one storage symbol that CANNOT descend: it needs
-//! `crate::services::EventEmitter`, which stays in cairn-core, so it lives here
-//! beside the facade and is re-exported into the same namespace.
+//! `team_sync` needs `crate::services::EventEmitter`, which stays in cairn-core,
+//! so it lives here beside the facade and is re-exported into the same namespace.
+//! `check_lane_adoptions` journals runner-owned remote check lifecycle state.
 pub use cairn_db::storage::*;
+
+pub(crate) mod check_lane_adoptions;
 
 mod team_sync;
 pub use team_sync::{

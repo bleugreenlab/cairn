@@ -188,6 +188,14 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "this runner's own restart-cancelled main-cadence pass: written as the runner stops, read back and deleted by its next boot; it describes the runner, not shared project state, and a deletion sweep has nothing to do because the next boot consumes it",
     ),
     (
+        "check_lane_adoptions",
+        "this runner's claim on a remote check attempt it was granted: it names this install's executor, request and attempt ids, and only the granting runner can adopt it at boot; a destination has no such attempt to join, and the observation a claim records exports in its own table",
+    ),
+    (
+        "check_lane_adoption_waiters",
+        "the consumers waiting on one of this runner's adoption claims, deleted with the claim; like the claim, meaningless to a destination runner",
+    ),
+    (
         "node_scratches",
         "a node scratch's authority row describes a Git store on this runner and replicas on this runner's executors; neither travels with an export, and the scratch ends with its node",
     ),

@@ -3,12 +3,12 @@
 //! often, or how they are woken.
 //!
 //! A swept fact persists for as long as nobody fixes it, and the sweep
-//! re-observes it every tick, so the fingerprint dedupe here is what bounds the
-//! wakes by what changed rather than by how many ticks passed.
+//! re-observes it every tick. Its receipt key carries the sweep's fingerprint,
+//! which names the episode, so the wakes are bounded by what changed rather
+//! than by how many ticks passed, and a new episode is a new fact.
 
-use crate::orchestrator::attention_push::{
-    latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
-};
+use cairn_attention::push::{Boundary, Wake};
+
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 
@@ -25,55 +25,58 @@ pub(crate) struct ChildFact<'a> {
 
 /// Tell the child's watchers, and hand back the ones a wake should rouse.
 ///
-/// The recipient set is [`watcher_jobs_for_issue`], which resolves the node
-/// currently driving the parent live on every call (CAIRN-3293) — so a parent
-/// issue that gained a new coordinator execution inherits its children's facts
-/// with no hand-off step, and a superseded coordinator stops hearing them. Jobs
-/// on the child's own issue are excluded: a node cannot act on its own death.
-///
-/// [`watcher_jobs_for_issue`]: crate::orchestrator::wakes::watcher_jobs_for_issue
+/// The recipients are everyone the resolver finds for the child issue: the
+/// node currently driving the parent, resolved live on every call
+/// (CAIRN-3293), so a parent issue that gained a new coordinator execution
+/// inherits its children's facts with no hand-off step and a superseded
+/// coordinator stops hearing them; explicit subscriptions; and the issue's
+/// camp. Jobs on the child's own issue are excluded: a node cannot act on its
+/// own death.
 pub(crate) async fn tell_child_watchers(
     db: &LocalDb,
     fact: &ChildFact<'_>,
 ) -> Result<Vec<String>, String> {
-    let watchers = crate::orchestrator::wakes::watcher_jobs_for_issue(db, fact.issue_uri).await?;
-    let mut pushed = Vec::new();
-    for recipient in watchers {
-        if crate::orchestrator::attention_delivery::job_belongs_to_issue(
-            db,
-            &recipient,
-            fact.issue_id,
-        )
-        .await?
-        {
-            continue;
-        }
-        // The change trigger. Without this the parent would be woken on every
-        // tick the fact stands.
-        if let Some(Some(previous)) = latest_push_fingerprint(db, &recipient, &fact.key)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            if previous == fact.fingerprint {
-                continue;
-            }
-        }
-        let (_, effective) = push_with_fingerprint(
-            db,
-            &recipient,
-            fact.node_uri,
-            Wake::Wake,
-            Boundary::Event,
-            &fact.key,
-            Some(&fact.fingerprint),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if effective.wakes_idle() {
-            pushed.push(recipient);
-        }
+    let _ = fact.issue_id;
+    let fact_kind = child_fact_kind(&fact.key);
+    let mut audience = cairn_attention::wakes::FactAudience::new(fact_kind, Wake::Wake, Wake::Wake);
+    audience.source = Some(cairn_attention::wakes::SourceRef::issue(fact.issue_uri));
+    audience.exclude.subject_issue_jobs = true;
+    let push = cairn_attention::delivery::AudiencePush {
+        fact_key: format!("{}#{}", fact.key, fact.fingerprint),
+        content: cairn_attention::delivery::PushContent::Fixed(fact.node_uri.to_string()),
+        boundary: Boundary::Event,
+        key: fact.key.clone(),
+        fingerprint: Some(fact.fingerprint.clone()),
+        guard: cairn_attention::delivery::PushGuard::None,
+    };
+    Ok(cairn_attention::delivery::push_to_audience(
+        std::sync::Arc::new(crate::attention_host::CoreRecipients),
+        db,
+        &audience,
+        &push,
+    )
+    .await?
+    .into_iter()
+    .filter(|delivery| delivery.fresh && delivery.wake.wakes_idle())
+    .map(|delivery| delivery.job_id)
+    .collect())
+}
+
+/// The fact kind a child sweep's push key announces, for subscriptions that
+/// narrow their fact kinds.
+fn child_fact_kind(key: &str) -> &'static str {
+    use cairn_attention::push::{
+        CHILD_STALL_PUSH_PREFIX, CHILD_UNOWNED_PUSH_PREFIX, CHILD_UNRESUMED_PUSH_PREFIX,
+    };
+    use cairn_attention::wakes::{
+        FACT_KIND_CHILD_STALLED, FACT_KIND_CHILD_UNOWNED, FACT_KIND_CHILD_UNRESUMED,
+    };
+    match key.split_once(':').map_or(key, |(prefix, _)| prefix) {
+        CHILD_UNRESUMED_PUSH_PREFIX => FACT_KIND_CHILD_UNRESUMED,
+        CHILD_UNOWNED_PUSH_PREFIX => FACT_KIND_CHILD_UNOWNED,
+        CHILD_STALL_PUSH_PREFIX => FACT_KIND_CHILD_STALLED,
+        _ => FACT_KIND_CHILD_STALLED,
     }
-    Ok(pushed)
 }
 
 /// Rouse the recipients [`tell_child_watchers`] handed back. `label` names the

@@ -64,7 +64,10 @@ impl AttentionHost for Host {
     }
     async fn mark_thread_chapter(&self, _: &LocalDb, _: &str, _: &str, _: &str, _: &str) {}
     fn emit_change(&self, _: &str, _: Option<&str>) {}
-    fn deliver(&self, _: &str, _: Option<&str>, _: &str, _: DeliveryUrgency, _: Option<&str>) {
+    async fn deliver(
+        &self,
+        _: crate::runtime::DeliveryRequest<'_>,
+    ) -> crate::runtime::DeliveryOutcome {
         panic!("rendering never delivers")
     }
 }

@@ -228,8 +228,12 @@ async fn record_operator_message(
             event.bytes = Some(message.content.len());
             event.emit();
             if let Err(error) =
-                crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(db, &job_id)
-                    .await
+                crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(
+                    db,
+                    &job_id,
+                    &message.id,
+                )
+                .await
             {
                 log::warn!("catch-up push creation for an operator message failed: {error}");
             }

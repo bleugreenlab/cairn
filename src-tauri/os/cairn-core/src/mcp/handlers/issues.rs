@@ -921,10 +921,10 @@ mod tests {
         // The adopting coordinator watches the child immediately, with nothing
         // persisted on its behalf.
         assert_eq!(
-            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/proj/2")
+            crate::orchestrator::wakes::issue_watchers(&orch.db.local, "cairn://p/proj/2")
                 .await
                 .unwrap(),
-            vec!["manual".to_string(), "coord".to_string()]
+            vec!["coord".to_string(), "manual".to_string()]
         );
         assert!(
             crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "coord")
@@ -954,7 +954,7 @@ mod tests {
         // Orphaned: the derived watch is gone with the parent edge, and the
         // manual watcher is untouched.
         assert_eq!(
-            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/proj/2")
+            crate::orchestrator::wakes::issue_watchers(&orch.db.local, "cairn://p/proj/2")
                 .await
                 .unwrap(),
             vec!["manual".to_string()],

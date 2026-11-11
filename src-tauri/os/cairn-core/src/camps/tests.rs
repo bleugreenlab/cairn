@@ -256,6 +256,7 @@ async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica(
     let project = "teamT~6f1c0a52-8f0e-4d55-9c1a-2b8d3a1e7f01";
     let thread = "teamT~6f1c0a52-8f0e-4d55-9c1a-2b8d3a1e7f02";
     let job = "teamT~6f1c0a52-8f0e-4d55-9c1a-2b8d3a1e7f03";
+    // The wake is owed to the thread; its session is resolved at delivery.
     team.execute_batch(&format!(
         "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
          INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('{project}','w','Team','tp','',1,1);
@@ -287,11 +288,73 @@ async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica(
     crate::routes::drain_fact_log(&orch).await;
     let reached = db
         .query_all(
-            "SELECT clause_ref FROM fact_log_wakes WHERE job_id = ?1",
-            (job.to_string(),),
+            "SELECT clause_ref FROM fact_log_wakes WHERE recipient_key = ?1",
+            (format!("thread:{thread}"),),
             |row| row.text(0),
         )
         .await
         .unwrap();
     assert_eq!(reached, ["addressed:camp_notice.camp@lead"]);
+}
+
+/// Specimen 4: one base camp notice is one fact row and one receipt per
+/// participant, however many threads the project has, and neither a second
+/// drain nor a restart's recovery adds a message or loses a receipt.
+#[tokio::test]
+async fn a_camp_notice_is_one_row_and_one_receipt_per_thread_at_any_size() {
+    for threads in [1usize, 3, 25] {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let mut seed = String::new();
+        for n in 0..threads {
+            seed.push_str(&format!(
+                "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('n{n}','p','n{n}','active',1,1);
+                 INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('n{n}-job','n{n}','p','running','thread',1,1);
+                 INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('n{n}-run','n{n}-job','running',1,1);"
+            ));
+        }
+        db.execute_batch(&seed).await.unwrap();
+        db.ensure_base_camp("p", "t", 1).await.unwrap();
+        notify_camp(
+            &orch,
+            CampNotice {
+                project_id: "p",
+                project_key: "cairn",
+                camp_slug: crate::models::BASE_CAMP_SLUG,
+                kind: "rebuild",
+                identity: format!("build-change:{threads}"),
+                summary: "Cairn was rebuilt.".into(),
+                detail_uri: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::routes::drain_fact_log(&orch).await;
+        let count = |sql: &'static str| {
+            let db = db.clone();
+            async move { db.query_opt_i64(sql, ()).await.unwrap().unwrap() }
+        };
+        let participants = threads as i64 + 1;
+        assert_eq!(
+            count("SELECT COUNT(*) FROM fact_log WHERE source = 'camp_notice'").await,
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM delivery_receipts WHERE state = 'delivered'").await,
+            participants,
+            "{threads} threads"
+        );
+        let told = "SELECT COUNT(*) FROM messages WHERE content LIKE 'From camp base%'";
+        assert_eq!(count(told).await, participants);
+
+        crate::storage::recover_fact_log(&db, i64::MAX / 2, 0)
+            .await
+            .unwrap();
+        crate::routes::drain_fact_log(&orch).await;
+        assert_eq!(count(told).await, participants, "recovery adds nothing");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM delivery_receipts").await,
+            participants
+        );
+    }
 }

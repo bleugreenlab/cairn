@@ -184,6 +184,8 @@ pub(crate) enum Adoption {
     /// A durable row claims the batch; the result is recorded, and its driver
     /// acknowledges it once the settled outcome is recorded too.
     Adopted,
+    /// A cadence claim owns it; its existing recorder will acknowledge it.
+    HeldForCheckLane,
     /// Nothing durable claims it; it is acknowledged and dropped, by name.
     Unclaimed,
     /// The rows could not be read; nothing is acknowledged.
@@ -200,6 +202,106 @@ pub(crate) async fn adopt(orch: &Orchestrator, result: UnboundResult) -> Adoptio
         attempt_id,
         ..
     } = result.clone();
+    // Check claims precede run-batch claims: an unavailable store cannot be
+    // interpreted as permission to discard the executor's retained result.
+    match crate::storage::check_lane_adoptions::lookup(&orch.db.local, &request_id, &attempt_id)
+        .await
+    {
+        Ok(Some(claim)) if claim.state == "recorded" || claim.state == "lost" => {
+            orch.fleet
+                .send_result_ack(&executor_id, &request_id, &attempt_id);
+            return Adoption::Unclaimed;
+        }
+        Ok(Some(_claim))
+            if orch
+                .fleet
+                .adoption_owner(&(request_id.clone(), attempt_id.clone()))
+                .is_some() =>
+        {
+            orch.fleet.hold_check_adoption(result);
+            return Adoption::HeldForCheckLane;
+        }
+        Ok(Some(claim)) => {
+            let waiters = match crate::storage::check_lane_adoptions::waiters(
+                &orch.db.local,
+                &request_id,
+                &attempt_id,
+            )
+            .await
+            {
+                Ok(waiters) => waiters,
+                Err(error) => {
+                    log::warn!("could not read check consumers for {request_id}: {error}");
+                    orch.adoption.undecided.lock().unwrap().push(result);
+                    return Adoption::Undecided;
+                }
+            };
+            let checks: Vec<_> = waiters
+                .iter()
+                .filter(|waiter| waiter.is_cadence_adopter())
+                .map(|waiter| waiter.check_name.clone())
+                .collect();
+            if !checks.is_empty()
+                && !orch
+                    .fleet
+                    .is_check_adoption_reloaded(&(request_id.clone(), attempt_id.clone()))
+            {
+                // A recovered read cannot resurrect a claim the fleet failed
+                // to preload. Use the same loss and repair path as boot.
+                if let Err(error) = crate::execution::checks_main::try_lose_adoption(
+                    orch,
+                    &claim,
+                    &checks,
+                    "boot preload failed; the fleet cancelled it",
+                )
+                .await
+                {
+                    log::warn!("could not settle unloaded cadence claim {request_id}: {error}");
+                    orch.adoption.undecided.lock().unwrap().push(result);
+                    return Adoption::Undecided;
+                }
+                orch.fleet
+                    .send_result_ack(&executor_id, &request_id, &attempt_id);
+                return Adoption::Unclaimed;
+            }
+            let evidence = claim
+                .evidence
+                .clone()
+                .filter(|evidence| evidence.starts_with("not adoptable:"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "result arrived for a {} lane, which has no adopter in this build",
+                        claim.consumer,
+                    )
+                });
+            let settled = crate::storage::check_lane_adoptions::settle_failure(
+                &orch.db.local,
+                &request_id,
+                &attempt_id,
+                "lost",
+                &evidence,
+            )
+            .await;
+            if let Err(error) = settled {
+                log::warn!(
+                    "could not settle check claim {request_id} before acknowledgement: {error}"
+                );
+                orch.adoption.undecided.lock().unwrap().push(result);
+                return Adoption::Undecided;
+            }
+            orch.fleet
+                .send_result_ack(&executor_id, &request_id, &attempt_id);
+            return Adoption::Unclaimed;
+        }
+        Err(error) => {
+            log::warn!(
+                "could not read check claim for {request_id}; result stays on {machine}: {error}"
+            );
+            orch.adoption.undecided.lock().unwrap().push(result);
+            return Adoption::Undecided;
+        }
+        Ok(None) => {}
+    }
     // A batch this process placed is its own path's to settle; its binding is
     // gone because that path already settled or abandoned this attempt.
     if detached::placed_here(&request_id) {

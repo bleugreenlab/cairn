@@ -213,6 +213,51 @@ impl ChecksSnapshot {
         })
     }
 
+    /// What makes this settlement the settlement it is (tenet 974): every lane
+    /// that holds a verdict, by suite, with that verdict and the observation it
+    /// projects (an observation is recorded for one sealed tree, so it names
+    /// the tree the lanes describe); for a verdictless settlement, the suites
+    /// that produced none and the terminal reason; and the head a retired node
+    /// was recorded at. Sorted, so the same settlement reads the same whoever
+    /// routes it. A new actionable verdict on the same tree is a new identity;
+    /// the same settlement routed again by another caller is not.
+    pub(crate) fn settlement_identity(&self) -> String {
+        let mut lanes: Vec<String> = self
+            .statuses
+            .iter()
+            .filter(|status| status.state != NodeCheckState::Pending)
+            .map(|status| {
+                format!(
+                    "{}={:?}@{}",
+                    status.name,
+                    status.state,
+                    status.observation_id.as_deref().unwrap_or("-")
+                )
+            })
+            .collect();
+        lanes.sort();
+        let mut verdictless = match &self.settlement {
+            Settlement::Settled { verdictless } => verdictless.clone(),
+            Settlement::Moving(_) => Vec::new(),
+        };
+        verdictless.sort();
+        let reason = if verdictless.is_empty() {
+            ""
+        } else {
+            self.terminal_reason.as_deref().unwrap_or("")
+        };
+        let head = self
+            .retired
+            .as_ref()
+            .and_then(|retired| retired.head.as_deref())
+            .unwrap_or("");
+        format!(
+            "lanes[{}] verdictless[{}] reason[{reason}] retired[{head}]",
+            lanes.join(","),
+            verdictless.join(",")
+        )
+    }
+
     /// The one word an orchestrator branches on.
     ///
     /// Neither `incomplete` nor `not_applicable` is folded into a verdict: a

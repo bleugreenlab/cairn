@@ -239,6 +239,7 @@ fn lane_with_env(
     item_env: Vec<(String, String)>,
 ) -> (PlannedCheckBatchRequest, PlannedCheckBatchItem) {
     let item = PlannedCheckBatchItem {
+        recording_plan: None,
         index: 0,
         name: "migrations".into(),
         input_hash: "hash".into(),

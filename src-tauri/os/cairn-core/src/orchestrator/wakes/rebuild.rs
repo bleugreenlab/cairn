@@ -387,6 +387,7 @@ pub async fn evaluate_rebuild_subscription(
             },
             urgency: DeliveryUrgency::Queue,
             muted: MutedDelivery::RideAlong,
+            fact_key: None,
         },
     )
     .await?;

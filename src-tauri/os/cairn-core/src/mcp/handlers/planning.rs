@@ -1418,9 +1418,14 @@ async fn announce_queued_answer(
         "db-change",
         serde_json::json!({"table": "queued_messages", "action": "update"}),
     );
-    if let Err(error) =
-        crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(owning_db, job_id)
-            .await
+    // Each answer is its own catch-up occurrence; nothing re-announces one.
+    let occurrence = uuid::Uuid::new_v4().to_string();
+    if let Err(error) = crate::orchestrator::attention_delivery::create_catchup_pushes_for_job(
+        owning_db,
+        job_id,
+        &occurrence,
+    )
+    .await
     {
         log::warn!("catch-up push creation for a question's answer failed: {error}");
     }

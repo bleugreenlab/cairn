@@ -2070,6 +2070,7 @@ fn manual_check_batch_item(
     transport_env: Vec<(String, String)>,
 ) -> PlannedCheckBatchItem {
     PlannedCheckBatchItem {
+        recording_plan: None,
         index: 0,
         name: check_name.to_string(),
         input_hash: input_hash.to_string(),
@@ -2165,6 +2166,10 @@ pub struct ManualConfiguredCheckResult {
     pub exit_code: Option<i32>,
     /// Set when the run produced NO VERDICT about the tree.
     pub no_verdict: Option<ManualCheckNoVerdict>,
+    #[serde(skip)]
+    pub(crate) left_running: Option<crate::fleet::LeftRunningAttempt>,
+    #[serde(skip)]
+    pub(crate) consumer_guard: Option<Arc<crate::fleet::CheckConsumerGuard>>,
     pub output_tail: String,
     /// The machine whose run is the recorded verdict: this run's, or for a
     /// reused verdict the source observation's. A mis-placed lane is visible
@@ -2220,6 +2225,7 @@ pub struct ManualCheckNoVerdict {
 
 /// [`ManualCheckNoVerdict::kind`] when Cairn declined to run the check.
 pub(crate) const NO_VERDICT_SUPPRESSED: &str = "suppressed";
+pub(crate) const NO_VERDICT_LEFT_RUNNING: &str = "awaiting_adoption";
 
 /// Build the manual reply from the outcome the run returned.
 ///
@@ -2311,6 +2317,8 @@ fn manual_configured_check_result(
         tier,
         exit_code: outcome.exit_code,
         no_verdict,
+        left_running: outcome.left_running,
+        consumer_guard: outcome.consumer_guard,
         output_tail: outcome.output_tail,
         executor: None,
         verdict_platform: None,
@@ -2333,6 +2341,13 @@ fn manual_configured_check_result(
 /// [`row_existence`]: crate::execution::checks_status::row_existence
 fn manual_check_no_verdict(outcome: &CheckOutcome) -> Option<ManualCheckNoVerdict> {
     use crate::execution::checks_status::{row_existence, LaneExistence};
+    if outcome.left_running.is_some() {
+        return Some(ManualCheckNoVerdict {
+            kind: NO_VERDICT_LEFT_RUNNING.to_string(),
+            after_failures: None,
+            cause: outcome.output_tail.clone(),
+        });
+    }
     if outcome.passed {
         return None;
     }
@@ -2487,6 +2502,7 @@ pub(crate) async fn run_manual_configured_check_with_progress(
         db,
         contract,
         CheckRunProducer {
+            adopt: None,
             tool_use_id: match manual_handle {
                 Some(handle) => format!("manual-check:{run_id}:handle={handle}:{check_name}"),
                 None => format!("manual-check:{run_id}:{check_name}"),
@@ -2502,8 +2518,159 @@ pub(crate) async fn run_manual_configured_check_with_progress(
     .map_err(Into::into)
 }
 
+/// The physical batch item a restarted runner re-attaches a check run to: the
+/// grant it joins, the machine running it, and its position in that batch.
+#[derive(Clone, Debug)]
+pub(crate) struct AdoptedAttempt {
+    pub(crate) request_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) executor_id: String,
+    pub(crate) item_index: usize,
+    pub(crate) item_count: usize,
+}
+
+/// Replay one physical batch item through the same check engine used before
+/// the restart. The persisted plan preserves partial selections and definition
+/// commits; the result's own provenance supplies its verdict environment.
+pub(crate) async fn execute_adopted_check_item(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    claim: &crate::storage::check_lane_adoptions::Claim,
+    item_index: usize,
+) -> Result<ManualConfiguredCheckResult, String> {
+    let value = claim.recording_plans.get(item_index).ok_or_else(|| {
+        format!(
+            "request {} has no recording contract for item {item_index}",
+            claim.request_id
+        )
+    })?;
+    let recording: CheckAdoptionRecordingPlan =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            format!(
+                "request {} item {item_index} has an unreadable recording contract: {error}",
+                claim.request_id
+            )
+        })?;
+    if claim.check_names.get(item_index) != Some(&recording.plan.name)
+        || claim.input_hashes.get(item_index) != Some(&recording.input_hash)
+        || claim.commit_sha != recording.evaluated_commit
+    {
+        return Err(format!("request {} item {item_index} recording contract disagrees with its granted suite, input hash, or commit", claim.request_id));
+    }
+    let project_key = db
+        .query_opt_text(
+            "SELECT key FROM projects WHERE id=?1",
+            (claim.project_id.clone(),),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("the adoption project no longer exists")?;
+    let coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+        &recording.evaluated_commit,
+        &recording.defined_by_commit,
+        &recording.tree_hash,
+        &recording.input_hash,
+    );
+    let keyed = vec![(recording.plan.clone(), recording.input_hash.clone())];
+    let identity = (claim.request_id.clone(), claim.attempt_id.clone());
+    let executor = claim.executor_id.clone();
+    let item_count = claim.check_names.len();
+    let result_shape = recording.result_shape;
+    if matches!(result_shape, CheckAdoptionResultShape::Single) && item_count != 1 {
+        return Err("a single-command adoption contract names multiple batch items".into());
+    }
+    orch.fleet.defer_result_ack(&identity.0).retain();
+    // Binding can end because the fleet settled loss, not because a command
+    // produced a verdict. Decide that before entering the shared recorder.
+    let executed = orch.fleet.bind_adopted(identity.clone(), &executor).await;
+    let current =
+        crate::storage::check_lane_adoptions::lookup(&orch.db.local, &identity.0, &identity.1)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("the adopted physical grant no longer has a durable claim")?;
+    if matches!(current.state.as_str(), "lost" | "cancelled")
+        || orch.fleet.check_claim(&identity).is_none()
+    {
+        return Err(current.evidence.unwrap_or_else(|| {
+            "the fleet settled or released the adopted physical grant before recording".into()
+        }));
+    }
+    let submitted_identity = identity.clone();
+    let outcomes = run_planned_checks_with_board(
+        db.clone(),
+        &claim.project_id,
+        CheckRunCommit {
+            evaluated: &recording.evaluated_commit,
+            defined_by: &recording.defined_by_commit,
+        },
+        &recording.tree_hash,
+        &recording.job_id,
+        &keyed,
+        &[coordinate],
+        &[InfraScopes::head_only(
+            &recording.job_id,
+            &recording.evaluated_commit,
+        )],
+        &recording.tool_use_id,
+        CheckExecMode::Shared,
+        Some(orch),
+        None,
+        &recording.effective_env,
+        true,
+        move |_, _, _| {
+            let identity = submitted_identity.clone();
+            let outcome = executed.outcome.clone();
+            let account = executed.account.clone();
+            async move {
+                let mut result = match result_shape {
+                    CheckAdoptionResultShape::Batch => {
+                        split_write_check_batch_outcome(outcome, &account, item_count)
+                            .0
+                            .remove(item_index)
+                    }
+                    CheckAdoptionResultShape::Single => {
+                        check_result_from_cell_outcome(outcome, &account, None)
+                    }
+                };
+                if let Ok(result) = &mut result {
+                    result.publication =
+                        Some(crate::fleet::PublicationCoordination::for_request(identity));
+                }
+                result
+            }
+        },
+        |_| {},
+    )
+    .await;
+    let outcome = outcomes
+        .into_iter()
+        .next()
+        .ok_or("the adopted item produced no outcome")?;
+    if outcome.left_running.is_none() {
+        let observation = outcome.recorded.as_ref().ok_or_else(|| {
+            outcome
+                .not_recorded
+                .clone()
+                .unwrap_or_else(|| "the adopted item produced no durable observation".into())
+        })?;
+        orch.fleet
+            .record_check_claim_observation(&identity, &recording.plan.name, &observation.id)
+            .await?;
+    }
+    Ok(manual_configured_check_result(
+        &recording.plan.name,
+        &project_key,
+        recording.evaluated_commit,
+        recording.tree_hash,
+        recording.input_hash,
+        Some(&recording.plan.command),
+        outcome,
+    ))
+}
+
 /// The producer a configured check run records itself as.
 pub(crate) struct CheckRunProducer {
+    pub(crate) adopt: Option<AdoptedAttempt>,
     /// Stream identity. Its prefix decides the observation's `cadence` label
     /// (see [`observation_cadence`]).
     pub(crate) tool_use_id: String,
@@ -2528,6 +2695,28 @@ pub(crate) async fn execute_check_contract(
     retry: bool,
     progress: ManualCheckProgress,
 ) -> Result<ManualConfiguredCheckResult, String> {
+    if let Some(adopt) = &producer.adopt {
+        let claim = orch
+            .fleet
+            .check_claim(&(adopt.request_id.clone(), adopt.attempt_id.clone()))
+            .ok_or("the adopted physical grant has no open durable claim")?;
+        if claim.executor_id != adopt.executor_id
+            || claim.check_names.len() != adopt.item_count
+            || claim.check_names.get(adopt.item_index) != Some(&contract.plan.name)
+            || claim.input_hashes.get(adopt.item_index) != Some(&contract.context.input_hash)
+        {
+            return Err(
+                "the rebuilt check contract does not match its adopted physical item".into(),
+            );
+        }
+        let mut result = execute_adopted_check_item(orch, db, &claim, adopt.item_index).await?;
+        // The claim is matched by suite and input hash, not commit, so the
+        // contract's capture is reported only when it names the judged head.
+        result.capture = contract
+            .capture
+            .filter(|capture| capture.head_after == result.commit_sha);
+        return Ok(result);
+    }
     let check_name = contract.plan.name.clone();
     let check_name = check_name.as_str();
     let capture = contract.capture;
@@ -2564,6 +2753,7 @@ pub(crate) async fn execute_check_contract(
         node_kind,
         owner_job_id,
         purpose,
+        adopt: _,
     } = producer;
     let project_id = context.project_id.clone();
     let job_id = context.job_id.clone();
@@ -2594,7 +2784,7 @@ pub(crate) async fn execute_check_contract(
         }],
     )
     .await;
-    let item_template = manual_check_batch_item(
+    let mut item_template = manual_check_batch_item(
         check_name,
         &context.input_hash,
         &command_check,
@@ -2604,6 +2794,15 @@ pub(crate) async fn execute_check_contract(
         infra_scopes[0].clone(),
         transport_env,
     );
+    item_template.recording_plan = Some(CheckAdoptionRecordingPlan::new(
+        &plan,
+        &sealed_coordinates[0],
+        &job_id,
+        &tool_use_id,
+        &item_template.env,
+    ));
+    let attempts = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let submitted_attempts = attempts.clone();
     let outcomes = run_planned_checks_with_board(
         db.clone(),
         &project_id,
@@ -2636,9 +2835,10 @@ pub(crate) async fn execute_check_contract(
             let node_kind = node_kind.clone();
             let owner_job_id = owner_job_id.clone();
             let purpose = purpose.clone();
+            let attempts = submitted_attempts.clone();
             async move {
                 require_snapshot_command(&snapshot_command, &command)?;
-                submit_planned_check_batch(
+                let mut batch_outcome = submit_planned_check_batch(
                     &orch,
                     PlannedCheckBatchRequest {
                         project_id: project_id.clone(),
@@ -2669,10 +2869,14 @@ pub(crate) async fn execute_check_contract(
                         purpose,
                     },
                 )
-                .await?
-                .results
-                .remove(&0)
-                .ok_or_else(|| {
+                .await?;
+                if let Some(request) = &batch_outcome.request {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push((request.request_id.clone(), request.attempt_id.clone()));
+                }
+                batch_outcome.results.remove(&0).ok_or_else(|| {
                     CheckExecutionFailure::substrate(
                         SubstrateFailureShape::Result,
                         format!("missing manual batch outcome for {tool_use_id}"),
@@ -2686,6 +2890,38 @@ pub(crate) async fn execute_check_contract(
     let outcome = outcomes.into_iter().next().ok_or_else(|| {
         format!("Cairn lost the result of {check_name}. Run the same command again.")
     })?;
+    // The engine's one recorder has returned. Only now may a remote result
+    // release the executor's retained attempt and its granted cell.
+    let attempts = attempts.lock().unwrap().clone();
+    for identity in attempts {
+        if let Some(claim) = orch.fleet.check_claim(&identity) {
+            if let Some(recorded) = &outcome.recorded {
+                orch.fleet
+                    .record_check_claim_observation(&identity, check_name, &recorded.id)
+                    .await?;
+            } else if outcome.left_running.is_none()
+                && orch.fleet.adoption_owner(&identity).is_some()
+            {
+                let evidence = outcome
+                    .not_recorded
+                    .as_deref()
+                    .unwrap_or("the check recorder returned no durable observation");
+                crate::storage::check_lane_adoptions::transition(
+                    &orch.db.local,
+                    &identity.0,
+                    &identity.1,
+                    "lost",
+                    Some(evidence),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| format!("could not record lost check claim: {error}"))?;
+                orch.fleet
+                    .cancel_adopted(&identity.0, &identity.1, &claim.executor_id);
+            }
+        }
+    }
     let mut result = manual_configured_check_result(
         check_name,
         &context.project_key,
@@ -2804,6 +3040,8 @@ pub(crate) async fn recover_manual_check_result(
             .map(|_| "the selected legacy executor did not report a complete verdict environment identity".to_string());
         let check_name = row.text(7)?;
         let outcome = CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: check_name.clone(),
             passed: row.text(12)? == "passed",
             exit_code: Some(row.i64(11)? as i32),
@@ -3911,6 +4149,7 @@ pub(crate) async fn execute_job_verdict(
             // that exist on the runner and nowhere else.
             env: Vec::new(),
             items: vec![PlannedCheckBatchItem {
+                recording_plan: None,
                 index: 0,
                 name: name.to_string(),
                 input_hash: coordinate.clone(),
@@ -3976,6 +4215,7 @@ pub(crate) async fn execute_job_verdict(
             CheckExecutionFailure::Suppressed(suppressed) => suppressed_check_message(&suppressed),
             CheckExecutionFailure::NotPlaceable(reason)
             | CheckExecutionFailure::ConfigUnreadable(reason) => reason,
+            CheckExecutionFailure::LeftRunning(attempt) => left_running_message(&attempt),
             CheckExecutionFailure::Cancelled(cause) => format!(
                 "Cairn cancelled this check before it produced a verdict: {}.",
                 cause.sentence()
@@ -5225,7 +5465,74 @@ async fn submit_single_planned_check_batch(
     // no authority to turn an unanswered check into a verdict.
     request.waiting_since_unix_ms = patience.waiting_since_unix_ms;
     let items = wire.items;
+    let stream = batch
+        .items
+        .first()
+        .map(|item| item.stream_id.as_str())
+        .unwrap_or("");
+    let (consumer, consumer_ref) = check_consumer_identity(
+        orch,
+        &batch.requesting_job_id,
+        stream,
+        batch.purpose.as_ref(),
+    )
+    .await?;
+    let adoption_claim = crate::storage::check_lane_adoptions::Claim {
+        request_id: request.request_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        project_id: batch.project_id.clone(),
+        check_names: batch.items.iter().map(|item| item.name.clone()).collect(),
+        recording_plans: batch
+            .items
+            .iter()
+            .map(|item| {
+                serde_json::to_value(&item.recording_plan).unwrap_or(serde_json::Value::Null)
+            })
+            .collect(),
+        platform: request
+            .executor
+            .as_ref()
+            .and_then(|selector| selector.os.clone())
+            .or_else(|| {
+                batch
+                    .items
+                    .first()
+                    .and_then(|item| item.verdict_platforms.first().cloned())
+            })
+            .unwrap_or_else(|| "any".to_string()),
+        commit_sha: batch.sealed_commit.clone(),
+        input_hashes: batch
+            .items
+            .iter()
+            .map(|item| item.input_hash.clone())
+            .collect(),
+        consumer: consumer.to_string(),
+        consumer_ref,
+        executor_id: String::new(),
+        machine: String::new(),
+        granted_at_ms: 0,
+        state: "running".to_string(),
+        stopped_at_ms: None,
+        evidence: None,
+        observation_id: None,
+        updated_ms: 0,
+    };
+    let identity = (request.request_id.clone(), request.attempt_id.clone());
+    orch.fleet
+        .register_check_claim(identity.clone(), adoption_claim.clone());
     let mutation_policy = request.mutation_policy.clone();
+    let direct_consumer_guards: Vec<_> = if mutation_policy != MutationPolicy::PureVerdict {
+        batch
+            .items
+            .iter()
+            .map(|item| {
+                orch.fleet
+                    .check_consumer_guard_for(&identity, &item.name, &adoption_claim)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if let Some(board) = &batch.status_board {
         board.set_phase(
             Some("queued"),
@@ -5344,10 +5651,19 @@ async fn submit_single_planned_check_batch(
                 .await
             }
         };
-        let (item_outcomes, delta) =
+        let (mut item_outcomes, delta) =
             split_write_check_batch_outcome(executed.outcome, &executed.account, indexed.len());
+        for (item, guard) in item_outcomes.iter_mut().zip(direct_consumer_guards) {
+            if let Ok(result) = item {
+                result.publication = Some(
+                    crate::fleet::PublicationCoordination::for_request(identity.clone())
+                        .with_consumer_guard(guard),
+                );
+            }
+        }
         let mut results = indexed.iter().copied().zip(item_outcomes).collect();
         stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
+        settle_unrecordable_delivery(orch, &request, &results).await;
         temporary_ref.retire();
         return Ok(PlannedCheckBatchOutcome {
             results,
@@ -5358,12 +5674,33 @@ async fn submit_single_planned_check_batch(
     };
     // Measured and answered before the sealed ref is released, so a lane's
     // outcome is reported at its own time.
+    let left_running = orch
+        .fleet
+        .check_left_running(&(request.request_id.clone(), request.attempt_id.clone()))
+        .and_then(|claim| {
+            orch.fleet.runner_stopping_since().map(|stopped_at_ms| {
+                crate::fleet::LeftRunningAttempt {
+                    machine: claim.machine,
+                    request_id: claim.request_id,
+                    attempt_id: claim.attempt_id,
+                    executor_id: claim.executor_id,
+                    stopped_at_ms,
+                }
+            })
+        });
     let mut results = indexed
         .into_iter()
         .zip(submitted)
-        .map(|(index, delivery)| (index, check_result_from_delivery(delivery)))
+        .map(|(index, delivery)| {
+            let result = match &left_running {
+                Some(attempt) => Err(CheckExecutionFailure::LeftRunning(attempt.clone())),
+                None => check_result_from_delivery(delivery),
+            };
+            (index, result)
+        })
         .collect();
     stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
+    settle_unrecordable_delivery(orch, &request, &results).await;
     temporary_ref.retire();
     Ok(PlannedCheckBatchOutcome {
         results,
@@ -5371,6 +5708,46 @@ async fn submit_single_planned_check_batch(
         delta: None,
         store_dir: Some(batch.store_dir),
     })
+}
+
+async fn lose_check_claim(orch: &Orchestrator, identity: &(String, String), evidence: &str) {
+    let Some(claim) = orch.fleet.check_claim(identity) else {
+        return;
+    };
+    loop {
+        let settled = crate::storage::check_lane_adoptions::settle_failure(
+            &orch.db.local,
+            &identity.0,
+            &identity.1,
+            "lost",
+            evidence,
+        )
+        .await;
+        match settled {
+            Ok(()) => {
+                orch.fleet
+                    .cancel_adopted(&identity.0, &identity.1, &claim.executor_id);
+                return;
+            }
+            Err(error) => {
+                log::error!("could not settle check claim {}: {error}; retaining the result and retrying without acknowledgement", identity.0);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn settle_unrecordable_delivery(
+    orch: &Orchestrator,
+    request: &CellRequest,
+    results: &CheckGroupResults,
+) {
+    if results.values().any(|result| matches!(result, Err(error) if !matches!(error, CheckExecutionFailure::LeftRunning(_)))) {
+        lose_check_claim(
+            orch, &(request.request_id.clone(), request.attempt_id.clone()),
+            "the granted check did not deliver every item to its recorder",
+        ).await;
+    }
 }
 
 /// Everything a write wave's synchronous planning unit reads, resolved before it
@@ -5614,8 +5991,58 @@ fn stamp_substrate_elapsed(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CheckAdoptionResultShape {
+    #[default]
+    Batch,
+    Single,
+}
+
+/// The immutable recording contract of an item actually granted to a machine.
+/// Recording a retained partial run must not replan it as a whole-suite run.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CheckAdoptionRecordingPlan {
+    #[serde(default)]
+    pub(crate) result_shape: CheckAdoptionResultShape,
+    pub(crate) plan: CheckPlan,
+    pub(crate) evaluated_commit: String,
+    pub(crate) defined_by_commit: String,
+    pub(crate) tree_hash: String,
+    pub(crate) input_hash: String,
+    pub(crate) job_id: String,
+    pub(crate) tool_use_id: String,
+    // Process environments may contain credentials. A retained result carries
+    // its own verdict-environment hash, so raw values never enter the journal.
+    #[serde(skip)]
+    pub(crate) effective_env: Vec<(String, String)>,
+}
+
+impl CheckAdoptionRecordingPlan {
+    pub(crate) fn new(
+        plan: &CheckPlan,
+        coordinate: &crate::execution::cache::SealedCheckCoordinate,
+        job_id: &str,
+        tool_use_id: &str,
+        effective_env: &[(String, String)],
+    ) -> Self {
+        Self {
+            result_shape: CheckAdoptionResultShape::Batch,
+            plan: plan.clone(),
+            evaluated_commit: coordinate.evaluated_commit().to_string(),
+            defined_by_commit: coordinate.defined_by_commit().to_string(),
+            tree_hash: coordinate.tree_hash().to_string(),
+            input_hash: coordinate.input_hash().to_string(),
+            job_id: job_id.to_string(),
+            tool_use_id: tool_use_id.to_string(),
+            effective_env: effective_env.to_vec(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PlannedCheckBatchItem {
+    pub recording_plan: Option<CheckAdoptionRecordingPlan>,
     pub index: usize,
     pub name: String,
     pub input_hash: String,
@@ -6489,6 +6916,8 @@ impl SubstrateFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckExecutionFailure {
+    /// The runner stopped waiting, but the remote lane remains owned.
+    LeftRunning(crate::fleet::LeftRunningAttempt),
     /// The check's own process failed — output the agent owns and can act on.
     Process(String),
     /// Cairn's machinery failed before, around, or after the check.
@@ -6529,9 +6958,9 @@ impl From<String> for CheckExecutionFailure {
     }
 }
 use crate::execution::check_parsers::{
-    anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
-    is_lint_parser, parse_check_output, reported_test, ParsedCheckResult, ReportedTest,
-    ESLINT_PARSER, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
+    extract_running_tests, format_failure_excerpt, format_failure_names, is_lint_parser,
+    parse_check_output, reported_test, stream_tail, ParsedCheckResult, ReportedTest, ESLINT_PARSER,
+    MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
 };
 use crate::execution::lane_claims::{ClaimedElsewhere, LaneKey, WaveClaims};
 use crate::execution::selection::{plan_checks, whole_suite_command, CheckPlan, CheckScope};
@@ -7619,13 +8048,13 @@ pub(crate) mod git_credential_fetch_specimens {
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
 /// the classification and its evidence (when the death was classified), then
 /// the check's own `report` (when its result file carried one), then as much of
-/// the output's tail as still fits. The tail is [`anchored_tail`], so a
-/// build error printed above a long run of warnings survives the cut.
+/// the output's tail as still fits. The tail is [`stream_tail`]: stdout and
+/// stderr are bounded separately, so a failure block on one stream survives
+/// any amount of chatter on the other, and within each stream a build error
+/// printed above a long run of warnings survives the cut.
 ///
-/// The report has to lead because the tail cannot be trusted to hold it. A
-/// script prints its verdict on stdout, the body puts stderr after stdout, and
-/// a minutes-long compile prints far more than the window on stderr alone. No
-/// window size fixes that, so the verdict travels as a separate field.
+/// The report leads anyway, because a report is the check's own verdict and
+/// should not compete with chatter on its own stream for the window.
 ///
 /// The tail never carries the result-file line: it was parsed already, and on
 /// a run with little stderr it would fill the window with JSON.
@@ -7639,7 +8068,7 @@ fn classified_output_excerpt(
         .and_then(|result| result.report.as_deref())
         .filter(|report| !report.trim().is_empty());
     if classification.is_none() && report.is_none() {
-        return anchored_tail(&chatter, OUTPUT_TAIL_CHARS);
+        return stream_tail(&chatter, OUTPUT_TAIL_CHARS);
     }
     let mut prefix = String::new();
     if let Some(classification) = classification {
@@ -7664,7 +8093,7 @@ fn classified_output_excerpt(
     }
     prefix.push_str("\n\nFinal output:\n");
     let remaining = OUTPUT_TAIL_CHARS.saturating_sub(prefix.chars().count());
-    prefix.push_str(&anchored_tail(&chatter, remaining));
+    prefix.push_str(&stream_tail(&chatter, remaining));
     prefix.chars().take(OUTPUT_TAIL_CHARS).collect()
 }
 
@@ -8578,6 +9007,8 @@ async fn run_write_checks_after_seal_inner(
                     order: &fixer_first_submission_order(&keyed, &checks, &split.cell),
                     timeouts: &timeouts,
                     sealed_commit: &sealed_commit,
+                    tree_hash: &tree_hash,
+                    defined_by_commit: &defined_by_commit,
                     cell_env: &cell_env,
                     process_env: &process_env,
                     tool_use_id,
@@ -8698,6 +9129,8 @@ async fn run_write_checks_after_seal_inner(
                 order: &split.cell,
                 timeouts: &timeouts,
                 sealed_commit: &sealed_commit,
+                tree_hash: &tree_hash,
+                defined_by_commit: &defined_by_commit,
                 cell_env: &cell_env,
                 process_env: &process_env,
                 tool_use_id,
@@ -8790,6 +9223,8 @@ async fn run_write_checks_after_seal_inner(
                 order: &spilled,
                 timeouts: &timeouts,
                 sealed_commit: observation_commit,
+                tree_hash: &tree_hash,
+                defined_by_commit: &defined_by_commit,
                 cell_env: &cell_env,
                 process_env: &process_env,
                 tool_use_id,
@@ -8815,6 +9250,8 @@ async fn run_write_checks_after_seal_inner(
     let retry_checks = checks.clone();
     let retry_timeouts = timeouts.clone();
     let retry_commit = observation_commit.to_string();
+    let retry_tree_hash = tree_hash.clone();
+    let retry_defined_by = defined_by_commit.clone();
     let retry_cell_env = cell_env.clone();
     let retry_process_env = process_env.clone();
     let retry_repository = resolve_check_repository(
@@ -8859,6 +9296,8 @@ async fn run_write_checks_after_seal_inner(
             let checks = retry_checks.clone();
             let timeouts = retry_timeouts.clone();
             let sealed_commit = retry_commit.clone();
+            let tree_hash = retry_tree_hash.clone();
+            let defined_by_commit = retry_defined_by.clone();
             let cell_env = retry_cell_env.clone();
             let process_env = retry_process_env.clone();
             let repository = retry_repository.clone();
@@ -8905,6 +9344,18 @@ async fn run_write_checks_after_seal_inner(
                         priority: CellPriority::WriteCheck,
                         env: cell_env,
                         items: vec![PlannedCheckBatchItem {
+                            recording_plan: Some(CheckAdoptionRecordingPlan::new(
+                                plan,
+                                &crate::execution::cache::SealedCheckCoordinate::new(
+                                    &sealed_commit,
+                                    &defined_by_commit,
+                                    &tree_hash,
+                                    &keyed[index].1,
+                                ),
+                                &context.job_id,
+                                &stream_id,
+                                &process_env,
+                            )),
                             index,
                             name: plan.name.clone(),
                             input_hash: keyed[index].1.clone(),
@@ -8996,6 +9447,8 @@ struct WriteCheckBatchRequest<'a> {
     order: &'a [usize],
     timeouts: &'a [u32],
     sealed_commit: &'a str,
+    tree_hash: &'a str,
+    defined_by_commit: &'a str,
     /// The build slot's environment: the cell request's, without the transport.
     cell_env: &'a [(String, String)],
     /// Each check process's environment: `cell_env` plus the change transport,
@@ -9080,6 +9533,8 @@ async fn submit_write_check_batch_for(
         order,
         timeouts,
         sealed_commit,
+        tree_hash,
+        defined_by_commit,
         cell_env,
         process_env,
         tool_use_id,
@@ -9088,6 +9543,18 @@ async fn submit_write_check_batch_for(
     let items: Vec<PlannedCheckBatchItem> = order
         .iter()
         .map(|index| PlannedCheckBatchItem {
+            recording_plan: Some(CheckAdoptionRecordingPlan::new(
+                &keyed[*index].0,
+                &crate::execution::cache::SealedCheckCoordinate::new(
+                    sealed_commit,
+                    defined_by_commit,
+                    tree_hash,
+                    &keyed[*index].1,
+                ),
+                &run_context.job_id,
+                tool_use_id,
+                process_env,
+            )),
             index: *index,
             name: keyed[*index].0.name.clone(),
             input_hash: keyed[*index].1.clone(),
@@ -9577,6 +10044,7 @@ async fn rekey_wave_onto_fix(
             keyed: &rekeyed,
             order: &fixer_first_submission_order(&rekeyed, wave.checks, &misses),
             sealed_commit: &head,
+            tree_hash: &tree_hash,
             process_env: &process_env,
             ..wave
         },
@@ -9989,6 +10457,8 @@ fn diff_tree_entries_for_selector(
 /// the inline summary can render WHAT failed, not just the exit code.
 #[derive(Clone)]
 pub(crate) struct CheckOutcome {
+    pub(crate) consumer_guard: Option<Arc<crate::fleet::CheckConsumerGuard>>,
+    pub(crate) left_running: Option<crate::fleet::LeftRunningAttempt>,
     pub(crate) name: String,
     pub(crate) passed: bool,
     pub(crate) exit_code: Option<i32>,
@@ -10037,6 +10507,7 @@ impl CheckOutcome {
     /// keeps both out of the wake path.
     pub(crate) fn is_genuine_failure(&self) -> bool {
         !self.passed
+            && self.left_running.is_none()
             && self.suppressed_after.is_none()
             && self
                 .failure_kind
@@ -10510,7 +10981,11 @@ fn fresh_observation_write(
         toolchain_fingerprint,
         output_tail: output_tail.to_string(),
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
-        selection: parsed.map(|result| result.selection.clone()),
+        selection: if plan.scope == CheckScope::Partial {
+            Some("partial".to_string())
+        } else {
+            parsed.map(|result| result.selection.clone())
+        },
         deferred_count: parsed.map(|result| result.deferred as i64).unwrap_or(0),
         plan_audit_state: plan_audit.map(|audit| audit.state.clone()),
         plan_audit_note: plan_audit.and_then(|audit| audit.note.clone()),
@@ -10608,6 +11083,38 @@ pub(crate) fn manual_check_handle(tool_use_id: &str) -> Option<&str> {
         .strip_prefix("handle=")?;
     uuid::Uuid::parse_str(handle).ok()?;
     Some(handle)
+}
+
+/// Consumer identity is independent of scheduling priority: a merge gate may
+/// request review priority without being a turn-end review-wave consumer.
+async fn check_consumer_identity(
+    orch: &Orchestrator,
+    job_id: &str,
+    stream: &str,
+    purpose: Option<&crate::fleet::purpose::PurposeKey>,
+) -> Result<(&'static str, String), String> {
+    if let Some(purpose) = purpose {
+        Ok(("main_cadence", purpose.to_string()))
+    } else if stream.starts_with("manual-check:") {
+        Ok((
+            "manual",
+            manual_check_handle(stream).unwrap_or(stream).to_string(),
+        ))
+    } else if stream.starts_with("turn-checks:") {
+        let attempt = orch
+            .db
+            .local
+            .query_opt_text(
+                "SELECT turn_end_check_attempt_id FROM jobs WHERE id=?1",
+                (job_id.to_string(),),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        Ok(("turn_end", attempt))
+    } else {
+        Ok(("write", job_id.to_string()))
+    }
 }
 
 /// The `cadence` an observation records, decided by its producer's stream prefix.
@@ -11425,6 +11932,8 @@ where
             .as_deref()
             .and_then(|s| serde_json::from_str::<ParsedCheckResult>(s).ok());
         let outcome = CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: plan.name.clone(),
             passed: entry.passed,
             exit_code: Some(entry.exit_code),
@@ -11530,6 +12039,11 @@ where
                     }
                     // Cairn ended the check itself. Nothing was evaluated, and
                     // nothing failed, so nothing is recorded or counted.
+                    Err(CheckExecutionFailure::LeftRunning(attempt)) => {
+                        let outcome = record_left_running_check(&plan.name, attempt);
+                        board.transition(index, "unverified", Some(outcome.output_tail.clone()));
+                        return (index, outcome);
+                    }
                     Err(CheckExecutionFailure::Cancelled(cause)) => {
                         let outcome = record_cancelled_check(job_id, &plan.name, cause);
                         board.transition(index, "unverified", summary_annotation(&outcome));
@@ -11615,7 +12129,8 @@ where
                         CheckExecutionFailure::Suppressed(_)
                         | CheckExecutionFailure::NotPlaceable(_)
                         | CheckExecutionFailure::ConfigUnreadable(_)
-                        | CheckExecutionFailure::Cancelled(_),
+                        | CheckExecutionFailure::Cancelled(_)
+                        | CheckExecutionFailure::LeftRunning(_),
                     ) => {
                         unreachable!("a refused submission returns above")
                     }
@@ -11754,6 +12269,12 @@ where
                     );
                 }
 
+                let consumer_guard = publication
+                    .as_ref()
+                    .and_then(|publication| publication.consumer_guard());
+                let request_identity = publication
+                    .as_ref()
+                    .and_then(|publication| publication.request_identity());
                 // A corruption result is provisional. The publisher retains the
                 // original execution's guard across the one uncached retry, keeping
                 // every coalesced sibling blocked until the retry is recorded.
@@ -11770,6 +12291,11 @@ where
                         }
                     };
                 if cache_corruption && !uncached_retry {
+                    if let (Some(orch), Some(request)) =
+                        (diagnostic_orch, request_identity.as_ref())
+                    {
+                        lose_check_claim(orch, request, "the result requires an uncached retry; the original attempt produced no accepted observation").await;
+                    }
                     match publication_role {
                         Some(crate::fleet::PublicationRole::Publisher(guard)) => {
                             pending_publication = Some((guard, publication_id));
@@ -11807,6 +12333,8 @@ where
                                 .as_deref()
                                 .and_then(|json| serde_json::from_str(json).ok());
                             let outcome = CheckOutcome {
+                                left_running: None,
+                                consumer_guard: None,
                                 name: plan.name.clone(),
                                 passed: entry.passed,
                                 exit_code: Some(entry.exit_code),
@@ -11842,27 +12370,9 @@ where
                 // wrote, or this evaluation records it and names that row for every
                 // sibling. Both arms end holding the same answer to "what is this
                 // verdict's durable identity", which is what the caller reports.
-                let (recorded, published_here, not_recorded) = match publication_role {
+                let (recorded, published_here, mut not_recorded) = match publication_role {
                     Some(crate::fleet::PublicationRole::Published(recorded)) => {
-                        let attachment_error =
-                            match (manual_check_handle(tool_use_id), recorded.as_ref()) {
-                                (Some(handle), Some(source)) => {
-                                    crate::execution::cache::attach_manual_check_observation(
-                                        db,
-                                        project_id,
-                                        handle,
-                                        &source.id,
-                                        commit.evaluated,
-                                        tree_hash,
-                                        input_hash,
-                                        "fresh",
-                                    )
-                                    .await
-                                    .err()
-                                }
-                                _ => None,
-                            };
-                        (recorded, false, attachment_error)
+                        (recorded, false, None)
                     }
                     role => {
                         // A failure with no executor provenance may still have
@@ -11937,6 +12447,57 @@ where
                             ),
                         );
                         observation.publication_id = publication_id;
+                        if let Some((request, attempt)) = &request_identity {
+                            observation.id =
+                                format!("remote-check:{request}:{attempt}:{}", plan.name);
+                            let physical_plan = diagnostic_orch
+                                .and_then(|orch| {
+                                    orch.fleet.check_claim(&(request.clone(), attempt.clone()))
+                                })
+                                .and_then(|claim| {
+                                    let index = claim
+                                        .check_names
+                                        .iter()
+                                        .position(|name| name == &plan.name)?;
+                                    let recording: CheckAdoptionRecordingPlan =
+                                        serde_json::from_value(
+                                            claim.recording_plans.get(index)?.clone(),
+                                        )
+                                        .ok()?;
+                                    (recording.input_hash == *input_hash
+                                        && recording.evaluated_commit == claim.commit_sha)
+                                        .then_some(recording)
+                                });
+                            if let Some(physical) = physical_plan {
+                                // Coalesced subscribers may ask from different commits.
+                                // The immutable source describes the physical execution,
+                                // never whichever subscriber wins publication.
+                                observation.sealed_coordinate =
+                                    crate::execution::cache::SealedCheckCoordinate::new(
+                                        &physical.evaluated_commit,
+                                        &physical.defined_by_commit,
+                                        &physical.tree_hash,
+                                        &physical.input_hash,
+                                    );
+                                observation.commit_sha = physical.evaluated_commit;
+                                observation.defined_by_commit_sha = physical.defined_by_commit;
+                                observation.tree_hash = physical.tree_hash;
+                                observation.job_id = Some(physical.job_id);
+                                observation.manual_handle =
+                                    manual_check_handle(&physical.tool_use_id).map(str::to_string);
+                                observation.run_id = physical
+                                    .tool_use_id
+                                    .strip_prefix("manual-check:")
+                                    .and_then(|value| {
+                                        value.split_once(':').map(|(run, _)| run.to_string())
+                                    });
+                                observation.cadence =
+                                    observation_cadence(&physical.tool_use_id).to_string();
+                                if physical.plan.scope == CheckScope::Partial {
+                                    observation.selection = Some("partial".to_string());
+                                }
+                            }
+                        }
                         if let Some(kind) = failure_kind {
                             let (cause, evidence) = failure_cause_and_evidence(
                                 substrate_failure.as_ref(),
@@ -11955,19 +12516,55 @@ where
                                 .as_ref()
                                 .map(|failure| failure.shape().stored().to_string());
                         }
-                        let identity = crate::execution::cache::RecordedCheckObservation {
-                            id: observation.id.clone(),
-                            public_handle: observation.public_handle.clone(),
-                            ran_at: observation.ran_at,
-                            environment_fingerprint: observation.environment_fingerprint.clone(),
-                            executor_id: observation.executor_id.clone(),
-                            reusable: observation.reusable,
+                        let retry_recording = request_identity.as_ref().is_some_and(|request| {
+                            diagnostic_orch
+                                .is_some_and(|orch| orch.fleet.check_claim(request).is_some())
+                        });
+                        let recording = loop {
+                            let existing = match &request_identity {
+                            Some(_) => db.query_opt(
+                                "SELECT id, public_handle, ran_at, environment_fingerprint, executor_id, reusable FROM check_result_observations WHERE id=?1 AND project_id=?2 AND commit_sha=?3 AND check_name=?4 AND input_hash=?5",
+                                cairn_db::turso::params![observation.id.clone(), project_id, observation.commit_sha.as_str(), plan.name.as_str(), input_hash.as_str()],
+                                |row| Ok(crate::execution::cache::RecordedCheckObservation {
+                                    id: row.text(0)?, public_handle: row.text(1)?, ran_at: row.i64(2)?,
+                                    environment_fingerprint: row.text(3)?, executor_id: row.opt_text(4)?,
+                                    reusable: row.i64(5)? != 0,
+                                }),
+                            ).await.map_err(|error| error.to_string()),
+                            None => Ok(None),
                         };
-                        let (recorded, not_recorded) = match record_observation(
-                            db.clone(),
-                            observation,
-                        ) {
-                            Ok(()) => {
+                            let identity = crate::execution::cache::RecordedCheckObservation {
+                                id: observation.id.clone(),
+                                public_handle: observation.public_handle.clone(),
+                                ran_at: observation.ran_at,
+                                environment_fingerprint: observation
+                                    .environment_fingerprint
+                                    .clone(),
+                                executor_id: observation.executor_id.clone(),
+                                reusable: observation.reusable,
+                            };
+                            let attempt = match existing {
+                                Ok(Some(existing)) => Ok(existing),
+                                Ok(None) => record_observation(db.clone(), observation.clone())
+                                    .map(|()| identity),
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = &attempt {
+                                if retry_recording {
+                                    log::error!("remote check observation {} could not commit: {error}; retaining its result and retrying the same immutable write", observation.id);
+                                    #[cfg(test)]
+                                    adoption_tests::notify_observation_retry(
+                                        &observation.id,
+                                        error,
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                            }
+                            break attempt;
+                        };
+                        let (recorded, not_recorded) = match recording {
+                            Ok(identity) => {
                                 if let Some(orch) = diagnostic_orch {
                                     orch.invalidate_project_check_results(project_id);
                                 }
@@ -11993,6 +12590,100 @@ where
                     }
                 };
 
+                if let Some(source) = recorded.as_ref() {
+                    let retry_projection = request_identity.as_ref().is_some_and(|request| {
+                        diagnostic_orch
+                            .is_some_and(|orch| orch.fleet.check_claim(request).is_some())
+                    });
+                    loop {
+                        let projected = async {
+                            // Cross-commit sharing creates an alias only when the
+                            // normal reuse contract admits this exact source.
+                            if request_identity.is_some() && reusable_verdict_for_plan(
+                                db.clone(), project_id, plan, input_hash, effective_env,
+                            ).is_some_and(|reused| reused.source_observation_id == source.id) {
+                                record_cached_check_observation(db.clone(), CachedCheckObservationWrite {
+                                    manual_handle: None,
+                                    project_id: project_id.to_string(),
+                                    commit_sha: commit.evaluated.to_string(),
+                                    defined_by_commit_sha: commit.defined_by.to_string(),
+                                    tree_hash: tree_hash.to_string(),
+                                    check_name: plan.name.clone(),
+                                    input_hash: input_hash.clone(),
+                                    environment_fingerprint: source.environment_fingerprint.clone(),
+                                    result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+                                    source_observation_id: source.id.clone(),
+                                    evaluated_at: chrono::Utc::now().timestamp_millis(),
+                                })?;
+                            }
+                            if let Some(handle) = manual_check_handle(tool_use_id) {
+                                crate::execution::cache::attach_manual_check_observation(
+                                    db, project_id, handle, &source.id,
+                                    commit.evaluated, tree_hash, input_hash, "fresh",
+                                ).await?;
+                            }
+                            Ok::<_, String>(())
+                        }.await;
+                        match projected {
+                            Ok(()) => break,
+                            Err(error) if retry_projection => {
+                                log::error!("check observation {} is durable, but consumer projection failed: {error}; retaining the result and retrying", source.id);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                            Err(error) => {
+                                not_recorded = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let (Some(orch), Some(request), Some(recorded)) = (
+                    diagnostic_orch,
+                    request_identity.as_ref(),
+                    recorded.as_ref(),
+                ) {
+                    loop {
+                        let settlement = async {
+                            orch.fleet
+                                .record_check_claim_observation(request, &plan.name, &recorded.id)
+                                .await?;
+                            // Main cadence delivers only after reporting its lane.
+                            // Reloaded batches have their own consumer delivery driver.
+                            if !orch.fleet.is_check_adoption_reloaded(request)
+                                && !tool_use_id.starts_with(MAIN_CADENCE_STREAM_PREFIX)
+                                && orch.fleet.check_claim(request).is_some()
+                            {
+                                if let Some(guard) = consumer_guard.as_ref() {
+                                    guard.deliver(&recorded.id).await?;
+                                } else {
+                                    let (consumer, consumer_ref) =
+                                        check_consumer_identity(orch, job_id, tool_use_id, None)
+                                            .await?;
+                                    orch.fleet
+                                        .deliver_check_consumer(
+                                            request,
+                                            &plan.name,
+                                            consumer,
+                                            &consumer_ref,
+                                            &recorded.id,
+                                        )
+                                        .await?;
+                                }
+                            }
+                            Ok::<(), String>(())
+                        }
+                        .await;
+                        match settlement {
+                            Ok(()) => break,
+                            Err(error) => {
+                                log::error!("check observation {} committed, but claim settlement failed: {error}; retaining the result and retrying without acknowledgement", recorded.id);
+                                #[cfg(test)]
+                                adoption_tests::notify_observation_retry(&recorded.id, &error);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                }
                 // A failure that shows the project needs a capability of its
                 // machines teaches placement to require it, so the lane re-arms
                 // somewhere that has it rather than back on this machine.
@@ -12054,6 +12745,8 @@ where
                 }
 
                 let outcome = CheckOutcome {
+                    left_running: None,
+                    consumer_guard,
                     name: plan.name.clone(),
                     passed,
                     exit_code,
@@ -12214,6 +12907,8 @@ pub(crate) fn record_suppressed_check(
          infrastructure failures; not executing it for job {job_id}"
     );
     CheckOutcome {
+        left_running: None,
+        consumer_guard: None,
         name: check_name.to_string(),
         passed: false,
         exit_code: None,
@@ -12356,6 +13051,8 @@ fn record_unattempted_check(
         );
     }
     CheckOutcome {
+        left_running: None,
+        consumer_guard: None,
         name: check_name.to_string(),
         passed: false,
         exit_code: None,
@@ -12386,6 +13083,8 @@ fn record_cancelled_check(
         cause.sentence()
     );
     CheckOutcome {
+        left_running: None,
+            consumer_guard: None,
         name: check_name.to_string(),
         passed: false,
         exit_code: None,
@@ -12403,12 +13102,44 @@ fn record_cancelled_check(
     }
 }
 
+fn left_running_message(attempt: &crate::fleet::LeftRunningAttempt) -> String {
+    format!(
+        "the runner stopped at {} while this lane ran on {} (request {}); awaiting adoption",
+        crate::clock::stamp_millis(attempt.stopped_at_ms as i64)
+            .unwrap_or_else(|| attempt.stopped_at_ms.to_string()),
+        attempt.machine,
+        attempt.request_id,
+    )
+}
+
+fn record_left_running_check(
+    check_name: &str,
+    attempt: crate::fleet::LeftRunningAttempt,
+) -> CheckOutcome {
+    CheckOutcome {
+        name: check_name.to_string(),
+        passed: false,
+        exit_code: None,
+        failure_kind: None,
+        parsed: None,
+        output_tail: left_running_message(&attempt),
+        cached: false,
+        duration_ms: 0,
+        suppressed_after: None,
+        recorded: None,
+        not_recorded: Some("awaiting adoption".to_string()),
+        left_running: Some(attempt),
+        consumer_guard: None,
+    }
+}
+
 /// Whether this outcome holds no verdict at all — the check never ran, or Cairn
 /// ended it — so a summary must not mark it red.
 fn holds_no_verdict(outcome: &CheckOutcome) -> bool {
-    outcome
-        .failure_kind
-        .is_some_and(|kind| kind.attempted_nothing() || kind == CheckFailureKind::Cancelled)
+    outcome.left_running.is_some()
+        || outcome
+            .failure_kind
+            .is_some_and(|kind| kind.attempted_nothing() || kind == CheckFailureKind::Cancelled)
 }
 
 /// Render the inline pass/fail summary appended to the originating tool result.
@@ -12763,6 +13494,7 @@ async fn submit_review_check(
     orch: &Orchestrator,
     result_identity: crate::execution::cache::CheckResultIdentity,
     request: CellRequest,
+    mut recording_plan: CheckAdoptionRecordingPlan,
 ) -> Result<CheckExecResult, CheckExecutionFailure> {
     let build_service = orch.build_service_diagnostic_snapshot("sccache");
     if let Some(failure) = active_build_service_failure(&build_service) {
@@ -12771,11 +13503,58 @@ async fn submit_review_check(
                 .implicating_build_service(),
         ));
     }
-    check_result_from_delivery(
+    let (consumer, consumer_ref) = check_consumer_identity(
+        orch,
+        request.requesting_job_id.as_deref().unwrap_or_default(),
+        &recording_plan.tool_use_id,
+        None,
+    )
+    .await?;
+    recording_plan.result_shape = CheckAdoptionResultShape::Single;
+    orch.fleet.register_check_claim(
+        (request.request_id.clone(), request.attempt_id.clone()),
+        crate::storage::check_lane_adoptions::Claim {
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            project_id: result_identity.project_id.clone(),
+            check_names: vec![result_identity.check_name.clone()],
+            recording_plans: vec![
+                serde_json::to_value(recording_plan).map_err(|error| error.to_string())?
+            ],
+            input_hashes: vec![result_identity.input_hash.clone()],
+            platform: request
+                .executor
+                .as_ref()
+                .and_then(|selector| selector.os.clone())
+                .unwrap_or_else(|| "any".into()),
+            commit_sha: request.base_commit.clone(),
+            consumer: consumer.into(),
+            consumer_ref,
+            executor_id: String::new(),
+            machine: String::new(),
+            granted_at_ms: 0,
+            state: "running".into(),
+            stopped_at_ms: None,
+            evidence: None,
+            observation_id: None,
+            updated_ms: 0,
+        },
+    );
+    let identity = (request.request_id.clone(), request.attempt_id.clone());
+    let result = check_result_from_delivery(
         orch.fleet
             .submit_pure_verdict(orch, result_identity, request)
             .await,
-    )
+    );
+    if matches!(&result, Err(error) if !matches!(error, CheckExecutionFailure::LeftRunning(_))) {
+        lose_check_claim(
+            orch,
+            &identity,
+            "the granted check did not deliver an item to its recorder",
+        )
+        .await;
+    }
+    result
 }
 
 /// Append the shared build-cache service's advisory to a verdict — but only for
@@ -13020,6 +13799,9 @@ fn outcome_result(
     account: &crate::fleet::CellAccount,
     publication: Option<crate::fleet::PublicationCoordination>,
 ) -> Result<CheckExecResult, CheckExecutionFailure> {
+    if let Some(attempt) = account.left_running.clone() {
+        return Err(CheckExecutionFailure::LeftRunning(attempt));
+    }
     match outcome {
         CellOutcome::Completed {
             output, metadata, ..
@@ -13476,6 +14258,19 @@ async fn run_prospective_tree_checks(
             defined_by: &defined_by_commit,
         };
         let sealed_coordinates = sealed_coordinates(commit_coordinate, tree_hash, &keyed);
+        let recording_plans: Vec<_> = keyed
+            .iter()
+            .zip(&sealed_coordinates)
+            .map(|((plan, _), coordinate)| {
+                CheckAdoptionRecordingPlan::new(
+                    plan,
+                    coordinate,
+                    requesting_job_id,
+                    &format!("merge-gate:{requesting_job_id}"),
+                    &execution_env,
+                )
+            })
+            .collect();
         run_planned_checks_at_commit_with_env_and_coordinates(
             result_db,
             project_id,
@@ -13502,6 +14297,7 @@ async fn run_prospective_tree_checks(
                 let resource_identity = command_identity_inputs[index].clone();
                 let resource_class = keyed_ref[index].0.resource_class;
                 let check_name = keyed_ref[index].0.name.clone();
+                let recording_plan = recording_plans[index].clone();
                 async move {
                     let request_id = uuid::Uuid::new_v4().to_string();
                     orch.set_turn_end_check_request_id(
@@ -13534,6 +14330,7 @@ async fn run_prospective_tree_checks(
                             &keyed_ref[index].1,
                         ),
                         request,
+                        recording_plan,
                     )
                     .await
                 }
@@ -18023,6 +18820,8 @@ cairn-common = { path = "../cairn-common" }
     /// summary renders only the header status line.
     fn outcome(name: &str, passed: bool, exit_code: Option<i32>) -> CheckOutcome {
         CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: name.to_string(),
             passed,
             exit_code,
@@ -18154,6 +18953,8 @@ cairn-common = { path = "../cairn-common" }
             }))
             .unwrap();
         let red = CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: "rust-tests".to_string(),
             passed: false,
             exit_code: Some(100),
@@ -18228,6 +19029,8 @@ cairn-common = { path = "../cairn-common" }
             "a.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.",
         );
         let results = vec![CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: "typecheck".to_string(),
             passed: false,
             exit_code: Some(1),
@@ -18258,6 +19061,8 @@ cairn-common = { path = "../cairn-common" }
         cached: bool,
     ) -> CheckOutcome {
         CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: name.to_string(),
             passed,
             exit_code,
@@ -21589,6 +22394,8 @@ cairn-common = { path = "../cairn-common" }
     #[test]
     fn merge_gate_treats_command_timeout_as_infrastructure_failure() {
         let result = review_tree_gate_result(vec![CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: "rust-full".to_string(),
             passed: false,
             exit_code: None,
@@ -21647,6 +22454,71 @@ cairn-common = { path = "../cairn-common" }
         assert!(!cancelled.is_genuine_failure());
         let summary = format_check_summary(&[cancelled], &HashMap::new());
         assert_eq!(summary, "\u{26a0} rust-tests (cancelled: job stopped)");
+    }
+
+    #[test]
+    fn adoption_recording_plan_never_serializes_process_credentials() {
+        let mut selected = plan("smoke", "echo selected");
+        selected.scope = CheckScope::Partial;
+        let recording = CheckAdoptionRecordingPlan::new(
+            &selected,
+            &crate::execution::cache::SealedCheckCoordinate::new(
+                "commit",
+                "definition",
+                "tree",
+                "input",
+            ),
+            "job",
+            "manual-check:producer",
+            &[("MCP_CALLBACK_BEARER".into(), "secret-bearer-value".into())],
+        );
+        let json = serde_json::to_string(&recording).unwrap();
+        assert!(!json.contains("secret-bearer-value"));
+        assert!(!json.contains("MCP_CALLBACK_BEARER"));
+        let restored: CheckAdoptionRecordingPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.plan.scope, CheckScope::Partial);
+        assert_eq!(restored.plan.command, "echo selected");
+        assert!(restored.effective_env.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_remote_lane_left_running_records_no_failure_or_cancellation() {
+        let attempt = crate::fleet::LeftRunningAttempt {
+            machine: "fedora".into(),
+            request_id: "request".into(),
+            attempt_id: "attempt".into(),
+            executor_id: "executor".into(),
+            stopped_at_ms: 1_794_185_000_000,
+        };
+        let db = cache_db().await;
+        let outcomes = run_planned_checks(
+            db.clone(), "project-a", "tree-left-running", "job-test",
+            &[(plan("rust", "cargo test"), "input-left-running".to_string())],
+            "tool", CheckExecMode::Shared, None,
+            move |_, _, _| {
+                let attempt = attempt.clone();
+                async move { Err::<CheckExecResult, _>(CheckExecutionFailure::LeftRunning(attempt)) }
+            },
+            |_| {},
+        ).await;
+        let outcome = &outcomes[0];
+        assert!(outcome.left_running.is_some());
+        assert!(outcome.failure_kind.is_none());
+        assert!(outcome.recorded.is_none());
+        assert!(!outcome.is_genuine_failure());
+        assert!(holds_no_verdict(outcome));
+        assert!(outcome
+            .output_tail
+            .contains("while this lane ran on fedora (request request); awaiting adoption"));
+        assert_eq!(
+            manual_check_no_verdict(outcome).unwrap().kind,
+            NO_VERDICT_LEFT_RUNNING
+        );
+        assert!(
+            crate::execution::cache::list_check_results(db, "project-a", "tree-left-running")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Every way the executor or the fleet reports a cancellation becomes the
@@ -22062,6 +22934,7 @@ cairn-common = { path = "../cairn-common" }
 
     fn batch_item(command: &str, resource_class: CheckResourceClass) -> PlannedCheckBatchItem {
         PlannedCheckBatchItem {
+            recording_plan: None,
             index: 0,
             name: "check".into(),
             input_hash: "hash".into(),
@@ -22766,20 +23639,152 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         );
     }
 
-    /// The same chatter with no result file keeps today's plain tail: that is
-    /// the record cairn/4888 reported, and every lane without a report is
-    /// unchanged.
+    /// The same chatter with no result file, the record cairn/4888 reported:
+    /// a plain tail loses the stdout findings, and the stream-bounded tail
+    /// keeps them without needing a report.
     #[tokio::test]
-    async fn without_a_result_file_the_stored_record_is_the_plain_tail() {
+    async fn without_a_result_file_the_stored_record_still_holds_the_stdout_findings() {
         let db = cache_db().await;
         let body = rust_lint_specimen_body(None);
+        assert!(!tail(&body, OUTPUT_TAIL_CHARS).contains("❌ clippy"));
         let outcome = run_rust_lint(db, "ih-lint-plain", 1, body.clone()).await;
         assert!(outcome.parsed.is_none());
-        assert_eq!(outcome.output_tail, tail(&body, OUTPUT_TAIL_CHARS));
         assert!(
-            !outcome.output_tail.contains("❌ clippy"),
-            "the findings are above the window, which is the defect"
+            outcome
+                .output_tail
+                .contains("❌ clippy: 1 new finding(s) in your diff"),
+            "{}",
+            outcome.output_tail
         );
+        assert!(outcome.output_tail.ends_with("Exit code: 1"));
+        assert!(outcome.output_tail.chars().count() <= OUTPUT_TAIL_CHARS);
+    }
+
+    // --- the stored record keeps a failure on either stream (cairn/6321) -----
+
+    /// libtest's report for cairn/6064's red, which libtest writes to stdout.
+    const LIBTEST_FAILURE_BLOCK: &str = "\
+failures:
+
+---- claude_session_survives_a_resume stdout ----
+thread 'claude_session_survives_a_resume' panicked at tests/sessions.rs:120:5:
+assertion `left == right` failed: the resumed session keeps its id
+
+failures:
+    claude_session_survives_a_resume
+    claude_session_reports_its_model
+
+test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out";
+
+    /// More than the window of cargo's progress lines.
+    fn cargo_chatter() -> String {
+        let mut chatter = String::new();
+        let mut index = 0;
+        while chatter.len() <= 2 * OUTPUT_TAIL_CHARS {
+            chatter.push_str(&format!("   Compiling crate-{index} v0.1.0\n"));
+            index += 1;
+        }
+        chatter.push_str("     Running tests/sessions.rs (target/debug/deps/sessions-0123)\n");
+        chatter
+    }
+
+    async fn run_external_host(db: Arc<LocalDb>, input_hash: &str, body: String) -> CheckOutcome {
+        let plans = vec![(
+            plan("external-host", "bun run check:external-host"),
+            input_hash.to_string(),
+        )];
+        run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "manual-check:run-a:external-host",
+            CheckExecMode::Shared,
+            None,
+            move |_, _, _| {
+                let body = body.clone();
+                async move { exec_ok(Some(1), body) }
+            },
+            |_| {},
+        )
+        .await
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    fn stored_tail(db: Arc<LocalDb>, outcome: &CheckOutcome) -> String {
+        let recorded = outcome
+            .recorded
+            .as_ref()
+            .expect("the run records its observation");
+        crate::execution::cache::get_check_result_observation(
+            db,
+            "project-a",
+            "commit-target",
+            "external-host",
+            &recorded.environment_fingerprint,
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap()
+        .expect("the observation is addressable")
+        .output_tail
+    }
+
+    /// The external-host shape: libtest's failure block on stdout early, then
+    /// more than the window of cargo chatter on stderr, then a nonzero exit.
+    /// Every stored red ended at `error: test failed` and named no test.
+    #[tokio::test]
+    async fn a_stdout_failure_block_survives_the_stderr_chatter_after_it() {
+        let db = cache_db().await;
+        let body = format!(
+            "{LIBTEST_FAILURE_BLOCK}\n\nstderr:\n{}\
+             error: test failed, to rerun pass `--test sessions`\n\
+             check:external-host: tests failed\n\
+             error: script \"check:external-host\" exited with code 1\n\nExit code: 1",
+            cargo_chatter()
+        );
+        assert!(
+            !crate::execution::check_parsers::anchored_tail(&body, OUTPUT_TAIL_CHARS)
+                .contains("panicked"),
+            "the single-window tail loses the failure block, which is the defect"
+        );
+        let outcome = run_external_host(db.clone(), "ih-host-stdout", body).await;
+        assert!(!outcome.passed);
+        let stored = stored_tail(db, &outcome);
+        for text in [outcome.output_tail.as_str(), stored.as_str()] {
+            assert!(text.contains(LIBTEST_FAILURE_BLOCK), "{text}");
+            assert!(text.contains("`--test sessions`"), "{text}");
+            assert!(text.ends_with("Exit code: 1"), "{text}");
+            assert!(text.chars().count() <= OUTPUT_TAIL_CHARS);
+        }
+    }
+
+    /// The reverse: a diagnostic on stderr after more than the window of
+    /// progress on stdout.
+    #[tokio::test]
+    async fn a_stderr_failure_survives_the_stdout_chatter_before_it() {
+        let db = cache_db().await;
+        let failure = "error: the mirror's manifest names an unpublished crate: cairn-exec\n\
+                       check:external-host: assemble the public mirror failed";
+        let body = format!("{}\n\nstderr:\n{failure}\n\nExit code: 1", cargo_chatter());
+        let outcome = run_external_host(db.clone(), "ih-host-stderr", body).await;
+        assert!(!outcome.passed);
+        let stored = stored_tail(db, &outcome);
+        for text in [outcome.output_tail.as_str(), stored.as_str()] {
+            assert!(text.contains(failure), "{text}");
+            assert!(text.contains("Running tests/sessions.rs"), "{text}");
+            assert!(text.chars().count() <= OUTPUT_TAIL_CHARS);
+        }
     }
 
     #[tokio::test]
@@ -23232,6 +24237,8 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn a_suppressed_check_reports_that_cairn_declined_to_run_it() {
         let suppressed = CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: "rust-tests".to_string(),
             passed: false,
             exit_code: None,
@@ -23262,6 +24269,8 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         );
 
         let red = CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: "rust-tests".to_string(),
             passed: false,
             exit_code: Some(1),
@@ -23300,6 +24309,8 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn repeated_observations_at_one_coordinate_get_distinct_public_permalinks() {
         let make = |id: uuid::Uuid, public_handle: &str, ran_at| CheckOutcome {
+            left_running: None,
+            consumer_guard: None,
             name: "rust-tests".into(),
             passed: true,
             exit_code: Some(0),
@@ -24550,6 +25561,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             .iter()
             .enumerate()
             .map(|(index, (plan, input_hash))| PlannedCheckBatchItem {
+                recording_plan: None,
                 index,
                 name: plan.name.clone(),
                 input_hash: input_hash.clone(),
@@ -24698,6 +25710,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         );
 
         let item = PlannedCheckBatchItem {
+            recording_plan: None,
             index: 0,
             name: "rust".to_string(),
             input_hash: "ih-rust".to_string(),
@@ -26531,6 +27544,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn review_batch_selectors_union_toolchains_and_reject_scalar_conflicts() {
         let item = |index, executor| PlannedCheckBatchItem {
+            recording_plan: None,
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -26620,6 +27634,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn disjoint_environment_suppressions_split_a_batch() {
         let item = |index: usize, avoid: &str| PlannedCheckBatchItem {
+            recording_plan: None,
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -26671,6 +27686,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn a_batch_with_no_common_machine_refuses_rather_than_placing() {
         let item = |index: usize, avoid: &str| PlannedCheckBatchItem {
+            recording_plan: None,
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -26731,6 +27747,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn an_empty_avoid_set_partitions_exactly_as_before() {
         let item = |index: usize| PlannedCheckBatchItem {
+            recording_plan: None,
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -26757,6 +27774,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     #[test]
     fn pure_verdict_batches_keep_untargeted_and_targeted_checks_separate() {
         let item = |index, executor| PlannedCheckBatchItem {
+            recording_plan: None,
             index,
             name: format!("check-{index}"),
             input_hash: format!("hash-{index}"),
@@ -27699,10 +28717,10 @@ mod manual_transport_tests {
         assert_ne!(main_baseline["tree"], parent_baseline["tree"]);
 
         let finding = "eslint|react-hooks/purity|src/Queue.tsx|Error: Cannot call impure function during render";
-        db.execute_script(&record_lint_tree_findings(&main_baseline, &[finding]))
+        db.execute_script(record_lint_tree_findings(&main_baseline, &[finding]))
             .await
             .unwrap();
-        db.execute_script(&record_lint_tree_findings(&parent_baseline, &[]))
+        db.execute_script(record_lint_tree_findings(&parent_baseline, &[]))
             .await
             .unwrap();
 
@@ -28797,6 +29815,19 @@ mod write_check_stack_headroom {
         });
     }
 }
+
+#[cfg(test)]
+pub(crate) fn notify_adoption_retry(id: &str, error: &str) {
+    adoption_tests::notify_observation_retry(id, error);
+}
+
+#[cfg(test)]
+#[path = "checks_adoption_tests.rs"]
+mod adoption_tests;
+
+#[cfg(test)]
+#[path = "checks_cross_commit_tests.rs"]
+mod cross_commit_tests;
 
 /// A manual check captured, then queued: everything about it was fixed at the
 /// capture, so moving the branch, its base, and the contract while it waits for

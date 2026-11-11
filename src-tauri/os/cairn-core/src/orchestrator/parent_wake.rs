@@ -1,40 +1,7 @@
-use crate::messages::{db as msg_db, queued::DeliveryUrgency};
-use crate::models::ChannelType;
+use cairn_attention::runtime::{DeliveryOutcome, DeliveryRequest};
+
 use crate::orchestrator::{attention_push, Orchestrator};
 use crate::storage::{run_db_blocking, LocalDb};
-
-fn persist_system_direct(
-    orch: &Orchestrator,
-    recipient_run_id: &str,
-    sender_name: &str,
-    message: &str,
-    urgency: DeliveryUrgency,
-) -> Result<String, String> {
-    let db = run_db_blocking({
-        let dbs = orch.db.clone();
-        let recipient_run_id = recipient_run_id.to_string();
-        move || async move {
-            crate::execution::routing::owning_db_for_run(&dbs, &recipient_run_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    let msg = msg_db::insert_message_with_urgency(
-        &db,
-        &ChannelType::Direct,
-        None,
-        None,
-        sender_name,
-        Some(recipient_run_id),
-        message,
-        Some(urgency),
-    )?;
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "messages", "action": "insert"}),
-    );
-    Ok(msg.id)
-}
 
 /// The job a child issue's attention belongs to: its validated spawning node,
 /// whoever currently drives the parent issue, or its parent thread's live
@@ -94,120 +61,164 @@ pub(crate) async fn queue_passive_parent_push(
     Ok(true)
 }
 
-pub(crate) fn queue_or_resume_parent(
+/// Persist one direct delivery and run its recipient: the attention engine's
+/// one way to hand a job a message.
+///
+/// One transaction in the recipient's owning database writes the message row
+/// under the request's message id and its `direct:` push, each only if absent,
+/// and settles the receipts the request carries when they live in that same
+/// database. The nudge runs only after the commit. Receipts that live in the
+/// private database while the recipient's job lives in a team database are
+/// settled right after; they are already bound to this message id, so a retry
+/// re-settles exactly this message and nothing is written twice.
+///
+/// A closed thread accrues nothing: dormancy is checked before anything is
+/// persisted, so reopening does not surface a backlog. A job that has never
+/// run takes the direct-message launch path, launched with the message as its
+/// prompt; a launch that cannot happen yet fails, and the caller keeps the
+/// receipts owed for its next attempt.
+pub(crate) async fn deliver_direct(
     orch: &Orchestrator,
-    parent_job_id: &str,
-    sender_name: Option<&str>,
-    message: &str,
-    urgency: DeliveryUrgency,
-    operator_message_id: Option<&str>,
-) {
-    let owning = run_db_blocking({
-        let dbs = orch.db.clone();
-        let parent_job_id = parent_job_id.to_string();
-        move || async move {
-            crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })
-    .unwrap_or_else(|_| orch.db.local.clone());
-    // The direct parent-push path takes the same eligibility rule the
-    // subscription path does. Checked before anything is persisted, so a closed
-    // thread accrues no direct message and no push it would have to be dug out of
-    // on reopen.
-    if crate::threads::is_dormant_thread_session_sync(&owning, parent_job_id) {
-        log::debug!(
-            "skipped attention for job {}: its thread is closed",
-            &parent_job_id[..parent_job_id.len().min(8)]
-        );
-        return;
+    request: DeliveryRequest<'_>,
+) -> DeliveryOutcome {
+    let job_id = request.job_id;
+    let short = &job_id[..job_id.len().min(8)];
+    let owning = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
+    if crate::threads::is_dormant_thread_session(&owning, job_id).await {
+        log::debug!("skipped attention for job {short}: its thread is closed");
+        return DeliveryOutcome::Refused("its thread is closed".to_string());
     }
-    if let Some(recipient_run_id) =
-        crate::messages::delivery::latest_run_for_job(&owning, parent_job_id)
-    {
-        let message_id = match persist_system_direct(
+    let run = match crate::messages::delivery::latest_run_for_job_async(&owning, job_id).await {
+        Ok(run) => run,
+        Err(error) => return DeliveryOutcome::Failed(error),
+    };
+    let receipts = request.receipts.to_vec();
+    let Some(run_id) = run else {
+        if request.urgency == crate::messages::queued::DeliveryUrgency::Passive {
+            return DeliveryOutcome::Refused(
+                "it has never run, so no next run exists for a passive line to ride along with"
+                    .to_string(),
+            );
+        }
+        let resume =
+            request
+                .operator_message_id
+                .map(|trigger_id| crate::execution::jobs::ResumeContext {
+                    goal_reactivation: Some(
+                        crate::execution::jobs::GoalReactivation::operator_message(trigger_id),
+                    ),
+                    ..Default::default()
+                });
+        return match crate::execution::jobs::continue_job_impl(
             orch,
-            &recipient_run_id,
-            sender_name.unwrap_or("system"),
-            message,
-            urgency,
+            job_id,
+            Some(request.message),
+            None,
+            resume,
         ) {
-            Ok(message_id) => {
-                // Ride the attention push queue (CAIRN-1900): create a `direct:`
-                // push so the nudge below has a drainable push and the raw
-                // messages row is not orphaned by the retired delivered_at path.
-                if let Err(error) =
-                    crate::messages::delivery::enqueue_direct_push_with_operator_trigger(
-                        orch,
-                        parent_job_id,
-                        &message_id,
-                        urgency,
-                        operator_message_id,
+            Ok(_) => {
+                log::info!("launched job {short} for an attention delivery");
+                if !receipts.is_empty() {
+                    if let Err(error) = cairn_attention::wakes::settle_receipts(
+                        &orch.db.local,
+                        &receipts,
+                        job_id,
+                        None,
+                        None,
                     )
-                {
-                    log::warn!(
-                        "failed to enqueue child attention direct push for parent job {}: {}",
-                        &parent_job_id[..parent_job_id.len().min(8)],
-                        error
-                    );
+                    .await
+                    {
+                        log::warn!("settling receipts for launched job {short}: {error}");
+                    }
                 }
-                Some(message_id)
+                DeliveryOutcome::Launched {
+                    job_id: job_id.to_string(),
+                }
             }
-            Err(error) => {
-                log::warn!(
-                    "failed to persist child attention direct for parent job {}: {}",
-                    &parent_job_id[..parent_job_id.len().min(8)],
-                    error
-                );
-                None
-            }
+            Err(error) => DeliveryOutcome::Failed(format!("could not launch job {short}: {error}")),
         };
-        if let Err(error) =
-            crate::messages::delivery::nudge_job_for_urgency(orch, parent_job_id, urgency)
-        {
-            log::warn!(
-                "failed to nudge parent job {} for child attention: {}",
-                &parent_job_id[..parent_job_id.len().min(8)],
-                error
+    };
+    let message_id = request
+        .message_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let settle_here = !receipts.is_empty() && std::sync::Arc::ptr_eq(&owning, &orch.db.local);
+    let written = owning
+        .write(|conn| {
+            let (job, run, message_id, receipts) = (
+                job_id.to_string(),
+                run_id.clone(),
+                message_id.clone(),
+                receipts.clone(),
             );
-        } else {
-            log::info!(
-                "queued child attention direct {:?} for parent job {} with {} urgency",
-                message_id,
-                &parent_job_id[..parent_job_id.len().min(8)],
-                urgency.as_str()
-            );
+            let sender = request.sender.unwrap_or("system").to_string();
+            let content = request.message.to_string();
+            let operator = request.operator_message_id.map(str::to_owned);
+            let urgency = request.urgency;
+            Box::pin(async move {
+                let (push_id, _) = cairn_attention::direct::settle_direct_conn(
+                    conn,
+                    &job,
+                    &run,
+                    &sender,
+                    &content,
+                    urgency,
+                    &message_id,
+                    operator.as_deref(),
+                )
+                .await?;
+                if settle_here {
+                    cairn_attention::wakes::settle_receipts_conn(
+                        conn,
+                        &receipts,
+                        &job,
+                        Some(&message_id),
+                        Some(&push_id),
+                    )
+                    .await?;
+                }
+                Ok(push_id)
+            })
+        })
+        .await;
+    let push_id = match written {
+        Ok(push_id) => push_id,
+        Err(error) => {
+            return DeliveryOutcome::Failed(format!(
+                "could not persist the direct for job {short}: {error}"
+            ))
         }
-        return;
+    };
+    if !settle_here && !receipts.is_empty() {
+        if let Err(error) = cairn_attention::wakes::settle_receipts(
+            &orch.db.local,
+            &receipts,
+            job_id,
+            Some(&message_id),
+            Some(&push_id),
+        )
+        .await
+        {
+            log::warn!("settling receipts of direct {message_id} for job {short}: {error}");
+        }
     }
-
-    log::warn!(
-        "failed to persist child attention direct for parent job {}: no recipient run found; attempting legacy resume",
-        &parent_job_id[..parent_job_id.len().min(8)]
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "messages", "action": "insert"}),
     );
-    let resume = operator_message_id.map(|trigger_id| crate::execution::jobs::ResumeContext {
-        goal_reactivation: Some(crate::execution::jobs::GoalReactivation::operator_message(
-            trigger_id,
-        )),
-        ..Default::default()
-    });
-    match crate::execution::jobs::continue_job_impl(
-        orch,
-        parent_job_id,
-        Some(message),
-        None,
-        resume,
-    ) {
+    orch.notifier.emit_change("attention_pushes");
+    match crate::messages::delivery::nudge_job_for_urgency(orch, job_id, request.urgency) {
         Ok(_) => log::info!(
-            "resumed parent job {} for child attention",
-            &parent_job_id[..parent_job_id.len().min(8)]
+            "queued attention direct {message_id} for job {short} with {} urgency",
+            request.urgency.as_str()
         ),
-        Err(error) => log::warn!(
-            "failed to resume parent job {} for child attention: {}",
-            &parent_job_id[..parent_job_id.len().min(8)],
-            error
-        ),
+        Err(error) => log::warn!("failed to nudge job {short} for attention: {error}"),
+    }
+    DeliveryOutcome::Persisted {
+        message_id,
+        job_id: job_id.to_string(),
     }
 }
 

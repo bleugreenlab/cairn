@@ -75,8 +75,12 @@ impl AttentionHost for Host {
         panic!("no chapter compaction expected")
     }
     fn emit_change(&self, _: &str, _: Option<&str>) {}
-    fn deliver(&self, job_id: &str, _: Option<&str>, _: &str, _: DeliveryUrgency, _: Option<&str>) {
-        self.delivered.lock().unwrap().push(job_id.into());
+    async fn deliver(&self, request: DeliveryRequest<'_>) -> DeliveryOutcome {
+        self.delivered.lock().unwrap().push(request.job_id.into());
+        DeliveryOutcome::Persisted {
+            message_id: request.message_id.unwrap_or("m").to_string(),
+            job_id: request.job_id.to_string(),
+        }
     }
 }
 async fn fixture() -> (AttentionRuntime, Arc<Host>) {
@@ -118,6 +122,7 @@ fn event(job_id: &str) -> WakeEvent {
         detail_uri: None,
         urgency: DeliveryUrgency::Queue,
         muted: crate::wakes::MutedDelivery::Drop,
+        fact_key: None,
         delivery: WakeDelivery::Targeted {
             subscriber_job_id: job_id.into(),
             sender_name: None,

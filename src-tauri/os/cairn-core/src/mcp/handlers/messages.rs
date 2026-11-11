@@ -695,6 +695,7 @@ pub async fn append_direct_message_with_urgency(
         match crate::orchestrator::attention_delivery::create_catchup_pushes_for_watchers(
             &owning_db,
             &addressed_uri,
+            &msg.id,
         )
         .await
         {

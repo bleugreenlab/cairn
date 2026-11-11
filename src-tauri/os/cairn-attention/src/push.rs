@@ -42,8 +42,12 @@ use uuid::Uuid;
 
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
-/// Wake level: where a push sits on the wake axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Wake level: where a push sits on the wake axis. Ordered by loudness, so
+/// merging two routes to one recipient keeps the louder with `max`.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum Wake {
     /// Never wakes an idle agent. On an active agent it still rides along at
     /// its `boundary` like any other push — wake level governs idle-waking, not
@@ -655,7 +659,7 @@ pub async fn push_review_with_fingerprint(
     .await
 }
 
-async fn review_issue_eligible_conn(
+pub(crate) async fn review_issue_eligible_conn(
     conn: &cairn_db::storage::TrackedConnection,
     issue_id: &str,
 ) -> DbResult<u64> {

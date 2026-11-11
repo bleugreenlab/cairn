@@ -59,7 +59,18 @@ pub(crate) fn format_checks_settled_message(
     out
 }
 
+/// The receipt key of one settlement of the lanes at `uri`.
+pub(crate) fn checks_settled_fact_key(uri: &str, snapshot: &ChecksSnapshot) -> String {
+    format!("condition:{uri}:{}", snapshot.settlement_identity())
+}
+
 /// Route a settled-checks wake to every job watching this node's lanes.
+///
+/// Three callers can route one settlement: the edge, the subscribe-time
+/// immediate fire and the verdictless confirm. The broadcast is keyed by the
+/// settlement's identity, so each watcher receives one message for it however
+/// many of them do (the cairn/4820 five-copy specimen), while a new actionable
+/// verdict is a new settlement and a new message.
 pub(crate) async fn route_checks_settled(
     orch: &Orchestrator,
     label: &str,
@@ -79,6 +90,7 @@ pub(crate) async fn route_checks_settled(
             },
             urgency: DeliveryUrgency::Queue,
             muted: MutedDelivery::Drop,
+            fact_key: Some(checks_settled_fact_key(uri, snapshot)),
         },
     )
     .await

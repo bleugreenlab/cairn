@@ -269,6 +269,13 @@ pub struct WakeEvent {
     /// because it is a property of what the event is, not of who muted it.
     #[serde(default)]
     pub muted: MutedDelivery,
+    /// The fact's identity, when it has one: a broadcast that carries it
+    /// writes one delivery receipt per recipient, so routing the same fact
+    /// again (another caller, a retry) delivers nothing more, while a genuine
+    /// recurrence with a new identity delivers again. `None` delivers each
+    /// routing as its own event.
+    #[serde(default)]
+    pub fact_key: Option<String>,
 }
 
 /// How a non-interrupt event reaches a subscription its recipient has muted.
@@ -302,6 +309,47 @@ pub enum WakeDelivery {
         subscriber_job_id: String,
         content: String,
     },
+}
+
+/// A bounded deferral of waking a recipient. A deferral never rewrites the
+/// level a receipt is owed at; it only says not yet, and until when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferUntil {
+    /// Past this instant (epoch milliseconds) the deferral admits, whatever
+    /// its predicate still says: no predicate may defer indefinitely.
+    pub deadline_ms: i64,
+    pub reason: String,
+}
+
+/// What the drain does with an owed wake now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Admit,
+    Defer(DeferUntil),
+}
+
+/// The longest a deferred wake waits before the drain asks again, so a
+/// predicate that clears early admits promptly rather than at its deadline.
+pub const DEFERRAL_RECHECK_MS: i64 = 30_000;
+
+/// Admit, or defer under the first deferral still before its deadline.
+pub fn admit_wake(
+    now_ms: i64,
+    deferrals: impl IntoIterator<Item = Option<DeferUntil>>,
+) -> Admission {
+    deferrals
+        .into_iter()
+        .flatten()
+        .find(|defer| now_ms < defer.deadline_ms)
+        .map_or(Admission::Admit, Admission::Defer)
+}
+
+/// When the drain looks at a deferred wake again: at its deadline itself, or
+/// sooner, never later.
+pub fn deferral_recheck_at(now_ms: i64, defer: &DeferUntil) -> i64 {
+    defer
+        .deadline_ms
+        .min(now_ms.saturating_add(DEFERRAL_RECHECK_MS))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

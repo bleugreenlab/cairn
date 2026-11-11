@@ -792,6 +792,57 @@ fn render_in_flight(
     )
 }
 
+/// Deliveries owed to this node's recipient that have waited past their bound:
+/// each with its age, why it is owed and why the last attempt did not
+/// deliver, so nothing waits invisibly.
+async fn render_held_receipts(db: &LocalDb, job_id: &str) -> String {
+    let Ok(recipient) = cairn_attention::wakes::stable_recipient_for_job(db, job_id).await else {
+        return String::new();
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let held = match cairn_attention::wakes::overdue_receipts(
+        db,
+        &recipient,
+        now - cairn_attention::wakes::RECEIPT_OVERDUE_MS,
+    )
+    .await
+    {
+        Ok(held) if !held.is_empty() => held,
+        _ => return String::new(),
+    };
+    let mut out = String::from("## Held deliveries\n\nOwed to you and not yet delivered:\n\n");
+    for receipt in held {
+        let reasons = receipt
+            .reasons
+            .iter()
+            .map(|reached| {
+                serde_json::to_value(&reached.reason)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("kind")
+                            .and_then(|kind| kind.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "- `{}` at {}, waiting {} min (owed for: {reasons}; last attempt: {})\n",
+            receipt.fact_key,
+            receipt.level.as_str(),
+            (now - receipt.created_at) / 60_000,
+            receipt
+                .last_refusal
+                .as_deref()
+                .unwrap_or("not attempted yet"),
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_id: &str) -> String {
     let subscriptions =
         match crate::orchestrator::wakes::list_subscriptions_for_job(db, job_id).await {
@@ -812,6 +863,7 @@ pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_i
             Err(error) => return error,
         };
     let mut out = format!("# Wakes — {label}\n\n`{uri}`\n\n");
+    out.push_str(&render_held_receipts(db, job_id).await);
     if let Ok(thread_id) = crate::orchestrator::wakes::thread_home_for_job(db, job_id).await {
         match crate::orchestrator::wakes::list_wake_schedules(db, &thread_id).await {
             Ok(schedules) if !schedules.is_empty() => {

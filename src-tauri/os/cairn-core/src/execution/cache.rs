@@ -3126,7 +3126,9 @@ async fn attach_manual_check_observation_conn(
         .execute(
             "UPDATE manual_check_handles
          SET observation_id=?3,commit_sha=?4,tree_hash=?5,input_hash=?6,disposition=?7
-         WHERE project_id=?1 AND handle=?2 AND response_json IS NULL
+         WHERE project_id=?1 AND handle=?2
+           AND (response_json IS NULL OR
+                (observation_id IS NULL AND commit_sha=?4 AND tree_hash=?5 AND input_hash=?6))
            AND (observation_id IS NULL OR observation_id=?3)
            AND EXISTS (SELECT 1 FROM check_result_observations WHERE project_id=?1 AND id=?3)",
             params![
@@ -3141,9 +3143,17 @@ async fn attach_manual_check_observation_conn(
         )
         .await?;
     if changed != 1 {
-        return Err(crate::storage::DbError::internal(format!(
-            "persist manual check source for {handle}: handle or project-owned observation is missing, or already settled"
-        )));
+        // A replay can reach a handle whose response was already persisted.
+        // Accept only the exact association; never rewrite a settled answer.
+        let mut existing = conn.query(
+            "SELECT 1 FROM manual_check_handles WHERE project_id=?1 AND handle=?2 AND observation_id=?3 AND commit_sha=?4 AND tree_hash=?5 AND input_hash=?6",
+            params![project_id, handle, observation_id, commit_sha, tree_hash, input_hash],
+        ).await?;
+        if existing.next().await?.is_none() {
+            return Err(crate::storage::DbError::internal(format!(
+                "persist manual check source for {handle}: handle or project-owned observation is missing, or already settled"
+            )));
+        }
     }
     Ok(())
 }
@@ -7008,6 +7018,168 @@ pub(crate) mod tests {
         assert_eq!(
             count, 0,
             "a durable verdict cannot commit without its handle association"
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_source_less_manual_response_accepts_only_exact_coordinate_evidence() {
+        let db = cache_db().await;
+        record_fresh_check_observation(
+            db.clone(),
+            observation("later-physical-source", "commit-1", "env-a"),
+        )
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at,commit_sha,tree_hash,input_hash,response_json)
+             VALUES('shutdown-handle','project-a',1,'commit-1','tree-commit-1','input-rust','{\"awaitingAdoption\":true}');",
+        ).await.unwrap();
+        for (project, commit, tree, input) in [
+            ("project-b", "commit-1", "tree-commit-1", "input-rust"),
+            ("project-a", "wrong-commit", "tree-commit-1", "input-rust"),
+            ("project-a", "commit-1", "wrong-tree", "input-rust"),
+            ("project-a", "commit-1", "tree-commit-1", "wrong-input"),
+        ] {
+            assert!(attach_manual_check_observation(
+                &db,
+                project,
+                "shutdown-handle",
+                "later-physical-source",
+                commit,
+                tree,
+                input,
+                "fresh",
+            )
+            .await
+            .is_err());
+        }
+        assert_eq!(
+            db.query_one(
+                "SELECT observation_id FROM manual_check_handles WHERE handle='shutdown-handle'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        attach_manual_check_observation(
+            &db,
+            "project-a",
+            "shutdown-handle",
+            "later-physical-source",
+            "commit-1",
+            "tree-commit-1",
+            "input-rust",
+            "fresh",
+        )
+        .await
+        .unwrap();
+        let saved = db.query_one(
+            "SELECT observation_id,response_json FROM manual_check_handles WHERE handle='shutdown-handle'",
+            (), |row| Ok((row.text(0)?,row.text(1)?)),
+        ).await.unwrap();
+        assert_eq!(
+            saved,
+            (
+                "later-physical-source".into(),
+                "{\"awaitingAdoption\":true}".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_manual_handle_replay_accepts_only_its_exact_association() {
+        let db = cache_db().await;
+        db.execute_script(
+            "INSERT INTO manual_check_handles(handle,project_id,created_at)
+             VALUES('settled-handle','project-a',1);",
+        )
+        .await
+        .unwrap();
+        let mut write = observation("settled-source", "commit-1", "env-a");
+        write.manual_handle = Some("settled-handle".into());
+        record_fresh_check_observation(db.clone(), write).unwrap();
+        record_fresh_check_observation(
+            db.clone(),
+            observation("other-source", "commit-1", "env-a"),
+        )
+        .unwrap();
+        db.execute_script(
+            "UPDATE manual_check_handles SET response_json='{\"settled\":true}'
+             WHERE handle='settled-handle';",
+        )
+        .await
+        .unwrap();
+
+        attach_manual_check_observation(
+            &db,
+            "project-a",
+            "settled-handle",
+            "settled-source",
+            "commit-1",
+            "tree-commit-1",
+            "input-rust",
+            "fresh",
+        )
+        .await
+        .unwrap();
+        for (project, source, commit, tree, input) in [
+            (
+                "project-a",
+                "other-source",
+                "commit-1",
+                "tree-commit-1",
+                "input-rust",
+            ),
+            (
+                "project-a",
+                "settled-source",
+                "commit-2",
+                "tree-commit-1",
+                "input-rust",
+            ),
+            (
+                "project-a",
+                "settled-source",
+                "commit-1",
+                "different-tree",
+                "input-rust",
+            ),
+            (
+                "project-a",
+                "settled-source",
+                "commit-1",
+                "tree-commit-1",
+                "different-input",
+            ),
+            (
+                "project-b",
+                "settled-source",
+                "commit-1",
+                "tree-commit-1",
+                "input-rust",
+            ),
+        ] {
+            assert!(attach_manual_check_observation(
+                &db,
+                project,
+                "settled-handle",
+                source,
+                commit,
+                tree,
+                input,
+                "fresh",
+            )
+            .await
+            .is_err());
+        }
+        let saved = db.query_one(
+            "SELECT observation_id,response_json FROM manual_check_handles WHERE handle='settled-handle'",
+            (), |row| Ok((row.text(0)?, row.text(1)?)),
+        ).await.unwrap();
+        assert_eq!(
+            saved,
+            ("settled-source".into(), "{\"settled\":true}".into())
         );
     }
 

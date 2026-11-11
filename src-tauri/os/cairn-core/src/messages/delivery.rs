@@ -84,6 +84,7 @@ pub async fn append_thread_message(
             },
             urgency: DeliveryUrgency::Steer,
             muted: crate::orchestrator::wakes::MutedDelivery::Drop,
+            fact_key: None,
         },
     )
     .await?;
@@ -106,7 +107,10 @@ pub fn latest_run_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
         .flatten()
 }
 
-async fn latest_run_for_job_async(db: &LocalDb, job_id: &str) -> Result<Option<String>, String> {
+pub(crate) async fn latest_run_for_job_async(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<String>, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();

@@ -2298,6 +2298,75 @@ pub(crate) fn anchored_tail(s: &str, max: usize) -> String {
     )
 }
 
+/// How an executor item body opens its stderr section. The body is the
+/// command's stdout, then this header and its stderr, then `Exit code: N`
+/// (cairn-exec's `format_process_body`, pinned by its
+/// `nonzero_exit_and_stderr_are_rendered_in_stable_item_body`), and every
+/// check lane, local or remote, hands the core that one body.
+const STDERR_SECTION: &str = "\n\nstderr:\n";
+
+/// [`anchored_tail`] over an executor item body, with each of its two streams
+/// bounded separately so neither can push the other out of the window.
+///
+/// The body is not in arrival order: all of stdout comes before all of
+/// stderr. A plain tail therefore keeps whichever stream is printed last and
+/// is long, whatever the other one said. cargo writes its progress to stderr
+/// and libtest writes its `failures:` block to stdout, so a test red keeps
+/// `error: test failed` and loses every failing test's name. A tool that
+/// does the opposite loses its stderr diagnostic under stdout chatter in the
+/// same way, if stdout is the one long enough to fill the window. A wider
+/// window does not help, because chatter grows with the build.
+///
+/// A nonzero exit says the command failed but not which stream explains it,
+/// so neither stream is favoured. The window is split in half, and a stream
+/// shorter than its half is kept whole and gives what it does not use to the
+/// other. A short failure block survives any amount of chatter in the other
+/// stream. When both streams are long, each keeps its own anchored tail.
+/// The `stderr:` header is always kept, so a reader can see where one stream
+/// ends and the other begins.
+///
+/// The split is at the header's first occurrence. A stdout that prints the
+/// header text itself splits early, and both parts are still kept within the
+/// window.
+pub(crate) fn stream_tail(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let Some(at) = s.find(STDERR_SECTION) else {
+        return anchored_tail(s, max);
+    };
+    let stdout = &s[..at];
+    let stderr = &s[at + STDERR_SECTION.len()..];
+    let available = max.saturating_sub(STDERR_SECTION.chars().count());
+    let (stdout_len, stderr_len) = (stdout.chars().count(), stderr.chars().count());
+    let half = available / 2;
+    let (stdout_budget, stderr_budget) = if stdout_len <= half {
+        (stdout_len, available - stdout_len)
+    } else if stderr_len <= half {
+        (available - stderr_len, stderr_len)
+    } else {
+        (half, available - half)
+    };
+    format!(
+        "{}{STDERR_SECTION}{}",
+        elided_stream(stdout, stdout_budget),
+        elided_stream(stderr, stderr_budget)
+    )
+}
+
+/// One stream within `max` chars. A stream that had to be cut opens with an
+/// elision mark, because a stream now sits mid-window and a reader could
+/// otherwise take its first kept line for its first line.
+fn elided_stream(stream: &str, max: usize) -> String {
+    const ELIDED_HEAD: &str = "…\n";
+    if stream.chars().count() <= max {
+        return stream.to_string();
+    }
+    let budget = max.saturating_sub(ELIDED_HEAD.chars().count());
+    format!("{ELIDED_HEAD}{}", anchored_tail(stream, budget))
+}
+
 static NEXTEST_SUMMARY_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*Summary\s+\[\s*[\d.]+s\]").unwrap());
 
@@ -3587,6 +3656,52 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             "{excerpt}"
         );
         assert!(excerpt.chars().count() <= 2_000);
+    }
+
+    /// libtest's failure block on stdout, then more than the window of cargo's
+    /// progress on stderr: a plain tail keeps only `error: test failed`.
+    #[test]
+    fn a_short_stream_survives_any_amount_of_chatter_on_the_other() {
+        let failures = "failures:\n\n---- claude_session_resumes stdout ----\n\
+            thread 'claude_session_resumes' panicked at tests/sessions.rs:120:5:\n\
+            assertion failed: resumed\n\nfailures:\n    claude_session_resumes\n\n\
+            test result: FAILED. 7 passed; 1 failed; 0 ignored";
+        let chatter: String = (0..400)
+            .map(|n| format!("   Compiling crate-{n} v0.1.0\n"))
+            .collect();
+        let body = format!(
+            "{failures}{STDERR_SECTION}{chatter}error: test failed, to rerun pass `--test sessions`\n\nExit code: 1"
+        );
+        assert!(!tail_chars(&body, 4_000).contains("panicked"));
+        let kept = stream_tail(&body, 4_000);
+        assert!(kept.chars().count() <= 4_000, "{kept}");
+        assert!(kept.starts_with(failures), "{kept}");
+        assert!(kept.contains("\n\nstderr:\n…\n"), "{kept}");
+        assert!(
+            kept.ends_with("`--test sessions`\n\nExit code: 1"),
+            "{kept}"
+        );
+
+        // Both streams long: each keeps its own tail, stdout's under the mark.
+        let long_stdout = format!("{}{failures}", "running 1 test\n".repeat(400));
+        let body =
+            format!("{long_stdout}{STDERR_SECTION}{chatter}error: test failed\n\nExit code: 1");
+        let kept = stream_tail(&body, 4_000);
+        assert!(kept.chars().count() <= 4_000, "{kept}");
+        assert!(kept.starts_with("…\n"), "{kept}");
+        assert!(
+            kept.contains(&format!("{failures}{STDERR_SECTION}…\n")),
+            "{kept}"
+        );
+        assert!(
+            kept.ends_with("error: test failed\n\nExit code: 1"),
+            "{kept}"
+        );
+
+        // A body that fits, or has no stderr section, is what it was.
+        let short = format!("ok{STDERR_SECTION}warn");
+        assert_eq!(stream_tail(&short, 4_000), short);
+        assert_eq!(stream_tail(&chatter, 300), anchored_tail(&chatter, 300));
     }
 
     /// c47874ea's Summary sits inside the window already, behind a short

@@ -2331,6 +2331,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     ("attention_pushes", TableScope::ProjectScoped),
     ("attention_read_cursors", TableScope::ProjectScoped),
+    // cairn/6391: one receipt per (fact, stable recipient). A push receipt
+    // lives beside its push, so it shares the push's scope; a fact-log receipt
+    // lives in the private database beside its coalesced wake.
+    ("delivery_receipts", TableScope::ProjectScoped),
     // Authorization state is this operator's decision about this install.
     // Replicating a grant would authorize a teammate's agents against their own
     // workspace configuration, which is the blast-radius expansion the
@@ -2862,6 +2866,18 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "main_cadence_interruptions",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // This runner's claims on remote check attempts it was granted, and the
+    // consumers waiting on each. A claim names this install's executor and
+    // request ids and is only adoptable by the runner that granted it, so it
+    // never syncs; the waiters cascade from their claim.
+    (
+        "check_lane_adoptions",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "check_lane_adoption_waiters",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // This install's rebuild history and idempotent journal receipts.
     (
         "rebuilds",
@@ -3205,6 +3221,17 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "attention_read_cursors",
         id_columns: &["recipient", "source"],
+    },
+    RekeyTableManifest {
+        table: "delivery_receipts",
+        id_columns: &[
+            "id",
+            "recipient_id",
+            "project_id",
+            "message_id",
+            "delivered_job_id",
+            "push_id",
+        ],
     },
     RekeyTableManifest {
         table: "main_incident_sources",

@@ -960,6 +960,39 @@ impl PurposeRegistry {
         account
     }
 
+    /// Restore the exact reloaded item as the live answer, without admitting a
+    /// successor beside it. A different live holder is never displaced here.
+    pub(crate) fn readopt(&mut self, key: &PurposeKey, request: &RequestIdentity) -> bool {
+        let Some(state) = self.items.get_mut(key) else {
+            return false;
+        };
+        if let Some(live) = &state.live {
+            return &live.request == request;
+        }
+        let Some(index) = state
+            .retiring
+            .iter()
+            .position(|item| &item.request == request)
+        else {
+            return false;
+        };
+        let item = state.retiring.remove(index);
+        let mut placement = item.placement;
+        if let Some(placement) = &mut placement {
+            placement.awaiting_post_boot_account = false;
+        }
+        state.live = Some(LiveItem {
+            request: item.request,
+            phase: item.phase,
+            armed_at_unix_ms: placement
+                .as_ref()
+                .map_or(item.retired_at_unix_ms, |p| p.dispatched_at_unix_ms),
+            placement,
+        });
+        self.journal_item(key, request, true);
+        true
+    }
+
     /// Settle the one debt an operator named, because they authorized the
     /// overlap it was preventing.
     ///
@@ -1804,6 +1837,44 @@ mod tests {
         });
         assert_eq!(settled.len(), 1);
         assert_eq!(after.pending_retirements(&key()), 0);
+    }
+
+    #[test]
+    fn readoption_restores_the_exact_holder_and_journals_it_live() {
+        let (mut before, mut journal) = journaled();
+        before.admit(key(), request("survivor"), 10);
+        before.dispatched(&request("survivor"), "machine-a", 7, 11);
+        let rows = rows_of(drain(&mut journal));
+        let (mut after, mut journal) = journaled();
+        after.reload(rows, 100);
+        after.post_boot_account("machine-a", 1, |_| true);
+        assert!(after.readopt(&key(), &request("survivor")));
+        assert!(after.is_live_holder(&key(), &request("survivor")));
+        assert_eq!(after.pending_retirements(&key()), 0);
+        assert!(after.machines_awaiting_post_boot_account().is_empty());
+        let rows = rows_of(drain(&mut journal));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row.state, DebtRowState::Live)
+                && row.request == request("survivor")
+                && row.placement.generation == 1
+                && !row.placement.awaiting_post_boot_account));
+        assert!(
+            after.readopt(&key(), &request("survivor")),
+            "binding is idempotent"
+        );
+    }
+
+    #[test]
+    fn readoption_does_not_displace_another_live_holder() {
+        let mut registry = PurposeRegistry::default();
+        registry.admit(key(), request("old"), 10);
+        registry.dispatched(&request("old"), "machine", 1, 11);
+        registry.admit(key(), request("new"), 20);
+        assert!(!registry.readopt(&key(), &request("old")));
+        assert!(registry.is_live_holder(&key(), &request("new")));
+        assert_eq!(registry.pending_retirements(&key()), 1);
+        assert!(!registry.readopt(&key(), &request("unknown")));
     }
 
     /// A machine lost while the journal is still being read is evidence for

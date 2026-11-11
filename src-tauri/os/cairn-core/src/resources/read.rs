@@ -2508,6 +2508,7 @@ async fn render_resource_body(
                     Some(executor) => match (view, request_id) {
                         (None, _) => {
                             let mut rendered = crate::resources::executors::render_executor(executor);
+                            rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &executor.name));
                             rendered.push_str(&crate::resources::executors::render_blocked_questions(
                                 &orch.fleet.blocked_questions(
                                     Some(&executor.health.identity.executor_id),
@@ -2609,6 +2610,7 @@ async fn render_resource_body(
                         // blocked question, so its page names them.
                         Some(remote) => {
                             let mut rendered = crate::resources::executors::render_enrolled_remote(remote, captured_at);
+                            rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &name));
                             rendered.push_str(&crate::resources::executors::render_blocked_questions(
                                 &orch.fleet.blocked_questions(Some(&remote.executor_id), captured_at),
                                 None,

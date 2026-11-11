@@ -7440,6 +7440,13 @@ pub struct LearnedResourceEstimate {
 /// an older executor: nothing it decodes differently; that executor still fails
 /// such an item as a spawn failure, as before. An older runner ignores the new
 /// field, so it loses only the cache entry, never the result.
+///
+/// cairn/6581 does not move the number. The runner withholds a shutdown Cancel
+/// for an adoptable check lane and defers ResultAck until the held result's
+/// observation is durable. Both are sequences version 167 already defines:
+/// an unacknowledged result is resent, and an acknowledgement for an unknown
+/// key is a no-op. No frame, variant, or field changes, so a runner talking
+/// to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 167;
 
 /// The version `build.rs` derived from the paragraphs above

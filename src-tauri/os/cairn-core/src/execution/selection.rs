@@ -101,7 +101,7 @@ fn shell_command_is_well_formed(command: &str) -> bool {
 /// The inheritance step needs this distinction: a `Full` run establishes the
 /// authoritative status for every target, while a `Partial` run only refreshes
 /// the selected subset and leaves the rest to inherit from a baseline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CheckScope {
     Full,
@@ -117,7 +117,7 @@ fn paths_match_impact(globs: &[String], paths: &[String]) -> bool {
 
 /// The decision for a single check: whether it applies to this change set and,
 /// if so, the concrete command to run and whether that run is full or partial.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckPlan {
     /// The check's name (its key in the `checks` map).

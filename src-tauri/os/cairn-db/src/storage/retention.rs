@@ -261,6 +261,11 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "closed wakes",
     ),
     owned_by(
+        "delivery_receipts",
+        "cairn-db storage::fact_log::prune_receipts",
+        "settled receipts past the fact log's default retention, in every open database",
+    ),
+    owned_by(
         "page_calls",
         "cairn-core pages::log",
         "newest N calls per page",
@@ -326,6 +331,12 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "cairn-core execution::checks_main",
         "cleared when the cadence resumes",
     ),
+    owned_by(
+        "check_lane_adoptions",
+        "cairn-core storage::check_lane_adoptions::prune",
+        "settled claims (recorded, lost, cancelled) 7 days after their last update once every waiter has settled; open claims are kept until adopted, never by age",
+    ),
+    owned("check_lane_adoption_waiters", "check_lane_adoptions"),
     owned_by(
         "node_scratches",
         "cairn-core node_scratch::lifecycle",
