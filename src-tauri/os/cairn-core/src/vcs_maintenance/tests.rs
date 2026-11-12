@@ -669,6 +669,171 @@ mod pass {
         );
     }
 
+    fn op_heads(store: &Path) -> Vec<String> {
+        let mut heads: Vec<String> = std::fs::read_dir(store.join(".jj/repo/op_heads/heads"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        heads.sort();
+        heads
+    }
+
+    /// The truncation rewrites every retained operation id, so it runs only
+    /// under the lock of the store it rewrites; a guard for any other store
+    /// is refused with nothing changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(jj)]
+    async fn the_truncation_refuses_without_the_store_lock() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping truncation lock test: jj not resolvable");
+            return;
+        };
+        let jj = crate::jj::environment(&fx.orch.jj_binary_path, &fx.orch.config_dir);
+        for name in ["one", "two"] {
+            crate::jj::create_bookmark_at(&jj, &fx.project.store, name, &fx.commit).unwrap();
+        }
+        let other = fx._temp.path().join("another-store");
+        let guard = fx
+            .orch
+            .acquire_jj_store_lock_with_timeout(
+                &other,
+                crate::orchestrator::StoreLockClass::Background,
+                "another store's work",
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        let heads = op_heads(&fx.project.store);
+        let cutoff = SystemTime::now();
+        let deadline = Instant::now() + Duration::from_secs(600);
+
+        let error = crate::jj::in_place_blocking(|| {
+            truncate_under_lock(&guard, &fx.project.store, cutoff, deadline)
+        })
+        .unwrap_err();
+
+        assert!(error.contains("refused"), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(op_heads(&fx.project.store), heads);
+        drop(guard);
+
+        let own = fx
+            .orch
+            .acquire_jj_store_lock_with_timeout(
+                &fx.project.store,
+                crate::orchestrator::StoreLockClass::Background,
+                "the store's own truncation",
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        crate::jj::in_place_blocking(|| {
+            truncate_under_lock(&own, &fx.project.store, cutoff, deadline)
+        })
+        .expect("under its own store's lock the truncation runs");
+    }
+
+    /// The backlog sweep retires a finished branch through teardown's own
+    /// judgement: a merged branch whose bookmark holds exactly the commit its
+    /// landing recorded goes, one holding work after the landing is kept and
+    /// counted by reason, and a branch whose issue is still open is never a
+    /// candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(jj)]
+    async fn the_bookmark_sweep_retires_only_what_its_landing_recorded() {
+        let Some(fx) = fixture().await else {
+            eprintln!("skipping finished-bookmark sweep test: jj not resolvable");
+            return;
+        };
+        let jj = crate::jj::environment(&fx.orch.jj_binary_path, &fx.orch.config_dir);
+        let store = &fx.project.store;
+        jj.run(
+            store,
+            &[
+                "new",
+                "main",
+                "--no-edit",
+                "-m",
+                "work after the landing",
+                "--ignore-working-copy",
+            ],
+            "fixture",
+        )
+        .unwrap();
+        let after_landing = jj
+            .run(
+                store,
+                &[
+                    "log",
+                    "-r",
+                    "latest(children(main))",
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy",
+                ],
+                "fixture",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        crate::jj::create_bookmark_at(&jj, store, "agent/landed", &fx.commit).unwrap();
+        crate::jj::create_bookmark_at(&jj, store, "agent/moved", &after_landing).unwrap();
+        crate::jj::create_bookmark_at(&jj, store, "agent/live", &fx.commit).unwrap();
+
+        let resolved = unix_now() - 40 * DAY as i64;
+        fx.orch
+            .db
+            .local
+            .execute_script(format!(
+                "INSERT INTO issues (id, project_id, number, title, status, progress, attention,
+                                     created_at, updated_at, merged_at)
+                   VALUES ('issue-done', 'p-refs', 9, 'done', 'merged', 'backlog', 'none', 1, 1,
+                           {resolved}),
+                          ('issue-open', 'p-refs', 10, 'open', 'active', 'backlog', 'none', 1, 1,
+                           NULL);
+                 INSERT INTO jobs (id, project_id, issue_id, branch, status, created_at, updated_at)
+                   VALUES ('job-landed', 'p-refs', 'issue-done', 'agent/landed', 'complete', 1, 1),
+                          ('job-moved', 'p-refs', 'issue-done', 'agent/moved', 'complete', 1, 1),
+                          ('job-live', 'p-refs', 'issue-open', 'agent/live', 'complete', 1, 1);
+                 INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch,
+                                             target_branch, status, opened_at, updated_at,
+                                             merged_at, merged_commit, merged_source_commit)
+                   VALUES ('mr-landed', 'job-landed', 'p-refs', 'issue-done', 'PR', 'agent/landed',
+                           'main', 'merged', 1, 1, 2, 'x', '{landed}'),
+                          ('mr-moved', 'job-moved', 'p-refs', 'issue-done', 'PR', 'agent/moved',
+                           'main', 'merged', 1, 1, 2, 'x', '{landed}');",
+                landed = fx.commit,
+            ))
+            .await
+            .unwrap();
+
+        let report = retire_finished_bookmarks(&fx.orch, &fx.project)
+            .await
+            .unwrap();
+
+        assert_eq!(report.candidates, 2, "{report:?}");
+        assert_eq!(report.retired, ["agent/landed"], "{report:?}");
+        assert_eq!(
+            report.kept,
+            BTreeMap::from([("not-proven".to_string(), 1)]),
+            "{report:?}"
+        );
+        assert_eq!(report.remaining, 0);
+        assert_eq!(report.holds, 1);
+        let local = crate::jj::local_bookmark_names(store).unwrap();
+        assert!(!local.contains("agent/landed"));
+        assert!(
+            local.contains("agent/moved"),
+            "work after the landing is kept"
+        );
+        assert!(
+            local.contains("agent/live"),
+            "an open issue's branch is untouched"
+        );
+    }
+
     /// Nobody has to remember a switch: a small store is pruned by default,
     /// and an explicit opt-out keeps it measured and untouched.
     #[tokio::test]

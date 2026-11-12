@@ -1036,8 +1036,8 @@ pub(super) fn render_ref_store(
     now: i64,
 ) -> String {
     use crate::vcs_maintenance::{
-        PrunePolicy, KEEP_REF_THRESHOLD, PACKED_BYTES_THRESHOLD, PRUNE_INTERVAL, PRUNE_OVERDUE,
-        RETENTION, TRUNCATION_OVERDUE,
+        PrunePolicy, KEEP_REF_THRESHOLD, OP_LOG_WINDOW, PACKED_BYTES_THRESHOLD, PRUNE_INTERVAL,
+        PRUNE_OVERDUE, RETENTION, TRUNCATION_OVERDUE,
     };
     const NAMESPACES: [(&str, &str); 8] = [
         ("jj/keep", "jj keep refs (`refs/jj/keep`)"),
@@ -1169,7 +1169,7 @@ pub(super) fn render_ref_store(
         Some(prune) => {
             let took = crate::clock::format_elapsed(prune.duration_ms / 1000);
             let attempt = format!("The last prune started {} ago", ago(prune.started_at));
-            let removed = [
+            let mut removed = vec![
                 format!(
                     "{} jj keep refs",
                     thousands(prune.removed_keep_refs.unwrap_or(0) as u64)
@@ -1178,22 +1178,43 @@ pub(super) fn render_ref_store(
                     "{} finished Cairn refs",
                     thousands(prune.removed_cairn_refs.unwrap_or(0) as u64)
                 ),
-                format!(
-                    "{} operations",
-                    thousands(prune.ops_abandoned.unwrap_or(0) as u64)
-                ),
-            ]
-            .join(", ");
+            ];
+            if let Some(retired) = prune.bookmarks_retired.filter(|retired| *retired > 0) {
+                removed.push(format!(
+                    "{} finished branches' bookmarks",
+                    thousands(retired)
+                ));
+            }
+            removed.push(format!(
+                "{} operations",
+                thousands(prune.ops_abandoned.unwrap_or(0) as u64)
+            ));
+            let removed = removed.join(", ");
             match prune.outcome.split_once(':') {
                 None if prune.outcome == "ok" => {
-                    let truncated = if prune.truncated {
-                        ", and truncated the operation log"
-                    } else {
-                        ""
+                    let truncated = match (prune.truncated, prune.views_deleted) {
+                        (true, Some(views)) => format!(
+                            ", and truncated the operation log, deleting {} operation views and \
+                             freeing {}",
+                            thousands(views),
+                            human_bytes(prune.op_store_bytes_freed.unwrap_or(0) as i64)
+                        ),
+                        (true, None) => ", and truncated the operation log".to_string(),
+                        (false, _) => String::new(),
                     };
                     out.push_str(&format!(
                         "{attempt} and succeeded in {took}. It removed {removed}{truncated}.\n\n"
                     ));
+                }
+                Some(("partial", refusal))
+                    if refusal.starts_with(crate::jj::TRUNCATION_DEADLINE) =>
+                {
+                    out.push_str(&format!(
+                        "{attempt} and only partly succeeded, in {took}. It removed {removed}, but \
+                         its truncation of the operation log reached its deadline under the store \
+                         lock and stopped with nothing changed, so the operation log is not being \
+                         bounded: {refusal}. The next prune tries again.\n\n"
+                    ))
                 }
                 Some(("partial", failure)) if failure.starts_with("reclaim-failed:") => {
                     out.push_str(&format!(
@@ -1202,11 +1223,18 @@ pub(super) fn render_ref_store(
                          why. The next prune retries the reclaim.\n\n"
                     ))
                 }
+                Some(("partial", refusal)) if refusal.contains("workspaces other than") => {
+                    out.push_str(&format!(
+                        "{attempt} and only partly succeeded, in {took}. It removed {removed}, but \
+                         it could not truncate the operation log, so hidden history is not being \
+                         bounded: {refusal}. Forget or remove those workspaces and the next prune \
+                         truncates.\n\n"
+                    ))
+                }
                 Some(("partial", refusal)) => out.push_str(&format!(
                     "{attempt} and only partly succeeded, in {took}. It removed {removed}, but it \
-                     could not truncate the operation log, so hidden history is not being \
-                     bounded: {refusal}. Forget or remove those workspaces and the next prune \
-                     truncates.\n\n"
+                     could not truncate the operation log, so the operation log is not being \
+                     bounded: {refusal}. The next prune tries again.\n\n"
                 )),
                 Some(("skipped", reason)) => out.push_str(&format!(
                     "{attempt} and was skipped because {}. It retries at the next hourly pass.\n\n",
@@ -1219,6 +1247,13 @@ pub(super) fn render_ref_store(
                     "{attempt} and recorded an outcome this page does not recognize: `{}`.\n\n",
                     prune.outcome
                 )),
+            }
+            if let Some(remaining) = prune.bookmarks_remaining.filter(|left| *left > 0) {
+                out.push_str(&format!(
+                    "{} finished branches' bookmarks are left for the next prune, which retires \
+                     them in short holds of the store lock.\n\n",
+                    thousands(remaining)
+                ));
             }
         }
     }
@@ -1243,9 +1278,10 @@ pub(super) fn render_ref_store(
             ),
             Some(last) if now - last > TRUNCATION_OVERDUE.as_secs() as i64 => {
                 out.push_str(&format!(
-                    "**The operation log was last truncated {} ago**, more than 14 days, so its \
-                     hidden history is growing past the retention window.\n\n",
-                    ago(last)
+                    "**The operation log was last truncated {} ago**, more than 48 hours, so it \
+                     is growing past its {}-day window.\n\n",
+                    ago(last),
+                    OP_LOG_WINDOW.as_secs() / 86_400
                 ))
             }
             _ => {}
@@ -1268,8 +1304,10 @@ pub(super) fn render_ref_store(
         }
     }
     out.push_str(&format!(
-        "Hidden history, operations, and unreferenced objects are kept for {} days; an older \
-         commit that nothing references any more stops resolving.\n\n",
+        "The operation log keeps {} days of operations. Hidden history and unreferenced objects \
+         are kept for {} days; an older commit that nothing references any more stops \
+         resolving.\n\n",
+        OP_LOG_WINDOW.as_secs() / 86_400,
         RETENTION.as_secs() / 86_400
     ));
     out
@@ -2599,6 +2637,10 @@ mod ref_store_render_tests {
                 removed_cairn_refs: Some(2_950),
                 ops_abandoned: Some(146_083),
                 truncated: true,
+                views_deleted: Some(144_910),
+                op_store_bytes_freed: Some(120 * 1024 * 1024 * 1024),
+                bookmarks_retired: Some(1_250),
+                bookmarks_remaining: Some(3_834),
                 reclaim_skipped: None,
                 reclaim_failed: None,
             }),
@@ -2608,9 +2650,18 @@ mod ref_store_render_tests {
         };
         let text = render_ref_store(&overview, "CAIRN", NOW);
         assert!(text.contains("succeeded in 12m"), "{text}");
-        assert!(text.contains("192,364 jj keep refs, 2,950 finished Cairn refs, 146,083 operations, and truncated the operation log"));
+        assert!(
+            text.contains(
+                "192,364 jj keep refs, 2,950 finished Cairn refs, 1,250 finished branches' \
+             bookmarks, 146,083 operations, and truncated the operation log, deleting 144,910 \
+             operation views and freeing 120.0 GB."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("3,834 finished branches' bookmarks are left for the next prune"));
         assert!(!text.contains("never been truncated"));
         assert!(text.contains("The next prune is due in 21h"));
+        assert!(text.contains("The operation log keeps 7 days of operations"));
         assert!(text.contains("kept for 30 days"));
         assert!(!text.contains("overdue"));
         assert!(!text.contains(" Ok"), "never a bare status code");
@@ -2655,8 +2706,7 @@ mod ref_store_render_tests {
                 removed_cairn_refs: Some(3),
                 ops_abandoned: Some(0),
                 truncated: false,
-                reclaim_skipped: None,
-                reclaim_failed: None,
+                ..Default::default()
             }),
             last_ok_prune_at: Some(NOW - HOUR),
             last_truncation_at: None,
@@ -2670,12 +2720,38 @@ mod ref_store_render_tests {
         assert!(!text.contains("and succeeded in"));
 
         let stale = RefStoreOverview {
-            last_truncation_at: Some(NOW - 20 * 24 * HOUR),
-            ..overview
+            last_truncation_at: Some(NOW - 3 * 24 * HOUR),
+            ..overview.clone()
         };
         let text = render_ref_store(&stale, "CAIRN", NOW);
         assert!(
-            text.contains("**The operation log was last truncated 20d ago**"),
+            text.contains(
+                "**The operation log was last truncated 3d ago**, more than 48 hours, so it is \
+                 growing past its 7-day window."
+            ),
+            "{text}"
+        );
+
+        // A truncation that ran out of time under the lock is not a workspace
+        // problem, and the page does not send the operator looking for one.
+        let deadline = format!(
+            "{} after rewriting 120,000 of 150,000 retained operation(s); nothing was changed",
+            crate::jj::TRUNCATION_DEADLINE
+        );
+        let timed_out = RefStoreOverview {
+            last_prune: Some(PruneSample {
+                outcome: format!("partial:{deadline}"),
+                ..overview.last_prune.clone().unwrap()
+            }),
+            ..overview
+        };
+        let text = render_ref_store(&timed_out, "CAIRN", NOW);
+        assert!(
+            text.contains("reached its deadline under the store lock"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Forget or remove those workspaces"),
             "{text}"
         );
     }

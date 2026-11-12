@@ -15,7 +15,17 @@
 //!    check batch holds (which every pass also retires, below),
 //!    `refs/cairn/stranded/*` whose issue was resolved more than the retention
 //!    window ago, and `refs/cairn/rescued/*` older than it.
-//! 2. Under the store lock, the store's view. First the origin tracking ref of
+//! 2. The local bookmarks of finished agent branches ([`BranchLifecycle`])
+//!    that teardown never retired, because they resolved before it retired
+//!    bookmarks at all. Each goes through teardown's own judgement
+//!    (`execution::teardown::retire_local_copies`): reserved, then judged and
+//!    removed under the store lock, a merged branch only while its bookmark
+//!    holds what its landing recorded. Every bookmark is in every operation's
+//!    view, so these are most of each view's bytes. The lock is held in holds
+//!    of at most [`BOOKMARK_HOLD`], released between them so landings are
+//!    served, and a prune spends at most [`BOOKMARK_BUDGET`] on it; whatever is
+//!    left waits for the next prune.
+//! 3. Under the store lock, the store's view. First the origin tracking ref of
 //!    every agent branch Cairn's records say is finished
 //!    ([`BranchLifecycle`]) is retired with its `<branch>@origin` remote
 //!    bookmark (`cairn_vcs::jj::retire_remote_tracking_refs`): the store never
@@ -28,14 +38,28 @@
 //!    (`cairn_vcs::jj::sweep_store_view`). Superseded history that some step
 //!    made visible again would otherwise stay visible for good, as divergent
 //!    twins and unreferenced heads that keep their objects alive. Hiding
-//!    changes only the view; objects go only through step 4's reclaim.
-//! 3. At most weekly, under the store lock, the operation log older than the
-//!    window.
-//! 4. Outside the store lock, unreachable operations and keep refs for anything
-//!    that is not an index head; then, at most once per window and outside
-//!    every Cairn lock, a cruft repack that reclaims unreferenced Git objects
-//!    older than the window. `cairn_vcs::jj::reclaim_unreachable_objects`
-//!    documents how it honours the operator's reflogs, stash, and branches.
+//!    changes only the view; objects go only through step 5's reclaim.
+//! 4. Under the store lock, the operation log older than [`OP_LOG_WINDOW`],
+//!    on every prune, stopping with nothing changed at [`TRUNCATION_BUDGET`]
+//!    ([`truncate_under_lock`]). Its cost follows the size of the window it
+//!    keeps, not what it drops, so truncating daily costs what weekly would
+//!    and keeps the store at about one window and a day of views.
+//! 5. Outside the store lock, unreachable operations and views, keep refs for
+//!    anything that is not an index head, and the commit metadata table; then,
+//!    at most once per retention window and outside every Cairn lock, a cruft
+//!    repack that reclaims unreferenced Git objects older than [`RETENTION`].
+//!    `cairn_vcs::jj::reclaim_unreachable_objects` documents how it honours
+//!    the operator's reflogs, stash, and branches. The operation-store
+//!    collection reads reachability from the operation heads when it starts
+//!    and spares only what is younger than [`OP_STORE_GC_GRACE`]: that grace
+//!    is the invariant that lets it run without the lock, because a writer's
+//!    operation not yet named by the heads it read was written after it
+//!    started. Holding the lock instead would stall every landing for the
+//!    collection's length, which is the number of views it deletes.
+//!
+//! Each prune logs one line saying what the truncation, the collection and
+//! the bookmark retirement did, with the truncation's lock hold and the
+//! collection's unlocked time reported apart.
 //!
 //! It never prunes while a reconcile intent for the store is pending or
 //! running, or while the operator's git holds `index.lock` or
@@ -63,8 +87,10 @@
 //! gets one. `refStorePrune: false` opts a store out: it is measured and never
 //! pruned. See [`prune_gate`].
 
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cairn_db::turso::params;
 use serde_json::json;
@@ -78,10 +104,43 @@ use crate::storage::{LocalDb, RowExt};
 
 const DAY: u64 = 24 * 60 * 60;
 
-/// Hidden history, operations, and unreferenced objects younger than this are
-/// kept. A commit older than it that nothing references any more (a rewritten
-/// or abandoned commit cited in an old issue) stops resolving.
+/// Unreferenced objects, the commit metadata of hidden commits, and Cairn's
+/// stranded and rescued refs younger than this are kept. A commit older than
+/// it that nothing references any more (a rewritten or abandoned commit cited
+/// in an old issue) stops resolving.
 pub(crate) const RETENTION: Duration = Duration::from_secs(30 * DAY);
+
+/// How far back the operation log is kept. Every operation's view snapshots
+/// every ref and head (about 860 KB each on the Cairn store, written some
+/// 4,400 times a day), so this window, not [`RETENTION`], is what bounds the
+/// store. Nothing in flight depends on an older operation: every restore runs
+/// under the store lock from a snapshot taken under the same hold, and the
+/// truncation takes that lock. The window only decides how far back
+/// `jj op log` can look. A commit hidden longer ago than this loses its keep
+/// ref, but its objects stay in Git until the reclaim.
+pub(crate) const OP_LOG_WINDOW: Duration = Duration::from_secs(7 * DAY);
+
+/// Unreachable operations and views younger than this survive a collection:
+/// long enough for a writer outside the store lock to land the operation-head
+/// update that names the operation it just wrote.
+const OP_STORE_GC_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// The truncation's rewrite holds the store lock; past this it stops with
+/// nothing changed. Rewriting 33,306 retained operations took 182 s on a copy
+/// of the Cairn store.
+const TRUNCATION_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// The longest one hold of the store lock retiring finished bookmarks. Each
+/// retirement is a jj transaction that writes a full view, and a landing that
+/// waits behind the hold is what this protects.
+const BOOKMARK_HOLD: Duration = Duration::from_secs(60);
+/// How long one prune spends retiring finished bookmarks, across holds.
+const BOOKMARK_BUDGET: Duration = Duration::from_secs(15 * 60);
+/// Finished branches reserved ahead of one hold.
+const BOOKMARK_SLICE: usize = 100;
+/// A finished branch someone else holds reserved is in use; it is not waited
+/// for, only counted and left for the next prune.
+const BOOKMARK_RESERVE_WAIT: Duration = Duration::from_millis(200);
 
 /// How long a loose keep ref is spared without being an index head: long enough
 /// for a writer to commit the operation that names its commit.
@@ -93,13 +152,10 @@ const CHECK_REF_GRACE: Duration = Duration::from_secs(60 * 60);
 
 const MEASURE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const PRUNE_INTERVAL: Duration = Duration::from_secs(DAY);
-/// Truncation rewrites every retained operation and reindexes the store under
-/// the store lock (about a minute on the Cairn project itself), so it runs at
-/// most weekly.
-const TRUNCATE_INTERVAL: Duration = Duration::from_secs(7 * DAY);
 /// An enabled store whose operation log has gone this long without a
-/// truncation is not being bounded, whatever its ref sweeps report.
-pub(crate) const TRUNCATION_OVERDUE: Duration = Duration::from_secs(14 * DAY);
+/// truncation is not being bounded, whatever its ref sweeps report. Every
+/// prune truncates, so this matches [`PRUNE_OVERDUE`].
+pub(crate) const TRUNCATION_OVERDUE: Duration = Duration::from_secs(2 * DAY);
 /// An enabled store whose last successful prune is older than this is overdue.
 pub(crate) const PRUNE_OVERDUE: Duration = Duration::from_secs(2 * DAY);
 
@@ -198,7 +254,7 @@ async fn run_pass(orch: &Orchestrator) {
         };
         let db = &orch.db.local;
         record_measurement(db, &project, &census, &objects, started).await;
-        let last_ok = last_successful_prune(db, &project.store, false).await;
+        let last_ok = last_successful_prune(db, &project.store).await;
         let gate = prune_gate(
             prune_policy(db, &project.store).await,
             last_ok.is_some(),
@@ -621,26 +677,37 @@ pub(crate) async fn set_prune_confirmed(
     .map_err(|error| format!("record the ref-store prune setting: {error}"))
 }
 
-/// When the store's refs were last swept and collected (`truncations_only`
-/// false), which a partial prune did too; or when its operation log was last
-/// truncated (`true`). A partial prune whose truncation was refused records no
-/// `ops_reparented`, so it never counts as a truncation; one that truncated and
-/// then failed only its reclaim does.
-async fn last_successful_prune(db: &LocalDb, store: &Path, truncations_only: bool) -> Option<i64> {
-    let sql = if truncations_only {
-        "SELECT MAX(started_at) FROM ref_store_samples
-         WHERE store_path = ?1 AND kind = 'prune' AND ops_reparented IS NOT NULL
-           AND (outcome = 'ok' OR outcome LIKE 'partial:%')"
-    } else {
+/// When the store's refs were last swept and collected, which a partial prune
+/// did too.
+async fn last_successful_prune(db: &LocalDb, store: &Path) -> Option<i64> {
+    db.query_opt(
         "SELECT MAX(started_at) FROM ref_store_samples
          WHERE store_path = ?1 AND kind = 'prune'
-           AND (outcome = 'ok' OR outcome LIKE 'partial:%')"
-    };
-    db.query_opt(sql, params![store_key(store)], |row| row.opt_i64(0))
-        .await
-        .ok()
-        .flatten()
-        .flatten()
+           AND (outcome = 'ok' OR outcome LIKE 'partial:%')",
+        params![store_key(store)],
+        |row| row.opt_i64(0),
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+}
+
+/// When the store's operation log was last truncated. Every prune truncates,
+/// but one whose truncation was refused records no `ops_reparented` and so
+/// does not count; one that truncated and then failed only its reclaim does.
+async fn last_truncation(db: &LocalDb, store: &Path) -> Option<i64> {
+    db.query_opt(
+        "SELECT MAX(started_at) FROM ref_store_samples
+         WHERE store_path = ?1 AND kind = 'prune' AND ops_reparented IS NOT NULL
+           AND (outcome = 'ok' OR outcome LIKE 'partial:%')",
+        params![store_key(store)],
+        |row| row.opt_i64(0),
+    )
+    .await
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 /// When a prune last reclaimed unreferenced objects: the latest prune that ran
@@ -674,10 +741,15 @@ struct PruneReport {
     store_bytes_before: Option<u64>,
     store_bytes_after: Option<u64>,
     cairn: CairnRefSweep,
+    /// Finished branches whose local bookmark was retired, or why the step
+    /// could not run.
+    bookmarks: Option<Result<BookmarkRetirements, String>>,
     /// Finished branches whose origin tracking ref the view sweep retired, or
     /// why it could not.
     tracking_refs: Option<Result<crate::jj::RetiredTrackingRefs, String>>,
     view: Option<crate::jj::StoreViewSweep>,
+    /// The operation log was cut at this unix time.
+    truncation_cutoff: Option<i64>,
     truncation: Option<OperationLogTruncation>,
     truncation_refusal: Option<String>,
     gc: Option<StoreGarbageCollection>,
@@ -766,6 +838,18 @@ async fn run_prune(
         .await
         .map_err(failed)?;
 
+    // Ahead of the view sweep, so the commits a retired bookmark alone kept
+    // visible are hidden by this same prune. Like the sweep, it never holds
+    // back the rest of the prune.
+    let bookmarks = retire_finished_bookmarks(orch, project).await;
+    if let Err(error) = &bookmarks {
+        log::warn!(
+            "ref-store prune of {}: retiring finished branches' bookmarks: {error}",
+            store.display()
+        );
+    }
+    report.bookmarks = Some(bookmarks);
+
     // The view sweep only hides; a skipped or failed one leaves residue the
     // next prune collects, so it never holds back the rest of this one.
     match sweep_view(orch, project).await {
@@ -814,12 +898,8 @@ async fn run_prune(
         Err(outcome) => log::warn!("store view sweep of {}: {outcome}", store.display()),
     }
 
-    let now = unix_now();
-    let truncation_due = last_successful_prune(&orch.db.local, &store, true)
-        .await
-        .is_none_or(|last| now - last >= TRUNCATE_INTERVAL.as_secs() as i64);
-    if truncation_due {
-        let Ok(_guard) = orch
+    {
+        let Ok(guard) = orch
             .acquire_jj_store_lock_with_timeout(
                 &store,
                 crate::orchestrator::StoreLockClass::Background,
@@ -835,31 +915,38 @@ async fn run_prune(
         if reconcile_in_flight(orch, &store).await {
             return Err("skipped:reconcile-in-flight".into());
         }
-        let cutoff = SystemTime::now() - RETENTION;
-        let result = blocking({
-            let store = store.clone();
-            move || crate::jj::truncate_operation_log(&store, cutoff)
-        })
-        .await;
+        let cutoff = SystemTime::now() - OP_LOG_WINDOW;
+        report.truncation_cutoff = Some(unix_of(cutoff));
+        let deadline = Instant::now() + TRUNCATION_BUDGET;
+        let result =
+            crate::jj::in_place_blocking(|| truncate_under_lock(&guard, &store, cutoff, deadline));
         match result {
             Ok(truncation) => report.truncation = Some(truncation),
-            // A live foreign workspace refuses with nothing changed; the rest
-            // of the pass still bounds the refs.
+            // A live foreign workspace, or the deadline, refuses with nothing
+            // changed; the rest of the pass still bounds the refs.
             Err(error) if error.contains("refused") => report.truncation_refusal = Some(error),
             Err(error) => return Err(failed(error)),
         }
     }
 
+    // Outside the store lock: see the module documentation for why the grace
+    // makes that safe.
     let gc = blocking({
         let store = store.clone();
         move || {
             let now = SystemTime::now();
-            crate::jj::collect_store_garbage(&store, now - RETENTION, now - KEEP_REF_GRACE)
+            crate::jj::collect_store_garbage(
+                &store,
+                now - OP_STORE_GC_GRACE,
+                now - RETENTION,
+                now - KEEP_REF_GRACE,
+            )
         }
     })
     .await
     .map_err(failed)?;
     report.gc = Some(gc);
+    log::info!("{}", prune_summary(&store, report));
 
     // After the keep refs were recreated, so every hidden commit inside the
     // window is reachable when the repack walks; outside every Cairn lock,
@@ -914,6 +1001,262 @@ async fn run_prune(
     Ok(())
 }
 
+/// Truncate `store`'s operation log at `cutoff`, under the store lock `guard`
+/// must be. The truncation gives every retained operation a new id, so a
+/// caller without the lock could cross a landing that snapshotted one for
+/// rollback; this refuses, with nothing changed, unless `guard` covers the
+/// store.
+pub(crate) fn truncate_under_lock(
+    guard: &crate::orchestrator::JjStoreGuard,
+    store: &Path,
+    cutoff: SystemTime,
+    deadline: Instant,
+) -> Result<OperationLogTruncation, String> {
+    if !guard.covers(store) {
+        return Err(format!(
+            "operation-log truncation refused: it needs the lock of {}, which this caller does \
+             not hold; nothing was changed",
+            store.display()
+        ));
+    }
+    crate::jj::truncate_operation_log(store, cutoff, deadline)
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The one line a prune logs about what bounded the store: the bookmark
+/// retirement and its lock holds, the truncation and its lock hold, and the
+/// unlocked collection, each timed apart.
+fn prune_summary(store: &Path, report: &PruneReport) -> String {
+    let mut parts = Vec::new();
+    match &report.bookmarks {
+        Some(Ok(bookmarks)) if bookmarks.candidates > 0 => parts.push(format!(
+            "retired {} of {} finished branch bookmark(s) in {} lock hold(s) (longest {:.1}s, \
+             {:.1}s in all), kept {}, {} left for the next prune",
+            bookmarks.retired.len(),
+            bookmarks.candidates,
+            bookmarks.holds,
+            bookmarks.longest_hold.as_secs_f64(),
+            bookmarks.duration.as_secs_f64(),
+            if bookmarks.kept.is_empty() {
+                "none".to_string()
+            } else {
+                bookmarks
+                    .kept
+                    .iter()
+                    .map(|(reason, count)| format!("{count} {reason}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            bookmarks.remaining
+        )),
+        _ => {}
+    }
+    let cutoff = report
+        .truncation_cutoff
+        .and_then(|cutoff| chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff, 0))
+        .map(|cutoff| cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "-".to_string());
+    match (&report.truncation, &report.truncation_refusal) {
+        (Some(truncation), _) => parts.push(format!(
+            "truncated the operation log at {cutoff}, reparented {} (truncate {:.1}s, reindex \
+             {:.1}s, under the store lock)",
+            truncation.reparented,
+            truncation.truncate.as_secs_f64(),
+            truncation.reindex.as_secs_f64()
+        )),
+        (None, Some(refusal)) => parts.push(format!("did not truncate: {refusal}")),
+        (None, None) => {}
+    }
+    if let Some(gc) = &report.gc {
+        parts.push(format!(
+            "abandoned {} operation(s), deleted {} view(s) freeing {} (op-store gc {:.1}s, keep \
+             refs and commit metadata {:.1}s, without the lock)",
+            gc.operations_before.saturating_sub(gc.operations_after),
+            gc.views_before.saturating_sub(gc.views_after),
+            mib(gc
+                .op_store_bytes_before
+                .saturating_sub(gc.op_store_bytes_after)),
+            gc.op_store_gc.as_secs_f64(),
+            gc.ref_phase.as_secs_f64()
+        ));
+    }
+    format!(
+        "ref-store prune of {}: {}",
+        store.display(),
+        parts.join("; ")
+    )
+}
+
+/// What retiring finished branches' local bookmarks did in one prune.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BookmarkRetirements {
+    /// Finished branches that still had a local bookmark.
+    pub(crate) candidates: u64,
+    pub(crate) retired: Vec<String>,
+    /// The bookmark went but its git ref could not.
+    pub(crate) partial: u64,
+    /// Kept, counted by [`crate::execution::teardown::Kept::reason`] and the
+    /// sweep's own reasons (`reserved`, `no-resolved-issue`,
+    /// `merge-target-unresolved`).
+    pub(crate) kept: BTreeMap<String, u64>,
+    /// Left for the next prune when this one's budget ran out or the store
+    /// lock could not be had.
+    pub(crate) remaining: u64,
+    pub(crate) holds: u64,
+    pub(crate) longest_hold: Duration,
+    pub(crate) duration: Duration,
+}
+
+impl BookmarkRetirements {
+    fn keep(&mut self, reason: &str) {
+        *self.kept.entry(reason.to_string()).or_default() += 1;
+    }
+}
+
+/// Retire the local bookmarks of finished branches that teardown never
+/// retired, through teardown's own judgement, bounded by time under the lock.
+async fn retire_finished_bookmarks(
+    orch: &Orchestrator,
+    project: &ProjectStore,
+) -> Result<BookmarkRetirements, String> {
+    let started = Instant::now();
+    let store = project.store.clone();
+    let cutoff = unix_now() - FINISHED_BRANCH_GRACE.as_secs() as i64;
+    let finished = finished_branches(orch, project, cutoff).await?;
+    let local = blocking({
+        let store = store.clone();
+        move || {
+            let _lease = crate::jj::StoreObjectLease::for_store(&store)?;
+            crate::jj::local_bookmark_names(&store)
+        }
+    })
+    .await?;
+    let mut report = BookmarkRetirements::default();
+    let mut queue: VecDeque<(String, Option<BranchOwner>)> = finished
+        .into_iter()
+        .filter(|branch| local.contains(&branch.name))
+        .map(|branch| (branch.name, branch.owner))
+        .collect();
+    report.candidates = queue.len() as u64;
+
+    while !queue.is_empty() && started.elapsed() < BOOKMARK_BUDGET {
+        // Reservations come before the store lock, never under it.
+        let mut slice = Vec::new();
+        while slice.len() < BOOKMARK_SLICE {
+            let Some((name, owner)) = queue.pop_front() else {
+                break;
+            };
+            let Some(owner) = owner else {
+                report.keep("no-resolved-issue");
+                continue;
+            };
+            match orch
+                .reserve_branches(
+                    &store,
+                    &[name.as_str()],
+                    "retire a finished branch's bookmark",
+                    BOOKMARK_RESERVE_WAIT,
+                )
+                .await
+            {
+                Ok(reservation) => slice.push((name, owner, reservation)),
+                Err(_) => report.keep("reserved"),
+            }
+        }
+        if slice.is_empty() {
+            continue;
+        }
+        let Ok(guard) = orch
+            .acquire_jj_store_lock_with_timeout(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                "ref-store maintenance: retire finished branches' bookmarks",
+                Some(STORE_LOCK_WAIT),
+            )
+            .await
+        else {
+            requeue(&mut queue, slice);
+            break;
+        };
+        if reconcile_in_flight(orch, &store).await {
+            requeue(&mut queue, slice);
+            break;
+        }
+        let held = Instant::now();
+        let mut unreached = Vec::new();
+        for (name, owner, reservation) in slice {
+            if held.elapsed() >= BOOKMARK_HOLD {
+                unreached.push((name, owner, reservation));
+                continue;
+            }
+            let merge_target = if owner.merged {
+                match crate::execution::teardown::resolve_merge_target_for_source(
+                    &owner.db,
+                    &owner.issue_id,
+                    &name,
+                    &owner.job_ids,
+                )
+                .await
+                {
+                    Some(target) => Some(target),
+                    None => {
+                        report.keep("merge-target-unresolved");
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let outcome = crate::execution::teardown::retire_local_copies(
+                orch,
+                &owner.db,
+                &guard,
+                &reservation,
+                &owner.project_id,
+                &name,
+                &owner.issue_id,
+                merge_target.as_deref(),
+            )
+            .await;
+            match outcome {
+                Ok(crate::execution::teardown::LocalRetirement::Retired { .. }) => {
+                    report.retired.push(name)
+                }
+                Ok(crate::execution::teardown::LocalRetirement::Partial(why)) => {
+                    log::warn!("ref-store prune of {}: {why}", store.display());
+                    report.partial += 1;
+                }
+                Ok(crate::execution::teardown::LocalRetirement::Kept(_)) => {
+                    report.keep("not-proven")
+                }
+                Err(kept) => report.keep(kept.reason),
+            }
+        }
+        drop(guard);
+        let hold = held.elapsed();
+        report.holds += 1;
+        report.longest_hold = report.longest_hold.max(hold);
+        requeue(&mut queue, unreached);
+    }
+    report.remaining = queue.len() as u64;
+    report.duration = started.elapsed();
+    Ok(report)
+}
+
+/// Put reserved branches a hold did not reach back at the front of the
+/// queue, releasing their reservations.
+fn requeue(
+    queue: &mut VecDeque<(String, Option<BranchOwner>)>,
+    slice: Vec<(String, BranchOwner, crate::orchestrator::BranchReservation)>,
+) {
+    for (name, owner, _reservation) in slice.into_iter().rev() {
+        queue.push_front((name, Some(owner)));
+    }
+}
+
 /// Retire finished branches' tracking refs, then sweep the store's view, under
 /// the store lock, which every reconcile and replay takes, so no rewrite is
 /// between naming a commit and anchoring it. A retirement that fails is
@@ -943,7 +1286,14 @@ async fn sweep_view(
         return Err("skipped:reconcile-in-flight".into());
     }
     let cutoff = unix_now() - FINISHED_BRANCH_GRACE.as_secs() as i64;
-    let finished = finished_branches(orch, project, cutoff).await;
+    let finished = finished_branches(orch, project, cutoff)
+        .await
+        .map(|finished| {
+            finished
+                .into_iter()
+                .map(|branch| branch.name)
+                .collect::<Vec<_>>()
+        });
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = project.store.clone();
     let bases = project.base_branches.clone();
@@ -1028,6 +1378,43 @@ fn is_resolution(status: &str) -> bool {
     matches!(status, "merged" | "closed")
 }
 
+/// A finished agent branch, and the resolved issue whose teardown judgement
+/// decides whether its local bookmark may go.
+#[derive(Clone)]
+struct FinishedBranch {
+    name: String,
+    owner: Option<BranchOwner>,
+}
+
+/// The resolved issue a finished branch is retired as: a merged one if any
+/// merged issue names the branch (its landing proof is the stricter rule),
+/// otherwise the latest closed one.
+#[derive(Clone)]
+struct BranchOwner {
+    db: Arc<LocalDb>,
+    project_id: String,
+    issue_id: String,
+    merged: bool,
+    resolved_at: i64,
+    /// The issue's nodes on the branch, for teardown's merge-target fallback.
+    job_ids: Vec<String>,
+}
+
+impl BranchOwner {
+    /// Offer a resolved issue naming the branch; keep whichever governs.
+    fn offer(slot: &mut Option<BranchOwner>, candidate: BranchOwner) {
+        match slot {
+            Some(known) if known.issue_id == candidate.issue_id => {
+                known.job_ids.extend(candidate.job_ids);
+            }
+            Some(known)
+                if (known.merged, known.resolved_at)
+                    >= (candidate.merged, candidate.resolved_at) => {}
+            _ => *slot = Some(candidate),
+        }
+    }
+}
+
 /// The agent branches of `project`'s store that every database's records say
 /// were finished by `cutoff`. An unreadable record is not evidence that nothing
 /// holds a branch, so any read failure retires nothing.
@@ -1035,7 +1422,7 @@ async fn finished_branches(
     orch: &Orchestrator,
     project: &ProjectStore,
     cutoff: i64,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<FinishedBranch>, String> {
     let mut serves_store = std::collections::HashMap::<String, bool>::new();
     let mut on_store = |repo_path: &str| {
         *serves_store
@@ -1045,12 +1432,34 @@ async fn finished_branches(
                     == project.store
             })
     };
-    let mut branches = std::collections::BTreeMap::<String, BranchLifecycle>::new();
+    let mut branches =
+        std::collections::BTreeMap::<String, (BranchLifecycle, Option<BranchOwner>)>::new();
     for db in orch.db.all_dbs().await {
+        let owner = |project_id: String,
+                     issue_id: Option<String>,
+                     issue_status: Option<&str>,
+                     resolved_at: Option<i64>,
+                     job_id: Option<String>| {
+            let issue_id = issue_id?;
+            let merged = match issue_status? {
+                "merged" => true,
+                "closed" => false,
+                _ => return None,
+            };
+            Some(BranchOwner {
+                db: db.clone(),
+                project_id,
+                issue_id,
+                merged,
+                resolved_at: resolved_at.unwrap_or(0),
+                job_ids: job_id.into_iter().collect(),
+            })
+        };
         let jobs = db
             .query_all(
                 "SELECT p.repo_path, j.branch, j.status, i.status,
-                        COALESCE(i.merged_at, i.closed_at, i.updated_at)
+                        COALESCE(i.merged_at, i.closed_at, i.updated_at),
+                        j.id, j.project_id, j.issue_id
                  FROM jobs j
                  JOIN projects p ON p.id = j.project_id
                  LEFT JOIN issues i ON i.id = j.issue_id
@@ -1063,17 +1472,32 @@ async fn finished_branches(
                         row.text(2)?,
                         row.opt_text(3)?,
                         row.opt_i64(4)?,
+                        row.text(5)?,
+                        row.text(6)?,
+                        row.opt_text(7)?,
                     ))
                 },
             )
             .await
             .map_err(|error| format!("read the nodes on agent branches: {error}"))?;
-        for (repo_path, branch, status, issue_status, resolved_at) in jobs {
+        for (repo_path, branch, status, issue_status, resolved_at, job_id, project_id, issue_id) in
+            jobs
+        {
             if on_store(&repo_path) {
                 let issue = issue_status
                     .as_deref()
                     .map(|s| (s, resolved_at.unwrap_or(0)));
-                branches.entry(branch).or_default().job(&status, issue);
+                let entry = branches.entry(branch).or_default();
+                entry.0.job(&status, issue);
+                if let Some(candidate) = owner(
+                    project_id,
+                    issue_id,
+                    issue_status.as_deref(),
+                    resolved_at,
+                    Some(job_id),
+                ) {
+                    BranchOwner::offer(&mut entry.1, candidate);
+                }
             }
         }
 
@@ -1082,7 +1506,8 @@ async fn finished_branches(
                 "SELECT p.repo_path, m.source_branch, m.status, m.github_state,
                         m.github_pr_number IS NOT NULL,
                         COALESCE(m.merged_at, m.closed_at, m.updated_at),
-                        i.status, COALESCE(i.merged_at, i.closed_at, i.updated_at)
+                        i.status, COALESCE(i.merged_at, i.closed_at, i.updated_at),
+                        m.project_id, m.issue_id
                  FROM merge_requests m
                  JOIN projects p ON p.id = m.project_id
                  LEFT JOIN issues i ON i.id = m.issue_id
@@ -1090,50 +1515,60 @@ async fn finished_branches(
                 (),
                 |row| {
                     Ok((
-                        row.text(0)?,
-                        row.text(1)?,
-                        row.text(2)?,
-                        row.opt_text(3)?,
-                        row.i64(4)? != 0,
-                        row.i64(5)?,
-                        row.opt_text(6)?,
-                        row.opt_i64(7)?,
+                        (
+                            row.text(0)?,
+                            row.text(1)?,
+                            row.text(2)?,
+                            row.opt_text(3)?,
+                            row.i64(4)? != 0,
+                            row.i64(5)?,
+                        ),
+                        (
+                            row.opt_text(6)?,
+                            row.opt_i64(7)?,
+                            row.text(8)?,
+                            row.opt_text(9)?,
+                        ),
                     ))
                 },
             )
             .await
             .map_err(|error| format!("read the pull requests from agent branches: {error}"))?;
         for (
-            repo_path,
-            branch,
-            status,
-            github_state,
-            published,
-            settled_at,
-            issue_status,
-            resolved_at,
+            (repo_path, branch, status, github_state, published, settled_at),
+            (issue_status, resolved_at, project_id, issue_id),
         ) in pull_requests
         {
             if on_store(&repo_path) {
                 let issue = issue_status
                     .as_deref()
                     .map(|s| (s, resolved_at.unwrap_or(0)));
-                branches.entry(branch).or_default().pull_request(
+                let entry = branches.entry(branch).or_default();
+                entry.0.pull_request(
                     &status,
                     github_state.as_deref(),
                     published,
                     settled_at,
                     issue,
                 );
+                if let Some(candidate) = owner(
+                    project_id,
+                    issue_id,
+                    issue_status.as_deref(),
+                    resolved_at,
+                    None,
+                ) {
+                    BranchOwner::offer(&mut entry.1, candidate);
+                }
             }
         }
     }
     Ok(branches
         .into_iter()
-        .filter(|(branch, lifecycle)| {
+        .filter(|(branch, (lifecycle, _))| {
             lifecycle.finished_by(cutoff) && !project.base_branches.contains(branch)
         })
-        .map(|(branch, _)| branch)
+        .map(|(name, (_, owner))| FinishedBranch { name, owner })
         .collect())
 }
 
@@ -1388,6 +1823,23 @@ async fn record_prune(
             "stranded_unattributed": report.cairn.stranded_unattributed,
             "locked": report.cairn.locked,
         },
+        "bookmarks": match &report.bookmarks {
+            // A retired bookmark's last value is in the operation log for
+            // the operation-log window; the names say which to look up.
+            Some(Ok(bookmarks)) => json!({
+                "candidates": bookmarks.candidates,
+                "retired": bookmarks.retired.len(),
+                "partial": bookmarks.partial,
+                "kept": bookmarks.kept,
+                "remaining": bookmarks.remaining,
+                "holds": bookmarks.holds,
+                "longest_hold_ms": bookmarks.longest_hold.as_millis() as u64,
+                "duration_ms": bookmarks.duration.as_millis() as u64,
+                "branches": bookmarks.retired,
+            }),
+            Some(Err(error)) => json!({ "failed": error }),
+            None => serde_json::Value::Null,
+        },
         "origin_tracking_refs": match &report.tracking_refs {
             // Deleting a ref deletes its reflog, so the refs and objects
             // recorded here are the only way to re-create them.
@@ -1409,6 +1861,7 @@ async fn record_prune(
             "bookmarks_settled": sweep.bookmarks_resolved.len(),
         })),
         "truncation": report.truncation.as_ref().map(|truncation| json!({
+            "cutoff": report.truncation_cutoff,
             "reparented": truncation.reparented,
             "truncate_ms": truncation.truncate.as_millis() as u64,
             "reindex_ms": truncation.reindex.as_millis() as u64,
@@ -1421,6 +1874,10 @@ async fn record_prune(
             "keep_refs_locked": gc.keep_refs_locked,
             "operations_before": gc.operations_before,
             "operations_after": gc.operations_after,
+            "views_before": gc.views_before,
+            "views_after": gc.views_after,
+            "op_store_bytes_before": gc.op_store_bytes_before,
+            "op_store_bytes_after": gc.op_store_bytes_after,
             "op_store_gc_ms": gc.op_store_gc.as_millis() as u64,
             "ref_phase_ms": gc.ref_phase.as_millis() as u64,
         })),
@@ -1629,6 +2086,14 @@ pub(crate) struct PruneSample {
     pub(crate) removed_cairn_refs: Option<i64>,
     pub(crate) ops_abandoned: Option<i64>,
     pub(crate) truncated: bool,
+    /// Operation views the collection deleted, and the operation-store bytes
+    /// that freed.
+    pub(crate) views_deleted: Option<u64>,
+    pub(crate) op_store_bytes_freed: Option<u64>,
+    /// Finished branches' bookmarks this prune retired, and how many it left
+    /// for the next one.
+    pub(crate) bookmarks_retired: Option<u64>,
+    pub(crate) bookmarks_remaining: Option<u64>,
     /// Why the reclaim this prune was due to run did not.
     pub(crate) reclaim_skipped: Option<String>,
     /// git's error from this prune's reclaim.
@@ -1710,6 +2175,14 @@ pub(crate) async fn ref_store_overview(
                 };
                 let reclaim_skipped = objects("skipped");
                 let reclaim_failed = objects("failed");
+                let count = |pointer: &str| {
+                    detail
+                        .as_ref()?
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_u64)
+                };
+                let drop =
+                    |before: &str, after: &str| Some(count(before)?.saturating_sub(count(after)?));
                 Ok(PruneSample {
                     started_at: row.i64(0)?,
                     outcome: row.text(1)?,
@@ -1718,6 +2191,13 @@ pub(crate) async fn ref_store_overview(
                     removed_cairn_refs: row.opt_i64(4)?,
                     ops_abandoned: row.opt_i64(5)?,
                     truncated: row.opt_i64(6)?.is_some(),
+                    views_deleted: drop("/gc/views_before", "/gc/views_after"),
+                    op_store_bytes_freed: drop(
+                        "/gc/op_store_bytes_before",
+                        "/gc/op_store_bytes_after",
+                    ),
+                    bookmarks_retired: count("/bookmarks/retired"),
+                    bookmarks_remaining: count("/bookmarks/remaining"),
                     reclaim_skipped,
                     reclaim_failed,
                 })
@@ -1772,8 +2252,8 @@ pub(crate) async fn ref_store_overview(
         day_ago: sample_at_or_before(db, project_id, now - DAY as i64).await,
         week_ago: sample_at_or_before(db, project_id, now - 7 * DAY as i64).await,
         last_prune,
-        last_ok_prune_at: last_successful_prune(db, &store, false).await,
-        last_truncation_at: last_successful_prune(db, &store, true).await,
+        last_ok_prune_at: last_successful_prune(db, &store).await,
+        last_truncation_at: last_truncation(db, &store).await,
         objects,
         last_compaction,
         last_reclaim,

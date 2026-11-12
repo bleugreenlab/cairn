@@ -217,74 +217,28 @@ async fn retire_branch(
         Ok(guard) => guard,
         Err(()) => return keep("the store is busy".into()),
     };
-    // Recording a recovery takes this same lock, so a fence recorded just
-    // before is seen here. A head a fence holds is kept: its coordinates are
-    // the repair's, not this retirement's to change.
-    if let Err(refusal) = crate::orchestrator::branch_recovery::refuse_coordinate_if_fenced(
+    let outcome = retire_local_copies(
         orch,
-        &store,
-        &[branch],
-        "Retiring this branch",
+        db,
+        &guard,
+        &reservation,
+        &target.project_id,
+        branch,
+        issue_id,
+        merge_target.as_deref(),
     )
-    .await
-    {
-        return keep(refusal);
-    }
-    // Read under the reservation and the lock: work cut from the branch, or a
-    // new owner, may have appeared while this waited for them.
-    match protection(db, &target.project_id, branch, merge_target.as_deref()).await {
-        Ok(None) => {}
-        Ok(Some(why)) => return keep(why),
-        Err(error) => return keep(format!("whether it is still in use is unknown ({error})")),
-    }
-    let recorded = match merge_target {
-        Some(_) => match recorded_source_commit(db, issue_id, branch).await {
-            Ok(recorded) => recorded,
-            Err(error) => return keep(error),
-        },
-        None => None,
-    };
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let outcome = {
-        // Admission immediately before the decision and the delete: the
-        // branch is reserved by this caller and owes no acceptance (a write
-        // whose acceptance is unsettled may or may not be in its bookmark, so
-        // its content is not known). Refused means kept, locally and on origin.
-        let permit = match guard
-            .branch_write_permit(
-                db,
-                &reservation,
-                &target.project_id,
-                branch,
-                crate::orchestrator::BatchAdmission::None,
-            )
-            .await
-        {
-            Ok(permit) => permit,
-            Err(refusal) => return keep(refusal.to_string()),
-        };
-        // The judgement and the delete are blocking jj and git work; the
-        // permit borrows the guard, so they run in place on this worker
-        // thread, handed off from the runtime, rather than on a pooled task.
-        crate::jj::in_place_blocking(|| {
-            retire_locally(
-                &jj,
-                &store,
-                branch,
-                merge_target.as_deref(),
-                recorded.as_deref(),
-                &permit,
-                &guard,
-            )
-        })
-    };
+    .await;
     // The lock ends with the local half; the reservation outlives it, through
     // the remote delete and its record.
     drop(guard);
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(kept) => return keep(kept.why),
+    };
     match outcome {
-        Ok(LocalRetirement::Retired {
+        LocalRetirement::Retired {
             tracked_origin: Some(origin),
-        }) => {
+        } => {
             retire_remote_copy(
                 orch,
                 db,
@@ -296,14 +250,121 @@ async fn retire_branch(
             )
             .await
         }
-        Ok(LocalRetirement::Retired {
+        LocalRetirement::Retired {
             tracked_origin: None,
-        }) => log::info!("Teardown: retired `{branch}`; origin has no tracked copy to retire"),
-        Ok(LocalRetirement::Kept(why)) => keep(why),
-        Ok(LocalRetirement::Partial(why)) => {
+        } => log::info!("Teardown: retired `{branch}`; origin has no tracked copy to retire"),
+        LocalRetirement::Kept(why) => keep(why),
+        LocalRetirement::Partial(why) => {
             log::warn!("Teardown: {why}; its origin copy is kept")
         }
-        Err(error) => keep(error),
+    }
+}
+
+/// Why a retirement kept a branch: a stable key to count kept branches by,
+/// and the sentence that says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Kept {
+    pub(crate) reason: &'static str,
+    pub(crate) why: String,
+}
+
+impl Kept {
+    fn new(reason: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            reason,
+            why: why.into(),
+        }
+    }
+}
+
+/// The one judgement of whether a resolved branch's local copies may go, and
+/// their retirement when they may. Teardown runs it when an issue resolves;
+/// the ref-store prune runs it for branches finished before teardown retired
+/// bookmarks at all.
+///
+/// The caller holds `branch` reserved and then the store lock (`guard`), in
+/// that order. `merge_target` is `None` for a discarded (closed) issue, whose
+/// branch needs no landing proof; a merged one is retired only as its landing
+/// recorded it (see [`retire_locally`]). Only the local copies are touched:
+/// a retired branch's origin copy, if the store still tracks one, is named in
+/// the result for the caller to retire or leave.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retire_local_copies(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    guard: &crate::orchestrator::JjStoreGuard,
+    reservation: &crate::orchestrator::BranchReservation,
+    project_id: &str,
+    branch: &str,
+    issue_id: &str,
+    merge_target: Option<&str>,
+) -> Result<LocalRetirement, Kept> {
+    let store = guard.store_path().to_path_buf();
+    // Recording a recovery takes this same lock, so a fence recorded just
+    // before is seen here. A head a fence holds is kept: its coordinates are
+    // the repair's, not this retirement's to change.
+    crate::orchestrator::branch_recovery::refuse_coordinate_if_fenced(
+        orch,
+        &store,
+        &[branch],
+        "Retiring this branch",
+    )
+    .await
+    .map_err(|refusal| Kept::new("fenced", refusal))?;
+    // Read under the reservation and the lock: work cut from the branch, or a
+    // new owner, may have appeared while this waited for them.
+    match protection(db, project_id, branch, merge_target).await {
+        Ok(None) => {}
+        Ok(Some(why)) => return Err(Kept::new("in-use", why)),
+        Err(error) => {
+            return Err(Kept::new(
+                "use-unknown",
+                format!("whether it is still in use is unknown ({error})"),
+            ))
+        }
+    }
+    let recorded = match merge_target {
+        Some(_) => recorded_source_commit(db, issue_id, branch)
+            .await
+            .map_err(|error| Kept::new("landing-record-unreadable", error))?,
+        None => None,
+    };
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    // Admission immediately before the decision and the delete: the branch is
+    // reserved by this caller and owes no acceptance (a write whose acceptance
+    // is unsettled may or may not be in its bookmark, so its content is not
+    // known). Refused means kept, locally and on origin.
+    let permit = guard
+        .branch_write_permit(
+            db,
+            reservation,
+            project_id,
+            branch,
+            crate::orchestrator::BatchAdmission::None,
+        )
+        .await
+        .map_err(|refusal| Kept::new("not-admitted", refusal.to_string()))?;
+    // The judgement and the delete are blocking jj and git work; the permit
+    // borrows the guard, so they run in place on this worker thread, handed
+    // off from the runtime, rather than on a pooled task.
+    // Timed as a store-lock phase, so its cost under the lock is in the log.
+    let outcome = guard.blocking_phase("judge and retire a branch's local copies", || {
+        crate::jj::in_place_blocking(|| {
+            retire_locally(
+                &jj,
+                &store,
+                branch,
+                merge_target,
+                recorded.as_deref(),
+                &permit,
+                guard,
+            )
+        })
+    });
+    match outcome {
+        Ok(LocalRetirement::Kept(why)) => Err(Kept::new("not-proven", why)),
+        Ok(outcome) => Ok(outcome),
+        Err(error) => Err(Kept::new("failed", error)),
     }
 }
 
@@ -470,7 +531,7 @@ async fn recorded_source_commit(
 
 /// What the local half of a retirement did.
 #[derive(Debug, PartialEq, Eq)]
-enum LocalRetirement {
+pub(crate) enum LocalRetirement {
     Retired { tracked_origin: Option<String> },
     Kept(String),
     Partial(String),
@@ -781,7 +842,7 @@ pub async fn cleanup_project_jobs(orch: &Orchestrator, project_id: &str) -> Resu
 /// in: the issue's MR `target_branch` first (the real destination), then a
 /// producing job's `base_branch` (its fork point), then the project default
 /// branch. `None` only when the issue's project cannot be resolved at all.
-async fn resolve_merge_target_for_source(
+pub(crate) async fn resolve_merge_target_for_source(
     db: &LocalDb,
     issue_id: &str,
     source_branch: &str,

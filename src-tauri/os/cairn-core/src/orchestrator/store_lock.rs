@@ -1766,7 +1766,8 @@ impl From<BranchAdmissionRefusal> for PreparationRefusal {
 }
 
 impl JjStoreGuard {
-    fn store_path(&self) -> &Path {
+    /// The store this guard locks, as the acquirer named it.
+    pub(crate) fn store_path(&self) -> &Path {
         Path::new(self.trace.store.as_ref())
     }
 

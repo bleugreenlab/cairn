@@ -55,6 +55,19 @@ pub fn read_local_branch_state(store: &Path, branch: &str) -> Result<LocalBranch
     })
 }
 
+/// Every local bookmark the store's one settled operation records, read from
+/// its view without a jj process. The caller holds the store's object lease.
+pub fn local_bookmark_names(store: &Path) -> Result<std::collections::BTreeSet<String>, String> {
+    block_on(async {
+        let repo = settled_repo(store).await?;
+        Ok(repo
+            .view()
+            .local_bookmarks()
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect())
+    })
+}
+
 /// Remove `branch`'s bookmark and git ref if they still hold exactly what
 /// `expected` says. The caller holds the branch reserved and the store lock,
 /// so no Cairn writer moves either between this read and the removal.

@@ -5246,10 +5246,20 @@ mod tests {
         run(&["bookmark", "set", "main", "-r", &owner]);
         assert!(!snapshot.coordinates_match().unwrap());
         assert_eq!(bookmark_commit(&jj, &store, "feature").unwrap(), owner);
-        let error =
-            collect_store_garbage(&store, SystemTime::now(), SystemTime::now()).unwrap_err();
+        let error = collect_store_garbage(
+            &store,
+            SystemTime::now(),
+            SystemTime::now(),
+            SystemTime::now(),
+        )
+        .unwrap_err();
         assert!(error.contains("detached advance"), "{error}");
-        let error = truncate_operation_log(&store, SystemTime::now()).unwrap_err();
+        let error = truncate_operation_log(
+            &store,
+            SystemTime::now(),
+            std::time::Instant::now() + std::time::Duration::from_secs(600),
+        )
+        .unwrap_err();
         assert!(error.contains("detached advance"), "{error}");
         let error = reclaim_unreachable_objects(&store_git_dir(&store).unwrap(), SystemTime::now())
             .unwrap_err();

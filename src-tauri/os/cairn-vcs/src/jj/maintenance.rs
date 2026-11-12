@@ -459,35 +459,67 @@ pub struct OperationLogTruncation {
 /// nothing will load again. Nothing the rewrite writes is visible until the
 /// operation heads move, and that is the last step.
 ///
+/// The rewrite's cost grows with the window it keeps, not with what it drops,
+/// and the caller holds the store lock across it, so it stops at `deadline`.
+/// Everything the store's working copy and operation heads record is changed
+/// only after the rewrite is complete, so a truncation that reaches its
+/// deadline refuses with nothing changed; the rewritten operations it leaves
+/// are unreachable files the next garbage collection deletes.
+///
 /// How many operations became unreachable is not counted here (counting means
 /// loading every one of them); the garbage collection that deletes them reports
 /// it.
 pub fn truncate_operation_log(
     store: &Path,
     older_than: SystemTime,
+    deadline: Instant,
 ) -> Result<OperationLogTruncation, String> {
     let _reclamation = super::object_lease::Reclamation::for_store(store)?;
-    block_on(truncate_operation_log_inner(store, older_than))
+    block_on(truncate_operation_log_inner(store, older_than, deadline))
 }
+
+/// The refusal a truncation that reached its deadline returns.
+pub const TRUNCATION_DEADLINE: &str = "operation-log truncation refused: it reached its deadline";
 
 async fn truncate_operation_log_inner(
     store: &Path,
     older_than: SystemTime,
+    deadline: Instant,
 ) -> Result<OperationLogTruncation, String> {
     let started = Instant::now();
     let mut workspace = crate::load_workspace(store)?;
     let loader = workspace.repo_loader().clone();
     let op_store = loader.op_store().clone();
-    // Loading at head merges divergent operation heads, so the walk below
-    // starts from exactly one.
+    // Loading at head would merge divergent operation heads and publish the
+    // merge, which is a change nobody judged; a split log is refused instead,
+    // and the one head is loaded without touching the heads.
+    let heads = loader
+        .op_heads_store()
+        .get_op_heads()
+        .await
+        .map_err(|error| format!("read the store's operation heads: {error}"))?;
+    let [head_id] = heads.as_slice() else {
+        return Err(format!(
+            "operation-log truncation refused: the store has {} operation heads, and \
+             truncating only from one settled head; nothing was changed",
+            heads.len()
+        ));
+    };
+    past_deadline(deadline, 0, 0)?;
+    let head = loader
+        .load_operation(head_id)
+        .await
+        .map_err(|error| format!("load the store's head operation: {error}"))?;
     let repo = loader
-        .load_at_head()
+        .load_at(&head)
         .await
         .map_err(|error| format!("load the store at its operation head: {error}"))?;
-    let head = repo.operation().clone();
     let mut wc_op_id = workspace.working_copy().operation_id().clone();
     refuse_live_foreign_workspaces(&workspace, &repo)?;
 
+    // A stale working copy is brought to the head only once the rewrite is
+    // complete, so a truncation that stops early leaves it as it was.
+    let mut refresh_working_copy = None;
     let mut cutoff_ms = millis_since_epoch(older_than);
     if wc_op_id != *head.id() {
         let own = workspace.workspace_name().to_owned();
@@ -497,12 +529,7 @@ async fn truncate_operation_log_inner(
                     .store()
                     .get_commit(&wc_commit_id)
                     .map_err(|error| format!("read the store's working-copy commit: {error}"))?;
-                workspace
-                    .check_out(head.id().clone(), None, &wc_commit)
-                    .await
-                    .map_err(|error| {
-                        format!("bring the store's working copy to the head operation: {error}")
-                    })?;
+                refresh_working_copy = Some(wc_commit);
                 wc_op_id = head.id().clone();
             }
             None => {
@@ -548,7 +575,7 @@ async fn truncate_operation_log_inner(
     }
 
     let root = loader.root_operation().await;
-    let rewritten = reparent_onto(op_store.as_ref(), &newest_old, &head, &root).await?;
+    let rewritten = reparent_onto(op_store.as_ref(), &newest_old, &head, &root, deadline).await?;
     let Some(new_head) = rewritten.ids.get(head.id()).cloned() else {
         return Err("operation-log truncation did not rewrite the head operation".to_string());
     };
@@ -563,7 +590,16 @@ async fn truncate_operation_log_inner(
             )
         })?
     };
+    past_deadline(deadline, rewritten.ids.len(), rewritten.ids.len())?;
 
+    if let Some(wc_commit) = refresh_working_copy {
+        workspace
+            .check_out(head.id().clone(), None, &wc_commit)
+            .await
+            .map_err(|error| {
+                format!("bring the store's working copy to the head operation: {error}")
+            })?;
+    }
     loader
         .op_heads_store()
         .update_op_heads(std::slice::from_ref(head.id()), &new_head)
@@ -640,14 +676,17 @@ async fn reparent_onto(
     cut: &Operation,
     head: &Operation,
     dest: &Operation,
+    deadline: Instant,
 ) -> Result<Reparented, String> {
     let to_rewrite: Vec<Operation> =
         op_walk::walk_ancestors_range(std::slice::from_ref(head), std::slice::from_ref(cut))
             .try_collect()
             .await
             .map_err(|error| format!("walk the operation log: {error}"))?;
+    let total = to_rewrite.len();
     let mut ids = HashMap::new();
     for old in to_rewrite.into_iter().rev() {
+        past_deadline(deadline, ids.len(), total)?;
         let mut data = old.store_operation().clone();
         let mut dest_once = Some(dest.id());
         data.parents = data
@@ -665,11 +704,28 @@ async fn reparent_onto(
     Ok(Reparented { ids })
 }
 
+fn past_deadline(deadline: Instant, rewritten: usize, total: usize) -> Result<(), String> {
+    if Instant::now() < deadline {
+        return Ok(());
+    }
+    Err(format!(
+        "{TRUNCATION_DEADLINE} after rewriting {rewritten} of {total} retained operation(s); \
+         nothing was changed"
+    ))
+}
+
 /// What a garbage collection removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoreGarbageCollection {
     pub operations_before: u64,
     pub operations_after: u64,
+    /// View files in the operation store. Each operation snapshots every ref
+    /// and head into one, so they are nearly all of its bytes.
+    pub views_before: u64,
+    pub views_after: u64,
+    /// Bytes of the whole operation store (operations and views).
+    pub op_store_bytes_before: u64,
+    pub op_store_bytes_after: u64,
     /// Visible and hidden heads the retained operation log still names: the
     /// commits that keep a `refs/jj/keep` ref.
     pub index_heads: u64,
@@ -682,7 +738,7 @@ pub struct StoreGarbageCollection {
     pub ref_phase: Duration,
 }
 
-/// Garbage-collect the store, keeping every operation newer than `keep_newer`.
+/// Garbage-collect the store.
 ///
 /// The first two of jj 0.42's `jj util gc` phases: unreachable operations and
 /// views, then the keep refs (recreated for the index heads only) and the
@@ -691,6 +747,17 @@ pub struct StoreGarbageCollection {
 /// third phase, Git objects, is [`reclaim_unreachable_objects`], which the
 /// caller runs after this so every hidden commit inside the window has its
 /// keep ref when the repack walks.
+///
+/// Reachability in the operation store is read from the operation heads when
+/// the collection starts, so `op_store_newer` only has to cover a writer
+/// outside the store lock whose operation and view are written but whose
+/// operation-head update has not landed yet: anything written after the heads
+/// were read is younger than it. It is the grace, not the retention window:
+/// the truncation decides which operations are kept, and sparing every
+/// unreachable view younger than the window would keep the window's views on
+/// disk whatever the truncation dropped. `extras_newer` protects the commit
+/// metadata table, whose entries describe hidden commits the retention window
+/// still keeps.
 ///
 /// Keep refs get their own, much shorter, grace (`keep_refs_newer`). jj spares a
 /// young loose keep ref because the commit it protects may belong to an
@@ -701,37 +768,46 @@ pub struct StoreGarbageCollection {
 /// first pass and would hold a month of them in steady state.
 pub fn collect_store_garbage(
     store: &Path,
-    keep_newer: SystemTime,
+    op_store_newer: SystemTime,
+    extras_newer: SystemTime,
     keep_refs_newer: SystemTime,
 ) -> Result<StoreGarbageCollection, String> {
     let _reclamation = super::object_lease::Reclamation::for_store(store)?;
     block_on(collect_store_garbage_inner(
         store,
-        keep_newer,
+        op_store_newer,
+        extras_newer,
         keep_refs_newer,
     ))
 }
 
 async fn collect_store_garbage_inner(
     store: &Path,
-    keep_newer: SystemTime,
+    op_store_newer: SystemTime,
+    extras_newer: SystemTime,
     keep_refs_newer: SystemTime,
 ) -> Result<StoreGarbageCollection, String> {
     let git_dir = store_git_dir(store)
         .ok_or_else(|| format!("resolve the Git repository behind {}", store.display()))?;
+    let before = OpStoreFootprint::measure(store);
     let mut report = StoreGarbageCollection {
         operations_before: operation_count(store)?,
+        views_before: before.views,
+        op_store_bytes_before: before.bytes,
         ..Default::default()
     };
 
     let started = Instant::now();
     let repo = load_repo(store).await?;
     repo.op_store()
-        .gc(std::slice::from_ref(repo.op_id()), keep_newer)
+        .gc(std::slice::from_ref(repo.op_id()), op_store_newer)
         .await
         .map_err(|error| format!("collect unreachable operations: {error}"))?;
     report.op_store_gc = started.elapsed();
     report.operations_after = operation_count(store)?;
+    let after = OpStoreFootprint::measure(store);
+    report.views_after = after.views;
+    report.op_store_bytes_after = after.bytes;
 
     let started = Instant::now();
     let root_commit = repo.store().root_commit_id().hex();
@@ -752,10 +828,53 @@ async fn collect_store_garbage_inner(
         .get_head()
         .map_err(|error| format!("read the commit metadata table: {error}"))?;
     extras
-        .gc(&extras_head, keep_newer)
+        .gc(&extras_head, extras_newer)
         .map_err(|error| format!("collect the commit metadata table: {error}"))?;
     report.ref_phase = started.elapsed();
     Ok(report)
+}
+
+/// View files and total bytes of the store's operation store, from file
+/// metadata. Only the operation store is walked: the commit metadata table
+/// beside it holds hundreds of thousands of files on a long-lived store.
+struct OpStoreFootprint {
+    views: u64,
+    bytes: u64,
+}
+
+impl OpStoreFootprint {
+    fn measure(store: &Path) -> Self {
+        let op_store = store.join(".jj").join("repo").join("op_store");
+        let mut footprint = Self { views: 0, bytes: 0 };
+        let Ok(entries) = std::fs::read_dir(&op_store) else {
+            return footprint;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let is_views = entry.file_name() == "views";
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    let Ok(files) = std::fs::read_dir(&path) else {
+                        continue;
+                    };
+                    for file in files.filter_map(Result::ok) {
+                        let Ok(metadata) = file.metadata() else {
+                            continue;
+                        };
+                        if metadata.is_file() {
+                            footprint.bytes += metadata.len();
+                            footprint.views += u64::from(is_views);
+                        }
+                    }
+                }
+                Ok(kind) if kind.is_file() => {
+                    footprint.bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                }
+                _ => {}
+            }
+        }
+        footprint
+    }
 }
 
 /// Keep exactly one `refs/jj/keep` ref per index head, plus any loose keep ref
@@ -1367,8 +1486,15 @@ fn block_on<T>(future: impl std::future::Future<Output = Result<T, String>>) -> 
 mod tests {
     use super::super::testing::*;
     use super::super::*;
+    use super::{block_on, load_repo, millis_since_epoch};
+    use futures::TryStreamExt as _;
+    use jj_lib::object_id::ObjectId as _;
+    use jj_lib::op_walk;
+    use jj_lib::operation::Operation;
+    use jj_lib::repo::Repo as _;
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
     use tempfile::TempDir;
 
     #[test]
@@ -1907,7 +2033,7 @@ mod tests {
         assert!(!loose_object_path(&git_dir, &dangling).exists());
 
         let future = SystemTime::now() + Duration::from_secs(60);
-        collect_store_garbage(&fx.store, future, future).unwrap();
+        collect_store_garbage(&fx.store, future, future, future).unwrap();
 
         // Inside the window, the unreferenced object survives in a cruft pack.
         let past = SystemTime::now() - DAY;
@@ -1948,7 +2074,7 @@ mod tests {
         let cutoff = cut_after_rewrites(&fx);
         let operations = operation_count(&fx.store).unwrap();
 
-        let error = truncate_operation_log(&fx.store, cutoff).unwrap_err();
+        let error = truncate_operation_log(&fx.store, cutoff, far_deadline()).unwrap_err();
         assert!(error.contains("refused"), "{error}");
         assert!(error.contains("agent"), "names the live workspace: {error}");
         assert_eq!(
@@ -1960,10 +2086,219 @@ mod tests {
         // A registration whose directory is gone is a leftover, not a reader.
         std::fs::remove_dir_all(&ws).unwrap();
         assert!(
-            truncate_operation_log(&fx.store, cutoff)
+            truncate_operation_log(&fx.store, cutoff, far_deadline())
                 .unwrap()
                 .reparented
                 > 0
         );
+    }
+
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(600)
+    }
+
+    /// One operation as the log holds it, minus its id, which a truncation
+    /// rewrites.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LoggedOperation {
+        description: String,
+        end_ms: i64,
+        view: String,
+    }
+
+    /// The operation log from its head back to the root, the root excluded.
+    fn operation_log(store: &Path) -> Vec<LoggedOperation> {
+        block_on(async {
+            let repo = load_repo(store).await?;
+            let root = repo.op_store().root_operation_id().clone();
+            let ops: Vec<Operation> =
+                op_walk::walk_ancestors(std::slice::from_ref(repo.operation()))
+                    .try_collect()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            Ok(ops
+                .into_iter()
+                .filter(|op| *op.id() != root)
+                .map(|op| LoggedOperation {
+                    description: op.metadata().description.clone(),
+                    end_ms: op.metadata().time.end.timestamp.0,
+                    view: op.view_id().hex(),
+                })
+                .collect())
+        })
+        .unwrap()
+    }
+
+    fn op_heads(store: &Path) -> Vec<String> {
+        let mut heads: Vec<String> = std::fs::read_dir(store.join(".jj/repo/op_heads/heads"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        heads.sort();
+        heads
+    }
+
+    fn working_copy_operation(store: &Path) -> String {
+        crate::load_workspace(store)
+            .unwrap()
+            .working_copy()
+            .operation_id()
+            .hex()
+    }
+
+    fn view_exists(store: &Path, view: &str) -> bool {
+        store.join(".jj/repo/op_store/views").join(view).exists()
+    }
+
+    /// Exactly the operations that ended at or after the cut survive, each
+    /// rewritten with its description, time and view intact; and a store
+    /// whose head is itself older than the cut is left as it was.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn truncation_never_abandons_an_operation_inside_the_window() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping truncation window test: jj not resolvable");
+            return;
+        };
+        let cutoff = cut_after_rewrites(&fx);
+        fx.jj(&["bookmark", "create", "also-after-cut", "-r", "main"]);
+        let before = operation_log(&fx.store);
+        let cutoff_ms = millis_since_epoch(cutoff);
+        let inside: Vec<LoggedOperation> = before
+            .iter()
+            .filter(|op| op.end_ms >= cutoff_ms)
+            .cloned()
+            .collect();
+        assert!(inside.len() >= 2, "precondition: {before:#?}");
+        assert!(
+            inside.len() < before.len(),
+            "precondition: operations before the cut: {before:#?}"
+        );
+
+        let truncation = truncate_operation_log(&fx.store, cutoff, far_deadline()).unwrap();
+
+        assert_eq!(truncation.reparented, inside.len() as u64);
+        assert_eq!(
+            operation_log(&fx.store),
+            inside,
+            "every operation inside the window, and nothing older"
+        );
+        fx.jj(&["log", "-r", "all()", "--no-graph"]);
+
+        // The whole log is now older than a cut taken after its head.
+        std::thread::sleep(Duration::from_millis(50));
+        let after_head = SystemTime::now();
+        let heads = op_heads(&fx.store);
+        let idle = truncate_operation_log(&fx.store, after_head, far_deadline()).unwrap();
+        assert_eq!(idle.reparented, 0);
+        assert_eq!(op_heads(&fx.store), heads, "an idle store is not rewritten");
+        assert_eq!(operation_log(&fx.store), inside);
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_truncation_past_its_deadline_changes_nothing() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping truncation deadline test: jj not resolvable");
+            return;
+        };
+        let cutoff = cut_after_rewrites(&fx);
+        let heads = op_heads(&fx.store);
+        let working_copy = working_copy_operation(&fx.store);
+        let log = operation_log(&fx.store);
+        assert_ne!(
+            working_copy, heads[0],
+            "precondition: the store's working copy is stale, so a truncation would move it"
+        );
+
+        let error = truncate_operation_log(&fx.store, cutoff, Instant::now()).unwrap_err();
+
+        assert!(error.starts_with(TRUNCATION_DEADLINE), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(op_heads(&fx.store), heads);
+        assert_eq!(working_copy_operation(&fx.store), working_copy);
+        assert_eq!(operation_log(&fx.store), log);
+    }
+
+    /// A split operation log would be merged, and the merge published, by
+    /// loading the store at its head. The truncation refuses it before loading
+    /// anything, deadline or not, and leaves every head where it was.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_truncation_refuses_a_split_operation_log_without_merging_it() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping split operation log test: jj not resolvable");
+            return;
+        };
+        let cutoff = cut_after_rewrites(&fx);
+        let earlier = fx.jj(&["op", "log", "--no-graph", "-T", "id ++ \"\\n\""]);
+        let earlier = earlier
+            .lines()
+            .nth(2)
+            .expect("an operation before the head");
+        std::fs::write(fx.store.join(".jj/repo/op_heads/heads").join(earlier), "").unwrap();
+        let heads = op_heads(&fx.store);
+        assert_eq!(heads.len(), 2, "precondition: a split log");
+        let working_copy = working_copy_operation(&fx.store);
+
+        for deadline in [Instant::now(), far_deadline()] {
+            let error = truncate_operation_log(&fx.store, cutoff, deadline).unwrap_err();
+            assert!(error.contains("refused"), "{error}");
+            assert!(error.contains("2 operation heads"), "{error}");
+            assert!(error.contains("nothing was changed"), "{error}");
+            assert_eq!(op_heads(&fx.store), heads, "the split was not merged");
+            assert_eq!(working_copy_operation(&fx.store), working_copy);
+        }
+    }
+
+    /// What frees the bytes: the truncation only rewrites, and the collection
+    /// after it deletes the views only abandoned operations named.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn the_op_store_collection_deletes_abandoned_views_past_its_grace() {
+        let Some(fx) = Fixture::new() else {
+            eprintln!("skipping op-store collection test: jj not resolvable");
+            return;
+        };
+        let cutoff = cut_after_rewrites(&fx);
+        let before = operation_log(&fx.store);
+        truncate_operation_log(&fx.store, cutoff, far_deadline()).unwrap();
+        let retained: HashSet<String> = operation_log(&fx.store)
+            .into_iter()
+            .map(|op| op.view)
+            .collect();
+        let abandoned: HashSet<String> = before
+            .into_iter()
+            .map(|op| op.view)
+            .filter(|view| !retained.contains(view))
+            .collect();
+        assert!(!abandoned.is_empty(), "precondition");
+        assert!(abandoned.iter().all(|view| view_exists(&fx.store, view)));
+
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let past = SystemTime::now() - DAY;
+        let gc = collect_store_garbage(&fx.store, future, past, future).unwrap();
+
+        for view in &abandoned {
+            assert!(
+                !view_exists(&fx.store, view),
+                "abandoned view {view} survived"
+            );
+        }
+        for view in &retained {
+            assert!(view_exists(&fx.store, view), "retained view {view} is gone");
+        }
+        let on_disk = std::fs::read_dir(fx.store.join(".jj/repo/op_store/views"))
+            .unwrap()
+            .count() as u64;
+        assert_eq!(gc.views_after, on_disk);
+        assert!(
+            gc.views_before >= gc.views_after + abandoned.len() as u64,
+            "{gc:?}"
+        );
+        assert!(gc.op_store_bytes_before > gc.op_store_bytes_after, "{gc:?}");
+        assert!(gc.operations_before > gc.operations_after, "{gc:?}");
+        fx.jj(&["log", "-r", "all()", "--no-graph"]);
     }
 }
