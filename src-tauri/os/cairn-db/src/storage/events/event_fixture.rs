@@ -320,6 +320,9 @@ pub fn render_targets(targets: &[(&str, &[u8])]) -> String {
 pub enum MixedSection<'a> {
     File(&'a str, &'a [u8]),
     Resource(&'a str, &'a str),
+    /// A `file:` image target whose bytes the live read promoted to this
+    /// stored-image URI, as `durable_images` records it on the block.
+    PromotedImage(&'a str, &'a [u8], &'a str),
 }
 
 /// Compose a mixed read batch exactly as the live `read_batch` did (and as
@@ -340,6 +343,15 @@ pub fn mixed_render_targets(sections: &[MixedSection]) -> String {
                 *body,
                 SegmentMeta::new(*uri, SegmentKind::Resource, NaturalUnit::Line),
             ),
+            MixedSection::PromotedImage(target, bytes, uri) => {
+                let mut segment = renderer
+                    .produce_archived_file_segment(target, bytes)
+                    .expect("produce archived image segment");
+                for image in &mut segment.images {
+                    image.uri = Some(uri.to_string());
+                }
+                segment
+            }
         })
         .collect();
     crate::storage::render::assemble(

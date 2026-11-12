@@ -6,7 +6,7 @@ use crate::mcp::handlers::read::view;
 use crate::mcp::types::McpCallbackRequest;
 use cairn_common::executor_protocol::{relay_wire_len, RELAY_RESPONSE_BYTE_BUDGET};
 use cairn_common::read::{
-    elide_tail_biased, ImageBlock, OverCeiling, OverCeilingItem, RunBatchEnvelope,
+    AnchoredText, ImageBlock, OverCeiling, OverCeilingItem, RunBatchEnvelope,
 };
 
 /// What a batch composed for code may carry in total, measured as its item
@@ -65,12 +65,30 @@ pub(super) fn run_budget_for(request: &McpCallbackRequest) -> RunOutputBudget {
     }
 }
 
-/// A composed batch result: its text, and under [`RunOutputBudget::Whole`] the
-/// items refused for being past the ceiling.
+/// A composed batch result: its text, its items' images placed in that text,
+/// and under [`RunOutputBudget::Whole`] the items refused for being past the
+/// ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ComposedRun {
     pub(super) text: String,
+    pub(super) images: Vec<ImageBlock>,
     pub(super) over_ceiling: Option<OverCeiling>,
+}
+
+impl ComposedRun {
+    fn new(output: AnchoredText, over_ceiling: Option<OverCeiling>) -> Self {
+        let (text, images) = output.into_parts();
+        Self {
+            text,
+            images,
+            over_ceiling,
+        }
+    }
+
+    /// The text and images, for an edit that keeps the images in place.
+    pub(super) fn output(&self) -> AnchoredText {
+        AnchoredText::new(self.text.clone(), self.images.clone())
+    }
 }
 
 /// Smallest per-item body budget worth showing. Below this an item is omitted
@@ -83,23 +101,40 @@ const MIN_ITEM_BODY_BUDGET: usize = 512;
 /// inter-segment separators, so the composed result stays under the cap.
 const OMISSION_NOTE_RESERVE: usize = 256;
 
-/// Render one item's body block (no header): tail-capped to `body_budget`
-/// unless the item is carried whole, with an empty body shown as `(no output)`.
-fn render_item_body(outcome: &ItemOutcome, body_budget: usize) -> String {
-    if outcome.whole || outcome.body.is_empty() {
-        whole_item_body(outcome)
-    } else {
-        elide_tail_biased(&outcome.body, body_budget)
+/// Render one item's body block (no header) with its images in place:
+/// tail-capped to `body_budget` unless the item is carried whole, with an empty
+/// body shown as `(no output)`.
+fn render_item_body(outcome: &ItemOutcome, body_budget: usize) -> AnchoredText {
+    let mut body = whole_item_body(outcome);
+    if !outcome.whole && !outcome.body.is_empty() {
+        body.elide_tail_biased(body_budget);
     }
+    body
 }
 
-/// One item's full body block (no header), `(no output)` when empty.
-fn whole_item_body(outcome: &ItemOutcome) -> String {
-    if outcome.body.is_empty() {
+/// One item's full body block (no header) with its images, `(no output)` when
+/// empty.
+fn whole_item_body(outcome: &ItemOutcome) -> AnchoredText {
+    let body = if outcome.body.is_empty() {
         "(no output)".to_string()
     } else {
         outcome.body.clone()
+    };
+    AnchoredText::new(body, outcome.images.clone())
+}
+
+/// Add one labeled item to a batch under composition. An item that is not the
+/// batch's last pins its trailing images to the end of its own text, so they
+/// arrive before the next item's header rather than after the whole batch.
+fn push_item(batch: &mut AnchoredText, header: &str, mut body: AnchoredText, last: bool) {
+    if !last {
+        body.pin_trailing();
     }
+    body.prepend(&format!("=== {header} ===\n"));
+    if !batch.is_empty() {
+        batch.push_str("\n");
+    }
+    batch.append(body);
 }
 
 /// `bytes` as a ceiling is stated: whole MiB when it is one, else bytes.
@@ -135,8 +170,9 @@ fn water_fill_budgets(natural: &[usize], total: usize) -> Vec<usize> {
 
 /// Serialize the run result into a [`RunBatchEnvelope`] for the transport edge.
 ///
-/// The composed `text` and any `images` ride together so the CLI lifts each image
-/// into its own content block after the text, mirroring the read-batch envelope.
+/// The composed `text` and any `images` ride together so the transport edge
+/// delivers each image as its own content block at its place in the text,
+/// mirroring the read-batch envelope.
 /// Serializing a struct of string/array fields does not fail in practice; the
 /// fallback returns the bare text so a run never errors on rendering.
 pub(super) fn run_envelope(text: String, images: Vec<ImageBlock>) -> String {
@@ -176,11 +212,6 @@ fn encode_envelope(envelope: RunBatchEnvelope) -> String {
     serde_json::to_string(&envelope).unwrap_or(envelope.text)
 }
 
-/// Collect every item's image blocks across the batch, in item order.
-pub(super) fn collect_run_images(outcomes: Vec<ItemOutcome>) -> Vec<ImageBlock> {
-    outcomes.into_iter().flat_map(|o| o.images).collect()
-}
-
 /// Every item's typed result in item order, `null` for an item without one;
 /// `None` when no item has one, so an ordinary batch's envelope is unchanged.
 pub(super) fn collect_run_data(outcomes: &mut [ItemOutcome]) -> Option<Vec<serde_json::Value>> {
@@ -201,13 +232,14 @@ pub(super) fn collect_run_data(outcomes: &mut [ItemOutcome]) -> Option<Vec<serde
 /// a request a caller may make.
 ///
 /// A single item renders its body directly with no header; several are
-/// labeled `=== <header> ===` in input order, under either budget.
+/// labeled `=== <header> ===` in input order, under either budget. Every item's
+/// images arrive in place: inside its text where it anchored them, and after
+/// its text (before the next item) where it did not. The last item's trailing
+/// images stay trailing, so a lone text-then-image item composes exactly as
+/// it did before images had places.
 pub(super) fn compose_run_output(outcomes: &[ItemOutcome], budget: RunOutputBudget) -> ComposedRun {
     match budget {
-        RunOutputBudget::Context => ComposedRun {
-            text: compose_for_context(outcomes),
-            over_ceiling: None,
-        },
+        RunOutputBudget::Context => ComposedRun::new(compose_for_context(outcomes), None),
         RunOutputBudget::Whole {
             byte_ceiling,
             batch_wire_ceiling,
@@ -233,7 +265,7 @@ fn compose_whole(
 ) -> ComposedRun {
     let mut refused: Vec<OverCeilingItem> = Vec::new();
     let mut wire_spent = 0usize;
-    let bodies: Vec<String> = outcomes
+    let bodies: Vec<AnchoredText> = outcomes
         .iter()
         .enumerate()
         .map(|(index, outcome)| {
@@ -261,25 +293,36 @@ fn compose_whole(
                 header: outcome.header.clone(),
                 bytes,
             });
-            refusal
+            // The refused body's places are gone, but its images still arrive,
+            // after the line that stands in for it.
+            let images = outcome
+                .images
+                .iter()
+                .cloned()
+                .map(|mut image| {
+                    image.at = None;
+                    image
+                })
+                .collect();
+            AnchoredText::new(refusal, images)
         })
         .collect();
-    let text = if outcomes.len() == 1 {
+    let output = if outcomes.len() == 1 {
         bodies.into_iter().next().unwrap_or_default()
     } else {
-        outcomes
-            .iter()
-            .zip(bodies)
-            .map(|(outcome, body)| format!("=== {} ===\n{body}", outcome.header))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let last = outcomes.len() - 1;
+        let mut batch = AnchoredText::default();
+        for (index, (outcome, body)) in outcomes.iter().zip(bodies).enumerate() {
+            push_item(&mut batch, &outcome.header, body, index == last);
+        }
+        batch
     };
     let over_ceiling = (!refused.is_empty()).then_some(OverCeiling {
         ceiling_bytes: byte_ceiling,
         batch_ceiling_bytes: batch_wire_ceiling,
         items: refused,
     });
-    ComposedRun { text, over_ceiling }
+    ComposedRun::new(output, over_ceiling)
 }
 
 /// [`RunOutputBudget::Context`]: `MAX_RUN_RESULT_BYTES` is divided fairly
@@ -291,7 +334,9 @@ fn compose_whole(
 /// An item carried whole ([`ItemOutcome::whole`]) is never capped, shared, or
 /// omitted: it renders its full body and takes nothing from the other items'
 /// budget. Without one, the composed result stays under `MAX_RUN_RESULT_BYTES`.
-fn compose_for_context(outcomes: &[ItemOutcome]) -> String {
+/// Images sit outside that budget: capping moves them but never drops them,
+/// and an omitted item's images still arrive, where the item would have been.
+fn compose_for_context(outcomes: &[ItemOutcome]) -> AnchoredText {
     if outcomes.len() == 1 {
         return render_item_body(&outcomes[0], MAX_RUN_RESULT_BYTES);
     }
@@ -330,7 +375,8 @@ fn compose_for_context(outcomes: &[ItemOutcome]) -> String {
         alloc[i] = share;
     }
 
-    let mut segments: Vec<String> = Vec::with_capacity(outcomes.len());
+    let last = outcomes.len() - 1;
+    let mut text = AnchoredText::default();
     let mut omitted: Vec<String> = Vec::new();
     for (i, o) in outcomes.iter().enumerate() {
         let body_budget = alloc[i].saturating_sub(overhead[i]);
@@ -339,16 +385,21 @@ fn compose_for_context(outcomes: &[ItemOutcome]) -> String {
         // usable floor is omitted whole rather than shown as a sliver.
         if natural_body > body_budget && body_budget < MIN_ITEM_BODY_BUDGET {
             omitted.push(o.header.clone());
+            let mut images = AnchoredText::new("", o.images.clone());
+            if i != last {
+                images.pin_trailing();
+            }
+            text.append(images);
             continue;
         }
-        segments.push(format!(
-            "{}{}",
-            headers[i],
-            render_item_body(o, body_budget)
-        ));
+        push_item(
+            &mut text,
+            &o.header,
+            render_item_body(o, body_budget),
+            i == last,
+        );
     }
 
-    let mut text = segments.join("\n");
     if !omitted.is_empty() {
         if !text.is_empty() {
             text.push_str("\n\n");
@@ -764,35 +815,220 @@ mod tests {
         assert_eq!(parsed.images, vec![image]);
     }
 
+    fn with_images(header: &str, body: &str, images: Vec<ImageBlock>) -> ItemOutcome {
+        ItemOutcome {
+            images,
+            ..outcome(header, body, true)
+        }
+    }
+
+    /// Where image `data` sits in a composed batch's text.
+    fn image_at(composed: &ComposedRun, data: &str) -> Option<usize> {
+        composed
+            .images
+            .iter()
+            .find(|image| image.data == data)
+            .unwrap_or_else(|| panic!("image {data} was dropped"))
+            .at
+    }
+
     #[test]
-    fn collect_run_images_gathers_in_item_order() {
-        let img_a = ImageBlock::inline("image/png", "a");
-        let img_b = ImageBlock::inline("image/png", "b");
+    fn images_arrive_in_item_order_each_after_its_own_item() {
         let outcomes = vec![
-            ItemOutcome {
-                header: "look".to_string(),
-                body: "tree".to_string(),
-                succeeded: true,
-                suspended: false,
-                images: vec![img_a.clone()],
-                tracked_modifications: None,
-                data: None,
-                whole: false,
-            },
-            // A text-only item contributes no images and is skipped.
+            with_images("look", "tree", vec![ImageBlock::inline("image/png", "a")]),
+            // A text-only item contributes no images.
             ItemOutcome::failed("echo".to_string(), "out"),
-            ItemOutcome {
-                header: "look2".to_string(),
-                body: "tree2".to_string(),
-                succeeded: true,
-                suspended: false,
-                images: vec![img_b.clone()],
-                tracked_modifications: None,
-                data: None,
-                whole: false,
-            },
+            with_images("look2", "tree2", vec![ImageBlock::inline("image/png", "b")]),
         ];
-        assert_eq!(collect_run_images(outcomes), vec![img_a, img_b]);
+        for budget in [
+            RunOutputBudget::Context,
+            RunOutputBudget::Whole {
+                byte_ceiling: view::WHOLE_READ_BYTE_CEILING,
+                batch_wire_ceiling: WHOLE_RUN_BATCH_WIRE_BYTES,
+            },
+        ] {
+            let composed = compose_run_output(&outcomes, budget);
+            let order: Vec<_> = composed.images.iter().map(|i| i.data.as_str()).collect();
+            assert_eq!(order, ["a", "b"], "{budget:?}");
+            // The first item's image comes before the next item's header,
+            // not after the whole batch.
+            let a = image_at(&composed, "a").expect("pinned to its item");
+            assert_eq!(&composed.text[..a], "=== look ===\ntree", "{budget:?}");
+            assert!(composed.text[a..].starts_with("\n=== echo ==="));
+            // The last item's trailing image stays trailing.
+            assert_eq!(image_at(&composed, "b"), None, "{budget:?}");
+        }
+    }
+
+    /// Every place the composer gives an image has a newline beside it, so a
+    /// model client that joins the delivered text blocks with `\n` reads back
+    /// exactly the composed text. Checked over the shapes composition takes:
+    /// labeling, pinning between items, an image before its text, elision of
+    /// a middle, tail, and head anchor, omission, and refusal.
+    #[test]
+    fn every_composed_placement_joins_back_to_the_composed_text() {
+        let png = |data: &str| ImageBlock::inline("image/png", data);
+        let lines = |n: usize| {
+            (0..n)
+                .map(|i| format!("line-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let big = lines(9_000);
+        let at_line = |line: &str| big.find(&format!("{line}\n")).unwrap();
+        let batches: Vec<Vec<ItemOutcome>> = vec![
+            vec![with_images("look", "caption", vec![png("a").placed_at(0)])],
+            vec![with_images(
+                "look",
+                "before\nafter",
+                vec![png("a").placed_at(7)],
+            )],
+            vec![
+                with_images("look", "tree", vec![png("a")]),
+                with_images("look2", "caption", vec![png("b").placed_at(0)]),
+                with_images("look3", "x\ny", vec![png("c").placed_at(2), png("d")]),
+            ],
+            vec![
+                with_images(
+                    "flood",
+                    &big,
+                    vec![
+                        png("head").placed_at(at_line("line-3")),
+                        png("middle").placed_at(at_line("line-4000")),
+                        png("tail").placed_at(at_line("line-8990")),
+                        png("trailing"),
+                    ],
+                ),
+                with_images("after", "done", vec![png("e")]),
+            ],
+            (0..400)
+                .map(|i| {
+                    with_images(
+                        &format!("cmd-{i}"),
+                        &"x".repeat(2_000),
+                        vec![png(&format!("o{i}"))],
+                    )
+                })
+                .collect(),
+            vec![
+                with_images("huge", &"h\n".repeat(1_024), vec![png("r").placed_at(10)]),
+                outcome("small", "S", true),
+            ],
+        ];
+        for outcomes in &batches {
+            for budget in [
+                RunOutputBudget::Context,
+                RunOutputBudget::Whole {
+                    byte_ceiling: 1_024,
+                    batch_wire_ceiling: 1 << 20,
+                },
+            ] {
+                let composed = compose_run_output(outcomes, budget);
+                let images = outcomes.iter().map(|o| o.images.len()).sum::<usize>();
+                assert_eq!(
+                    composed.images.len(),
+                    images,
+                    "{budget:?}: no image is dropped"
+                );
+                let output = composed.output();
+                let joined = output
+                    .blocks()
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        cairn_common::read::OrderedBlock::Text(text) => Some(text),
+                        cairn_common::read::OrderedBlock::Image(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert_eq!(joined, composed.text, "{budget:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_text_then_image_item_composes_as_it_always_did() {
+        let image = ImageBlock::inline("image/png", "a");
+        let composed = compose_run_output(
+            &[with_images("look", "AX tree", vec![image.clone()])],
+            RunOutputBudget::Context,
+        );
+        assert_eq!(composed.text, "AX tree");
+        assert_eq!(composed.images, vec![image]);
+    }
+
+    #[test]
+    fn an_anchored_image_keeps_its_place_under_the_item_header() {
+        let composed = compose_run_output(
+            &[
+                with_images(
+                    "cairn://mcp/stub/look",
+                    "caption",
+                    vec![ImageBlock::inline("image/png", "a").placed_at(0)],
+                ),
+                outcome("echo after", "after", true),
+            ],
+            RunOutputBudget::Context,
+        );
+        let a = image_at(&composed, "a").unwrap();
+        assert_eq!(&composed.text[..a], "=== cairn://mcp/stub/look ===\n");
+        assert!(composed.text[a..].starts_with("caption\n=== echo after ==="));
+    }
+
+    #[test]
+    fn an_image_in_the_elided_middle_lands_at_the_start_of_the_tail() {
+        let body = format!(
+            "HEAD\n{}\nPICTURED\n{}\nTAIL",
+            "m\n".repeat(30_000),
+            "n\n".repeat(30_000)
+        );
+        let middle = body.find("PICTURED").unwrap();
+        let composed = compose_run_output(
+            &[with_images(
+                "look",
+                &body,
+                vec![ImageBlock::inline("image/png", "a").placed_at(middle)],
+            )],
+            RunOutputBudget::Context,
+        );
+        assert!(composed.text.len() <= MAX_RUN_RESULT_BYTES);
+        let a = image_at(&composed, "a").expect("still anchored");
+        assert!(composed.text[..a].ends_with("tail kept below ---\n"));
+    }
+
+    #[test]
+    fn an_omitted_items_images_still_arrive_where_it_would_have_been() {
+        let big = "x".repeat(2_000);
+        let mut outcomes: Vec<ItemOutcome> = (0..400)
+            .map(|i| outcome(&format!("cmd-{i}"), &big, true))
+            .collect();
+        outcomes[200].images = vec![ImageBlock::inline("image/png", "a")];
+        let composed = compose_run_output(&outcomes, RunOutputBudget::Context);
+        assert!(composed.text.contains("items omitted"));
+        assert!(composed.text.len() <= MAX_RUN_RESULT_BYTES);
+        assert_eq!(composed.images.len(), 1);
+        assert!(image_at(&composed, "a").is_some());
+    }
+
+    #[test]
+    fn a_refused_items_images_arrive_after_its_refusal_line() {
+        let outcomes = vec![
+            with_images(
+                "huge",
+                &"h".repeat(2_048),
+                vec![ImageBlock::inline("image/png", "a").placed_at(10)],
+            ),
+            outcome("small", "S", true),
+        ];
+        let composed = compose_run_output(
+            &outcomes,
+            RunOutputBudget::Whole {
+                byte_ceiling: 1_024,
+                batch_wire_ceiling: 1 << 20,
+            },
+        );
+        let a = image_at(&composed, "a").unwrap();
+        assert!(composed.text[..a].ends_with("read that instead."));
+        assert!(composed.text[a..].starts_with("\n=== small ==="));
     }
 
     #[test]

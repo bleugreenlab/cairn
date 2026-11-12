@@ -32,7 +32,7 @@ use cairn_uri::{parse_uri as parse_cairn_uri, CairnResource};
 use crate::heartbeat::{with_heartbeat, HEARTBEAT_INTERVAL};
 use crate::output::{
     assemble_reminders, cap_text_result, change_callback_result, redact_command,
-    run_transport_error_result, CallbackOutcome,
+    run_transport_error_result, tool_result_blocks, CallbackOutcome,
 };
 use crate::schemas::{validate_run_input, ChangeInput, ReadFileInput, RunInput};
 use crate::sink::{CallbackSink, RunPrincipal};
@@ -257,14 +257,11 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
                 )]));
             }
         };
-        let text = assemble_reminders(envelope.text, &outcome.reminders);
-
-        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
-        blocks.push(ContentBlock::text(text));
-        for image in envelope.images {
-            blocks.push(ContentBlock::image(image.data, image.mime_type));
-        }
-        Ok(CallToolResult::success(blocks))
+        Ok(CallToolResult::success(tool_result_blocks(
+            envelope.text,
+            envelope.images,
+            &outcome.reminders,
+        )))
     }
 
     /// Issue one `read_batch` callback for `input`.
@@ -391,8 +388,8 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
         let outcome = self.callback(&request).await;
         // The run handler returns a RunBatchEnvelope (composed text + image
         // content blocks) like read_batch; parse it and lift each image into its
-        // own content block after the text so an image-bearing MCP tool result
-        // (e.g. an Axon look screenshot) reaches the agent.
+        // own content block at its place in the text, so an image-bearing MCP
+        // tool result (e.g. an Axon look screenshot) reaches the agent in order.
         let envelope = match serde_json::from_str::<RunBatchEnvelope>(&outcome.result) {
             Ok(envelope) => envelope,
             // No host answer arrived: an error, with the one line that says
@@ -416,12 +413,7 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
         };
         // Core composes the text within its own cap, and a model door's reply
         // must arrive whole, so the edge passes it through untouched.
-        let text = assemble_reminders(envelope.text, &outcome.reminders);
-        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
-        blocks.push(ContentBlock::text(text));
-        for image in envelope.images {
-            blocks.push(ContentBlock::image(image.data, image.mime_type));
-        }
+        let blocks = tool_result_blocks(envelope.text, envelope.images, &outcome.reminders);
         if envelope.invalid_input {
             return Ok(CallToolResult::error(blocks));
         }

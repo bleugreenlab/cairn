@@ -106,6 +106,8 @@ pub(crate) fn build_cli_client(callback_url: String) -> CairnMcpServer {
 
 /// Extract printable text and the error flag from a tool result
 /// (version-tolerant: reads the serialized JSON rather than rmcp internals).
+/// Text blocks join with newlines, the inverse of how the edge splits a result
+/// around its images, so a split result prints as the text the host composed.
 fn tool_result_text(result: &CallToolResult) -> (String, bool) {
     let value = serde_json::to_value(result).unwrap_or_default();
     let is_error = value
@@ -113,14 +115,17 @@ fn tool_result_text(result: &CallToolResult) -> (String, bool) {
         .or_else(|| value.get("is_error"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let mut out = String::new();
-    if let Some(items) = value.get("content").and_then(|c| c.as_array()) {
-        for item in items {
-            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                out.push_str(t);
-            }
-        }
-    }
+    let out = value
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
     (out, is_error)
 }
 

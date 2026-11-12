@@ -617,13 +617,41 @@ fn image_label(uri: &str) -> &str {
 /// producer has to know about durable storage. A block with no `uri` (nothing was
 /// promoted, or a legacy archived read reconstructed from bytes alone) renders
 /// nothing, exactly as before.
-fn image_reference_trailer(images: &[ImageBlock], target: &str) -> String {
+///
+/// Each image's place in the segment is just after its own reference line, so
+/// the reference and the bytes arrive together; an un-promoted image sits
+/// where its line would have been.
+fn image_reference_trailer(images: &[ImageBlock], target: &str) -> ImageTrailer {
     let label = image_label(target);
-    images
-        .iter()
-        .filter_map(|image| image.uri.as_deref())
-        .map(|uri| format!("\n![{label}]({uri})"))
-        .collect()
+    let mut trailer = ImageTrailer::default();
+    for image in images {
+        if let Some(uri) = image.uri.as_deref() {
+            trailer.text.push_str(&format!("\n![{label}]({uri})"));
+        }
+        trailer.ends.push(trailer.text.len());
+    }
+    trailer
+}
+
+/// A segment's image-reference trailer, and where in it each image sits.
+#[derive(Default)]
+struct ImageTrailer {
+    text: String,
+    /// Per image, in order: the offset into `text` just after its reference.
+    ends: Vec<usize>,
+}
+
+impl ImageTrailer {
+    /// Append the trailer to `text` and return `images` placed in it.
+    fn push_onto(&self, text: &mut String, images: &[ImageBlock]) -> Vec<ImageBlock> {
+        let start = text.len();
+        text.push_str(&self.text);
+        images
+            .iter()
+            .zip(&self.ends)
+            .map(|(image, end)| image.clone().placed_at(start + end))
+            .collect()
+    }
 }
 
 fn header(meta: &SegmentMeta, shown: usize, truncated: bool) -> String {
@@ -677,6 +705,7 @@ fn label_with_suffix(meta: &SegmentMeta, suffix: Option<String>) -> String {
 pub struct RenderedSegment {
     pub text: String,
     meta: SegmentMeta,
+    /// The segment's images, each placed in `text` after its reference line.
     images: Vec<ImageBlock>,
 }
 
@@ -822,7 +851,7 @@ fn render_with<'t>(
     let fixed_tokens = meter.count(&format!(
         "{}\n{}{}",
         header(&meta, full_lines, true),
-        image_trailer,
+        image_trailer.text,
         history_suffix
     ));
     let mut content_budget = budget;
@@ -881,7 +910,7 @@ fn render_with<'t>(
             candidate.push('\n');
             candidate.push_str(&footer.text);
         }
-        candidate.push_str(&image_trailer);
+        let images = image_trailer.push_onto(&mut candidate, &seg.images);
         candidate.push_str(&history_suffix);
 
         let candidate_tokens = meter.count(&candidate);
@@ -893,7 +922,7 @@ fn render_with<'t>(
             return RenderedSegment {
                 text: candidate,
                 meta,
-                images: seg.images.clone(),
+                images,
             };
         }
         let step = (candidate_tokens - budget).saturating_add(1);
@@ -1010,20 +1039,19 @@ fn render_record_segment<'t>(
     meter: &Metering<'t, '_>,
 ) -> RenderedSegment {
     let body = seg.body.as_str();
-    let images = seg.images.clone();
     let mut meta = seg.meta.clone();
 
     let history_suffix = history
         .filter(|h| !h.is_empty())
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
-    let image_trailer = image_reference_trailer(&images, &meta.uri);
+    let image_trailer = image_reference_trailer(&seg.images, &meta.uri);
 
     let produced_shown = meta.shown_units;
     let fixed = format!(
         "{}\n{}{}",
         header(&meta, produced_shown, true),
-        image_trailer,
+        image_trailer.text,
         history_suffix
     );
     let body_budget = budget.saturating_sub(meter.count(&fixed));
@@ -1048,7 +1076,7 @@ fn render_record_segment<'t>(
         text.push('\n');
         text.push_str(&footer.text);
         meta.continuation = footer.continuation;
-        text.push_str(&image_trailer);
+        let images = image_trailer.push_onto(&mut text, &seg.images);
         text.push_str(&history_suffix);
         return RenderedSegment { text, meta, images };
     };
@@ -1094,7 +1122,7 @@ fn render_record_segment<'t>(
             meta.continuation = footer.continuation;
         }
     }
-    text.push_str(&image_trailer);
+    let images = image_trailer.push_onto(&mut text, &seg.images);
     text.push_str(&history_suffix);
 
     meta.truncated = truncated;
@@ -1211,7 +1239,7 @@ fn estimate_len(segment: &ReadSegment, history: Option<&str>, meter: &Metering<'
         header(&segment.meta, segment.meta.shown_units, true),
         segment.body,
         "x".repeat(220),
-        images,
+        images.text,
         history.unwrap_or_default()
     );
     meter.count(&estimate)
@@ -1376,6 +1404,7 @@ fn assemble_inner(
     for meta in &mut overflow.segments {
         meta.truncated = true;
         meta.continuation = None;
+        meta.image_count = 0;
     }
     if let Some(bodies) = &mut overflow.bodies {
         bodies.fill(String::new());
@@ -1524,6 +1553,12 @@ fn distinct_affordances(segments: &[ReadSegment], carried: Carried) -> Vec<Affor
 /// Join rendered segments into one envelope: sections in input order, then
 /// the deduped affordance blocks. `render` turns the segment at an index into
 /// its final section; how much of it survives is the caller's budget.
+///
+/// Each segment's images are placed in the batch text after their own
+/// segment's references, so an image read between two other targets arrives
+/// between them. The last segment's images arrive after everything — the
+/// affordance blocks, and whatever the transport edge appends — which is
+/// where every read's images arrived before they had places.
 fn compose<'t>(
     segments: &'t [ReadSegment],
     carried: Carried,
@@ -1539,12 +1574,18 @@ fn compose<'t>(
     let mut images = Vec::new();
     let mut metas: Vec<SegmentMeta> = Vec::new();
     let mut bodies = include_bodies.then(|| Vec::with_capacity(segments.len()));
+    let last = segments.len().saturating_sub(1);
     for (index, segment) in segments.iter().enumerate() {
-        let rendered = render(segment, index);
+        let mut rendered = render(segment, index);
         if !text.is_empty() {
             text.push('\n');
         }
+        let start = text.len();
         text.push_str(&rendered.text);
+        for image in &mut rendered.images {
+            image.at = image.at.filter(|_| index != last).map(|at| start + at);
+        }
+        rendered.meta.image_count = rendered.images.len();
         if let Some(bodies) = &mut bodies {
             let body = rendered
                 .text
@@ -1602,6 +1643,63 @@ mod tests {
 
     const STORED_IMAGE: &str =
         "cairn://p/CAIRN/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The text blocks of `envelope` joined the way a model client keeps them.
+    fn joined_blocks(envelope: &ReadBatchEnvelope) -> String {
+        let anchored =
+            cairn_common::read::AnchoredText::new(envelope.text.clone(), envelope.images.clone());
+        anchored
+            .blocks()
+            .into_iter()
+            .filter_map(|block| match block {
+                cairn_common::read::OrderedBlock::Text(text) => Some(text.to_string()),
+                cairn_common::read::OrderedBlock::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_image_read_between_two_targets_arrives_between_them() {
+        let envelope = assemble(
+            vec![
+                image_seg("cairn:~/browser?screenshot", Some(STORED_IMAGE)),
+                file_seg("file:a.rs", "     1\tfn main() {}", 1, 0),
+                image_seg("file:last.png", Some(STORED_IMAGE)),
+            ],
+            ReadBudget::Context,
+            &BYTE_METER,
+        );
+        assert_eq!(envelope.images.len(), 2);
+        let at = envelope.images[0].at.expect("the first image is placed");
+        assert!(
+            envelope.text[..at].ends_with(&format!("![browser]({STORED_IMAGE})")),
+            "{}",
+            envelope.text
+        );
+        assert!(envelope.text[at..].starts_with("\n=== file:a.rs"));
+        // The last segment's image arrives after everything, as every read's did.
+        assert_eq!(envelope.images[1].at, None);
+        let counts: Vec<usize> = envelope
+            .segments
+            .iter()
+            .map(|meta| meta.image_count)
+            .collect();
+        assert_eq!(counts, [1, 0, 1]);
+        assert_eq!(joined_blocks(&envelope), envelope.text);
+    }
+
+    #[test]
+    fn a_single_image_read_composes_exactly_as_before() {
+        let envelope = assemble(
+            vec![image_seg("file:plots/fig.png", Some(STORED_IMAGE))],
+            ReadBudget::Context,
+            &BYTE_METER,
+        );
+        assert_eq!(envelope.images[0].at, None);
+        // Serialized exactly as an un-anchored block: no `at` on the wire.
+        assert!(!serde_json::to_string(&envelope).unwrap().contains("\"at\""));
+    }
 
     #[test]
     fn promoted_image_renders_a_durable_reference_under_the_header() {

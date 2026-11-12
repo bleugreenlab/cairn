@@ -231,6 +231,28 @@ pub fn cap_text_result(text: &str, offset: usize) -> String {
 /// them into the model-visible text here, reproducing the legacy wrapping and
 /// ordering byte-for-byte. Handler content therefore stays parseable as data
 /// end-to-end — no JSON payload is ever followed by trailing reminder text.
+/// A composed read or run result as MCP content blocks: its text, with the
+/// turn's reminders appended, split around each image at the place the host
+/// put it ([`AnchoredText::blocks`]). A text-only result is one text block, and
+/// an image with nothing after it in the host's text arrives after the
+/// reminders, as every image did before images had places.
+pub fn tool_result_blocks(
+    text: String,
+    images: Vec<cairn_common::read::ImageBlock>,
+    reminders: &[String],
+) -> Vec<ContentBlock> {
+    let text = cairn_common::read::AnchoredText::new(assemble_reminders(text, reminders), images);
+    text.blocks()
+        .into_iter()
+        .map(|block| match block {
+            cairn_common::read::OrderedBlock::Text(text) => ContentBlock::text(text.to_string()),
+            cairn_common::read::OrderedBlock::Image(image) => {
+                ContentBlock::image(image.data.clone(), image.mime_type.clone())
+            }
+        })
+        .collect()
+}
+
 pub fn assemble_reminders(mut content: String, reminders: &[String]) -> String {
     for body in reminders {
         content.push_str("\n\n<system-reminder>\n");
@@ -805,8 +827,9 @@ mod tests {
     #[test]
     fn run_envelope_image_becomes_a_content_block() {
         // The run tool parses a RunBatchEnvelope and lifts each image into its
-        // own content block after the text, so an image-bearing MCP tool result
-        // (e.g. an Axon look screenshot) reaches the agent. Exercise that lift.
+        // own content block, so an image-bearing MCP tool result (e.g. an Axon
+        // look screenshot) reaches the agent. A text-then-image result keeps
+        // the shape it always had: one text block, then the image.
         let envelope = RunBatchEnvelope {
             text: "=== look ===\nAX tree".to_string(),
             images: vec![cairn_common::read::ImageBlock::inline("image/png", "b64")],
@@ -817,14 +840,68 @@ mod tests {
         let serialized = serde_json::to_string(&envelope).unwrap();
         let parsed: RunBatchEnvelope = serde_json::from_str(&serialized).unwrap();
 
-        let mut blocks: Vec<ContentBlock> = vec![ContentBlock::text(parsed.text)];
-        for image in parsed.images {
-            blocks.push(ContentBlock::image(image.data, image.mime_type));
-        }
+        let blocks = tool_result_blocks(parsed.text, parsed.images, &["r".to_string()]);
         assert_eq!(blocks.len(), 2);
+        let text = blocks[0].as_text().expect("first block is text");
+        assert!(text.text.starts_with("=== look ===\nAX tree"));
+        assert!(text.text.ends_with("</system-reminder>"));
         let image_block = blocks[1].as_image().expect("second block is an image");
         assert_eq!(image_block.mime_type, "image/png");
         assert_eq!(image_block.data, "b64");
+    }
+
+    /// Blocks as `T:<text>` / `I:<data>` labels, for order assertions.
+    fn shape(blocks: &[ContentBlock]) -> Vec<String> {
+        blocks
+            .iter()
+            .map(|block| match (block.as_text(), block.as_image()) {
+                (Some(text), _) => format!("T:{}", text.text),
+                (_, Some(image)) => format!("I:{}", image.data),
+                _ => panic!("unexpected block {block:?}"),
+            })
+            .collect()
+    }
+
+    fn image(data: &str) -> cairn_common::read::ImageBlock {
+        cairn_common::read::ImageBlock::inline("image/png", data)
+    }
+
+    #[test]
+    fn an_interleaved_run_result_keeps_its_block_order() {
+        let text = "=== look ===\ncaption\n=== echo after ===\nafter".to_string();
+        let blocks = tool_result_blocks(
+            text,
+            vec![image("a").placed_at("=== look ===\n".len())],
+            &["note".to_string()],
+        );
+        assert_eq!(
+            shape(&blocks),
+            [
+                "T:=== look ===",
+                "I:a",
+                "T:caption\n=== echo after ===\nafter\n\n<system-reminder>\nnote\n</system-reminder>",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_interleaved_read_result_puts_the_image_between_its_segments() {
+        let first = "=== cairn:~/browser?screenshot ===\n![browser](cairn://p/x/1/images/1)";
+        let text = format!("{first}\n=== file:a.rs ===\n1\tfn main() {{}}");
+        let blocks = tool_result_blocks(
+            text,
+            vec![image("shot").placed_at(first.len())],
+            &["note".to_string()],
+        );
+        let shape = shape(&blocks);
+        assert_eq!(shape[0], format!("T:{first}"));
+        assert_eq!(shape[1], "I:shot");
+        assert!(shape[2].starts_with("T:=== file:a.rs ==="));
+        assert!(
+            shape[2].ends_with("</system-reminder>"),
+            "the reminder rides the final text block"
+        );
+        assert_eq!(shape.len(), 3);
     }
 
     #[test]

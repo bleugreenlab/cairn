@@ -22058,6 +22058,9 @@ pub struct ProcessBatchItemOutcome {
     pub body: String,
     pub succeeded: bool,
     pub suspended: bool,
+    /// [`crate::read::ImageBlock`]s as JSON. An entry may carry `at`, a byte
+    /// offset into `body`; a peer that ignores it delivers the image after the
+    /// body, which is where every image arrived before images had places.
     #[serde(default)]
     pub images: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

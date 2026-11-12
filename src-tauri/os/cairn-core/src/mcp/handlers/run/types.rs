@@ -2,7 +2,10 @@
 //! per-item outcomes, the promoted-terminal marker, and streaming payloads.
 
 use crate::config::mcp_servers::McpServerConfig;
-use cairn_common::{executor_protocol::ExecutorSelector, read::ImageBlock};
+use cairn_common::{
+    executor_protocol::ExecutorSelector,
+    read::{AnchoredText, ImageBlock},
+};
 use serde::{Deserialize, Serialize};
 
 /// Payload for run tool from MCP server.
@@ -279,9 +282,10 @@ pub(crate) struct ItemOutcome {
     /// The item durably suspended on a worktree-fence approval; the whole batch
     /// re-runs on resume. Carried so `handle_run` can surface the suspend marker.
     pub(crate) suspended: bool,
-    /// Image content blocks this item produced. Only an external MCP `tools/call`
-    /// returns them today; collected across the batch into the run envelope so the
-    /// transport edge delivers them as real image content blocks (read-path mirror).
+    /// Image content blocks this item produced: an external MCP `tools/call`, or
+    /// `cairn://models/image`. Each one's `at` is a byte offset into `body`. The
+    /// composer carries them into the run envelope in place, so the transport
+    /// edge delivers them as real image content blocks where they belong.
     pub(crate) images: Vec<ImageBlock>,
     pub(crate) tracked_modifications:
         Option<cairn_common::executor_protocol::TrackedModificationEvidence>,
@@ -317,6 +321,20 @@ impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutc
 }
 
 impl ItemOutcome {
+    /// This item's body with its images placed in it, for an edit that must
+    /// keep them in place. Both fields stay empty until [`Self::put_anchored`]
+    /// returns them.
+    pub(crate) fn take_anchored(&mut self) -> AnchoredText {
+        AnchoredText::new(
+            std::mem::take(&mut self.body),
+            std::mem::take(&mut self.images),
+        )
+    }
+
+    pub(crate) fn put_anchored(&mut self, anchored: AnchoredText) {
+        (self.body, self.images) = anchored.into_parts();
+    }
+
     /// A failed item carrying `header` and `body`, with no image blocks — the
     /// common shape for every error / denial / spawn-failure path.
     pub(super) fn failed(header: String, body: impl Into<String>) -> Self {

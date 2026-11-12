@@ -1286,9 +1286,17 @@ mod tests {
         // a second reference to the blob it just resolved.
         assert_eq!(image.uri.as_deref(), Some(target.as_str()));
 
-        // The text half — the only half a transcript keeps — now carries it.
+        // The text half — the only half a transcript keeps — now carries it,
+        // exactly once: the renderer's labeled reference, and no second one.
+        let label = target.rsplit('/').next().unwrap();
         assert!(
-            envelope.text.contains(&format!("![image]({target})")),
+            envelope.text.contains(&format!("![{label}]({target})")),
+            "{}",
+            envelope.text
+        );
+        assert_eq!(
+            envelope.text.matches(&format!("]({target})")).count(),
+            1,
             "{}",
             envelope.text
         );

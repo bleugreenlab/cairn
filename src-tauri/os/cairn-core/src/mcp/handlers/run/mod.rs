@@ -5477,8 +5477,8 @@ async fn finalize_delta_receipt(
 
 use hygiene::check_cd_commands;
 use output::{
-    collect_run_data, collect_run_images, compose_run_output, run_budget_for, run_envelope,
-    run_envelope_with_data, run_input_refusal, RunOutputBudget,
+    collect_run_data, compose_run_output, run_budget_for, run_envelope, run_envelope_with_data,
+    run_input_refusal, RunOutputBudget,
 };
 use process::run_one;
 pub(crate) use process::READ_ONLY_CHECKOUT_DENIAL;
@@ -6423,7 +6423,7 @@ async fn prepare_and_run_batch(
                 let composed = compose_run_output(&outcomes, run_budget_for(request));
                 return run_envelope_with_data(
                     composed.text,
-                    collect_run_images(outcomes),
+                    composed.images,
                     None,
                     composed.over_ceiling,
                 );
@@ -7924,18 +7924,20 @@ impl SettledRunBatch {
         }
     }
 
-    /// A batch that ran to `text`, carrying its items' images and data.
-    fn settled(text: String, mut outcomes: Vec<ItemOutcome>) -> Self {
+    /// A batch that ran to `output` (its text with the items' images placed
+    /// in it), carrying its items' data.
+    fn settled(output: cairn_common::read::AnchoredText, mut outcomes: Vec<ItemOutcome>) -> Self {
         let failed = outcomes.iter().filter(|outcome| !outcome.succeeded).count();
         let verdict = match (failed, outcomes.len()) {
             (0, _) => "succeeded".to_string(),
             (1, 1) => "failed".to_string(),
             (failed, total) => format!("{failed} of {total} items failed"),
         };
+        let (text, images) = output.into_parts();
         Self {
             text,
             data: collect_run_data(&mut outcomes),
-            images: collect_run_images(outcomes),
+            images,
             over_ceiling: None,
             suspended: false,
             verdict,
@@ -10817,7 +10819,7 @@ pub(crate) fn compose_adopted_result(
     else {
         unreachable!("failure_without_result answers every outcome but a completion");
     };
-    let (outcomes, body) = match serde_json::from_str::<
+    let (outcomes, mut composed) = match serde_json::from_str::<
         Vec<cairn_common::executor_protocol::ProcessBatchItemOutcome>,
     >(output)
     {
@@ -10825,20 +10827,21 @@ pub(crate) fn compose_adopted_result(
             let (outcomes, _) = pace::time_batch(items, None, metadata.duration_ms, None);
             // No caller's request survives to this text: it opens a notice, so
             // it composes for the model context the notice lands in.
-            let body = compose_run_output(&outcomes, RunOutputBudget::Context).text;
+            let body = compose_run_output(&outcomes, RunOutputBudget::Context).output();
             (outcomes, body)
         }
         Err(error) => (
             Vec::new(),
-            format!("(its output could not be read back: {error})"),
+            cairn_common::read::AnchoredText::new(
+                format!("(its output could not be read back: {error})"),
+                Vec::new(),
+            ),
         ),
     };
-    let body = if body.is_empty() {
-        "(no output)".to_string()
-    } else {
-        body
-    };
-    let composed = format!("{}\n\n{body}", adopted_ran_on(machine));
+    if composed.is_empty() {
+        composed.push_str("(no output)");
+    }
+    composed.prepend(&format!("{}\n\n", adopted_ran_on(machine)));
     let Some(reason) = unpublished else {
         let settled = SettledRunBatch::settled(composed, outcomes);
         let verdict = settled.verdict.clone();
@@ -10855,11 +10858,12 @@ pub(crate) fn compose_adopted_result(
         None => format!("the commands ran on {machine}"),
     };
     let text = format!(
-        "{}\n\n{composed}",
+        "{}\n\n{}",
         RunFailure::NotPublished(format!(
             "{sealed}, but it was not published because {reason}. Re-run the batch with its commit_msg to publish its changes; nothing it made is on the branch."
         ))
-        .text()
+        .text(),
+        composed.text()
     );
     let verdict = detached::verdict_from_text(&text);
     (text, verdict)
@@ -11124,39 +11128,40 @@ async fn settle_run_batch(
         return SettledRunBatch::suspended();
     }
     for outcome in &mut outcomes {
-        crate::mcp::handlers::durable_images::promote_images(
-            orch,
-            &s.request,
-            &mut outcome.images,
-            &mut outcome.body,
-        )
-        .await;
+        let mut body = outcome.take_anchored();
+        crate::mcp::handlers::durable_images::promote_images(orch, &s.request, &mut body).await;
+        outcome.put_anchored(body);
     }
     // Trailing, because the composer keeps an item's tail when it caps one.
     for (index, note) in &s.machine_notes {
         if let Some(outcome) = outcomes.get_mut(*index) {
-            outcome.body.truncate(outcome.body.trim_end().len());
-            if !outcome.body.is_empty() {
-                outcome.body.push('\n');
+            let mut body = outcome.take_anchored();
+            body.truncate(body.text().trim_end().len());
+            if !body.is_empty() {
+                body.push_str("\n");
             }
-            outcome.body.push_str(note);
+            body.push_str(note);
+            outcome.put_anchored(body);
         }
     }
     let composed = compose_run_output(&outcomes, run_budget_for(&s.request));
+    let mut result = composed.output();
     let over_ceiling = composed.over_ceiling;
-    let mut result = composed.text;
+    // A citation the cap elided, or one an omitted or refused item carried,
+    // is restored beside its image so the transcript still shows the image.
+    // Each is one short line outside the result cap, as the image it names is.
+    crate::mcp::handlers::durable_images::cite_stored_images(&mut result);
     if let Some(label) = &s.revision_label {
-        result = format!("{}\n\n{result}", ran_against_line(label, cell_origin));
+        result.prepend(&format!("{}\n\n", ran_against_line(label, cell_origin)));
     }
     // Every batch a machine ran opens by naming it, selector or not, so a
     // batch is never somewhere its caller cannot see. Host items (MCP tools,
     // decide, REPL sends) run on the host and carry no line.
     if let Some(line) = notes.and_then(|notes| notes.ran_on.as_deref()) {
-        let body = match result.is_empty() {
-            true => "(no output)",
-            false => result.as_str(),
-        };
-        result = format!("{line}\n\n{body}");
+        if result.is_empty() {
+            result.push_str("(no output)");
+        }
+        result.prepend(&format!("{line}\n\n"));
     }
     let residence_note = notes.and_then(PlacementNotes::executed);
     // Read once for both reports below: the verdict-only one, and the commit
@@ -11211,12 +11216,10 @@ async fn settle_run_batch(
             }
             result.push_str(tip);
         }
-        let text = if result.is_empty() {
-            "(no output)".to_string()
-        } else {
-            result
-        };
-        return SettledRunBatch::settled(text, outcomes).with_over_ceiling(over_ceiling);
+        if result.is_empty() {
+            result.push_str("(no output)");
+        }
+        return SettledRunBatch::settled(result, outcomes).with_over_ceiling(over_ceiling);
     }
 
     // Publish an authenticated cell delta through the runner-owned logical-head
@@ -11553,12 +11556,10 @@ async fn settle_run_batch(
         result.push_str(tip);
     }
 
-    let text = if result.is_empty() {
-        "(no output)".to_string()
-    } else {
-        result
-    };
-    SettledRunBatch::settled(text, outcomes).with_over_ceiling(over_ceiling)
+    if result.is_empty() {
+        result.push_str("(no output)");
+    }
+    SettledRunBatch::settled(result, outcomes).with_over_ceiling(over_ceiling)
 }
 
 /// The Cairn environment a placed process carries to whatever machine runs it.
@@ -13480,6 +13481,8 @@ pub(crate) mod host_batch_tests {
         Complete,
         /// The tool answers with this text.
         Text(String),
+        /// The tool answers with this whole result, images and all.
+        Result(crate::mcp::gateway::McpToolCallResult),
         InputRequired {
             input_requests: serde_json::Value,
             request_state: Option<String>,
@@ -13578,6 +13581,7 @@ pub(crate) mod host_batch_tests {
                 FirstAnswer::Text(text) => {
                     McpCallOutcome::Complete(McpToolCallResult::from_text(&text))
                 }
+                FirstAnswer::Result(result) => McpCallOutcome::Complete(result),
                 FirstAnswer::InputRequired {
                     input_requests,
                     request_state,
@@ -13701,6 +13705,212 @@ pub(crate) mod host_batch_tests {
                 assert_eq!(parsed["reports"].as_array().map(Vec::len), Some(600));
             }
         }
+    }
+
+    const REMINDER: &str = "\n\n<system-reminder>\nnote\n</system-reminder>";
+
+    /// `result` from a tool called `look`, through the whole run path as an
+    /// agent receives it: a model-facing host batch (alone, or before a
+    /// text-only `after` item), durable promotion, composition and
+    /// settlement, then the MCP edge's split of the envelope around its
+    /// images, after the edge appends a reminder.
+    async fn delivered(
+        result: crate::mcp::gateway::McpToolCallResult,
+        beside_text: bool,
+    ) -> (
+        cairn_common::read::RunBatchEnvelope,
+        cairn_common::read::AnchoredText,
+    ) {
+        let orch = env().await;
+        scripted_tool(
+            &orch,
+            Duration::ZERO,
+            [
+                ("look", Duration::ZERO, FirstAnswer::Result(result)),
+                ("after", Duration::ZERO, FirstAnswer::Text("after".into())),
+            ],
+        );
+        let (mut settlement, mut batch) =
+            batch_of(&orch, mcp_item_named("look", None), false).await;
+        if beside_text {
+            let (header, spec) = mcp_item_named("after", None);
+            batch.resolved.push((header, Ok(spec)));
+        }
+        for payload in [&mut settlement.request.payload, &mut batch.request.payload] {
+            cairn_common::protocol::stamp_callback_origin(
+                payload,
+                cairn_common::protocol::MODEL_FACING_ORIGIN,
+            );
+        }
+        let envelope =
+            run_suspendable_host_batch(&orch, settlement, batch, Duration::from_secs(5)).await;
+        let envelope: cairn_common::read::RunBatchEnvelope =
+            serde_json::from_str(&envelope).unwrap();
+        let mut edge =
+            cairn_common::read::AnchoredText::new(envelope.text.clone(), envelope.images.clone());
+        edge.push_str(REMINDER);
+        (envelope, edge)
+    }
+
+    /// Blocks as `T:<text>` / `I:<data>` labels.
+    fn block_labels(edge: &cairn_common::read::AnchoredText) -> Vec<String> {
+        edge.blocks()
+            .into_iter()
+            .map(|block| match block {
+                cairn_common::read::OrderedBlock::Text(text) => format!("T:{text}"),
+                cairn_common::read::OrderedBlock::Image(image) => format!("I:{}", image.data),
+            })
+            .collect()
+    }
+
+    /// The text blocks joined the way a model client keeps tool-result text.
+    fn joined_text(edge: &cairn_common::read::AnchoredText) -> String {
+        edge.blocks()
+            .into_iter()
+            .filter_map(|block| match block {
+                cairn_common::read::OrderedBlock::Text(text) => Some(text),
+                cairn_common::read::OrderedBlock::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn png_base64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture")
+    }
+
+    /// What the gateway renders for `[image, text]`: the image anchored at the
+    /// start of the text that followed it.
+    fn image_then_text() -> crate::mcp::gateway::McpToolCallResult {
+        crate::mcp::gateway::McpToolCallResult {
+            text: "its description".into(),
+            images: vec![
+                cairn_common::read::ImageBlock::inline("image/png", png_base64()).placed_at(0),
+            ],
+            links: Vec::new(),
+        }
+    }
+
+    /// What the gateway renders for `[text, image, resource_link, text]`: the
+    /// parts joined by newlines, the image anchored where the link starts.
+    fn text_image_link_text() -> crate::mcp::gateway::McpToolCallResult {
+        let text = "summary\n[linked resource] res://report\ntrailing prose";
+        crate::mcp::gateway::McpToolCallResult {
+            text: text.into(),
+            images: vec![
+                cairn_common::read::ImageBlock::inline("image/png", png_base64())
+                    .placed_at("summary\n".len()),
+            ],
+            links: Vec::new(),
+        }
+    }
+
+    /// The citation the run path wrote for the delivered image.
+    fn citation(envelope: &cairn_common::read::RunBatchEnvelope) -> String {
+        let uri = envelope.images[0]
+            .uri
+            .as_deref()
+            .unwrap_or_else(|| panic!("the image was promoted: {}", envelope.text));
+        format!("![image]({uri})")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_image_before_its_text_reaches_the_agent_first_with_its_citation() {
+        let png = png_base64();
+        let (envelope, edge) = delivered(image_then_text(), false).await;
+        let cite = citation(&envelope);
+        assert_eq!(
+            block_labels(&edge),
+            [
+                format!("T:{cite}"),
+                format!("I:{png}"),
+                format!("T:its description{REMINDER}"),
+            ]
+        );
+        assert_eq!(joined_text(&edge), edge.text());
+
+        let (envelope, edge) = delivered(image_then_text(), true).await;
+        let cite = citation(&envelope);
+        assert_eq!(
+            block_labels(&edge),
+            [
+                format!("T:=== cairn://mcp/fake/look ===\n{cite}"),
+                format!("I:{png}"),
+                format!("T:its description\n=== cairn://mcp/fake/after ===\nafter{REMINDER}"),
+            ]
+        );
+        assert_eq!(joined_text(&edge), edge.text());
+
+        // Control: the same envelope without anchors hoists the image past
+        // all of the text, which is how every image arrived before.
+        let hoisted = cairn_common::read::AnchoredText::new(
+            edge.text(),
+            envelope
+                .images
+                .iter()
+                .cloned()
+                .map(|mut image| {
+                    image.at = None;
+                    image
+                })
+                .collect(),
+        );
+        assert_eq!(
+            block_labels(&hoisted),
+            [format!("T:{}", edge.text()), format!("I:{png}")]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_image_between_text_and_a_link_holds_its_place() {
+        let png = png_base64();
+        let (envelope, edge) = delivered(text_image_link_text(), false).await;
+        let cite = citation(&envelope);
+        assert_eq!(
+            block_labels(&edge),
+            [
+                format!("T:summary\n{cite}"),
+                format!("I:{png}"),
+                format!("T:[linked resource] res://report\ntrailing prose{REMINDER}"),
+            ]
+        );
+        assert_eq!(joined_text(&edge), edge.text());
+
+        let (envelope, edge) = delivered(text_image_link_text(), true).await;
+        let cite = citation(&envelope);
+        assert_eq!(
+            block_labels(&edge),
+            [
+                format!("T:=== cairn://mcp/fake/look ===\nsummary\n{cite}"),
+                format!("I:{png}"),
+                format!(
+                    "T:[linked resource] res://report\ntrailing prose\n=== cairn://mcp/fake/after ===\nafter{REMINDER}"
+                ),
+            ]
+        );
+        assert_eq!(joined_text(&edge), edge.text());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_then_image_result_arrives_exactly_as_it_always_did() {
+        let png = png_base64();
+        let result = crate::mcp::gateway::McpToolCallResult {
+            text: "AX tree".into(),
+            images: vec![cairn_common::read::ImageBlock::inline(
+                "image/png",
+                png.clone(),
+            )],
+            links: Vec::new(),
+        };
+        let (envelope, edge) = delivered(result, false).await;
+        let cite = citation(&envelope);
+        assert_eq!(envelope.text, format!("AX tree\n{cite}"));
+        assert_eq!(envelope.images[0].at, None);
+        assert_eq!(
+            block_labels(&edge),
+            [format!("T:AX tree\n{cite}{REMINDER}"), format!("I:{png}")]
+        );
     }
 
     /// A tool that asks for an approval 800 ms in, well after a 100 ms grace

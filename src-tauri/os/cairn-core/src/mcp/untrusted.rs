@@ -141,13 +141,25 @@ fn scrub_error<T>(what: &str, result: Result<T, String>) -> Result<T, String> {
 }
 
 fn scrub_call_result(result: &mut McpToolCallResult) {
-    scrub_text("a tool result", &mut result.text);
+    scrub("a tool result", result, sanitize_result_text);
     // A linked resource is a reference the agent may later read *through* Cairn,
     // and the reference is persisted with the result, so a credential parked in
     // a link's uri or description would outlive the call that returned it. The
     // rendered copy in `text` is covered above; this covers the structured one.
     scrub_resources(&mut result.links);
-    // `images` is deliberately untouched; see the module docs.
+    // `images`' bytes are deliberately untouched; see the module docs.
+}
+
+/// Redact a result's text without moving an image off the part the gateway
+/// placed it against: a redaction changes the text's length, and the image's
+/// offset has to change with it.
+fn sanitize_result_text(sanitizer: &mut Sanitizer<'_>, result: &mut McpToolCallResult) {
+    let mut text = cairn_common::read::AnchoredText::new(
+        std::mem::take(&mut result.text),
+        std::mem::take(&mut result.images),
+    );
+    text.sanitize(sanitizer);
+    (result.text, result.images) = text.into_parts();
 }
 
 fn scrub_call_outcome(outcome: &mut McpCallOutcome) {
@@ -552,6 +564,17 @@ mod tests {
                 "go-json-result" => Ok(McpCallOutcome::Complete(McpToolCallResult::from_text(
                     GO_SERIALIZED_ECHO,
                 ))),
+                // `[text, image, text]` whose first part echoes the credential.
+                "anchored" => {
+                    let first = format!("token {ECHOED}");
+                    Ok(McpCallOutcome::Complete(McpToolCallResult {
+                        text: format!("{first}\nits description"),
+                        images: vec![
+                            ImageBlock::inline("image/png", "base64png").placed_at(first.len() + 1)
+                        ],
+                        links: Vec::new(),
+                    }))
+                }
                 "defer" => Ok(McpCallOutcome::Task {
                     task_id: format!("task-{ECHOED}"),
                     poll_interval_ms: None,
@@ -621,6 +644,33 @@ mod tests {
         assert!(!result.text.contains(ECHOED), "{}", result.text);
         assert!(!result.text.contains(&escaped_echo()), "{}", result.text);
         assert_eq!(result.text, r#"{"credential":"[REDACTED]"}"#);
+    }
+
+    /// Redacting a credential shortens the text; the image the gateway placed
+    /// after it must still sit at the start of the part that followed it.
+    #[tokio::test]
+    async fn redacting_a_tool_result_keeps_its_image_in_place() {
+        let _guard = register();
+        let outcome = wrapped()
+            .call_tool_once(
+                "s",
+                "srv",
+                &config(),
+                "anchored",
+                json_args(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let McpCallOutcome::Complete(result) = outcome else {
+            panic!("expected a complete outcome");
+        };
+        assert_eq!(result.text, "token [REDACTED]\nits description");
+        let at = result.images[0].at.expect("still placed");
+        assert_eq!(&result.text[at..], "its description");
     }
 
     #[tokio::test]

@@ -162,6 +162,16 @@ impl<'a> Sanitizer<'a> {
         self.policy.is_none() && self.snapshot.is_empty()
     }
 
+    /// A pass with this one's registry view and policy that records nothing:
+    /// for re-running, in pieces, a match this pass has already counted.
+    pub fn shadow(&self) -> Sanitizer<'a> {
+        Self {
+            snapshot: self.snapshot.clone(),
+            policy: self.policy,
+            found: Detections::new(),
+        }
+    }
+
     pub fn detections(&self) -> &Detections {
         &self.found
     }

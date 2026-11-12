@@ -48,11 +48,52 @@ pub(crate) fn is_explicitly_paged_target(target: &str) -> bool {
 
 impl Sanitize for DispatchOutput {
     fn sanitize_observed(&mut self, sanitizer: &mut crate::security::Sanitizer<'_>) {
-        sanitizer.text_in_place(&mut self.content);
+        sanitize_content(&mut self.content, sanitizer);
         for reminder in &mut self.reminders {
             sanitizer.text_in_place(reminder);
         }
     }
+}
+
+/// Sanitize a handler's `content` in place.
+///
+/// A `read` or `run` result is an envelope whose images sit at byte offsets
+/// into its `text` (`ImageBlock::at`). A redaction shortens or lengthens that
+/// text, so for an envelope with placed images the text is redacted through
+/// `AnchoredText::sanitize`, which moves the offsets with it. Every other
+/// string in the envelope is sanitized as a JSON value. Anything else is
+/// sanitized as plain text. The first pass over the raw content records what
+/// matched and is the only cost when nothing does.
+fn sanitize_content(content: &mut String, sanitizer: &mut crate::security::Sanitizer<'_>) {
+    let std::borrow::Cow::Owned(redacted) = sanitizer.text(content) else {
+        return;
+    };
+    *content = resanitize_placed_envelope(content, sanitizer).unwrap_or(redacted);
+}
+
+/// `content` re-sanitized with its images' places in view, or `None` when it
+/// is not an envelope with placed images.
+fn resanitize_placed_envelope(
+    content: &str,
+    sanitizer: &crate::security::Sanitizer<'_>,
+) -> Option<String> {
+    use cairn_common::read::{AnchoredText, ImageBlock};
+    let mut value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let envelope = value.as_object_mut()?;
+    let text = envelope.get("text")?.as_str()?.to_string();
+    let images: Vec<ImageBlock> = serde_json::from_value(envelope.get("images")?.clone()).ok()?;
+    if images.iter().all(|image| image.at.is_none()) {
+        return None;
+    }
+    // The pass over the raw content already recorded every match.
+    let mut shadow = sanitizer.shadow();
+    let mut placed = AnchoredText::new(text, images);
+    placed.sanitize(&mut shadow);
+    let (text, images) = placed.into_parts();
+    envelope.insert("text".into(), serde_json::Value::String(text));
+    envelope.insert("images".into(), serde_json::to_value(images).ok()?);
+    shadow.json(&mut value);
+    serde_json::to_string(&value).ok()
 }
 
 /// `process_info` response when the windowless runner has no desktop connected.
@@ -1213,6 +1254,115 @@ async fn drain_tool_boundary(
         }
     }
     reminders
+}
+
+#[cfg(test)]
+mod placed_image_redaction_tests {
+    use super::*;
+    use cairn_common::read::{AnchoredText, ImageBlock, OrderedBlock, RunBatchEnvelope};
+    use cairn_common::security::registry::SecretRegistry;
+    use cairn_common::security::{SecretCategory, SecretId, SecretMaterial};
+
+    const SECRET: &str = "dispatch-test-Qa9Zm2Xp7Lr4Wd3Ty8Uv5";
+
+    fn registry() -> SecretRegistry {
+        let registry = SecretRegistry::new();
+        registry
+            .register(
+                SecretId::new("test:dispatch"),
+                SecretCategory::CallbackCredential,
+                "test",
+                SecretMaterial::from_string(SECRET.to_string()),
+            )
+            .expect("registerable")
+            .retain_for_process();
+        registry
+    }
+
+    /// A batch whose first item echoes a credential and whose second item is
+    /// an MCP tool's `[image, text]`, cited in place, crosses the final
+    /// response with its image still immediately after its citation.
+    #[test]
+    fn an_echoed_credential_before_a_placed_image_does_not_move_it() {
+        let registry = registry();
+        let before = format!(
+            "=== printenv | grep TOKEN ===\nTOKEN={SECRET}\n=== cairn://mcp/axon/look ===\n![image](cairn://p/p/1/images/1)\n"
+        );
+        let text = format!("{before}its description\n=== echo after ===\nafter");
+        let envelope = RunBatchEnvelope {
+            text,
+            images: vec![ImageBlock::inline("image/png", "b64").placed_at(before.len())],
+            invalid_input: false,
+            data: None,
+            over_ceiling: None,
+        };
+        let mut output = DispatchOutput {
+            content: serde_json::to_string(&envelope).unwrap(),
+            reminders: Vec::new(),
+        };
+        let mut sanitizer = crate::security::Sanitizer::with_snapshot(registry.snapshot(), None);
+        output.sanitize_observed(&mut sanitizer);
+        assert!(sanitizer.detections().has_exact());
+        assert!(!output.content.contains(SECRET));
+
+        let envelope: RunBatchEnvelope = serde_json::from_str(&output.content).unwrap();
+        let delivered = AnchoredText::new(envelope.text.clone(), envelope.images);
+        let blocks = delivered.blocks();
+        let image = blocks
+            .iter()
+            .position(|block| matches!(block, OrderedBlock::Image(_)))
+            .unwrap();
+        let OrderedBlock::Text(cited) = blocks[image - 1] else {
+            panic!("text before the image");
+        };
+        assert!(
+            cited.ends_with("![image](cairn://p/p/1/images/1)"),
+            "{cited}"
+        );
+        assert!(
+            matches!(blocks[image + 1], OrderedBlock::Text(text) if text.starts_with("its description"))
+        );
+        let joined = blocks
+            .iter()
+            .filter_map(|block| match block {
+                OrderedBlock::Text(text) => Some(*text),
+                OrderedBlock::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(joined, envelope.text);
+    }
+
+    /// An envelope with no placed images, or anything that is not an
+    /// envelope, is sanitized as plain text, exactly as before.
+    #[test]
+    fn content_without_placed_images_is_sanitized_as_text() {
+        let registry = registry();
+        for content in [
+            format!("plain {SECRET}"),
+            serde_json::to_string(&RunBatchEnvelope {
+                text: format!("AX tree {SECRET}"),
+                images: vec![ImageBlock::inline("image/png", "b64")],
+                invalid_input: false,
+                data: None,
+                over_ceiling: None,
+            })
+            .unwrap(),
+        ] {
+            let mut expected = content.clone();
+            crate::security::Sanitizer::with_snapshot(registry.snapshot(), None)
+                .text_in_place(&mut expected);
+            let mut output = DispatchOutput {
+                content,
+                reminders: Vec::new(),
+            };
+            output.sanitize_observed(&mut crate::security::Sanitizer::with_snapshot(
+                registry.snapshot(),
+                None,
+            ));
+            assert_eq!(output.content, expected);
+        }
+    }
 }
 
 #[cfg(test)]

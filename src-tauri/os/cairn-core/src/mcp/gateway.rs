@@ -61,17 +61,17 @@ pub trait PlacedFacade: Send + Sync {
 /// `text` is the flattened textual content. `images` carries any image content
 /// blocks the server returned, preserved rather than flattened to a placeholder
 /// so they can reach the agent as real image content blocks — mirroring the read
-/// path's text/image split (`cairn_common::read`).
+/// path's text/image split (`cairn_common::read`). Each one is anchored in `text`
+/// where the server put it (`ImageBlock::at`), or unanchored when nothing
+/// followed it.
 ///
 /// `links` carries the resources the server named by *reference* — MCP
 /// `resource_link` content blocks. A reference stays a reference: its bytes are
 /// never inlined, nothing fetches it while the result is rendered or forwarded,
 /// and the metadata the server supplied rides along so the agent can judge
 /// whether retrieving it (an explicit later `read`) is worth it. The same
-/// reference is also rendered into `text` at the position it occupied, so text
-/// and link blocks keep their relative order. Image blocks do not participate in
-/// that ordering: they are lifted out of the stream here and delivered after the
-/// composed text, which is how they have always reached the agent.
+/// reference is also rendered into `text` at the position it occupied, so text,
+/// link, and image blocks all keep their relative order.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpToolCallResult {
     pub text: String,
@@ -510,6 +510,29 @@ pub trait McpGateway: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A continuation persisted before images had places (an `agent_waits`
+    /// row written by an older host) still decodes, its images trailing.
+    #[test]
+    fn a_persisted_outcome_without_image_anchors_still_decodes() {
+        let row = r#"{"kind":"complete","text":"AX tree","images":[{"mime_type":"image/png","data":"b64"}]}"#;
+        let McpCallOutcome::Complete(result) = serde_json::from_str(row).unwrap() else {
+            panic!("a completed outcome");
+        };
+        assert_eq!(result.images, vec![ImageBlock::inline("image/png", "b64")]);
+
+        let placed = McpCallOutcome::Complete(McpToolCallResult {
+            text: "its description".into(),
+            images: vec![ImageBlock::inline("image/png", "b64").placed_at(0)],
+            links: Vec::new(),
+        });
+        let McpCallOutcome::Complete(round_trip) =
+            serde_json::from_str(&serde_json::to_string(&placed).unwrap()).unwrap()
+        else {
+            panic!("a completed outcome");
+        };
+        assert_eq!(round_trip.images[0].at, Some(0));
+    }
 
     /// Supplementary source guard: aliases and refactors can bypass a textual
     /// scan. Behavioral prompt tests hold the trust boundary; this guard makes

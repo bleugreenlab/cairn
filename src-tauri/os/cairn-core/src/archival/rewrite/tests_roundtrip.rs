@@ -563,6 +563,75 @@ async fn live_read_batch_round_trips_through_archival() {
     );
 }
 
+/// A read of an image file whose bytes were promoted renders its one durable
+/// `![label](uri)` reference, which the archived segment (bytes, no address)
+/// cannot. Archival still reconstructs the live text byte for byte, with the
+/// reference exactly once.
+#[tokio::test]
+async fn a_promoted_image_read_round_trips_through_archival() {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nimage-bytes\x00\xff";
+    const STORED: &str = "cairn://p/p/1/images/1";
+    crate::mcp::handlers::read::register_archived_file_renderer();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_repo(repo);
+    write_file(repo, "logo.png", PNG);
+    write_file(repo, "a.txt", b"alpha\nbeta\n");
+    commit_all(repo, "base");
+
+    // The live read: the producer's segments, the image's address recorded
+    // on its block as promotion records it, through the live composer.
+    use crate::storage::event_fixture::{mixed_render_targets, MixedSection};
+    let stored = mixed_render_targets(&[
+        MixedSection::PromotedImage("file:logo.png", PNG, STORED),
+        MixedSection::File("file:a.txt", b"alpha\nbeta\n"),
+    ]);
+    assert_eq!(
+        stored.matches(&format!("]({STORED})")).count(),
+        1,
+        "{stored}"
+    );
+    assert!(
+        stored.contains(&format!("![logo.png]({STORED})")),
+        "{stored}"
+    );
+
+    let db = migrated_test_db("archival-image-read.db").await;
+    seed_chain(&db, repo.to_str().unwrap(), false).await;
+    insert_event(
+        &db,
+        "a1",
+        "run",
+        1,
+        1,
+        "assistant",
+        &assistant_read("r1", &["file:logo.png", "file:a.txt"]),
+    )
+    .await;
+    insert_event(
+        &db,
+        "e1",
+        "run",
+        2,
+        2,
+        "tool_result",
+        &read_result("r1", &stored),
+    )
+    .await;
+    archive(&db, Some(branch_range(repo, "main")))
+        .await
+        .unwrap();
+
+    let events = load_events(&db).await;
+    let reconstructed = reconstruct_events(&db, events).await;
+    let read = reconstructed.iter().find(|e| e.id == "e1").unwrap();
+    assert_eq!(
+        tool_result_of(read),
+        stored,
+        "an image read reconstructs byte-identical to the live read"
+    );
+}
+
 /// A mixed read batch — a reproducible in-repo file plus a verbatim resource
 /// section — archives per-section: the file section is git-addressed, the
 /// resource stays verbatim in the skeleton, and reconstruction is byte-exact.

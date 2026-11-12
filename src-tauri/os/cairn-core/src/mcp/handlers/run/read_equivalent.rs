@@ -21,7 +21,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cairn_common::read::{SegmentKind, SegmentMeta};
+use cairn_common::read::{AnchoredText, ImageBlock, SegmentKind, SegmentMeta};
 
 use super::hygiene::{expand_tilde, normalize_path};
 use super::process::append_exit_code;
@@ -1092,21 +1092,31 @@ pub(super) async fn try_serve_batch(
         }
     }
 
+    // Each segment's images, in segment order, go to the item that read it.
+    let mut images = envelope.images.iter().cloned();
     let mut outcomes: Vec<ItemOutcome> = spans
         .iter()
         .zip(&plans)
         .zip(resolved)
         .map(|((span, (_, exit)), (header, _))| {
+            let metas = &envelope.segments[span.clone()];
+            let count = metas.iter().map(|meta| meta.image_count).sum();
             served_outcome(
                 header.clone(),
-                &envelope.segments[span.clone()],
+                metas,
                 &bodies[span.clone()],
+                images.by_ref().take(count).collect(),
                 *exit,
             )
         })
         .collect();
-    if let Some(first) = outcomes.first_mut() {
-        first.images = envelope.images;
+    // Counts that do not account for every image leave the rest trailing the
+    // batch rather than dropping them.
+    if let Some(last) = outcomes.last_mut() {
+        last.images.extend(images.map(|mut image| {
+            image.at = None;
+            image
+        }));
     }
     for (header, _) in resolved {
         log::debug!(
@@ -1154,32 +1164,54 @@ fn framing_bytes(resolved: &[(String, Result<RunSpec, String>)], targets: usize)
     headers + labels + exits
 }
 
+/// One served item: its segments' bodies under `↳ read` labels, with each
+/// segment's images (`images`, split by [`SegmentMeta::image_count`]) after
+/// that segment's own text.
 fn served_outcome(
     header: String,
     metas: &[SegmentMeta],
     bodies: &[String],
+    images: Vec<ImageBlock>,
     exit: ExitRule,
 ) -> ItemOutcome {
-    let mut body = String::new();
-    for (meta, segment_body) in metas.iter().zip(bodies) {
+    let mut body = AnchoredText::default();
+    let mut images = images.into_iter();
+    for (index, (meta, segment_body)) in metas.iter().zip(bodies).enumerate() {
         if !body.is_empty() {
-            body.push('\n');
+            body.push_str("\n");
         }
         body.push_str("↳ read ");
         body.push_str(&view::segment_label(meta));
         if !segment_body.is_empty() {
-            body.push('\n');
+            body.push_str("\n");
             body.push_str(segment_body);
         }
+        let mut placed = AnchoredText::new(
+            "",
+            images
+                .by_ref()
+                .take(meta.image_count)
+                .map(|mut image| {
+                    image.at = None;
+                    image
+                })
+                .collect(),
+        );
+        if index + 1 < metas.len() {
+            placed.pin_trailing();
+        }
+        body.append(placed);
     }
+    body.append(AnchoredText::new("", images.collect()));
     let status = exit.status(metas);
+    let (mut body, images) = body.into_parts();
     append_exit_code(&mut body, status);
     ItemOutcome {
         header,
         body,
         succeeded: status == 0,
         suspended: false,
-        images: Vec::new(),
+        images,
         tracked_modifications: None,
         data: None,
         // Read already budgeted this body and its `continue:` footer is only
@@ -1718,6 +1750,7 @@ mod tests {
             "rg x".to_string(),
             &[meta(SegmentKind::Grep, None, Some(0))],
             &["No matches found for pattern 'x'".to_string()],
+            Vec::new(),
             ExitRule::Search,
         );
         assert!(!outcome.succeeded);
@@ -1726,6 +1759,43 @@ mod tests {
             outcome.body,
             "↳ read file:src?grep=x [0 files]\nNo matches found for pattern 'x'\n\nExit code: 1"
         );
+    }
+
+    #[test]
+    fn a_served_items_images_follow_the_segment_that_read_them() {
+        let image = |data: &str| ImageBlock::inline("image/png", data);
+        let mut shot = SegmentMeta::new(
+            "cairn:~/browser?screenshot",
+            SegmentKind::Image,
+            cairn_common::read::NaturalUnit::Line,
+        );
+        shot.image_count = 1;
+        let file = SegmentMeta::new(
+            "file:a.rs",
+            SegmentKind::File,
+            cairn_common::read::NaturalUnit::Line,
+        );
+        let mut last = shot.clone();
+        last.uri = "file:b.png".to_string();
+        let outcome = served_outcome(
+            "cat".to_string(),
+            &[shot, file, last],
+            &[
+                "![browser](cairn://p/x/1/images/1)".to_string(),
+                "1\tfn main() {}".to_string(),
+                "![b.png](cairn://p/x/1/images/2)".to_string(),
+            ],
+            vec![image("shot"), image("b")],
+            ExitRule::Pipeline,
+        );
+        assert_eq!(outcome.images.len(), 2);
+        let at = outcome.images[0]
+            .at
+            .expect("the first segment's image is placed");
+        assert!(outcome.body[..at].ends_with("![browser](cairn://p/x/1/images/1)"));
+        assert!(outcome.body[at..].starts_with("\n↳ read file:a.rs"));
+        // The item's last segment keeps its image trailing.
+        assert_eq!(outcome.images[1].at, None);
     }
 
     #[test]
