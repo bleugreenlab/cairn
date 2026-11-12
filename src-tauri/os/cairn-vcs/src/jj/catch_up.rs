@@ -9,9 +9,15 @@
 //! commit of the stack keeps its id, and the bookmark fast-forwards onto a new
 //! child of its old tip.
 //!
-//! The canonical kernel uses jj's own tree merge and writes only hidden objects.
-//! The tree judged is the tree committed. Detached preparation and the locked
-//! adapter share this kernel; only installation publishes the accepted candidate.
+//! The canonical kernel (`compute_branch_merge_advance`) uses jj's own tree
+//! merge and writes only hidden objects. The tree judged is the tree committed,
+//! and only installation publishes the accepted candidate.
+//!
+//! Its destination is always captured from the store's own view of the base
+//! bookmark, in the same operation as the branch tip, so a base tip origin has
+//! but the store has not yet imported is never a coordinate: the pass catches
+//! up to what the store holds, and the next pass after the import takes the
+//! rest. There is no pinned destination that can fail to resolve.
 //!
 //! Which branches catch up this way is the orchestrator's decision (an
 //! operator-set per-branch mode); this module only performs one merge, and
@@ -29,32 +35,6 @@ pub const MERGE_CATCH_UP_REFUSAL: &str = "catch-up refused:";
 /// ambiguous merge base). Retrying cannot help until the tip or the base
 /// changes, so it is parked on those coordinates.
 pub const MERGE_CATCH_UP_REFUSED: &str = "merge_catch_up_refused";
-
-/// What one merge-shaped catch-up did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeCatchUp {
-    /// The destination is already in the branch's ancestry. Nothing moved.
-    AlreadyCurrent,
-    /// The branch had no commit of its own past the destination, so its
-    /// bookmark was fast-forwarded to `to`; no merge commit was made.
-    FastForwarded { to: String },
-    /// One two-parent commit `merge` (parents: the old tip, then `new_base`)
-    /// was created and the bookmark fast-forwarded onto it. `old_base` is the
-    /// merge base the three-way merge used: the range `old_base..new_base` is
-    /// what the merge brought in.
-    Merged {
-        merge: String,
-        old_base: String,
-        new_base: String,
-    },
-    /// The merge recorded a conflict, or produced a tree that does not parse
-    /// or carries conflict scaffolding. It was not installed: the branch is exactly
-    /// where it was. The diagnostic's coordinates are (merge base, tip, dest).
-    Conflicted { diagnostic: ConflictDiagnostic },
-    /// The merge was not attempted, and nothing moved. `reason` begins with
-    /// [`MERGE_CATCH_UP_REFUSAL`].
-    Refused { reason: String },
-}
 
 /// The description of a catch-up merge commit. Publication requires every
 /// commit to be described, and the subject says what the commit is.
@@ -127,84 +107,6 @@ pub fn base_side_paths(jj: &JjEnv, store: &Path, old_base: &str, new_base: &str)
     changed_paths(jj, store, old_base, new_base)
         .into_iter()
         .collect()
-}
-
-/// Bring `branch` current with `dest_commit` by one merge commit.
-///
-/// The caller holds the store lock and, for an automatic pass, the operation
-/// budget. `carry` is an explicitly requested resolution: the branch tip is
-/// the owner's committed resolution (a single-parent commit on top of the tip
-/// that conflicted), and each carried path is taken whole from it into the
-/// merge. Only [`CarriedContent::FromTip`] is meaningful here, because the
-/// owner resolved against this very destination.
-///
-/// Uses the same hidden-object kernel as detached preparation, then installs
-/// through the two-coordinate CAS and guarded export. Conflicts and refusals
-/// publish no operation and require no live mutation or undo.
-pub fn merge_base_into_branch(
-    jj: &JjEnv,
-    store: &Path,
-    branch: &str,
-    dest_commit: &str,
-    message: &str,
-    carry: Option<&ResolutionCarry>,
-) -> Result<MergeCatchUp, String> {
-    let snapshot = super::advance::capture_replay(store, branch, dest_commit, false)?;
-    let coordinate = snapshot.coordinate().clone();
-    let budget = jj
-        .operation_deadline
-        .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
-        .unwrap_or(super::env::JJ_DEFAULT_TIMEOUT);
-    let candidate = match super::advance::compute_branch_merge_with_message(
-        jj, snapshot, carry, message, budget,
-    ) {
-        Ok(candidate) => candidate,
-        Err(AdvanceComputeError::Conflict(diagnostic)) => {
-            return Ok(MergeCatchUp::Conflicted {
-                diagnostic: *diagnostic,
-            });
-        }
-        Err(AdvanceComputeError::Repository(reason))
-            if reason.starts_with(MERGE_CATCH_UP_REFUSAL) =>
-        {
-            return Ok(MergeCatchUp::Refused { reason });
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    let head = candidate.head();
-    if head == coordinate.head {
-        return Ok(MergeCatchUp::AlreadyCurrent);
-    }
-    let old_base = if head == coordinate.base {
-        None
-    } else {
-        // The kernel already proved uniqueness at the captured operation.
-        Some(
-            merge_bases(jj, store, &coordinate.head, &coordinate.base)?
-                .into_iter()
-                .next()
-                .ok_or("catch-up merge lost its merge base")?,
-        )
-    };
-    let installed =
-        super::advance::install_legacy_replay(jj, candidate).map_err(|error| error.to_string())?;
-    if let Err(error) = installed.export {
-        return Err(roll_back_rebase(
-            jj,
-            store,
-            branch,
-            &coordinate.operation,
-            error,
-        ));
-    }
-    match old_base {
-        Some(old_base) => Ok(MergeCatchUp::Merged {
-            merge: head,
-            old_base,
-            new_base: coordinate.base,
-        }),
-        None => Ok(MergeCatchUp::FastForwarded { to: head }),
-    }
 }
 
 #[cfg(test)]
@@ -295,31 +197,19 @@ mod tests {
                 .into_owned()
         }
 
-        fn operations(&self) -> Vec<String> {
-            self.jj
-                .run(
-                    &self.store,
-                    &[
-                        "op",
-                        "log",
-                        "--no-graph",
-                        "--ignore-working-copy",
-                        "-T",
-                        "description ++ \"\\n\"",
-                    ],
-                    "fixture op log",
-                )
-                .unwrap()
-                .lines()
-                .map(ToOwned::to_owned)
-                .collect()
-        }
-
-        /// The descriptions of the operations recorded since `before`, newest
-        /// first.
-        fn operations_since(&self, before: &[String]) -> Vec<String> {
-            let after = self.operations();
-            after[..after.len() - before.len()].to_vec()
+        /// Merge the detached candidate for `BRANCH` onto the store's `main`,
+        /// expecting the kernel to refuse it.
+        fn refused_merge(&self) -> AdvanceComputeError {
+            let snapshot = capture_branch_advance(&self.store, BRANCH, "main").unwrap();
+            match compute_branch_merge_advance(
+                &self.jj,
+                snapshot,
+                None,
+                std::time::Duration::from_secs(30),
+            ) {
+                Ok(candidate) => panic!("the merge computed {}", candidate.head()),
+                Err(error) => error,
+            }
         }
     }
 
@@ -407,27 +297,18 @@ mod tests {
         assert_eq!(fx.tip(BRANCH), source);
     }
 
-    fn message(dest: &str) -> String {
-        catch_up_merge_message("main", dest, BRANCH)
-    }
-
     #[test]
     #[serial_test::serial(jj)]
-    fn a_conflicting_advance_leaves_the_branch_untouched_with_merge_coordinates() {
+    fn a_conflicting_merge_names_its_merge_coordinates_and_leaves_the_branch() {
         let Some(bin) = jj_bin() else { return };
         let fx = fixture(&bin);
         let base = fx.tip("main");
         let tip = fx.commit(&["main"], BRANCH, "shared.rs", "BRANCH\n");
         let dest = fx.commit(&["main"], "main", "shared.rs", "MAIN\n");
-        let ops = fx.operations();
 
-        let outcome =
-            merge_base_into_branch(&fx.jj, &fx.store, BRANCH, &dest, &message(&dest), None)
-                .unwrap();
-        let MergeCatchUp::Conflicted { diagnostic } = outcome else {
-            panic!("the same-hunk edit conflicts: {outcome:?}");
+        let AdvanceComputeError::Conflict(diagnostic) = fx.refused_merge() else {
+            panic!("the same-hunk edit conflicts");
         };
-        assert_eq!(fx.tip(BRANCH), tip, "the bookmark did not move");
         assert_eq!(diagnostic.base.as_deref(), Some(base.as_str()));
         assert_eq!(diagnostic.ours.as_deref(), Some(tip.as_str()));
         assert_eq!(diagnostic.theirs.as_deref(), Some(dest.as_str()));
@@ -435,23 +316,8 @@ mod tests {
             diagnostic.conflicting_paths(),
             vec!["shared.rs".to_string()]
         );
+        assert_eq!(fx.tip(BRANCH), tip, "the bookmark did not move");
         assert_eq!(fx.file(BRANCH, "shared.rs"), "BRANCH\n");
-        let since = fx.operations_since(&ops);
-        assert!(
-            since.iter().all(|op| !op.contains("rebase")),
-            "no rebase ran: {since:?}"
-        );
-        // Undone: no merge of the pair survives.
-        assert!(
-            revset_commit_ids(
-                &fx.jj,
-                &fx.store,
-                &format!("children({tip}) & children({dest})")
-            )
-            .unwrap()
-            .is_empty(),
-            "the conflicted merge was undone"
-        );
     }
 
     #[test]
@@ -461,14 +327,11 @@ mod tests {
         let fx = fixture(&bin);
         let a1 = fx.commit(&["main"], "side-a", "a.rs", "a\n");
         let b1 = fx.commit(&["main"], BRANCH, "b.rs", "b\n");
-        let dest = fx.commit(&[&a1, &b1], "main", "", "");
+        fx.commit(&[&a1, &b1], "main", "", "");
         let tip = fx.commit(&[&b1, &a1], BRANCH, "", "");
 
-        let outcome =
-            merge_base_into_branch(&fx.jj, &fx.store, BRANCH, &dest, &message(&dest), None)
-                .unwrap();
-        let MergeCatchUp::Refused { reason } = outcome else {
-            panic!("two merge bases are refused: {outcome:?}");
+        let AdvanceComputeError::Repository(reason) = fx.refused_merge() else {
+            panic!("two merge bases are refused");
         };
         assert!(reason.starts_with(MERGE_CATCH_UP_REFUSAL), "{reason}");
         assert!(reason.contains(&a1) && reason.contains(&b1), "{reason}");
@@ -479,6 +342,73 @@ mod tests {
             "the refusal is its own failure kind, not a divergence"
         );
         assert!(reconcile_failure_is_permanent(MERGE_CATCH_UP_REFUSED));
+    }
+
+    /// A base tip that has reached the store's backing Git repository but not
+    /// its jj view (the window between a sync's fetch and its import) is not a
+    /// destination yet. A pass in that window merges the base the store holds
+    /// and fails nothing; the first pass after the import takes the new tip.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_base_tip_not_yet_imported_is_never_the_destination() {
+        let Some(bin) = jj_bin() else { return };
+        let fx = fixture(&bin);
+        let source = fx.commit(&["main"], BRANCH, "own.txt", "own\n");
+        let imported = fx.commit(&["main"], "main", "base.txt", "base\n");
+        let git_dir = git_backend_root(&fx.jj, &fx.store).unwrap();
+        let git = |args: &[&str]| {
+            let mut full = vec![
+                "-c",
+                "user.name=Upstream",
+                "-c",
+                "user.email=upstream@example.com",
+                "--git-dir",
+                &git_dir,
+            ];
+            full.extend_from_slice(args);
+            git_stdout(&fx.store, &full)
+        };
+        // Upstream advances main, and the fetch lands it in the backing Git
+        // repository; nothing has imported it.
+        let tree = git(&["rev-parse", &format!("{imported}^{{tree}}")]);
+        let pending = git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &imported,
+            "-m",
+            "upstream advance",
+        ]);
+        git(&["update-ref", "refs/heads/main", &pending]);
+
+        let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+        assert_eq!(snapshot.coordinate().head, source);
+        assert_eq!(
+            snapshot.coordinate().base,
+            imported,
+            "the destination is the base the store has imported"
+        );
+        let candidate = compute_branch_merge_advance(
+            &fx.jj,
+            snapshot,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap_or_else(|error| panic!("the in-flight import fails nothing: {error}"));
+        assert_eq!(candidate.coordinate().base, imported);
+        drop(candidate);
+
+        fx.jj
+            .run(&fx.store, &["git", "import"], "fixture import")
+            .unwrap();
+        let snapshot = capture_branch_advance(&fx.store, BRANCH, "main").unwrap();
+        assert_eq!(
+            snapshot.coordinate().base,
+            pending,
+            "once imported, the new tip is the destination"
+        );
+        compute_branch_merge_advance(&fx.jj, snapshot, None, std::time::Duration::from_secs(30))
+            .unwrap_or_else(|error| panic!("the imported tip merges: {error}"));
     }
 
     #[test]

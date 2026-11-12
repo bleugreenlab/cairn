@@ -721,17 +721,6 @@ pub struct ReconcileOptions {
     pub publish: bool,
     /// An explicitly requested committed resolution for one named sibling.
     pub resolution: Option<(String, ResolutionCarry)>,
-    /// Siblings that catch up by ONE merge commit of the destination and are
-    /// never rebased (see [`merge_base_into_branch`]). Every other sibling is
-    /// rebased exactly as before.
-    pub merge_mode: std::collections::BTreeSet<String>,
-    /// The destination's branch name, for the merge commit's description; the
-    /// pass itself is usually handed a pinned commit id.
-    pub target_name: Option<String>,
-    /// For a resolved merge-mode sibling: the destination the resolution was
-    /// made against. The resolution is merged there first, and the branch is
-    /// then merged with the pass's destination if that is newer.
-    pub resolution_dest: Option<String>,
 }
 
 pub fn reconcile_siblings_with_options(
@@ -797,28 +786,16 @@ pub fn reconcile_siblings_with_options(
             record_failure(&mut report, branch, deferred.clone());
             continue;
         }
-        if options.merge_mode.contains(branch) {
-            merge_one_sibling(
-                jj,
-                store,
-                integration_branch,
-                branch,
-                dest_commit.as_deref(),
-                options,
-                &mut report,
-            );
-        } else {
-            reconcile_one_sibling(
-                jj,
-                store,
-                integration_branch,
-                branch,
-                dest_commit.as_deref(),
-                publish,
-                resolution,
-                &mut report,
-            );
-        }
+        reconcile_one_sibling(
+            jj,
+            store,
+            integration_branch,
+            branch,
+            dest_commit.as_deref(),
+            publish,
+            resolution,
+            &mut report,
+        );
         deferral = report
             .failed
             .iter()
@@ -826,108 +803,6 @@ pub fn reconcile_siblings_with_options(
             .and_then(|failure| ref_lock_deferral(&failure.error));
     }
     Ok(report)
-}
-
-/// One merge-mode sibling's slice of the pass: never a rebase. A clean merge
-/// is reported as `rebased_clean` (plus its `merged_clean` detail), a conflict
-/// as an ordinary rolled-back conflict whose coordinates are (merge base, tip,
-/// dest), and a refusal as a failure of kind [`MERGE_CATCH_UP_REFUSED`].
-fn merge_one_sibling(
-    jj: &JjEnv,
-    store: &Path,
-    integration_branch: &str,
-    branch: &str,
-    dest_commit: Option<&str>,
-    options: &ReconcileOptions,
-    report: &mut ReconcileReport,
-) {
-    let Some(dest) = dest_commit else {
-        record_failure(
-            report,
-            branch,
-            format!("catch-up merge: destination `{integration_branch}` did not resolve"),
-        );
-        return;
-    };
-    let target = options.target_name.as_deref().unwrap_or(integration_branch);
-    let carry = options
-        .resolution
-        .as_ref()
-        .filter(|(resolved, _)| resolved == branch)
-        .map(|(_, carry)| carry);
-    // A resolution is merged against the destination it was made against, so
-    // its carried paths are exact there; the pass's newer destination follows
-    // as an ordinary merge.
-    let mut steps: Vec<(&str, Option<&ResolutionCarry>)> = Vec::new();
-    match (carry, options.resolution_dest.as_deref()) {
-        (Some(carry), Some(resolved_on)) if resolved_on != dest => {
-            steps.push((resolved_on, Some(carry)));
-            steps.push((dest, None));
-        }
-        (carry, _) => steps.push((dest, carry)),
-    }
-    let mut merged: Option<MergedCatchUp> = None;
-    for (step_dest, step_carry) in steps {
-        let message = catch_up_merge_message(target, step_dest, branch);
-        match merge_base_into_branch(jj, store, branch, step_dest, &message, step_carry) {
-            Ok(MergeCatchUp::AlreadyCurrent) => {}
-            Ok(MergeCatchUp::FastForwarded { .. }) => {
-                if merged.is_none() {
-                    report.rebased_clean.push(branch.to_string());
-                    report.silent.push(branch.to_string());
-                    return;
-                }
-            }
-            Ok(MergeCatchUp::Merged {
-                merge,
-                old_base,
-                new_base,
-            }) => {
-                let resolved =
-                    step_carry.is_some() || merged.as_ref().is_some_and(|earlier| earlier.resolved);
-                let old_base = merged
-                    .take()
-                    .map(|earlier| earlier.old_base)
-                    .unwrap_or(old_base);
-                merged = Some(MergedCatchUp {
-                    merge,
-                    old_base,
-                    new_base,
-                    resolved,
-                });
-            }
-            Ok(MergeCatchUp::Conflicted { diagnostic }) => {
-                record_conflict(report, branch, diagnostic);
-                return;
-            }
-            Ok(MergeCatchUp::Refused { reason }) => {
-                report
-                    .merge_refused
-                    .insert(branch.to_string(), reason.clone());
-                record_failure(report, branch, reason);
-                return;
-            }
-            Err(error) => {
-                log::warn!("catch-up[{branch}] merge onto {step_dest} failed: {error}");
-                record_failure(report, branch, error);
-                return;
-            }
-        }
-    }
-    let Some(merged) = merged else {
-        return;
-    };
-    if options.publish {
-        if let Err(error) =
-            publish_reconciled_bookmark(jj, store, branch, discover_origin_presence(jj, store))
-        {
-            log::warn!("catch-up[{branch}] publishing the merge failed: {error}");
-            record_failure(report, branch, error.to_string());
-            return;
-        }
-    }
-    report.rebased_clean.push(branch.to_string());
-    report.merged_clean.insert(branch.to_string(), merged);
 }
 
 #[expect(

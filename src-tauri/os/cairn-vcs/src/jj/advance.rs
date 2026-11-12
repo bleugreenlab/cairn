@@ -812,8 +812,8 @@ pub(super) fn compute_branch_merge_with_message(
     })
 }
 
-/// The canonical merge kernel for both detached preparation and the locked
-/// legacy adapter. Only fresh objects are written; its transaction is never committed.
+/// The canonical merge kernel of detached preparation. Only fresh objects are
+/// written; its transaction is never committed.
 async fn compute_merge_candidate(
     snapshot: &BranchAdvanceSnapshot,
     resolution: Option<&super::ResolutionCarry>,
