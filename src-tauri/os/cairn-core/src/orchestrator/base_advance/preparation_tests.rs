@@ -350,6 +350,55 @@ pub(super) fn export_fails(store: &Path) -> bool {
     failing_exports().lock().unwrap().contains(store)
 }
 
+/// Two suites of one `cairn check run` prepare the same branch at once. The
+/// one that reaches the install while its sibling's preparation still holds
+/// the branch's reservation waits for it and then installs, rather than
+/// refusing as busy.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_check_waits_for_a_sibling_preparation_holding_the_branch() {
+    let h = harness_or_skip!("prep_sibling_check");
+    h.commit(&h.branch_ws, BRANCH, "own.txt", "own\n");
+    let base = h.advance_main("base.txt", "base\n");
+    let sibling = h
+        .orch
+        .reserve_branches(
+            &h.store,
+            &[BRANCH],
+            &format!("branch preparation of `{BRANCH}` for check"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let orch = h.orch.clone();
+    let mut waiting = tokio::spawn(async move {
+        prepare_branch(
+            &orch,
+            PreparationRequest::for_check("proj-1", BRANCH, Some(JOB.to_string())),
+        )
+        .await
+    });
+    // A preparation that does not wait refuses well inside this window.
+    if let Ok(early) = tokio::time::timeout(Duration::from_secs(3), &mut waiting).await {
+        panic!(
+            "the check must wait on its sibling's reservation, not end: {:?}",
+            early
+                .unwrap()
+                .map(|prepared| prepared.head_after)
+                .map_err(|refusal| refusal.to_string())
+        );
+    }
+    drop(sibling);
+    let prepared = tokio::time::timeout(Duration::from_secs(60), waiting)
+        .await
+        .expect("the check proceeds once its sibling releases the branch")
+        .unwrap()
+        .expect("the check prepares the branch after waiting");
+    assert!(prepared.advanced, "the waiting check installed the advance");
+    assert!(h.is_ancestor(&base, &prepared.head_after));
+    assert_eq!(h.tip(BRANCH), prepared.head_after);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(jj)]
 async fn an_unmanaged_or_ambiguous_branch_is_refused_before_touching_the_store() {

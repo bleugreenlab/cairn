@@ -1940,19 +1940,18 @@ impl Context<'_> {
         }
     }
 
-    /// Reserve this branch, never while holding a store guard. An owner's
-    /// commit or merge waits within its lock bound; a check or run tries once.
+    /// Reserve this branch, never while holding a store guard. Every purpose
+    /// waits within the same bound it waits for the store lock: a reservation
+    /// is held only across one preparation or publication, and the suites of
+    /// one `cairn check run` prepare the same branch concurrently, so a check
+    /// or run that refused at once would fail on its own sibling.
     async fn ensure_reserved(
         &self,
     ) -> Result<Arc<crate::orchestrator::BranchReservation>, PreparationRefusal> {
         if let Some(held) = self.reserved() {
             return Ok(held);
         }
-        let wait = if self.request.purpose.actionable() {
-            within_deadline(self.request, self.request.lock_wait)
-        } else {
-            Duration::ZERO
-        };
+        let wait = within_deadline(self.request, self.request.lock_wait);
         let purpose = format!(
             "branch preparation of `{}` for {}",
             self.request.branch,
