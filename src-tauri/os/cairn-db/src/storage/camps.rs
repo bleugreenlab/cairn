@@ -1158,14 +1158,25 @@ fn subject_from_row(key: &str, principal: Option<&PrincipalRef>) -> DbResult<Cam
 
 /// Every participant of a camp with its effective role: the maximum of the
 /// lead edge and its stored level. Highest role first, then longest standing.
+///
+/// A closed thread is not a participant. Its membership row stays (base camp
+/// seats closed threads so a reopened thread finds its seat waiting), but it
+/// is dormant: every census, count and recipient list reads through here and
+/// so never sees it until the thread is active again.
 pub async fn camp_participants_conn(
     conn: &TrackedConnection,
     camp: &Camp,
 ) -> DbResult<Vec<CampParticipant>> {
     let mut rows = conn
         .query(
-            "SELECT subject_key, subject_json, camp_level, reason, created_at, assigned_by_json
-             FROM wake_subscriptions WHERE camp_id = ?1",
+            "SELECT ws.subject_key, ws.subject_json, ws.camp_level, ws.reason, ws.created_at,
+                    ws.assigned_by_json
+             FROM wake_subscriptions ws
+             WHERE ws.camp_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM threads t
+                   WHERE t.id = ws.subject_key AND t.status = 'closed'
+               )",
             params![camp.id.as_str()],
         )
         .await?;
@@ -1439,8 +1450,21 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["t-general", "t-devops", "t-old"],
-            "closed threads are seated; other projects are not"
+            ["t-general", "t-devops"],
+            "a closed thread is not a participant; other projects are not seated"
+        );
+        let dormant = db
+            .query_all(
+                "SELECT subject_key FROM wake_subscriptions WHERE camp_id = ?1 AND subject_key = 't-old'",
+                (camp.id.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dormant.len(),
+            1,
+            "a closed thread is still seated, dormant until it reopens"
         );
         assert_eq!(participants[0].role, CampRole::Lead);
         assert!(participants[1..].iter().all(|p| p.role == CampRole::Watch));
@@ -1473,7 +1497,7 @@ mod tests {
             "a retry never reassigns the lead"
         );
         let participants = db.camp_participants(&again).await.unwrap();
-        assert_eq!(participants.len(), 3);
+        assert_eq!(participants.len(), 2);
         let devops = participants
             .iter()
             .find(|p| p.subject_key == "t-devops")
