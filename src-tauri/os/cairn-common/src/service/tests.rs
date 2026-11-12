@@ -19,6 +19,7 @@ fn spec() -> ServiceSpec {
         file_descriptor_limit: 8192,
         supervision: Supervision::always_on(),
         legacy: None,
+        bounds: None,
     }
 }
 
@@ -110,6 +111,250 @@ fn systemd_stop_timeout_is_written_only_when_the_spec_names_one() {
     let mut bounded = spec();
     bounded.supervision = Supervision::retry_on_failure(5).with_stop_timeout(15);
     assert!(systemd_unit_contents(&bounded).contains("\nTimeoutStopSec=15\n"));
+}
+
+const GRANULE: u64 = 256 << 20;
+
+fn facts(mem_total_kib: u64, threads_max: u64) -> MachineFacts {
+    MachineFacts {
+        mem_total_bytes: mem_total_kib * 1024,
+        threads_max,
+        pid_max: 4_194_304,
+    }
+}
+
+/// The fleet's machines as measured (`MemTotal`, `threads-max`), and the
+/// bounds each gets: a quarter of the machine left to the host, at least
+/// 4 GiB and at most 16 GiB, in 256 MiB steps.
+#[test]
+fn unit_bounds_are_sized_from_each_fleet_machine() {
+    let table = [
+        // bgsrv-ub2: 15.37 GiB. The 14.1 GiB rustc dies at 11.25 GiB.
+        (
+            "bgsrv-ub2",
+            facts(16_116_228, 124_760),
+            45 * GRANULE,
+            18_714,
+        ),
+        // bgsrv-ub: 12.1 GiB.
+        ("bgsrv-ub", facts(12_687_769, 97_286), 32 * GRANULE, 14_592),
+        // bbs: 61.9 GiB, a quarter of it reserved.
+        ("bbs", facts(64_907_853, 505_800), 185 * GRANULE, 75_870),
+        // bginf-sp1/2: 121.7 GiB, the 16 GiB cap reserved.
+        (
+            "bginf-sp1",
+            facts(127_611_699, 1_023_656),
+            422 * GRANULE,
+            153_548,
+        ),
+        // fedora: 125.1 GiB.
+        (
+            "fedora",
+            facts(131_176_858, 1_024_020),
+            436 * GRANULE,
+            153_603,
+        ),
+    ];
+    for (host, facts, memory_max_bytes, tasks_max) in table {
+        assert_eq!(
+            UnitBounds::for_machine(facts, 180),
+            UnitBounds {
+                memory_max_bytes,
+                tasks_max,
+                watchdog_secs: 180,
+            },
+            "{host}"
+        );
+    }
+    // The tighter of the kernel's two task ceilings is the one shared.
+    let pid_bound = MachineFacts {
+        pid_max: 32_768,
+        ..facts(16_116_228, 124_760)
+    };
+    assert_eq!(UnitBounds::for_machine(pid_bound, 180).tasks_max, 4_915);
+}
+
+#[test]
+fn the_host_reserve_has_a_floor_a_cap_and_never_takes_half() {
+    const GIB: u64 = 1 << 30;
+    let memory = |gib: u64| {
+        UnitBounds::for_machine(
+            MachineFacts {
+                mem_total_bytes: gib * GIB,
+                threads_max: 1,
+                pid_max: 1,
+            },
+            180,
+        )
+        .memory_max_bytes
+    };
+    assert_eq!(memory(16), 12 * GIB, "the 4 GiB floor");
+    assert_eq!(memory(32), 24 * GIB, "a quarter");
+    assert_eq!(memory(64), 48 * GIB, "a quarter, at the cap");
+    assert_eq!(memory(256), 240 * GIB, "the 16 GiB cap");
+    assert_eq!(memory(6), 3 * GIB, "never more than half");
+    assert_eq!(memory(0), 0);
+}
+
+/// A kernel update that moves `MemTotal` by a few MiB does not change the
+/// unit, so it does not rewrite it.
+#[test]
+fn a_few_mib_of_memtotal_drift_leave_the_unit_text_alone() {
+    let unit = |kib: u64| {
+        let mut spec = spec();
+        spec.bounds = Some(UnitBounds::for_machine(facts(kib, 124_760), 180));
+        systemd_unit_contents(&spec)
+    };
+    let measured = unit(16_116_228);
+    assert_eq!(unit(16_116_228 - 8 * 1024), measured);
+    assert_eq!(unit(16_116_228 + 8 * 1024), measured);
+}
+
+#[test]
+fn a_bounded_unit_says_so_and_an_unbounded_one_says_nothing() {
+    let unbounded = systemd_unit_contents(&spec());
+    for line in [
+        "MemoryMax",
+        "MemorySwapMax",
+        "TasksMax",
+        "WatchdogSec",
+        "NotifyAccess",
+    ] {
+        assert!(!unbounded.contains(line), "{line}");
+    }
+    let mut bounded = spec();
+    bounded.bounds = Some(UnitBounds {
+        memory_max_bytes: 45 * GRANULE,
+        tasks_max: 18_714,
+        watchdog_secs: 180,
+    });
+    let unit = systemd_unit_contents(&bounded);
+    let (_, service) = unit.split_once("[Service]").unwrap();
+    let (service, _) = service.split_once("[Install]").unwrap();
+    for line in [
+        "\nMemoryMax=12079595520\n",
+        "\nMemorySwapMax=0\n",
+        "\nTasksMax=18714\n",
+        "\nWatchdogSec=180\n",
+        "\nNotifyAccess=main\n",
+        "\nType=simple\n",
+    ] {
+        assert!(service.contains(line), "{line:?} in [Service]:\n{service}");
+    }
+    // Deliberately absent; see `systemd_unit_contents`.
+    for line in ["MemoryHigh", "CPUWeight", "KillMode", "WatchdogSignal"] {
+        assert!(!unit.contains(line), "{line}");
+    }
+    // launchd has no counterpart; the plist is the same either way.
+    assert_eq!(plist_contents(&bounded), plist_contents(&spec()));
+}
+
+/// A machine running a build from before bounds gets them at the next
+/// start of a build that has them, through the same self-rewrite.
+#[test]
+fn an_unbounded_installed_unit_is_rewritten_with_its_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cairn-test.service");
+    std::fs::write(&path, systemd_unit_contents(&spec())).unwrap();
+    let mut bounded = spec();
+    bounded.bounds = Some(UnitBounds::for_machine(facts(16_116_228, 124_760), 180));
+    assert_eq!(
+        refresh_systemd_unit(&bounded, Some(UNIT_CGROUP), &path, || false, || Ok(())),
+        Ok(SystemdRefresh::Rewritten)
+    );
+    let rewritten = std::fs::read_to_string(&path).unwrap();
+    assert!(rewritten.contains("\nMemoryMax=12079595520\n"));
+    assert!(rewritten.contains("\nWatchdogSec=180\n"));
+}
+
+/// Only the generation that rewrote its unit with a watchdog restarts to be
+/// armed; the restarted one, which finds the unit current, never does, even
+/// if it was not armed either, so it cannot loop.
+#[test]
+fn only_the_rewriting_generation_restarts_to_arm_its_watchdog() {
+    let mut bounded = spec();
+    bounded.bounds = Some(UnitBounds::for_machine(facts(16_116_228, 124_760), 180));
+    assert!(must_restart_to_arm_watchdog(&bounded, true, false));
+    assert!(
+        !must_restart_to_arm_watchdog(&bounded, false, false),
+        "the restarted generation"
+    );
+    assert!(
+        !must_restart_to_arm_watchdog(&bounded, true, true),
+        "already armed"
+    );
+    assert!(
+        !must_restart_to_arm_watchdog(&spec(), true, false),
+        "no watchdog in the unit"
+    );
+}
+
+/// The page reports what the kernel enforces on the unit's own cgroup, not
+/// what the template asked for.
+#[test]
+fn enforced_bounds_are_read_from_the_units_cgroup() {
+    let root = tempfile::tempdir().unwrap();
+    let unit = root
+        .path()
+        .join("user.slice/user-1000.slice/user@1000.service/app.slice/cairn-test.service");
+    std::fs::create_dir_all(&unit).unwrap();
+    let watchdog = Some(std::time::Duration::from_secs(180));
+    assert_eq!(
+        read_enforced_bounds(root.path(), UNIT_CGROUP, None),
+        None,
+        "no limit files and no watchdog is no bound"
+    );
+    for (file, body) in [
+        ("memory.max", "12079595520\n"),
+        ("memory.swap.max", "0\n"),
+        ("pids.max", "18714\n"),
+    ] {
+        std::fs::write(unit.join(file), body).unwrap();
+    }
+    assert_eq!(
+        read_enforced_bounds(root.path(), UNIT_CGROUP, watchdog),
+        Some(crate::executor_protocol::ServiceBounds {
+            memory_max_bytes: Some(12_079_595_520),
+            swap_max_bytes: Some(0),
+            tasks_max: Some(18_714),
+            watchdog_secs: Some(180),
+            host_memory_bytes: None,
+        })
+    );
+    // An installation from before bounds: every limit reads `max`.
+    for file in ["memory.max", "memory.swap.max", "pids.max"] {
+        std::fs::write(unit.join(file), "max\n").unwrap();
+    }
+    assert_eq!(read_enforced_bounds(root.path(), UNIT_CGROUP, None), None);
+}
+
+/// The page's line, which the fleet panel's `executorBoundText` mirrors.
+#[test]
+fn the_executor_bound_line_names_the_bound_or_why_there_is_none() {
+    use crate::executor_protocol::{describe_executor_bound, ServiceBounds};
+    let bounds = ServiceBounds {
+        memory_max_bytes: Some(12_079_595_520),
+        swap_max_bytes: Some(0),
+        tasks_max: Some(18_714),
+        watchdog_secs: Some(180),
+        host_memory_bytes: Some(16_503_017_472),
+    };
+    assert_eq!(
+        describe_executor_bound("linux", Some(&bounds)),
+        "memory 11.25 GiB of 15.4 GiB (swap 0), tasks 18714, watchdog 180 s"
+    );
+    assert_eq!(
+        describe_executor_bound("linux", None),
+        "no unit bound (unbounded install or not under systemd)"
+    );
+    assert_eq!(
+        describe_executor_bound("macos", None),
+        "no service-level bound: launchd has no memory accounting; admission is the only bound"
+    );
+    assert_eq!(
+        describe_executor_bound("windows", Some(&ServiceBounds::default())),
+        "no service-level bound; admission only"
+    );
 }
 
 const UNIT_CGROUP: &str =

@@ -21550,6 +21550,7 @@ cairn-common = { path = "../cairn-common" }
                 rss_bytes: Some(10_583_000_000),
                 machine_total_bytes: Some(13_000_000_000),
                 process_name: Some("rustc".into()),
+                bound_bytes: None,
             },
             "error: could not compile `cairn-core`",
             serde_json::from_value(serde_json::json!({

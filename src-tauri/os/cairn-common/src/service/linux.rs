@@ -95,10 +95,11 @@ pub fn install(spec: &ServiceSpec) -> Result<(), String> {
 
 /// Rewrite the installed unit when its template has drifted, and reload the
 /// user manager so the running unit is supervised by the new policy. Acts only
-/// in the process the unit started (its cgroup names the unit).
-pub fn refresh_if_stale(spec: &ServiceSpec) {
+/// in the process the unit started (its cgroup names the unit). Returns
+/// whether this process rewrote the unit.
+pub fn refresh_if_stale(spec: &ServiceSpec) -> bool {
     let Ok(path) = unit_path(&spec.unit_name) else {
-        return;
+        return false;
     };
     let own_cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
     let needs_reload = || {
@@ -116,17 +117,26 @@ pub fn refresh_if_stale(spec: &ServiceSpec) {
     match super::refresh_systemd_unit(spec, own_cgroup.as_deref(), &path, needs_reload, || {
         run_systemctl(&["daemon-reload"])
     }) {
-        Ok(super::SystemdRefresh::Rewritten) => tracing::info!(
-            unit = %spec.unit_name,
-            path = %path.display(),
-            "systemd unit template drifted; rewrote it and reloaded the user manager"
-        ),
-        Ok(super::SystemdRefresh::Reloaded) => tracing::info!(
-            unit = %spec.unit_name,
-            "systemd unit was current on disk but not loaded; reloaded the user manager"
-        ),
-        Ok(_) => {}
-        Err(error) => tracing::warn!(unit = %spec.unit_name, %error, "systemd unit refresh failed"),
+        Ok(super::SystemdRefresh::Rewritten) => {
+            tracing::info!(
+                unit = %spec.unit_name,
+                path = %path.display(),
+                "systemd unit template drifted; rewrote it and reloaded the user manager"
+            );
+            true
+        }
+        Ok(super::SystemdRefresh::Reloaded) => {
+            tracing::info!(
+                unit = %spec.unit_name,
+                "systemd unit was current on disk but not loaded; reloaded the user manager"
+            );
+            false
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::warn!(unit = %spec.unit_name, %error, "systemd unit refresh failed");
+            false
+        }
     }
 }
 

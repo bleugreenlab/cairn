@@ -2313,6 +2313,7 @@ pub(super) fn oom_killed_for_test(
             rss_bytes: Some(victim_resident_bytes),
             machine_total_bytes,
             process_name: None,
+            bound_bytes: None,
         }),
         cell_origin: None,
     }
@@ -3296,6 +3297,7 @@ mod tests {
             github_credential: None,
             machine_services: Vec::new(),
             credential_floor_service_residents: false,
+            service_bounds: None,
         }
     }
 

@@ -39,6 +39,7 @@ mod linux;
 mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod other;
+pub mod sd_notify;
 #[cfg(target_os = "windows")]
 mod windows;
 pub mod windows_task;
@@ -87,6 +88,153 @@ pub struct ServiceSpec {
     pub supervision: Supervision,
     /// A previous identity to stop and remove before registering this one.
     pub legacy: Option<LegacyIdentity>,
+    /// The resource bounds the systemd unit enforces on the daemon and
+    /// everything it runs. `None` writes no bound lines; only systemd can
+    /// express them (see [`systemd_unit_contents`] and [`plist_contents`]).
+    pub bounds: Option<UnitBounds>,
+}
+
+/// What the executor's unit bounds are computed from, read from the host
+/// rather than from any cgroup, so a bound never feeds on itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineFacts {
+    /// `MemTotal` from `/proc/meminfo`.
+    pub mem_total_bytes: u64,
+    /// `/proc/sys/kernel/threads-max`.
+    pub threads_max: u64,
+    /// `/proc/sys/kernel/pid_max`.
+    pub pid_max: u64,
+}
+
+/// The bounds a systemd unit puts around a daemon and every process it runs.
+///
+/// Computed from the machine each time the unit is generated, at install and
+/// at every self-rewrite, so there is no figure to configure and a machine
+/// whose memory changes gets a matching bound at its next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnitBounds {
+    /// `MemoryMax=`: the most memory, page cache included, the unit's cgroup
+    /// may hold before the kernel kills inside it.
+    pub memory_max_bytes: u64,
+    /// `TasksMax=`.
+    pub tasks_max: u64,
+    /// `WatchdogSec=`.
+    pub watchdog_secs: u64,
+}
+
+const GIB: u64 = 1 << 30;
+
+/// The memory a bounded unit leaves to the rest of the host: a quarter of it,
+/// at least 4 GiB and at most 16 GiB, and never more than half the machine.
+/// The floor keeps the host's own daemons (networkd renewing a lease, sshd,
+/// a CI runner) out of a long starvation on a small box; the cap stops a
+/// large one from idling a quarter of its memory; the half keeps a machine
+/// smaller than 8 GiB able to run anything at all.
+const fn host_reserve_bytes(mem_total_bytes: u64) -> u64 {
+    let quarter = mem_total_bytes / 4;
+    let reserve = if quarter < 4 * GIB {
+        4 * GIB
+    } else if quarter > 16 * GIB {
+        16 * GIB
+    } else {
+        quarter
+    };
+    let half = mem_total_bytes / 2;
+    if reserve > half {
+        half
+    } else {
+        reserve
+    }
+}
+
+/// The granule `MemoryMax=` is rounded down to, so a kernel update that moves
+/// `MemTotal` by a few MiB does not change the unit's text and rewrite it.
+const UNIT_MEMORY_GRANULE_BYTES: u64 = 256 << 20;
+
+/// `TasksMax=` as a share of the kernel's own task ceiling, in percent: the
+/// share systemd applies implicitly today, written so it no longer depends on
+/// a distribution's default.
+const UNIT_TASKS_PERCENT: u64 = 15;
+
+impl UnitBounds {
+    /// The bounds for a machine with `facts`, watched every `watchdog_secs`.
+    pub fn for_machine(facts: MachineFacts, watchdog_secs: u64) -> Self {
+        let memory = facts
+            .mem_total_bytes
+            .saturating_sub(host_reserve_bytes(facts.mem_total_bytes));
+        Self {
+            memory_max_bytes: memory / UNIT_MEMORY_GRANULE_BYTES * UNIT_MEMORY_GRANULE_BYTES,
+            tasks_max: facts.threads_max.min(facts.pid_max) * UNIT_TASKS_PERCENT / 100,
+            watchdog_secs,
+        }
+    }
+}
+
+/// This host's [`MachineFacts`], or `None` where they cannot be read (not
+/// Linux, or no procfs). A daemon that cannot read them installs unbounded
+/// rather than guessing.
+pub fn machine_facts() -> Option<MachineFacts> {
+    #[cfg(target_os = "linux")]
+    {
+        let read =
+            |path: &str| -> Option<u64> { std::fs::read_to_string(path).ok()?.trim().parse().ok() };
+        return Some(MachineFacts {
+            mem_total_bytes: crate::memory::host_total_bytes()?,
+            threads_max: read("/proc/sys/kernel/threads-max")?,
+            pid_max: read("/proc/sys/kernel/pid_max")?,
+        });
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// The bounds the kernel enforces on this process's unit, read back from the
+/// cgroup `/proc/self/cgroup` names and the watchdog systemd armed, so what
+/// is reported is what is enforced rather than what a template meant. `None`
+/// where nothing bounds it, including everywhere but Linux.
+pub fn enforced_bounds() -> Option<crate::executor_protocol::ServiceBounds> {
+    #[cfg(target_os = "linux")]
+    {
+        let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        return read_enforced_bounds(
+            Path::new(crate::memory::CGROUP_ROOT),
+            &cgroup,
+            sd_notify::watchdog().map(sd_notify::SystemdWatchdog::interval),
+        )
+        .map(|bounds| crate::executor_protocol::ServiceBounds {
+            host_memory_bytes: crate::memory::host_total_bytes(),
+            ..bounds
+        });
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// [`enforced_bounds`] over the cgroup tree at `root`. A limit file that
+/// reads `max`, or cannot be read, is `None`.
+#[cfg(any(target_os = "linux", test))]
+fn read_enforced_bounds(
+    root: &Path,
+    proc_self_cgroup: &str,
+    watchdog: Option<std::time::Duration>,
+) -> Option<crate::executor_protocol::ServiceBounds> {
+    let relative = crate::memory::unified_cgroup_path(proc_self_cgroup)?.trim_start_matches('/');
+    let unit = root.join(relative);
+    let limit = |file: &str| -> Option<u64> {
+        std::fs::read_to_string(unit.join(file))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let bounds = crate::executor_protocol::ServiceBounds {
+        memory_max_bytes: limit("memory.max"),
+        swap_max_bytes: limit("memory.swap.max"),
+        tasks_max: limit("pids.max"),
+        watchdog_secs: watchdog.map(|interval| interval.as_secs()),
+        host_memory_bytes: None,
+    };
+    (!bounds.is_empty()).then_some(bounds)
 }
 
 /// A daemon's Windows autostart.
@@ -444,6 +592,16 @@ pub fn runner_stderr_log(home: &Path) -> PathBuf {
 /// daemon. These are interactive-latency execution engines, and under
 /// `Background` those children measured glacial in prod (15-60s worktree
 /// creation, 12s exec registration).
+///
+/// [`ServiceSpec::bounds`] has no launchd counterpart, so a plist never
+/// carries one. launchd cannot bound a job's memory: `HardResourceLimits`'
+/// resident-set limit is not enforced and would be per process anyway, and
+/// macOS's memory-pressure kills (jetsam) choose processes, not jobs.
+/// `ProcessType=Background` and `LowPriorityIO` bound nothing and would slow
+/// every child, as above. On macOS the executor's admission is its only
+/// bound. Windows is the same today: a job object's memory limit fails
+/// allocations rather than killing, so wrapping the daemon in one would fail
+/// the daemon's own allocations; the shape that fits is a job per command.
 pub fn plist_contents(spec: &ServiceSpec) -> String {
     let mut env_block = String::new();
     if !spec.env.is_empty() {
@@ -547,6 +705,38 @@ pub fn plist_contents(spec: &ServiceSpec) -> String {
 /// launchd has no cgroup memory accounting, so a child the kernel kills is an
 /// ordinary child exit and the job stays loaded. macOS's own memory-pressure
 /// kills (jetsam) pick processes, not jobs.
+///
+/// When the spec carries [`UnitBounds`] (the executor's does, on Linux), the
+/// unit also says:
+///
+/// - `MemoryMax=` and `MemorySwapMax=0`. The unit's memory is bounded below
+///   the machine's, so a command that outgrows it is killed inside the unit,
+///   named on its result, while the host's own daemons keep the rest. With no
+///   swap, an over-budget compile becomes a fast kill instead of minutes of
+///   host-wide thrash, and the daemon's own pages stay resident. User units
+///   are enforced: `user@.service` delegates the memory controller.
+/// - `TasksMax=`, explicit rather than the distribution's implicit default.
+/// - `WatchdogSec=` with `NotifyAccess=main`. The daemon tells systemd it is
+///   alive from a task on its runtime, so a wedged runtime stops telling it,
+///   and systemd ends the process (`SIGABRT`, so a core is left where
+///   `LimitCORE` permits) and `Restart=on-failure` restarts it: a watchdog
+///   timeout is a failure in systemd's restart table. `Type=simple` stays:
+///   the watchdog arms at start, and no readiness protocol is needed.
+///
+/// And deliberately not:
+///
+/// - `MemoryHigh=`. Above `memory.high` the kernel throttles every task that
+///   charges memory, and the daemon shares its cgroup with its commands and
+///   allocates constantly. With swap off, a command above it can crawl
+///   without ever reaching `MemoryMax`, and the throttled daemon would then
+///   miss its watchdog. Its place is a per-command cgroup, once commands have
+///   one.
+/// - `CPUWeight=`. Weights compete only among siblings, and a user unit's
+///   siblings are the user's other units, not sshd or a CI runner in
+///   `system.slice`. It would change nothing it is meant to.
+/// - `KillMode=`. The default `control-group` ends every command with the
+///   daemon, and the next generation re-adopts cells, never commands, so a
+///   mode that left them running would only leave orphans for it to reap.
 pub fn systemd_unit_contents(spec: &ServiceSpec) -> String {
     let mut env_lines = String::new();
     for (k, v) in &spec.env {
@@ -554,6 +744,13 @@ pub fn systemd_unit_contents(spec: &ServiceSpec) -> String {
     }
     let stop_timeout = match spec.supervision.stop_timeout_secs {
         Some(secs) => format!("TimeoutStopSec={secs}\n"),
+        None => String::new(),
+    };
+    let bounds = match spec.bounds {
+        Some(bounds) => format!(
+            "MemoryMax={}\nMemorySwapMax=0\nTasksMax={}\nWatchdogSec={}\nNotifyAccess=main\n",
+            bounds.memory_max_bytes, bounds.tasks_max, bounds.watchdog_secs
+        ),
         None => String::new(),
     };
     format!(
@@ -573,6 +770,7 @@ Restart=on-failure\n\
 RestartSec={restart_delay}\n\
 {stop_timeout}\
 OOMPolicy=continue\n\
+{bounds}\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
@@ -582,6 +780,7 @@ WantedBy=default.target\n",
         file_descriptor_limit = spec.file_descriptor_limit,
         restart_delay = spec.supervision.restart_delay_secs,
         stop_timeout = stop_timeout,
+        bounds = bounds,
     )
 }
 
@@ -628,9 +827,14 @@ enum SystemdRefresh {
 /// current file the manager reports it has not loaded (`needs_reload`) is
 /// reloaded too, so a reload that failed once is not stranded until a reboot.
 ///
-/// No restart: after `daemon-reload`, systemd applies `OOMPolicy`, `Restart*`
-/// and `TimeoutStopSec` to the running unit, so the very process that rewrote
-/// its unit is already supervised by the new policy.
+/// No restart here: after `daemon-reload`, systemd applies `OOMPolicy`,
+/// `Restart*`, `TimeoutStopSec` and the cgroup limits to the running unit, so
+/// the very process that rewrote its unit is already supervised by them. The
+/// watchdog is the exception: systemd arms it only when a service starts, so
+/// the caller restarts itself when the rewrite added one (see
+/// [`must_restart_to_arm_watchdog`]). The executor rewrites at startup after
+/// a self-update, which drains the machine first, so lowering a limit cannot
+/// kill work in flight.
 ///
 /// The program the installed unit names is kept whenever it resolves to the
 /// running binary. On Linux `current_exe` is `/proc/self/exe`, symlinks
@@ -1139,11 +1343,40 @@ pub fn terminate_run_value_processes(command_line: &str) -> Result<Vec<Terminate
 ///
 /// Without this, a machine keeps the supervision policy of whichever binary
 /// last ran `service install`, however many self-updates later.
-pub fn refresh_if_stale(spec: &ServiceSpec) {
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+///
+/// Returns whether this process rewrote a systemd unit, which is what
+/// [`must_restart_to_arm_watchdog`] needs to know.
+pub fn refresh_if_stale(spec: &ServiceSpec) -> bool {
+    #[cfg(target_os = "linux")]
+    return sys::refresh_if_stale(spec);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     sys::refresh_if_stale(spec);
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    let _ = spec;
+    #[allow(unreachable_code)]
+    {
+        let _ = spec;
+        false
+    }
+}
+
+/// Whether a daemon that just rewrote its own unit must exit so systemd
+/// starts it again under that unit, before it takes on any work.
+///
+/// `daemon-reload` applies a rewritten unit's cgroup limits to the running
+/// process, but not its watchdog: systemd records the watchdog interval when
+/// a service starts (`watchdog_original_usec`), keeps that record across
+/// reloads, and hands the process its `WATCHDOG_USEC` only at start. So the
+/// generation that first writes `WatchdogSec=` runs unwatched until its next
+/// start, which after a self-update may not come for weeks. Restarting at
+/// once closes that window. It keys on this process having rewritten the
+/// unit, never on the watchdog being absent alone, so the restarted
+/// generation (which finds the unit current) cannot loop even on a systemd
+/// that, for whatever reason, does not arm it.
+pub fn must_restart_to_arm_watchdog(
+    spec: &ServiceSpec,
+    rewrote_unit: bool,
+    process_has_watchdog: bool,
+) -> bool {
+    rewrote_unit && spec.bounds.is_some() && !process_has_watchdog
 }
 
 #[cfg(test)]

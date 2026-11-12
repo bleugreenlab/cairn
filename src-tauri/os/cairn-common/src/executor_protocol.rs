@@ -8184,6 +8184,23 @@ pub struct LearnedResourceEstimate {
 /// every peer already exchanges: the snapshot fields are unchanged, and
 /// `Cancel` for a granted attempt is the message an executor has always acted
 /// on. What a runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/6994 does not move the number. It bounds a Linux executor at its
+/// systemd unit (`MemoryMax` below the machine's memory with no swap, an
+/// explicit `TasksMax`, and a watchdog that restarts a daemon whose runtime
+/// stops turning), which the daemon writes itself when a new build starts;
+/// the build reaches each machine as a directed update, as any build does.
+/// Two defaulted, optional fields carry what the bound changes, each read as
+/// unmeasured when absent and gating nothing: [`ExecutorCapabilities::service_bounds`] reports the
+/// bounds the kernel enforces, read back from the unit's cgroup, and
+/// [`CommandStop::OomKilled`]'s `boundBytes` says a command was killed at
+/// that bound rather than by the machine running out. The executor admits its
+/// own work, and sizes the memory budget it advertises, against the bound;
+/// the machine memory it reports stays the machine's, since the runner places
+/// work there (a model in a container) that the bound does not cover. What a
+/// runner gets wrong talking to an older executor:
+/// nothing; it reads the absent bounds as an unbounded unit, which that
+/// executor's is. An older runner ignores both fields.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -9564,6 +9581,90 @@ pub struct ExecutorCapabilities {
     /// says so on the instance. Additive and defaulted, so not a wire boundary.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credential_floor_service_residents: bool,
+    /// The bounds this executor's service manager enforces on it and on
+    /// everything it runs, read from the kernel rather than from the unit
+    /// file. `None` from an executor with no bound: one predating bounds,
+    /// one not running under systemd, or any macOS or Windows executor,
+    /// whose only bound is its admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_bounds: Option<ServiceBounds>,
+}
+
+/// The bounds a service manager enforces on an executor, as the kernel
+/// reports them. Each is `None` when it is unbounded or could not be read.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceBounds {
+    /// The unit cgroup's `memory.max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_bytes: Option<u64>,
+    /// Its `memory.swap.max`; zero means the unit never swaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_max_bytes: Option<u64>,
+    /// Its `pids.max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks_max: Option<u64>,
+    /// The watchdog interval systemd armed for the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_secs: Option<u64>,
+    /// The machine's own memory, which the memory bound sits below. The
+    /// machine reading says the same where it is the host's; this one is the
+    /// host's whatever that reading measures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_bytes: Option<u64>,
+}
+
+impl ServiceBounds {
+    /// Whether any bound was read. The host's memory is context, not a bound.
+    pub fn is_empty(&self) -> bool {
+        self.memory_max_bytes.is_none()
+            && self.swap_max_bytes.is_none()
+            && self.tasks_max.is_none()
+            && self.watchdog_secs.is_none()
+    }
+
+    /// `memory 11.25 GiB of 15.4 GiB (swap 0), tasks 18714, watchdog 180 s`:
+    /// each bound that was read.
+    pub fn describe(&self) -> String {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let mut parts = Vec::new();
+        if let Some(max) = self.memory_max_bytes {
+            let mut memory = format!("memory {:.2} GiB", max as f64 / GIB);
+            if let Some(host) = self.host_memory_bytes {
+                memory.push_str(&format!(" of {:.1} GiB", host as f64 / GIB));
+            }
+            match self.swap_max_bytes {
+                Some(0) => memory.push_str(" (swap 0)"),
+                Some(swap) => memory.push_str(&format!(" (swap {:.2} GiB)", swap as f64 / GIB)),
+                None => {}
+            }
+            parts.push(memory);
+        }
+        if let Some(tasks) = self.tasks_max {
+            parts.push(format!("tasks {tasks}"));
+        }
+        if let Some(secs) = self.watchdog_secs {
+            parts.push(format!("watchdog {secs} s"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// The executor-bound line a page shows for a machine on `os` that reported
+/// `bounds`. A macOS or Windows executor has no service-level bound to
+/// report, and says why rather than nothing.
+pub fn describe_executor_bound(os: &str, bounds: Option<&ServiceBounds>) -> String {
+    match bounds {
+        Some(bounds) if !bounds.is_empty() => bounds.describe(),
+        _ if os.eq_ignore_ascii_case("macos") => {
+            "no service-level bound: launchd has no memory accounting; admission is the only bound"
+                .to_string()
+        }
+        _ if os.eq_ignore_ascii_case("windows") => {
+            "no service-level bound; admission only".to_string()
+        }
+        _ => "no unit bound (unbounded install or not under systemd)".to_string(),
+    }
 }
 
 /// What the executor's GitHub credential probe measured: whether git, run as
@@ -22138,6 +22239,12 @@ pub enum CommandStop {
         /// The victim's short name (`rustc`), when the executor read it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         process_name: Option<String>,
+        /// The executor's own memory bound, when that bound is what the kill
+        /// enforced: the unit's cgroup counted an out-of-memory event of its
+        /// own alongside the kill. `None` for a kill the whole machine
+        /// running out made.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bound_bytes: Option<u64>,
     },
 }
 
@@ -22289,6 +22396,7 @@ impl CommandStop {
                 rss_bytes,
                 machine_total_bytes,
                 process_name,
+                bound_bytes,
             } => {
                 let victim = match process_name {
                     Some(name) => format!("{name} (pid {pid})"),
@@ -22297,10 +22405,25 @@ impl CommandStop {
                 let size = rss_bytes
                     .map(|bytes| format!(" at {}", human_bytes(bytes)))
                     .unwrap_or_default();
-                let machine = machine_total_bytes
-                    .map(|bytes| format!(" on a machine with {}", human_bytes(bytes)))
-                    .unwrap_or_default();
-                format!("killed by the kernel out-of-memory killer: {victim}{size}{machine}")
+                match bound_bytes {
+                    Some(bound) => {
+                        let machine = machine_total_bytes
+                            .map(|bytes| format!(" on a {} machine", human_bytes(bytes)))
+                            .unwrap_or_default();
+                        format!(
+                            "killed by the kernel out-of-memory killer at the executor's memory bound: {victim}{size}, bound {:.2} GiB{machine}",
+                            *bound as f64 / (1u64 << 30) as f64
+                        )
+                    }
+                    None => {
+                        let machine = machine_total_bytes
+                            .map(|bytes| format!(" on a machine with {}", human_bytes(bytes)))
+                            .unwrap_or_default();
+                        format!(
+                            "killed by the kernel out-of-memory killer: {victim}{size}{machine}"
+                        )
+                    }
+                }
             }
         }
     }
@@ -25074,6 +25197,7 @@ mod tests {
                 github_credential: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
+                service_bounds: None,
             },
             current_load: 1,
             observed_at_unix_ms: 4,

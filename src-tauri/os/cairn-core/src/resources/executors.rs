@@ -1659,6 +1659,13 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         })
     ));
     out.push_str(&format!(
+        "- Executor bound: {}\n",
+        cairn_common::executor_protocol::describe_executor_bound(
+            &capabilities.os,
+            capabilities.service_bounds.as_ref()
+        )
+    ));
+    out.push_str(&format!(
         "- Memory pressure: {}\n",
         reading(
             &health.host.memory_pressure,
@@ -8688,6 +8695,7 @@ mod tests {
                         github_credential: None,
                         machine_services: Vec::new(),
                         credential_floor_service_residents: false,
+                        service_bounds: None,
                     },
                     current_load: 0,
                     observed_at_unix_ms: CAPTURED_AT - 4_000,

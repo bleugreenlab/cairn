@@ -3241,6 +3241,7 @@ mod tests {
                 github_credential: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
+                service_bounds: None,
             },
             current_load: 0,
             observed_at_unix_ms: 0,
