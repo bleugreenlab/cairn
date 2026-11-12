@@ -459,7 +459,7 @@ async fn a_fired_condition_names_the_row_a_structured_write_touched() {
     await_condition_push(db, ROWS_RUN, "structured row").await;
     let content = db
         .query_one(
-            "SELECT content FROM messages WHERE recipient_run_id = ?1 AND sender_name = 'system'
+            "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) AND sender_name = 'system'
              ORDER BY created_at DESC LIMIT 1",
             cairn_db::turso::params![ROWS_RUN],
             |row| row.text(0),

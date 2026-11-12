@@ -168,7 +168,7 @@ pub use launch_deltas::{LaunchCustomization, LaunchDeltas};
 pub use files::{detect_language, BranchInfo, FileContent};
 
 // Message types
-pub use message::{ChannelType, DeliveryUrgency, Message};
+pub use message::{ChannelType, DeliveryUrgency, Message, MessageRecipient, Wake};
 
 // Embedding types
 

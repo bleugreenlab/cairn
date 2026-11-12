@@ -687,8 +687,8 @@ mod tests {
                 .await?;
                 // The external reply's catch-up cursor is its own created_at.
                 conn.execute(
-                    "INSERT INTO messages (id, channel_type, channel_id, sender_run_id, sender_name, recipient_run_id, content, created_at)
-                     VALUES ('m-external', 'issue', 'cairn/1181', 'run-builder', 'cairn://p/cairn/1181/1/builder', NULL, 'done', ?1)",
+                    "INSERT INTO messages (id, channel_type, channel_id, sender_run_id, sender_name, content, created_at)
+                     VALUES ('m-external', 'issue', 'cairn/1181', 'run-builder', 'cairn://p/cairn/1181/1/builder', 'done', ?1)",
                     params![marker],
                 )
                 .await?;

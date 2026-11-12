@@ -8941,9 +8941,18 @@ mod tests {
         orch.db
             .local
             .execute(
-                "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at, urgency)
-                 VALUES ('msg-1', 'direct', 'coordinator', 'run-1', 'stop waiting, the plan changed', 1, ?1)",
+                "INSERT INTO messages (id, channel_type, sender_name, content, created_at, urgency)
+                 VALUES ('msg-1', 'direct', 'coordinator', 'stop waiting, the plan changed', 1, ?1)",
                 (urgency.to_string(),),
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO message_recipients (message_id, position, recipient_job_id, recipient_run_id, created_at)
+                 VALUES ('msg-1', 0, 'job-1', 'run-1', 1)",
+                (),
             )
             .await
             .unwrap();

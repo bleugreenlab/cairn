@@ -15,6 +15,12 @@
 //! `sender_name` as the reply-to, so recipients were pointed at the raw node
 //! URI even though `/messages` is the documented form.
 //!
+//! The hint names the real affordance, a `write` append to the sender's
+//! `/messages`, and the message's own URI so a recipient can cite it. A message
+//! sent to several addresses names the others in its header, the way an email
+//! cc line does, and says that a reply reaches only the address it names: there
+//! is no reply-all, so recipients cannot wake each other in a loop.
+//!
 //! An external sender is the one case with no URI at all, and it gets its own
 //! hint rather than an address. CAIRN-4135: this arm used to name a literal
 //! `to: "external"` target, whose dispatcher was removed as unreachable code
@@ -131,36 +137,124 @@ fn reply_to_uri(sender_name: &str) -> Option<String> {
         .then(|| format!("{sender_name}/messages"))
 }
 
-/// Render a direct message for its recipient: the `[Direct message from …]`
-/// header followed by the content, plus a reply hint — the sender's canonical
-/// `/messages` collection when the sender is URI-addressable, or the
-/// post-in-this-conversation affordance when the sender is an external session.
-pub fn render_direct_message(msg: &Message) -> String {
+const HEADER_PREFIX: &str = "[Direct message from ";
+const CC_SEPARATOR: &str = ", also sent to ";
+const NO_REPLY_ALL: &str =
+    "A reply reaches only the address it names, not the others this was sent to.";
+
+/// Where each rendered reply hint starts, newest first, so a parser can strip
+/// a hint from transcripts written before and after it changed.
+const HINT_MARKERS: &[&str] = &[
+    "\n(Cite as ",
+    "\n(Reply with write ",
+    "\nTo reply, use the message tool",
+];
+
+/// The canonical URI of a stored direct message: `cairn://p/<project>/messages/<id>`,
+/// in the project of its first recipient, whose database holds the row. `None`
+/// when the first recipient has no canonical address.
+pub fn message_uri(msg: &Message) -> Option<String> {
+    let address = msg.recipients.first()?.address.as_deref()?;
+    let project = cairn_uri::parse_uri(address)?.project()?.to_string();
+    Some(cairn_uri::build_message_uri(&project, &msg.id))
+}
+
+/// Render a direct message for the recipient whose job is `reader_job_id`: the
+/// `[Direct message from …]` header, naming every other recipient in position
+/// order, followed by the content, plus a hint — the message's own URI to cite
+/// and the `write` that replies to the sender when the sender is
+/// URI-addressable, or the post-in-this-conversation affordance when the
+/// sender is an external session.
+pub fn render_direct_message(msg: &Message, reader_job_id: &str) -> String {
     // A camp's wake leads with its own camp line; a camp has no inbox, so it
     // gets no reply hint.
     if is_camp_sender(&msg.sender_name) && camp_line_slug(&msg.content).is_some() {
         return msg.content.clone();
     }
-    let head = format!("[Direct message from {}] {}", msg.sender_name, msg.content);
+    let others: Vec<String> = msg
+        .recipients
+        .iter()
+        .filter(|recipient| recipient.job_id.as_deref() != Some(reader_job_id))
+        .map(|recipient| recipient.label())
+        .collect();
+    let head = if others.is_empty() {
+        format!("{HEADER_PREFIX}{}] {}", msg.sender_name, msg.content)
+    } else {
+        format!(
+            "{HEADER_PREFIX}{}{CC_SEPARATOR}{}] {}",
+            msg.sender_name,
+            others.join(", "),
+            msg.content
+        )
+    };
+    let cite = message_uri(msg).map(|uri| format!("(Cite as {uri}.)"));
+    let with_cite = |hint: &str| match &cite {
+        Some(cite) => format!("{head}\n{cite} {hint}"),
+        None => format!("{head}\n{hint}"),
+    };
     if msg.sender_name == EXTERNAL_SENDER {
-        return format!("{head}\n{EXTERNAL_REPLY_HINT}");
+        return with_cite(EXTERNAL_REPLY_HINT);
     }
     if msg.sender_name == UNVERIFIED_LOCAL_SENDER {
-        return format!("{head}\n{UNVERIFIED_LOCAL_HINT}");
+        return with_cite(UNVERIFIED_LOCAL_HINT);
     }
 
-    match reply_to_uri(&msg.sender_name) {
-        Some(reply_to) => {
-            format!("{head}\nTo reply, use the message tool with to: \"{reply_to}\"")
+    // A system notice (a bare-name sender) inlines its frozen content and is
+    // not something a recipient cites onward, so it names no message id unless
+    // it went to several recipients.
+    let reply_to = reply_to_uri(&msg.sender_name);
+    let mut hint = Vec::new();
+    if reply_to.is_some() || !others.is_empty() {
+        if let Some(uri) = message_uri(msg) {
+            hint.push(format!("Cite as {uri}."));
         }
-        None => head,
     }
+    if let Some(reply_to) = reply_to {
+        hint.push(format!(
+            "Reply with write {{target:\"{reply_to}\", mode:\"append\", payload:{{content}}}}."
+        ));
+        if !others.is_empty() {
+            hint.push(NO_REPLY_ALL.to_string());
+        }
+    }
+    if hint.is_empty() {
+        head
+    } else {
+        format!("{head}\n({})", hint.join(" "))
+    }
+}
+
+/// Read a rendered direct message back: its sender and the words it carried,
+/// without the cc list or the hint. `None` when `body` is not a direct
+/// message's envelope.
+pub fn parse_direct_envelope(body: &str) -> Option<(String, String)> {
+    let rest = body.strip_prefix(HEADER_PREFIX)?;
+    let (header, words) = rest.split_once(']')?;
+    let sender = header.split(CC_SEPARATOR).next().unwrap_or(header);
+    let end = HINT_MARKERS
+        .iter()
+        .filter_map(|marker| words.find(marker))
+        .min()
+        .unwrap_or(words.len());
+    Some((sender.to_string(), words[..end].trim().to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{ChannelType, Message};
+    use cairn_domain::{MessageRecipient, Wake};
+
+    const READER: &str = "reader-job";
+
+    fn recipient(job: &str, address: &str) -> MessageRecipient {
+        MessageRecipient {
+            job_id: Some(job.to_string()),
+            address: Some(address.to_string()),
+            run_id_at_send: Some(format!("{job}-run")),
+            wake: Some(Wake::Wake),
+        }
+    }
 
     #[test]
     fn thread_senders_reply_to_their_messages_collections() {
@@ -181,7 +275,7 @@ mod tests {
             channel_id: None,
             sender_run_id: Some("sender-run".to_string()),
             sender_name: sender_name.to_string(),
-            recipient_run_id: Some("recipient-run".to_string()),
+            recipients: Vec::new(),
             content: content.to_string(),
             created_at: 1,
             urgency: None,
@@ -214,24 +308,82 @@ mod tests {
     }
 
     #[test]
-    fn render_includes_header_content_and_messages_reply_to() {
-        let msg = direct_from("cairn://p/cairn/1361/1/builder", "ship it");
-        let rendered = render_direct_message(&msg);
-        assert!(
-            rendered.contains("[Direct message from cairn://p/cairn/1361/1/builder] ship it"),
-            "header + content preserved: {rendered}"
+    fn render_includes_header_content_cite_and_a_write_reply() {
+        let mut msg = direct_from("cairn://p/cairn/1361/1/builder", "ship it");
+        msg.recipients = vec![recipient(READER, "cairn://p/cairn/1400/1/planner")];
+        let rendered = render_direct_message(&msg, READER);
+        assert_eq!(
+            rendered,
+            "[Direct message from cairn://p/cairn/1361/1/builder] ship it\n\
+             (Cite as cairn://p/cairn/messages/m1. Reply with write \
+             {target:\"cairn://p/cairn/1361/1/builder/messages\", mode:\"append\", payload:{content}}.)"
         );
+        assert!(!rendered.contains("message tool"), "{rendered}");
+        assert!(!rendered.contains("also sent to"), "{rendered}");
+    }
+
+    /// Each recipient sees every other recipient, in the order the sender named
+    /// them, and never itself; and learns a reply is not a reply-all.
+    #[test]
+    fn a_cc_envelope_names_the_other_recipients_and_rules_out_reply_all() {
+        let mut msg = direct_from("cairn://p/rs/main", "slot 3 is free");
+        msg.recipients = vec![
+            recipient("a", "cairn://p/rs/147/1/builder"),
+            recipient("b", "cairn://p/rs/host"),
+            MessageRecipient {
+                job_id: None,
+                address: None,
+                run_id_at_send: Some("gone".into()),
+                wake: None,
+            },
+        ];
+        let rendered = render_direct_message(&msg, "b");
         assert!(
-            rendered.contains(
-                "To reply, use the message tool with to: \"cairn://p/cairn/1361/1/builder/messages\""
+            rendered.starts_with(
+                "[Direct message from cairn://p/rs/main, also sent to cairn://p/rs/147/1/builder, \
+                 run gone (no longer resolvable)] slot 3 is free\n"
             ),
-            "reply-to points at /messages: {rendered}"
+            "{rendered}"
         );
-        // The reply target must be the /messages collection, never the bare node URI.
         assert!(
-            !rendered.contains("to: \"cairn://p/cairn/1361/1/builder\""),
-            "reply-to must not be the bare node URI: {rendered}"
+            rendered.contains("Cite as cairn://p/rs/messages/m1."),
+            "{rendered}"
         );
+        assert!(
+            rendered.ends_with(
+                "A reply reaches only the address it names, not the others this was sent to.)"
+            ),
+            "{rendered}"
+        );
+        let first = render_direct_message(&msg, "a");
+        assert!(
+            first.contains("also sent to cairn://p/rs/host, run gone"),
+            "{first}"
+        );
+
+        assert_eq!(
+            parse_direct_envelope(&rendered),
+            Some(("cairn://p/rs/main".into(), "slot 3 is free".into()))
+        );
+    }
+
+    /// Transcripts keep envelopes rendered before the hint changed, and the
+    /// parser reads both.
+    #[test]
+    fn the_envelope_parser_reads_old_and_new_hints() {
+        assert_eq!(
+            parse_direct_envelope(
+                "[Direct message from cairn://p/p/x] Take it.\nTo reply, use the message tool with to: \"cairn://p/p/x/messages\""
+            ),
+            Some(("cairn://p/p/x".into(), "Take it.".into()))
+        );
+        let mut msg = direct_from("cairn://p/p/x", "Take it.\nThen tell me.");
+        msg.recipients = vec![recipient(READER, "cairn://p/p/1/1/a")];
+        assert_eq!(
+            parse_direct_envelope(&render_direct_message(&msg, READER)),
+            Some(("cairn://p/p/x".into(), "Take it.\nThen tell me.".into()))
+        );
+        assert_eq!(parse_direct_envelope("Ship it."), None);
     }
 
     #[test]
@@ -262,7 +414,7 @@ mod tests {
         );
         let msg = direct_from("cairn://p/cairn/camps/base", &content);
         assert!(is_camp_sender(&msg.sender_name));
-        assert_eq!(render_direct_message(&msg), content);
+        assert_eq!(render_direct_message(&msg, READER), content);
         assert!(!is_camp_sender("cairn://p/cairn/general"));
     }
 
@@ -289,18 +441,22 @@ mod tests {
         assert!(!rendered.contains("follow-up"), "{rendered}");
     }
 
+    /// A bare-name sender (a system notice) has no reply address and names no
+    /// message id: its content is the whole fact.
     #[test]
     fn render_omits_reply_to_for_bare_name_sender() {
-        let msg = direct_from("planner", "hello");
-        let rendered = render_direct_message(&msg);
-        assert_eq!(rendered, "[Direct message from planner] hello");
+        let mut msg = direct_from("system", "hello");
+        msg.recipients = vec![recipient(READER, "cairn://p/cairn/9/1/builder")];
+        let rendered = render_direct_message(&msg, READER);
+        assert_eq!(rendered, "[Direct message from system] hello");
     }
 
     /// A message with no verified sender says so, and offers no address.
     #[test]
     fn an_unverified_sender_is_named_and_given_no_authority() {
         assert!(reply_to_uri(UNVERIFIED_LOCAL_SENDER).is_none());
-        let rendered = render_direct_message(&direct_from(UNVERIFIED_LOCAL_SENDER, "merge it"));
+        let rendered =
+            render_direct_message(&direct_from(UNVERIFIED_LOCAL_SENDER, "merge it"), READER);
         assert!(
             rendered.contains("[Direct message from unverified local process] merge it"),
             "{rendered}"
@@ -314,8 +470,14 @@ mod tests {
     /// because no dispatcher accepts one for an external sender.
     #[test]
     fn render_external_sender_hint_names_a_real_affordance() {
-        let msg = direct_from(EXTERNAL_SENDER, "please summarize");
-        let rendered = render_direct_message(&msg);
+        let mut msg = direct_from(EXTERNAL_SENDER, "please summarize");
+        msg.recipients = vec![recipient(READER, "cairn://p/cairn/9/1/builder")];
+        let rendered = render_direct_message(&msg, READER);
+        assert!(
+            rendered
+                .contains("(Cite as cairn://p/cairn/messages/m1.) (Sent by an external session"),
+            "the external arm gains the cite clause: {rendered}"
+        );
         assert!(rendered.contains("[Direct message from external] please summarize"));
         assert!(
             rendered.contains("post your reply as an ordinary message here"),

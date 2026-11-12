@@ -81,6 +81,7 @@ impl CairnResource {
             | NodeProgress { project, .. }
             | TaskMessages { project, .. }
             | ProjectMessages { project, .. }
+            | ProjectMessage { project, .. }
             | IssueMessages { project, .. }
             | Changed { project, .. }
             | IssueExecutions { project, .. }
@@ -215,6 +216,7 @@ impl CairnResource {
             | Self::NodeProgress { project, .. }
             | Self::TaskMessages { project, .. }
             | Self::ProjectMessages { project }
+            | Self::ProjectMessage { project, .. }
             | Self::IssueMessages { project, .. }
             | Self::IssueComments { project, .. }
             | Self::IssueComment { project, .. }
@@ -449,6 +451,7 @@ impl CairnResource {
             | Self::ProjectVcsLog { .. }
             | Self::ProjectVcsBlame { .. }
             | Self::ProjectMessages { .. }
+            | Self::ProjectMessage { .. }
             | Self::ProjectTerminal { .. }
             | Self::ProjectBrowser { .. }
             | Self::ProjectBrowserNetworkRequest { .. }

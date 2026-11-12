@@ -251,6 +251,11 @@ pub fn build_project_messages_uri(project: &str) -> String {
     format!("{}/messages", build_project_uri(project))
 }
 
+/// One stored message: `cairn://p/{project}/messages/{id}`.
+pub fn build_message_uri(project: &str, id: &str) -> String {
+    format!("{}/{id}", build_project_messages_uri(project))
+}
+
 pub fn build_issue_messages_uri(project: &str, number: i32) -> String {
     format!("{}/messages", build_issue_uri(project, number))
 }
@@ -1584,6 +1589,7 @@ impl CairnResource {
                 task_name,
             } => build_task_messages_uri(project, *number, *exec_seq, node_id, task_name),
             Self::ProjectMessages { project } => build_project_messages_uri(project),
+            Self::ProjectMessage { project, id } => build_message_uri(project, id),
             Self::IssueMessages { project, number } => build_issue_messages_uri(project, *number),
             Self::Changed { project, number } => build_issue_changed_uri(project, *number),
             Self::IssueExecutions { project, number } => {

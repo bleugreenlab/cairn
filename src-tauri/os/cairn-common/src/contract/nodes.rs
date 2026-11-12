@@ -42,7 +42,7 @@ pub(crate) const NODE_MESSAGES_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeMessages,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/messages",
         name: "Node messages",
-        description: "Direct messages to and from a node agent. Canonical messaging target for a node, symmetric with project/issue /messages: append delivers a direct message (queued and steered if the recipient is mid-turn), read returns the node's direct-message stream across all of its runs, each line marked with its delivery urgency: the newest `limit` messages by default, or reading forward from `since`.",
+        description: "Direct messages to and from a node agent. Canonical messaging target for a node, symmetric with project/issue /messages: append delivers a direct message (queued and steered if the recipient is mid-turn), to this node and any `cc` recipients as one stored message; read returns the node's direct-message stream across all of its runs, each line marked with its delivery urgency, its recipients when there are several, and its citable URI: the newest `limit` messages by default, or reading forward from `since`.",
         read_projections: &[
             ProjectionSpec {
                 key: "since",
@@ -58,9 +58,9 @@ pub(crate) const NODE_MESSAGES_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[CONTENT],
-            optional: &[ESCALATE],
+            optional: &[MESSAGE_URGENCY, ESCALATE, MESSAGE_CC],
             label: "send direct message",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/messages\",mode:\"append\",payload:{content:\"...\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/messages\",mode:\"append\",payload:{content:\"...\",cc:[\"cairn://p/PROJECT/THREAD\"]}}]})",
         }],
     };
 

@@ -422,6 +422,17 @@ pub(crate) const PROJECT_ISSUES_CONTRACT: ResourceContract =
         }],
     };
 
+pub(crate) const PROJECT_MESSAGE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectMessage,
+    uri_template: "cairn://p/{project}/messages/{id}",
+    name: "Message",
+    description: "One stored message: its sender, time and urgency, every recipient in the order the sender named them with the wake each one's own mutes left it, and its content with the references it cites. A direct message sent to several addresses is this one message; every recipient's envelope cites this address",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PROJECT_MESSAGES_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::ProjectMessages,

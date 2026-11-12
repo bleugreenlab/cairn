@@ -584,14 +584,8 @@ fn strip_turn_machinery(content: &str) -> String {
 /// Who wrote a turn's `user` input and the words they wrote, with a direct
 /// message's reply hint removed.
 fn attribute_user_input(body: &str) -> (String, String) {
-    if let Some(rest) = body.strip_prefix("[Direct message from ") {
-        if let Some((sender, words)) = rest.split_once(']') {
-            let words = words
-                .split("\nTo reply, use the message tool")
-                .next()
-                .unwrap_or_default();
-            return (sender.to_string(), words.trim().to_string());
-        }
+    if let Some(envelope) = cairn_attention::message_render::parse_direct_envelope(body) {
+        return envelope;
     }
     if body.starts_with("Attention update (") {
         return ("Cairn (an attention update)".into(), body.to_string());

@@ -53,7 +53,6 @@ pub async fn append_thread_message(
         Some(thread_id),
         sender_run_id,
         sender_name,
-        None,
         content,
     )?;
     use crate::orchestrator::wakes::{WakeDelivery, WakeEvent, WakeSource};
@@ -746,23 +745,23 @@ pub(crate) async fn insert_system_direct_push_once_conn(
     use crate::orchestrator::attention_push::Boundary;
     let now = chrono::Utc::now().timestamp();
     let message_id = system_direct_once_message_id(idempotency_key);
-    let inserted = conn
-        .execute(
-            "INSERT OR IGNORE INTO messages (
-            id, channel_type, channel_id, sender_run_id, sender_name,
-            recipient_run_id, content, created_at, urgency
-         ) VALUES (?1, 'direct', NULL, NULL, 'system', ?2, ?3, ?4, ?5)",
-            params![
-                message_id.as_str(),
-                recipient_run_id,
-                content,
-                now,
-                urgency.as_str()
-            ],
-        )
-        .await?;
     let wake = direct_wake_for_urgency(urgency);
-    if inserted == 0 {
+    let inserted = cairn_attention::direct::insert_direct_message_conn(
+        conn,
+        &cairn_attention::direct::NewDirect::system_to_one(
+            &message_id,
+            "system",
+            content,
+            urgency,
+            recipient_job_id,
+            recipient_run_id,
+            wake,
+            now,
+        ),
+        cairn_attention::direct::OnExisting::Ignore,
+    )
+    .await?;
+    if !inserted {
         return Ok((message_id, wake, false));
     }
     let content_ref = node_uri_for_job_conn(conn, recipient_job_id)

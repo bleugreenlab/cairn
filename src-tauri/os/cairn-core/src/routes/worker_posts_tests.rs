@@ -211,7 +211,7 @@ fn job(name: &str, via: Option<&str>) -> (String, Option<String>) {
 
 async fn events_received(db: &LocalDb, run: &str) -> Vec<String> {
     db.query_all(
-        "SELECT content FROM messages WHERE recipient_run_id = ?1 AND content LIKE '[Event]%' ORDER BY rowid",
+        "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) AND content LIKE '[Event]%' ORDER BY rowid",
         (run.to_string(),),
         |row| row.text(0),
     )
@@ -1070,7 +1070,7 @@ async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outrank
     // by its mention, reads an event.
     let (sender, told) = db
         .query_opt(
-            "SELECT sender_name, content FROM messages WHERE recipient_run_id = 'reader-run' ORDER BY rowid DESC LIMIT 1",
+            "SELECT sender_name, content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'reader-run') ORDER BY rowid DESC LIMIT 1",
             (),
             |row| Ok((row.text(0)?, row.text(1)?)),
         )

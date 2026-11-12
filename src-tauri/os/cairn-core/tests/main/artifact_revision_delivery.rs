@@ -190,7 +190,7 @@ async fn messages_to(db: &LocalDb, run_id: &str) -> Vec<String> {
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT content FROM messages WHERE recipient_run_id = ?1 ORDER BY created_at, id",
+                    "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) ORDER BY created_at, id",
                     params![run_id.as_str()],
                 )
                 .await?;

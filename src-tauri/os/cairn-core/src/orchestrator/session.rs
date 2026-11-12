@@ -1598,7 +1598,10 @@ fn build_messaging_context(
     );
     out.push_str("Messages sent to the issue channel are visible to all agents on the issue.\n");
     out.push_str(
-        "Direct messages go to a specific agent via their URI and auto-resume them if idle.\n\n",
+        "Direct messages go to a specific agent via their URI and auto-resume them if idle. \
+         To reach several agents with one message, name the others in `cc` \
+         (`payload:{content, cc:[\"<uri>\"]}`): each is woken under its own mutes and sees who \
+         else got it, and a reply reaches only the address it names.\n\n",
     );
 
     if !peers.is_empty() {

@@ -486,6 +486,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("issue_labels", "issues"),
     owned("issue_workspaces", "issues"),
     owned("memory_triage_issue_memories", "issues"),
+    owned("message_recipients", "messages"),
     owned("thread_read_positions", "threads"),
     owned("headline_read_cursors", "threads"),
     owned("thread_services", "threads"),

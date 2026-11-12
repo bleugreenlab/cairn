@@ -423,7 +423,7 @@ async fn a_camp_notice_is_one_fact_delivered_to_each_participant_by_role() {
     );
     let told = db
         .query_opt_text(
-            "SELECT content FROM messages WHERE recipient_run_id = 'watcher-run' ORDER BY created_at DESC LIMIT 1",
+            "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'watcher-run') ORDER BY created_at DESC LIMIT 1",
             (),
         )
         .await
@@ -528,7 +528,7 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
     crate::routes::drain_fact_log(&orch).await;
     let told = db
         .query_all(
-            "SELECT sender_name, content FROM messages WHERE recipient_run_id = 'n0-run'",
+            "SELECT sender_name, content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'n0-run')",
             (),
             |row| Ok((row.text(0)?, row.text(1)?)),
         )
@@ -550,13 +550,13 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
         channel_id: None,
         sender_run_id: None,
         sender_name: told[0].0.clone(),
-        recipient_run_id: Some("n0-run".into()),
+        recipients: Vec::new(),
         content: told[0].1.clone(),
         created_at: 1,
         urgency: None,
     };
     assert_eq!(
-        cairn_attention::message_render::render_direct_message(&message),
+        cairn_attention::message_render::render_direct_message(&message, "n0"),
         told[0].1
     );
 }

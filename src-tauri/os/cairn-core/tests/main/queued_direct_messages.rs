@@ -18,19 +18,37 @@ use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_core::messages::db as msg_db;
-use cairn_core::models::ChannelType;
 use cairn_db::turso::params;
 
-fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &str) -> String {
-    let msg = msg_db::insert_message(
+/// A direct from the planner to the job whose latest run is `recipient`.
+async fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &str) -> String {
+    let job = orch
+        .db
+        .local
+        .query_opt_text(
+            "SELECT job_id FROM runs WHERE id = ?1",
+            (recipient.to_string(),),
+        )
+        .await
+        .unwrap()
+        .expect("the recipient run has a job");
+    let msg = msg_db::insert_direct_message(
         &orch.db.local,
-        &ChannelType::Direct,
-        None,
-        Some("sender-run"),
-        "planner",
-        Some(recipient),
-        content,
+        cairn_attention::direct::NewDirect {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender_run_id: Some("sender-run".to_string()),
+            sender_name: "planner".to_string(),
+            content: content.to_string(),
+            urgency: None,
+            created_at: chrono::Utc::now().timestamp(),
+            recipients: vec![cairn_attention::direct::NewRecipient {
+                job_id: job,
+                run_id_at_send: Some(recipient.to_string()),
+                wake: None,
+            }],
+        },
     )
+    .await
     .unwrap();
     msg.id
 }
@@ -307,7 +325,7 @@ async fn latest_direct_to(db: &LocalDb, recipient_run_id: &str) -> Option<String
             let mut rows = conn
                 .query(
                     "SELECT id FROM messages
-                     WHERE channel_type = 'direct' AND recipient_run_id = ?1
+                     WHERE channel_type = 'direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)
                      ORDER BY created_at DESC, id DESC LIMIT 1",
                     params![recipient_run_id.as_str()],
                 )
@@ -749,7 +767,7 @@ async fn latest_direct_sender(db: &LocalDb, recipient_run_id: &str) -> Option<St
             let mut rows = conn
                 .query(
                     "SELECT sender_name FROM messages
-                     WHERE channel_type = 'direct' AND recipient_run_id = ?1
+                     WHERE channel_type = 'direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)
                      ORDER BY created_at DESC, id DESC LIMIT 1",
                     params![recipient_run_id.as_str()],
                 )
@@ -1006,7 +1024,7 @@ async fn node_messages_read_returns_directs() {
     // node's direct-message stream.
     let (_temp, orch) = common::test_orchestrator().await;
     insert_dm_recipient(&orch.db.local, "proj", "running").await;
-    let _ = insert_pending_direct(&orch, "run-1", "hello builder");
+    let _ = insert_pending_direct(&orch, "run-1", "hello builder").await;
 
     let request = McpCallbackRequest {
         answer_bound_ms: None,

@@ -444,10 +444,10 @@ mod tests {
         db.execute_script(
             "INSERT INTO messages
                (id, channel_type, channel_id, sender_run_id, sender_name,
-                recipient_run_id, content, created_at)
+                content, created_at)
              VALUES
                ('direct-message', 'direct', NULL, NULL,
-                'cairn://p/proj/1/1/sender', NULL, 'frozen direct content', 1);",
+                'cairn://p/proj/1/1/sender', 'frozen direct content', 1);",
         )
         .await
         .unwrap();

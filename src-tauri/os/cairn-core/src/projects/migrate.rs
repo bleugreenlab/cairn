@@ -435,10 +435,16 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("attention_read_cursors", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1) OR source IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("event_read_tokens", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
     spec("event_vibes", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),
+    // A direct's recipients come before the message: deletion walks this list
+    // in reverse, and the `messages` predicate finds a project's directs
+    // through their recipient rows, so those rows must outlive the sweep of
+    // `messages`. Neither table references the other, so copying recipients
+    // first is safe.
+    spec("message_recipients", "recipient_job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR recipient_run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     split_scope(
         "messages",
-        "channel_id = ?1 OR channel_id IN (SELECT id FROM issues WHERE project_id = ?1) OR sender_run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR recipient_run_id IN (SELECT id FROM runs WHERE project_id = ?1)",
-        "channel_id = ?1 OR channel_id IN (SELECT id FROM issues WHERE project_id = ?1) OR channel_id IN (SELECT id FROM threads WHERE project_id = ?1) OR sender_run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR recipient_run_id IN (SELECT id FROM runs WHERE project_id = ?1)",
+        "channel_id = ?1 OR channel_id IN (SELECT id FROM issues WHERE project_id = ?1) OR sender_run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR id IN (SELECT message_id FROM message_recipients WHERE recipient_job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR recipient_run_id IN (SELECT id FROM runs WHERE project_id = ?1))",
+        "channel_id = ?1 OR channel_id IN (SELECT id FROM issues WHERE project_id = ?1) OR channel_id IN (SELECT id FROM threads WHERE project_id = ?1) OR sender_run_id IN (SELECT id FROM runs WHERE project_id = ?1) OR id IN (SELECT message_id FROM message_recipients WHERE recipient_job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR recipient_run_id IN (SELECT id FROM runs WHERE project_id = ?1))",
     ),
     spec("queued_messages", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("memory_triage_issue_memories", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR memory_id IN (SELECT id FROM memories WHERE project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),

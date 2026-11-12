@@ -1324,7 +1324,7 @@ async fn contradiction(
 
 async fn messages(db: &LocalDb) -> Vec<String> {
     db.query_all(
-        "SELECT content FROM messages WHERE recipient_run_id = 'run-design' ORDER BY created_at, id",
+        "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-design') ORDER BY created_at, id",
         (),
         |row| row.text(0),
     )

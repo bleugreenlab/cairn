@@ -138,9 +138,9 @@ pub(crate) const TASK_MESSAGES_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[CONTENT],
-            optional: &[ESCALATE],
+            optional: &[MESSAGE_URGENCY, ESCALATE, MESSAGE_CC],
             label: "send direct message",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/task/NAME/messages\",mode:\"append\",payload:{content:\"...\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/task/NAME/messages\",mode:\"append\",payload:{content:\"...\",cc:[\"cairn://p/PROJECT/NUMBER/EXEC/NODE\"]}}]})",
         }],
     };
 

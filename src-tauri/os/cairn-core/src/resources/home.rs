@@ -259,10 +259,13 @@ fn home_sql() -> String {
     let hot_columns = HotRow::columns(Some("e"));
     format!(
         r#"
-WITH thread_runs AS (
- SELECT r.id run_id,t.name thread_name FROM threads t
+WITH thread_jobs AS (
+ SELECT j.id job_id,t.name thread_name FROM threads t
  JOIN jobs j ON j.thread_id=t.id AND j.parent_job_id IS NULL AND j.uri_segment='thread'
- JOIN runs r ON r.job_id=j.id WHERE t.project_id=?1
+ WHERE t.project_id=?1
+), thread_runs AS (
+ SELECT r.id run_id,tj.thread_name thread_name FROM thread_jobs tj
+ JOIN runs r ON r.job_id=tj.job_id
 ), home_entries AS (
  SELECT * FROM (
   SELECT pick.at at,pick.id id,'say' kind,'cairn://p/'||?2||'/'||tr.thread_name author,NULL target,
@@ -299,19 +302,23 @@ WITH thread_runs AS (
  UNION ALL
  SELECT * FROM (
   SELECT pick.at,pick.id,'message',m.sender_name,
-  CASE WHEN recipient.thread_name IS NULL THEN NULL ELSE 'cairn://p/'||?2||'/'||recipient.thread_name END,
-  CASE WHEN sender.thread_name IS NOT NULL THEN 'cairn://p/'||?2||'/'||sender.thread_name||'/messages' ELSE 'cairn://p/'||?2||'/'||recipient.thread_name||'/messages' END,NULL,NULL
+  pick.recipient_thread,
+  CASE WHEN sender.thread_name IS NOT NULL THEN 'cairn://p/'||?2||'/'||sender.thread_name||'/messages' ELSE pick.recipient_thread||'/messages' END,NULL,NULL
   FROM (
-   SELECT m.created_at at,m.id id FROM messages m
+   SELECT m.created_at at,m.id id,
+   (SELECT 'cairn://p/'||?2||'/'||tj.thread_name FROM message_recipients mr
+     JOIN thread_jobs tj ON tj.job_id=mr.recipient_job_id
+     WHERE mr.message_id=m.id ORDER BY mr.position LIMIT 1) recipient_thread
+   FROM messages m
    LEFT JOIN thread_runs sender ON sender.run_id=m.sender_run_id
-   LEFT JOIN thread_runs recipient ON recipient.run_id=m.recipient_run_id
-   WHERE m.channel_type='direct' AND (sender.run_id IS NOT NULL OR recipient.run_id IS NOT NULL)
+   WHERE m.channel_type='direct'
+   AND (sender.run_id IS NOT NULL OR EXISTS(SELECT 1 FROM message_recipients mr
+     JOIN thread_jobs tj ON tj.job_id=mr.recipient_job_id WHERE mr.message_id=m.id))
    AND (?3 IS NULL OR m.created_at<?3 OR (m.created_at=?3 AND m.id<?4))
    ORDER BY m.created_at DESC,m.id DESC LIMIT ?5
   ) pick
   JOIN messages m ON m.id=pick.id
   LEFT JOIN thread_runs sender ON sender.run_id=m.sender_run_id
-  LEFT JOIN thread_runs recipient ON recipient.run_id=m.recipient_run_id
   ORDER BY pick.at DESC,pick.id DESC LIMIT ?5
  )
  UNION ALL
@@ -855,14 +862,14 @@ mod tests {
         );
     }
 
-    /// Direct messages reach Home through the thread run on either end.
+    /// Direct messages reach Home through a thread on either end: the sending
+    /// thread run, or a thread session among the recipients.
     ///
-    /// This branch resolves its `target` and `source` from two independent
-    /// LEFT JOINs, and the row is now selected by key and joined back to
-    /// afterwards -- so the second pair of joins has to land on the same rows the
-    /// first pair chose. A message addressed TO a thread and one sent FROM a
-    /// thread take opposite arms of both `CASE`s, which is what makes them worth
-    /// asserting together.
+    /// The row is selected by key and joined back to afterwards, so the
+    /// join-back has to land on the same ends the candidate walk chose. A
+    /// message addressed TO a thread and one sent FROM a thread take opposite
+    /// arms of the `CASE`, which is what makes them worth asserting together. A
+    /// message to two threads appears once, attributed to the first.
     #[tokio::test]
     async fn direct_messages_resolve_their_thread_end() {
         let db = migrated_test_db("home-direct-messages.db").await;
@@ -876,13 +883,20 @@ mod tests {
                     "INSERT INTO jobs(id,project_id,thread_id,status,uri_segment,created_at,updated_at) VALUES ('j3','p','t2','complete','thread',1,1)",
                     "INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES ('r3','j3','exited',1,1)",
                     // Sent by a thread to something that is not a thread.
-                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,recipient_run_id,content,created_at) VALUES ('from','direct','general','r','outsider','sent from a thread',30)",
+                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,content,created_at) VALUES ('from','direct','general','r','sent from a thread',30)",
+                    "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES ('from',0,'outsider-job','outsider',30)",
                     // Sent to a thread by something that is not a thread.
-                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,recipient_run_id,content,created_at) VALUES ('to','direct','someone','outsider','r','sent to a thread',20)",
+                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,content,created_at) VALUES ('to','direct','someone','outsider','sent to a thread',20)",
+                    "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES ('to',0,'j','r',20)",
                     // Between two threads.
-                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,recipient_run_id,content,created_at) VALUES ('both','direct','general','r','r3','thread to thread',10)",
+                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,content,created_at) VALUES ('both','direct','general','r','thread to thread',10)",
+                    "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES ('both',0,'j3','r3',10)",
+                    // To two threads from outside: once, attributed to the first.
+                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,content,created_at) VALUES ('cc','direct','someone','outsider','to two threads',5)",
+                    "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES ('cc',0,'j3','r3',5),('cc',1,'j','r',5)",
                     // Between two runs that are not threads: not Home's business.
-                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,recipient_run_id,content,created_at) VALUES ('neither','direct','someone','outsider','other','not a thread at either end',40)",
+                    "INSERT INTO messages(id,channel_type,sender_name,sender_run_id,content,created_at) VALUES ('neither','direct','someone','outsider','not a thread at either end',40)",
+                    "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES ('neither',0,NULL,'other',40)",
                 ] {
                     conn.execute(sql, ()).await?;
                 }
@@ -914,6 +928,11 @@ mod tests {
                     "both",
                     Some("cairn://p/proj/testing"),
                     "cairn://p/proj/general/messages"
+                ),
+                (
+                    "cc",
+                    Some("cairn://p/proj/testing"),
+                    "cairn://p/proj/testing/messages"
                 ),
             ],
             "a direct message belongs to Home exactly when a thread run sits on \
@@ -1148,7 +1167,7 @@ mod tests {
                 let mut batch: Vec<String> = Vec::with_capacity(500);
                 let flush_messages = |batch: &mut Vec<String>| {
                     let sql = format!(
-                        "INSERT INTO messages(id,channel_type,channel_id,sender_name,sender_run_id,recipient_run_id,content,created_at) VALUES {}",
+                        "INSERT INTO messages(id,channel_type,channel_id,sender_name,sender_run_id,content,created_at) VALUES {}",
                         batch.join(",")
                     );
                     batch.clear();
@@ -1163,7 +1182,7 @@ mod tests {
                         "'rx'".into()
                     };
                     batch.push(format!(
-                        "('dm{i}','direct',NULL,'someone',{sender},'rx','a direct message',{at})"
+                        "('dm{i}','direct',NULL,'someone',{sender},'a direct message',{at})"
                     ));
                     if batch.len() == 500 {
                         conn.execute(&flush_messages(&mut batch), ()).await?;
@@ -1172,11 +1191,27 @@ mod tests {
                 if !batch.is_empty() {
                     conn.execute(&flush_messages(&mut batch), ()).await?;
                 }
+                // Every direct names its recipient, as every production direct
+                // does, so the thread-recipient probe meets a row each time.
+                for i in 0..DIRECT_MESSAGES {
+                    batch.push(format!("('dm{i}',0,'jx','rx',{})", i + 1));
+                    if batch.len() == 500 || i + 1 == DIRECT_MESSAGES {
+                        conn.execute(
+                            &format!(
+                                "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES {}",
+                                batch.join(",")
+                            ),
+                            (),
+                        )
+                        .await?;
+                        batch.clear();
+                    }
+                }
                 for i in 0..THREAD_MESSAGES {
                     at += 1;
                     let thread = i % THREADS;
                     batch.push(format!(
-                        "('tm{i}','thread','t{thread}','someone',NULL,NULL,'a thread message',{at})"
+                        "('tm{i}','thread','t{thread}','someone',NULL,'a thread message',{at})"
                     ));
                     if batch.len() == 500 {
                         conn.execute(&flush_messages(&mut batch), ()).await?;

@@ -6395,8 +6395,16 @@ mod tests {
         orch.db
             .local
             .execute(
-                "INSERT INTO messages(id,channel_type,channel_id,sender_run_id,sender_name,recipient_run_id,content,created_at) VALUES(?1,'direct',NULL,?2,'sender','run-0','please look',2)",
+                "INSERT INTO messages(id,channel_type,channel_id,sender_run_id,sender_name,content,created_at) VALUES(?1,'direct',NULL,?2,'sender','please look',2)",
                 params![id, sender_run_id],
+            )
+            .await
+            .unwrap();
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES(?1,0,'j','run-0',2)",
+                params![id],
             )
             .await
             .unwrap();

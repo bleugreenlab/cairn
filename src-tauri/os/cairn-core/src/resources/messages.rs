@@ -145,10 +145,18 @@ fn project_board_purpose(project_key: &str) -> String {
     )
 }
 
-/// A direct message's line carries its delivery urgency: whether it woke its
-/// recipient or rode along is part of what was said. Rows written before
-/// system directs recorded urgency carry none and show none.
-fn format_direct_messages(messages: &[crate::models::Message]) -> String {
+/// The citable address of a message read from `project_key`'s database: in
+/// its first recipient's project when that recipient has an address.
+fn cite_uri(msg: &crate::models::Message, project_key: &str) -> String {
+    cairn_attention::message_render::message_uri(msg)
+        .unwrap_or_else(|| cairn_uri::build_message_uri(project_key, &msg.id))
+}
+
+/// A direct message's line carries its citable address, its delivery urgency
+/// (whether it woke its recipient or rode along is part of what was said), and,
+/// when it went to several recipients, all of them in the order they were
+/// named. Rows written before system directs recorded urgency show none.
+fn format_direct_messages(messages: &[crate::models::Message], project_key: &str) -> String {
     if messages.is_empty() {
         return "(no messages)".to_string();
     }
@@ -157,17 +165,141 @@ fn format_direct_messages(messages: &[crate::models::Message]) -> String {
     for msg in messages {
         let ts = crate::clock::stamp_with_seconds(msg.created_at)
             .unwrap_or_else(|| msg.created_at.to_string());
-        match msg.urgency {
-            Some(urgency) => out.push_str(&format!(
-                "[{}] {} ({}): {}\n",
-                ts,
-                msg.sender_name,
-                urgency.as_str(),
-                msg.content
-            )),
-            None => out.push_str(&format!("[{}] {}: {}\n", ts, msg.sender_name, msg.content)),
+        let urgency = msg
+            .urgency
+            .map(|urgency| format!(" ({})", urgency.as_str()))
+            .unwrap_or_default();
+        let to = if msg.recipients.len() > 1 {
+            let names = msg
+                .recipients
+                .iter()
+                .map(|recipient| recipient.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" to {names}")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "[{ts} · {}] {}{urgency}{to}: {}\n",
+            cite_uri(msg, project_key),
+            msg.sender_name,
+            msg.content
+        ));
+    }
+    out
+}
+
+/// Whether a message belongs to `project_key`: a direct when one of its
+/// recipients is a job of that project, a channel message when its channel
+/// is the project, one of its issues, or one of its threads.
+async fn message_in_project(
+    db: &LocalDb,
+    msg: &crate::models::Message,
+    project_key: &str,
+) -> Result<bool, String> {
+    use crate::models::ChannelType;
+    let key = cairn_uri::canonical_project(project_key);
+    match msg.channel_type {
+        ChannelType::Direct => {
+            let jobs: Vec<String> = msg
+                .recipients
+                .iter()
+                .filter_map(|recipient| recipient.job_id.clone())
+                .collect();
+            for job in jobs {
+                let project = db
+                    .query_opt_text(
+                        "SELECT p.key FROM jobs j
+                           LEFT JOIN issues i ON i.id = j.issue_id
+                           JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
+                          WHERE j.id = ?1",
+                        (job,),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if project.is_some_and(|project| cairn_uri::canonical_project(&project) == key) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        ChannelType::Project => Ok(msg
+            .channel_id
+            .as_deref()
+            .is_some_and(|channel| cairn_uri::canonical_project(channel) == key)),
+        ChannelType::Issue => Ok(msg
+            .channel_id
+            .as_deref()
+            .and_then(|channel| channel.split_once('/'))
+            .is_some_and(|(project, _)| cairn_uri::canonical_project(project) == key)),
+        ChannelType::Thread => {
+            let Some(thread_id) = msg.channel_id.clone() else {
+                return Ok(false);
+            };
+            let project = db
+                .query_opt_text(
+                    "SELECT p.key FROM threads t JOIN projects p ON p.id = t.project_id WHERE t.id = ?1",
+                    (thread_id,),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(project.is_some_and(|project| cairn_uri::canonical_project(&project) == key))
         }
     }
+}
+
+/// Read one stored message by its citable address: who sent it, when, at what
+/// urgency, every recipient in position order with the wake its own mutes
+/// left it, and the content with what it cites.
+pub(super) async fn read_project_message(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_key: &str,
+    id: &str,
+    params: &[QueryParam],
+) -> String {
+    let uri = cairn_uri::build_message_uri(project_key, id);
+    if let Some(param) = params.first() {
+        return format!("Unsupported query parameter '{}' for {uri}", param.key);
+    }
+    let not_found = || format!("Message {uri} not found.");
+    let msg = match crate::messages::db::get_message_by_id_async(db, id).await {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return not_found(),
+        Err(error) => return format!("Failed to read {uri}: {error}"),
+    };
+    match message_in_project(db, &msg, project_key).await {
+        Ok(true) => {}
+        Ok(false) => return not_found(),
+        Err(error) => return format!("Failed to read {uri}: {error}"),
+    }
+    let ts = crate::clock::stamp_with_seconds(msg.created_at)
+        .unwrap_or_else(|| msg.created_at.to_string());
+    let mut out = format!("# Message — {uri}\n\n");
+    out.push_str(&format!("- From: {}\n- Sent: {ts}\n", msg.sender_name));
+    if let Some(urgency) = msg.urgency {
+        out.push_str(&format!("- Urgency: {}\n", urgency.as_str()));
+    }
+    if msg.recipients.is_empty() {
+        let channel = msg.channel_id.as_deref().unwrap_or("none");
+        out.push_str(&format!("- Channel: {} {channel}\n", msg.channel_type));
+    } else {
+        out.push_str("- To:\n");
+        for (position, recipient) in msg.recipients.iter().enumerate() {
+            let wake = recipient
+                .wake
+                .map(|wake| format!(" ({})", wake.as_str()))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {}. {}{wake}\n",
+                position + 1,
+                recipient.label()
+            ));
+        }
+    }
+    out.push_str(&format!("\n{}\n", msg.content));
+    out.push_str(&references_after(orch, std::slice::from_ref(&msg)).await);
     out
 }
 
@@ -216,7 +348,7 @@ pub(super) async fn read_node_messages(
             };
             let mut out = format!("# Messages \u{2014} {}\n\n", label);
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
-            out.push_str(&format_direct_messages(&messages));
+            out.push_str(&format_direct_messages(&messages, project_key));
             out.push_str(&references_after(orch, &messages).await);
             out
         }
@@ -303,9 +435,11 @@ mod tests {
         // Sixty older directs to the first run: more than one default page.
         for i in 0..60 {
             script.push_str(&format!(
-                "INSERT INTO messages(id,channel_type,sender_name,recipient_run_id,content,created_at,urgency) \
-                 VALUES('old-{i}','direct','cairn://p/p/peer','r1','history {i:02}',{},'steer');",
-                100 + i
+                "INSERT INTO messages(id,channel_type,sender_name,content,created_at,urgency) \
+                 VALUES('old-{i}','direct','cairn://p/p/peer','history {i:02}',{at},'steer');
+                 INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) \
+                 VALUES('old-{i}',0,'j','r1',{at});",
+                at = 100 + i
             ));
         }
         db.execute_script(&script).await.unwrap();

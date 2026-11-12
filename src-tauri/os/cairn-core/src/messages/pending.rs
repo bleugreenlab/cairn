@@ -285,7 +285,7 @@ mod tests {
     /// kinds of row to withhold.
     async fn seeded_recipient(name: &str, status: &str) -> LocalDb {
         let db = crate::storage::migrated_test_db(name).await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -525,10 +525,17 @@ mod tests {
         let db = seeded_direct_db("pending-direct-sender.db").await;
         db.execute(
             "INSERT INTO messages (id, channel_type, channel_id, sender_run_id, sender_name,
-                                   recipient_run_id, content, created_at, urgency)
-             VALUES ('msg-1', 'direct', NULL, NULL, 'cairn://p/proj/2/1/planner', 'run-1',
+                                   content, created_at, urgency)
+             VALUES ('msg-1', 'direct', NULL, NULL, 'cairn://p/proj/2/1/planner',
                      'Rebase onto main
   before review.', 1, 'queue')",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO message_recipients (message_id, position, recipient_job_id, recipient_run_id, created_at)
+             VALUES ('msg-1', 0, 'job-1', 'run-1', 1)",
             (),
         )
         .await

@@ -273,6 +273,7 @@ impl CairnResource {
             // ---- Project ----
             // The bare project and its message stream are the project itself.
             Self::Project { project } | Self::ProjectMessages { project } => key(project),
+            Self::ProjectMessage { project, id } => in_project(project, format!("message {id}")),
             Self::ProjectSettings { project } => in_project(project, "settings"),
             Self::ProjectIssues { project } => in_project(project, "issues"),
             Self::ProjectThreads { project } => in_project(project, "threads"),

@@ -1,10 +1,14 @@
 //! Message database operations.
 //!
-//! Insert, query by channel (cursor-paginated), and query for a run's subscribed channels.
+//! Insert, query by channel (cursor-paginated), and query a job's direct
+//! stream. A direct message's addressees live in `message_recipients`; every
+//! loader here fills [`Message::recipients`] from it, and every direct is
+//! written through [`cairn_attention::direct::insert_direct_message_conn`].
 
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::{ChannelType, Message};
 use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
+use cairn_attention::direct::{insert_direct_message_conn, NewDirect, OnExisting};
 use cairn_db::turso::params;
 use uuid::Uuid;
 
@@ -25,8 +29,8 @@ pub async fn query_for_thread(
                 "SELECT {} FROM messages WHERE channel_type = 'thread' AND channel_id = ?1 AND (?2 IS NULL OR created_at >= ?2) ORDER BY created_at ASC LIMIT 200",
                 MESSAGE_COLUMNS
             );
-            let mut rows = conn.query(&sql, params![thread_id, since]).await?;
-            collect_messages(&mut rows).await
+            let rows = conn.query(&sql, params![thread_id, since]).await?;
+            collect_messages(conn, rows).await
         })
     })
     .await
@@ -37,9 +41,10 @@ pub async fn query_for_thread(
 /// only needs one edit here and a matching row-index update in
 /// [`message_from_row`].
 const MESSAGE_COLUMNS: &str = "id, channel_type, channel_id, sender_run_id, sender_name,
-        recipient_run_id, content, created_at, urgency";
+        content, created_at, urgency";
 
-/// Convert a database row to a domain Message.
+/// Convert a database row to a domain Message. Its recipients are filled by
+/// [`with_recipients`].
 fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
     let channel_type = row.text(1)?;
     Ok(Message {
@@ -48,11 +53,11 @@ fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
         channel_id: row.opt_text(2)?,
         sender_run_id: row.opt_text(3)?,
         sender_name: row.text(4)?,
-        recipient_run_id: row.opt_text(5)?,
-        content: row.text(6)?,
-        created_at: row.i64(7)?,
+        recipients: Vec::new(),
+        content: row.text(5)?,
+        created_at: row.i64(6)?,
         urgency: row
-            .opt_text(8)?
+            .opt_text(7)?
             .as_deref()
             .map(DeliveryUrgency::parse)
             .transpose()
@@ -60,38 +65,61 @@ fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
     })
 }
 
+/// Fill each direct's recipients with one batched read of
+/// `message_recipients` (its primary key), resolving each distinct recipient
+/// job to its address once.
+async fn with_recipients(
+    conn: &cairn_db::storage::TrackedConnection,
+    mut messages: Vec<Message>,
+) -> DbResult<Vec<Message>> {
+    let directs: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.channel_type == ChannelType::Direct)
+        .map(|message| message.id.as_str())
+        .collect();
+    if directs.is_empty() {
+        return Ok(messages);
+    }
+    let mut recipients = cairn_attention::direct::load_recipients_conn(conn, &directs).await?;
+    for message in &mut messages {
+        if let Some(found) = recipients.remove(&message.id) {
+            message.recipients = found;
+        } else if let Some(found) = recipients.get(&message.id) {
+            // The same direct read from both sides of a job's stream.
+            message.recipients = found.clone();
+        }
+    }
+    Ok(messages)
+}
+
 /// Load a single message by id, or `None` when no such row exists. The attention
 /// push delivery layer uses this to resolve a `direct:` push's frozen content
-/// from the durable `messages` row (the push key carries the message id), which
-/// is why migrating directs onto the push queue needs no schema change
-/// (CAIRN-1900).
+/// from the durable `messages` row (the push key carries the message id).
 pub(crate) async fn get_message_by_id_async(db: &LocalDb, id: &str) -> DbResult<Option<Message>> {
     let id = id.to_string();
     db.read(|conn| {
         let id = id.clone();
-        Box::pin(async move {
-            let sql = format!("SELECT {} FROM messages WHERE id = ?1", MESSAGE_COLUMNS);
-            let mut rows = conn.query(&sql, params![id.as_str()]).await?;
-            rows.next()
-                .await?
-                .map(|row| message_from_row(&row))
-                .transpose()
-        })
+        Box::pin(async move { load_message_conn(conn, &id).await })
     })
     .await
+}
+
+/// [`get_message_by_id_async`] inside a caller's transaction.
+pub(crate) async fn load_message_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<Option<Message>> {
+    let sql = format!("SELECT {} FROM messages WHERE id = ?1", MESSAGE_COLUMNS);
+    let rows = conn.query(&sql, params![id]).await?;
+    Ok(collect_messages(conn, rows).await?.into_iter().next())
 }
 
 async fn load_message_by_id(
     conn: &cairn_db::storage::TrackedConnection,
     id: &str,
 ) -> DbResult<Message> {
-    let sql = format!("SELECT {} FROM messages WHERE id = ?1", MESSAGE_COLUMNS);
-    let mut rows = conn.query(&sql, params![id]).await?;
-
-    rows.next()
+    load_message_conn(conn, id)
         .await?
-        .map(|row| message_from_row(&row))
-        .transpose()?
         .ok_or_else(|| DbError::Row(format!("inserted message not found: {}", id)))
 }
 
@@ -112,204 +140,71 @@ async fn cursor_position(
         .transpose()
 }
 
-async fn collect_messages(rows: &mut cairn_db::turso::Rows) -> DbResult<Vec<Message>> {
+/// Drain a result set into messages, then fill the directs' recipients.
+async fn collect_messages(
+    conn: &cairn_db::storage::TrackedConnection,
+    mut rows: crate::storage::TrackedRows,
+) -> DbResult<Vec<Message>> {
     let mut messages = Vec::new();
     while let Some(row) = rows.next().await? {
         messages.push(message_from_row(&row)?);
     }
-    Ok(messages)
+    drop(rows);
+    with_recipients(conn, messages).await
 }
 
-/// Insert a new message. Returns the created Message.
+/// Insert a channel message (project, issue or thread). Returns the created
+/// Message. A direct message has recipients and is written by
+/// [`insert_direct_message`].
 pub fn insert_message(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
     sender_run_id: Option<&str>,
     sender_name: &str,
-    recipient_run_id: Option<&str>,
     content: &str,
-) -> Result<Message, String> {
-    insert_message_with_urgency(
-        db,
-        channel_type,
-        channel_id,
-        sender_run_id,
-        sender_name,
-        recipient_run_id,
-        content,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn insert_message_with_urgency(
-    db: &LocalDb,
-    channel_type: &ChannelType,
-    channel_id: Option<&str>,
-    sender_run_id: Option<&str>,
-    sender_name: &str,
-    recipient_run_id: Option<&str>,
-    content: &str,
-    urgency: Option<DeliveryUrgency>,
-) -> Result<Message, String> {
-    insert_message_with_urgency_and_id(
-        db,
-        channel_type,
-        channel_id,
-        sender_run_id,
-        sender_name,
-        recipient_run_id,
-        content,
-        urgency,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn insert_message_with_urgency_and_id(
-    db: &LocalDb,
-    channel_type: &ChannelType,
-    channel_id: Option<&str>,
-    sender_run_id: Option<&str>,
-    sender_name: &str,
-    recipient_run_id: Option<&str>,
-    content: &str,
-    urgency: Option<DeliveryUrgency>,
-    stable_id: Option<&str>,
 ) -> Result<Message, String> {
     let channel_type = channel_type.clone();
     let channel_id = channel_id.map(str::to_string);
     let sender_run_id = sender_run_id.map(str::to_string);
     let sender_name = sender_name.to_string();
-    let recipient_run_id = recipient_run_id.map(str::to_string);
     let content = content.to_string();
-    let stable_id = stable_id.map(str::to_string);
 
     run_db_blocking(move || async move {
-        insert_message_async_with_id(
+        insert_message_at_async(
             db,
             &channel_type,
             channel_id.as_deref(),
             sender_run_id.as_deref(),
             &sender_name,
-            recipient_run_id.as_deref(),
             &content,
-            urgency,
-            stable_id.as_deref(),
+            chrono::Utc::now().timestamp(),
         )
         .await
     })
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn insert_message_async(
-    db: &LocalDb,
-    channel_type: &ChannelType,
-    channel_id: Option<&str>,
-    sender_run_id: Option<&str>,
-    sender_name: &str,
-    recipient_run_id: Option<&str>,
-    content: &str,
-    urgency: Option<DeliveryUrgency>,
-) -> Result<Message, String> {
-    insert_message_async_with_id(
-        db,
-        channel_type,
-        channel_id,
-        sender_run_id,
-        sender_name,
-        recipient_run_id,
-        content,
-        urgency,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_message_async_with_id(
-    db: &LocalDb,
-    channel_type: &ChannelType,
-    channel_id: Option<&str>,
-    sender_run_id: Option<&str>,
-    sender_name: &str,
-    recipient_run_id: Option<&str>,
-    content: &str,
-    urgency: Option<DeliveryUrgency>,
-    stable_id: Option<&str>,
-) -> Result<Message, String> {
-    let now = chrono::Utc::now().timestamp();
-    insert_message_at_async_with_id(
-        db,
-        channel_type,
-        channel_id,
-        sender_run_id,
-        sender_name,
-        recipient_run_id,
-        content,
-        urgency,
-        now,
-        stable_id,
-    )
-    .await
-}
-
-/// Insert a message with an explicit `created_at`. Most callers use
-/// [`insert_message_async`] (which stamps `now`); the external-reply path passes
-/// the issue's strictly-monotonic `updated_at` so the row's own timestamp is the
-/// `cairn watch` catch-up cursor.
-#[allow(clippy::too_many_arguments)]
+/// Insert a channel message with an explicit `created_at`. The external-reply
+/// path passes the issue's strictly-monotonic `updated_at` so the row's own
+/// timestamp is the `cairn watch` catch-up cursor.
 async fn insert_message_at_async(
     db: &LocalDb,
     channel_type: &ChannelType,
     channel_id: Option<&str>,
     sender_run_id: Option<&str>,
     sender_name: &str,
-    recipient_run_id: Option<&str>,
     content: &str,
-    urgency: Option<DeliveryUrgency>,
     created_at: i64,
 ) -> Result<Message, String> {
-    insert_message_at_async_with_id(
-        db,
-        channel_type,
-        channel_id,
-        sender_run_id,
-        sender_name,
-        recipient_run_id,
-        content,
-        urgency,
-        created_at,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_message_at_async_with_id(
-    db: &LocalDb,
-    channel_type: &ChannelType,
-    channel_id: Option<&str>,
-    sender_run_id: Option<&str>,
-    sender_name: &str,
-    recipient_run_id: Option<&str>,
-    content: &str,
-    urgency: Option<DeliveryUrgency>,
-    created_at: i64,
-    stable_id: Option<&str>,
-) -> Result<Message, String> {
-    let id = stable_id
-        .map(str::to_string)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if *channel_type == ChannelType::Direct {
+        return Err("Failed to insert message: a direct message is written with its recipients by insert_direct_message".to_string());
+    }
+    let id = Uuid::new_v4().to_string();
     let channel_type = channel_type.to_string();
     let channel_id = channel_id.map(str::to_string);
     let sender_run_id = sender_run_id.map(str::to_string);
     let sender_name = sender_name.to_string();
-    let recipient_run_id = recipient_run_id.map(str::to_string);
     let content = content.to_string();
-    let urgency = urgency.map(|u| u.as_str().to_string());
 
     db.write(|conn| {
         let id = id.clone();
@@ -317,44 +212,41 @@ async fn insert_message_at_async_with_id(
         let channel_id = channel_id.clone();
         let sender_run_id = sender_run_id.clone();
         let sender_name = sender_name.clone();
-        let recipient_run_id = recipient_run_id.clone();
         let content = content.clone();
-        let urgency = urgency.clone();
         Box::pin(async move {
             conn.execute(
-                "INSERT OR IGNORE INTO messages (
+                "INSERT INTO messages (
                     id, channel_type, channel_id, sender_run_id, sender_name,
-                    recipient_run_id, content, created_at, urgency
+                    content, created_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id.as_str(),
                     channel_type.as_str(),
                     channel_id.as_deref(),
                     sender_run_id.as_deref(),
                     sender_name.as_str(),
-                    recipient_run_id.as_deref(),
                     content.as_str(),
-                    created_at,
-                    urgency.as_deref()
+                    created_at
                 ],
             )
             .await?;
+            load_message_by_id(conn, &id).await
+        })
+    })
+    .await
+    .map_err(|error| db_error("Failed to insert message", error))
+}
 
-            let message = load_message_by_id(conn, &id).await?;
-            if message.channel_type.to_string() != channel_type
-                || message.channel_id != channel_id
-                || message.sender_run_id != sender_run_id
-                || message.sender_name != sender_name
-                || message.recipient_run_id != recipient_run_id
-                || message.content != content
-                || message.urgency.as_ref().map(|value| value.as_str()) != urgency.as_deref()
-            {
-                return Err(DbError::Row(format!(
-                    "message identity {id} already exists with different content"
-                )));
-            }
-            Ok(message)
+/// Write one direct message and its recipient rows in their own transaction,
+/// and return it as stored. A stable id that already holds a different message
+/// is refused; one that holds the same message returns it unchanged.
+pub async fn insert_direct_message(db: &LocalDb, direct: NewDirect) -> Result<Message, String> {
+    db.write(|conn| {
+        let direct = direct.clone();
+        Box::pin(async move {
+            insert_direct_message_conn(conn, &direct, OnExisting::Verify).await?;
+            load_message_by_id(conn, &direct.id).await
         })
     })
     .await
@@ -382,9 +274,7 @@ pub async fn insert_external_reply(
         Some(channel_id),
         Some(sender_run_id),
         sender_name,
-        None,
         content,
-        None,
         created_at,
     )
     .await
@@ -475,7 +365,7 @@ async fn query_channel_async(
                 None => None,
             };
 
-            let mut rows = conn
+            let rows = conn
                 .query(
                     &channel_page_sql(),
                     params![
@@ -491,7 +381,7 @@ async fn query_channel_async(
                 )
                 .await?;
 
-            collect_messages(&mut rows).await
+            collect_messages(conn, rows).await
         })
     })
     .await
@@ -530,9 +420,9 @@ async fn query_for_issue_async(
                      LIMIT 200",
                 MESSAGE_COLUMNS
             );
-            let mut rows = conn.query(&sql, params![issue_key.as_str(), since]).await?;
+            let rows = conn.query(&sql, params![issue_key.as_str(), since]).await?;
 
-            collect_messages(&mut rows).await
+            collect_messages(conn, rows).await
         })
     })
     .await
@@ -540,12 +430,12 @@ async fn query_for_issue_async(
 }
 
 /// Query the direct-message stream for a node/task job: every direct message
-/// where this job is the sender or the recipient, across all of its runs.
+/// this job was sent (as any of its recipients) or sent from any of its runs.
 ///
-/// Direct messages are keyed by `recipient_run_id` (and `sender_run_id`), so a
-/// job's full DM history is the union of directs touching any run owned by the
-/// job: a thread session's messages survive every run it crashes or rotates out
-/// of. Returned in chronological order, oldest first.
+/// The received side is keyed by the recipient job in `message_recipients`;
+/// the sent side by `sender_run_id`, so a thread session's messages survive
+/// every run it crashes or rotates out of. Returned in chronological order,
+/// oldest first.
 ///
 /// Without `since` the window is the newest `limit` messages, because a
 /// long-lived recipient's history outgrows any page and an oldest-first window
@@ -588,7 +478,9 @@ async fn query_directs_for_job_async(
                         params![job_id.as_str(), since, limit],
                     )
                     .await?;
-                messages.extend(collect_messages(&mut rows).await?);
+                while let Some(row) = rows.next().await? {
+                    messages.push(message_from_row(&row)?);
+                }
             }
             messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
             messages.dedup_by(|a, b| a.id == b.id);
@@ -598,7 +490,7 @@ async fn query_directs_for_job_async(
             } else {
                 messages.truncate(window);
             }
-            Ok(messages)
+            with_recipients(conn, messages).await
         })
     })
     .await
@@ -614,28 +506,40 @@ enum DirectSide {
 }
 
 /// One side of a job's direct stream, the `?3` newest (or, reading forward from
-/// `?2`, oldest). The read starts from the job's runs and seeks each run's
-/// directs in the side's run-id index; naming the index is what puts `runs`
-/// first, since left to itself Turso walks every direct in the workspace
-/// through `idx_messages_channel_created`. Both indexes are partial on the run
-/// id being set, which the statement restates so the index qualifies. The
-/// ordering sorts only the job's own directs.
+/// `?2`, oldest).
+///
+/// Received: the job's recipient rows in `idx_message_recipients_job`, which
+/// holds them in `(created_at, message_id)` order, so the read walks the job's
+/// own rows in order and stops at the limit, then fetches each message by its
+/// key.
+///
+/// Sent: from the job's runs into `idx_messages_sender`; naming the index is
+/// what puts `runs` first, since left to itself Turso walks every direct in the
+/// workspace through `idx_messages_channel_created`. The index is partial on
+/// the run id being set, which the statement restates so the index qualifies.
+/// The ordering sorts only the job's own sent directs.
 fn directs_for_job_sql(side: DirectSide, newest_first: bool) -> String {
-    let (column, index) = match side {
-        DirectSide::Received => ("recipient_run_id", "idx_messages_recipient"),
-        DirectSide::Sent => ("sender_run_id", "idx_messages_sender"),
-    };
     let order = if newest_first { "DESC" } else { "ASC" };
     let columns = qualified_message_columns("m");
-    format!(
-        "SELECT {columns} FROM runs r
-           JOIN messages m INDEXED BY {index} ON m.{column} = r.id
-          WHERE r.job_id = ?1 AND m.{column} IS NOT NULL
-            AND m.channel_type = 'direct'
-            AND (?2 IS NULL OR m.created_at >= ?2)
-          ORDER BY m.created_at {order}, m.id {order}
-          LIMIT ?3"
-    )
+    match side {
+        DirectSide::Received => format!(
+            "SELECT {columns} FROM message_recipients rr INDEXED BY idx_message_recipients_job
+               JOIN messages m ON m.id = rr.message_id
+              WHERE rr.recipient_job_id = ?1
+                AND (?2 IS NULL OR rr.created_at >= ?2)
+              ORDER BY rr.created_at {order}, rr.message_id {order}
+              LIMIT ?3"
+        ),
+        DirectSide::Sent => format!(
+            "SELECT {columns} FROM runs r
+               JOIN messages m INDEXED BY idx_messages_sender ON m.sender_run_id = r.id
+              WHERE r.job_id = ?1 AND m.sender_run_id IS NOT NULL
+                AND m.channel_type = 'direct'
+                AND (?2 IS NULL OR m.created_at >= ?2)
+              ORDER BY m.created_at {order}, m.id {order}
+              LIMIT ?3"
+        ),
+    }
 }
 
 /// [`MESSAGE_COLUMNS`] qualified by a table alias, for a read that joins.
@@ -685,9 +589,9 @@ mod tests {
                 conn.execute(
                     "INSERT INTO messages (
                         id, channel_type, channel_id, sender_run_id, sender_name,
-                        recipient_run_id, content, created_at
+                        content, created_at
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         id.as_str(),
                         channel_type.as_str(),
@@ -710,15 +614,14 @@ mod tests {
     async fn test_insert_and_query_channel() {
         let db = migrated_db().await;
 
-        let msg = insert_message_async(
+        let msg = insert_message_at_async(
             &db,
             &ChannelType::Project,
             Some("proj-1"),
             Some("run-1"),
             "builder-1",
-            None,
             "taking src/api/",
-            None,
+            1,
         )
         .await
         .unwrap();
@@ -809,15 +712,14 @@ mod tests {
         let db = migrated_db().await;
 
         // System messages now carry the run_id of the agent they describe
-        let msg = insert_message_async(
+        let msg = insert_message_at_async(
             &db,
             &ChannelType::Issue,
             Some("CRN/1"),
             Some("run-1"), // run_id of the agent this event is about
             "system",
-            None,
             "builder-1 started",
-            None,
+            1,
         )
         .await
         .unwrap();
@@ -826,25 +728,86 @@ mod tests {
         assert_eq!(msg.sender_name, "system");
     }
 
+    fn direct(id: &str, recipients: &[(&str, &str)]) -> NewDirect {
+        NewDirect {
+            id: id.to_string(),
+            sender_run_id: Some("run-1".to_string()),
+            sender_name: "builder-1".to_string(),
+            content: "ready for handoff".to_string(),
+            urgency: Some(DeliveryUrgency::Steer),
+            created_at: 7,
+            recipients: recipients
+                .iter()
+                .map(|(job, run)| cairn_attention::direct::NewRecipient {
+                    job_id: job.to_string(),
+                    run_id_at_send: Some(run.to_string()),
+                    wake: Some(crate::orchestrator::attention_push::Wake::Wake),
+                })
+                .collect(),
+        }
+    }
+
+    /// A direct is one message row and one recipient row per addressee, in the
+    /// order named, and it loads back with them.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_direct_message() {
+    async fn a_direct_is_stored_once_with_its_recipients_in_order() {
         let db = migrated_db().await;
 
-        let msg = insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("run-1"),
-            "builder-1",
-            Some("run-2"),
-            "ready for handoff",
-            None,
-        )
-        .await
-        .unwrap();
+        let msg = insert_direct_message(&db, direct("d1", &[("j2", "run-2"), ("j3", "run-3")]))
+            .await
+            .unwrap();
 
         assert!(matches!(msg.channel_type, ChannelType::Direct));
-        assert_eq!(msg.recipient_run_id.as_deref(), Some("run-2"));
+        let jobs: Vec<_> = msg
+            .recipients
+            .iter()
+            .map(|recipient| {
+                (
+                    recipient.job_id.as_deref(),
+                    recipient.run_id_at_send.as_deref(),
+                    recipient.wake,
+                )
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            [
+                (
+                    Some("j2"),
+                    Some("run-2"),
+                    Some(crate::orchestrator::attention_push::Wake::Wake)
+                ),
+                (
+                    Some("j3"),
+                    Some("run-3"),
+                    Some(crate::orchestrator::attention_push::Wake::Wake)
+                ),
+            ]
+        );
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The same stable id with the same message is the message already
+        // stored; with other recipients it is refused.
+        let again = insert_direct_message(&db, direct("d1", &[("j2", "run-2"), ("j3", "run-3")]))
+            .await
+            .unwrap();
+        assert_eq!(again.recipients.len(), 2);
+        let error = insert_direct_message(&db, direct("d1", &[("j2", "run-2")]))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("already exists with different content"),
+            "{error}"
+        );
+
+        let refused = insert_message(&db, &ChannelType::Direct, None, None, "x", "no recipients")
+            .unwrap_err();
+        assert!(refused.contains("insert_direct_message"), "{refused}");
     }
 
     /// Messages written in the same second page in the order they were written,
@@ -877,9 +840,10 @@ mod tests {
         assert_eq!(page(Some("c")).await, ["second", "third"]);
     }
 
-    /// A job's direct stream is what any of its runs received or sent, each
+    /// A job's direct stream is what it was sent or any of its runs sent, each
     /// message once even when it went between two of the job's own runs, and
-    /// nothing of another job's.
+    /// nothing of another job's. A message to several recipients is in each
+    /// recipient's stream.
     #[tokio::test(flavor = "current_thread")]
     async fn a_jobs_directs_merge_both_sides_once() {
         let db = migrated_db().await;
@@ -889,13 +853,19 @@ mod tests {
              INSERT INTO jobs(id,project_id,status,created_at,updated_at) VALUES('j','p','running',1,1),('other','p','running',1,1);
              INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at)
                VALUES('r1','j','p','crashed',1,1),('r2','j','p','live',2,2),('o1','other','p','live',1,1);
-             INSERT INTO messages(id,channel_type,sender_run_id,sender_name,recipient_run_id,content,created_at) VALUES
-               ('m1','direct','o1','peer','r1','received',100),
-               ('m2','direct','r2','me','o1','sent',101),
-               ('m3','direct','r1','me','r2','to myself',102),
-               ('m4','direct','o1','peer','o1','not mine',103),
-               ('m5','direct',NULL,'system','r2','nudge',104),
-               ('m6','issue','r1','me',NULL,'not a direct',105);",
+             INSERT INTO messages(id,channel_type,sender_run_id,sender_name,content,created_at) VALUES
+               ('m1','direct','o1','peer','received',100),
+               ('m2','direct','r2','me','sent',101),
+               ('m3','direct','r1','me','to myself',102),
+               ('m4','direct','o1','peer','not mine',103),
+               ('m5','direct',NULL,'system','nudge',104),
+               ('m6','issue','r1','me','not a direct',105);
+             INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at) VALUES
+               ('m1',0,'other','o1',100),('m1',1,'j','r1',100),
+               ('m2',0,'other','o1',101),
+               ('m3',0,'j','r2',102),
+               ('m4',0,'other','o1',103),
+               ('m5',0,'j','r2',104);",
         )
         .await
         .unwrap();
@@ -909,6 +879,11 @@ mod tests {
         let newest = query_directs_for_job_async(&db, "j", None, None)
             .await
             .unwrap();
+        assert_eq!(
+            newest[0].recipients.len(),
+            2,
+            "a cc'd message carries every recipient"
+        );
         assert_eq!(contents(newest), ["received", "sent", "to myself", "nudge"]);
 
         let newest_two = query_directs_for_job_async(&db, "j", None, Some(2))
@@ -943,23 +918,45 @@ mod tests {
         assert!(!plan.contains("SCAN messages"), "{plan}");
     }
 
-    /// Each side of a job's direct stream starts from the job's runs and seeks
-    /// each run's directs by run id. Driven from `messages` instead, it reads
-    /// every direct in the workspace (~98k on the 11-02 production clone).
+    /// The received side walks the job's own recipient rows in index order and
+    /// fetches each message by key, with no sorter, so the limit bounds the
+    /// walk. Driven from `messages` instead, it reads every direct in the
+    /// workspace (~98k on the 11-02 production clone).
     #[tokio::test(flavor = "current_thread")]
-    async fn a_jobs_directs_seek_each_of_its_runs() {
+    async fn a_jobs_received_directs_walk_its_recipient_rows_in_order() {
         use cairn_db::turso::Value;
         let db = migrated_db().await;
-        for (side, seek) in [
-            (
-                DirectSide::Received,
-                "SEARCH m USING INDEX idx_messages_recipient (recipient_run_id=?)",
-            ),
-            (
-                DirectSide::Sent,
-                "SEARCH m USING INDEX idx_messages_sender (sender_run_id=?)",
-            ),
-        ] {
+        for newest_first in [true, false] {
+            let binds = vec![Value::Text("j".into()), Value::Null, Value::Integer(50)];
+            let plan = crate::storage::query_plan(
+                &db,
+                &directs_for_job_sql(DirectSide::Received, newest_first),
+                binds,
+            )
+            .await;
+            let recipients_first = plan
+                .find("idx_message_recipients_job (recipient_job_id=?)")
+                .unwrap_or_else(|| panic!("the job's recipient rows drive the read:\n{plan}"));
+            let then_message = plan
+                .find("SEARCH m USING INDEX sqlite_autoindex_messages_1 (id=?)")
+                .or_else(|| plan.find("SEARCH m USING PRIMARY KEY"))
+                .unwrap_or_else(|| panic!("each row fetches its message by key:\n{plan}"));
+            assert!(recipients_first < then_message, "{plan}");
+            assert!(!plan.contains("SORTER"), "{plan}");
+            assert!(!plan.contains("idx_messages_channel_created"), "{plan}");
+        }
+    }
+
+    /// The sent side starts from the job's runs and seeks each run's directs
+    /// by sender run id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_jobs_sent_directs_seek_each_of_its_runs() {
+        use cairn_db::turso::Value;
+        let db = migrated_db().await;
+        for (side, seek) in [(
+            DirectSide::Sent,
+            "SEARCH m USING INDEX idx_messages_sender (sender_run_id=?)",
+        )] {
             for newest_first in [true, false] {
                 let binds = vec![Value::Text("j".into()), Value::Null, Value::Integer(50)];
                 let plan = crate::storage::query_plan(

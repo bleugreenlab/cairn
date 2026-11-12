@@ -76,6 +76,79 @@ impl std::str::FromStr for ChannelType {
     }
 }
 
+/// Wake level: where an attention push sits on the wake axis. Ordered by
+/// loudness, so merging two routes to one recipient keeps the louder with `max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wake {
+    /// Never wakes an idle agent. On an active agent it still rides along at
+    /// its boundary like any other push — wake level governs idle-waking, not
+    /// whether a running agent sees the push.
+    Passive,
+    /// Wakes an idle agent; on an active agent lands at its boundary.
+    Wake,
+    /// Breaks the running turn now.
+    Interrupt,
+}
+
+impl Wake {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Wake::Passive => "passive",
+            Wake::Wake => "wake",
+            Wake::Interrupt => "interrupt",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "passive" => Some(Wake::Passive),
+            "wake" => Some(Wake::Wake),
+            "interrupt" => Some(Wake::Interrupt),
+            _ => None,
+        }
+    }
+
+    /// Whether this wake level wakes an *idle* agent — so a push creator should
+    /// nudge the recipient. `Passive` rides along on the next run and never
+    /// wakes; `Wake` and `Interrupt` do. A muted source downgraded to `Passive`
+    /// reports `false` here, which is how a creator skips nudging a muted
+    /// recipient.
+    pub fn wakes_idle(self) -> bool {
+        matches!(self, Wake::Wake | Wake::Interrupt)
+    }
+}
+
+/// One addressee of a direct message, in the order the sender named them
+/// (the append target first, then each `cc` entry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRecipient {
+    /// The addressed session, node or task job. `None` only for history whose
+    /// run row was gone when recipients moved off `messages`.
+    pub job_id: Option<String>,
+    /// The recipient's canonical home URI, derived from `job_id` when the
+    /// message is loaded. `None` when the job has no canonical address.
+    pub address: Option<String>,
+    /// The recipient's latest run when the message was sent: provenance only.
+    pub run_id_at_send: Option<String>,
+    /// What this recipient's own mute made of the sender's urgency. `None` for
+    /// history written before it was recorded.
+    pub wake: Option<Wake>,
+}
+
+impl MessageRecipient {
+    /// How this recipient is named to a reader: its address, else the run it
+    /// was sent to.
+    pub fn label(&self) -> String {
+        match (&self.address, &self.run_id_at_send) {
+            (Some(address), _) => address.clone(),
+            (None, Some(run)) => format!("run {run} (no longer resolvable)"),
+            (None, None) => "an unknown recipient".to_string(),
+        }
+    }
+}
+
 /// A message in the agent chatroom.
 ///
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +159,10 @@ pub struct Message {
     pub channel_id: Option<String>,
     pub sender_run_id: Option<String>,
     pub sender_name: String,
-    pub recipient_run_id: Option<String>,
+    /// A direct message's addressees in position order; empty for a channel
+    /// message.
+    #[serde(default)]
+    pub recipients: Vec<MessageRecipient>,
     pub content: String,
     pub created_at: i64,
     pub urgency: Option<DeliveryUrgency>,

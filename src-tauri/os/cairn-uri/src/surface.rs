@@ -363,6 +363,7 @@ impl CairnResource {
             | Self::ProjectEventEndpoints { .. }
             | Self::ProjectEventEndpoint { .. }
             | Self::ProjectEventDelivery { .. }
+            | Self::ProjectMessage { .. }
             | Self::ProjectResponses { .. }
             | Self::ProjectResponse { .. }
             | Self::ProjectResponseHistory { .. }

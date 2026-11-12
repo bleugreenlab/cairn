@@ -607,7 +607,7 @@ mod tests {
     use serde_json::json;
 
     const PLAN_URI: &str = "cairn://p/prj/2/1/planner/plan";
-    const WAKES: &str = "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'run-coord'";
+    const WAKES: &str = "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')";
     const PUSHES: &str = "SELECT COUNT(*) FROM attention_pushes WHERE key LIKE 'ask-condition:%'";
 
     /// A planner on issue 2 (a child of issue 9, whose coordinator approves it)
@@ -647,7 +647,7 @@ mod tests {
     async fn wake_messages(env: &Env) -> Vec<String> {
         env.db
             .query_all(
-                "SELECT content FROM messages WHERE recipient_run_id = 'run-coord'",
+                "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')",
                 (),
                 |row| row.text(0),
             )

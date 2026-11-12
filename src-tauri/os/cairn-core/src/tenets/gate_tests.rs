@@ -158,7 +158,7 @@ async fn answer(env: &Env, number: i64, verdict: Verdict, comment: Option<&str>)
 async fn thread_messages(env: &Env) -> Vec<String> {
     texts(
         env,
-        "SELECT content FROM messages WHERE recipient_run_id = 'run-thread' ORDER BY created_at, id",
+        "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-thread') ORDER BY created_at, id",
     )
     .await
 }
@@ -609,7 +609,7 @@ async fn no_forecloses_and_wakes_the_proposer_not_the_filer() {
     assert_eq!(
         count(
             &env,
-            "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'run-coord'"
+            "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')"
         )
         .await,
         0,

@@ -299,11 +299,14 @@ const REVIEW_READINESS_BEFORE_4714: &str = "SELECT j.id FROM jobs j WHERE j.issu
 /// The probe's first arm after #4714, naming the index 0335 added for it.
 const REVIEW_READINESS_AFTER_4714: &str = "SELECT 1 FROM artifacts a INDEXED BY idx_artifacts_job_review WHERE a.job_id = ?1 AND (a.artifact_type = 'create-pr' OR (a.artifact_type = 'plan' AND a.confirmed = 0))";
 
-/// A job's direct messages before #4726 (cairn/5930).
-const JOB_DIRECTS_BEFORE_4726: &str = "SELECT id FROM messages WHERE channel_type = 'direct' AND (recipient_run_id IN (SELECT id FROM runs WHERE job_id = ?1) OR sender_run_id IN (SELECT id FROM runs WHERE job_id = ?1))";
+/// A job's direct messages before #4726 (cairn/5930), its received side
+/// restated through `message_recipients` once recipients moved there
+/// (cairn/5537): driven from `messages`, it still walks every direct.
+const JOB_DIRECTS_BEFORE_4726: &str = "SELECT id FROM messages WHERE channel_type = 'direct' AND (id IN (SELECT message_id FROM message_recipients WHERE recipient_job_id = ?1) OR sender_run_id IN (SELECT id FROM runs WHERE job_id = ?1))";
 
-/// One side of it after #4726: from the job's runs into the recipient index.
-const JOB_DIRECTS_AFTER_4726: &str = "SELECT m.id FROM runs r JOIN messages m INDEXED BY idx_messages_recipient ON m.recipient_run_id = r.id WHERE r.job_id = ?1 AND m.channel_type = 'direct' AND m.recipient_run_id IS NOT NULL";
+/// The received side as it reads now: the job's own recipient rows, in
+/// index order, into each message by key.
+const JOB_DIRECTS_AFTER_4726: &str = "SELECT m.id FROM message_recipients rr INDEXED BY idx_message_recipients_job JOIN messages m ON m.id = rr.message_id WHERE rr.recipient_job_id = ?1";
 
 /// The semantic lane's turn-excerpt load before #4729 (cairn/5618), with the
 /// long turn list that tips the planner onto the type index.

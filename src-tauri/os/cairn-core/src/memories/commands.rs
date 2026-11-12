@@ -278,23 +278,21 @@ fn memory_review_turn_count_for_job(
     })
 }
 
-/// The newest Memory Review direct any of a job's runs received. The read starts
-/// from the job's runs and seeks each run's directs in `idx_messages_recipient`
-/// (restating its partial clause so it qualifies); naming the index is what puts
-/// `runs` first, since left to itself Turso walks every direct in the workspace
-/// through `idx_messages_channel_created`.
+/// The newest Memory Review direct a job received. The read walks the job's
+/// recipient rows newest first in `idx_message_recipients_job`, fetching each
+/// message by key, and stops at the first that matches. `CROSS JOIN` holds that
+/// order: only directs have recipient rows, and a `channel_type` term would
+/// draw Turso onto a `messages` index that walks every direct in the workspace.
 const LATEST_MEMORY_REVIEW_DIRECT_SQL: &str = "SELECT m.id
-     FROM runs r
-     JOIN messages m INDEXED BY idx_messages_recipient ON m.recipient_run_id = r.id
-     WHERE r.job_id = ?1
-       AND m.recipient_run_id IS NOT NULL
-       AND m.channel_type = 'direct'
+     FROM message_recipients rr INDEXED BY idx_message_recipients_job
+     CROSS JOIN messages m ON m.id = rr.message_id
+     WHERE rr.recipient_job_id = ?1
        AND m.sender_name = 'system'
        AND (
            m.content LIKE 'Before you finish, review the memories%'
            OR m.content LIKE 'Before you finish, take a moment to reflect:%'
        )
-     ORDER BY m.created_at DESC
+     ORDER BY rr.created_at DESC, rr.message_id DESC
      LIMIT 1";
 
 fn latest_memory_review_direct_message_id(
@@ -701,10 +699,11 @@ fn job_has_artifacts_or_review_state(db: Arc<LocalDb>, job_id: &str) -> Result<b
 mod tests {
     use super::send_memory_review_on_idle;
 
-    /// The Memory Review lookup seeks the job's runs and then each run's
-    /// directs; driven from `messages` it reads every direct in the workspace.
+    /// The Memory Review lookup seeks the job's recipient rows in index order
+    /// and fetches each message by key; driven from `messages` it reads every
+    /// direct in the workspace.
     #[tokio::test]
-    async fn the_memory_review_lookup_seeks_the_jobs_runs() {
+    async fn the_memory_review_lookup_seeks_the_jobs_recipient_rows() {
         let db = crate::storage::migrated_test_db("memory-review-plan.db").await;
         let plan = crate::storage::query_plan(
             &db,
@@ -712,14 +711,16 @@ mod tests {
             vec![cairn_db::turso::Value::Text("j".into())],
         )
         .await;
-        let runs_first = plan
-            .find("SEARCH r USING INDEX idx_runs_job_id (job_id=?)")
-            .unwrap_or_else(|| panic!("the job's runs drive the read:\n{plan}"));
+        let recipients_first = plan
+            .find("idx_message_recipients_job (recipient_job_id=?)")
+            .unwrap_or_else(|| panic!("the job's recipient rows drive the read:\n{plan}"));
         let then_messages = plan
-            .find("SEARCH m USING INDEX idx_messages_recipient (recipient_run_id=?)")
-            .unwrap_or_else(|| panic!("each run seeks its own directs:\n{plan}"));
-        assert!(runs_first < then_messages, "{plan}");
-        assert!(!plan.contains("idx_messages_channel_created"), "{plan}");
+            .find("SEARCH m USING INDEX sqlite_autoindex_messages_1 (id=?)")
+            .or_else(|| plan.find("SEARCH m USING PRIMARY KEY"))
+            .unwrap_or_else(|| panic!("each row fetches its message by key:\n{plan}"));
+        assert!(recipients_first < then_messages, "{plan}");
+        assert!(!plan.contains("SORTER"), "{plan}");
+        assert!(!plan.contains("idx_messages_channel"), "{plan}");
     }
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
@@ -1018,7 +1019,7 @@ mod tests {
             .db
             .local
             .query_opt(
-                "SELECT content FROM messages WHERE recipient_run_id = ?1 LIMIT 1",
+                "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) LIMIT 1",
                 params![run_id],
                 |row| row.text(0),
             )

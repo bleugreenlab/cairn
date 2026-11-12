@@ -524,8 +524,9 @@ async fn directs(h: &Harness) -> Vec<(String, String, String)> {
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT recipient_run_id, urgency, content FROM messages
-                      WHERE channel_type = 'direct' ORDER BY created_at, rowid",
+                    "SELECT mr.recipient_run_id, m.urgency, m.content FROM messages m
+                       JOIN message_recipients mr ON mr.message_id = m.id
+                      WHERE m.channel_type = 'direct' ORDER BY m.created_at, m.rowid, mr.position",
                     (),
                 )
                 .await?;

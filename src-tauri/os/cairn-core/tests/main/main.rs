@@ -75,6 +75,7 @@ mod mcp_run_cas_acceptance;
 mod mcp_run_execution;
 mod mcp_skill_resources;
 mod memories;
+mod multi_recipient_messages;
 mod node_scratch_acceptance;
 mod pr_actions;
 mod project_prs;

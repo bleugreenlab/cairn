@@ -1864,7 +1864,7 @@ pub(crate) mod tests {
         let messages = env
             .db
             .query_all(
-                "SELECT content FROM messages WHERE recipient_run_id = 'run-coord'",
+                "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')",
                 (),
                 |row| row.text(0),
             )
@@ -1906,7 +1906,7 @@ pub(crate) mod tests {
         sweep_at(&env.orch, now()).await.unwrap();
 
         let pushes = "SELECT COUNT(*) FROM attention_pushes WHERE key LIKE 'gate:%'";
-        let messages = "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'run-coord'";
+        let messages = "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')";
         assert_eq!(
             (count(&env, pushes).await, count(&env, messages).await),
             (1, 1)
@@ -2145,7 +2145,7 @@ pub(crate) mod tests {
         assert_eq!(
             count(
                 &env,
-                "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'run-coord'"
+                "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')"
             )
             .await,
             1
@@ -2193,7 +2193,7 @@ pub(crate) mod tests {
         let messages = env
             .db
             .query_all(
-                "SELECT content FROM messages WHERE recipient_run_id = 'run-later'",
+                "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-later')",
                 (),
                 |row| row.text(0),
             )
@@ -2820,7 +2820,7 @@ pub(crate) mod tests {
         assert_eq!(
             count(
                 &env,
-                "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'run-coord'"
+                "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-coord')"
             )
             .await,
             0

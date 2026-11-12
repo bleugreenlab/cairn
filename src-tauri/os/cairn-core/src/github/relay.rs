@@ -529,7 +529,7 @@ mod tests {
         for sql in [
             "SELECT COUNT(*) FROM fact_log WHERE source = 'github_comment'",
             "SELECT COUNT(*) FROM fact_log_wakes WHERE job_id = 'watcher'",
-            "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'watcher-run' AND content LIKE '[Event]%'",
+            "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'watcher-run') AND content LIKE '[Event]%'",
         ] {
             assert_eq!(db.query_opt_i64(sql, ()).await.unwrap(), Some(1), "{sql}");
         }

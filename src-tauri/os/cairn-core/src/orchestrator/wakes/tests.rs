@@ -764,7 +764,7 @@ async fn queueable_node_delivers_wake_without_resuming_or_spawning() {
             .db
             .local
             .query_all(
-                "SELECT sender_name, content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                "SELECT sender_name, content FROM messages WHERE channel_type='direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)",
                 params![fixture.run_id],
                 |row| Ok((row.text(0)?, row.text(1)?)),
             )
@@ -829,7 +829,7 @@ async fn queueable_node_fixture_can_drive_issue_wakes_without_tribal_setup() {
         .db
         .local
         .query_all(
-            "SELECT COUNT(*) FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+            "SELECT COUNT(*) FROM messages WHERE channel_type='direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)",
             params![fixture.run_id],
             |row| row.i64(0),
         )
@@ -961,7 +961,7 @@ async fn one_checks_settlement_is_one_message_per_watcher_however_often_routed()
         let db = orch.db.local.clone();
         async move {
             db.query_one(
-                "SELECT COUNT(*) FROM messages WHERE recipient_run_id = ?1 AND content LIKE '[Checks%'",
+                "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) AND content LIKE '[Checks%'",
                 (run.to_string(),),
                 |row| row.i64(0),
             )
@@ -1364,7 +1364,7 @@ async fn terminal_output_wake_delivers_targeted_and_consumes_one_shot() {
         .db
         .local
         .query_all(
-            "SELECT content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+            "SELECT content FROM messages WHERE channel_type='direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)",
             params![fixture.run_id],
             |row| row.text(0),
         )
@@ -2556,7 +2556,7 @@ mod rebuild {
         orch.db
             .local
             .query_all(
-                "SELECT content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                "SELECT content FROM messages WHERE channel_type='direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)",
                 params![run_id],
                 |row| row.text(0),
             )
@@ -2890,7 +2890,7 @@ mod rebuild {
         orch.db
             .local
             .query_all(
-                "SELECT content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                "SELECT content FROM messages WHERE channel_type='direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1)",
                 params![run_id],
                 |row| row.text(0),
             )
@@ -3012,7 +3012,7 @@ mod rebuild {
 
     async fn told(db: &LocalDb, run: &str) -> Vec<(String, String)> {
         db.query_all(
-            "SELECT sender_name, content FROM messages WHERE recipient_run_id = ?1 ORDER BY rowid",
+            "SELECT sender_name, content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) ORDER BY rowid",
             params![run],
             |row| Ok((row.text(0)?, row.text(1)?)),
         )

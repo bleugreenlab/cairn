@@ -17,7 +17,9 @@ use super::issue::{
 };
 use super::labels::{read_label, read_labels};
 use super::memories::{read_node_memories_collection, read_node_memory};
-use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
+use super::messages::{
+    read_issue_messages, read_node_messages, read_project_message, read_project_messages,
+};
 use super::node::{
     grep_node_chat, grep_node_chat_turn, grep_task_chat, grep_task_chat_turn,
     parse_artifact_format, ArtifactCoordinates,
@@ -3336,6 +3338,9 @@ async fn render_resource_body(
         } => read_node_rebase(orch, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::ProjectMessages { project } => {
             read_project_messages(orch, db, &project, &params).await
+        }
+        CairnResource::ProjectMessage { project, id } => {
+            read_project_message(orch, db, &project, &id, &params).await
         }
         CairnResource::IssueMessages { project, number } => {
             read_issue_messages(orch, db, &project, number, &params).await

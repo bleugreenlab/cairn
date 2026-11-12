@@ -2205,7 +2205,7 @@ mod tests {
         );
         assert_eq!(
             db.query_opt_i64(
-                "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'watcher-run' AND content LIKE '[Event] src/a/x.rs modified%'",
+                "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'watcher-run') AND content LIKE '[Event] src/a/x.rs modified%'",
                 (),
             )
             .await
@@ -2526,7 +2526,7 @@ mod tests {
         assert_eq!(woken_jobs(wakes), vec!["watcher"]);
         assert_eq!(
             db.query_opt_i64(
-                "SELECT COUNT(*) FROM messages WHERE recipient_run_id = 'other-watcher-run'",
+                "SELECT COUNT(*) FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'other-watcher-run')",
                 (),
             )
             .await
@@ -2899,7 +2899,7 @@ mod tests {
         /// The `[Event]` messages a thread's session received, oldest first.
         async fn events_received(db: &crate::storage::LocalDb, run: &str) -> Vec<String> {
             db.query_all(
-                "SELECT content FROM messages WHERE recipient_run_id = ?1 AND content LIKE '[Event]%' ORDER BY rowid",
+                "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) AND content LIKE '[Event]%' ORDER BY rowid",
                 (run.to_string(),),
                 |row| crate::storage::RowExt::text(row, 0),
             )
@@ -2909,7 +2909,7 @@ mod tests {
 
         async fn messages_to(db: &crate::storage::LocalDb, run: &str) -> Vec<String> {
             db.query_all(
-                "SELECT id FROM messages WHERE recipient_run_id = ?1 ORDER BY rowid",
+                "SELECT id FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = ?1) ORDER BY rowid",
                 (run.to_string(),),
                 |row| crate::storage::RowExt::text(row, 0),
             )

@@ -313,7 +313,7 @@ async fn null_with_drafts_but_no_artifact_does_not_send_review() {
             .db
             .local
             .query_one(
-                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND recipient_run_id = 'run-review'",
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-review')",
                 (),
                 |row| row.i64(0),
             )
@@ -398,7 +398,7 @@ async fn direct_push_count(orch: &crate::orchestrator::Orchestrator, like: &str)
                  WHERE p.recipient = 'j-review'
                    AND p.delivered_event_id IS NULL
                    AND m.channel_type = 'direct'
-                   AND m.recipient_run_id = 'run-review'
+                   AND m.id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-review')
                    AND m.content LIKE ?1",
             (like,),
             |row| row.i64(0),
@@ -453,7 +453,7 @@ async fn direct_message_count(orch: &crate::orchestrator::Orchestrator, like: &s
     orch.db
             .local
             .query_one(
-                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND recipient_run_id = 'run-review' AND content LIKE ?1",
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-review') AND content LIKE ?1",
                 (like,),
                 |row| row.i64(0),
             )
@@ -563,19 +563,25 @@ async fn idle_flush_creates_memory_review_turn_from_pending_push() {
     ));
 }
 
+/// The Memory Review direct the review job was sent, as its run received it.
+async fn seed_review_direct(db: &LocalDb) {
+    db.execute_script(
+        "INSERT INTO messages (id, channel_type, sender_name, content, created_at)
+         VALUES ('msg-review', 'direct', 'system', 'Before you finish, review the memories you captured during this job. Draft memories:', 2);
+         INSERT INTO message_recipients (message_id, position, recipient_job_id, recipient_run_id, created_at)
+         VALUES ('msg-review', 0, 'j-review', 'run-review', 2);",
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn stranded_sent_reconcile_resumes_once() {
     let db = test_db().await;
     seed_job(&db, Some("sent")).await;
     insert_artifact(&db).await;
     insert_run_session_with_turns(&db, 1).await;
-    db.execute(
-            "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at)
-             VALUES ('msg-review', 'direct', 'system', 'run-review', 'Before you finish, review the memories you captured during this job. Draft memories:', 2)",
-            (),
-        )
-        .await
-        .unwrap();
+    seed_review_direct(&db).await;
     let orch = test_orchestrator(db);
     register_warm_process(&orch);
     let first = crate::memories::commands::reconcile_stranded_memory_reviews(orch.clone()).unwrap();
@@ -593,13 +599,7 @@ async fn stranded_sent_reconcile_preserves_queued_user_followup() {
     seed_job(&db, Some("sent")).await;
     insert_artifact(&db).await;
     insert_run_session_with_turns(&db, 1).await;
-    db.execute(
-            "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at)
-             VALUES ('msg-review', 'direct', 'system', 'run-review', 'Before you finish, review the memories you captured during this job. Draft memories:', 2)",
-            (),
-        )
-        .await
-        .unwrap();
+    seed_review_direct(&db).await;
     crate::messages::queued::enqueue_async(
         &db,
         "j-review",

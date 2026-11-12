@@ -644,7 +644,8 @@ pub enum CairnResource {
     },
     /// Messages addressed to a node job (collection). The canonical messaging
     /// target for a node, symmetric with project/issue `/messages`: append
-    /// delivers a direct message to the node agent; read returns the node's
+    /// delivers a direct message to the node agent, and to every `cc`
+    /// recipient as one stored message; read returns the node's
     /// direct-message stream. The bare-node append (`Node` + append) is kept
     /// as a backward-compatible alias.
     NodeMessages {
@@ -665,7 +666,7 @@ pub enum CairnResource {
         node_id: String,
     },
     /// Messages addressed to a sub-agent task job (collection). The task
-    /// analogue of `NodeMessages`; `node_id` is the parent node.
+    /// analogue of `NodeMessages`, `cc` included; `node_id` is the parent node.
     TaskMessages {
         project: String,
         number: i32,
@@ -675,6 +676,13 @@ pub enum CairnResource {
     },
     ProjectMessages {
         project: String,
+    },
+    /// One stored message, addressed through the project whose database holds
+    /// it. A direct message sent to several recipients is one message, and this
+    /// is the address each recipient's envelope cites.
+    ProjectMessage {
+        project: String,
+        id: String,
     },
     IssueMessages {
         project: String,
@@ -1264,6 +1272,7 @@ impl CairnResource {
             Self::ProjectAttachment { .. } => ResourceKind::ProjectAttachment,
             Self::ProjectAttachments { .. } => ResourceKind::ProjectAttachments,
             Self::ProjectMessages { .. } => ResourceKind::ProjectMessages,
+            Self::ProjectMessage { .. } => ResourceKind::ProjectMessage,
             Self::ProjectTerminal { .. } => ResourceKind::ProjectTerminal,
             Self::ProjectBrowser { .. } => ResourceKind::ProjectBrowser,
             Self::ProjectBrowserNetworkRequest { .. } => ResourceKind::ProjectBrowserNetworkRequest,

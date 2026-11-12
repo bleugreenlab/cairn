@@ -384,16 +384,25 @@ async fn a_direct_message_citing_a_turn_delivers_the_quoted_words_after_the_repl
     orch.db
         .local
         .execute(
-            "INSERT INTO messages(id,channel_type,channel_id,sender_run_id,sender_name,recipient_run_id,content,created_at)
-             VALUES('m-1','direct',NULL,NULL,'cairn://p/proj/execution','run-1',?1,5)",
+            "INSERT INTO messages(id,channel_type,channel_id,sender_run_id,sender_name,content,created_at)
+             VALUES('m-1','direct',NULL,NULL,'cairn://p/proj/execution',?1,5)",
             params![format!("The operator ruled in {TURN}; plan around it.")],
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO message_recipients(message_id,position,recipient_job_id,recipient_run_id,created_at)
+             VALUES('m-1',0,'watcher','run-1',5)",
+            (),
         )
         .await
         .unwrap();
 
     let rendered = render_push_resolved(&orch, &push("direct:m-1", NODE)).await;
 
-    let reply = "To reply, use the message tool with to: \"cairn://p/proj/execution/messages\"";
+    let reply = "(Reply with write {target:\"cairn://p/proj/execution/messages\", mode:\"append\", payload:{content}}.)";
     let stamp = crate::clock::stamp(100).unwrap();
     let expected_tail = format!(
         "[Direct message from cairn://p/proj/execution] The operator ruled in {TURN}; plan around it.\n\

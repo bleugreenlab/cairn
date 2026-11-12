@@ -641,6 +641,12 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "messages"] => Some(CairnResource::ProjectMessages {
             project: canonical_project(project),
         }),
+        [PROJECT_SCOPE, project, "messages", id] if !id.is_empty() => {
+            Some(CairnResource::ProjectMessage {
+                project: canonical_project(project),
+                id: (*id).to_string(),
+            })
+        }
         // Must precede the `[PROJECT_SCOPE, project, number]` issue arm: a
         // literal `settings` segment is not a numeric issue id.
         [PROJECT_SCOPE, project, "settings"] => Some(CairnResource::ProjectSettings {

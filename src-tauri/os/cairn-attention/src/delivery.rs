@@ -1242,8 +1242,12 @@ async fn review_artifact_line(runtime: &AttentionRuntime, content_ref: &str) -> 
 /// A direct message as its recipient reads it: the header, the content and the
 /// reply hint, then the references block for the URIs the content cites, so
 /// the sender never has to paste what a cited URI holds.
-async fn direct_message_body(runtime: &AttentionRuntime, msg: &cairn_domain::Message) -> String {
-    let body = crate::message_render::render_direct_message(msg);
+async fn direct_message_body(
+    runtime: &AttentionRuntime,
+    msg: &cairn_domain::Message,
+    reader_job_id: &str,
+) -> String {
+    let body = crate::message_render::render_direct_message(msg, reader_job_id);
     let cited = cairn_common::references::without_references_block(&msg.content);
     match runtime.host.references_block(cited).await {
         Some(block) => format!("{body}\n\n{block}"),
@@ -1519,12 +1523,21 @@ where
         .filter(|msg| msg.channel_type == crate::models::ChannelType::Direct)
 }
 
+/// The message a push carries, read from the database that owns the push's
+/// recipient: a direct to a team project's agent is written to that team's
+/// replica, beside the push, not to the private database.
 async fn pushed_direct_message(
     runtime: &AttentionRuntime,
     push: &crate::push::Push,
 ) -> Option<cairn_domain::Message> {
-    direct_push_message(&runtime.private_db, push, move |message_id| async move {
-        runtime.host.message(&runtime.private_db, &message_id).await
+    let db = runtime
+        .host
+        .database_for_job(&push.recipient)
+        .await
+        .unwrap_or_else(|_| runtime.private_db.clone());
+    let db = &db;
+    direct_push_message(db, push, move |message_id| async move {
+        runtime.host.message(db, &message_id).await
     })
     .await
 }
@@ -1568,7 +1581,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
                     push.wake.as_str(),
                     label
                 );
-                let body = direct_message_body(runtime, &msg).await;
+                let body = direct_message_body(runtime, &msg, &push.recipient).await;
                 return format!("{schedule_header}\n\n{body}");
             }
         }
@@ -1664,7 +1677,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     if push.key.starts_with("direct:") {
         return match pushed_direct_message(runtime, push).await {
             Some(msg) => {
-                let body = direct_message_body(runtime, &msg).await;
+                let body = direct_message_body(runtime, &msg, &push.recipient).await;
                 format!("{header}\n\n{body}")
             }
             _ => header,
@@ -1706,7 +1719,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     // carries, not by a list of prefixes: a list missed every producer added
     // after it, and each of those reached its recipient as a pointer home.
     if let Some(msg) = pushed_direct_message(runtime, push).await {
-        let body = direct_message_body(runtime, &msg).await;
+        let body = direct_message_body(runtime, &msg, &push.recipient).await;
         return format!("{header}\n\n{body}");
     }
     pointer_update(&header, push)

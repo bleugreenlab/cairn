@@ -42,22 +42,7 @@ use uuid::Uuid;
 
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
-/// Wake level: where a push sits on the wake axis. Ordered by loudness, so
-/// merging two routes to one recipient keeps the louder with `max`.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Wake {
-    /// Never wakes an idle agent. On an active agent it still rides along at
-    /// its `boundary` like any other push — wake level governs idle-waking, not
-    /// whether a running agent sees the push.
-    Passive,
-    /// Wakes an idle agent; on an active agent lands at its `boundary`.
-    Wake,
-    /// Breaks the running turn now.
-    Interrupt,
-}
+pub use cairn_domain::Wake;
 
 const OPERATOR_MESSAGE_KEY_MARKER: &str = ":operator_message:";
 
@@ -221,34 +206,6 @@ async fn resolution_receipt_for_ask(
         })
     })
     .await
-}
-
-impl Wake {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Wake::Passive => "passive",
-            Wake::Wake => "wake",
-            Wake::Interrupt => "interrupt",
-        }
-    }
-
-    pub fn from_db(value: &str) -> Option<Self> {
-        match value {
-            "passive" => Some(Wake::Passive),
-            "wake" => Some(Wake::Wake),
-            "interrupt" => Some(Wake::Interrupt),
-            _ => None,
-        }
-    }
-
-    /// Whether this wake level wakes an *idle* agent — so a push creator should
-    /// nudge the recipient. `Passive` rides along on the next run and never
-    /// wakes; `Wake` and `Interrupt` do. A muted source downgraded to `Passive`
-    /// (see [`push_with_fingerprint`]) reports `false` here, which is how a
-    /// creator skips nudging a muted recipient.
-    pub fn wakes_idle(self) -> bool {
-        matches!(self, Wake::Wake | Wake::Interrupt)
-    }
 }
 
 /// Boundary: where a push lands on a *busy* agent.
@@ -678,7 +635,7 @@ pub(crate) async fn review_issue_eligible_conn(
 /// Insert or supersede a push using the caller's transaction. With deduplication,
 /// an identical fingerprint in pending OR delivered history is a no-op.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn push_fingerprinted_conn(
+pub async fn push_fingerprinted_conn(
     conn: &cairn_db::storage::TrackedConnection,
     recipient: &str,
     content_ref: &str,

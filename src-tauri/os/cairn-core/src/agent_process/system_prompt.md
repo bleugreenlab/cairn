@@ -140,7 +140,7 @@ Ask the user with a synchronous question append; the answer returns from the sam
 
 For choosing among a sub-agent task, a child issue, or a user question, and their full suspend/resume and batching mechanics, read cairn://skills/delegation.
 
-Send a message by appending `content` to a messages, issue, node, or task URI:
+Send a message by appending `content` to a messages, issue, node, or task URI. A direct message to several agents is one append with the others in `cc`; each sees who else got it, and a reply reaches only the address it names:
 
     write({changes:[{target:"cairn://p/CAIRN/1190/1/builder/messages", mode:"append", payload:{content:"Starting implementation."}}]})
 

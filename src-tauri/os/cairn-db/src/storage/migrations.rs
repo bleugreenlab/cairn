@@ -2535,6 +2535,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("pr_resolution_attributions", TableScope::ProjectScoped),
     ("message_stream_chunks", TableScope::ProjectScoped),
     ("message_streams", TableScope::ProjectScoped),
+    ("message_recipients", TableScope::ProjectScoped),
     ("messages", TableScope::ProjectScoped),
     ("permission_requests", TableScope::ProjectScoped),
     ("pack_catalog", TableScope::ProjectScoped),
@@ -3582,8 +3583,12 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "run_id", "turn_id", "final_event_id"],
     },
     RekeyTableManifest {
+        table: "message_recipients",
+        id_columns: &["message_id", "recipient_job_id", "recipient_run_id"],
+    },
+    RekeyTableManifest {
         table: "messages",
-        id_columns: &["id", "channel_id", "sender_run_id", "recipient_run_id"],
+        id_columns: &["id", "channel_id", "sender_run_id"],
     },
     RekeyTableManifest {
         table: "pack_catalog",
@@ -5635,6 +5640,135 @@ mod tests {
             "open",
             "the job's current session is not replaced, so the backfill leaves it alone — \
              a terminal job is not evidence its conversation is unusable"
+        );
+    }
+
+    /// cairn/5537: each addressed direct's recipient moves off `messages` into
+    /// `message_recipients`, keyed by the run's job; a direct whose run is gone
+    /// keeps its run id with no job, and one that named no run gets no row. The
+    /// column goes, and the table keeps its search triggers and other indexes.
+    #[tokio::test]
+    async fn message_recipients_backfill_moves_each_direct_s_recipient_off_messages() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("message-recipients.turso.db"))
+            .await
+            .unwrap();
+        let name = "message_recipients";
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != name)
+            .copied()
+            .collect::<Vec<_>>();
+        let migration = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == name)
+            .copied()
+            .expect("the migration is in the private lineage");
+        assert!(
+            TEAM_MIGRATIONS
+                .iter()
+                .any(|migration| migration.name() == name),
+            "messages is shared, so the team lineage carries it too"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','default','P','p','/tmp/p',1,1);
+            INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+              VALUES('j','p','running',1,1);
+            INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
+              VALUES('r','j','p','live',1,1);
+            INSERT INTO messages(id, channel_type, sender_name, recipient_run_id, content, created_at)
+              VALUES('live','direct','a','r','to a live run',10),
+                    ('orphan','direct','a','gone','to a deleted run',11),
+                    ('unaddressed','direct','a',NULL,'to nobody',12),
+                    ('channel','issue','a',NULL,'not a direct',13);
+            ",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![migration])
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(message_id || ':' || position || ':' || COALESCE(recipient_job_id, '-')
+                        || ':' || COALESCE(recipient_run_id, '-') || ':' || created_at
+                        || ':' || COALESCE(wake, '-'), ' ')
+                   FROM (SELECT * FROM message_recipients ORDER BY message_id)"
+            )
+            .await
+            .unwrap(),
+            "live:0:j:r:10:- orphan:0:-:gone:11:-",
+            "a live run maps to its job, a gone run keeps its id, and no other row is written"
+        );
+        // The primary key is what makes the backfill safe to run again.
+        db.execute(
+            "INSERT OR IGNORE INTO message_recipients
+               (message_id, position, recipient_job_id, recipient_run_id, created_at)
+             VALUES('live', 0, 'j', 'r', 10)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM message_recipients")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'messages' AND sql LIKE '%recipient_run_id%'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "the column is gone"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'messages'"
+            )
+            .await
+            .unwrap(),
+            3,
+            "the search triggers survive"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN
+                   ('idx_messages_channel', 'idx_messages_created_at', 'idx_messages_channel_created',
+                    'idx_messages_channel_seq', 'idx_messages_sender', 'idx_message_recipients_job')"
+            )
+            .await
+            .unwrap(),
+            6
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_messages_recipient'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM messages")
+                .await
+                .unwrap(),
+            4,
+            "every message survives"
         );
     }
 

@@ -37,7 +37,17 @@ pub(crate) const CHANNEL_MESSAGE_CONTENT: KeySpec = KeySpec::new(
 pub(crate) const ESCALATE: KeySpec = KeySpec::new(
     "escalate",
     KeyType::Bool,
-    "interrupt the recipient's active turn instead of queueing for its next one",
+    "urgency interrupt: interrupt each recipient's active turn, and wake it even through a mute",
+);
+pub(crate) const MESSAGE_URGENCY: KeySpec = KeySpec::new(
+    "urgency",
+    KeyType::Str,
+    "passive | queue | steer (the default) | interrupt",
+);
+pub(crate) const MESSAGE_CC: KeySpec = KeySpec::new(
+    "cc",
+    KeyType::Array,
+    "more recipients of this one message: node, task or thread addresses (or their /messages). Each is woken on its own, under its own mutes, and sees the others; a reply reaches only the address it names. Any bad entry refuses the whole send",
 );
 pub(crate) const PROGRESS_KIND: KeySpec = KeySpec::new("kind", KeyType::Str, "phase | log");
 pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(

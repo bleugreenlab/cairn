@@ -342,8 +342,8 @@ async fn reprompts(orch: &Orchestrator, child: &str) -> i64 {
     count(
         orch,
         &format!(
-            "SELECT COUNT(*) FROM messages m JOIN runs r ON r.id = m.recipient_run_id
-             WHERE r.job_id = '{child}' AND m.channel_type = 'direct'
+            "SELECT COUNT(*) FROM messages m JOIN message_recipients rr ON rr.message_id = m.id
+             WHERE rr.recipient_job_id = '{child}' AND m.channel_type = 'direct'
                AND m.sender_name = 'system' AND m.sender_run_id IS NULL
                AND m.content LIKE '{REPROMPT_PREFIX}%'"
         ),

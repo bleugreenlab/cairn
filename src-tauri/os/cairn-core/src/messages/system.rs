@@ -58,7 +58,6 @@ pub(crate) fn emit_job_event(
         Some(&ctx.channel_id),
         run_id, // Identifies which agent this event is about
         "system",
-        None,
         &content,
     );
 
@@ -208,7 +207,6 @@ pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, titl
         Some(&ctx.channel_id),
         None, // No sender_run_id — user-initiated, all agents should see it
         "system",
-        None,
         &content,
     );
 
@@ -246,7 +244,6 @@ pub fn emit_repl_created(orch: &Orchestrator, job_id: &str, slug: &str, interpre
         Some(&ctx.channel_id),
         None, // No sender_run_id — user-initiated, all agents should see it
         "system",
-        None,
         &content,
     );
 
