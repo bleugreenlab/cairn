@@ -319,7 +319,6 @@ pub(crate) fn batch_command_class(items: &[PlannedCheckBatchItem]) -> CellComman
             CellCommandClass::Typecheck => 1,
             CellCommandClass::Vitest => 2,
             CellCommandClass::Build => 3,
-            // Never a check item's class; ranked with the other compiles.
             CellCommandClass::ReleaseBuild | CellCommandClass::CargoCheck => 4,
             CellCommandClass::CargoClippy => 5,
             CellCommandClass::CargoTest => 6,

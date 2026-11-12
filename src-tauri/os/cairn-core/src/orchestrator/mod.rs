@@ -3758,6 +3758,16 @@ impl Orchestrator {
         });
     }
 
+    /// Settle the publications a restart interrupted, drive any still queued,
+    /// and start the publication heartbeat. Both boot schedules call this
+    /// outside any maintenance gate: the heartbeat is its only backstop.
+    pub fn spawn_publications_boot(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move {
+            crate::publications::boot(&orch).await;
+        });
+    }
+
     /// Start thread-owned services and every schedule at boot. Both boot
     /// schedules call this outside any maintenance gate: a thread's services
     /// come from its own store, so they have no reason to wait for the

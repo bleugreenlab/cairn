@@ -1850,6 +1850,9 @@ async fn produce_record_page(
     Some(match resource {
         CairnResource::Requests => super::requests::list_page(orch, params).await,
         CairnResource::Rebuilds => super::rebuilds::list_page(&orch.db.local, params).await,
+        CairnResource::ProjectPublish { project } => {
+            super::publications::list_page(orch, project, params).await
+        }
         CairnResource::ProjectVcsLog { project } => {
             super::vcs::read_log_page(orch, request, project, params).await
         }
@@ -3653,6 +3656,18 @@ async fn render_resource_body(
         CairnResource::ProjectServiceLog { project, service } => {
             super::services::read_log(orch, &project, None, &service, &params).await
         }
+        CairnResource::ProjectPublish { project } => {
+            super::publications::read_collection(orch, &project, &params).await
+        }
+        CairnResource::ProjectPublication { project, id } => {
+            super::publications::read_publication(orch, &project, &id, &params).await
+        }
+        CairnResource::ProjectPublicationLegLog {
+            project,
+            id,
+            target,
+            leg,
+        } => super::publications::read_leg_log(orch, &project, &id, &target, &leg, &params).await,
         CairnResource::ThreadServices { project, name } => {
             if let Some(error) = reject_query_params("thread services", &params) {
                 error

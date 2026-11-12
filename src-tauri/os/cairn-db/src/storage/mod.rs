@@ -30,6 +30,7 @@ pub mod migration_files;
 pub mod pack_catalog;
 pub mod pipe_floor;
 pub mod plan_audit;
+pub mod publications;
 pub mod quarantine;
 pub mod rebuilds;
 pub mod render;

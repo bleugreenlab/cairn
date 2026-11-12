@@ -2960,6 +2960,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::ProjectEventEndpoints => "cairn://p/cairn/events/endpoints",
         K::ProjectEventEndpoint => "cairn://p/cairn/events/endpoints/bugs",
         K::ProjectService => "cairn://p/cairn/services/echo",
+        K::ProjectPublish => "cairn://p/cairn/publish",
         // Pre-existing gaps, filled here because they sit between this test and
         // the arm above: the parity check panics on the first unsampled kind and
         // never reaches any later one, so the whole tail of the table —

@@ -47,6 +47,7 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
     match kind {
         K::Requests
         | K::Rebuilds
+        | K::ProjectPublish
         | K::Db
         | K::DbTable
         | K::DevDb
@@ -77,6 +78,7 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
         | K::TaskMessages
         | K::NodeProgress
         | K::ProjectServiceLog
+        | K::ProjectPublicationLegLog
         | K::ThreadServiceLog => Paging::Limit,
         K::Logs
         | K::ProjectAttachment

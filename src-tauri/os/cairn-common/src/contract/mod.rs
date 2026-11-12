@@ -24,6 +24,7 @@ mod nodes;
 mod pages;
 mod posts;
 mod projects;
+mod publish;
 mod registry;
 mod requests;
 mod responses;
@@ -257,6 +258,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     services::PROJECT_SERVICE_CONTRACT,
     services::PROJECT_SERVICE_STATUS_CONTRACT,
     services::PROJECT_SERVICE_LOG_CONTRACT,
+    publish::PROJECT_PUBLISH_CONTRACT,
+    publish::PROJECT_PUBLICATION_CONTRACT,
+    publish::PROJECT_PUBLICATION_LEG_LOG_CONTRACT,
     services::THREAD_SERVICES_CONTRACT,
     services::THREAD_SERVICE_CONTRACT,
     services::THREAD_SERVICE_STATUS_CONTRACT,

@@ -41,6 +41,7 @@ mod posts;
 mod progress;
 mod projects;
 mod prompts;
+mod publish;
 mod queue;
 pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
 mod rebase;
@@ -503,6 +504,10 @@ pub(crate) async fn dispatch_resource_change_under_store(
         summary
     } else if let Some(summary) =
         off_frame(|| services::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| publish::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =

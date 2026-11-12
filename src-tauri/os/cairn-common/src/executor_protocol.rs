@@ -4775,11 +4775,11 @@ pub enum CellCommandClass {
     Vitest,
     Typecheck,
     Build,
-    /// A Cairn-owned release build that runs outside every cell, such as the
-    /// rebuild actor's `tauri build`, counted because the runner adopted its
-    /// process tree on the colocated executor ([`ProcessTreeAdoption`]). Only
-    /// adoption assigns it: [`Self::classify`] never does, because no command
-    /// a cell runs is one.
+    /// A Cairn-owned release build. Two kinds reach a machine: the rebuild
+    /// actor's `tauri build`, which runs outside every cell and is counted
+    /// because the runner adopted its process tree on the colocated executor
+    /// ([`ProcessTreeAdoption`]), and a publication's placed build leg
+    /// (`scripts/publish-leg.ts build`), which [`Self::classify`] names.
     ReleaseBuild,
     #[default]
     Other,
@@ -4799,15 +4799,21 @@ impl CellCommandClass {
 
     /// Whether a command of this class compiles the project's Rust, so needs
     /// what a machine's build-prerequisite verdict judges whatever toolchains
-    /// its selector names. `Build` is not: it is the frontend bundle. Nor is
-    /// `ReleaseBuild`, which is adopted where it already runs and never placed.
+    /// its selector names. `Build` is not: it is the frontend bundle.
+    /// `ReleaseBuild` is: a placed publication build leg compiles the release
+    /// binaries and must meet the same prerequisite verdict.
     pub fn compiles_rust(self) -> bool {
-        matches!(self, Self::CargoCheck | Self::CargoTest | Self::CargoClippy)
+        matches!(
+            self,
+            Self::CargoCheck | Self::CargoTest | Self::CargoClippy | Self::ReleaseBuild
+        )
     }
 
     pub fn classify(command: &str) -> Self {
         let command = command.to_ascii_lowercase();
-        if command.contains("cargo clippy") || command.contains("check:rust") {
+        if command.contains("publish-leg.ts build") || command.contains("publish:leg build") {
+            Self::ReleaseBuild
+        } else if command.contains("cargo clippy") || command.contains("check:rust") {
             Self::CargoClippy
         } else if command.contains("cargo test") || command.contains("test:rust") {
             Self::CargoTest
@@ -8201,6 +8207,16 @@ pub struct LearnedResourceEstimate {
 /// runner gets wrong talking to an older executor:
 /// nothing; it reads the absent bounds as an unbounded unit, which that
 /// executor's is. An older runner ignores both fields.
+///
+/// cairn/5962 does not move the number. [`CellCommandClass::classify`] now
+/// names a publication's placed build leg (`publish-leg.ts build`)
+/// `releaseBuild`, and `compiles_rust` counts that class. The variant and its
+/// wire spelling already exist (adoption sends it), so an older executor
+/// decodes a request carrying it as it decodes an adopted tree's class. What a
+/// runner gets wrong talking to an older executor: nothing. The class is the
+/// runner's own classification of the command it places, and the
+/// prerequisite verdict it now gates on is judged by the runner from what the
+/// executor already reports.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -23373,19 +23389,33 @@ mod tests {
         }
     }
 
-    /// A release build is compile-class work wherever running work is
-    /// counted, but only adoption names one: a cell's command line never
-    /// classifies as one, and it is never a placement-eligibility class.
+    /// A release build is compile-class Rust work wherever running work is
+    /// counted or placed. The rebuild's `tauri build` is named only by
+    /// adoption; a publication's placed build leg is named by its command.
     #[test]
-    fn release_build_is_counted_as_compile_work_and_assigned_only_by_adoption() {
+    fn release_build_is_counted_as_compile_work_and_named_by_adoption_or_publish_leg() {
         assert!(CellCommandClass::ReleaseBuild.is_compile_class());
-        assert!(!CellCommandClass::ReleaseBuild.compiles_rust());
+        assert!(CellCommandClass::ReleaseBuild.compiles_rust());
         assert_eq!(
             CellCommandClass::classify(
                 "bun run tauri build --bundles app --config {\"bundle\":{}}"
             ),
             CellCommandClass::Other
         );
+        assert_eq!(
+            CellCommandClass::classify(
+                "bun scripts/publish-leg.ts build --target x86_64-unknown-linux-gnu --publication p --out o"
+            ),
+            CellCommandClass::ReleaseBuild
+        );
+        for other_leg in ["manifest", "verify"] {
+            assert_eq!(
+                CellCommandClass::classify(&format!(
+                    "bun scripts/publish-leg.ts {other_leg} --target t --publication p --out o"
+                )),
+                CellCommandClass::Other
+            );
+        }
         assert_eq!(
             serde_json::to_value(CellCommandClass::ReleaseBuild).unwrap(),
             serde_json::json!(CellCommandClass::ReleaseBuild.as_str())

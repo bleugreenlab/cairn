@@ -520,6 +520,14 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("inference_deployments", CONFIG),
     keep("inference_machines", CONFIG),
     keep("model_pool_preferences", CONFIG),
+    keep(
+        "publications",
+        "one row per publication: a manual start or a twelve-hourly heartbeat, a few a day",
+    ),
+    keep(
+        "publication_legs",
+        "a dozen rows per publication at most (plan, then build and verify per target)",
+    ),
     keep("model_pins", "one row per pinned model resident"),
     keep(
         "rebuilds",

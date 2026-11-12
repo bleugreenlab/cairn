@@ -775,6 +775,20 @@ pub(crate) struct CheckPhaseStatus {
 
 type CheckStatusNotify = Arc<dyn Fn(Vec<CheckStatusEntry>, CheckPhaseStatus) + Send + Sync>;
 
+/// What a one-item batch's observer hears while the batch runs: the placement
+/// request it was presented as, each change of where it stands (queued, the
+/// machine that claimed it), and each scrubbed output chunk as it arrives. A
+/// publication leg records these into its ledger row and log while the build
+/// is still running.
+#[derive(Debug, Clone)]
+pub(crate) enum BatchProgress {
+    Request(String),
+    Phase(CheckPhaseStatus),
+    Output(String),
+}
+
+pub(crate) type BatchObserver = Arc<dyn Fn(BatchProgress) + Send + Sync>;
+
 #[derive(Clone)]
 struct CheckStatusGroup {
     indices: Vec<usize>,
@@ -793,6 +807,9 @@ pub(crate) struct CheckStatusBoard {
     /// Whether the check engine, not the executor's per-item report, owns
     /// this board's verdicts. See [`Self::for_review_wave`].
     engine_owned: bool,
+    /// Who hears this board's request, phases and output, when anyone does.
+    /// See [`Self::observed`].
+    observer: Option<BatchObserver>,
 }
 
 impl CheckStatusBoard {
@@ -818,6 +835,49 @@ impl CheckStatusBoard {
             group: None,
             notify,
             engine_owned: false,
+            observer: None,
+        }
+    }
+
+    /// The board of a one-item batch whose caller follows it as it runs: the
+    /// request it is presented as, every phase (queued, claimed by a machine),
+    /// and its output chunk by chunk, all delivered to `observer`.
+    pub(crate) fn observed(name: &str, observer: BatchObserver) -> Self {
+        let phases = observer.clone();
+        Self {
+            entries: Arc::new(std::sync::Mutex::new(vec![CheckStatusEntry {
+                index: 0,
+                name: name.to_string(),
+                state: "pending".into(),
+                annotation: None,
+                cached: false,
+                since_unix_ms: None,
+            }])),
+            phase: Arc::new(std::sync::Mutex::new(CheckPhaseStatus::default())),
+            groups: Arc::new(std::sync::Mutex::new(Vec::new())),
+            durability_errors: Arc::new(std::sync::Mutex::new(Vec::new())),
+            group: None,
+            notify: Arc::new(move |_, phase| phases(BatchProgress::Phase(phase))),
+            engine_owned: false,
+            observer: Some(observer),
+        }
+    }
+
+    /// Whether a caller follows this board's output, so the fleet must hand
+    /// it the batch's process reports.
+    pub(crate) fn is_observed(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    pub(crate) fn note_request(&self, request_id: &str) {
+        if let Some(observer) = &self.observer {
+            observer(BatchProgress::Request(request_id.to_string()));
+        }
+    }
+
+    pub(crate) fn note_output(&self, chunk: &str) {
+        if let Some(observer) = &self.observer {
+            observer(BatchProgress::Output(chunk.to_string()));
         }
     }
 
@@ -4458,11 +4518,14 @@ pub(crate) fn reserve_batch_items(
             // refused: somewhere else may still be healthy, and a verdict from a
             // healthy machine beats a diagnostic from a broken one.
             Ok(CheckExecutionClaim::Clear {
-                mut avoid,
+                avoid,
                 avoid_platforms,
             }) => {
-                avoid.sort();
-                item.avoid_executor_ids = avoid;
+                // Added to what the caller already ruled out, never in place
+                // of it: a caller's avoidance is a placement requirement.
+                item.avoid_executor_ids.extend(avoid);
+                item.avoid_executor_ids.sort();
+                item.avoid_executor_ids.dedup();
                 // A platform whose own stall budget is spent at this head is
                 // dropped from what this request counts. The claim refuses the
                 // item outright when every platform is spent, so what is left
@@ -5820,6 +5883,7 @@ async fn submit_single_planned_check_batch(
         Vec::new()
     };
     if let Some(board) = &batch.status_board {
+        board.note_request(&request.request_id);
         board.set_phase(
             Some("queued"),
             Some("queued"),
@@ -5854,11 +5918,13 @@ async fn submit_single_planned_check_batch(
                 batch.run_context,
                 // Only a board whose verdicts the engine owns takes the
                 // executor's per-item reports; any other pure-verdict board
-                // would read an exit code as a verdict.
+                // would read an exit code as a verdict. An observed board
+                // takes them too: its caller reads output, never a verdict,
+                // from it.
                 batch
                     .status_board
                     .clone()
-                    .filter(CheckStatusBoard::engine_owns_verdicts),
+                    .filter(|board| board.engine_owns_verdicts() || board.is_observed()),
                 batch.purpose,
             )
         });
@@ -6351,9 +6417,10 @@ pub(crate) struct PlannedCheckBatchItem {
     /// Carried on the item so the reservation that refuses it and the row a
     /// returning failure writes can only ever name the same counters.
     pub infra_scopes: InfraScopes,
-    /// The machines this item must not land on, because its own environment
-    /// counter is spent on each of them. Empty at construction: only
-    /// [`reserve_batch_items`] knows, because only the reservation reads the
+    /// The machines this item must not land on: any its caller rules out (a
+    /// publication leg steering away from machines of the wrong architecture),
+    /// plus those whose environment counter for it is spent, which only
+    /// [`reserve_batch_items`] knows because only the reservation reads the
     /// counters.
     pub avoid_executor_ids: Vec<String>,
 }

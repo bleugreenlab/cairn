@@ -357,6 +357,16 @@ impl CairnResource {
             Self::ProjectServiceLog { project, service } => {
                 in_project(project, format!("service {service} / log"))
             }
+            Self::ProjectPublish { project } => in_project(project, "publications"),
+            Self::ProjectPublication { project, id } => {
+                in_project(project, format!("publication {id}"))
+            }
+            Self::ProjectPublicationLegLog {
+                project,
+                id,
+                target,
+                leg,
+            } => in_project(project, format!("publication {id} / {target} {leg} log")),
             Self::ProjectRoutes { project } => in_project(project, "routes"),
             Self::ProjectRoute { project, route_id } => {
                 in_project(project, format!("route {route_id}"))

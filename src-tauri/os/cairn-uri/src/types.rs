@@ -882,6 +882,22 @@ pub enum CairnResource {
         project: String,
         service: String,
     },
+    /// The project's publish action and publication ledger, newest first.
+    ProjectPublish {
+        project: String,
+    },
+    /// One publication: its targets by legs.
+    ProjectPublication {
+        project: String,
+        id: String,
+    },
+    /// One publication leg's log.
+    ProjectPublicationLegLog {
+        project: String,
+        id: String,
+        target: String,
+        leg: String,
+    },
     /// Contextual routes collection (workspace + current project).
     Routes,
     Route {
@@ -1397,6 +1413,9 @@ impl CairnResource {
             Self::ProjectService { .. } => ResourceKind::ProjectService,
             Self::ProjectServiceStatus { .. } => ResourceKind::ProjectServiceStatus,
             Self::ProjectServiceLog { .. } => ResourceKind::ProjectServiceLog,
+            Self::ProjectPublish { .. } => ResourceKind::ProjectPublish,
+            Self::ProjectPublication { .. } => ResourceKind::ProjectPublication,
+            Self::ProjectPublicationLegLog { .. } => ResourceKind::ProjectPublicationLegLog,
             Self::Routes => ResourceKind::Routes,
             Self::Route { .. } => ResourceKind::Route,
             Self::RouteHistory { .. } => ResourceKind::RouteHistory,

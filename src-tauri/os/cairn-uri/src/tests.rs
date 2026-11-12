@@ -1507,6 +1507,71 @@ fn service_arms_coexist_with_numeric_issue_and_node_arms() {
 }
 
 #[test]
+fn round_trips_publish_resources_and_refuses_other_shapes() {
+    let cases = [
+        (
+            "cairn://p/cairn/publish",
+            CairnResource::ProjectPublish {
+                project: "cairn".to_string(),
+            },
+            ResourceKind::ProjectPublish,
+            "cairn / publications",
+        ),
+        (
+            "cairn://p/cairn/publish/pub-1",
+            CairnResource::ProjectPublication {
+                project: "cairn".to_string(),
+                id: "pub-1".to_string(),
+            },
+            ResourceKind::ProjectPublication,
+            "cairn / publication pub-1",
+        ),
+        (
+            "cairn://p/cairn/publish/pub-1/x86_64-unknown-linux-gnu/build/log",
+            CairnResource::ProjectPublicationLegLog {
+                project: "cairn".to_string(),
+                id: "pub-1".to_string(),
+                target: "x86_64-unknown-linux-gnu".to_string(),
+                leg: "build".to_string(),
+            },
+            ResourceKind::ProjectPublicationLegLog,
+            "cairn / publication pub-1 / x86_64-unknown-linux-gnu build log",
+        ),
+    ];
+    for (uri, resource, kind, label) in cases {
+        assert_eq!(parse_uri(uri), Some(resource.clone()), "{uri}");
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.kind(), kind);
+        assert_eq!(resource.project(), Some("cairn"));
+        assert_eq!(resource.issue_number(), None);
+        assert_eq!(
+            resource.surface(),
+            crate::Surface::Read {
+                uri: uri.to_string()
+            }
+        );
+        assert_eq!(resource.label(&crate::LabelContext::default()), label);
+    }
+    assert_eq!(
+        parse_uri("cairn://p/CAIRN/publish"),
+        Some(CairnResource::ProjectPublish {
+            project: "cairn".to_string()
+        })
+    );
+    for refused in [
+        "cairn://p/cairn/publish/pub-1/x86_64-unknown-linux-gnu/build",
+        "cairn://p/cairn/publish/pub-1/x86_64-unknown-linux-gnu",
+        "cairn://p/cairn/publish/pub-1/x86_64-unknown-linux-gnu/build/log/more",
+        "cairn://p/cairn/publish/pub-1/t/build/logs",
+        "cairn://p/cairn/publish/a%2Fb",
+        "cairn://p/cairn/publish//t/build/log",
+    ] {
+        assert_eq!(parse_uri(refused), None, "{refused}");
+    }
+    assert!(crate::thread_name::validate_thread_name("publish").is_err());
+}
+
+#[test]
 fn project_reference_resources_report_project_and_kind() {
     let collection = parse_uri("cairn://p/cairn/references").unwrap();
     assert_eq!(collection.project(), Some("cairn"));
@@ -1887,6 +1952,7 @@ fn project_parser_literals_are_reserved_thread_names() {
         "images",
         "issues",
         "messages",
+        "publish",
         "recipes",
         "references",
         "responses",

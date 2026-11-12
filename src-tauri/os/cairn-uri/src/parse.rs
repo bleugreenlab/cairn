@@ -404,6 +404,28 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 service: (*service).to_string(),
             })
         }
+        // `publish` is reserved the same way; its ids, targets and legs are
+        // each one opaque segment.
+        [PROJECT_SCOPE, project, "publish"] => Some(CairnResource::ProjectPublish {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "publish", id] if valid_opaque_id(id) => {
+            Some(CairnResource::ProjectPublication {
+                project: canonical_project(project),
+                id: (*id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, "publish", id, target, leg, "log"]
+            if valid_opaque_id(id) && valid_opaque_id(target) && valid_opaque_id(leg) =>
+        {
+            Some(CairnResource::ProjectPublicationLegLog {
+                project: canonical_project(project),
+                id: (*id).to_string(),
+                target: (*target).to_string(),
+                leg: (*leg).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, _, "publish", ..] => None,
         [PROJECT_SCOPE, project, "services", service, "log"] => {
             Some(CairnResource::ProjectServiceLog {
                 project: canonical_project(project),

@@ -2904,6 +2904,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "rebuilds",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // cairn/5962: what this install published, on which builder, with what
+    // evidence. The actor that writes it runs on this runner alone.
+    (
+        "publications",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "publication_legs",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // cairn/6440: this install's fresh-pipe floor engagements, their
     // descriptor census and the idle sessions released under them. About this
     // install's hosts, so never synced.

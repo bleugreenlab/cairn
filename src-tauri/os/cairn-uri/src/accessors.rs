@@ -106,6 +106,9 @@ impl CairnResource {
             | ProjectService { project, .. }
             | ProjectServiceStatus { project, .. }
             | ProjectServiceLog { project, .. }
+            | ProjectPublish { project, .. }
+            | ProjectPublication { project, .. }
+            | ProjectPublicationLegLog { project, .. }
             | ProjectRoutes { project, .. }
             | ProjectRoute { project, .. }
             | ProjectRouteHistory { project, .. }
@@ -242,6 +245,9 @@ impl CairnResource {
             | Self::ProjectService { project, .. }
             | Self::ProjectServiceStatus { project, .. }
             | Self::ProjectServiceLog { project, .. }
+            | Self::ProjectPublish { project }
+            | Self::ProjectPublication { project, .. }
+            | Self::ProjectPublicationLegLog { project, .. }
             | Self::ProjectRoutes { project }
             | Self::ProjectRoute { project, .. }
             | Self::ProjectRouteHistory { project, .. }
@@ -499,6 +505,9 @@ impl CairnResource {
             | Self::ProjectService { .. }
             | Self::ProjectServiceStatus { .. }
             | Self::ProjectServiceLog { .. }
+            | Self::ProjectPublish { .. }
+            | Self::ProjectPublication { .. }
+            | Self::ProjectPublicationLegLog { .. }
             | Self::ProjectSymbols { .. }
             | Self::Db
             | Self::DbTable { .. }

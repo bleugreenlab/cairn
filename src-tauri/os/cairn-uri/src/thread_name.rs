@@ -22,6 +22,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "messages",
     "memories",
     "pages",
+    "publish",
     "queue",
     "recipes",
     "references",

@@ -1005,6 +1005,27 @@ pub fn build_project_service_log_uri(project: &str, service: &str) -> String {
     format!("{}/log", build_project_service_uri(project, service))
 }
 
+/// The project's publish action and publication ledger (`cairn://p/{project}/publish`).
+pub fn build_project_publish_uri(project: &str) -> String {
+    format!("{}/publish", build_project_uri(project))
+}
+
+pub fn build_project_publication_uri(project: &str, id: &str) -> String {
+    format!("{}/{id}", build_project_publish_uri(project))
+}
+
+pub fn build_project_publication_leg_log_uri(
+    project: &str,
+    id: &str,
+    target: &str,
+    leg: &str,
+) -> String {
+    format!(
+        "{}/{target}/{leg}/log",
+        build_project_publication_uri(project, id)
+    )
+}
+
 /// The services a thread owns (`cairn://p/{project}/{thread}/services`).
 pub fn build_thread_services_uri(project: &str, thread: &str) -> String {
     format!("{}/services", build_thread_uri(project, thread))
@@ -1762,6 +1783,14 @@ impl CairnResource {
             Self::ProjectServiceLog { project, service } => {
                 build_project_service_log_uri(project, service)
             }
+            Self::ProjectPublish { project } => build_project_publish_uri(project),
+            Self::ProjectPublication { project, id } => build_project_publication_uri(project, id),
+            Self::ProjectPublicationLegLog {
+                project,
+                id,
+                target,
+                leg,
+            } => build_project_publication_leg_log_uri(project, id, target, leg),
             Self::Routes => build_routes_uri(),
             Self::Route { route_id } => build_route_uri(route_id),
             Self::RouteHistory { route_id } => build_route_history_uri(route_id),

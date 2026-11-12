@@ -350,6 +350,10 @@ impl CairnResource {
             | Self::ProjectService { .. }
             | Self::ProjectServiceStatus { .. }
             | Self::ProjectServiceLog { .. }
+            // The ledger has no dedicated pane; `Builds` renders rebuilds.
+            | Self::ProjectPublish { .. }
+            | Self::ProjectPublication { .. }
+            | Self::ProjectPublicationLegLog { .. }
             | Self::ProjectRoutes { .. }
             | Self::ProjectRoute { .. }
             | Self::ProjectRouteHistory { .. }

@@ -1142,6 +1142,18 @@ pub(crate) struct CellPlacement {
     pub platform: Option<ExecutorPlatform>,
 }
 
+/// One machine [`Fleet::known_machine_platforms`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KnownMachinePlatform {
+    pub executor_id: String,
+    pub name: String,
+    pub os: String,
+    pub arch: String,
+    /// What it advertises once attached; `None` for an enrolled machine that
+    /// has not attached, whose toolchains are unknown until it does.
+    pub toolchains: Option<Vec<String>>,
+}
+
 /// The operating system and architecture a machine advertises, in the
 /// lowercase vocabulary verdict platforms are recorded in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7872,6 +7884,39 @@ impl Fleet {
         self.occupancy_for_at(scope, unix_time_ms())
     }
 
+    /// Every machine this fleet knows of, attached or enrolled, with the
+    /// platform it advertises (or was enrolled as) and, once attached, its
+    /// toolchains. A selector names an operating system but not an
+    /// architecture, so work that needs one (a release build for a target
+    /// triple) reads this to know which machines exist for it and steers the
+    /// rest away through the request's avoid list.
+    pub(crate) fn known_machine_platforms(&self) -> Vec<KnownMachinePlatform> {
+        // Read before the connection lock is taken, as `unplaceable_reason` does.
+        let mut machines: Vec<KnownMachinePlatform> = self
+            .unattached_enrolled_remotes()
+            .into_iter()
+            .map(|machine| KnownMachinePlatform {
+                executor_id: machine.executor_id,
+                name: machine.name,
+                os: machine.os.to_ascii_lowercase(),
+                arch: machine.arch.to_ascii_lowercase(),
+                toolchains: None,
+            })
+            .collect();
+        let connections = self.lock_connections();
+        for (executor_id, entry) in connections.iter() {
+            let capabilities = &entry.advertisement.capabilities;
+            machines.push(KnownMachinePlatform {
+                executor_id: executor_id.clone(),
+                name: executor_public_name(entry),
+                os: capabilities.os.to_ascii_lowercase(),
+                arch: capabilities.arch.to_ascii_lowercase(),
+                toolchains: Some(capabilities.toolchains.clone()),
+            });
+        }
+        machines
+    }
+
     /// Why no machine this fleet knows of could ever take work that asks for
     /// `selector` and counts its verdict from `verdict_platforms`, or `None`
     /// while one could.
@@ -14012,6 +14057,11 @@ impl Fleet {
             .lock()
             .unwrap()
             .settle_text(stream_id, &payload);
+        if !payload.is_empty() {
+            if let Some(board) = &context.check_status_board {
+                board.note_output(&payload);
+            }
+        }
         if let Some(run_context) = context.run_context {
             if let Some(board) = context.check_status_board {
                 if let Some(index) = stream_id

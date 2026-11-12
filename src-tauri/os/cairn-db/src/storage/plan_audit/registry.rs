@@ -154,6 +154,13 @@ pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
     trigger("main_incident_source_enqueue", "check_result_observations",
         "enqueues one prospective main source by its (project_id,event_key) primary key; reads no table"),
     trigger("main_incidents_immutable", "main_incidents", IMMUTABLE),
+    trigger("publications_settled_immutable", "publications", IMMUTABLE),
+    trigger("publications_identity_immutable", "publications", IMMUTABLE),
+    trigger("publication_legs_terminal_immutable", "publication_legs", IMMUTABLE),
+    trigger("publication_legs_shadow_never_uploads_insert", "publication_legs",
+        "probes the leg's publication by its id primary key for its mode; refuses with RAISE"),
+    trigger("publication_legs_shadow_never_uploads_update", "publication_legs",
+        "probes the leg's publication by its id primary key for its mode; refuses with RAISE"),
     trigger(
         "main_incident_evidence_immutable",
         "main_incident_evidence",
