@@ -8,10 +8,12 @@ use cairn_uri::ResourceKind;
 // where the key name + type + example don't already make the value obvious; an
 // empty note renders as just `key(type)`.
 pub(crate) const CONTENT: KeySpec = KeySpec::new("content", KeyType::Str, "");
-pub(crate) const CHANNEL_CONVERSATION: KeySpec = KeySpec::new(
-    "conversation",
+pub(crate) const CHANNEL_PROVIDER: KeySpec =
+    KeySpec::new("provider", KeyType::Str, "discord | imessage | telegram");
+pub(crate) const CHANNEL_PURPOSE: KeySpec = KeySpec::new(
+    "purpose",
     KeyType::Str,
-    "canonical address of a row that carries send",
+    "one line on what the provider is for; empty clears it",
 );
 pub(crate) const AMBIENT_FEEDBACK_EVENT: KeySpec = KeySpec::new(
     "event",

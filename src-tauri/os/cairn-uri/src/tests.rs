@@ -11,16 +11,76 @@ fn uri_identity_canonicalization_preserves_non_project_segments() {
 }
 
 #[test]
-fn parses_and_roundtrips_channel_conversations() {
-    let resource = CairnResource::ChannelsConversations;
+fn parses_and_roundtrips_the_channels_tree() {
+    let channels = CairnResource::Channels;
+    assert_eq!(parse_uri("cairn://channels"), Some(channels.clone()));
+    assert_eq!(channels.to_uri(), "cairn://channels");
+    assert_eq!(channels.kind(), ResourceKind::Channels);
+
+    let discord = CairnResource::ChannelsProvider {
+        provider: "discord".into(),
+    };
     assert_eq!(
-        parse_uri("cairn://channels/conversations?provider=telegram&deliverability=ready"),
-        Some(resource.clone())
+        parse_uri("cairn://channels/discord?limit=5"),
+        Some(discord.clone())
     );
-    assert_eq!(resource.to_uri(), "cairn://channels/conversations");
-    assert_eq!(resource.kind(), ResourceKind::ChannelsConversations);
-    assert_eq!(resource.project(), None);
-    assert_eq!(resource.issue_number(), None);
+    assert_eq!(discord.to_uri(), "cairn://channels/discord");
+    assert_eq!(discord.label(&LabelContext::default()), "Discord channels");
+
+    for (uri, path, label) in [
+        (
+            "cairn://channels/discord/cairn",
+            vec!["cairn"],
+            "#ambient · cairn · Discord",
+        ),
+        (
+            "cairn://channels/discord/cairn/channels",
+            vec!["cairn", "channels"],
+            "#channels · cairn · Discord",
+        ),
+        (
+            "cairn://channels/discord/cairn/6772",
+            vec!["cairn", "6772"],
+            "#6772 · cairn · Discord",
+        ),
+    ] {
+        let resource = CairnResource::ChannelsConversation {
+            provider: "discord".into(),
+            path: path.into_iter().map(str::to_string).collect(),
+        };
+        assert_eq!(parse_uri(uri), Some(resource.clone()), "{uri}");
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.kind(), ResourceKind::ChannelsConversation);
+        assert_eq!(resource.label(&LabelContext::default()), label);
+        assert_eq!(resource.project(), None);
+        assert_eq!(resource.issue_number(), None);
+    }
+
+    let imessage = CairnResource::ChannelsConversation {
+        provider: "imessage".into(),
+        path: vec!["+15551234567".into()],
+    };
+    assert_eq!(
+        imessage.to_uri(),
+        "cairn://channels/imessage/%2B15551234567"
+    );
+    assert_eq!(parse_uri(&imessage.to_uri()), Some(imessage.clone()));
+    assert_eq!(
+        imessage.label(&LabelContext::default()),
+        "iMessage +15551234567"
+    );
+    let telegram = CairnResource::ChannelsConversation {
+        provider: "telegram".into(),
+        path: vec!["-100123".into()],
+    };
+    assert_eq!(
+        parse_uri("cairn://channels/telegram/-100123"),
+        Some(telegram)
+    );
+
+    // Only a provider word opens the tree; the old enumeration is gone.
+    assert_eq!(parse_uri("cairn://channels/conversations"), None);
+    assert_eq!(parse_uri("cairn://channels/slack/x"), None);
 }
 
 #[test]

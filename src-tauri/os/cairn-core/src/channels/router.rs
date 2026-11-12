@@ -140,6 +140,21 @@ fn route_conversation(address: Option<&crate::channels::ConversationAddress>) ->
     })
 }
 
+/// Who a route's outbound speaks for, which decides whether it waits on the
+/// operator's presence. A subscription delivery and an undirected notice are
+/// Cairn reaching for the operator's attention, so tenet 1054's grace defers
+/// them while the operator is at the desktop. A route that names its
+/// conversation (an acknowledgement answering a message the operator just
+/// wrote there) is a reply to the operator, and holding it for minutes reads
+/// as Cairn not answering.
+fn route_initiator(submission: &ChannelSubmission) -> OutboundInitiator {
+    match submission.initiated_by.as_deref() {
+        Some("operator_subscription") => OutboundInitiator::OperatorSubscription,
+        _ if submission.destination.is_some() => OutboundInitiator::OperatorInbound,
+        _ => OutboundInitiator::CairnPush,
+    }
+}
+
 fn starts_with_known_slash_command(text: &str) -> bool {
     text.split_whitespace()
         .next()
@@ -206,11 +221,6 @@ fn route_binding_target(binding_ref: &str) -> Option<&str> {
     let start = binding_ref.find("cairn://")?;
     binding_ref[start..].split(":event:").next()
 }
-
-/// The record every admitted inbound message's `channel_message` fact points at.
-/// There is no per-message resource yet, so it names the conversations
-/// enumeration; the fact's `record_id` is the `channel_inbound` row.
-const CHANNEL_MESSAGE_RECORD_REF: &str = "cairn://channels/conversations";
 
 /// One explicit addressee at the head of a message in an ambient conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +312,18 @@ struct AdmittedMessage<'a> {
     addressed: bool,
     /// The ledger record a reply answered.
     reply_of: Option<String>,
+    /// The leading address an ambient message opened with, as typed.
+    addressed_by: Option<String>,
+}
+
+impl AmbientAddress {
+    /// The address as the operator typed it.
+    fn token(&self) -> String {
+        match self {
+            Self::Selector(name) => format!("@{name}"),
+            Self::Channel(id) => format!("<#{id}>"),
+        }
+    }
 }
 
 fn routed_gate_target(uri: &str) -> Option<String> {
@@ -1350,10 +1372,7 @@ impl ChannelRouter {
         presence: OperatorPresence,
         now: Instant,
     ) -> Result<bool, String> {
-        let initiated_by = match submission.initiated_by.as_deref() {
-            Some("operator_subscription") => OutboundInitiator::OperatorSubscription,
-            _ => OutboundInitiator::CairnPush,
-        };
+        let initiated_by = route_initiator(&submission);
         self.deliver_or_defer(
             Gate {
                 kind: "route",
@@ -1617,10 +1636,7 @@ impl ChannelRouter {
             })?;
             let submission: ChannelSubmission =
                 serde_json::from_str(json).map_err(|error| error.to_string())?;
-            let initiated_by = match submission.initiated_by.as_deref() {
-                Some("operator_subscription") => OutboundInitiator::OperatorSubscription,
-                _ => OutboundInitiator::CairnPush,
-            };
+            let initiated_by = route_initiator(&submission);
             let conversation = match route_conversation(submission.destination.as_ref()) {
                 Some(conversation) => Some(conversation),
                 // An undirected Discord row is keyed by the structural
@@ -2480,26 +2496,23 @@ impl ChannelRouter {
 
     /// Deliver a person's message into `target`, then record it as an admitted
     /// `channel_message`. The fact follows the delivery, so it records a
-    /// message that reached its target; `header` is prepended to what the
-    /// target receives but not to what the fact records.
+    /// message that reached its target; `delivered`, when given, is what the
+    /// target receives in place of `text` (the text under a header naming where
+    /// it came from), while the fact records `text` alone.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_inbound(
         &self,
         conversation: &str,
         sender: &str,
         text: &str,
-        header: Option<&str>,
+        delivered: Option<&str>,
         target: &FollowTarget,
         binding_kind: Option<BindingKind>,
         reply_of: Option<String>,
+        addressed_by: Option<String>,
     ) -> Result<(), String> {
-        match header {
-            Some(header) => {
-                self.route_to_target(target, &format!("{header} {text}"))
-                    .await?
-            }
-            None => self.route_to_target(target, text).await?,
-        }
+        self.route_to_target(target, delivered.unwrap_or(text))
+            .await?;
         // A structural channel delivers even a command to its thread, as it
         // always has, but a command is never a `channel_message`.
         if is_channel_command(text) {
@@ -2514,6 +2527,7 @@ impl ChannelRouter {
             project_key: cairn_uri::canonical_project(target.project()),
             addressed: true,
             reply_of,
+            addressed_by,
         })
         .await;
         Ok(())
@@ -2536,6 +2550,7 @@ impl ChannelRouter {
             project_key: message.project_key,
             addressed: message.addressed,
             reply_of: message.reply_of,
+            addressed_by: message.addressed_by,
         };
         let id = Uuid::new_v4().to_string();
         let received_at = chrono::Utc::now().timestamp_millis();
@@ -2554,6 +2569,7 @@ impl ChannelRouter {
                 conversation: Some(message.conversation.into()),
                 target_uri: Some(message.target_uri.clone()),
                 binding_kind: Some(binding_kind.into()),
+                addressed_by: message.addressed_by.clone(),
             },
         )
         .await
@@ -2595,7 +2611,39 @@ impl ChannelRouter {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("no project with key {}", message.project_key))?;
+        // The conversation's own binding names it: an ambient conversation's
+        // target is its project root even when the message went to a thread.
+        let provider = self
+            .provider_id
+            .parse::<super::ConversationProvider>()
+            .map_err(|error| error.to_string())?;
+        let binding_kind = message.binding_kind.map(BindingKind::as_str);
+        let binding_target = match message.binding_kind {
+            Some(BindingKind::Ambient) => cairn_uri::build_project_uri(&message.project_key),
+            _ => message.target_uri.clone(),
+        };
+        let conversation_label = super::label::conversation_label(
+            provider,
+            message.conversation,
+            binding_kind,
+            Some(&binding_target),
+        );
+        let record_ref = super::label::conversation_uri(
+            provider,
+            message.conversation,
+            binding_kind,
+            Some(&binding_target),
+        )
+        .unwrap_or_else(|| super::label::provider_uri(provider));
         let mut fields = std::collections::BTreeMap::from([
+            (
+                "conversationLabel".to_string(),
+                serde_json::json!(conversation_label),
+            ),
+            (
+                "senderLabel".to_string(),
+                serde_json::json!(super::label::sender_label(super::label::Sender::Operator)),
+            ),
             (
                 "project".to_string(),
                 serde_json::json!(message.project_key),
@@ -2621,6 +2669,9 @@ impl ChannelRouter {
         if let Some(reply_of) = &message.reply_of {
             fields.insert("replyOf".to_string(), serde_json::json!(reply_of));
         }
+        if let Some(addressed_by) = &message.addressed_by {
+            fields.insert("addressedBy".to_string(), serde_json::json!(addressed_by));
+        }
         let origin = match crate::routes::installation_machine_origin(&self.orch) {
             Ok(origin) => Some(origin),
             Err(error) => {
@@ -2641,7 +2692,7 @@ impl ChannelRouter {
                     origin,
                     route_provenance: None,
                 },
-                record_ref: CHANNEL_MESSAGE_RECORD_REF.into(),
+                record_ref,
                 record_id: Some(id.to_string()),
                 project_id: Some(&project_id),
                 presence: crate::routes::log::operator_presence().await,
@@ -2703,6 +2754,7 @@ impl ChannelRouter {
                 project_key: cairn_uri::canonical_project(project),
                 addressed: false,
                 reply_of,
+                addressed_by: None,
             })
             .await;
             return Ok(());
@@ -2735,16 +2787,37 @@ impl ChannelRouter {
                 )
                 .await;
         }
-        let header = format!("[Addressed in ambient Discord channel {conversation}]");
+        // The thread reads where the message came from by name, and the
+        // conversation's resource on its own line to read or answer it there.
+        let provider = super::ConversationProvider::Discord;
+        let project_uri = cairn_uri::build_project_uri(&cairn_uri::canonical_project(project));
+        let ambient = Some(BindingKind::Ambient.as_str());
+        let label =
+            super::label::conversation_label(provider, conversation, ambient, Some(&project_uri));
+        let delivered = match super::label::conversation_uri(
+            provider,
+            conversation,
+            ambient,
+            Some(&project_uri),
+        ) {
+            Some(uri) => format!("[{label}] {rest}\n{uri}"),
+            None => format!("[{label}] {rest}"),
+        };
+        let addressed_by = addresses
+            .iter()
+            .map(AmbientAddress::token)
+            .collect::<Vec<_>>()
+            .join(" ");
         for target in targets {
             self.deliver_inbound(
                 conversation,
                 sender,
                 rest,
-                Some(&header),
+                Some(&delivered),
                 &target,
                 Some(BindingKind::Ambient),
                 reply_of.clone(),
+                Some(addressed_by.clone()),
             )
             .await?;
         }
@@ -3802,7 +3875,7 @@ impl ChannelRouter {
         if matches!(event, InboundEvent::Rejected { .. }) {
             let (sender, text) = inbound_sender_text(&event);
             return self
-                .store_rejected(None, sender, text, "allowlist", false)
+                .store_rejected(None, &conversation, sender, text, "allowlist", false)
                 .await;
         }
         let (guid, sender, text) = inbound_parts(&event);
@@ -3847,7 +3920,7 @@ impl ChannelRouter {
             InboundCapability::FreeText
         };
         if !admits_capability(self.inbound_capabilities, capability) {
-            self.store_rejected(guid, sender, text, "policy", false)
+            self.store_rejected(guid, &conversation, sender, text, "policy", false)
                 .await?;
             let notice = match capability {
                 InboundCapability::Permissions => {
@@ -3878,45 +3951,9 @@ impl ChannelRouter {
                             .await;
                     }
                     let Some(target_uri) = target_uri else {
-                        self.store_rejected(None, sender, text, "unbound_conversation", false)
-                            .await?;
-                        return self
-                            .send_notice(
-                                &conversation,
-                                "This Discord channel is not bound to a Cairn conversation.",
-                            )
-                            .await;
-                    };
-                    let target = self.resolve_target(&target_uri).await?;
-                    return self
-                        .deliver_inbound(
-                            &conversation,
-                            sender,
-                            text,
-                            None,
-                            &target,
-                            Some(BindingKind::Structural),
-                            None,
-                        )
-                        .await;
-                }
-                InboundEvent::Reply {
-                    bound_guid,
-                    sender,
-                    text,
-                    ..
-                } if ledger::get_by_provider_guid(self.ledger(), self.provider_id, bound_guid)
-                    .await?
-                    .is_none() =>
-                {
-                    if let Some(project) = &ambient {
-                        return self
-                            .handle_ambient(&conversation, sender, text, project, None)
-                            .await;
-                    }
-                    let Some(target_uri) = target_uri else {
                         self.store_rejected(
-                            Some(bound_guid),
+                            None,
+                            &conversation,
                             sender,
                             text,
                             "unbound_conversation",
@@ -3939,6 +3976,52 @@ impl ChannelRouter {
                             None,
                             &target,
                             Some(BindingKind::Structural),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                InboundEvent::Reply {
+                    bound_guid,
+                    sender,
+                    text,
+                    ..
+                } if ledger::get_by_provider_guid(self.ledger(), self.provider_id, bound_guid)
+                    .await?
+                    .is_none() =>
+                {
+                    if let Some(project) = &ambient {
+                        return self
+                            .handle_ambient(&conversation, sender, text, project, None)
+                            .await;
+                    }
+                    let Some(target_uri) = target_uri else {
+                        self.store_rejected(
+                            Some(bound_guid),
+                            &conversation,
+                            sender,
+                            text,
+                            "unbound_conversation",
+                            false,
+                        )
+                        .await?;
+                        return self
+                            .send_notice(
+                                &conversation,
+                                "This Discord channel is not bound to a Cairn conversation.",
+                            )
+                            .await;
+                    };
+                    let target = self.resolve_target(&target_uri).await?;
+                    return self
+                        .deliver_inbound(
+                            &conversation,
+                            sender,
+                            text,
+                            None,
+                            &target,
+                            Some(BindingKind::Structural),
+                            None,
                             None,
                         )
                         .await;
@@ -4075,6 +4158,7 @@ impl ChannelRouter {
                         &target,
                         binding_kind,
                         Some(record.id),
+                        None,
                     )
                     .await;
             }
@@ -4100,6 +4184,7 @@ impl ChannelRouter {
                         &target,
                         binding_kind,
                         Some(record.id),
+                        None,
                     )
                     .await;
             }
@@ -4257,6 +4342,7 @@ impl ChannelRouter {
                     &target,
                     binding_kind,
                     None,
+                    None,
                 )
                 .await;
         }
@@ -4409,9 +4495,12 @@ impl ChannelRouter {
         Ok(())
     }
 
+    /// Record an inbound message the router refused. The conversation it
+    /// arrived in is kept so the conversation's resource can show the refusal.
     async fn store_rejected(
         &self,
         guid: Option<&str>,
+        conversation: &str,
         sender: &str,
         text: &str,
         reason: &str,
@@ -4430,9 +4519,10 @@ impl ChannelRouter {
                 received_at: chrono::Utc::now().timestamp_millis(),
                 rejection_reason: Some(reason.into()),
                 acknowledged_at: acknowledged.then(|| chrono::Utc::now().timestamp_millis()),
-                conversation: None,
+                conversation: Some(canonical_inbound_conversation(conversation)),
                 target_uri: None,
                 binding_kind: None,
+                addressed_by: None,
             },
         )
         .await?;
@@ -4463,9 +4553,10 @@ impl ChannelRouter {
                 received_at: chrono::Utc::now().timestamp_millis(),
                 rejection_reason: Some("unmatched".into()),
                 acknowledged_at: None,
-                conversation: None,
+                conversation: Some(canonical_inbound_conversation(conversation)),
                 target_uri: None,
                 binding_kind: None,
+                addressed_by: None,
             },
         )
         .await?;
@@ -9948,6 +10039,62 @@ mod tests {
         assert_eq!(*provider.presence_checks.lock().unwrap(), 2);
     }
 
+    /// A route acknowledgement into the conversation the operator just wrote in
+    /// is a reply, so it goes out at once even while the operator is present;
+    /// an undirected route notice still waits out the attention grace.
+    #[tokio::test]
+    async fn a_conversation_bound_route_is_sent_while_present_and_an_undirected_one_waits() {
+        let (orch, _db) = route_test_orchestrator("route-bound-present.db").await;
+        let provider = Arc::new(PresentProvider {
+            sends: Mutex::new(Vec::new()),
+            presence_checks: Mutex::new(0),
+            presence: Mutex::new(OperatorPresence::Present),
+        });
+        let router = ChannelRouter::new(
+            orch,
+            provider.clone(),
+            IMessageChannelConfig {
+                enabled: true,
+                to: "default@example.com".into(),
+                ..Default::default()
+            },
+        );
+        let mut bound = route_submission("channel-message:in-1");
+        bound.destination = Some("imessage:operator@example.com".parse().unwrap());
+        assert_eq!(route_initiator(&bound), OutboundInitiator::OperatorInbound);
+        router
+            .submit_route(bound, OperatorPresence::Present, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.sends.lock().unwrap().len(),
+            1,
+            "sent on the first sweep"
+        );
+        assert!(router.deferred_attention.lock().unwrap().is_empty());
+
+        let undirected = route_submission("cairn://p/cairn/3727:review_ready");
+        assert_eq!(route_initiator(&undirected), OutboundInitiator::CairnPush);
+        router
+            .submit_route(undirected, OperatorPresence::Present, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.sends.lock().unwrap().len(),
+            1,
+            "the undirected notice waits"
+        );
+        assert_eq!(router.deferred_attention.lock().unwrap().len(), 1);
+
+        let mut subscribed = route_submission("subscribed");
+        subscribed.initiated_by = Some("operator_subscription".into());
+        subscribed.destination = Some("imessage:operator@example.com".parse().unwrap());
+        assert_eq!(
+            route_initiator(&subscribed),
+            OutboundInitiator::OperatorSubscription
+        );
+    }
+
     /// One sweep's worth of claiming, reporting which gates it won. Drives the
     /// real claim path, so what it reports is exactly what the router would send.
     async fn sweep_questions(claims: &ClaimSet, db: &LocalDb) -> Vec<String> {
@@ -11307,11 +11454,12 @@ mod tests {
         route_state: String,
         project_id: Option<String>,
         record_id: Option<String>,
+        record_ref: String,
     }
 
     async fn channel_message_rows(db: &LocalDb) -> Vec<ChannelMessageRow> {
         db.query_all(
-            "SELECT id, fields_json, summary, route_state, project_id, record_id
+            "SELECT id, fields_json, summary, route_state, project_id, record_id, record_ref
                FROM fact_log WHERE source = 'channel_message' ORDER BY id",
             (),
             |row| {
@@ -11322,6 +11470,7 @@ mod tests {
                     route_state: row.text(3)?,
                     project_id: row.opt_text(4)?,
                     record_id: row.opt_text(5)?,
+                    record_ref: row.text(6)?,
                 })
             },
         )
@@ -11501,7 +11650,8 @@ mod tests {
         let rows = channel_message_rows(&db).await;
         assert_eq!(rows.len(), 1);
         let summary = rows[0].summary.as_deref().unwrap();
-        assert_eq!(summary, "discord ambient discord:1/9 operator");
+        assert_eq!(summary, "#ambient · cairn · Discord operator");
+        assert_eq!(rows[0].record_ref, "cairn://channels/discord/cairn");
         assert!(!summary.contains("Ignore"));
     }
 
@@ -11539,18 +11689,34 @@ mod tests {
         ] {
             router.handle_inbound(event).await.unwrap();
         }
-        let header = "[Addressed in ambient Discord channel discord:1/9]";
+        // The thread reads the conversation by name, with its resource beneath
+        // the text, and never the provider address.
+        let delivered = |text: &str| {
+            format!("[#ambient · cairn · Discord] {text}\ncairn://channels/discord/cairn")
+        };
         assert_eq!(
             thread_messages(&db, "t-general").await,
-            vec![format!("{header} ship it"), "thanks".to_string()]
+            vec![delivered("ship it"), "thanks".to_string()]
         );
         assert_eq!(
             thread_messages(&db, "t-perf").await,
-            vec![
-                format!("{header} look at the flame graph"),
-                "on it".to_string()
-            ]
+            vec![delivered("look at the flame graph"), "on it".to_string()]
         );
+        for thread in ["t-general", "t-perf"] {
+            for message in thread_messages(&db, thread).await {
+                assert!(!message.contains("discord:"), "{message}");
+            }
+        }
+        let addressed_by = db
+            .query_all(
+                "SELECT COALESCE(addressed_by, '-') FROM channel_inbound
+                  WHERE target_uri IS NOT NULL ORDER BY received_at, rowid",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(addressed_by, ["@General", "<#4>", "-", "-"]);
 
         router
             .handle_inbound(bare("discord:1/9", "@nobody hello?"))

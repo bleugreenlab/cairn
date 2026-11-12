@@ -15,8 +15,21 @@ use cairn_uri::parse_uri;
 
 /// All-caps segments the docs use as stand-ins for a real value.
 const PLACEHOLDER_SEGMENTS: &[&str] = &[
-    "P", "N", "PROJ", "PROJECT", "NUMBER", "ISSUE", "EXEC", "NODE", "TASK", "THREAD", "NAME", "ID",
+    "P",
+    "N",
+    "PROJ",
+    "PROJECT",
+    "NUMBER",
+    "ISSUE",
+    "EXEC",
+    "NODE",
+    "TASK",
+    "THREAD",
+    "NAME",
+    "ID",
     "SEQ",
+    "PROVIDER",
+    "CONVERSATION",
 ];
 
 /// `cairn://` hosts the desktop app's URL handler reserves for itself

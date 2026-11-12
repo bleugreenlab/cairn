@@ -17,7 +17,7 @@ pub const MESSAGE_CLASS_NOTIFY: i64 = 1 << 2;
 pub const MESSAGE_CLASSES_ALL: i64 =
     MESSAGE_CLASS_QUESTION | MESSAGE_CLASS_PERMISSION | MESSAGE_CLASS_NOTIFY;
 /// The operator's grant for agents to send free text into this conversation
-/// with `write cairn://channels/conversations`. Discord structural surfaces (a
+/// by appending to the conversation's resource under `cairn://channels`. Discord structural surfaces (a
 /// thread's or issue's own channel) carry it by default; follow rows, which are
 /// the operator's pocket, do not.
 pub const MESSAGE_CLASS_AGENT_TEXT: i64 = 1 << 3;

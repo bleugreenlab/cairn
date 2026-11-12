@@ -281,19 +281,29 @@ const MAX_LABEL_CHARS: usize = 64;
 /// An untrusted source's summary: its label fields' values, each limited to
 /// identifier characters and a short length, joined by spaces. Absent and
 /// non-scalar labels are left out.
+///
+/// A field named `...Label` is one Cairn composed from its own names (a
+/// conversation's `#channels · cairn · Discord`), never from what an outsider
+/// wrote, so it also keeps its spaces and `·` separators.
 pub fn label_summary(labels: &[&str], fields: &BTreeMap<String, Value>) -> Option<String> {
     let parts: Vec<String> = labels
         .iter()
-        .filter_map(|label| match fields.get(*label)? {
-            Value::String(text) => Some(text.clone()),
-            Value::Number(number) => Some(number.to_string()),
-            _ => None,
+        .filter_map(|label| {
+            let value = match fields.get(*label)? {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => return None,
+            };
+            Some((label.ends_with("Label"), value))
         })
-        .map(|value| {
+        .map(|(composed, value)| {
             let mut label: String = value
                 .chars()
                 .map(|c| {
-                    if c.is_ascii_alphanumeric() || "._-/@#:".contains(c) {
+                    if c.is_ascii_alphanumeric()
+                        || "._-/@#:".contains(c)
+                        || (composed && (c == ' ' || c == '·'))
+                    {
                         c
                     } else {
                         '_'
@@ -583,16 +593,19 @@ impl Default for FactRegistry {
             actor_home: None,
             whole_lists: false,
             muted: MutedDelivery::Drop,
-            untrusted: Some(&["provider", "bindingKind", "conversation", "sender"]),
+            untrusted: Some(&["conversationLabel", "senderLabel"]),
             fields: fields(&[
                 ("project", Scalar, STORED),
                 ("provider", Scalar, STORED),
                 ("conversation", Scalar, STORED),
+                ("conversationLabel", Scalar, STORED),
                 ("sender", Scalar, STORED),
+                ("senderLabel", Scalar, STORED),
                 ("receivedAt", Scalar, STORED),
                 ("bindingKind", Scalar, STORED),
                 ("target", Scalar, STORED),
                 ("addressed", Scalar, STORED),
+                ("addressedBy", Scalar, STORED),
                 ("replyOf", Scalar, STORED),
                 ("text", Scalar, HYDRATED),
             ]),

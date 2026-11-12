@@ -142,6 +142,15 @@ fn thread(project: &str, name: &str, uri: &str) -> String {
 }
 
 /// `Word`, or `Word id` when the address names one member.
+fn channel_provider_name(provider: &str) -> &str {
+    match provider {
+        "discord" => "Discord",
+        "imessage" => "iMessage",
+        "telegram" => "Telegram",
+        other => other,
+    }
+}
+
 fn workspace(word: &str, id: Option<&str>) -> String {
     match id {
         Some(id) => format!("{word} {id}"),
@@ -214,7 +223,19 @@ impl CairnResource {
             Self::DevPid => "Dev pid".to_string(),
             Self::DevLaunchTicket => "Dev launch ticket".to_string(),
             Self::Logs => "Logs".to_string(),
-            Self::ChannelsConversations => "Channel conversations".to_string(),
+            Self::Channels => "Channels".to_string(),
+            Self::ChannelsProvider { provider } => {
+                format!("{} channels", channel_provider_name(provider))
+            }
+            Self::ChannelsConversation { provider, path } => {
+                match (provider.as_str(), path.as_slice()) {
+                    ("discord", [project]) => format!("#ambient · {project} · Discord"),
+                    ("discord", [project, name]) => format!("#{name} · {project} · Discord"),
+                    ("telegram", _) => "Telegram chat".to_string(),
+                    ("imessage", [handle]) => format!("iMessage {handle}"),
+                    _ => with_path(format!("{} channel", channel_provider_name(provider)), path),
+                }
+            }
             Self::ChannelsAmbientFeedback => "Channel ambient feedback".to_string(),
             Self::Executors => "Executors".to_string(),
             Self::Executor { name } => workspace("Executor", Some(name)),

@@ -1071,8 +1071,22 @@ pub enum CairnResource {
     /// Read-only projection of the running app's JSONL log entries
     /// (URI parity with the in-app Logs viewer).
     Logs,
-    /// Configured, enabled external-channel conversations and their deliverability.
-    ChannelsConversations,
+    /// The external-channel providers: each one's health, purpose, and operator
+    /// presence.
+    Channels,
+    /// One provider's conversations the reader can reach. `provider` is
+    /// `discord`, `imessage`, or `telegram`.
+    ChannelsProvider {
+        provider: String,
+    },
+    /// One conversation: its messages in both directions, and the send that
+    /// appends to it. A Discord `path` is `[project]` (the project's ambient
+    /// channel) or `[project, thread_or_issue]`; Telegram's is `[chat_id]` and
+    /// iMessage's `[handle]`. Segments are percent-decoded.
+    ChannelsConversation {
+        provider: String,
+        path: Vec<String>,
+    },
     /// The ambient Discord route's label set: one row per routing outcome,
     /// read by judgment and labelled by the receiving threads.
     ChannelsAmbientFeedback,
@@ -1342,7 +1356,9 @@ impl CairnResource {
             Self::DevPid => ResourceKind::DevPid,
             Self::DevLaunchTicket => ResourceKind::DevLaunchTicket,
             Self::Logs => ResourceKind::Logs,
-            Self::ChannelsConversations => ResourceKind::ChannelsConversations,
+            Self::Channels => ResourceKind::Channels,
+            Self::ChannelsProvider { .. } => ResourceKind::ChannelsProvider,
+            Self::ChannelsConversation { .. } => ResourceKind::ChannelsConversation,
             Self::ChannelsAmbientFeedback => ResourceKind::ChannelsAmbientFeedback,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,

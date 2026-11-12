@@ -59,23 +59,55 @@ pub(crate) const DB_ROW_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
-pub(crate) const CHANNELS_CONVERSATIONS_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::ChannelsConversations,
-    uri_template: "cairn://channels/conversations",
+pub(crate) const CHANNELS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Channels,
+    uri_template: "cairn://channels",
+    name: "Channels",
+    description: "The external-channel providers (Discord, iMessage, Telegram), one row each: whether it is enabled, its runtime health and detail (Discord's card-pin degradation is reported here, once), the operator's purpose line for it, operator presence (for iMessage, the presence its local probe reads), when the operator last wrote on it, and a link to its conversations at cairn://channels/{provider}. The purpose is the line an agent reads to decide which provider a message belongs on. Only the verified desktop operator may patch {provider, purpose}; an agent's or any run-less caller's patch is refused.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[CHANNEL_PROVIDER, CHANNEL_PURPOSE],
+        optional: &[],
+        label: "set a provider's purpose (desktop operator only)",
+        example: "write({changes:[{target:\"cairn://channels\",mode:\"patch\",payload:{provider:\"telegram\",purpose:\"urgent: reaches the operator's phone\"}}]})",
+    }],
+};
+
+pub(crate) const CHANNELS_PROVIDER_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ChannelsProvider,
+    uri_template: "cairn://channels/{provider}",
     name: "Channel conversations",
-    description: "Every active binding on an enabled external-channel provider, with its canonical conversation address, target, message classes (question, permission, notify, agent_text), transport capabilities, current deliverability, and provider-wide failed outbound count. Compatibility rows also contain label, provider, and optional last_error. A row carrying `send` accepts an agent message: append {conversation, content} here and it is queued as plain text under the sender's attribution; a human reply to it routes back to the sending thread, or to the sending node's issue.",
+    description: "The conversations on one provider that the reader can reach, newest activity first. A thread reaches its own channel, its project's ambient channel, and any conversation bound to it with agent text; an issue node reaches its issue's channel and the project's ambient channel; the verified desktop operator reaches every active binding. A request that speaks for no run and carries no operator credential reaches none. Each row is the conversation's resource URI, its label (`#channels · cairn · Discord`), its provider address, the binding kind, the classes the reader may send (`agent_text` only while a send would be admitted), its last activity, and a copy-paste send.",
     read_projections: &[
-        ProjectionSpec { key: "provider", values: "imessage | telegram | discord" },
-        ProjectionSpec { key: "deliverability", values: "ready | degraded | stopped" },
+        ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },
+        ProjectionSpec { key: "project", values: "project key; only conversations whose binding targets it (the operator's view narrowed to one project)" },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const CHANNELS_CONVERSATION_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ChannelsConversation,
+    uri_template: "cairn://channels/{provider}/{conversation}",
+    name: "Channel conversation",
+    description: "One conversation the reader can reach: a header (label, provider address, binding, target, provider health, the send affordance) and then its messages oldest first, inbound and outbound interleaved, each with its Cairn id. An inbound message shows its sender, text, the address it opened with, and what the router did: delivered to a target, logged for routes (with each route firing, its outcome, and the acknowledgement it sent), or rejected with a reason. An outbound message shows its sender (a thread, a route, or Cairn), kind, text, and delivery state: pending, deferred for operator presence, sent, failed with its attempt count and next retry, resolved, or expired. A Discord conversation is cairn://channels/discord/PROJECT (the project's #ambient) or cairn://channels/discord/PROJECT/THREAD_OR_ISSUE; Telegram's is cairn://channels/telegram/CHAT_ID and iMessage's cairn://channels/imessage/HANDLE. Append {content} to send plain text under the sender's attribution; a reply to it routes back to the sending thread, or to the sending node's issue.",
+    read_projections: &[
+        ProjectionSpec { key: "since", values: "epoch seconds; messages at or after" },
+        ProjectionSpec { key: "limit", values: "N newest messages (default 50, max 500)" },
+        ProjectionSpec { key: "direction", values: "in | out | all (default all)" },
     ],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
-        required: &[CHANNEL_CONVERSATION, CHANNEL_MESSAGE_CONTENT],
+        required: &[CHANNEL_MESSAGE_CONTENT],
         optional: &[],
-        label: "send a message to a bound conversation",
-        example: "write({changes:[{target:\"cairn://channels/conversations\",mode:\"append\",payload:{conversation:\"discord:GUILD/CHANNEL\",content:\"...\"}}]})",
+        label: "send a message to this conversation",
+        example: "write({changes:[{target:\"cairn://channels/discord/PROJECT/THREAD\",mode:\"append\",payload:{content:\"...\"}}]})",
     }],
 };
 

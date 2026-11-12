@@ -2129,17 +2129,15 @@ async fn render_resource_body(
         CairnResource::DevDb => produce_dev_db_sql_resource(&params, None).await.content,
         CairnResource::DevPid => produce_dev_pid_resource(&params, None).await.content,
         CairnResource::Logs => logs_resource_body(&cairn_common::paths::cairn_log_dir(), &params),
-        CairnResource::ChannelsConversations => {
-            let unsupported = params
-                .iter()
-                .find(|param| !matches!(param.key.as_str(), "provider" | "deliverability"));
-            match unsupported {
-                Some(param) => format!(
-                    "Unsupported query parameter '{}' for cairn://channels/conversations",
-                    param.key
-                ),
-                None => crate::resources::channels::render_conversations(orch, &params).await,
-            }
+        CairnResource::Channels => crate::resources::channels::render_channels(orch, &params).await,
+        CairnResource::ChannelsProvider { provider } => {
+            crate::resources::channels::render_provider(orch, request, &provider, &params).await
+        }
+        CairnResource::ChannelsConversation { provider, path } => {
+            crate::resources::channels::render_conversation(
+                orch, request, &provider, &path, &params,
+            )
+            .await
         }
         CairnResource::ChannelsAmbientFeedback => {
             crate::resources::channels::render_ambient_feedback(orch, &params).await

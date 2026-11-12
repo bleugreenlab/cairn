@@ -1643,7 +1643,16 @@ impl CairnResource {
             Self::DevPid => "cairn://dev/pid".to_string(),
             Self::DevLaunchTicket => "cairn://dev/launch-ticket".to_string(),
             Self::Logs => "cairn://logs".to_string(),
-            Self::ChannelsConversations => "cairn://channels/conversations".to_string(),
+            Self::Channels => "cairn://channels".to_string(),
+            Self::ChannelsProvider { provider } => format!("cairn://channels/{provider}"),
+            Self::ChannelsConversation { provider, path } => {
+                let mut uri = format!("cairn://channels/{provider}");
+                for segment in path {
+                    uri.push('/');
+                    uri.push_str(&encode_path_segment(segment));
+                }
+                uri
+            }
             Self::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback".to_string(),
             Self::Executors => "cairn://executors".to_string(),
             Self::Requests => "cairn://requests".to_string(),

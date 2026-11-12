@@ -61,6 +61,13 @@ pub fn removed_executor_verb_refusal(uri: &str) -> Option<String> {
     ))
 }
 
+/// The external-channel providers `cairn://channels/{provider}` names. Any
+/// other word under `cairn://channels` is not a provider, so
+/// `cairn://channels/ambient/feedback` keeps its own meaning.
+pub fn is_channel_provider(segment: &str) -> bool {
+    matches!(segment, "discord" | "imessage" | "telegram")
+}
+
 pub fn parse_uri(uri: &str) -> Option<CairnResource> {
     let uri = uri.strip_prefix("cairn://")?;
 
@@ -114,8 +121,22 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev", "pid"] => Some(CairnResource::DevPid),
         ["dev", "launch-ticket"] => Some(CairnResource::DevLaunchTicket),
         ["logs"] => Some(CairnResource::Logs),
-        ["channels", "conversations"] => Some(CairnResource::ChannelsConversations),
+        ["channels"] => Some(CairnResource::Channels),
         ["channels", "ambient", "feedback"] => Some(CairnResource::ChannelsAmbientFeedback),
+        ["channels", provider] if is_channel_provider(provider) => {
+            Some(CairnResource::ChannelsProvider {
+                provider: (*provider).to_string(),
+            })
+        }
+        ["channels", provider, rest @ ..] if is_channel_provider(provider) => {
+            Some(CairnResource::ChannelsConversation {
+                provider: (*provider).to_string(),
+                path: rest
+                    .iter()
+                    .map(|segment| decode_path_segment(segment).ok())
+                    .collect::<Option<Vec<_>>>()?,
+            })
+        }
         ["executors"] => Some(CairnResource::Executors),
         ["requests"] => Some(CairnResource::Requests),
         ["requests", id]

@@ -1865,29 +1865,9 @@ fn marker(row: &DiscordSurface) -> String {
 }
 
 fn surface_name(row: &DiscordSurface) -> String {
-    if row.kind == SurfaceKind::AmbientHome {
-        return "ambient".into();
-    }
-    let source = row
-        .target_uri
-        .as_deref()
-        .and_then(|uri| uri.rsplit('/').next())
-        .unwrap_or(&row.project_key);
-    let mut name = source
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    name.truncate(80);
-    if name.is_empty() {
-        "cairn".into()
-    } else {
-        name
-    }
+    super::label::discord_channel_name(
+        row.target_uri.as_deref(),
+        &row.project_key,
+        row.kind == SurfaceKind::AmbientHome,
+    )
 }

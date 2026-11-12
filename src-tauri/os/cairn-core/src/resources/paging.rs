@@ -73,6 +73,8 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
         | K::ProjectHeadlines
         | K::ProjectMessages
         | K::ChannelsAmbientFeedback
+        | K::ChannelsProvider
+        | K::ChannelsConversation
         | K::IssueMessages
         | K::NodeMessages
         | K::TaskMessages

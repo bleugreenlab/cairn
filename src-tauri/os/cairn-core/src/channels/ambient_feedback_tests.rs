@@ -107,6 +107,7 @@ async fn fact(orch: &Orchestrator, n: i64, at: i64, state: &str, binding_kind: &
             conversation: Some(CONVERSATION.into()),
             target_uri: Some("cairn://p/cairn".into()),
             binding_kind: Some(binding_kind.into()),
+            addressed_by: None,
         },
     )
     .await
@@ -122,7 +123,11 @@ async fn fact(orch: &Orchestrator, n: i64, at: i64, state: &str, binding_kind: &
             project_id: Some("p".into()),
             source: "channel_message".into(),
             identity: format!("channel-message:{inbound}"),
-            record_ref: CairnResource::ChannelsConversations.to_uri(),
+            record_ref: CairnResource::ChannelsConversation {
+                provider: "discord".into(),
+                path: vec!["cairn".into()],
+            }
+            .to_uri(),
             record_id: Some(inbound),
             fields_json: fields.to_string(),
             summary: None,

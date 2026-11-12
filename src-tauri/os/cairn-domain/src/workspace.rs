@@ -100,6 +100,10 @@ pub struct DiscordChannelConfig {
     pub inbound_capabilities: ChannelInboundCapabilities,
     #[serde(default)]
     pub route: MessageClassPolicy,
+    /// The operator's one line on what this provider is for, which agents read
+    /// on `cairn://channels` to choose where a message belongs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 /// Telegram delivery configuration. The bot token is deliberately absent: it
@@ -117,6 +121,9 @@ pub struct TelegramChannelConfig {
     pub inbound_capabilities: ChannelInboundCapabilities,
     #[serde(default)]
     pub route: MessageClassPolicy,
+    /// The operator's one line on what this provider is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 /// Custom deserializer for nullable optional fields in UpdateSettings.
@@ -181,6 +188,9 @@ pub struct IMessageChannelConfig {
     pub inbound_capabilities: ChannelInboundCapabilities,
     #[serde(default)]
     pub route: MessageClassPolicy,
+    /// The operator's one line on what this provider is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
 }
 
 impl Default for IMessageChannelConfig {
@@ -196,6 +206,7 @@ impl Default for IMessageChannelConfig {
                 permission: true,
                 notify: false,
             },
+            purpose: None,
         }
     }
 }

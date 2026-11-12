@@ -229,7 +229,9 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::DevLaunchTicket
-            | Self::ChannelsConversations
+            | Self::Channels
+            | Self::ChannelsProvider { .. }
+            | Self::ChannelsConversation { .. }
             | Self::ChannelsAmbientFeedback
             | Self::Grants
             | Self::Grant { .. }

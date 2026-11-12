@@ -205,6 +205,30 @@ pub async fn configured_conversations_json(
         .expect("conversation rows serialize")
 }
 
+/// The verified desktop operator reading a resource under `cairn://channels`.
+/// Callers must already have checked the desktop operator credential: this is
+/// the one door that reads the channels tree as the operator.
+pub async fn read_as_operator(
+    orch: &crate::orchestrator::Orchestrator,
+    target: &str,
+) -> Result<String, String> {
+    crate::resources::channels::operator_read(orch, target).await
+}
+
+/// The verified desktop operator writing under `cairn://channels` (the purpose
+/// patch). Callers must already have checked the desktop operator credential.
+pub async fn write_as_operator(
+    orch: &crate::orchestrator::Orchestrator,
+    target: &str,
+    mode: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let mode: crate::mcp::types::ChangeMode =
+        serde_json::from_value(serde_json::Value::String(mode.to_string()))
+            .map_err(|_| format!("'{mode}' is not a write mode"))?;
+    crate::resources::channels::operator_write(orch, target, mode, payload).await
+}
+
 /// The operator's `agent_text` toggle on one binding. Callers must already have
 /// established operator authority; see `resources::channels::set_agent_text`.
 pub async fn set_conversation_agent_text(
@@ -1210,6 +1234,7 @@ pub mod ambient_feedback;
 pub mod bindings;
 pub mod discord_surfaces;
 pub mod imessage;
+pub mod label;
 pub mod ledger;
 pub mod router;
 pub mod state_card;

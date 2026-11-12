@@ -286,52 +286,50 @@ fn gate_rejects_the_unknown_key_that_caused_the_misdelivery() {
     assert!(failure.error.contains("Example:"), "{}", failure.error);
 }
 
-/// An agent channel message declares exactly the two keys the handler honours:
-/// anything else (an embed, an attachment) is refused naming the accepted set,
+/// An agent channel message declares exactly the one key the handler honours:
+/// the conversation is the target, so a `conversation` key (the retired
+/// enumeration's shape) or anything else is refused naming the accepted set,
 /// and the advertised example passes the gate as written.
 #[test]
-fn gate_holds_a_channel_message_to_conversation_and_content() {
-    let refused = item(
-        "cairn://channels/conversations",
-        ChangeMode::Append,
-        Some(serde_json::json!({
-            "conversation": "discord:1/2",
-            "content": "hi",
-            "embed": {"title": "x"}
-        })),
-    );
-    let failure = gate(&refused).unwrap_err();
-    assert!(failure.error.contains("`embed`"), "{}", failure.error);
-    assert!(
-        failure.error.contains("conversation") && failure.error.contains("content"),
-        "{}",
-        failure.error
-    );
+fn gate_holds_a_channel_message_to_its_content() {
+    const TARGET: &str = "cairn://channels/discord/cairn/channels";
+    for stray in [
+        serde_json::json!({ "content": "hi", "embed": {"title": "x"} }),
+        serde_json::json!({ "content": "hi", "conversation": "discord:1/2" }),
+    ] {
+        let failure = gate(&item(TARGET, ChangeMode::Append, Some(stray))).unwrap_err();
+        assert!(
+            failure.error.contains("Unknown payload key") && failure.error.contains("content"),
+            "{}",
+            failure.error
+        );
+    }
 
-    let missing = item(
-        "cairn://channels/conversations",
-        ChangeMode::Append,
-        Some(serde_json::json!({ "content": "hi" })),
-    );
+    let missing = item(TARGET, ChangeMode::Append, Some(serde_json::json!({})));
     assert!(gate(&missing)
         .unwrap_err()
         .error
         .contains("Missing required payload key"));
 
     let accepted = item(
-        "cairn://channels/conversations",
+        "cairn://channels/discord/PROJECT/THREAD",
         ChangeMode::Append,
-        Some(serde_json::json!({
-            "conversation": "discord:GUILD/CHANNEL",
-            "content": "..."
-        })),
+        Some(serde_json::json!({ "content": "..." })),
     );
     assert_eq!(
         gate(&accepted).unwrap().label,
-        "send a message to a bound conversation"
+        "send a message to this conversation"
     );
+    // The purpose patch passes the gate; who may make it is the handler's
+    // decision (the verified desktop operator only).
+    let purpose = item(
+        "cairn://channels",
+        ChangeMode::Patch,
+        Some(serde_json::json!({ "provider": "telegram", "purpose": "urgent" })),
+    );
+    assert!(gate(&purpose).is_ok());
     for mode in [ChangeMode::Create, ChangeMode::Patch, ChangeMode::Delete] {
-        let it = item("cairn://channels/conversations", mode, None);
+        let it = item(TARGET, mode, None);
         assert!(gate(&it)
             .unwrap_err()
             .error

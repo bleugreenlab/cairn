@@ -461,7 +461,12 @@ resource_samples! {
     DevPid {} => Parser,
     DevLaunchTicket {} => Parser,
     Logs {} => Parser,
-    ChannelsConversations {} => Parser,
+    Channels {} => Parser,
+    ChannelsProvider { provider: "discord".to_string() } => Parser,
+    ChannelsConversation {
+        provider: "discord".to_string(),
+        path: vec!["cairn".to_string(), "channels".to_string()],
+    } => Parser,
     ChannelsAmbientFeedback {} => Parser,
     Executors {} => Parser,
     Executor { name: "mac-mini".to_string() } => Parser,

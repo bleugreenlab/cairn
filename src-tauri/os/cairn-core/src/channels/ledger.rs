@@ -133,15 +133,62 @@ pub async fn list_active_bindings(db: &LocalDb) -> Result<Vec<ActiveBinding>, St
           WHERE message_classes != 0
           ORDER BY provider, conversation, target_uri",
         (),
-        |row| {
-            Ok(ActiveBinding {
-                provider: row.text(0)?,
-                conversation: row.text(1)?,
-                target_uri: row.text(2)?,
-                message_classes: row.i64(3)?,
-                binding_kind: row.text(4)?,
-            })
-        },
+        active_binding,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn active_binding(row: &Row) -> DbResult<ActiveBinding> {
+    Ok(ActiveBinding {
+        provider: row.text(0)?,
+        conversation: row.text(1)?,
+        target_uri: row.text(2)?,
+        message_classes: row.i64(3)?,
+        binding_kind: row.text(4)?,
+    })
+}
+
+/// The active binding of `kind` that targets `target_uri`, newest first when a
+/// guild change left more than one: the conversation
+/// `cairn://channels/discord/{project}/...` names.
+pub async fn binding_for_target(
+    db: &LocalDb,
+    provider: &str,
+    target_uri: &str,
+    kind: super::bindings::BindingKind,
+) -> Result<Option<ActiveBinding>, String> {
+    db.query_opt(
+        "SELECT provider, conversation, target_uri, message_classes, binding_kind
+           FROM channel_conversation_binding
+          WHERE provider = ?1 AND target_uri = ?2 AND binding_kind = ?3
+            AND message_classes != 0
+          ORDER BY followed_at DESC, conversation
+          LIMIT 1",
+        params![
+            provider.to_string(),
+            target_uri.to_string(),
+            kind.as_str().to_string()
+        ],
+        active_binding,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Every active binding one conversation carries, in target order.
+pub async fn bindings_for_conversation(
+    db: &LocalDb,
+    provider: &str,
+    conversation: &str,
+) -> Result<Vec<ActiveBinding>, String> {
+    db.query_all(
+        "SELECT provider, conversation, target_uri, message_classes, binding_kind
+           FROM channel_conversation_binding
+          WHERE provider = ?1 AND conversation = ?2 AND message_classes != 0
+          ORDER BY target_uri",
+        params![provider.to_string(), conversation.to_string()],
+        active_binding,
     )
     .await
     .map_err(|error| error.to_string())
@@ -1661,9 +1708,13 @@ pub struct InboundRecord {
     /// For an admitted message, the kind of binding that resolved its target:
     /// `structural`, `follow`, `ambient`, or `none`.
     pub binding_kind: Option<String>,
+    /// For a message delivered from an ambient conversation, the address it
+    /// opened with (`@channels`, `<#123>`), space-separated, which the router
+    /// consumed before delivering the rest.
+    pub addressed_by: Option<String>,
 }
 
-const INBOUND_COLUMNS: &str = "id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at, conversation, target_uri, binding_kind";
+const INBOUND_COLUMNS: &str = "id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at, conversation, target_uri, binding_kind, addressed_by";
 
 impl InboundRecord {
     fn from_row(row: &Row) -> DbResult<Self> {
@@ -1679,14 +1730,15 @@ impl InboundRecord {
             conversation: row.opt_text(8)?,
             target_uri: row.opt_text(9)?,
             binding_kind: row.opt_text(10)?,
+            addressed_by: row.opt_text(11)?,
         })
     }
 }
 
 pub async fn insert_inbound(db: &LocalDb, record: &InboundRecord) -> Result<bool, String> {
     db.execute(
-        format!("INSERT OR IGNORE INTO channel_inbound ({INBOUND_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
-        params![record.id.clone(), record.channel.clone(), record.provider_guid.clone(), record.sender.clone(), record.text.clone(), record.received_at, record.rejection_reason.clone(), record.acknowledged_at, record.conversation.clone(), record.target_uri.clone(), record.binding_kind.clone()],
+        format!("INSERT OR IGNORE INTO channel_inbound ({INBOUND_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+        params![record.id.clone(), record.channel.clone(), record.provider_guid.clone(), record.sender.clone(), record.text.clone(), record.received_at, record.rejection_reason.clone(), record.acknowledged_at, record.conversation.clone(), record.target_uri.clone(), record.binding_kind.clone(), record.addressed_by.clone()],
     ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
@@ -1714,6 +1766,290 @@ pub async fn list_inbound(
         params![channel.to_string(), limit.max(0)],
         InboundRecord::from_row,
     ).await.map_err(|error| error.to_string())
+}
+
+/// Which way a conversation message travelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDirection {
+    In,
+    Out,
+}
+
+/// One row of a conversation's history: a `channel_inbound` or a
+/// `channel_outbound` row, projected onto the columns both directions share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationMessage {
+    pub direction: MessageDirection,
+    pub id: String,
+    /// `received_at` inbound, `created_at` outbound (epoch milliseconds).
+    pub at: i64,
+    /// The provider sender id inbound; the outbound `kind`.
+    pub sender: String,
+    pub text: String,
+    /// The rejection reason inbound (NULL when admitted); the outbound status.
+    pub state: Option<String>,
+    /// The target delivered into inbound; the outbound `binding_ref`.
+    pub reference: Option<String>,
+    pub binding_kind: Option<String>,
+    /// The address an ambient message opened with inbound; the last delivery
+    /// error outbound.
+    pub detail: Option<String>,
+    pub attempts: Option<i64>,
+    pub next_attempt_at: Option<i64>,
+    pub sent_at: Option<i64>,
+    pub resolved_at: Option<i64>,
+    pub job_id: Option<String>,
+}
+
+/// Which directions a conversation read takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectionFilter {
+    In,
+    Out,
+    All,
+}
+
+impl DirectionFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::All => "all",
+        }
+    }
+}
+
+/// An outbound row projected onto [`ConversationMessage`]'s columns.
+const OUTBOUND_MESSAGE_COLUMNS: &str = "'out', id, created_at, kind, rendered_text, status, binding_ref, NULL, last_error, attempts, next_attempt_at, sent_at, resolved_at, job_id";
+
+fn conversation_message(row: &Row) -> DbResult<ConversationMessage> {
+    Ok(ConversationMessage {
+        direction: if row.text(0)? == "in" {
+            MessageDirection::In
+        } else {
+            MessageDirection::Out
+        },
+        id: row.text(1)?,
+        at: row.i64(2)?,
+        sender: row.text(3)?,
+        text: row.text(4)?,
+        state: row.opt_text(5)?,
+        reference: row.opt_text(6)?,
+        binding_kind: row.opt_text(7)?,
+        detail: row.opt_text(8)?,
+        attempts: row.opt_i64(9)?,
+        next_attempt_at: row.opt_i64(10)?,
+        sent_at: row.opt_i64(11)?,
+        resolved_at: row.opt_i64(12)?,
+        job_id: row.opt_text(13)?,
+    })
+}
+
+/// The bare form some outbound rows of `conversation` are keyed under: a route
+/// row's Telegram chat id or iMessage handle. Discord rows carry the address.
+fn bare_alias(conversation: &str) -> &str {
+    match conversation.split_once(':') {
+        Some(("telegram" | "imessage", bare)) => bare,
+        _ => conversation,
+    }
+}
+
+/// A conversation's newest `limit` messages at or after `since_ms`, both
+/// directions interleaved, oldest first. `conversation` is the canonical
+/// address. Every row is held to `provider`: a bare alias such as a phone
+/// number can be both an iMessage handle and a Telegram chat id.
+pub async fn conversation_messages(
+    db: &LocalDb,
+    provider: &str,
+    conversation: &str,
+    since_ms: i64,
+    direction: DirectionFilter,
+    limit: i64,
+) -> Result<Vec<ConversationMessage>, String> {
+    let mut rows = db
+        .query_all(
+            format!(
+                "SELECT direction, id, at, sender, text, state, reference, binding_kind, detail,
+                        attempts, next_attempt_at, sent_at, resolved_at, job_id
+                   FROM (
+                     SELECT 'in' AS direction, id, received_at AS at, sender, text,
+                            rejection_reason AS state, target_uri AS reference, binding_kind,
+                            addressed_by AS detail, NULL AS attempts, NULL AS next_attempt_at,
+                            NULL AS sent_at, NULL AS resolved_at, NULL AS job_id
+                       FROM channel_inbound
+                      WHERE channel = ?6 AND conversation = ?1 AND received_at >= ?3
+                        AND ?4 IN ('in', 'all')
+                     UNION ALL
+                     SELECT {OUTBOUND_MESSAGE_COLUMNS}
+                       FROM channel_outbound
+                      WHERE channel = ?6 AND conversation IN (?1, ?2) AND created_at >= ?3
+                        AND ?4 IN ('out', 'all')
+                   )
+                  ORDER BY at DESC, id DESC
+                  LIMIT ?5"
+            ),
+            params![
+                conversation.to_string(),
+                bare_alias(conversation).to_string(),
+                since_ms,
+                direction.as_str().to_string(),
+                limit.max(0),
+                provider.to_string()
+            ],
+            conversation_message,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    rows.reverse();
+    Ok(rows)
+}
+
+/// The acknowledgement a route firing sent, found from the firing itself and
+/// never from a page of messages: by the outbound id a firing recorded as
+/// `channel_outbound:{id}`, or by the route's delivery key
+/// (`route:{route}:channel-message:{inbound}`, with a `:{position}` suffix past
+/// the first sink) under the conversation a channel sink names. Held to
+/// `provider`, as [`conversation_messages`] is.
+pub async fn route_acknowledgement(
+    db: &LocalDb,
+    provider: &str,
+    firing: &InboundFiring,
+) -> Result<Option<ConversationMessage>, String> {
+    let Some(sink) = firing.sink_ref.as_deref() else {
+        return Ok(None);
+    };
+    if let Some(id) = sink.strip_prefix("channel_outbound:") {
+        return db
+            .query_opt(
+                format!(
+                    "SELECT {OUTBOUND_MESSAGE_COLUMNS} FROM channel_outbound
+                      WHERE id = ?1 AND channel = ?2"
+                ),
+                params![id.to_string(), provider.to_string()],
+                conversation_message,
+            )
+            .await
+            .map_err(|error| error.to_string());
+    }
+    if firing.sink_kind != "channel" {
+        return Ok(None);
+    }
+    let key = format!(
+        "route:{}:channel-message:{}",
+        firing.route_id, firing.inbound_id
+    );
+    db.query_opt(
+        format!(
+            "SELECT {OUTBOUND_MESSAGE_COLUMNS} FROM channel_outbound
+              WHERE channel = ?1 AND conversation IN (?2, ?3) AND kind = 'route'
+                AND (binding_ref = ?4 OR (binding_ref > ?4 || ':' AND binding_ref < ?4 || ';'))
+              ORDER BY created_at, id
+              LIMIT 1"
+        ),
+        params![
+            provider.to_string(),
+            sink.to_string(),
+            bare_alias(sink).to_string(),
+            key
+        ],
+        conversation_message,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// The newest activity on each of a provider's conversations, in epoch
+/// milliseconds: its latest inbound receipt or outbound send (or, unsent, its
+/// creation). Keys are the conversation strings rows carry, which for a route
+/// row on Telegram or iMessage is the bare chat id or handle.
+pub async fn last_activity(
+    db: &LocalDb,
+    provider: &str,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let rows = db
+        .query_all(
+            "SELECT conversation, MAX(at) FROM (
+                 SELECT conversation, received_at AS at FROM channel_inbound
+                  WHERE channel = ?1 AND conversation IS NOT NULL
+                 UNION ALL
+                 SELECT conversation, COALESCE(sent_at, created_at) FROM channel_outbound
+                  WHERE channel = ?1
+               )
+              GROUP BY conversation",
+            params![provider.to_string()],
+            |row| Ok((row.text(0)?, row.i64(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(rows.into_iter().collect())
+}
+
+/// When the operator last wrote on a provider: its newest admitted inbound.
+pub async fn last_operator_message(db: &LocalDb, provider: &str) -> Result<Option<i64>, String> {
+    db.query_opt(
+        "SELECT MAX(received_at) FROM channel_inbound
+          WHERE channel = ?1 AND target_uri IS NOT NULL",
+        params![provider.to_string()],
+        |row| row.opt_i64(0),
+    )
+    .await
+    .map(Option::flatten)
+    .map_err(|error| error.to_string())
+}
+
+/// One route firing a `channel_message` fact caused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundFiring {
+    /// The `channel_inbound` id whose fact fired it.
+    pub inbound_id: String,
+    pub route_id: String,
+    pub status: String,
+    pub drop_reason: Option<String>,
+    pub error: Option<String>,
+    pub sink_kind: String,
+    pub sink_ref: Option<String>,
+}
+
+/// The route firings each inbound message's `channel_message` fact caused, in
+/// firing order. A fact's identity is `channel-message:{inbound id}`.
+pub async fn firings_for_inbound(
+    db: &LocalDb,
+    inbound_ids: &[String],
+) -> Result<Vec<InboundFiring>, String> {
+    let mut firings = Vec::new();
+    for chunk in inbound_ids.chunks(cairn_db::sql::IN_LIST_CHUNK) {
+        let binds = chunk
+            .iter()
+            .map(|id| cairn_db::turso::Value::Text(format!("channel-message:{id}")))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT fact_identity, route_id, status, drop_reason, error, sink_kind, sink_ref
+               FROM route_firings
+              WHERE fact_identity IN ({})
+              ORDER BY created_at, seq",
+            cairn_db::sql::placeholders(chunk.len())
+        );
+        firings.extend(
+            db.query_all(sql, binds, |row| {
+                let identity = row.text(0)?;
+                Ok(InboundFiring {
+                    inbound_id: identity
+                        .strip_prefix("channel-message:")
+                        .unwrap_or(&identity)
+                        .to_string(),
+                    route_id: row.text(1)?,
+                    status: row.text(2)?,
+                    drop_reason: row.opt_text(3)?,
+                    error: row.opt_text(4)?,
+                    sink_kind: row.text(5)?,
+                    sink_ref: row.opt_text(6)?,
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(firings)
 }
 
 pub async fn mark_inbound_acknowledged(
@@ -2975,6 +3311,7 @@ mod tests {
             conversation: None,
             target_uri: None,
             binding_kind: None,
+            addressed_by: None,
         };
         assert!(insert_inbound(&db, &inbound).await.unwrap());
         let mut duplicate = inbound.clone();

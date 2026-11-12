@@ -2526,6 +2526,7 @@ externalReplies: disabled
                     permission: false,
                     notify: true,
                 },
+                purpose: Some("urgent asks reach the operator's phone".to_string()),
             },
             telegram: TelegramChannelConfig {
                 enabled: true,
@@ -2537,6 +2538,7 @@ externalReplies: disabled
                     permission: true,
                     notify: false,
                 },
+                purpose: None,
             },
             discord: DiscordChannelConfig {
                 enabled: true,
@@ -2548,6 +2550,7 @@ externalReplies: disabled
                     free_text: false,
                 },
                 route: MessageClassPolicy::default(),
+                purpose: None,
             },
         };
         let settings = Settings {

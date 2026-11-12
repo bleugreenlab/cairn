@@ -1,7 +1,8 @@
 //! Agent-authored free text sent to a bound channel conversation.
 //!
-//! The write side (`write cairn://channels/conversations`, append) admits a send
-//! and [`enqueue`]s it; the provider's router delivers it through the same
+//! The write side (an append to the conversation's own resource,
+//! `cairn://channels/{provider}/{conversation}`) admits a send and
+//! [`enqueue`]s it; the provider's router delivers it through the same
 //! `channel_outbound` intent, claim, retry, and failure path every other outbound
 //! uses. This module holds the grammar the two sides share: the ledger kind, the
 //! `binding_ref` that records the sender, and the context header rendered above

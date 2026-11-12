@@ -304,7 +304,9 @@ impl CairnResource {
             | Self::DevPid
             | Self::DevLaunchTicket
             | Self::Logs
-            | Self::ChannelsConversations
+            | Self::Channels
+            | Self::ChannelsProvider { .. }
+            | Self::ChannelsConversation { .. }
             | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }
@@ -520,7 +522,9 @@ impl CairnResource {
             | Self::DevPid
             | Self::DevLaunchTicket
             | Self::Logs
-            | Self::ChannelsConversations
+            | Self::Channels
+            | Self::ChannelsProvider { .. }
+            | Self::ChannelsConversation { .. }
             | Self::ChannelsAmbientFeedback
             | Self::Executors
             | Self::Executor { .. }

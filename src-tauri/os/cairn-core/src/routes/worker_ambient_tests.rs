@@ -26,6 +26,8 @@ const PROJECT: &str = "cairn";
 const FIRST: &str = "discord:1/2";
 const SECOND: &str = "discord:3/4";
 const HINT: &str = "Start with @thread or #channel to route it.";
+/// How the route's body names an ambient conversation of `PROJECT`.
+const AMBIENT_LABEL: &str = "#ambient · cairn · Discord";
 
 /// Each acknowledgement sink's ordinal among the route's sinks, which numbers
 /// its delivery key; `deliver` is ordinal 0.
@@ -189,6 +191,7 @@ async fn seed(orch: &Orchestrator, inbound: &Inbound<'_>) -> i64 {
             conversation: Some(inbound.conversation.into()),
             target_uri: Some(target.clone()),
             binding_kind: Some(inbound.binding_kind.into()),
+            addressed_by: None,
         },
     )
     .await
@@ -197,7 +200,9 @@ async fn seed(orch: &Orchestrator, inbound: &Inbound<'_>) -> i64 {
         ("project".to_string(), json!(PROJECT)),
         ("provider".to_string(), json!(inbound.provider)),
         ("conversation".to_string(), json!(inbound.conversation)),
+        ("conversationLabel".to_string(), json!(AMBIENT_LABEL)),
         ("sender".to_string(), json!(inbound.sender)),
+        ("senderLabel".to_string(), json!("operator")),
         ("receivedAt".to_string(), json!(received_at)),
         ("bindingKind".to_string(), json!(inbound.binding_kind)),
         ("target".to_string(), json!(target)),
@@ -215,7 +220,11 @@ async fn seed(orch: &Orchestrator, inbound: &Inbound<'_>) -> i64 {
                 origin: None,
                 route_provenance: None,
             },
-            record_ref: CairnResource::ChannelsConversations.to_uri(),
+            record_ref: CairnResource::ChannelsConversation {
+                provider: "discord".into(),
+                path: vec![PROJECT.into()],
+            }
+            .to_uri(),
             record_id: Some(inbound.id.into()),
             project_id: Some("p"),
             presence: Presence::Away,
@@ -403,9 +412,9 @@ fn citation(name: &str, probability: &str, method: &str) -> String {
     )
 }
 
-fn delivered(citations: &str, conversation: &str, sender: &str, event: &str, text: &str) -> String {
+fn delivered(citations: &str, event: &str, text: &str) -> String {
     format!(
-        "Decision: {citations}.\nVia ambient Discord channel {conversation}, from {sender}. Event {event}.\nIf this isn't yours, answer the event: write cairn://channels/ambient/feedback {{event, verdict: not_mine | reroute, to?}}.\n\n{text}\n"
+        "Decision: {citations}.\nVia {AMBIENT_LABEL}, from operator. Event {event}.\nIf this isn't yours, answer the event: write cairn://channels/ambient/feedback {{event, verdict: not_mine | reroute, to?}}.\n\n{text}\n"
     )
 }
 
@@ -561,7 +570,7 @@ async fn one_admitted_thread_hears_the_message_and_the_conversation_hears_where_
         event,
         format!("cairn://p/{PROJECT}/events/{}", routed.row.id)
     );
-    let body = delivered(&devops, FIRST, "ada", &event, inbound.text);
+    let body = delivered(&devops, &event, inbound.text);
     assert_eq!(
         thread_messages(&orch).await,
         [("devops".to_string(), format!("route:{ROUTE}"), body.clone())]
@@ -644,7 +653,7 @@ async fn two_admitted_threads_each_hear_it_and_one_acknowledgement_cites_both_in
     assert_ne!(revision(charter("devops")), revision(charter("docs")));
     let citations = format!("{devops}, {docs}");
     let event = event_of(&routed);
-    let body = delivered(&citations, FIRST, "grace", &event, inbound.text);
+    let body = delivered(&citations, &event, inbound.text);
     let sender = format!("route:{ROUTE}");
     let messages = thread_messages(&orch).await;
     assert_eq!(
@@ -1061,18 +1070,12 @@ async fn each_conversation_hears_about_its_own_message() {
             (
                 "devops".to_string(),
                 sender.clone(),
-                delivered(&devops, FIRST, "ada", &event_of(&routed_first), first.text)
+                delivered(&devops, &event_of(&routed_first), first.text)
             ),
             (
                 "docs".to_string(),
                 sender,
-                delivered(
-                    &docs,
-                    SECOND,
-                    "grace",
-                    &event_of(&routed_second),
-                    second.text
-                )
+                delivered(&docs, &event_of(&routed_second), second.text)
             ),
         ]
     );

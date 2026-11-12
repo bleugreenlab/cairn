@@ -70,6 +70,11 @@ pub enum DispatchOrigin {
     /// carried its call. It is limited and labelled as [`Self::UnverifiedLocal`]
     /// is: the relay proves which process called, not who stands behind it.
     RelayedRunLessProcess(RelayedProcess),
+    /// This install's verified desktop operator, set only by the runner's
+    /// channels door (`read_channel_resource` / `write_channel_resource`)
+    /// after the invoke presented the desktop operator credential, which the
+    /// native proxy attaches for the main webview alone.
+    DesktopOperator,
 }
 
 /// The resident process a relay verified a call came from.
@@ -163,9 +168,18 @@ impl CallbackRequest {
     pub fn row_write_origin(&self) -> Option<&RowWriteOrigin> {
         match &self.origin {
             Some(DispatchOrigin::RowWrite(origin)) => Some(&**origin),
-            Some(DispatchOrigin::UnverifiedLocal | DispatchOrigin::RelayedRunLessProcess(_))
+            Some(
+                DispatchOrigin::UnverifiedLocal
+                | DispatchOrigin::RelayedRunLessProcess(_)
+                | DispatchOrigin::DesktopOperator,
+            )
             | None => None,
         }
+    }
+
+    /// Whether this request was made by the verified desktop operator.
+    pub fn is_desktop_operator(&self) -> bool {
+        self.origin == Some(DispatchOrigin::DesktopOperator)
     }
 
     /// The run-less resident process a relay verified this request came from.

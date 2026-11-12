@@ -2713,7 +2713,7 @@ mod tests {
     async fn sink_body_templates_render_transformed_text_and_projected_provenance() {
         let temp = tempfile::tempdir().unwrap();
         let (orch, _) = orchestrator(temp.path(), &[]).await;
-        let template = "Routed to {{answers.thread.citations}}.\nVia ambient Discord channel {{conversation}} from {{sender}}. If this isn't yours, say so.\n{{text}}";
+        let template = "Routed to {{answers.thread.citations}}.\nVia {{conversationLabel}} from {{senderLabel}}. If this isn't yours, say so.\n{{text}}";
         let route = body_route("message", Some(template));
         // Exercise the delivery's existing flat fields, including producer text,
         // instead of looking answers up again from the graph.
@@ -2728,8 +2728,11 @@ mod tests {
                 "text".into(),
                 serde_json::json!("transformed producer text"),
             ),
-            ("conversation".into(), serde_json::json!("discord:G/C")),
-            ("sender".into(), serde_json::json!("Ada")),
+            (
+                "conversationLabel".into(),
+                serde_json::json!("#ambient · cairn · Discord"),
+            ),
+            ("senderLabel".into(), serde_json::json!("operator")),
             (
                 "answers.thread.citations".into(),
                 serde_json::json!([
@@ -2752,7 +2755,7 @@ mod tests {
             position: 0,
         };
         let preview = sink_preview(&orch, &delivery, &bindings).await;
-        assert_eq!(preview["text"], "Routed to devops (0.82, native, rev 1a2b3c4d5e6f), execution (0.61, native, rev 9f8e7d6c5b4a).\nVia ambient Discord channel discord:G/C from Ada. If this isn't yours, say so.\ntransformed producer text");
+        assert_eq!(preview["text"], "Routed to devops (0.82, native, rev 1a2b3c4d5e6f), execution (0.61, native, rev 9f8e7d6c5b4a).\nVia #ambient · cairn · Discord from operator. If this isn't yours, say so.\ntransformed producer text");
         assert!(route.contains("body:"));
     }
 
