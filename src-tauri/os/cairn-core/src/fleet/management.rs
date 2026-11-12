@@ -3035,7 +3035,8 @@ fn check_selectable(
                 .map(|declared| declared.key.to_string())
                 .collect();
         return Err(format!(
-            "no installed pack declares the machine service {key} (installed: {})",
+            "{} (machine services installed: {})",
+            crate::project_services::pack_source::undeclared_reason(&orch.config_dir, key),
             if known.is_empty() {
                 "none".to_string()
             } else {

@@ -1278,6 +1278,7 @@ pub mod test_support {
             keywords: vec![],
             default: false,
             retired: vec![],
+            services: vec![],
             format: pack::PackFormat::Cairn,
             notes: vec![],
             root: PathBuf::new(),

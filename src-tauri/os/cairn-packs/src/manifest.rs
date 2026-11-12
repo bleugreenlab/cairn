@@ -34,6 +34,8 @@ use crate::lock::PackSourceKind;
 pub const MANIFEST_FILE: &str = "cairn-pack.yaml";
 /// Where a pack's machine services live, in its source and in the workspace.
 pub const SERVICES_DIR: &str = "services";
+/// The one file a pack's service directory holds: its declaration.
+pub const SERVICE_MANIFEST_FILE: &str = "service.yaml";
 /// Claude Code's plugin manifest, relative to the pack root.
 pub const CLAUDE_PLUGIN_MANIFEST: &str = ".claude-plugin/plugin.json";
 /// A pack's MCP server definitions, native form.
@@ -277,6 +279,13 @@ pub struct PackManifest {
     /// workspace holding a stale copy; listing it here removes it when it is
     /// still pack-owned.
     pub retired: Vec<String>,
+    /// Machine services this pack ships, by id. Contents are otherwise
+    /// discovered, but a service only ever runs from the app bundle's own
+    /// declaration, so a pack names the ones it ships in its manifest, which
+    /// every build carries: a build whose bundle left a declaration out then
+    /// says so ([`Self::missing_services`]) instead of reading as a pack that
+    /// never had it.
+    pub services: Vec<String>,
     pub format: PackFormat,
     /// Ingest warnings surfaced on the catalog — components of a foreign pack
     /// format that Cairn has no equivalent for and skipped.
@@ -301,6 +310,8 @@ struct RawManifest {
     default: bool,
     #[serde(default)]
     retired: Vec<String>,
+    #[serde(default)]
+    services: Vec<String>,
 }
 
 /// Claude Code plugin components Cairn has no equivalent for. Their presence is
@@ -406,6 +417,7 @@ fn load_claude_plugin(
         // A foreign pack is never part of Cairn's default set.
         default: false,
         retired: Vec::new(),
+        services: Vec::new(),
     };
 
     let mut notes = Vec::new();
@@ -460,6 +472,7 @@ fn from_raw(
         keywords: raw.keywords,
         default: raw.default,
         retired: raw.retired,
+        services: raw.services,
         format,
         notes,
         root: root.to_path_buf(),
@@ -524,6 +537,23 @@ impl PackManifest {
         let mut items = discover_items(&self.root);
         items.extend(self.mcp_server_names().into_iter().map(PackItem::mcp));
         items
+    }
+
+    /// The services [`Self::services`] names that this tree carries no
+    /// declaration for: a build whose bundle omitted the file.
+    pub fn missing_services(&self) -> Vec<String> {
+        self.services
+            .iter()
+            .filter(|id| {
+                !self
+                    .root
+                    .join(SERVICES_DIR)
+                    .join(id.as_str())
+                    .join(SERVICE_MANIFEST_FILE)
+                    .is_file()
+            })
+            .cloned()
+            .collect()
     }
 
     /// What installing this pack from a source of `kind` puts in the workspace:
@@ -628,7 +658,7 @@ pub fn discover_items(root: &Path) -> Vec<PackItem> {
                     }
                 }
                 "services" => {
-                    if path.is_dir() && path.join("service.yaml").is_file() {
+                    if path.is_dir() && path.join(SERVICE_MANIFEST_FILE).is_file() {
                         items.push(PackItem::file(PackItemKind::Service, file_name, rel));
                     }
                 }
@@ -692,6 +722,22 @@ mod tests {
             )]
         );
         assert_eq!(PackItemKind::parse("service"), Some(PackItemKind::Service));
+    }
+
+    #[test]
+    fn a_service_the_manifest_names_and_the_tree_lacks_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("kit");
+        write(
+            &root.join(MANIFEST_FILE),
+            "id: kit\nname: Kit\nversion: 1.0.0\nservices: [axon, gone]\n",
+        );
+        write(&root.join("services/axon/service.yaml"), "name: Axon\n");
+        std::fs::create_dir_all(root.join("services/gone")).unwrap();
+
+        let manifest = load(&root).unwrap();
+        assert_eq!(manifest.services, ["axon", "gone"]);
+        assert_eq!(manifest.missing_services(), ["gone"]);
     }
 
     #[test]

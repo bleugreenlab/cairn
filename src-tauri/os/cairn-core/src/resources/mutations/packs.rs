@@ -330,6 +330,7 @@ pub fn export_agent_plugin(
         keywords: lock.keywords.clone(),
         default: false,
         retired: vec![],
+        services: vec![],
         format: pack::PackFormat::AgentPlugin,
         notes: lock.notes.clone(),
         root: orch.config_dir.clone(),

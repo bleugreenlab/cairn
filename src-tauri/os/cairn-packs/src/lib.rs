@@ -360,6 +360,34 @@ mod tests {
         assert!(available_pack(resources, "linear").is_none());
     }
 
+    /// A shipped pack names every service it ships and ships every service it
+    /// names, so a bundle that drops a declaration is caught by the manifest it
+    /// still carries.
+    #[test]
+    fn shipped_packs_name_exactly_the_services_they_ship() {
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let packs = discover_available_packs(&resources);
+        assert!(packs.iter().any(|pack| pack.id == "axon"), "{resources:?}");
+        for pack in packs {
+            assert!(
+                pack.missing_services().is_empty(),
+                "pack {} names services it does not ship: {:?}",
+                pack.id,
+                pack.missing_services()
+            );
+            for item in pack.items() {
+                if item.kind == PackItemKind::Service {
+                    assert!(
+                        pack.services.contains(&item.id),
+                        "pack {} ships services/{} but its cairn-pack.yaml does not name it under `services:`",
+                        pack.id,
+                        item.id
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn content_hash_tracks_content_and_paths() {
         let temp = TempDir::new().unwrap();

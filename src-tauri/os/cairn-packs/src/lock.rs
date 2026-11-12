@@ -528,6 +528,7 @@ mod tests {
             keywords: vec![],
             default: false,
             retired: vec![],
+            services: vec![],
             format: PackFormat::Cairn,
             notes: vec![],
             root: PathBuf::from("/src"),

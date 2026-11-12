@@ -1268,7 +1268,7 @@ fn fleet_state(
     match &declared.package {
         None => {
             return InstanceState::NotInstalled {
-                reason: format!("no installed pack declares {key}"),
+                reason: declared.absent_reason(),
             }
         }
         Some(Err(error)) => {
@@ -1375,9 +1375,15 @@ struct Declared {
     package: Option<Result<ServicePackage, String>>,
     /// Why the pack's own artifact may not run.
     refusal: Option<String>,
+    /// Why nothing declares the key, when nothing does.
+    absent: Option<String>,
 }
 
 impl Declared {
+    fn absent_reason(&self) -> String {
+        self.absent.clone().unwrap_or_default()
+    }
+
     fn shipped(&self) -> Option<&ServicePackage> {
         self.package
             .as_ref()
@@ -1405,11 +1411,16 @@ fn declared(orch: &Orchestrator, key: &MachineServiceKey) -> Declared {
         .into_iter()
         .find(|(pack, _)| *pack == key.pack)
         .map(|(_, source)| source);
+    let package = source
+        .as_ref()
+        .and_then(|source| source.package(&key.service).transpose());
+    let absent = package
+        .is_none()
+        .then(|| super::super::pack_source::undeclared_reason(&orch.config_dir, key));
     Declared {
-        package: source
-            .as_ref()
-            .and_then(|source| source.package(&key.service).transpose()),
+        package,
         refusal: source.and_then(|source| source.refusal(&key.service)),
+        absent,
     }
 }
 
@@ -1437,7 +1448,6 @@ fn instance(
     let machine_cell = cell.as_ref().and_then(|cell| cell.machine.as_ref());
     let probe = machine_cell.and_then(|machine_cell| machine_cell.probe.lock().unwrap().clone());
     let state = derive_state(
-        key,
         selection,
         declared,
         view,
@@ -1548,7 +1558,6 @@ fn holding<'a>(
 
 /// An instance's state, for everything that reports or announces one.
 fn derive_state(
-    key: &MachineServiceKey,
     selection: &MachineSelection,
     declared: &Declared,
     view: Option<&MachineView>,
@@ -1567,7 +1576,7 @@ fn derive_state(
     }
     match (&declared.package, &declared.refusal) {
         (None, _) => InstanceState::NotInstalled {
-            reason: format!("no installed pack declares {key}"),
+            reason: declared.absent_reason(),
         },
         (Some(Err(error)), _) => InstanceState::Failed {
             reason: format!("its declaration does not parse: {error}"),
@@ -1613,7 +1622,6 @@ pub(super) fn announce_state(orch: &Orchestrator, cell: &Arc<Cell>) -> bool {
         .and_then(|cell| cell.machine.as_ref())
         .and_then(|machine_cell| machine_cell.probe.lock().unwrap().clone());
     let state = derive_state(
-        key,
         selection,
         &declared,
         view.as_ref(),

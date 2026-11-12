@@ -487,6 +487,11 @@ pub struct PackCatalogEntry {
     pub installed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Machine services the shipped manifest names that this build's app
+    /// bundle carries no declaration for. No machine can run one until a build
+    /// that carries it is installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_services: Vec<String>,
     /// Every item the pack carries, including the ones the user removed, sorted
     /// by kind then id.
     pub items: Vec<PackCatalogItem>,
@@ -844,6 +849,11 @@ fn project(
             .unwrap_or_default(),
         installed_at: view.installed.as_ref().map(|l| l.installed_at.clone()),
         notes: view.notes(),
+        missing_services: view
+            .available
+            .as_ref()
+            .map(PackManifest::missing_services)
+            .unwrap_or_default(),
         counts: counts
             .into_iter()
             .map(|(kind, count)| PackContentCount {
@@ -1512,8 +1522,21 @@ fn render_web_services(out: &mut String, entry: &PackCatalogEntry) {
 }
 
 fn render_items(out: &mut String, entry: &PackCatalogEntry) {
+    for service in &entry.missing_services {
+        out.push_str(&format!(
+            "- service `{service}`: declaration missing from this build. The pack's manifest names \
+             it, but this app's bundle has no `packs/{pack}/services/{service}/service.yaml`, so no \
+             machine can run `{pack}/{service}`. A build that carries the file declares it again \
+             at its next start.\n",
+            pack = entry.id
+        ));
+    }
     if entry.items.is_empty() {
-        out.push_str("No contents.\n\n");
+        if entry.missing_services.is_empty() {
+            out.push_str("No contents.\n\n");
+        } else {
+            out.push('\n');
+        }
         return;
     }
 
@@ -2019,6 +2042,7 @@ mod tests {
             keywords: vec![],
             installed_at: Some("2026-01-01T00:00:00Z".into()),
             notes: vec![],
+            missing_services: vec![],
             items: vec![
                 PackCatalogItem {
                     shadowed_by: Some("~".into()),
@@ -2087,6 +2111,36 @@ mod tests {
         assert!(page.contains("## Removed by you"), "{page}");
         assert!(page.contains("- mcp `matlab`"), "{page}");
         assert!(page.contains("Source: Bundled\n"), "{page}");
+    }
+
+    /// A pack installed from a bundle that lost its service declaration says
+    /// the build is missing it, never that the pack has no contents.
+    #[test]
+    fn a_service_missing_from_this_build_is_named_on_the_page() {
+        let pack = PackCatalogEntry {
+            id: "axon".into(),
+            items: vec![],
+            counts: vec![],
+            shadowed_count: 0,
+            missing_services: vec!["axon".into()],
+            ..entry()
+        };
+        let page = render_pack(&pack);
+        assert!(!page.contains("No contents"), "{page}");
+        assert!(
+            page.contains("- service `axon`: declaration missing from this build"),
+            "{page}"
+        );
+        assert!(
+            page.contains("`packs/axon/services/axon/service.yaml`"),
+            "{page}"
+        );
+
+        let empty = PackCatalogEntry {
+            missing_services: vec![],
+            ..pack
+        };
+        assert!(render_pack(&empty).contains("No contents."));
     }
 
     /// Every entry says where it came from and what it runs, and a pending

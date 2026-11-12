@@ -118,6 +118,7 @@ pub fn load(root: &Path) -> Result<AgentPlugin, String> {
             .unwrap_or_default(),
         default: false,
         retired: Vec::new(),
+        services: Vec::new(),
         format: PackFormat::AgentPlugin,
         notes: diagnostics.clone(),
         root,

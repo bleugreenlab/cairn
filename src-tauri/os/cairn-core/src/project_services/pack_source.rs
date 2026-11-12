@@ -250,6 +250,34 @@ pub(crate) fn declared_machine_service(
         .find(|declared| &declared.key == key)
 }
 
+/// Why no installed pack declares `key`, in the terms that point at the fix:
+/// the pack is not installed, the user removed the service, the pack came from
+/// a source that cannot declare services, or this build's app bundle lacks a
+/// declaration the pack's own manifest names.
+pub(crate) fn undeclared_reason(config_dir: &Path, key: &MachineServiceKey) -> String {
+    let (pack, service) = (&key.pack, &key.service);
+    let Some(lock) = installed_lock(config_dir, pack) else {
+        return format!("no installed pack declares {key}");
+    };
+    if lock.is_removed(PackItemKind::Service, service) {
+        return format!("{key} was removed from pack {pack}; restore it at cairn://packs/{pack}");
+    }
+    if lock.source.kind != cairn_packs::lock::PackSourceKind::Bundled {
+        return format!(
+            "pack {pack} is not installed from the app bundle, and only the app bundle declares machine services"
+        );
+    }
+    let shipped = cairn_packs::source_dir(config_dir)
+        .and_then(|resources| cairn_packs::available_pack(&resources, pack));
+    match shipped {
+        None => format!("pack {pack} is installed, but this build's app bundle does not ship it"),
+        Some(manifest) if manifest.missing_services().contains(service) => format!(
+            "the declaration is missing from this build: pack {pack}'s manifest names service {service}, but the app bundle has no packs/{pack}/services/{service}/{MANIFEST_FILE}"
+        ),
+        Some(_) => format!("installed pack {pack} declares no service {service}"),
+    }
+}
+
 /// The hash a native package's bytes give, for a test's expectation.
 #[cfg(test)]
 pub(crate) fn manifest_hash(bytes: &[u8]) -> String {
@@ -434,6 +462,54 @@ mod tests {
             panic!("a declaration without a size must be refused");
         };
         assert!(error.contains("`size`"), "{error}");
+    }
+
+    /// A bundle built without a service's declaration installs its pack with
+    /// the manifest alone. Nothing declares the service, and the reason says
+    /// the build lost it rather than that it was never installed.
+    #[test]
+    fn a_declaration_missing_from_the_bundle_is_named_as_missing_from_this_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, resources) = (dir.path().join("home"), dir.path().join("resources"));
+        let root = resources.join("packs/kit");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("cairn-pack.yaml"),
+            "id: kit\nname: Kit\nversion: 1.0.0\nservices: [probe]\n",
+        )
+        .unwrap();
+        cairn_packs::sync_one_pack(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            &resources,
+            &home,
+            "kit",
+        )
+        .unwrap();
+
+        assert!(declared_machine_service(&home, &key()).is_none());
+        let reason = undeclared_reason(&home, &key());
+        assert!(reason.contains("missing from this build"), "{reason}");
+        assert!(
+            reason.contains("packs/kit/services/probe/service.yaml"),
+            "{reason}"
+        );
+
+        let other: MachineServiceKey = "kit/other".parse().unwrap();
+        assert_eq!(
+            undeclared_reason(&home, &other),
+            "installed pack kit declares no service other"
+        );
+        let absent: MachineServiceKey = "nope/probe".parse().unwrap();
+        assert_eq!(
+            undeclared_reason(&home, &absent),
+            "no installed pack declares nope/probe"
+        );
+
+        // The rebuilt bundle carries it: declared at once, from the bundle.
+        std::fs::create_dir_all(root.join("services/probe")).unwrap();
+        std::fs::write(root.join("services/probe/service.yaml"), AXON).unwrap();
+        assert!(declared_machine_service(&home, &key()).is_some());
     }
 
     #[test]
