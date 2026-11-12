@@ -12704,6 +12704,7 @@ mod running_now_tests {
             measured_at_unix_ms: 58_000,
             quality: MeasurementQuality::Sampled,
             quiet_window: None,
+            scheduling: None,
         });
         let rendered = render_running_now(&snapshot, None, 60_000);
         assert!(
