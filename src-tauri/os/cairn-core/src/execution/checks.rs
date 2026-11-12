@@ -18018,7 +18018,7 @@ cairn-common = { path = "../cairn-common" }
                 | "workspace-compile"
                 | "source-scans"
                 | "third-party-notices" => &["bun", "rust"],
-                "executor-windows-check" | "executor-macos-check" => &["rust"],
+                "executor-windows-check" | "executor-macos-check" | "core-macos-check" => &["rust"],
                 _ if check
                     .command
                     .split_whitespace()
@@ -18036,19 +18036,32 @@ cairn-common = { path = "../cairn-common" }
     }
 
     #[test]
-    fn repository_executor_compile_checks_cover_macos_and_windows_all_targets() {
+    fn repository_native_compile_checks_cover_macos_and_windows_all_targets() {
         let config = include_str!("../../../../../.cairn/config.yaml");
         let (settings, _) = crate::config::project_settings::parse_project_settings(config)
             .expect("repository project config must parse");
         let contract = crate::config::project_settings::checks_contract_from(settings)
             .expect("repository must declare checks");
 
-        for (name, target, platform) in [
-            ("executor-macos-check", None, "macos"),
+        for (name, target, platform, selection) in [
+            (
+                "executor-macos-check",
+                None,
+                "macos",
+                "-p cairn-exec -p cairn-common",
+            ),
             (
                 "executor-windows-check",
                 Some("x86_64-pc-windows-msvc"),
                 "windows",
+                "-p cairn-exec -p cairn-common",
+            ),
+            // Without the feature a cairn-core test build is a compile_error!.
+            (
+                "core-macos-check",
+                None,
+                "macos",
+                "-p cairn-core --features cairn-core/test-utils",
             ),
         ] {
             let check = contract
@@ -18087,8 +18100,8 @@ cairn-common = { path = "../cairn-common" }
                 "{name} must compile test targets as well as the library"
             );
             assert!(
-                check.command.contains("-p cairn-exec -p cairn-common"),
-                "{name} covers both executor protocol crates"
+                check.command.contains(selection),
+                "{name} compiles the intended crates: {selection}"
             );
         }
     }
