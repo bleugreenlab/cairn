@@ -1663,7 +1663,7 @@ fn probe_version(entrypoint: &Path, env: &[(&str, &str)]) -> Option<String> {
 fn wait_off_runtime<T>(wait: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(wait)
+            cairn_platform::runtime_regions::hand_off_and_block(wait)
         }
         _ => wait(),
     }

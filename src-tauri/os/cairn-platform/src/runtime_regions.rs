@@ -19,6 +19,14 @@
 //! ([`sample_cpu`]), keeping a baseline per unpark. A report then says how much
 //! of a worker's unparked time it actually spent on a CPU, at no cost to the
 //! worker's park and unpark path.
+//!
+//! `tokio::task::block_in_place` breaks the park hooks' bookkeeping: it hands
+//! the calling worker's core to a replacement thread, and the caller finishes
+//! its blocking section, drives its task to completion, and then waits in the
+//! blocking pool's idle loop, where no worker park hook fires. Its running
+//! clock would never stop. Every handoff therefore goes through
+//! [`hand_off_and_block`], which stops the clock first and marks the thread as
+//! handed off for the length of the section.
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -32,6 +40,9 @@ struct ThreadSlot {
     /// Nanoseconds since [`origin`] at which this worker last unparked; zero
     /// while parked, and always zero on a thread that is not a runtime worker.
     running_since: AtomicU64,
+    /// Nanoseconds since [`origin`] at which this thread entered the
+    /// outermost [`hand_off_and_block`] it is inside; zero outside one.
+    handed_off_since: AtomicU64,
     regions: Mutex<Vec<ActiveRegion>>,
     cpu_clock: ThreadCpuClock,
     /// The interval [`sample_cpu`] last baselined: the `running_since` of a
@@ -48,6 +59,10 @@ impl ThreadSlot {
         let running_since = self.running_since.load(Ordering::Acquire);
         if running_since != 0 {
             return running_since;
+        }
+        let handed_off_since = self.handed_off_since.load(Ordering::Acquire);
+        if handed_off_since != 0 {
+            return handed_off_since;
         }
         self.regions
             .try_lock()
@@ -198,8 +213,12 @@ pub struct ThreadReport {
     /// Not the duration of any one task: a worker that keeps finding ready
     /// work never parks.
     pub running_for: Option<Duration>,
+    /// How long this thread has been inside [`hand_off_and_block`]; `None`
+    /// outside one. A handed-off thread holds no core and is not a worker.
+    pub handed_off_for: Option<Duration>,
     /// CPU time the thread used over the interval reported (since it
-    /// unparked, or since its region began), when the platform can say.
+    /// unparked, since it handed its core off, or since its region began),
+    /// when the platform can say.
     pub cpu: Option<Duration>,
     /// The innermost region the thread is in, if any.
     pub region: Option<RegionReport>,
@@ -258,6 +277,7 @@ fn with_slot<R>(f: impl FnOnce(&ThreadSlot) -> R) -> Option<R> {
                     .to_string(),
                 runtime: OnceLock::new(),
                 running_since: AtomicU64::new(0),
+                handed_off_since: AtomicU64::new(0),
                 regions: Mutex::new(Vec::new()),
                 cpu_clock: ThreadCpuClock::current(),
                 cpu_epoch: AtomicU64::new(0),
@@ -289,6 +309,51 @@ pub fn mark_running() {
 /// The current worker is about to park. Install as `on_thread_park`.
 pub fn mark_parked() {
     with_slot(|slot| slot.running_since.store(0, Ordering::Release));
+}
+
+/// Run `blocking` with `tokio::task::block_in_place`, the one way the tree
+/// hands a worker's core away. Must be called on a thread of a multi-thread
+/// runtime, as `block_in_place` itself requires.
+///
+/// The thread stops reading as a running worker before the handoff and reads
+/// as handed off until `blocking` returns. Afterwards it reads as neither: if
+/// the replacement took the core, the thread finishes its task and idles in the
+/// blocking pool, and if the core was still there to take back, the thread is
+/// a worker again and its clock restarts at its next unpark. Tokio's stable API
+/// cannot say which happened, so the second case reads as parked for the rest
+/// of that one run rather than the first reading as unparked forever.
+pub fn hand_off_and_block<R>(blocking: impl FnOnce() -> R) -> R {
+    let _handoff = HandOff::begin();
+    tokio::task::block_in_place(blocking)
+}
+
+/// The span of one [`hand_off_and_block`]. Restores the enclosing handoff's
+/// mark when dropped, unwinding included, so a nested handoff (a bridged call
+/// that reaches another bridge) keeps the outer section's start.
+struct HandOff {
+    enclosing: Option<u64>,
+}
+
+impl HandOff {
+    fn begin() -> Self {
+        let enclosing = with_slot(|slot| {
+            slot.running_since.store(0, Ordering::Release);
+            let enclosing = slot.handed_off_since.load(Ordering::Acquire);
+            if enclosing == 0 {
+                slot.handed_off_since.store(now_nanos(), Ordering::Release);
+            }
+            enclosing
+        });
+        Self { enclosing }
+    }
+}
+
+impl Drop for HandOff {
+    fn drop(&mut self) {
+        if let Some(enclosing) = self.enclosing {
+            with_slot(|slot| slot.handed_off_since.store(enclosing, Ordering::Release));
+        }
+    }
 }
 
 /// Marks the current thread as inside a named region until dropped. Regions
@@ -403,8 +468,8 @@ pub fn sample_cpu(runtime: &str) {
     }
 }
 
-/// Every thread of `runtime` that is running or inside a region, for a stall
-/// report. A slot whose lock is momentarily held by its own thread reports no
+/// Every thread of `runtime` that is running, handed off, or inside a region,
+/// for a stall report. A slot whose lock is momentarily held by its own thread reports no
 /// region rather than waiting for it.
 pub fn runtime_threads(runtime: &str) -> Vec<ThreadReport> {
     slots_of(runtime)
@@ -412,6 +477,8 @@ pub fn runtime_threads(runtime: &str) -> Vec<ThreadReport> {
         .filter_map(|slot| {
             let running_since = slot.running_since.load(Ordering::Acquire);
             let running_for = (running_since != 0).then(|| since(running_since));
+            let handed_off_since = slot.handed_off_since.load(Ordering::Acquire);
+            let handed_off_for = (handed_off_since != 0).then(|| since(handed_off_since));
             let region = slot.regions.try_lock().ok().and_then(|regions| {
                 regions.last().map(|region| RegionReport {
                     label: region.label,
@@ -428,19 +495,32 @@ pub fn runtime_threads(runtime: &str) -> Vec<ThreadReport> {
                         now.saturating_sub(slot.cpu_baseline.load(Ordering::Acquire)),
                     )
                 });
-            (running_for.is_some() || region.is_some()).then(|| ThreadReport {
-                thread_name: slot.thread_name.clone(),
-                running_for,
-                cpu,
-                region,
+            (running_for.is_some() || handed_off_for.is_some() || region.is_some()).then(|| {
+                ThreadReport {
+                    thread_name: slot.thread_name.clone(),
+                    running_for,
+                    handed_off_for,
+                    cpu,
+                    region,
+                }
             })
         })
         .collect()
 }
 
+/// `reports` split into the runtime's workers and the threads handed off in
+/// [`hand_off_and_block`], which hold no core and belong in no worker list.
+pub fn split_handed_off(reports: &[ThreadReport]) -> (Vec<ThreadReport>, Vec<ThreadReport>) {
+    reports
+        .iter()
+        .cloned()
+        .partition(|report| report.handed_off_for.is_none())
+}
+
 /// `name(unparked_ms=N cpu_ms=N off_cpu_ms=N region=label[detail]
 /// region_ms=N)` per thread, joined by `; `, or `none`. One token-friendly field
-/// for a log line.
+/// for a log line. A handed-off thread reads `handed_off_ms=N`, the time since
+/// it gave its core away, in place of `unparked_ms`.
 ///
 /// `off_cpu_ms` is the part of the interval the thread was not on a CPU: near
 /// zero for a worker genuinely executing, near the whole interval for one the
@@ -452,12 +532,14 @@ pub fn format_thread_reports(reports: &[ThreadReport]) -> String {
     reports
         .iter()
         .map(|report| {
-            let unparked = report
-                .running_for
-                .map(|running| running.as_millis().to_string())
-                .unwrap_or_else(|| "parked".to_string());
+            let clock = match (report.running_for, report.handed_off_for) {
+                (Some(running), _) => format!("unparked_ms={}", running.as_millis()),
+                (None, Some(handed_off)) => format!("handed_off_ms={}", handed_off.as_millis()),
+                (None, None) => "unparked_ms=parked".to_string(),
+            };
             let interval = report
                 .running_for
+                .or(report.handed_off_for)
                 .or(report.region.as_ref().map(|region| region.elapsed));
             let cpu = match (report.cpu, interval) {
                 (Some(cpu), Some(interval)) => format!(
@@ -480,10 +562,7 @@ pub fn format_thread_reports(reports: &[ThreadReport]) -> String {
                 ),
                 None => "region=none".to_string(),
             };
-            format!(
-                "{}(unparked_ms={unparked}{cpu} {region})",
-                report.thread_name
-            )
+            format!("{}({clock}{cpu} {region})", report.thread_name)
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -571,6 +650,64 @@ mod tests {
 
         go_tx.send(()).unwrap();
         thread.join().unwrap();
+    }
+
+    /// A thread inside `hand_off_and_block` holds no core: from the handoff
+    /// until the outermost section returns it reads as handed off, apart from
+    /// the workers, and afterwards as nothing, not as a worker unparked since
+    /// before the handoff.
+    #[test]
+    fn a_thread_that_hands_its_core_off_reads_apart_from_the_workers() {
+        const RUNTIME: &str = "regions-handoff";
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tokio = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name_fn(|| format!("{RUNTIME}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+            .on_thread_start(|| register_runtime_thread(RUNTIME))
+            .build()
+            .unwrap();
+        let own = || {
+            let name = std::thread::current().name().unwrap().to_string();
+            runtime_threads(RUNTIME)
+                .into_iter()
+                .find(|report| report.thread_name == name)
+        };
+        let task = tokio.spawn(async move {
+            // A worker's clock runs from its last unpark; start one so the
+            // handoff has a clock to stop.
+            mark_running();
+            let before = own();
+            let (outer, nested, after_nested) = hand_off_and_block(|| {
+                let outer = own();
+                let nested = hand_off_and_block(own);
+                (outer, nested, own())
+            });
+            (before, outer, nested, after_nested, own())
+        });
+        let (before, outer, nested, after_nested, after) = tokio.block_on(task).unwrap();
+        tokio.shutdown_background();
+
+        let before = before.expect("the worker reads as running before the handoff");
+        assert!(
+            before.running_for.is_some() && before.handed_off_for.is_none(),
+            "{before:?}"
+        );
+        // A nested handoff (a bridged call reaching another bridge) leaves the
+        // thread handed off once it returns.
+        for inside in [&outer, &nested, &after_nested] {
+            let inside = inside.as_ref().expect("a handed-off thread is reported");
+            assert_eq!(inside.running_for, None, "{inside:?}");
+            assert!(inside.handed_off_for.is_some(), "{inside:?}");
+        }
+        let outer = outer.unwrap();
+        let (workers, handed_off) = split_handed_off(std::slice::from_ref(&outer));
+        assert!(workers.is_empty(), "{workers:?}");
+        assert!(
+            format_thread_reports(&handed_off)
+                .starts_with(&format!("{}(handed_off_ms=", outer.thread_name)),
+            "{handed_off:?}"
+        );
+        assert!(after.is_none(), "{after:?}");
     }
 
     #[test]

@@ -193,6 +193,48 @@ fn no_production_code_hand_rolls_a_runtime_bridge() {
     );
 }
 
+/// cairn/6211. `block_in_place` hands the calling worker's core to a
+/// replacement, and the caller ends up idle in the blocking pool, where no
+/// worker park hook fires: its running clock never stops, and every stall line
+/// after that read it as a worker unparked for a quarter of an hour.
+/// `cairn_platform::runtime_regions::hand_off_and_block` stops the clock
+/// first, so it is the only place the call may appear. Comments and string
+/// literals may name it; a call or an import, test code included, may not.
+#[test]
+fn block_in_place_is_reached_only_through_the_handoff_wrapper() {
+    const SHAPES: &[&str] = &[
+        "block_in_place(",
+        "::block_in_place",
+        "block_in_place,",
+        "block_in_place}",
+    ];
+    let offenders: Vec<String> = workspace_rust_files()
+        .iter()
+        .filter(|(path, _)| {
+            let display = path.to_string_lossy().replace('\\', "/");
+            !display.ends_with("cairn-platform/src/runtime_regions.rs")
+                && !display.ends_with("tests/main/source_structure.rs")
+        })
+        .flat_map(|(path, source)| {
+            source
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let code = line.split("//").next().unwrap_or_default();
+                    SHAPES.iter().any(|shape| code.contains(shape))
+                })
+                .map(move |(index, _)| format!("{}:{}", path.display(), index + 1))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "call cairn_platform::runtime_regions::hand_off_and_block instead of \
+         tokio::task::block_in_place, so the stall watchdog stops counting the \
+         thread as a worker:\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn the_runtime_bridge_detector_sees_through_qualifiers_and_ignores_types() {
     assert_eq!(

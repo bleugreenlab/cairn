@@ -13,7 +13,9 @@
 /// Where the work runs depends on the calling thread:
 ///
 /// - **A multi-thread runtime's thread**: on this thread, inside
-///   `block_in_place`, which first hands a worker's core to a replacement.
+///   `block_in_place` (through `runtime_regions::hand_off_and_block`, so the
+///   stall watchdog stops counting the thread as a worker), which first hands
+///   a worker's core to a replacement.
 /// - **A current-thread runtime's thread**: on a scoped thread this one joins.
 ///   `block_in_place` panics there, and work that starts a runtime of its own
 ///   (as the store transactions do) cannot run on a thread already driving one.
@@ -23,7 +25,9 @@
 /// `spawn_blocking` pays. A panic in the work resumes on the caller.
 pub fn in_place_blocking<T: Send>(work: impl FnOnce() -> T + Send) -> T {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            cairn_platform::runtime_regions::hand_off_and_block(work)
+        }
         Ok(_) => std::thread::scope(|scope| scope.spawn(work).join())
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
         Err(_) => work(),

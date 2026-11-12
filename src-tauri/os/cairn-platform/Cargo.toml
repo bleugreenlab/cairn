@@ -19,6 +19,8 @@ reflink-copy = "0.1.30"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 mockall = { version = "0.13", optional = true }
+# `runtime_regions::hand_off_and_block` is the tree's one `block_in_place`.
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

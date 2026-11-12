@@ -2208,7 +2208,7 @@ mod tests {
                 if *pages == 2 {
                     // Break every later page read. No connection is held
                     // between pages, so the schema change lands at once.
-                    tokio::task::block_in_place(|| {
+                    cairn_platform::runtime_regions::hand_off_and_block(|| {
                         tokio::runtime::Handle::current().block_on(async {
                             db.exclusive(|conn| {
                                 Box::pin(async move {

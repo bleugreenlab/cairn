@@ -515,7 +515,9 @@ impl Boundary {
                 // `run_db_blocking`, a hold must hand this worker's queued
                 // tasks to another thread first, or a held write strands
                 // whatever was scheduled behind it.
-                tokio::task::block_in_place(|| self.wait_for_release(ticket))
+                cairn_platform::runtime_regions::hand_off_and_block(|| {
+                    self.wait_for_release(ticket)
+                })
             }
         }
     }

@@ -3,6 +3,7 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
+use cairn_platform::runtime_regions::hand_off_and_block;
 use cairn_platform::stack::off_frame;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
@@ -52,7 +53,9 @@ pub fn install_bridge_runtime(handle: Handle) {
 ///
 /// - **A thread of a multi-thread runtime** (a worker, a `spawn_blocking`
 ///   thread, a bridged future that reached a sync facade): on this thread,
-///   inside `block_in_place`. Parking a worker with its core idles the runtime
+///   inside `block_in_place` (through `runtime_regions::hand_off_and_block`,
+///   so the stall watchdog stops counting the thread as a worker). Parking a
+///   worker with its core idles the runtime
 ///   one worker short for the whole call, and enough of them at once starve the
 ///   runner until open write transactions stop reaching their commits.
 ///   `block_in_place` hands the core to a replacement first, so the park costs
@@ -90,7 +93,7 @@ where
 {
     match Handle::try_current() {
         Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| on_this_thread(&current, make_future))
+            hand_off_and_block(|| on_this_thread(&current, make_future))
         }
         Ok(_) => on_a_scoped_thread(make_future),
         Err(_) => match installed {
