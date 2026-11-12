@@ -2944,6 +2944,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
+        "runtime_admission_host_guard",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
         "prepared_runtime_calls",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),

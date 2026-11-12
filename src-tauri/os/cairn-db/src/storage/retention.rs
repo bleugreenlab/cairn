@@ -644,6 +644,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("integrity_sweep_state", MARKER),
     keep("trigger_accumulator_state", MARKER),
     keep("runtime_admission_cursors", MARKER),
+    keep("runtime_admission_host_guard", MARKER),
     keep("channel_cursor", MARKER),
     keep("ambient_routing_feedback_cursor", MARKER),
     keep(

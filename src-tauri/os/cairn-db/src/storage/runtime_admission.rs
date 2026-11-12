@@ -159,10 +159,16 @@ pub async fn persist_team_ordinary_lease(
             // The mirror's phase is this runner's local launch fact, not
             // authority: leased here, not yet registered. Set in the same write
             // as the journal so reaper cover never lapses between them.
-            conn.execute(
+            let leased = conn.execute(
                 "UPDATE runtime_admission_requests SET state='leased',updated_at=?2 WHERE request_id=?1 AND state='queued'",
                 params![authority.request_id, authority.updated_at],
             ).await?;
+            // The authority granted this without a local memory check, but the
+            // mirror is now a spawn in flight that a private lane's lease must
+            // count, so it conflicts with one leasing at the same moment.
+            if leased > 0 {
+                guard_host_spawn(conn).await?;
+            }
             Ok(())
         })
     })
@@ -1082,6 +1088,24 @@ pub enum MemoryPriority<'a> {
     YieldsTo(&'a str),
 }
 
+/// Writes the host's spawn guard row inside the caller's transaction.
+///
+/// Every write that puts a new process in flight on this host calls it. A
+/// lease's memory check reads every lane's in-flight rows but writes only its
+/// own lane's, so two lanes leasing at once would each pass on the same
+/// headroom and both commit (docs/database.md, "Write skew"). Writing one
+/// shared row makes them conflict under `BEGIN CONCURRENT`, and the retried
+/// lease counts the winner's spawn. Leases that add no process do not write
+/// it, so the row is touched once per process start.
+async fn guard_host_spawn(conn: &crate::storage::TrackedConnection) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO runtime_admission_host_guard(host,process_leases) VALUES('local',1) ON CONFLICT(host) DO UPDATE SET process_leases=process_leases+1",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
 fn adds_resident_process(claim: &RuntimeResourceClaim, resident_servers: &HashSet<String>) -> bool {
     claim.resident_process_units > 0
         && claim
@@ -1117,6 +1141,9 @@ fn adds_resident_process(claim: &RuntimeResourceClaim, resident_servers: &HashSe
 /// `BEGIN CONCURRENT`, so one retries and counts the other's lease instead of
 /// both admitting past the unit ceiling. It stays inside this transaction for
 /// that reason, and so the urgent streak advances atomically with the lease.
+/// Memory spans lanes, which the single-flight does not serialise, so a lease
+/// that adds a process also writes the host-wide guard row
+/// ([`guard_host_spawn`]) for the same reason across lanes.
 #[allow(clippy::too_many_arguments)]
 pub async fn lease_next_admission_within(
     db: &LocalDb,
@@ -1276,7 +1303,7 @@ pub async fn lease_next_admission_within(
             };
             match shortfall {
                 None => {
-                    selected = Some((id, urgent));
+                    selected = Some((id, urgent, candidate_process_units > 0));
                     break;
                 }
                 Some(shortfall) => {
@@ -1287,7 +1314,7 @@ pub async fn lease_next_admission_within(
                 }
             }
         }
-        let Some((id, urgent)) = selected else {
+        let Some((id, urgent, adds_process)) = selected else {
             return Ok(match head {
                 Some((id, shortfall)) => Outcome::Blocked(id, shortfall, in_flight_requests),
                 None => Outcome::Empty,
@@ -1295,6 +1322,9 @@ pub async fn lease_next_admission_within(
         };
         conn.execute("UPDATE runtime_admission_requests SET state='leased',lease_owner=?2,lease_generation=lease_generation+1,lease_expires_at=?3,updated_at=?4 WHERE request_id=?1 AND state='queued'", params![id.clone(),owner,expires_at,now]).await?;
         conn.execute("UPDATE runtime_admission_cursors SET urgent_streak=?3 WHERE workspace_key=?1 AND resource_lane=?2", params![workspace,lane,if urgent { streak+1 } else { 0 }]).await?;
+        if adds_process {
+            guard_host_spawn(conn).await?;
+        }
         Ok(Outcome::Leased(id))
     })}).await?;
     if matches!(outcome, Outcome::Leased(_)) {
@@ -2857,6 +2887,91 @@ mod tests {
                 }
             ),
             "{decision:?}"
+        );
+    }
+
+    /// Two lanes each hold a resident process, so neither has the empty-lane
+    /// exemption, and each has a 600 MiB spawn queued with 1000 MiB above the
+    /// reserve: one fits, two do not. Their leases write disjoint lane rows,
+    /// so only the host guard row makes them conflict; without it both pass
+    /// the memory check on the same snapshot and both lease. Looped, from OS
+    /// threads.
+    #[test]
+    fn concurrent_leases_on_two_lanes_never_spend_the_same_headroom() {
+        const LANES: [&str; 2] = ["codex", "process"];
+        let runtime = crate::storage::race_runtime();
+        let db = runtime.block_on(crate::storage::migrated_test_db(
+            "admission-cross-lane-race.db",
+        ));
+        runtime.block_on(async {
+            for (n, lane) in LANES.iter().enumerate() {
+                let id = format!("{lane}-resident");
+                let mut resident = estimated(&id, n as i64, Some(600 * MIB));
+                resident.resource_lane = (*lane).into();
+                enqueue_admission_request(&db, resident).await.unwrap();
+            }
+            db.execute("UPDATE runtime_admission_requests SET state='active'", ())
+                .await
+                .unwrap();
+        });
+
+        const ROUNDS: usize = 20;
+        for round in 0..ROUNDS {
+            runtime.block_on(async {
+                for lane in LANES {
+                    let mut spawn = estimated(&format!("{lane}-{round}"), 10, Some(600 * MIB));
+                    spawn.resource_lane = lane.into();
+                    enqueue_admission_request(&db, spawn).await.unwrap();
+                }
+            });
+
+            let (rt, db) = (&runtime, &db);
+            let leased = crate::storage::race_on_threads(LANES.map(|lane| {
+                move || {
+                    rt.block_on(lease_next_admission_within(
+                        db,
+                        "w",
+                        lane,
+                        "runner",
+                        10,
+                        300,
+                        unbounded(),
+                        envelope(2_000, 1_000),
+                        None,
+                        MemoryPriority::Interactive,
+                        None,
+                    ))
+                    .unwrap()
+                }
+            }))
+            .into_iter()
+            .filter(|decision| matches!(decision, LeaseDecision::Leased(_)))
+            .count();
+            assert_eq!(
+                leased, 1,
+                "round {round}: two lanes leased against the same host headroom"
+            );
+
+            // Settle the round: the spawn finishes and the loser is withdrawn,
+            // so the next round starts from the same headroom.
+            runtime
+                .block_on(db.execute_script(
+                    "UPDATE runtime_admission_requests SET state='released' WHERE state='leased';
+                     UPDATE runtime_admission_requests SET state='cancelled' WHERE state='queued';",
+                ))
+                .unwrap();
+        }
+
+        let guarded = runtime
+            .block_on(db.query_opt_i64(
+                "SELECT process_leases FROM runtime_admission_host_guard",
+                (),
+            ))
+            .unwrap();
+        assert_eq!(
+            guarded,
+            Some(ROUNDS as i64),
+            "each process lease writes the guard once"
         );
     }
 
