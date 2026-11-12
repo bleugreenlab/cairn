@@ -5437,11 +5437,24 @@ fn render_running_now(
             .build_jobs
             .map(|jobs| format!("; {}", jobs.describe()))
             .unwrap_or_default();
+        // An adopted tree is no cell's command: it is named by where it runs
+        // and its leader, and by its attempt rather than a request.
+        let (place, identity) = match &request.adopted {
+            Some(tree) => (
+                format!(
+                    "{}, pid {} (adopted, not a cell)",
+                    tree.label, tree.leader_pid
+                ),
+                format!("attempt {}", request.attempt_id),
+            ),
+            None => (
+                request.cell_id.clone(),
+                format!("request {}", request.request_id),
+            ),
+        };
         out.push_str(&format!(
-            "- {}: `{}` (request {}, started {}): {}{build_jobs}\n",
-            request.cell_id,
-            command,
-            request.request_id,
+            "- {place}: `{command}` [{}] ({identity}, started {}): {}{build_jobs}\n",
+            request.command_class.as_str(),
             age(now.saturating_sub(request.started_at_unix_ms)),
             usage(request.live_usage)
         ));
@@ -12418,6 +12431,7 @@ mod running_now_tests {
                 command_resource_identity: None,
                 live_usage: None,
                 build_jobs,
+                adopted: None,
             }],
             ..FleetSnapshot::default()
         }
@@ -12438,6 +12452,51 @@ mod running_now_tests {
         // An executor that does not report build jobs leaves the row as it was.
         let silent = render_running_now(&running(None), None, 60_000);
         assert!(silent.contains("usage not measured yet\n"), "{silent}");
+    }
+
+    /// Every running row carries its class; an adopted build reads as what
+    /// it is, where it runs, and what it measured, never as a cell.
+    #[test]
+    fn running_rows_carry_their_class_and_an_adopted_build_names_its_label() {
+        use cairn_common::executor_protocol::{AdoptedTree, LiveUsageSample, MeasurementQuality};
+        let lane = render_running_now(&running(None), None, 60_000);
+        assert!(
+            lane.contains(
+                "- slot-103: `bun run test:rust:tiered` [cargoTest] (request request, started"
+            ),
+            "{lane}"
+        );
+
+        let mut snapshot = running(None);
+        let build = &mut snapshot.executing_requests[0];
+        build.cell_id = String::new();
+        build.request_id = "rebuild:attempt-9:build".into();
+        build.attempt_id = "attempt-9".into();
+        build.command_class = CellCommandClass::ReleaseBuild;
+        build.command = "rebuild build: bun run tauri build --bundles app".into();
+        build.adopted = Some(AdoptedTree {
+            label: "computer.cairn.rebuild".into(),
+            leader_pid: 4242,
+        });
+        build.live_usage = Some(LiveUsageSample {
+            window_cpu_ms: 49_000,
+            window_ms: 5_000,
+            resident_bytes: Some(14 * GIB),
+            measured_at_unix_ms: 58_000,
+            quality: MeasurementQuality::Sampled,
+            quiet_window: None,
+        });
+        let rendered = render_running_now(&snapshot, None, 60_000);
+        assert!(
+            rendered.contains(
+                "- computer.cairn.rebuild, pid 4242 (adopted, not a cell): `rebuild build: bun run tauri build --bundles app` [releaseBuild] (attempt attempt-9, started"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("9.8 cores CPU, 14.0 GiB resident"),
+            "{rendered}"
+        );
     }
 
     /// Each resident line says what the machine charges it and why, so a

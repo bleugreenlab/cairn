@@ -23,6 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cairn_common::executor_protocol::{
+    AdoptedTreeMeasurement, CellCommandClass, CommandResourceIdentity, ProcessTreeAdoption,
+    ProcessTreeAdoptionChange, ProcessTreeAdoptionOutcome, ResourceReservation,
+    COMMAND_RESOURCE_IDENTITY_VERSION,
+};
 use cairn_common::identity::PrincipalRef;
 use cairn_common::requests::{
     RequestAcceptance, RequestAttemptOutcome, RequestFilter, RequestKind, RequestState,
@@ -704,16 +709,203 @@ fn journal_refusal(root: &Path, id: &str, summary: &str) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
+/// The actor's phases that run cargo: from the first rustc of the app build
+/// to the end of the voice engine's, the rebuild is compile work on this host.
+const CARGO_PHASES: [(&str, &str); 2] = [
+    ("build", "bun run tauri build --bundles app"),
+    (
+        "voice-engine",
+        "cargo build --locked --release -p cairn-voice",
+    ),
+];
+
+/// The release build the runner wants its colocated executor to count now:
+/// one cargo phase of one launched attempt, led by the actor's process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DesiredAdoption {
+    pub key: String,
+    pub rebuild_id: String,
+    pub attempt_id: String,
+    pub phase: &'static str,
+    pub command: &'static str,
+    pub leader_pid: u32,
+}
+
+/// The cargo phase `row` is in now: its latest phase still open, when that is
+/// one of [`CARGO_PHASES`].
+fn open_cargo_phase(row: &RebuildRecord) -> Option<(&'static str, &'static str)> {
+    let open = row
+        .phases
+        .iter()
+        .rev()
+        .find(|phase| phase.ended.is_none())?;
+    CARGO_PHASES
+        .into_iter()
+        .find(|(name, _)| *name == open.name)
+}
+
+/// What the colocated executor should be counting, from launchd's answer and
+/// the ingested ledger: `Some` only while the label is Running with a pid
+/// and a launched attempt with no outcome has a cargo phase open. The label
+/// alone is never enough: the executor verifies and measures that pid's
+/// tree, so what is counted is the tree.
+pub(crate) fn desired_adoption(job: &ActorJob, rows: &[RebuildRecord]) -> Option<DesiredAdoption> {
+    if job.state != ActorState::Running {
+        return None;
+    }
+    let leader_pid = job.pid?;
+    rows.iter()
+        .filter(|row| row.outcome.is_none())
+        .filter_map(|row| {
+            let launch = row.launch.as_ref()?;
+            let (phase, command) = open_cargo_phase(row)?;
+            Some((
+                launch.recorded_at,
+                DesiredAdoption {
+                    key: format!("rebuild:{}:{phase}", launch.attempt_id),
+                    rebuild_id: row.id.clone(),
+                    attempt_id: launch.attempt_id.clone(),
+                    phase,
+                    command,
+                    leader_pid,
+                },
+            ))
+        })
+        .max_by_key(|(recorded_at, _)| *recorded_at)
+        .map(|(_, desired)| desired)
+}
+
+/// Whether `phase` of `rebuild_id` ended reporting success. A phase still
+/// open when its tree was released ended with its actor, which is a failure.
+fn phase_succeeded(rows: &[RebuildRecord], rebuild_id: &str, phase: &str) -> bool {
+    rows.iter()
+        .find(|row| row.id == rebuild_id)
+        .and_then(|row| {
+            row.phases
+                .iter()
+                .rev()
+                .find(|candidate| candidate.name == phase && candidate.ended.is_some())
+        })
+        .is_some_and(|ended| ended.outcome.as_deref() == Some("ok"))
+}
+
+/// The one identity every rebuild's release build is learned under, so its
+/// memory profile accumulates across rebuilds as a lane's does across runs.
+fn release_build_identity() -> CommandResourceIdentity {
+    CommandResourceIdentity {
+        version: COMMAND_RESOURCE_IDENTITY_VERSION,
+        key: format!("{ACTOR_LABEL}:release-build"),
+        suite: None,
+    }
+}
+
+/// The colocated executor, injected so tests never need a live link.
+#[async_trait]
+pub(crate) trait TreeAdopter: Send + Sync {
+    fn generation(&self, orch: &Orchestrator) -> Option<u64>;
+    /// The keys the colocated executor's latest snapshot reports adopted under
+    /// the actor's label: its own account, which survives a link gap.
+    fn adopted_keys(&self, orch: &Orchestrator) -> Vec<String>;
+    async fn reservation(
+        &self,
+        orch: &Orchestrator,
+        identity: &CommandResourceIdentity,
+    ) -> Option<ResourceReservation>;
+    async fn change(
+        &self,
+        orch: &Orchestrator,
+        generation: u64,
+        change: ProcessTreeAdoptionChange,
+    ) -> Result<ProcessTreeAdoptionOutcome, String>;
+    async fn observe(
+        &self,
+        orch: &Orchestrator,
+        identity: &CommandResourceIdentity,
+        measured: &AdoptedTreeMeasurement,
+        succeeded: bool,
+    );
+}
+
+struct ColocatedExecutor;
+
+#[async_trait]
+impl TreeAdopter for ColocatedExecutor {
+    fn generation(&self, orch: &Orchestrator) -> Option<u64> {
+        orch.fleet.colocated_generation()
+    }
+    fn adopted_keys(&self, orch: &Orchestrator) -> Vec<String> {
+        orch.fleet.colocated_adopted_keys(ACTOR_LABEL)
+    }
+    async fn reservation(
+        &self,
+        orch: &Orchestrator,
+        identity: &CommandResourceIdentity,
+    ) -> Option<ResourceReservation> {
+        orch.fleet
+            .colocated_release_build_reservation(orch.db.local.clone(), identity)
+            .await
+    }
+    async fn change(
+        &self,
+        orch: &Orchestrator,
+        generation: u64,
+        change: ProcessTreeAdoptionChange,
+    ) -> Result<ProcessTreeAdoptionOutcome, String> {
+        orch.fleet
+            .change_process_tree_adoption(generation, change)
+            .await
+    }
+    async fn observe(
+        &self,
+        orch: &Orchestrator,
+        identity: &CommandResourceIdentity,
+        measured: &AdoptedTreeMeasurement,
+        succeeded: bool,
+    ) {
+        orch.fleet
+            .observe_adopted_release(orch.db.local.clone(), identity, measured, succeeded)
+            .await;
+    }
+}
+
+/// What this runner asked of the colocated executor. Never the authority on
+/// what the executor holds, which is its own report: this only remembers a
+/// key the report may not show yet (an adopt answered late, or a tree whose
+/// leader ended before its release) and paces asking again.
+#[derive(Default)]
+struct AdoptionAsks {
+    /// The key last asked to be adopted, until it is released.
+    asked: Option<String>,
+    /// When that key was last asked for, on which link, and how many asks in
+    /// a row went unconfirmed.
+    last_ask: Option<(u64, i64, u32)>,
+}
+
+/// The first wait before asking again for an adoption the executor has not
+/// reported: a refusal may be a transient read, and an older executor never
+/// answers. Doubles per unconfirmed ask, to [`ADOPT_RETRY_MAX_MS`].
+const ADOPT_RETRY_MS: i64 = 30_000;
+const ADOPT_RETRY_MAX_MS: i64 = 600_000;
+
+/// The attempt and phase an adoption key names, `rebuild:<attempt>:<phase>`,
+/// so a key read back from the executor can be settled after a runner restart.
+fn adoption_key_parts(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix("rebuild:")?.rsplit_once(':')
+}
+
 pub(crate) struct RebuildConsumer {
     host: RebuildHost,
     launchd: Arc<dyn Launchd>,
     source: Arc<dyn SourceStore>,
+    adopter: Arc<dyn TreeAdopter>,
     /// [`MACOS_FLOOR_PROVEN`] in production.
     dispatch_enabled: bool,
     /// The primitive holds this from before its claim until dispatch returns,
     /// and reconciliation holds it too: a claimed attempt with no ledger row
     /// seen under it was abandoned by an earlier runner, never in flight here.
     serial: Arc<tokio::sync::Mutex<()>>,
+    adoption: tokio::sync::Mutex<AdoptionAsks>,
+    adopt_retry_ms: i64,
 }
 
 impl RebuildConsumer {
@@ -727,9 +919,19 @@ impl RebuildConsumer {
             host,
             launchd,
             source,
+            adopter: Arc::new(ColocatedExecutor),
             dispatch_enabled: MACOS_FLOOR_PROVEN,
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            adoption: tokio::sync::Mutex::new(AdoptionAsks::default()),
+            adopt_retry_ms: ADOPT_RETRY_MS,
         }
+    }
+
+    #[cfg(test)]
+    fn with_adopter(mut self, adopter: Arc<dyn TreeAdopter>, adopt_retry_ms: i64) -> Self {
+        self.adopter = adopter;
+        self.adopt_retry_ms = adopt_retry_ms;
+        self
     }
 
     /// Exercise the held path in tests only.
@@ -1116,9 +1318,10 @@ impl RebuildConsumer {
         let rows = ledger::unacknowledged_launches(&orch.db.local)
             .await
             .map_err(|error| error.to_string())?;
+        self.sync_adoption(orch, &job, &rows).await;
         let mut reported = 0;
-        for row in rows {
-            match self.settle(orch, &row, actor).await {
+        for row in &rows {
+            match self.settle(orch, row, actor).await {
                 Ok(true) => reported += 1,
                 Ok(false) => {}
                 Err(error) => {
@@ -1137,6 +1340,139 @@ impl RebuildConsumer {
     pub(crate) async fn reconcile(&self, orch: &Orchestrator) -> Result<usize, String> {
         let _serial = self.serial.lock().await;
         self.reconcile_locked(orch).await
+    }
+
+    /// Bring the colocated executor's count of the rebuild's build in line
+    /// with [`desired_adoption`], reconciling against what the executor itself
+    /// reports adopted. Every key it reports, or that this runner asked for,
+    /// other than the desired one is released, so an adoption that survived a
+    /// link gap, or that was accepted after its answer timed out, is settled
+    /// when its phase ends. The desired key is asked for until the executor
+    /// reports it, with backoff, and at once on a new link. Visibility only:
+    /// what the executor does with the count is its ordinary measured
+    /// admission, never a hold of this module's.
+    async fn sync_adoption(&self, orch: &Orchestrator, job: &ActorJob, rows: &[RebuildRecord]) {
+        let desired = desired_adoption(job, rows);
+        let Some(generation) = self.adopter.generation(orch) else {
+            return;
+        };
+        let reported = self.adopter.adopted_keys(orch);
+        let desired_key = desired.as_ref().map(|desired| desired.key.as_str());
+        let mut asks = self.adoption.lock().await;
+        let mut obsolete: std::collections::BTreeSet<String> = reported
+            .iter()
+            .filter(|key| Some(key.as_str()) != desired_key)
+            .cloned()
+            .collect();
+        if let Some(asked) = asks.asked.as_deref() {
+            if Some(asked) != desired_key {
+                obsolete.insert(asked.to_string());
+                asks.asked = None;
+                asks.last_ask = None;
+            }
+        }
+        for key in obsolete {
+            self.release_adoption(orch, generation, &key, rows).await;
+        }
+        let Some(desired) = desired else {
+            return;
+        };
+        if reported.contains(&desired.key) {
+            asks.asked = Some(desired.key);
+            asks.last_ask = None;
+            return;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let unconfirmed = match asks.last_ask {
+            Some((asked_on, at, unconfirmed)) if asked_on == generation => {
+                let wait = self
+                    .adopt_retry_ms
+                    .saturating_mul(1_i64 << unconfirmed.min(5))
+                    .min(ADOPT_RETRY_MAX_MS);
+                if now_ms.saturating_sub(at) < wait {
+                    return;
+                }
+                unconfirmed.saturating_add(1)
+            }
+            _ => 0,
+        };
+        asks.asked = Some(desired.key.clone());
+        asks.last_ask = Some((generation, now_ms, unconfirmed));
+        let identity = release_build_identity();
+        let resource_reservation =
+            self.adopter
+                .reservation(orch, &identity)
+                .await
+                .unwrap_or(ResourceReservation {
+                    concurrency_units: 0,
+                    ..ResourceReservation::default()
+                });
+        let adoption = ProcessTreeAdoption {
+            key: desired.key.clone(),
+            attempt_id: desired.attempt_id.clone(),
+            leader_pid: desired.leader_pid,
+            label: ACTOR_LABEL.into(),
+            command: format!("rebuild {}: {}", desired.phase, desired.command),
+            command_class: CellCommandClass::ReleaseBuild,
+            started_at_unix_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            resource_reservation,
+            command_resource_identity: Some(identity),
+        };
+        // An error is an unknown outcome, never a refusal to remember: the
+        // executor may still accept it, and its report is what settles it.
+        match self
+            .adopter
+            .change(
+                orch,
+                generation,
+                ProcessTreeAdoptionChange::Adopt { adoption },
+            )
+            .await
+        {
+            Ok(ProcessTreeAdoptionOutcome::Adopted { .. }) => asks.last_ask = None,
+            Ok(other) => {
+                tracing::warn!(key = %desired.key, ?other, "rebuild build adoption answered something else")
+            }
+            Err(error) => {
+                tracing::warn!(key = %desired.key, %error, "rebuild build not yet accounted on the colocated executor; asking again later")
+            }
+        }
+    }
+
+    /// Release `key` and teach its measurement, as a success only when the
+    /// phase it names ended reporting `ok`. Releasing a key the executor no
+    /// longer holds is answered with nothing measured and teaches nothing.
+    async fn release_adoption(
+        &self,
+        orch: &Orchestrator,
+        generation: u64,
+        key: &str,
+        rows: &[RebuildRecord],
+    ) {
+        let released = self
+            .adopter
+            .change(
+                orch,
+                generation,
+                ProcessTreeAdoptionChange::Release { key: key.into() },
+            )
+            .await;
+        match released {
+            Ok(ProcessTreeAdoptionOutcome::Released {
+                measured: Some(measured),
+            }) => {
+                let succeeded = adoption_key_parts(key).is_some_and(|(attempt, phase)| {
+                    phase_succeeded(rows, &rebuild_id(attempt), phase)
+                });
+                self.adopter
+                    .observe(orch, &release_build_identity(), &measured, succeeded)
+                    .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%key, %error, "rebuild build release went unanswered; its report settles it")
+            }
+        }
     }
 
     async fn settle(

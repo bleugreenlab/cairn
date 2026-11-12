@@ -779,6 +779,22 @@ struct PendingMemoryDiagnosticResult {
     waiter: oneshot::Sender<Result<(), String>>,
 }
 
+// Constructed only by the macOS adoption API; the response arm that answers it
+// is platform-neutral, so the type exists everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct PendingTreeAdoptionResult {
+    generation: u64,
+    waiter: oneshot::Sender<
+        Result<cairn_common::executor_protocol::ProcessTreeAdoptionOutcome, String>,
+    >,
+}
+
+/// How long the runner waits for its colocated executor to answer an adoption.
+/// An executor older than adoption drops the request unanswered, so this bound
+/// is also how long a reconciler tick pays to learn that once per link.
+#[cfg(target_os = "macos")]
+const TREE_ADOPTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct PendingDrainResult {
     executor_id: String,
     generation: u64,
@@ -1644,6 +1660,7 @@ pub struct Fleet {
     pending_materialization_reads: Arc<Mutex<PendingMaterializationReads>>,
     pending_policy: Arc<Mutex<HashMap<String, PendingPolicyResult>>>,
     pending_memory_diagnostic: Arc<Mutex<HashMap<String, PendingMemoryDiagnosticResult>>>,
+    pending_tree_adoption: Arc<Mutex<HashMap<String, PendingTreeAdoptionResult>>>,
     desired_runtime_policies:
         Arc<Mutex<HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>>>,
     pending_drain: Arc<Mutex<HashMap<String, PendingDrainResult>>>,
@@ -6827,6 +6844,20 @@ impl Fleet {
                 }
                 false
             }
+            ExecutorMessage::ProcessTreeAdoptionResponse {
+                correlation_id,
+                result,
+            } => {
+                let mut pending = self.pending_tree_adoption.lock().unwrap();
+                if pending.get(&correlation_id).is_some_and(|request| {
+                    executor_id == COLOCATED_EXECUTOR_ID && request.generation == generation
+                }) {
+                    if let Some(request) = pending.remove(&correlation_id) {
+                        let _ = request.waiter.send(result);
+                    }
+                }
+                false
+            }
             ExecutorMessage::RuntimePolicyResponse {
                 correlation_id,
                 result,
@@ -8869,6 +8900,159 @@ impl Fleet {
             .unwrap()
             .remove(&correlation_id);
         result
+    }
+
+    // The adoption API below serves the macOS rebuild consumer, the one
+    // Cairn-owned tree outside every cell; it is compiled where that is.
+
+    /// The colocated executor's link generation, while one is attached.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn colocated_generation(&self) -> Option<u64> {
+        self.lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .filter(|entry| entry.colocated)
+            .map(|entry| entry.generation)
+    }
+
+    /// The keys the colocated executor's latest snapshot reports adopted
+    /// under `label`: its own account of what it measures, which outlives a
+    /// link gap and includes an adoption accepted after its answer was lost.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn colocated_adopted_keys(&self, label: &str) -> Vec<String> {
+        self.lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .filter(|entry| entry.colocated)
+            .map(|entry| {
+                entry
+                    .snapshot
+                    .executing_requests
+                    .iter()
+                    .filter(|request| {
+                        request
+                            .adopted
+                            .as_ref()
+                            .is_some_and(|tree| tree.label == label)
+                    })
+                    .map(|request| request.request_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Ask the colocated executor, on exactly the link `expected_generation`
+    /// names, to begin or end measuring a Cairn-owned tree outside every cell.
+    /// Never addressed to a remote machine: such a tree runs on this host.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn change_process_tree_adoption(
+        &self,
+        expected_generation: u64,
+        change: cairn_common::executor_protocol::ProcessTreeAdoptionChange,
+    ) -> Result<cairn_common::executor_protocol::ProcessTreeAdoptionOutcome, String> {
+        let sender = self
+            .lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .filter(|entry| entry.colocated && entry.generation == expected_generation)
+            .map(|entry| entry.sender.clone())
+            .ok_or_else(|| "local executor connection generation is stale".to_string())?;
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.pending_tree_adoption.lock().unwrap().insert(
+            correlation_id.clone(),
+            PendingTreeAdoptionResult {
+                generation: expected_generation,
+                waiter: tx,
+            },
+        );
+        let sent = sender.send(ExecutorMessage::ProcessTreeAdoptionRequest {
+            correlation_id: correlation_id.clone(),
+            expected_generation,
+            change,
+        });
+        let result = match sent {
+            Err(_) => Err("local executor disconnected before the adoption was sent".into()),
+            Ok(()) => match tokio::time::timeout(TREE_ADOPTION_RESPONSE_TIMEOUT, rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("local executor dropped the adoption response".into()),
+                Err(_) => Err("local executor did not answer the adoption; an executor older than adoption drops it".into()),
+            },
+        };
+        self.pending_tree_adoption
+            .lock()
+            .unwrap()
+            .remove(&correlation_id);
+        result
+    }
+
+    /// The colocated machine's identity and capabilities as its profiles are
+    /// keyed, while it is attached.
+    #[cfg(target_os = "macos")]
+    fn colocated_profile(&self) -> Option<(SelectedExecutor, resource_profiles::ProfileContext)> {
+        let selected = self
+            .lock_connections()
+            .get(COLOCATED_EXECUTOR_ID)
+            .filter(|entry| entry.colocated)
+            .map(selected_executor)?;
+        let context = ReservationPlan::profile_context(&selected);
+        Some((selected, context))
+    }
+
+    /// What a release build adopted on the colocated machine is charged: its
+    /// class's learned memory profile there, or the class prior until one is
+    /// learned, and never any concurrency. It is counted, not admitted.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn colocated_release_build_reservation(
+        &self,
+        db: Arc<cairn_db::storage::LocalDb>,
+        identity: &CommandResourceIdentity,
+    ) -> Option<cairn_common::executor_protocol::ResourceReservation> {
+        let (selected, context) = self.colocated_profile()?;
+        let class = cairn_common::executor_protocol::CellCommandClass::ReleaseBuild;
+        let resolved = resource_profiles::resolve_reservation(
+            db,
+            Some(identity),
+            &context,
+            resource_profiles::cold_start_prior(class, &selected.capabilities),
+            selected.capabilities.memory_budget_bytes,
+            resource_profiles::DurationContext {
+                class,
+                warmth: cairn_common::executor_protocol::ExecutionWarmth::default(),
+                now_unix_ms: unix_time_ms(),
+            },
+        )
+        .await;
+        Some(cairn_common::executor_protocol::ResourceReservation {
+            concurrency_units: 0,
+            ..resolved.reservation
+        })
+    }
+
+    /// Teach the release build's profile what an adopted tree measured, through
+    /// the one learner every command completes into. The measurement makes no
+    /// warmth claim and carries no load context, so it teaches memory and never
+    /// the duration predictor; a phase that failed teaches its peak as the
+    /// failure kind, which keeps its duration out of the profile entirely.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn observe_adopted_release(
+        &self,
+        db: Arc<cairn_db::storage::LocalDb>,
+        identity: &CommandResourceIdentity,
+        measured: &cairn_common::executor_protocol::AdoptedTreeMeasurement,
+        succeeded: bool,
+    ) {
+        let Some((selected, context)) = self.colocated_profile() else {
+            return;
+        };
+        resource_profiles::observe_completed(
+            db,
+            Some(identity),
+            &context,
+            &adopted_release_metadata(&selected, measured),
+            match succeeded {
+                true => resource_profiles::CompletionKind::Succeeded,
+                false => resource_profiles::CompletionKind::Failed,
+            },
+        )
+        .await;
     }
 
     pub async fn set_executor_runtime_policy(
@@ -21487,6 +21671,43 @@ fn executor_link_status(
     }
 }
 
+/// An adopted tree's measurement in the shape the profile learner reads, with
+/// no warmth claim and no load context: what it says about speed is nothing.
+#[cfg(target_os = "macos")]
+fn adopted_release_metadata(
+    selected: &SelectedExecutor,
+    measured: &cairn_common::executor_protocol::AdoptedTreeMeasurement,
+) -> CellExecutionMeta {
+    CellExecutionMeta {
+        executor_id: selected.executor_id.clone(),
+        executor_device_id: selected.device_id.clone(),
+        executor_connection_generation: selected.generation,
+        cell_id: String::new(),
+        cell_epoch: 0,
+        started_at_unix_ms: measured.started_at_unix_ms,
+        finished_at_unix_ms: measured.finished_at_unix_ms,
+        duration_ms: Some(measured.duration_ms),
+        peak_rss_bytes: measured.peak_rss_bytes,
+        peak_physical_footprint_bytes: None,
+        peak_process: measured.peak_process.clone(),
+        disk_delta_bytes: None,
+        measurement_quality: Some(measured.measurement_quality.clone()),
+        warmth: None,
+        cell_origin: None,
+        load_context: None,
+        allocation: None,
+        cpu: None,
+        environment_fingerprint: String::new(),
+        verdict_platform: None,
+        verdict_arch: None,
+        toolchain_fingerprint: None,
+        verdict_environment_hash: None,
+        sandbox: None,
+        containment: None,
+        stop: None,
+    }
+}
+
 fn selected_executor(entry: &ExecutorConnectionState) -> SelectedExecutor {
     SelectedExecutor {
         executor_id: entry.identity.executor_id.clone(),
@@ -26353,6 +26574,7 @@ mod tests {
                     learned_estimate: None,
                     live_usage: None,
                     build_jobs: None,
+                    adopted: None,
                 }],
                 ..FleetSnapshot::default()
             },
@@ -27757,6 +27979,7 @@ mod tests {
                     process_ids: vec![42],
                     live_usage: None,
                     build_jobs: None,
+                    adopted: None,
                 }],
                 ..FleetSnapshot::default()
             },
@@ -31605,6 +31828,50 @@ mod tests {
         run.profile_key = Some("skip-census".into());
         run.fallback = None;
         run
+    }
+
+    /// A release build adopted on a machine is a compile it carries, so a
+    /// compile-class lane is priced higher there than on an otherwise equal
+    /// machine. A price, never a gate: nothing here refuses the machine.
+    #[test]
+    fn an_adopted_release_build_prices_its_machine_as_carrying_a_compile() {
+        let host = cairn_common::executor_protocol::HostHealth::default();
+        let carrying = FleetSnapshot {
+            executing_requests: vec![ExecutingCellRequest {
+                executor_id: String::new(),
+                cell_id: String::new(),
+                request_id: "rebuild:attempt:build".into(),
+                attempt_id: "attempt".into(),
+                owner: None,
+                command_class: CellCommandClass::ReleaseBuild,
+                command: "rebuild build: bun run tauri build --bundles app".into(),
+                started_at_unix_ms: 0,
+                process_ids: vec![4242],
+                priority: None,
+                subscriber_count: 1,
+                resource_reservation: ResourceReservation {
+                    concurrency_units: 0,
+                    ..ResourceReservation::default()
+                },
+                learned_estimate: None,
+                command_resource_identity: None,
+                live_usage: None,
+                build_jobs: None,
+                adopted: Some(cairn_common::executor_protocol::AdoptedTree {
+                    label: "computer.cairn.rebuild".into(),
+                    leader_pid: 4242,
+                }),
+            }],
+            ..FleetSnapshot::default()
+        };
+        let busy = load_context(&carrying, &host);
+        let idle = load_context(&FleetSnapshot::default(), &host);
+        assert_eq!(busy.co_resident_compile_jobs, 1);
+        assert_eq!(idle.co_resident_compile_jobs, 0);
+        assert!(
+            resource_profiles::contention_prior(&busy).multiplier_millis
+                > resource_profiles::contention_prior(&idle).multiplier_millis
+        );
     }
 
     fn machine_curve(compile: u32, light: u32, multiplier_millis: u32) -> ContentionEstimate {
@@ -35918,6 +36185,7 @@ mod tests {
             learned_estimate: None,
             live_usage: None,
             build_jobs: None,
+            adopted: None,
         }];
         let mut remote = fleet_entry("remote-a", "linux", 0, &[]).1;
         remote.identity.display_name = "BGLab UB".into();
@@ -35976,6 +36244,7 @@ mod tests {
             learned_estimate: None,
             live_usage: None,
             build_jobs: None,
+            adopted: None,
         }];
         Arc::make_mut(&mut busy.health).machine.memory =
             cairn_common::executor_protocol::Measurement::measured(
@@ -37550,6 +37819,7 @@ mod tests {
             }),
             live_usage: None,
             build_jobs: None,
+            adopted: None,
         }
     }
 
@@ -39159,6 +39429,7 @@ mod tests {
             learned_estimate: None,
             live_usage: None,
             build_jobs: None,
+            adopted: None,
         }
     }
 

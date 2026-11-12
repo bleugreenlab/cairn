@@ -4618,6 +4618,12 @@ pub enum CellCommandClass {
     Vitest,
     Typecheck,
     Build,
+    /// A Cairn-owned release build that runs outside every cell, such as the
+    /// rebuild actor's `tauri build`, counted because the runner adopted its
+    /// process tree on the colocated executor ([`ProcessTreeAdoption`]). Only
+    /// adoption assigns it: [`Self::classify`] never does, because no command
+    /// a cell runs is one.
+    ReleaseBuild,
     #[default]
     Other,
 }
@@ -4626,13 +4632,18 @@ impl CellCommandClass {
     pub fn is_compile_class(self) -> bool {
         matches!(
             self,
-            Self::CargoCheck | Self::CargoTest | Self::CargoClippy | Self::Build
+            Self::CargoCheck
+                | Self::CargoTest
+                | Self::CargoClippy
+                | Self::Build
+                | Self::ReleaseBuild
         )
     }
 
     /// Whether a command of this class compiles the project's Rust, so needs
     /// what a machine's build-prerequisite verdict judges whatever toolchains
-    /// its selector names. `Build` is not: it is the frontend bundle.
+    /// its selector names. `Build` is not: it is the frontend bundle. Nor is
+    /// `ReleaseBuild`, which is adopted where it already runs and never placed.
     pub fn compiles_rust(self) -> bool {
         matches!(self, Self::CargoCheck | Self::CargoTest | Self::CargoClippy)
     }
@@ -4664,6 +4675,7 @@ impl CellCommandClass {
             Self::Vitest => "vitest",
             Self::Typecheck => "typecheck",
             Self::Build => "build",
+            Self::ReleaseBuild => "releaseBuild",
             Self::Other => "other",
         }
     }
@@ -7930,6 +7942,20 @@ pub struct LearnedResourceEstimate {
 /// saturated. That changes what a runner concludes about admission (tenet
 /// 541), so the number moves and the handshake refuses the pairing until the
 /// executor self-updates.
+///
+/// cairn/6977 does not move the number. It adds
+/// [`CellCommandClass::ReleaseBuild`], the runner-to-executor
+/// [`ExecutorMessage::ProcessTreeAdoptionRequest`] with its
+/// [`ExecutorMessage::ProcessTreeAdoptionResponse`], and a defaulted `adopted`
+/// field on [`ExecutingCellRequest`]. The runner addresses the request only to
+/// its colocated executor, never to a remote one, and the new class reaches the
+/// wire only on a tree that runner asked to adopt. What a runner gets wrong
+/// talking to an older executor: nothing it decodes differently. That executor
+/// drops the request, as it drops any frame it cannot decode without ending the
+/// link; the runner's wait for an answer times out and the rebuild's build stays
+/// unaccounted, exactly as before this change, so admission there concludes
+/// what it did. An older runner never sends the request, so a newer executor
+/// never reports the class or the field to it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 170;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -13220,6 +13246,90 @@ pub struct ExecutingCellRequest {
     /// to a few jobs on a small machine says why while it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_jobs: Option<BuildJobs>,
+    /// Set when this is not a command a cell runs but a Cairn-owned tree the
+    /// executor adopted ([`ProcessTreeAdoption`]): measured and counted like
+    /// one, and never ended, cancelled or reaped by the executor. Its
+    /// `cell_id` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<AdoptedTree>,
+}
+
+/// Where an adopted tree came from: the launchd label that runs it and the
+/// leader process the executor verified and measures from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptedTree {
+    pub label: String,
+    pub leader_pid: u32,
+}
+
+/// A Cairn-owned process tree that runs outside every cell, which the runner
+/// asks its colocated executor to measure as a running command: today the
+/// rebuild actor's release build, from its first rustc to the end of its
+/// cargo phases.
+///
+/// The executor verifies the leader's identity, measures the tree with the
+/// same process-tree sampler and membership rules a spawned command gets, and
+/// counts it wherever running commands are counted: co-resident compile jobs,
+/// the elastic build width, owed memory and the snapshot. It never ends,
+/// cancels or reaps it; the actor owns that process. `resource_reservation`
+/// carries the learned profile's memory charge and no concurrency, so no
+/// admission budget is ever taken by it (tenet 1309).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessTreeAdoption {
+    /// Stable for one adoption: an adopt naming a key already held with the
+    /// same leader is a repeat, and with another leader a refusal.
+    pub key: String,
+    pub attempt_id: String,
+    pub leader_pid: u32,
+    pub label: String,
+    pub command: String,
+    pub command_class: CellCommandClass,
+    pub started_at_unix_ms: u64,
+    pub resource_reservation: ResourceReservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_resource_identity: Option<CommandResourceIdentity>,
+}
+
+/// What a [`ExecutorMessage::ProcessTreeAdoptionRequest`] asks for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "camelCase")]
+pub enum ProcessTreeAdoptionChange {
+    Adopt { adoption: ProcessTreeAdoption },
+    Release { key: String },
+}
+
+/// The executor's answer to a [`ProcessTreeAdoptionChange`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProcessTreeAdoptionOutcome {
+    /// Measured from now on. `leader_start` is the verified start token.
+    Adopted { leader_start: String },
+    /// No longer counted. `measured` is what the tree held over its adopted
+    /// life, kept when its leader ended before the release arrived, and absent
+    /// for a key the executor never held.
+    Released {
+        measured: Option<AdoptedTreeMeasurement>,
+    },
+}
+
+/// What an adopted tree measured between its adoption and its release.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptedTreeMeasurement {
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_process: Option<PeakProcess>,
+    pub measurement_quality: ExecutionMeasurementQuality,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -21900,6 +22010,18 @@ pub enum ExecutorMessage {
         correlation_id: String,
         result: Result<bool, String>,
     },
+    /// Runner → its colocated executor only, fenced to the link generation
+    /// it was addressed to: measure, or stop measuring, a Cairn-owned tree
+    /// that runs outside every cell. A remote executor is never sent one.
+    ProcessTreeAdoptionRequest {
+        correlation_id: String,
+        expected_generation: u64,
+        change: ProcessTreeAdoptionChange,
+    },
+    ProcessTreeAdoptionResponse {
+        correlation_id: String,
+        result: Result<ProcessTreeAdoptionOutcome, String>,
+    },
     /// Runner → the ONE machine placement chose. An invitation, not an order.
     ///
     /// It carries what the machine needs to answer from its own live facts and
@@ -22337,6 +22459,120 @@ mod tests {
             let decoded: ExecutorMessage = serde_json::from_value(wire.clone()).unwrap();
             assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
         }
+    }
+
+    /// A release build is compile-class work wherever running work is
+    /// counted, but only adoption names one: a cell's command line never
+    /// classifies as one, and it is never a placement-eligibility class.
+    #[test]
+    fn release_build_is_counted_as_compile_work_and_assigned_only_by_adoption() {
+        assert!(CellCommandClass::ReleaseBuild.is_compile_class());
+        assert!(!CellCommandClass::ReleaseBuild.compiles_rust());
+        assert_eq!(
+            CellCommandClass::classify(
+                "bun run tauri build --bundles app --config {\"bundle\":{}}"
+            ),
+            CellCommandClass::Other
+        );
+        assert_eq!(
+            serde_json::to_value(CellCommandClass::ReleaseBuild).unwrap(),
+            serde_json::json!(CellCommandClass::ReleaseBuild.as_str())
+        );
+    }
+
+    #[test]
+    fn process_tree_adoption_frames_and_the_adopted_field_round_trip() {
+        let adoption = ProcessTreeAdoption {
+            key: "rebuild:attempt".into(),
+            attempt_id: "attempt".into(),
+            leader_pid: 42,
+            label: "computer.cairn.rebuild".into(),
+            command: "bun run tauri build".into(),
+            command_class: CellCommandClass::ReleaseBuild,
+            started_at_unix_ms: 7,
+            resource_reservation: ResourceReservation {
+                concurrency_units: 0,
+                ..ResourceReservation::default()
+            },
+            command_resource_identity: None,
+        };
+        let measured = AdoptedTreeMeasurement {
+            started_at_unix_ms: 7,
+            finished_at_unix_ms: 9,
+            duration_ms: 2,
+            peak_rss_bytes: Some(1 << 30),
+            peak_process: None,
+            measurement_quality: ExecutionMeasurementQuality {
+                duration: MeasurementQuality::Sampled,
+                memory: MeasurementQuality::Sampled,
+                disk: MeasurementQuality::Unavailable,
+                memory_platform: None,
+                disk_boundary: "none".into(),
+            },
+        };
+        for message in [
+            ExecutorMessage::ProcessTreeAdoptionRequest {
+                correlation_id: "adopt".into(),
+                expected_generation: 3,
+                change: ProcessTreeAdoptionChange::Adopt {
+                    adoption: adoption.clone(),
+                },
+            },
+            ExecutorMessage::ProcessTreeAdoptionRequest {
+                correlation_id: "release".into(),
+                expected_generation: 3,
+                change: ProcessTreeAdoptionChange::Release {
+                    key: adoption.key.clone(),
+                },
+            },
+            ExecutorMessage::ProcessTreeAdoptionResponse {
+                correlation_id: "adopt".into(),
+                result: Ok(ProcessTreeAdoptionOutcome::Adopted {
+                    leader_start: "1:2".into(),
+                }),
+            },
+            ExecutorMessage::ProcessTreeAdoptionResponse {
+                correlation_id: "release".into(),
+                result: Ok(ProcessTreeAdoptionOutcome::Released {
+                    measured: Some(measured),
+                }),
+            },
+            ExecutorMessage::ProcessTreeAdoptionResponse {
+                correlation_id: "refused".into(),
+                result: Err("no live process 42".into()),
+            },
+        ] {
+            let wire = serde_json::to_value(&message).unwrap();
+            let decoded: ExecutorMessage = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded, message);
+        }
+        let executing = ExecutingCellRequest {
+            executor_id: String::new(),
+            cell_id: String::new(),
+            request_id: adoption.key.clone(),
+            attempt_id: adoption.attempt_id.clone(),
+            owner: None,
+            command_class: CellCommandClass::ReleaseBuild,
+            command: adoption.command.clone(),
+            started_at_unix_ms: 7,
+            process_ids: vec![42],
+            priority: None,
+            subscriber_count: 1,
+            resource_reservation: adoption.resource_reservation.clone(),
+            learned_estimate: None,
+            command_resource_identity: None,
+            live_usage: None,
+            build_jobs: None,
+            adopted: Some(AdoptedTree {
+                label: adoption.label.clone(),
+                leader_pid: 42,
+            }),
+        };
+        let wire = serde_json::to_value(&executing).unwrap();
+        assert_eq!(wire["adopted"]["leaderPid"], 42);
+        assert_eq!(wire["commandClass"], "releaseBuild");
+        let decoded: ExecutingCellRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, executing);
     }
 
     /// Work inside a residency live on the machine provisions nothing, however
@@ -25546,6 +25782,7 @@ mod tests {
                     learned_estimate: Some(learned_estimate.clone()),
                     live_usage: None,
                     build_jobs: None,
+                    adopted: None,
                 }],
                 in_flight_residency_operations: HashMap::new(),
                 recent_completions: vec![CellCompletion {

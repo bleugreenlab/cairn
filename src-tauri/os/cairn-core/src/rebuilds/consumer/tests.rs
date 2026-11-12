@@ -1241,3 +1241,282 @@ async fn a_runner_outside_an_installed_bundle_cannot_offer_rebuilds() {
     let error = consumer.availability(&f.orch).await.unwrap_err();
     assert!(error.contains("installed Cairn.app"), "{error}");
 }
+
+/// A colocated executor that answers every adoption and release, and records
+/// what it was told and what the release taught.
+#[derive(Default)]
+struct FakeAdopter {
+    generation: Mutex<Option<u64>>,
+    changes: Mutex<Vec<(u64, ProcessTreeAdoptionChange)>>,
+    observed: Mutex<Vec<(String, bool)>>,
+}
+
+impl FakeAdopter {
+    fn on_link(generation: u64) -> Arc<Self> {
+        let adopter = Self::default();
+        *adopter.generation.lock().unwrap() = Some(generation);
+        Arc::new(adopter)
+    }
+    fn told(&self) -> Vec<String> {
+        self.changes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(generation, change)| match change {
+                ProcessTreeAdoptionChange::Adopt { adoption } => {
+                    format!("adopt {} on {generation}", adoption.key)
+                }
+                ProcessTreeAdoptionChange::Release { key } => {
+                    format!("release {key} on {generation}")
+                }
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl TreeAdopter for FakeAdopter {
+    fn generation(&self, _: &Orchestrator) -> Option<u64> {
+        *self.generation.lock().unwrap()
+    }
+    async fn reservation(
+        &self,
+        _: &Orchestrator,
+        _: &CommandResourceIdentity,
+    ) -> Option<ResourceReservation> {
+        Some(ResourceReservation {
+            memory_bytes: 14 << 30,
+            concurrency_units: 0,
+            ..ResourceReservation::default()
+        })
+    }
+    async fn change(
+        &self,
+        _: &Orchestrator,
+        generation: u64,
+        change: ProcessTreeAdoptionChange,
+    ) -> Result<ProcessTreeAdoptionOutcome, String> {
+        let outcome = match &change {
+            ProcessTreeAdoptionChange::Adopt { .. } => ProcessTreeAdoptionOutcome::Adopted {
+                leader_start: "1:0".into(),
+            },
+            ProcessTreeAdoptionChange::Release { .. } => ProcessTreeAdoptionOutcome::Released {
+                measured: Some(AdoptedTreeMeasurement {
+                    started_at_unix_ms: 1,
+                    finished_at_unix_ms: 2,
+                    duration_ms: 1,
+                    peak_rss_bytes: Some(12 << 30),
+                    peak_process: None,
+                    measurement_quality:
+                        cairn_common::executor_protocol::ExecutionMeasurementQuality {
+                            duration:
+                                cairn_common::executor_protocol::MeasurementQuality::Approximate,
+                            memory: cairn_common::executor_protocol::MeasurementQuality::Sampled,
+                            disk: cairn_common::executor_protocol::MeasurementQuality::Unavailable,
+                            memory_platform: None,
+                            disk_boundary: "unavailable-outside-a-cell".into(),
+                        },
+                }),
+            },
+        };
+        self.changes.lock().unwrap().push((generation, change));
+        Ok(outcome)
+    }
+    async fn observe(
+        &self,
+        _: &Orchestrator,
+        identity: &CommandResourceIdentity,
+        _: &AdoptedTreeMeasurement,
+        succeeded: bool,
+    ) {
+        self.observed
+            .lock()
+            .unwrap()
+            .push((identity.key.clone(), succeeded));
+    }
+}
+
+fn running_actor(pid: u32) -> ActorJob {
+    ActorJob {
+        state: ActorState::Running,
+        pid: Some(pid),
+        program: None,
+        last_exit: None,
+    }
+}
+
+/// A launched attempt's ledger row whose phases are `phases`, each
+/// `(name, ended)`.
+fn row_in(phases: &[(&str, bool)], outcome: Option<&str>) -> RebuildRecord {
+    serde_json::from_value(json!({
+        "id": "req-attempt",
+        "status": outcome.unwrap_or("acting"),
+        "outcome": outcome,
+        "requests": [], "requesters": [], "waiting": [], "facts": {}, "events": [], "faults": [],
+        "phases": phases.iter().map(|(name, ended)| json!({
+            "name": name,
+            "started": "2026-11-11T20:00:00Z",
+            "ended": ended.then_some("2026-11-11T20:10:00Z"),
+            "outcome": ended.then_some("ok"),
+        })).collect::<Vec<_>>(),
+        "launch": {
+            "request_ids": ["request"], "attempt_id": "attempt", "authorization_event_id": "event",
+            "kind": "rebuild", "target": null, "commit": commit('b'), "facts_version": 1,
+            "recorded_at": 1, "bootstrap_requested_at": 1,
+        },
+    }))
+    .unwrap()
+}
+
+/// The build is counted from its first rustc to its last: only while launchd
+/// runs the label with a pid and the attempt's open phase is one of cargo's.
+#[test]
+fn the_build_is_adopted_only_while_a_running_actor_has_a_cargo_phase_open() {
+    let adopted = |job: &ActorJob, row: RebuildRecord| desired_adoption(job, &[row]);
+    let build = adopted(
+        &running_actor(7),
+        row_in(&[("fetch", true), ("build", false)], None),
+    )
+    .expect("the app build is compile work");
+    assert_eq!(build.key, "rebuild:attempt:build");
+    assert_eq!(build.leader_pid, 7);
+    assert_eq!(
+        adopted(
+            &running_actor(7),
+            row_in(&[("build", true), ("voice-engine", false)], None)
+        )
+        .map(|desired| desired.phase),
+        Some("voice-engine")
+    );
+    for phases in [
+        &[("fetch", false)][..],
+        &[("build", true), ("install", false)][..],
+        &[("build", true)][..],
+    ] {
+        assert_eq!(
+            adopted(&running_actor(7), row_in(phases, None)),
+            None,
+            "{phases:?}"
+        );
+    }
+    assert_eq!(
+        adopted(
+            &running_actor(7),
+            row_in(&[("build", false)], Some("failed"))
+        ),
+        None,
+        "an attempt with an outcome is over"
+    );
+    for state in [ActorState::Exited, ActorState::Unknown, ActorState::Absent] {
+        let job = ActorJob {
+            state,
+            ..running_actor(7)
+        };
+        assert_eq!(adopted(&job, row_in(&[("build", false)], None)), None);
+    }
+    let pidless = ActorJob {
+        pid: None,
+        ..running_actor(7)
+    };
+    assert_eq!(adopted(&pidless, row_in(&[("build", false)], None)), None);
+}
+
+async fn adopting_fixture(adopter: Arc<FakeAdopter>) -> Fixture {
+    let root = tempfile::tempdir().unwrap().keep();
+    let orch = orchestrator(&root).await;
+    seed(&orch).await;
+    let launchd = FakeLaunchd::new(ActorState::Absent);
+    let consumer = Arc::new(
+        RebuildConsumer::new(host(&root), launchd.clone(), Arc::new(FixedSource))
+            .with_adopter(adopter),
+    );
+    orch.operator_requests.register(consumer.clone()).unwrap();
+    Fixture {
+        orch,
+        root,
+        launchd,
+        consumer,
+    }
+}
+
+/// The reconciler tells the colocated executor once per cargo phase, again on
+/// a new link, and releases as a phase or its actor ends; each release teaches
+/// the release-build profile, as a success only when the phase reported ok.
+#[tokio::test]
+async fn the_reconciler_adopts_each_cargo_phase_once_and_releases_it_with_its_outcome() {
+    let adopter = FakeAdopter::on_link(1);
+    let f = adopting_fixture(adopter.clone()).await;
+    let (_, id) = launched(&f).await;
+    let attempt = id.strip_prefix("req-").unwrap().to_string();
+    let key = |phase: &str| format!("rebuild:{attempt}:{phase}");
+    *f.launchd.job.lock().unwrap() = running_actor(4242);
+
+    f.append(
+        &id,
+        json!({"type":"phase","name":"fetch","state":"started"}),
+    );
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert!(adopter.told().is_empty(), "fetching compiles nothing");
+
+    f.append(
+        &id,
+        json!({"type":"phase","name":"fetch","state":"ended","outcome":"ok"}),
+    );
+    f.append(
+        &id,
+        json!({"type":"phase","name":"build","state":"started"}),
+    );
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(adopter.told(), vec![format!("adopt {} on 1", key("build"))]);
+    {
+        let changes = adopter.changes.lock().unwrap();
+        let ProcessTreeAdoptionChange::Adopt { adoption } = &changes[0].1 else {
+            panic!("an adoption");
+        };
+        assert_eq!(adoption.leader_pid, 4242);
+        assert_eq!(adoption.label, ACTOR_LABEL);
+        assert_eq!(adoption.command_class, CellCommandClass::ReleaseBuild);
+        assert_eq!(adoption.resource_reservation.concurrency_units, 0);
+    }
+
+    // The colocated executor reattached: the new link is told again.
+    *adopter.generation.lock().unwrap() = Some(2);
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(adopter.told().len(), 2);
+    assert_eq!(adopter.told()[1], format!("adopt {} on 2", key("build")));
+
+    f.append(
+        &id,
+        json!({"type":"phase","name":"build","state":"ended","outcome":"ok"}),
+    );
+    f.append(
+        &id,
+        json!({"type":"phase","name":"voice-engine","state":"started"}),
+    );
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(
+        adopter.told()[2..],
+        [
+            format!("release {} on 2", key("build")),
+            format!("adopt {} on 2", key("voice-engine")),
+        ]
+    );
+
+    // The actor dies with the voice engine's phase still open.
+    f.launchd.exited(&staged_runtime(&f, &id));
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(
+        adopter.told().last().unwrap(),
+        &format!("release {} on 2", key("voice-engine"))
+    );
+    let identity = format!("{ACTOR_LABEL}:release-build");
+    assert_eq!(
+        *adopter.observed.lock().unwrap(),
+        vec![(identity.clone(), true), (identity, false)],
+        "the ok build teaches as a success, the phase its actor died in as a failure"
+    );
+    let told = adopter.told().len();
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(adopter.told().len(), told, "nothing more to say");
+}

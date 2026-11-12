@@ -1342,9 +1342,12 @@ pub(super) fn cold_start_prior(
     // modest on both. `Other` keeps the historical floor, because an unclassified
     // command is exactly the case nothing is known about.
     let (memory, disk) = match class {
+        // A release build is a Rust compile of the whole app, so it starts
+        // from the same figures until its own profile has been learned.
         CellCommandClass::CargoTest
         | CellCommandClass::CargoClippy
-        | CellCommandClass::CargoCheck => (2 * GIB, 4 * GIB),
+        | CellCommandClass::CargoCheck
+        | CellCommandClass::ReleaseBuild => (2 * GIB, 4 * GIB),
         CellCommandClass::Build => (1536 * MIB, 2 * GIB),
         CellCommandClass::Typecheck => (1536 * MIB, 512 * MIB),
         CellCommandClass::Vitest => (GIB, GIB),
@@ -1476,7 +1479,8 @@ pub(super) fn duration_prior(class: CellCommandClass) -> u64 {
     match class {
         CellCommandClass::CargoTest
         | CellCommandClass::CargoClippy
-        | CellCommandClass::CargoCheck => 300 * SECOND,
+        | CellCommandClass::CargoCheck
+        | CellCommandClass::ReleaseBuild => 300 * SECOND,
         CellCommandClass::Build => 60 * SECOND,
         CellCommandClass::Typecheck | CellCommandClass::Vitest => 30 * SECOND,
         CellCommandClass::Other => 10 * SECOND,
