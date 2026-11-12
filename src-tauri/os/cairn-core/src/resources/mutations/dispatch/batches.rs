@@ -109,6 +109,7 @@ pub(super) async fn dispatch(
     }
     let report = cancel::cancel_batch(
         orch,
+        &db,
         request_id,
         writer.principal(),
         cancel::CANCEL_SETTLE_WAIT,
@@ -127,12 +128,15 @@ pub(super) async fn batch_owner(db: &LocalDb, request_id: &str) -> Result<Option
         return Ok(Some(owner.job_id));
     }
     if let Some(batch) = detached::load(db, request_id).await? {
-        return Ok(matches!(
+        if matches!(
             batch.state,
             detached::DetachedState::Parked | detached::DetachedState::Running
-        )
-        .then_some(batch.job_id));
+        ) {
+            return Ok(Some(batch.job_id));
+        }
     }
+    // A settled row may still have a pending wait: a lost batch whose call
+    // was never resumed, which a repeated cancel finishes.
     db.query_opt_text(
         "SELECT job_id FROM agent_waits
           WHERE state IN ('pending', 'resolving')

@@ -8176,6 +8176,14 @@ pub struct LearnedResourceEstimate {
 /// and only cannot say that inodes are the cause, nor predict the hold before
 /// an offer. That is a weaker explanation, not a different admission
 /// conclusion: the executor still refuses, and the runner still routes away.
+///
+/// cairn/6991 does not move the number. The runner now judges a request an
+/// earlier runner placed by the report of the machine that claimed it, rather
+/// than waiting for every enrolled machine, and may send `Cancel` for an
+/// attempt a machine's snapshot lists as granted. Both read and send only what
+/// every peer already exchanges: the snapshot fields are unchanged, and
+/// `Cancel` for a granted attempt is the message an executor has always acted
+/// on. What a runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above

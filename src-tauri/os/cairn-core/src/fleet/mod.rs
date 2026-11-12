@@ -3934,13 +3934,15 @@ impl ExecutorConnectionState {
 /// What the machines report about one request; see [`Fleet::request_report`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestReport {
-    /// Not every machine has reported since it attached, so nothing is known.
-    Unknown,
+    /// A machine that could hold it has not reported since this runner
+    /// started; `awaiting` names them, in the words an operator reads.
+    Unknown { awaiting: Vec<String> },
     /// A machine still holds an attempt of it.
     Held { executor_id: String },
     /// A machine finished it and still lists the completion.
     Completed(Box<cairn_common::executor_protocol::CellCompletion>),
-    /// Every machine has reported, and none holds or finished it.
+    /// Every machine that could hold it has reported, and none holds or
+    /// finished it; or the machine that held it is no longer enrolled.
     Gone,
 }
 
@@ -9241,32 +9243,40 @@ impl Fleet {
     /// What the machines' own reports say about a request this runner may no
     /// longer hold a subscriber for (one placed before a restart).
     ///
-    /// `Unknown` until the evidence is complete: every enrolled machine is
-    /// attached and the colocated substrate is not restoring, and every
-    /// attached machine has delivered at least one snapshot on its current
-    /// link. Attachment alone proves nothing; the snapshot is the machine's
-    /// account of the attempts it was granted and has not finished, and an
-    /// attempt absent from it and from its recent completions did not survive
-    /// the process that ran it (tenet 308).
-    pub(crate) fn request_report(&self, request_id: &str) -> RequestReport {
-        if !self.unattached_enrolled_remotes().is_empty()
-            || matches!(
-                self.link_restoration(),
-                placement::LinkRestoration::Restoring
-            )
-        {
-            return RequestReport::Unknown;
-        }
+    /// Only a machine that has delivered at least one snapshot on its current
+    /// link has said anything. Attachment alone proves nothing; the snapshot is
+    /// the machine's account of the attempts it was granted and has not
+    /// finished, and an attempt absent from it and from its recent completions
+    /// did not survive the process that ran it (tenet 308). So a reporting
+    /// machine that holds or lists the request decides it, whoever else is
+    /// away.
+    ///
+    /// Absence is judged against `holder`, the machine durable evidence says
+    /// claimed it, when one is known: that machine's report is the whole
+    /// question, and another machine being away is irrelevant. A holder that
+    /// is no longer enrolled can never report again, which is evidence too.
+    /// With no known holder every machine that could hold it must have
+    /// reported: every enrolled one attached, the colocated substrate not
+    /// restoring, and every attached one past its first snapshot.
+    pub(crate) fn request_report(&self, request_id: &str, holder: Option<&str>) -> RequestReport {
+        let restoring = matches!(
+            self.link_restoration(),
+            placement::LinkRestoration::Restoring
+        );
+        let away: Vec<(String, String)> = self
+            .unattached_enrolled_remotes()
+            .into_iter()
+            .map(|remote| (remote.executor_id, remote.name))
+            .collect();
+        let holder_enrolled = holder.is_some_and(|holder| {
+            holder == COLOCATED_EXECUTOR_ID || self.is_enrolled_remote(holder)
+        });
         let connections = self.lock_connections();
-        if connections.is_empty()
-            || connections
-                .values()
-                .any(|connection| connection.snapshots_received == 0)
-        {
-            return RequestReport::Unknown;
-        }
+        let reported = |entry: &ExecutorConnectionState| {
+            entry.snapshots_received >= 1 && !(entry.colocated && restoring)
+        };
         let mut completed = None;
-        for (executor_id, connection) in connections.iter() {
+        for (executor_id, connection) in connections.iter().filter(|(_, entry)| reported(entry)) {
             let snapshot = &connection.snapshot;
             let held = snapshot
                 .granted_attempts
@@ -9299,10 +9309,87 @@ impl Fleet {
                     .cloned();
             }
         }
-        match completed {
-            Some(completion) => RequestReport::Completed(Box::new(completion)),
-            None => RequestReport::Gone,
+        if let Some(completion) = completed {
+            return RequestReport::Completed(Box::new(completion));
         }
+        if let Some(holder) = holder {
+            return match connections.get(holder) {
+                Some(entry) if reported(entry) => RequestReport::Gone,
+                Some(entry) => RequestReport::Unknown {
+                    awaiting: vec![executor_public_name(entry)],
+                },
+                None if !holder_enrolled => RequestReport::Gone,
+                None => RequestReport::Unknown {
+                    awaiting: vec![away
+                        .iter()
+                        .find(|(executor_id, _)| executor_id == holder)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_else(|| {
+                            if holder == COLOCATED_EXECUTOR_ID {
+                                LOCAL_EXECUTOR_NAME.to_string()
+                            } else {
+                                holder.to_string()
+                            }
+                        })],
+                },
+            };
+        }
+        let mut awaiting: Vec<String> = away.into_iter().map(|(_, name)| name).collect();
+        if restoring && !connections.contains_key(COLOCATED_EXECUTOR_ID) {
+            awaiting.push(LOCAL_EXECUTOR_NAME.to_string());
+        }
+        awaiting.extend(
+            connections
+                .values()
+                .filter(|entry| !reported(entry))
+                .map(executor_public_name),
+        );
+        // No machine attached at all is not every machine having reported;
+        // it names no one because none has said anything.
+        if awaiting.is_empty() && !connections.is_empty() {
+            RequestReport::Gone
+        } else {
+            RequestReport::Unknown { awaiting }
+        }
+    }
+
+    /// Tell every reporting machine whose snapshot lists a granted attempt of
+    /// `request_id` to cancel it, for a request this runner holds no binding
+    /// for (one an earlier runner placed). Best effort; how many were told.
+    pub(crate) fn cancel_reported_attempts(&self, request_id: &str) -> usize {
+        let granted: Vec<(String, u64, String)> = self
+            .lock_connections()
+            .iter()
+            .flat_map(|(executor_id, entry)| {
+                entry
+                    .snapshot
+                    .granted_attempts
+                    .iter()
+                    .filter(|attempt| attempt.request_id == request_id)
+                    .map(|attempt| {
+                        (
+                            executor_id.clone(),
+                            entry.generation,
+                            attempt.attempt_id.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        granted
+            .into_iter()
+            .filter(|(executor_id, generation, attempt_id)| {
+                self.send_to(
+                    executor_id,
+                    *generation,
+                    ExecutorMessage::Cancel {
+                        request_id: request_id.to_string(),
+                        attempt_id: attempt_id.clone(),
+                    },
+                )
+                .is_ok()
+            })
+            .count()
     }
 
     /// Whether this runner's registry holds a live subscriber for the request.
@@ -36669,9 +36756,11 @@ mod tests {
             }];
         pool.lock_connections()
             .insert(executor_id.clone(), connection);
-        assert_eq!(
-            pool.request_report("gone"),
-            RequestReport::Unknown,
+        assert!(
+            matches!(
+                pool.request_report("gone", None),
+                RequestReport::Unknown { .. }
+            ),
             "an attached machine that has not reported proves nothing"
         );
 
@@ -36680,15 +36769,67 @@ mod tests {
             .unwrap()
             .snapshots_received = 1;
         assert_eq!(
-            pool.request_report("held"),
+            pool.request_report("held", None),
             RequestReport::Held {
                 executor_id: executor_id.clone()
             }
         );
-        assert_eq!(pool.request_report("gone"), RequestReport::Gone);
+        assert_eq!(pool.request_report("gone", None), RequestReport::Gone);
         assert!(
             !pool.is_request_in_flight("held"),
             "the registry has no subscriber for it, which is why the report is asked"
+        );
+    }
+
+    /// cairn/6991: a request whose holder is known is judged by that machine's
+    /// report alone. Another enrolled machine being away (bgsrv-ub2, offline
+    /// for days) no longer leaves every restart-detached batch unknown; the
+    /// holder away names itself as what the request waits for; and with no
+    /// known holder the away machine is named instead.
+    #[test]
+    fn a_request_report_judges_the_machine_that_claimed_it() {
+        let pool = Fleet::default();
+        let (holder, mut connection) = fleet_entry("bgsrv-mac", "macos", 0, &[]);
+        connection.snapshots_received = 1;
+        let holder_name = executor_public_name(&connection);
+        pool.lock_connections().insert(holder.clone(), connection);
+        pool.declare_enrolled_remote(&holder, &holder_name, "macos", "aarch64");
+        pool.declare_enrolled_remote("bgsrv-ub2", "bgsrv-ub2", "linux", "x86_64");
+
+        assert_eq!(
+            pool.request_report("gone", Some(&holder)),
+            RequestReport::Gone,
+            "its holder reported without it; another machine being away is irrelevant"
+        );
+        assert_eq!(
+            pool.request_report("gone", None),
+            RequestReport::Unknown {
+                awaiting: vec!["bgsrv-ub2".to_string()]
+            },
+            "with no known holder, the away machine could hold it"
+        );
+        assert_eq!(
+            pool.request_report("gone", Some("bgsrv-ub2")),
+            RequestReport::Unknown {
+                awaiting: vec!["bgsrv-ub2".to_string()]
+            }
+        );
+        assert_eq!(
+            pool.request_report("gone", Some("retired-machine")),
+            RequestReport::Gone,
+            "a holder no longer enrolled can never report again"
+        );
+
+        pool.lock_connections()
+            .get_mut(&holder)
+            .unwrap()
+            .snapshots_received = 0;
+        assert_eq!(
+            pool.request_report("gone", Some(&holder)),
+            RequestReport::Unknown {
+                awaiting: vec![holder_name]
+            },
+            "an attached holder that has not reported proves nothing"
         );
     }
 

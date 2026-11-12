@@ -117,12 +117,25 @@ struct Claim {
 /// The unsettled durable row that claims `request_id`, if one does: a pending
 /// run-batch wait, else a running detached row. A wait already `resolving`
 /// holds its answer and is not claimed: that answer is what reaches the call.
+/// Nothing claims a batch already settled lost, even while its wait is still
+/// pending (a cancel writes the loss before it resumes the call): that batch's
+/// branch was released, so its result is reported, never published.
 /// Read through `idx_agent_waits_pending_run_batch`, whose predicate this
 /// spells exactly.
 async fn claim_of(
     c: &cairn_db::storage::TrackedConnection,
     request_id: &str,
 ) -> DbResult<Option<Claim>> {
+    let mut rows = c
+        .query(
+            "SELECT 1 FROM run_batch_detached WHERE request_id=?1 AND state='lost'",
+            params![request_id],
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Ok(None);
+    }
+    drop(rows);
     let mut rows = c
         .query(
             "SELECT job_id,condition_json,created_at FROM agent_waits INDEXED BY idx_agent_waits_pending_run_batch WHERE state = 'pending' AND kind = 'run_batch' AND json_extract(condition_json,'$.request_id')=?1 LIMIT 1",
@@ -394,12 +407,50 @@ pub(crate) async fn adopt(orch: &Orchestrator, result: UnboundResult) -> Adoptio
         orch.adoption.undecided.lock().unwrap().push(result);
         return Adoption::Undecided;
     }
+    // A batch already settled lost has told its job that its branch is free,
+    // so its result is reported and never published.
+    let late = late_report_of(&result);
+    for db in orch.db.all_dbs().await {
+        match detached::report_late(orch, &db, &request_id, &late).await {
+            Ok(true) => {
+                log::info!(
+                    "result of request {request_id} attempt {attempt_id} from {machine} arrived after its batch was settled lost; reported to its job, not published"
+                );
+                break;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("{error}");
+                orch.adoption.undecided.lock().unwrap().push(result);
+                return Adoption::Undecided;
+            }
+        }
+    }
     log::info!(
         "result of request {request_id} attempt {attempt_id} from {machine}: no unsettled batch claims it (already settled, or never a run batch); acknowledged without effect"
     );
     orch.fleet
         .send_result_ack(&executor_id, &request_id, &attempt_id);
     Adoption::Unclaimed
+}
+
+/// What a result that arrives for a lost batch reports: its verdict as the
+/// batch's own settlement would state it, and the commit it sealed.
+fn late_report_of(result: &UnboundResult) -> detached::LateReport {
+    let (_, verdict) = super::compose_adopted_result(&result.outcome, &result.machine, None);
+    let commit = match &result.outcome {
+        CellOutcome::Completed {
+            mutation_delta: Some(delta),
+            ..
+        } => Some(delta.delta_commit.clone()),
+        _ => None,
+    };
+    detached::LateReport {
+        verdict,
+        machine: result.machine.clone(),
+        received_ms: chrono::Utc::now().timestamp_millis(),
+        commit,
+    }
 }
 
 /// One `run_batch_adopted_outcomes` row a driver works.
@@ -754,14 +805,18 @@ pub(crate) fn local_restart_text(request_id: &str, commits: bool) -> String {
     )
 }
 
-/// What a batch no reporting machine holds is told.
+/// What a batch no reporting machine holds is told. `placed_on` is the
+/// machine that claimed it, when one is known: its report alone decided.
 pub(crate) fn lost_text(request_id: &str, placed_on: Option<&PlacedOn>, commits: bool) -> String {
-    let placed = match placed_on {
-        Some(placed) => format!(" It was placed on {}.", placed.name),
-        None => String::new(),
+    let (who, placed) = match placed_on {
+        Some(placed) => (
+            "the machine it was placed on has",
+            format!(" It was placed on {}.", placed.name),
+        ),
+        None => ("every machine has", String::new()),
     };
     format!(
-        "Cairn restarted while this batch was running, and every machine has reported since without holding or having finished it (request {request_id}).{placed} Its outcome is unknown.{}",
+        "Cairn restarted while this batch was running, and {who} reported since without holding or having finished it (request {request_id}).{placed} Its outcome is unknown.{}",
         if commits {
             " It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it."
         } else {
@@ -770,13 +825,14 @@ pub(crate) fn lost_text(request_id: &str, placed_on: Option<&PlacedOn>, commits:
     )
 }
 
-/// What a parked call is told when it is released because a machine has not
-/// reconnected within [`RELEASE_AFTER`] of this process's start.
+/// What a parked call is told when it is released because a machine that
+/// could hold its batch has not reported within [`RELEASE_AFTER`] of this
+/// process's start.
 pub(crate) fn release_text(request_id: &str, machines: &[String], commits: bool) -> String {
     let away = match machines {
         [] => "a machine has not reported".to_string(),
-        [one] => format!("{one} has not reconnected"),
-        many => format!("{} have not reconnected", many.join(", ")),
+        [one] => format!("{one} has not reported"),
+        many => format!("{} have not reported", many.join(", ")),
     };
     format!(
         "Cairn restarted while this batch was running, and {away} in the {} minutes since. Nothing was cancelled: when it does, the batch's result settles `{}`{}, and reaches this job as a notice. Do not re-run it.",
@@ -793,7 +849,7 @@ pub(crate) fn release_text(request_id: &str, machines: &[String], commits: bool)
 /// Settle a parked wait with a text of this process's own: resolve it, then
 /// settle the detached row a resolution diverted it into, exactly as a live
 /// resolver does.
-async fn resolve_wait(
+pub(super) async fn resolve_wait(
     orch: &Orchestrator,
     db: &LocalDb,
     record: &Record,
@@ -904,6 +960,30 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
             if live.contains(&record.id) || heard_here(orch, request_id) {
                 continue;
             }
+            // A batch already settled lost (a cancel whose runner stopped
+            // before it resumed the call) is answered from that loss, before
+            // any machine is asked: its branch was released, whatever its
+            // machine still reports.
+            match detached::load(&db, request_id).await {
+                Ok(Some(batch)) if batch.state == detached::DetachedState::Lost => {
+                    resolve_wait(
+                        orch,
+                        &db,
+                        &record,
+                        request_id,
+                        &detached::lost_wait_text(&batch),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!(
+                        "could not read the detached row of run batch {request_id}: {error}"
+                    );
+                    continue;
+                }
+            }
             claimed.insert(request_id.clone());
             if *host {
                 resolve_wait(
@@ -924,10 +1004,10 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                     continue;
                 }
             }
-            let placed_on = settlement
+            let recorded = settlement
                 .as_ref()
                 .and_then(|settlement| settlement.placed_on.clone());
-            if placed_on.as_ref().is_some_and(PlacedOn::colocated) {
+            if recorded.as_ref().is_some_and(PlacedOn::colocated) {
                 resolve_wait(
                     orch,
                     &db,
@@ -938,7 +1018,19 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                 .await;
                 continue;
             }
-            match orch.fleet.request_report(request_id) {
+            // The machine that claimed it, from its record or the journal:
+            // its report alone decides, whoever else is away.
+            let placed_on = match detached::holder_of(orch, request_id, recorded.as_ref()).await {
+                Ok(holder) => holder.placed().cloned(),
+                Err(error) => {
+                    log::warn!("{error}");
+                    continue;
+                }
+            };
+            match orch.fleet.request_report(
+                request_id,
+                placed_on.as_ref().map(|placed| placed.executor_id.as_str()),
+            ) {
                 RequestReport::Held { .. } => {}
                 RequestReport::Completed(completion) => {
                     let (_, output) = detached::completion_result(&completion, *commits);
@@ -960,27 +1052,16 @@ pub(crate) async fn judge_unheard(orch: &Orchestrator) {
                     )
                     .await;
                 }
-                RequestReport::Unknown if uptime >= RELEASE_AFTER => {
-                    let away: Vec<String> = orch
-                        .fleet
-                        .unattached_enrolled_remotes()
-                        .into_iter()
-                        .map(|remote| remote.name)
-                        .collect();
-                    // The batch's own machine when it is known and among them.
-                    let machines = match placed_on {
-                        Some(placed) if away.contains(&placed.name) => vec![placed.name],
-                        _ => away,
-                    };
+                RequestReport::Unknown { awaiting } if uptime >= RELEASE_AFTER => {
                     release_wait(
                         orch,
                         &db,
                         &record,
-                        &release_text(request_id, &machines, *commits),
+                        &release_text(request_id, &awaiting, *commits),
                     )
                     .await;
                 }
-                RequestReport::Unknown => {}
+                RequestReport::Unknown { .. } => {}
             }
         }
     }

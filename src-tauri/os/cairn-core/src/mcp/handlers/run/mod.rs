@@ -9833,6 +9833,7 @@ async fn record_detached(
         settled_ms: None,
         notified_ms: None,
         settlement: control.persisted_for_record(&orch.fleet),
+        late_report: None,
     };
     detached::insert(&db, &batch).await?;
     if control.row_written(db.clone()) && waiting_on.is_some() {
@@ -14800,7 +14801,19 @@ pub(crate) mod host_batch_tests {
         let refusal = reissue_refusal(&orch, &call_request(payload.clone())).await;
         assert_eq!(
             refusal.as_deref(),
-            Some(detached::reissue_refusal_text("req-d", &detached::LiveState::Untracked).as_str())
+            Some(
+                detached::reissue_refusal_text(
+                    "req-d",
+                    &detached::live_state(
+                        &orch,
+                        &detached::load(&orch.db.local, "req-d")
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    )
+                )
+                .as_str()
+            )
         );
         assert!(refusal.unwrap().contains("cairn:~/batches/req-d"));
         let different = call_request(json!({"commands": [{"command": "cargo check"}]}));
@@ -15129,6 +15142,7 @@ pub(crate) mod host_batch_tests {
                 settled_ms: None,
                 notified_ms: None,
                 settlement: None,
+                late_report: None,
             },
         )
         .await
@@ -15206,8 +15220,14 @@ pub(crate) mod host_batch_tests {
             "settlement begins: the commit is being written"
         );
 
-        let report =
-            cancel::cancel_batch(&orch, &control.request_id, BUILDER, Duration::from_secs(5)).await;
+        let report = cancel::cancel_batch(
+            &orch,
+            &orch.db.local,
+            &control.request_id,
+            BUILDER,
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(report, cancel::CancelReport::AlreadySettling);
         assert!(!control
             .stop_placement
@@ -15239,6 +15259,7 @@ pub(crate) mod host_batch_tests {
 
         let report = cancel::cancel_batch(
             &orch,
+            &orch.db.local,
             &control.request_id,
             "operator",
             Duration::from_secs(10),
@@ -15282,6 +15303,7 @@ pub(crate) mod host_batch_tests {
 
         let report = cancel::cancel_batch(
             &orch,
+            &orch.db.local,
             &control.request_id,
             "operator",
             Duration::from_secs(10),
@@ -15311,7 +15333,8 @@ pub(crate) mod host_batch_tests {
     /// A batch an earlier runner placed has no task here, only the fleet's
     /// request (what cairn/6612 makes common across an orderly restart). The
     /// cancel still reaches it, through the same `Cancel`, and its machine's
-    /// report settles it. One with neither is refused as not live.
+    /// report settles it. One with no task, no fleet binding and no durable
+    /// record is refused as not live.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_batch_held_only_by_the_fleet_is_cancelled_through_its_request() {
         let orch = env().await;
@@ -15319,13 +15342,20 @@ pub(crate) mod host_batch_tests {
         let _claimed = orch
             .fleet
             .claim_job_command_for_test(&request_id, "job-1", 1);
-        let report = cancel::cancel_batch(&orch, &request_id, "operator", Duration::ZERO).await;
+        let report = cancel::cancel_batch(
+            &orch,
+            &orch.db.local,
+            &request_id,
+            "operator",
+            Duration::ZERO,
+        )
+        .await;
         assert_eq!(report, cancel::CancelReport::Retracted);
         assert!(orch.fleet.was_retired_for_test(&request_id));
 
         let unknown = uuid::Uuid::new_v4().to_string();
         assert_eq!(
-            cancel::cancel_batch(&orch, &unknown, "operator", Duration::ZERO).await,
+            cancel::cancel_batch(&orch, &orch.db.local, &unknown, "operator", Duration::ZERO).await,
             cancel::CancelReport::NotLive
         );
     }
@@ -15471,7 +15501,13 @@ pub(crate) mod host_batch_tests {
                 } else {
                     Some(detached::reissue_refusal_text(
                         "req-abandoned",
-                        &detached::LiveState::Untracked,
+                        &detached::live_state(
+                            &orch,
+                            &detached::load(&orch.db.local, "req-abandoned")
+                                .await
+                                .unwrap()
+                                .unwrap(),
+                        ),
                     ))
                 }
             );

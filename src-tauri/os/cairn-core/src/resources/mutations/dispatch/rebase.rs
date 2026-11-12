@@ -549,6 +549,7 @@ async fn cancel_holding(
     };
     let report = crate::mcp::handlers::run::cancel::cancel_batch(
         orch,
+        db,
         &batch.request_id,
         &by,
         crate::mcp::handlers::run::cancel::CANCEL_SETTLE_WAIT,

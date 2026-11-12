@@ -760,7 +760,7 @@ async fn open_batch_waits(db: &LocalDb, job_id: &str) -> Result<Vec<OpenBatchWai
 
 fn cancel_line(home: &str, request_id: &str) -> String {
     format!(
-        "\nCancel this batch only: `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`. A call waiting on it resumes with a cancelled result; a commit it is already writing stands.\n"
+        "\nCancel this batch only: `write({{changes:[{{target:\"{home}/batches/{request_id}\",mode:\"patch\",payload:{{action:\"cancel\"}}}}]}})`. A call waiting on it resumes with a cancelled result, and it releases its branch; a commit it is already writing stands. One that no runner task or machine holds (an earlier runner placed it) is settled as lost, with its outcome unknown.\n"
     )
 }
 

@@ -1,0 +1,13 @@
+-- lineage: shared
+-- cairn/6991: what a lost detached batch reported after it was settled lost.
+--
+-- A row settled `lost` (by its owner's cancel, or by evidence that its machine
+-- no longer holds it) has told its job the batch's outcome is unknown and that
+-- it no longer holds its branch, so others may build on that branch. If the
+-- batch's machine reports a result afterwards, that result is recorded here
+-- and reported to the job as a second notice; its commit is not published,
+-- because publishing it would move a branch everyone was told is free.
+--
+-- `late_report`: JSON `{verdict, machine, receivedMs, commit}` for the first
+-- result that arrived after the row was lost; null until one does.
+ALTER TABLE run_batch_detached ADD COLUMN late_report TEXT;

@@ -3889,6 +3889,264 @@ mod tests {
             assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
         }
 
+        /// cairn/6991: a parked call whose batch no runner task, fleet binding
+        /// or machine holds is cancelled by its owner: its batch is recorded
+        /// lost first, then the call resumes once saying the outcome is
+        /// unknown and the branch is released. A result its machine reports
+        /// afterwards is not the wait's to adopt (nothing publishes it): it
+        /// is recorded against the lost row and reported to the job.
+        #[tokio::test]
+        async fn cancelling_a_parked_batch_nothing_holds_resumes_its_call_once() {
+            use crate::mcp::handlers::run::{cancel, detached};
+            let (orch, base, _) = durable_env().await;
+            parked(&orch, &run_batch_record(&base, false)).await;
+
+            let report = cancel::cancel_batch(
+                &orch,
+                &orch.db.local,
+                "request-1",
+                "operator",
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(report, cancel::CancelReport::SettledUnheld);
+            assert!(report.reached());
+            assert_eq!(
+                resolution(&orch).await,
+                cancel::unheld_cancel_text("request-1", "operator", false)
+            );
+            assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+            let lost = detached::load(&orch.db.local, "request-1")
+                .await
+                .unwrap()
+                .expect("the cancelled batch has a durable record");
+            assert_eq!(lost.state, detached::DetachedState::Lost);
+
+            let mut frames = orch.fleet.attach_reported_machine_for_test("exec-a", &[]);
+            adopted::start(&orch);
+            let sealed = "d".repeat(40);
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                result(completed(&orch, "late output", Some(&sealed))),
+            );
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+            let late = detached::load(&orch.db.local, "request-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .late_report
+                .expect("the late result is recorded");
+            assert_eq!(late.commit.as_deref(), Some(sealed.as_str()));
+            let late_notice: Option<String> = orch
+                .db
+                .local
+                .query_opt_text(
+                    "SELECT content FROM suppressed_wakes WHERE id='run-batch:request-1:late'",
+                    (),
+                )
+                .await
+                .unwrap();
+            assert!(
+                late_notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("was not published")),
+                "{late_notice:?}"
+            );
+            assert_eq!(
+                adopted_state(&orch).await,
+                None,
+                "the cancelled wait no longer claims its result"
+            );
+            assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+        }
+
+        /// cairn/6991: a runner that stopped between a cancel's loss and its
+        /// resumption of the call leaves a lost row and a pending wait. After
+        /// the restart the call resumes once from that loss, before its
+        /// machine is asked, even while that machine still reports holding
+        /// the batch; and a repeated cancel finishes it too.
+        #[tokio::test]
+        async fn a_loss_whose_call_was_never_resumed_resumes_it_after_a_restart() {
+            use crate::mcp::handlers::run::{cancel, detached};
+            for retry_by_cancel in [false, true] {
+                let (orch, base, _) = durable_env().await;
+                parked(&orch, &run_batch_record(&base, false)).await;
+                detached::insert(
+                    &orch.db.local,
+                    &detached::DetachedBatch {
+                        request_id: "request-1".into(),
+                        job_id: "job-1".into(),
+                        run_id: "run-1".into(),
+                        label: None,
+                        identity: None,
+                        commits: false,
+                        holds_branch: true,
+                        state: detached::DetachedState::Lost,
+                        verdict: None,
+                        output: None,
+                        commit_id: None,
+                        reason: "test".into(),
+                        lost_evidence: Some(detached::cancel_evidence("operator")),
+                        created_ms: 1,
+                        settled_ms: Some(2),
+                        notified_ms: Some(2),
+                        settlement: None,
+                        waiting_on: None,
+                        late_report: None,
+                    },
+                )
+                .await
+                .unwrap();
+                let _frames = orch
+                    .fleet
+                    .attach_reported_machine_for_test("exec-a", &[("request-1", "attempt-1")]);
+
+                if retry_by_cancel {
+                    let report = cancel::cancel_batch(
+                        &orch,
+                        &orch.db.local,
+                        "request-1",
+                        "operator",
+                        Duration::ZERO,
+                    )
+                    .await;
+                    assert_eq!(report, cancel::CancelReport::SettledUnheld);
+                } else {
+                    adopted::judge_unheard(&orch).await;
+                }
+                assert_eq!(
+                    resolution(&orch).await,
+                    cancel::unheld_cancel_text("request-1", "operator", false),
+                    "retry by cancel: {retry_by_cancel}"
+                );
+                assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+                adopted::judge_unheard(&orch).await;
+                assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+            }
+        }
+
+        /// cairn/6991: a cancel that finds a result already adopted for its
+        /// parked call touches nothing; that result is being published.
+        #[tokio::test]
+        async fn a_cancel_leaves_a_parked_batch_whose_result_was_adopted() {
+            use crate::mcp::handlers::run::{cancel, detached};
+            let (orch, base, _) = durable_env().await;
+            parked(&orch, &run_batch_record(&base, false)).await;
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO run_batch_adopted_outcomes(request_id,attempt_id,job_id,executor_id,machine,outcome_json,state,received_ms) VALUES('request-1','attempt-1','job-1','exec-a','exec-a','{}','publishing',1)",
+                    (),
+                )
+                .await
+                .unwrap();
+
+            let report = cancel::cancel_batch(
+                &orch,
+                &orch.db.local,
+                "request-1",
+                "operator",
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(report, cancel::CancelReport::AlreadySettling);
+            assert_eq!(wait_state(&orch).await, "pending");
+            assert!(detached::load(&orch.db.local, "request-1")
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        /// cairn/6991: a detached batch cancelled while nothing held it is
+        /// lost and releases its branch, so a result its machine reports
+        /// afterwards is recorded and reported to the job as a second notice,
+        /// acknowledged, and never published (nothing is adopted).
+        #[tokio::test]
+        async fn a_result_after_a_lost_settle_is_reported_and_never_published() {
+            use crate::mcp::handlers::run::{cancel, detached};
+            let (orch, _base, _) = durable_env().await;
+            let db = &orch.db.local;
+            detached::insert(
+                db,
+                &detached::DetachedBatch {
+                    request_id: "request-1".into(),
+                    job_id: "job-1".into(),
+                    run_id: "run-1".into(),
+                    label: Some("echo".into()),
+                    identity: None,
+                    commits: true,
+                    holds_branch: true,
+                    state: detached::DetachedState::Running,
+                    verdict: None,
+                    output: None,
+                    commit_id: None,
+                    reason: "test".into(),
+                    lost_evidence: None,
+                    created_ms: 1,
+                    settled_ms: None,
+                    notified_ms: None,
+                    settlement: None,
+                    waiting_on: None,
+                    late_report: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let report =
+                cancel::cancel_batch(&orch, db, "request-1", "operator", Duration::ZERO).await;
+            assert_eq!(report, cancel::CancelReport::SettledUnheld);
+            let lost = detached::load(db, "request-1").await.unwrap().unwrap();
+            assert_eq!(lost.state, detached::DetachedState::Lost);
+            assert!(
+                lost.lost_evidence
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("cancelled by operator"),
+                "{lost:?}"
+            );
+
+            let mut frames = orch.fleet.attach_reported_machine_for_test("exec-a", &[]);
+            adopted::start(&orch);
+            let sealed = "c".repeat(40);
+            orch.fleet.handle_executor_message(
+                "exec-a",
+                1,
+                result(completed(&orch, "late output", Some(&sealed))),
+            );
+            assert!(is_ack(&next_frame(&mut frames, is_ack).await));
+
+            let late = detached::load(db, "request-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .late_report
+                .expect("the late result is recorded");
+            assert_eq!(late.commit.as_deref(), Some(sealed.as_str()));
+            assert_eq!(late.machine, "exec-a");
+            let notices: Vec<String> = db
+                .query_all(
+                    "SELECT id FROM suppressed_wakes WHERE source_ref='request-1' ORDER BY id",
+                    (),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                notices,
+                vec![
+                    "run-batch:request-1".to_string(),
+                    "run-batch:request-1:late".to_string()
+                ]
+            );
+            assert_eq!(
+                adopted_state(&orch).await,
+                None,
+                "nothing was adopted, so nothing was published"
+            );
+        }
+
         /// Execution's condition 1: a result that arrives before this runner
         /// can read its durable rows is not acknowledged, so its machine keeps
         /// it, and it is adopted once the runner can decide.

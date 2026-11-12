@@ -21,7 +21,15 @@
 //! nowhere.
 //!
 //! A runner restart does not settle it. Only the batch's report, or evidence
-//! that it can no longer report, does.
+//! that it can no longer report, does. For a batch an earlier runner placed,
+//! that evidence is about the machine that held it ([`holder_of`]): its own
+//! report since the restart, not whether every other machine is attached.
+//!
+//! Its owner can always end it. A cancel that reaches no runner task and no
+//! machine settles it `lost` ([`cancel_unheld`]), which releases the branch.
+//! A lost batch's result that arrives afterwards is recorded on the row and
+//! reported to the job ([`report_late`]), and never published: the branch was
+//! released, and others may already have built on it.
 
 use cairn_db::turso::params;
 
@@ -89,9 +97,24 @@ pub(crate) struct DetachedBatch {
     pub(crate) settlement: Option<super::PersistedSettlement>,
     /// What a parked batch waits for, in a sentence.
     pub(crate) waiting_on: Option<String>,
+    /// What a lost batch's machine reported after it was settled lost.
+    pub(crate) late_report: Option<LateReport>,
 }
 
-const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json,waiting_on";
+/// A result that arrived for a batch already settled lost: recorded and
+/// reported, never published.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LateReport {
+    pub(crate) verdict: String,
+    pub(crate) machine: String,
+    pub(crate) received_ms: i64,
+    /// The commit its machine sealed, which was not published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) commit: Option<String>,
+}
+
+const COLUMNS: &str = "request_id,job_id,run_id,label,identity,commits,holds_branch,state,verdict,output,commit_id,reason,lost_evidence,created_ms,settled_ms,notified_ms,settlement_json,waiting_on,late_report";
 
 fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
     Ok(DetachedBatch {
@@ -117,6 +140,9 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<DetachedBatch> {
             .opt_text(16)?
             .and_then(|json| serde_json::from_str(&json).ok()),
         waiting_on: row.opt_text(17)?,
+        late_report: row
+            .opt_text(18)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -365,9 +391,25 @@ pub(crate) enum LiveState {
     /// Its task is alive here but no machine holds it right now: it is
     /// between placement attempts, or is publishing its result.
     InRunner,
+    /// Nothing in this runner holds it, and a machine that could hold it has
+    /// not reported since Cairn restarted; `machines` names them (empty when
+    /// no machine is attached at all).
+    Awaiting { machines: Vec<String> },
     /// Nothing in this runner holds it; a batch an earlier runner placed is
     /// settled from its machine's report or from evidence it cannot report.
     Untracked,
+}
+
+/// `machines` as one phrase: `` `a` ``, `` `a`, `b` ``, or a machine.
+fn machines_phrase(machines: &[String]) -> String {
+    if machines.is_empty() {
+        return "a machine".to_string();
+    }
+    machines
+        .iter()
+        .map(|machine| format!("`{machine}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl LiveState {
@@ -378,6 +420,9 @@ impl LiveState {
             Self::Placed { on } => format!("running on `{on}`"),
             Self::Unplaced { .. } => "queued, not yet placed on any machine".to_string(),
             Self::InRunner => "in this runner, held by no machine right now".to_string(),
+            Self::Awaiting { machines } => {
+                format!("waiting for {} to report", machines_phrase(machines))
+            }
             Self::Untracked => "running".to_string(),
         }
     }
@@ -389,6 +434,10 @@ impl LiveState {
             Self::Placed { on } => format!("it is running on `{on}`"),
             Self::Unplaced { wait } => format!("no machine has taken it: it is {wait}"),
             Self::InRunner => "it is between placement attempts or publishing its result; no machine holds it right now".to_string(),
+            Self::Awaiting { machines } => format!(
+                "this runner holds no task for it, and {}, which could hold it, has not reported since Cairn restarted. It settles from that report; cancelling it settles it as lost now and releases its branch",
+                machines_phrase(machines)
+            ),
             Self::Untracked => "this runner holds no task for it, so it settles from its machine's own report or from evidence that it cannot report".to_string(),
         }
     }
@@ -418,7 +467,214 @@ pub(crate) fn live_state(orch: &Orchestrator, batch: &DetachedBatch) -> LiveStat
     if batch_is_live(orch, request_id) {
         return LiveState::InRunner;
     }
-    LiveState::Untracked
+    let holder = batch
+        .settlement
+        .as_ref()
+        .and_then(|settlement| settlement.placed_on.as_ref())
+        .map(|placed| placed.executor_id.as_str());
+    match orch.fleet.request_report(request_id, holder) {
+        crate::fleet::RequestReport::Held { executor_id } => LiveState::Placed {
+            on: orch.fleet.executor_name_for_text(&executor_id),
+        },
+        crate::fleet::RequestReport::Unknown { awaiting } => {
+            LiveState::Awaiting { machines: awaiting }
+        }
+        _ => LiveState::Untracked,
+    }
+}
+
+/// The machine durable evidence says held a batch an earlier runner placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// A machine claimed its attempt: named by the batch's own record, or by
+    /// the execution queue journal's `claimed` event.
+    Machine {
+        placed: super::PlacedOn,
+        /// When the journal recorded the claim.
+        claimed_ms: Option<i64>,
+        /// The claimed attempt's result reached a runner process that has
+        /// since ended (the journal's `completed`, under a closed runner
+        /// incarnation), at this time.
+        delivered_ms: Option<i64>,
+    },
+    /// The journal shows it queued and never claimed by any machine, and
+    /// every runner that queued it has ended. A later runner never places an
+    /// earlier one's entries: its start closes them as expired
+    /// (`fleet::queue::expire_previous_incarnations`), so no machine ever will.
+    NeverClaimed {
+        incarnation: String,
+        last_state: String,
+        last_ms: i64,
+    },
+    /// Nothing durable names a machine.
+    Unrecorded,
+}
+
+impl Holder {
+    /// The machine whose report decides the batch, when one is known.
+    pub(crate) fn executor_id(&self) -> Option<&str> {
+        match self {
+            Self::Machine { placed, .. } => Some(placed.executor_id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn placed(&self) -> Option<&super::PlacedOn> {
+        match self {
+            Self::Machine { placed, .. } => Some(placed),
+            _ => None,
+        }
+    }
+}
+
+/// One `execution_queue` journal row, as [`holder_of`] reads it.
+struct JournalRow {
+    entry_id: String,
+    state: String,
+    executor_id: Option<String>,
+    incarnation: String,
+    created_ms: i64,
+}
+
+/// Who held `request_id`, from the batch's own record (`placed_on`) and the
+/// runner's execution queue journal. The journal is runner-local, so it is
+/// read from the private database whichever database holds the batch.
+///
+/// The queue journal exists to explain a binding, never to rebuild one
+/// (`fleet::queue::QueueJournalRow`); this reads it as exactly that: evidence
+/// about which machine one request was bound to.
+pub(crate) async fn holder_of(
+    orch: &Orchestrator,
+    request_id: &str,
+    placed_on: Option<&super::PlacedOn>,
+) -> Result<Holder, String> {
+    let local = &orch.db.local;
+    let rows = local
+        .query_all(
+            "SELECT entry_id,state,executor_id,runner_incarnation,created_at FROM execution_queue INDEXED BY idx_execution_queue_request WHERE request_id=?1 ORDER BY created_at,sequence",
+            params![request_id.to_string()],
+            |row| {
+                Ok(JournalRow {
+                    entry_id: row.text(0)?,
+                    state: row.text(1)?,
+                    executor_id: row.opt_text(2)?,
+                    incarnation: row.text(3)?,
+                    created_ms: row.i64(4)?,
+                })
+            },
+        )
+        .await
+        .map_err(|error| format!("read the queue journal of request {request_id}: {error}"))?;
+    let closed = |incarnation: String| async move {
+        local
+            .query_opt_text(
+                "SELECT runner_incarnation FROM execution_queue_closed_incarnations WHERE runner_incarnation=?1",
+                (incarnation,),
+            )
+            .await
+            .map(|found| found.is_some())
+            .map_err(|error| format!("read which runners have ended: {error}"))
+    };
+    let claim = rows.iter().rev().find(|row| row.state == "claimed");
+    let placed = match (placed_on, claim) {
+        (Some(placed), _) => Some(placed.clone()),
+        (None, Some(claim)) => claim
+            .executor_id
+            .as_ref()
+            .map(|executor_id| super::PlacedOn {
+                name: orch.fleet.executor_name_for_text(executor_id),
+                executor_id: executor_id.clone(),
+            }),
+        (None, None) => None,
+    };
+    if let Some(placed) = placed {
+        // The journal's account of the attempt, when it is the same machine's.
+        let claim = claim.filter(|claim| claim.executor_id.as_deref() == Some(&placed.executor_id));
+        let mut delivered_ms = None;
+        if let Some(claim) = claim {
+            let completed = rows.iter().find(|row| {
+                row.entry_id == claim.entry_id
+                    && row.state == "completed"
+                    && row.created_ms >= claim.created_ms
+            });
+            if let Some(completed) = completed {
+                if closed(completed.incarnation.clone()).await? {
+                    delivered_ms = Some(completed.created_ms);
+                }
+            }
+        }
+        return Ok(Holder::Machine {
+            placed,
+            claimed_ms: claim.map(|claim| claim.created_ms),
+            delivered_ms,
+        });
+    }
+    // A start's expiry rows are written under the runner that closed the
+    // entry, so only the rows that queued and offered it name who placed it.
+    let placing: Vec<&JournalRow> = rows.iter().filter(|row| row.state != "expired").collect();
+    let Some(last) = placing.last() else {
+        return Ok(Holder::Unrecorded);
+    };
+    let mut incarnations: Vec<&str> = placing.iter().map(|row| row.incarnation.as_str()).collect();
+    incarnations.dedup();
+    for incarnation in &incarnations {
+        if !closed(incarnation.to_string()).await? {
+            return Ok(Holder::Unrecorded);
+        }
+    }
+    Ok(Holder::NeverClaimed {
+        incarnation: last.incarnation.clone(),
+        last_state: last.state.clone(),
+        last_ms: last.created_ms,
+    })
+}
+
+/// A journal or row time, in the form the batch texts use.
+fn at(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|time| time.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+/// Why a batch the journal shows was never claimed is lost.
+pub(crate) fn never_claimed_evidence(incarnation: &str, last_state: &str, last_ms: i64) -> String {
+    format!(
+        "it was never claimed by any machine: the runner that queued it (incarnation {incarnation}) has ended with it still {last_state} (last recorded at {}), and a later runner does not place another runner's work",
+        at(last_ms)
+    )
+}
+
+/// Why a batch its holder no longer holds or lists is lost.
+fn holder_gone_evidence(orch: &Orchestrator, holder: &Holder) -> String {
+    let Holder::Machine {
+        placed,
+        claimed_ms,
+        delivered_ms,
+    } = holder
+    else {
+        return "every machine has reported its work since Cairn restarted, and none holds or finished it".to_string();
+    };
+    let claimed = claimed_ms
+        .map(|ms| format!(" at {}", at(ms)))
+        .unwrap_or_default();
+    let mut evidence = if orch.fleet.link_generation(&placed.executor_id).is_some() {
+        format!(
+            "`{}`, which claimed it{claimed}, has reported since Cairn restarted and neither holds nor lists it",
+            placed.name
+        )
+    } else {
+        format!(
+            "`{}`, which claimed it{claimed}, is no longer enrolled, so it can never report it",
+            placed.name
+        )
+    };
+    if let Some(delivered) = delivered_ms {
+        evidence.push_str(&format!(
+            "; its machine delivered its result at {} to a runner process that ended before settling it",
+            at(*delivered)
+        ));
+    }
+    evidence
 }
 
 /// The caller-home-relative handle, resolved beneath the owning node or task.
@@ -542,9 +798,50 @@ pub(crate) fn render(batch: &DetachedBatch, live: &LiveState) -> String {
                     "It had no commit_msg, so it committed nothing."
                 }
             ));
+            if let Some(late) = batch.late_report.as_ref() {
+                out.push_str(&format!(
+                    "Reported afterwards: {} reported at {}: {}. {}\n",
+                    late.machine,
+                    at(late.received_ms),
+                    late.verdict,
+                    late_publication_sentence(batch, late)
+                ));
+            }
         }
     }
     out
+}
+
+/// What became of a late result's changes.
+fn late_publication_sentence(batch: &DetachedBatch, late: &LateReport) -> String {
+    match (late.commit.as_deref(), batch.commits) {
+        (Some(commit), _) => format!(
+            "Its commit {} was not published, because the batch had already been settled and its branch released; re-run it if the work still matters.",
+            &commit[..commit.len().min(12)]
+        ),
+        (None, true) => "Nothing of it was published, because the batch had already been settled and its branch released; re-run it if the work still matters.".to_string(),
+        (None, false) => "It had no commit_msg, so it changed nothing.".to_string(),
+    }
+}
+
+/// Cairn's second notice for a lost batch whose machine reported afterwards.
+pub(crate) fn late_notice_sentence(batch: &DetachedBatch, late: &LateReport) -> String {
+    format!(
+        "Your run batch '{}' ({}), settled lost at {} ({}), reported afterwards from {}: {}. {}",
+        label_of(batch),
+        handle_uri(&batch.request_id),
+        batch
+            .settled_ms
+            .map(at)
+            .unwrap_or_else(|| "an earlier time".into()),
+        batch
+            .lost_evidence
+            .as_deref()
+            .unwrap_or("no evidence was recorded"),
+        late.machine,
+        late.verdict,
+        late_publication_sentence(batch, late)
+    )
 }
 
 /// One line for the node's batch list.
@@ -682,15 +979,20 @@ pub(crate) fn completion_result(
 ///
 /// - a batch this runner process placed whose task, fleet request, and
 ///   resolver are all gone ended here without its result reaching anyone;
-/// - a batch an earlier process placed is settled from its machines' own
-///   reports once every enrolled machine has reported on its current link
-///   ([`crate::fleet::Fleet::request_report`]): finished with the completion a
-///   machine lists, or lost when none holds or finished it.
+/// - a batch an earlier process placed is settled from the report of the
+///   machine that claimed it ([`holder_of`], judged by
+///   [`crate::fleet::Fleet::request_report`]): finished with the completion a
+///   machine lists, or lost once its holder has reported without holding or
+///   listing it. With no holder on record every machine that could hold it
+///   must have reported;
+/// - a batch the journal shows no machine ever claimed, queued by runners
+///   that have all ended, is lost: no later runner places it.
 ///
 /// A timer, a restart, attachment, or a registry miss alone settles nothing:
-/// until the evidence arrives the row stands, and so does the branch hold it
-/// makes. Each pass also wakes jobs whose result notice is still waiting, so a
-/// wake lost to a crash after settlement is made good.
+/// until the evidence arrives the row stands, says which machine it waits
+/// for, and holds its branch until its owner cancels it. Each pass also wakes
+/// jobs whose result notice is still waiting, so a wake lost to a crash after
+/// settlement is made good.
 pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
     use crate::fleet::RequestReport;
     let mut settled = 0;
@@ -747,9 +1049,36 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                     )
                     .await
                 } else {
-                    match orch.fleet.request_report(id) {
-                        RequestReport::Unknown | RequestReport::Held { .. } => continue,
-                        RequestReport::Completed(completion) => {
+                    let holder = match holder_of(orch, id, placed_on).await {
+                        Ok(holder) => holder,
+                        Err(error) => {
+                            log::warn!("could not read which machine held run batch {id}: {error}");
+                            continue;
+                        }
+                    };
+                    // A reporting machine that holds or lists it decides it
+                    // whatever the journal says: the journal explains, the
+                    // machines' reports are the evidence.
+                    match (orch.fleet.request_report(id, holder.executor_id()), &holder) {
+                        (RequestReport::Held { .. }, _) => continue,
+                        (
+                            RequestReport::Unknown { .. } | RequestReport::Gone,
+                            Holder::NeverClaimed {
+                                incarnation,
+                                last_state,
+                                last_ms,
+                            },
+                        ) => {
+                            mark_lost(
+                                orch,
+                                &db,
+                                id,
+                                &never_claimed_evidence(incarnation, last_state, *last_ms),
+                            )
+                            .await
+                        }
+                        (RequestReport::Unknown { .. }, _) => continue,
+                        (RequestReport::Completed(completion), _) => {
                             let (verdict, output) = completion_result(&completion, batch.commits);
                             end(
                                 orch,
@@ -764,13 +1093,9 @@ pub(crate) async fn sweep_unreported(orch: &Orchestrator) -> usize {
                             )
                             .await
                         }
-                        RequestReport::Gone => mark_lost(
-                            orch,
-                            &db,
-                            id,
-                            "every machine has reported its work since Cairn restarted, and none holds or finished it",
-                        )
-                        .await,
+                        (RequestReport::Gone, _) => {
+                            mark_lost(orch, &db, id, &holder_gone_evidence(orch, &holder)).await
+                        }
                     }
                 };
                 if let Ok(Some(batch)) = finished {
@@ -805,7 +1130,7 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
         let b = batch.clone();
         Box::pin(async move {
             c.execute(
-                &format!("INSERT INTO run_batch_detached({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"),
+                &format!("INSERT INTO run_batch_detached({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"),
                 params![
                     b.request_id.as_str(),
                     b.job_id.as_str(),
@@ -826,7 +1151,10 @@ pub(crate) async fn insert(db: &LocalDb, batch: &DetachedBatch) -> Result<(), St
                     b.settlement
                         .as_ref()
                         .and_then(|settlement| serde_json::to_string(settlement).ok()),
-                    b.waiting_on.as_deref()
+                    b.waiting_on.as_deref(),
+                    b.late_report
+                        .as_ref()
+                        .and_then(|late| serde_json::to_string(late).ok())
                 ],
             )
             .await?;
@@ -952,10 +1280,31 @@ pub(crate) async fn queue_notice(
     sentence: &str,
     now_secs: i64,
 ) -> DbResult<()> {
+    let id = crate::orchestrator::wakes::run_batch_notice_id(request_id);
+    queue_notice_as(c, &id, job_id, request_id, sentence, now_secs).await
+}
+
+/// The notice id of a lost batch's late report: distinct from its first
+/// notice's, so it is queued even after that one was delivered.
+fn late_notice_id(request_id: &str) -> String {
+    format!(
+        "{}:late",
+        crate::orchestrator::wakes::run_batch_notice_id(request_id)
+    )
+}
+
+async fn queue_notice_as(
+    c: &cairn_db::storage::TrackedConnection,
+    notice_id: &str,
+    job_id: &str,
+    request_id: &str,
+    sentence: &str,
+    now_secs: i64,
+) -> DbResult<()> {
     c.execute(
         "INSERT OR IGNORE INTO suppressed_wakes (id, subscription_id, job_id, source_kind, source_ref, fact_kind, occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at) VALUES (?1, NULL, ?2, ?3, ?4, ?5, 1, NULL, ?6, ?7, ?7, NULL)",
         params![
-            crate::orchestrator::wakes::run_batch_notice_id(request_id),
+            notice_id,
             job_id,
             crate::orchestrator::wakes::SOURCE_KIND_RUN_BATCH,
             request_id,
@@ -972,6 +1321,10 @@ pub(crate) async fn queue_notice(
 /// transaction: a finished batch is never left without the notice its job is
 /// owed, whatever crashes after. `None` when it was not running, so something
 /// else already finished it and this call queues nothing.
+///
+/// A batch with an adopted result still open is never settled lost: its
+/// result has arrived and its driver is publishing it. That is checked in the
+/// same write, so a loss and an adoption serialize and exactly one wins.
 async fn finish(
     db: &LocalDb,
     request_id: &str,
@@ -992,6 +1345,7 @@ async fn finish(
         ),
         Finish::Lost { evidence } => ("lost", None, None, None, Some(evidence.to_string())),
     };
+    let lost = state == "lost";
     let id = request_id.to_string();
     db.write(|c| {
         let (id, verdict, output, commit, evidence) = (
@@ -1005,8 +1359,8 @@ async fn finish(
             let now = chrono::Utc::now().timestamp_millis();
             let changed = c
                 .execute(
-                    "UPDATE run_batch_detached SET state=?2,verdict=?3,output=?4,commit_id=?5,lost_evidence=?6,settled_ms=?7,waiting_on=NULL WHERE request_id=?1 AND state IN ('parked','running')",
-                    params![id.clone(), state, verdict, output, commit, evidence, now],
+                    "UPDATE run_batch_detached SET state=?2,verdict=?3,output=?4,commit_id=?5,lost_evidence=?6,settled_ms=?7,waiting_on=NULL WHERE request_id=?1 AND state IN ('parked','running') AND (?8=0 OR NOT EXISTS (SELECT 1 FROM run_batch_adopted_outcomes WHERE request_id=?1 AND state<>'delivered'))",
+                    params![id.clone(), state, verdict, output, commit, evidence, now, lost as i64],
                 )
                 .await?;
             if changed == 0 {
@@ -1071,6 +1425,115 @@ pub(crate) async fn mark_lost(
     evidence: &str,
 ) -> Result<Option<DetachedBatch>, String> {
     end(orch, db, request_id, Finish::Lost { evidence }, true).await
+}
+
+/// What a parked call is told when its batch was settled lost: the outcome is
+/// unknown, the branch is released, and a later result is only reported.
+pub(crate) fn lost_text_for_wait(request_id: &str, evidence: &str, commits: bool) -> String {
+    format!(
+        "{}: run batch `{request_id}` was settled lost ({evidence}). It no longer holds its branch, and a result that arrives later is reported to this job and not published.{}",
+        super::RUN_OUTCOME_UNKNOWN,
+        if commits {
+            " It carried a commit_msg; read `cairn:@/vcs/log?limit=5` before re-running it."
+        } else {
+            " Re-run it if the work still matters."
+        }
+    )
+}
+
+/// [`lost_text_for_wait`] from a lost row's own record.
+pub(crate) fn lost_wait_text(batch: &DetachedBatch) -> String {
+    lost_text_for_wait(
+        &batch.request_id,
+        batch
+            .lost_evidence
+            .as_deref()
+            .unwrap_or("no evidence was recorded"),
+        batch.commits,
+    )
+}
+
+/// Why a cancel that reached no runner task and no machine settled a batch.
+pub(crate) fn cancel_evidence(by: &str) -> String {
+    format!("cancelled by {by}; no runner task or machine held it, so its outcome is unknown")
+}
+
+/// Settle as lost, on `by`'s cancel, a parked or running batch that no task in
+/// this runner and no machine holds (one an earlier runner placed), queue its
+/// notice, and wake its job. Lost rather than cancelled: it may have run
+/// before the restart, so nothing here can say it did not. `None` when it was
+/// not unsettled, or an adopted result for it is open.
+pub(crate) async fn cancel_unheld(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    request_id: &str,
+    by: &str,
+) -> Result<Option<DetachedBatch>, String> {
+    let ended = mark_lost(orch, db, request_id, &cancel_evidence(by)).await?;
+    if let Some(batch) = ended.as_ref() {
+        wake_job(orch, &batch.job_id, request_id).await;
+    }
+    Ok(ended)
+}
+
+/// Record a result that arrived for a batch already settled lost, queue the
+/// second notice that says so in the same write, and wake its job. Its commit
+/// is never published. `false` when no lost row without a late report claims
+/// it here.
+pub(crate) async fn report_late(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    request_id: &str,
+    late: &LateReport,
+) -> Result<bool, String> {
+    let (id, late) = (request_id.to_string(), late.clone());
+    let recorded = db
+        .write(|c| {
+            let (id, late) = (id.clone(), late.clone());
+            Box::pin(async move {
+                let json = serde_json::to_string(&late)
+                    .map_err(|error| cairn_db::storage::DbError::internal(error.to_string()))?;
+                let changed = c
+                    .execute(
+                        "UPDATE run_batch_detached SET late_report=?2 WHERE request_id=?1 AND state='lost' AND late_report IS NULL",
+                        params![id.clone(), json],
+                    )
+                    .await?;
+                if changed == 0 {
+                    return Ok(None);
+                }
+                let mut rows = c
+                    .query(
+                        &format!("SELECT {COLUMNS} FROM run_batch_detached WHERE request_id=?1"),
+                        params![id.clone()],
+                    )
+                    .await?;
+                let batch = match rows.next().await? {
+                    Some(row) => from_row(&row)?,
+                    None => return Ok(None),
+                };
+                drop(rows);
+                queue_notice_as(
+                    c,
+                    &late_notice_id(&id),
+                    &batch.job_id,
+                    &id,
+                    &late_notice_sentence(&batch, &late),
+                    chrono::Utc::now().timestamp(),
+                )
+                .await?;
+                Ok(Some(batch))
+            })
+        })
+        .await
+        .map_err(|error| format!("record the late report of run batch {request_id}: {error}"))?;
+    match recorded {
+        Some(batch) => {
+            wake_job(orch, &batch.job_id, request_id).await;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Wake a job whose batch result notice is queued, if it is idle. A job busy
@@ -1173,6 +1636,7 @@ mod tests {
             notified_ms: None,
             settlement: None,
             waiting_on: None,
+            late_report: None,
         }
     }
 
@@ -1327,6 +1791,180 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    /// cairn/6991: a loss and an adoption arbitrate in the store. A batch
+    /// whose result was adopted (its driver may be publishing it) is never
+    /// written lost, by the sweep or by a cancel, however the reads that
+    /// preceded the write interleaved with the adoption.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_with_an_open_adoption_is_never_written_lost() {
+        let orch = orch_with_job().await;
+        let db: &LocalDb = &orch.db.local;
+        insert(db, &running("req-1")).await.unwrap();
+        db.execute(
+            "INSERT INTO run_batch_adopted_outcomes(request_id,attempt_id,job_id,executor_id,machine,outcome_json,state,received_ms) VALUES('req-1','a','job','exec-a','exec-a','{}','publishing',1)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(cancel_unheld(&orch, db, "req-1", "operator")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load(db, "req-1").await.unwrap().unwrap().state,
+            DetachedState::Running
+        );
+        assert!(
+            settle_and_deliver(&orch, db, "req-1", "succeeded", "ok").await,
+            "the adopted result itself still settles it"
+        );
+    }
+
+    /// A journal row of one request under one runner incarnation.
+    async fn journal(
+        db: &LocalDb,
+        request_id: &str,
+        incarnation: &str,
+        sequence: i64,
+        state: &str,
+        executor_id: Option<&str>,
+    ) {
+        db.execute(
+            "INSERT INTO execution_queue(event_id,entry_id,sequence,runner_incarnation,request_id,attempt_id,project_id,state,executor_id,constraints_json,scoring_json,horizon_unix_ms,created_at) VALUES(?1,?2,?3,?4,?5,'attempt','p',?6,?7,'{}','{}',0,?8)",
+            params![
+                format!("{request_id}:{state}:{sequence}"),
+                format!("entry-{request_id}"),
+                sequence,
+                incarnation,
+                request_id,
+                state,
+                executor_id,
+                1_000 + sequence
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// cairn/6991: a batch an earlier runner placed is settled from the report
+    /// of the machine that claimed it, named by its own record or by the queue
+    /// journal, however long another enrolled machine stays away; one no
+    /// machine ever claimed, queued by runners that have ended, is lost; and
+    /// one whose holder is the machine away stays running and says it waits
+    /// for that machine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_detached_batch_is_judged_by_the_machine_that_claimed_it() {
+        let orch = orch_with_job().await;
+        let db = orch.db.local.clone();
+        let _frames = orch
+            .fleet
+            .attach_reported_machine_for_test("bgsrv-mac", &[]);
+        orch.fleet
+            .declare_enrolled_remote("bgsrv-ub2", "bgsrv-ub2", "linux", "x86_64");
+        let placed_on = |executor_id: &str| {
+            Some(super::super::PersistedSettlement::for_test(
+                None,
+                None,
+                Some(super::super::PlacedOn {
+                    executor_id: executor_id.into(),
+                    name: executor_id.into(),
+                }),
+            ))
+        };
+        insert(
+            &db,
+            &DetachedBatch {
+                settlement: placed_on("bgsrv-mac"),
+                ..running("req-recorded")
+            },
+        )
+        .await
+        .unwrap();
+        insert(&db, &running("req-journal")).await.unwrap();
+        for (sequence, state, executor) in [
+            (1, "queued", None),
+            (2, "offered", Some("bgsrv-mac")),
+            (3, "claimed", Some("bgsrv-mac")),
+            (4, "completed", Some("bgsrv-mac")),
+        ] {
+            journal(&db, "req-journal", "runner-old", sequence, state, executor).await;
+        }
+        insert(&db, &running("req-unclaimed")).await.unwrap();
+        journal(&db, "req-unclaimed", "runner-old", 1, "queued", None).await;
+        journal(
+            &db,
+            "req-unclaimed",
+            "runner-old",
+            2,
+            "offered",
+            Some("bgsrv-ub2"),
+        )
+        .await;
+        db.execute(
+            "INSERT INTO execution_queue_closed_incarnations(runner_incarnation,closed_by,expired_entries,closed_at) VALUES('runner-old','runner-new',1,5000)",
+            (),
+        )
+        .await
+        .unwrap();
+        insert(
+            &db,
+            &DetachedBatch {
+                settlement: placed_on("bgsrv-ub2"),
+                ..running("req-away")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sweep_unreported(&orch).await, 3);
+        for id in ["req-recorded", "req-journal"] {
+            let row = load(&db, id).await.unwrap().unwrap();
+            assert_eq!(row.state, DetachedState::Lost, "{id}");
+            let evidence = row.lost_evidence.unwrap();
+            assert!(
+                evidence.contains("`bgsrv-mac`, which claimed it")
+                    && evidence.contains("neither holds nor lists it"),
+                "{id}: {evidence}"
+            );
+        }
+        let journal_evidence = load(&db, "req-journal")
+            .await
+            .unwrap()
+            .unwrap()
+            .lost_evidence
+            .unwrap();
+        assert!(
+            journal_evidence.contains("delivered its result at"),
+            "{journal_evidence}"
+        );
+        let unclaimed = load(&db, "req-unclaimed").await.unwrap().unwrap();
+        assert_eq!(unclaimed.state, DetachedState::Lost);
+        assert!(
+            unclaimed
+                .lost_evidence
+                .as_deref()
+                .unwrap()
+                .starts_with("it was never claimed by any machine"),
+            "{unclaimed:?}"
+        );
+
+        let away = load(&db, "req-away").await.unwrap().unwrap();
+        assert_eq!(away.state, DetachedState::Running);
+        let live = live_state(&orch, &away);
+        assert_eq!(
+            live,
+            LiveState::Awaiting {
+                machines: vec!["bgsrv-ub2".into()]
+            }
+        );
+        let read = render(&away, &live);
+        assert!(
+            read.contains("State: waiting for `bgsrv-ub2` to report"),
+            "{read}"
+        );
+        assert!(read.contains("releases its branch"), "{read}");
     }
 
     /// A batch a machine finished while Cairn was down settles from the
@@ -1507,6 +2145,7 @@ mod tests {
             "pub(crate) async fn settle_and_deliver(",
             "pub(crate) async fn settle_answered_inline(",
             "pub(crate) async fn sweep_unreported(",
+            "pub(crate) async fn cancel_unheld(",
         ] {
             let ending_body = body(&own, ending);
             assert!(
