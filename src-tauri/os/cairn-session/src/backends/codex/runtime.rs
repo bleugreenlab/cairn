@@ -23,7 +23,11 @@ pub trait CodexHost: Send + Sync {
     fn account_usage(&self, snapshot: ProviderUsageSnapshot);
     fn context_snapshot(&self, snapshot: ContextTokenState);
     fn admit_goal_turn(&self, provider_turn_id: &str) -> Result<Option<GoalTurnAdmission>, String>;
+    /// Interrupt the turn at its terminal tool's boundary, as a handoff.
     fn interrupt(&self) -> Result<(), String>;
+    /// Why Cairn interrupted `provider_turn_id`, consuming the record; `None`
+    /// when it never asked. Called once per terminal notification.
+    fn take_interrupt_cause(&self, provider_turn_id: &str) -> Option<InterruptCause>;
     fn artifact_handoff(&self);
     fn watchdog_arm_failed(&self) -> Result<(), String>;
     fn recover_watchdog(
@@ -98,7 +102,7 @@ use super::json_string;
 use super::protocol::StreamingState;
 use crate::agent_process::completion::{CodexTurnContext, TurnFailureDisposition};
 use crate::agent_process::completion::{
-    SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
+    ProviderInterruption, SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
 };
 use crate::agent_process::stream::TokenCounts;
 use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
@@ -106,6 +110,7 @@ use cairn_db::storage::LocalDb;
 use cairn_domain::ContextTokenState;
 use cairn_models::codex::app_server::AppServerClient;
 use cairn_models::codex::thread_router::{Scoped, ThreadRouter};
+use cairn_models::interface::session::InterruptCause;
 use cairn_models::usage::codex_rate_limits::codex_rate_limit_snapshot_from_value;
 use cairn_models::wire::claude_stream::Usage;
 use cairn_models::wire::codex_app_server::{
@@ -124,15 +129,18 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Normalize provider status without deciding the Cairn run or workflow state.
+/// An interrupted turn carries `interruption`, who stopped it; any other
+/// outcome drops it.
 pub(crate) fn codex_turn_completion(
     status: ProviderTurnStatus<'_>,
     usage: Option<Usage>,
     ephemeral: bool,
+    interruption: ProviderInterruption,
 ) -> SessionTurnCompletion {
     SessionTurnCompletion {
         outcome: match status {
             ProviderTurnStatus::Completed => SessionTurnOutcome::Completed,
-            ProviderTurnStatus::Interrupted => SessionTurnOutcome::Interrupted,
+            ProviderTurnStatus::Interrupted => SessionTurnOutcome::Interrupted(interruption),
             ProviderTurnStatus::Other(status) => SessionTurnOutcome::Failed {
                 status: status.to_string(),
             },
@@ -201,6 +209,7 @@ pub(crate) fn watchdog_lifecycle(
     kind: crate::runs::watchdog_ledger::WatchdogLifecycleKind,
     phase: Option<CodexTurnWatchdogPhase>,
     reason: Option<String>,
+    details: Option<Value>,
 ) -> Result<(), String> {
     let event = crate::runs::watchdog_ledger::NewWatchdogLifecycle {
         id: Uuid::new_v4().to_string(),
@@ -208,7 +217,7 @@ pub(crate) fn watchdog_lifecycle(
         kind,
         phase: phase.map(Into::into),
         reason,
-        details: None,
+        details,
         successor_run_id: None,
         successor_turn_id: None,
         created_at: chrono::Utc::now().timestamp(),
@@ -318,7 +327,7 @@ impl OwnedCodexWatchdog {
             if !matches!(outcome, Ok(true)) {
                 let kind = if outcome.is_err() { crate::runs::watchdog_ledger::WatchdogLifecycleKind::WorkerPanicked } else { crate::runs::watchdog_ledger::WatchdogLifecycleKind::WorkerExitedUnexpectedly };
                 if let Some(id) = worker_identity.lock().ok().and_then(|guard| guard.clone()) {
-                    if let Err(error) = watchdog_lifecycle(worker_db.clone(), id.clone(), kind, None, Some("owned watchdog worker exited before disarm".into())) {
+                    if let Err(error) = watchdog_lifecycle(worker_db.clone(), id.clone(), kind, None, Some("owned watchdog worker exited before disarm".into()), None) {
                         log::error!("Failed to diagnose Codex watchdog worker exit for {:?}: {}", id, error);
                     }
                 }
@@ -395,6 +404,7 @@ impl OwnedCodexWatchdog {
                         crate::runs::watchdog_ledger::WatchdogLifecycleKind::Disarmed,
                         None,
                         Some(reason.to_string()),
+                        None,
                     ) {
                         log::error!(
                             "Failed to persist Codex watchdog disarm lifecycle for run {}: {}",
@@ -513,6 +523,7 @@ impl WatchdogWorker {
                                 crate::runs::watchdog_ledger::WatchdogLifecycleKind::PhaseTransition,
                                 Some(phase),
                                 None,
+                                None,
                             ) {
                                 log::error!(
                                     "Failed to persist Codex watchdog phase lifecycle for {:?}: {}",
@@ -568,6 +579,7 @@ impl WatchdogWorker {
                         crate::runs::watchdog_ledger::WatchdogLifecycleKind::Expired,
                         Some(expiry.phase),
                         Some(format!("no provider progress for {:?}", expiry.elapsed)),
+                        Some(expiry.details()),
                     ) {
                         log::error!(
                             "Failed to persist Codex watchdog expiry lifecycle for {:?}: {}",
@@ -745,6 +757,66 @@ pub(crate) struct CodexTurnWatchdogExpiry {
     turn_id: String,
     phase: CodexTurnWatchdogPhase,
     elapsed: Duration,
+    /// The last thing the provider said before going quiet, and how long
+    /// before the expiry it said it.
+    last_notification: Option<(&'static str, Duration)>,
+    reasoning_items_since_tool: u32,
+}
+
+impl CodexTurnWatchdogExpiry {
+    /// What the expiry's lifecycle row records, so every expiry explains
+    /// itself: which phase, how long, and what was last heard.
+    fn details(&self) -> Value {
+        serde_json::json!({
+            "provider_turn_id": self.turn_id,
+            "elapsed_ms": self.elapsed.as_millis() as u64,
+            "last_notification": self.last_notification.map(|(label, _)| label),
+            "last_notification_age_ms": self
+                .last_notification
+                .map(|(_, age)| age.as_millis() as u64),
+            "reasoning_items_since_tool": self.reasoning_items_since_tool,
+        })
+    }
+}
+
+/// A stable label for a notification, for the watchdog's record of the last
+/// thing the provider said. Items carry their type.
+pub(crate) fn notification_label(notification: &Notification<'_>) -> &'static str {
+    fn item_label(prefix_started: bool, item: &Value) -> &'static str {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match (prefix_started, item_type) {
+            (true, "reasoning") => "item/started:reasoning",
+            (true, "agentMessage") => "item/started:agentMessage",
+            (true, "commandExecution") => "item/started:commandExecution",
+            (true, "fileChange") => "item/started:fileChange",
+            (true, "mcpToolCall") => "item/started:mcpToolCall",
+            (true, _) => "item/started:other",
+            (false, "reasoning") => "item/completed:reasoning",
+            (false, "agentMessage") => "item/completed:agentMessage",
+            (false, "commandExecution") => "item/completed:commandExecution",
+            (false, "fileChange") => "item/completed:fileChange",
+            (false, "mcpToolCall") => "item/completed:mcpToolCall",
+            (false, "contextCompaction") => "item/completed:contextCompaction",
+            (false, _) => "item/completed:other",
+        }
+    }
+    match notification {
+        Notification::ServerRequest { .. } => "server_request",
+        Notification::AuthTokensRefreshRequest { .. } => "auth_tokens_refresh",
+        Notification::TurnStarted { .. } => "turn/started",
+        Notification::AgentMessageDelta { .. } => "item/agentMessage/delta",
+        Notification::ReasoningDelta { .. } => "item/reasoning/delta",
+        Notification::ItemStarted { item } => item_label(true, item),
+        Notification::ItemCompleted { item, .. } => item_label(false, item),
+        Notification::TurnCompleted { .. } => "turn/completed",
+        Notification::TurnAborted { .. } => "turn/aborted",
+        Notification::Error { .. } => "error",
+        Notification::TokenUsageUpdated { .. } => "thread/tokenUsage/updated",
+        Notification::RateLimitsUpdated { .. } => "account/rateLimits/updated",
+        Notification::CommandOutputDelta { .. } => "item/commandExecution/outputDelta",
+        Notification::Ignored { .. } => "ignored",
+        Notification::Unknown { .. } => "unknown",
+    }
 }
 
 #[derive(Debug)]
@@ -757,6 +829,10 @@ pub(crate) struct CodexTurnProgressWatchdog {
     outstanding_tool_ids: HashSet<String>,
     fired: bool,
     progress_sequence: u64,
+    /// The last notification the reader saw, whatever it was, and when.
+    last_notification: Option<(&'static str, Instant)>,
+    /// Reasoning items the provider started since the last tool boundary.
+    reasoning_items_since_tool: u32,
 }
 
 impl CodexTurnProgressWatchdog {
@@ -770,6 +846,8 @@ impl CodexTurnProgressWatchdog {
             outstanding_tool_ids: HashSet::new(),
             fired: false,
             progress_sequence: 0,
+            last_notification: None,
+            reasoning_items_since_tool: 0,
         }
     }
 
@@ -780,6 +858,25 @@ impl CodexTurnProgressWatchdog {
         self.outstanding_tool_ids.clear();
         self.fired = false;
         self.progress_sequence = self.progress_sequence.wrapping_add(1);
+        self.reasoning_items_since_tool = 0;
+    }
+
+    /// Note the last notification heard, for the expiry's diagnostics. It is
+    /// not progress: only what [`Self::record_forward_progress`] counts is.
+    pub fn observe_notification(&mut self, label: &'static str, now: Instant) {
+        self.last_notification = Some((label, now));
+    }
+
+    /// The provider started or finished a reasoning item. A reasoning model
+    /// thinks between a tool result and its next action, and with reasoning
+    /// summaries off these item boundaries are all it shows of that thinking,
+    /// so they are forward progress: a visibly reasoning turn is judged by the
+    /// general timeout, not the post-tool one.
+    pub fn record_reasoning_item(&mut self, started: bool, now: Instant) {
+        if started && self.active_turn_id.is_some() {
+            self.reasoning_items_since_tool = self.reasoning_items_since_tool.saturating_add(1);
+        }
+        self.record_forward_progress(now);
     }
 
     pub fn clear_turn(&mut self) {
@@ -814,6 +911,7 @@ impl CodexTurnProgressWatchdog {
             self.phase = CodexTurnWatchdogPhase::PostToolContinuation;
             self.last_forward_progress_at = now;
             self.progress_sequence = self.progress_sequence.wrapping_add(1);
+            self.reasoning_items_since_tool = 0;
         }
         matched
     }
@@ -870,6 +968,10 @@ impl CodexTurnProgressWatchdog {
             turn_id: turn_id.clone(),
             phase: self.phase,
             elapsed,
+            last_notification: self
+                .last_notification
+                .map(|(label, at)| (label, now.saturating_duration_since(at))),
+            reasoning_items_since_tool: self.reasoning_items_since_tool,
         })
     }
 }
@@ -945,6 +1047,9 @@ impl CodexRuntime {
                 continue;
             }
             let notification = Notification::parse(&msg);
+            if let Ok(mut watchdog) = progress_watchdog.lock() {
+                watchdog.observe_notification(notification_label(&notification), Instant::now());
+            }
 
             if terminal_tool_called_for_run(host, run_id)
                 && matches!(
@@ -1210,6 +1315,11 @@ impl CodexRuntime {
                                 };
                                 store_event(host, run_id, session_id.as_deref(), &event);
                             }
+                            "reasoning" => {
+                                if let Ok(mut watchdog) = progress_watchdog.lock() {
+                                    watchdog.record_reasoning_item(true, Instant::now());
+                                }
+                            }
                             _ => {
                                 log::debug!("Unhandled Codex item/started type: {}", item_type);
                             }
@@ -1313,6 +1423,11 @@ impl CodexRuntime {
                                     store_event(host, run_id, session_id.as_deref(), &event);
                                 }
                             }
+                            "reasoning" => {
+                                if let Ok(mut watchdog) = progress_watchdog.lock() {
+                                    watchdog.record_reasoning_item(false, Instant::now());
+                                }
+                            }
                             _ => {
                                 log::debug!("Unhandled Codex item/completed type: {}", item_type);
                             }
@@ -1326,6 +1441,12 @@ impl CodexRuntime {
                         &current_turn_id,
                         &progress_watchdog,
                     );
+                    // Taken on every terminal notification, so a cause never
+                    // outlives its turn: a turn that completed while its
+                    // interrupt was in flight drops it here.
+                    let interrupt_cause = completed_provider_turn_id
+                        .as_deref()
+                        .and_then(|id| host.host.take_interrupt_cause(id));
                     if consume_deferred_goal_terminal(
                         &mut deferred_goal_turns,
                         completed_provider_turn_id.as_deref(),
@@ -1412,6 +1533,11 @@ impl CodexRuntime {
                             status,
                             usage_accumulator.take_turn_usage(),
                             ephemeral,
+                            ProviderInterruption {
+                                provider_turn_id: completed_provider_turn_id.clone(),
+                                provider_reason: Some(status.as_str().to_string()),
+                                cause: interrupt_cause,
+                            },
                         ),
                         CodexTurnContext {
                             failure_disposition,
@@ -1425,6 +1551,9 @@ impl CodexRuntime {
                 }
                 Notification::TurnAborted { turn_id, reason } => {
                     let aborted_provider_turn_id = turn_id_or_cached(turn_id, &current_turn_id);
+                    let interrupt_cause = aborted_provider_turn_id
+                        .as_deref()
+                        .and_then(|id| host.host.take_interrupt_cause(id));
                     if consume_deferred_goal_terminal(
                         &mut deferred_goal_turns,
                         aborted_provider_turn_id.as_deref(),
@@ -1456,7 +1585,13 @@ impl CodexRuntime {
                         .disarm_turn(aborted_provider_turn_id.as_deref(), "provider_turn_aborted");
                     let status = ProviderTurnStatus::from_abort_reason(reason);
                     if status == ProviderTurnStatus::Interrupted {
-                        log::info!("codex turn aborted ({}), handling interrupt", reason);
+                        log::info!(
+                            "codex turn aborted ({}), handling interrupt: run={} provider_turn_id={:?} cause={:?}",
+                            reason,
+                            run_id,
+                            aborted_provider_turn_id,
+                            interrupt_cause.as_ref().map(InterruptCause::as_str)
+                        );
                     }
                     finalize_streaming(
                         host,
@@ -1470,6 +1605,11 @@ impl CodexRuntime {
                             status,
                             usage_accumulator.take_turn_usage(),
                             ephemeral,
+                            ProviderInterruption {
+                                provider_turn_id: aborted_provider_turn_id.clone(),
+                                provider_reason: Some(reason.to_string()),
+                                cause: interrupt_cause,
+                            },
                         ),
                         CodexTurnContext {
                             failure_disposition: TurnFailureDisposition::Unhandled,
@@ -1503,7 +1643,12 @@ impl CodexRuntime {
                         continue;
                     }
                     if will_retry {
-                        log::warn!("Codex retryable error: {}", message);
+                        log::warn!(
+                            "Codex retryable error: run={} provider_turn_id={:?}: {}",
+                            run_id,
+                            error_provider_turn_id,
+                            message
+                        );
                         if is_selected_model_capacity_error(message) {
                             if let Some(turn_id) = error_provider_turn_id {
                                 provider_turn_failures
@@ -1547,11 +1692,17 @@ impl CodexRuntime {
                             session_id.as_deref(),
                         );
                         host.host.error(&format!("Codex error: {}", message));
+                        if let Some(turn_id) = error_provider_turn_id.as_deref() {
+                            // The turn is over; a cause recorded for it has
+                            // nothing left to attribute.
+                            host.host.take_interrupt_cause(turn_id);
+                        }
                         host.host.complete(
                             codex_turn_completion(
                                 ProviderTurnStatus::Other("error"),
                                 usage_accumulator.take_turn_usage(),
                                 ephemeral,
+                                ProviderInterruption::default(),
                             ),
                             CodexTurnContext {
                                 failure_disposition: TurnFailureDisposition::DiagnosticRecorded,
@@ -1638,7 +1789,14 @@ mod tests {
         for ephemeral in [false, true] {
             for (status, expected) in [
                 ("completed", SessionTurnOutcome::Completed),
-                ("interrupted", SessionTurnOutcome::Interrupted),
+                (
+                    "interrupted",
+                    SessionTurnOutcome::Interrupted(ProviderInterruption {
+                        provider_turn_id: Some("provider-turn".into()),
+                        provider_reason: Some("interrupted".into()),
+                        cause: Some(InterruptCause::WatchdogPostTool),
+                    }),
+                ),
                 (
                     "new_provider_failure",
                     SessionTurnOutcome::Failed {
@@ -1651,6 +1809,11 @@ mod tests {
                     ProviderTurnStatus::from_wire(status),
                     Some(usage),
                     ephemeral,
+                    ProviderInterruption {
+                        provider_turn_id: Some("provider-turn".into()),
+                        provider_reason: Some(status.into()),
+                        cause: Some(InterruptCause::WatchdogPostTool),
+                    },
                 );
                 assert_eq!(report.outcome, expected);
                 assert_eq!(
@@ -1674,7 +1837,13 @@ mod tests {
             }
         }
         assert_eq!(
-            codex_turn_completion(ProviderTurnStatus::Completed, None, false).usage,
+            codex_turn_completion(
+                ProviderTurnStatus::Completed,
+                None,
+                false,
+                ProviderInterruption::default()
+            )
+            .usage,
             TokenCounts::default()
         );
     }
@@ -1947,6 +2116,109 @@ mod tests {
             CodexTurnWatchdogPhase::ProviderProgress
         );
     }
+    /// cairn/4634: a completed read, then the model reasons. Codex shows that
+    /// reasoning only as `reasoning` item boundaries (summaries are off), and
+    /// the 45 s post-tool window used to cut it off. A reasoning item moves
+    /// the turn back to the general timeout.
+    #[test]
+    fn a_reasoning_item_after_a_completed_read_holds_the_turn_past_the_post_tool_window() {
+        let start = Instant::now();
+        let general = Duration::from_secs(300);
+        let post_tool = Duration::from_secs(45);
+        let mut watchdog = CodexTurnProgressWatchdog::new(general, post_tool);
+        watchdog.start_turn("turn-1", start);
+        assert_eq!(
+            watchdog.start_host_call("read-1", start),
+            Some("turn-1".into())
+        );
+        let read_done = start + Duration::from_secs(1);
+        assert!(watchdog.complete_host_call("read-1", "turn-1", read_done));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::PostToolContinuation);
+
+        let reasoning = read_done + Duration::from_secs(3);
+        watchdog.record_reasoning_item(true, reasoning);
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ProviderProgress);
+        assert_eq!(watchdog.expired(read_done + Duration::from_secs(120)), None);
+        assert_eq!(
+            watchdog.expired(reasoning + general - Duration::from_millis(1)),
+            None
+        );
+        let expiry = watchdog
+            .expired(reasoning + general)
+            .expect("a turn reasoning forever still meets the general timeout");
+        assert_eq!(expiry.phase, CodexTurnWatchdogPhase::ProviderProgress);
+        assert_eq!(expiry.reasoning_items_since_tool, 1);
+    }
+
+    #[test]
+    fn a_completed_reasoning_item_resets_the_clock() {
+        let start = Instant::now();
+        let general = Duration::from_secs(300);
+        let mut watchdog = CodexTurnProgressWatchdog::new(general, Duration::from_secs(45));
+        watchdog.start_turn("turn-1", start);
+        watchdog.start_tool("tool-1".into(), start);
+        watchdog.complete_tool(Some("tool-1"), start);
+        let finished = start + Duration::from_secs(200);
+        watchdog.record_reasoning_item(false, finished);
+        assert_eq!(
+            watchdog.expired(start + general + Duration::from_secs(1)),
+            None
+        );
+        assert!(watchdog.expired(finished + general).is_some());
+        assert_eq!(
+            watchdog.reasoning_items_since_tool, 0,
+            "only a started item counts as a new one"
+        );
+    }
+
+    #[test]
+    fn silence_after_a_tool_result_still_expires_the_post_tool_window_and_says_why() {
+        let start = Instant::now();
+        let post_tool = Duration::from_secs(45);
+        let mut watchdog = CodexTurnProgressWatchdog::new(Duration::from_secs(300), post_tool);
+        watchdog.start_turn("turn-1", start);
+        watchdog.start_tool("tool-1".into(), start);
+        watchdog.record_reasoning_item(true, start);
+        watchdog.complete_tool(Some("tool-1"), start);
+        watchdog.observe_notification("item/completed:commandExecution", start);
+
+        assert_eq!(
+            watchdog.expired(start + post_tool - Duration::from_millis(1)),
+            None
+        );
+        let expiry = watchdog
+            .expired(start + post_tool)
+            .expect("genuine silence after a tool result is still caught");
+        assert_eq!(expiry.phase, CodexTurnWatchdogPhase::PostToolContinuation);
+        assert_eq!(
+            expiry.reasoning_items_since_tool, 0,
+            "the tool boundary resets the count"
+        );
+        let details = expiry.details();
+        assert_eq!(
+            details["last_notification"],
+            "item/completed:commandExecution"
+        );
+        assert_eq!(details["last_notification_age_ms"], 45_000);
+        assert_eq!(details["elapsed_ms"], 45_000);
+        assert_eq!(details["provider_turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn reasoning_items_are_labelled_for_the_expiry_record() {
+        let started =
+            json!({"method": "item/started", "params": {"item": {"type": "reasoning", "id": "r"}}});
+        let completed = json!({"method": "item/completed", "params": {"turnId": "t", "item": {"type": "reasoning", "id": "r"}}});
+        assert_eq!(
+            notification_label(&Notification::parse(&started)),
+            "item/started:reasoning"
+        );
+        assert_eq!(
+            notification_label(&Notification::parse(&completed)),
+            "item/completed:reasoning"
+        );
+    }
+
     #[test]
     fn turn_progress_watchdog_clear_turn_disarms_and_clears_tools() {
         let start = Instant::now();

@@ -72,6 +72,11 @@ pub struct JobFacts {
     pub turn_failed: bool,
     /// The latest turn completed successfully.
     pub turn_complete: bool,
+    /// The latest work turn was cut off before finishing by Cairn's
+    /// provider-silence watchdog or by the provider itself, not by an operator
+    /// (`TurnEndReason::truncates_work`). It rests as a completed turn would
+    /// (rung 3), never as a claimable Pending one.
+    pub turn_truncated: bool,
     /// The checkpoint classification of the job's node.
     pub checkpoint: CheckpointGate,
     /// The resolution of the blocking gate.
@@ -107,6 +112,7 @@ impl JobFacts {
             live_turn: false,
             turn_failed: false,
             turn_complete: false,
+            turn_truncated: false,
             checkpoint: CheckpointGate::None,
             resolution: Resolution::Pending,
             requires_output: false,
@@ -137,7 +143,11 @@ impl JobFacts {
 ///    missing (-> **Blocked**, idle/resumable; -> **Failed** once the job was
 ///    re-prompted for it and still did not produce it), the node derives as
 ///    long-running with no unmet output contract (-> **Idle**, non-terminal),
-///    or a User-policy confirm gate is unconfirmed (-> **Blocked**).
+///    or a User-policy confirm gate is unconfirmed (-> **Blocked**). A latest
+///    work turn cut off by the watchdog or the provider takes this rung as
+///    well, exactly as it did when such a turn was recorded `complete`; it
+///    must never fall through to Pending, which advancement would claim and
+///    relaunch as if the job had never run.
 /// 4. Upstream control-dep `Failed` -> **Failed** (cascade by derivation).
 /// 5. Dependencies unmet -> **Pending**.
 /// 6. DAG-ready, no turn yet: standalone-checkpoint nodes resolve from their
@@ -163,7 +173,7 @@ pub fn derive_job_status(facts: &JobFacts) -> JobStatus {
     // 3. Ran to completion: gate on declared output, then on a User-policy
     //    confirm gate. A completed job's work stands even if an upstream later
     //    fails (cascade is rung 4).
-    if facts.turn_complete {
+    if facts.turn_complete || facts.turn_truncated {
         // A node that declares an output contract must actually produce it before
         // it can complete and fire control-out. Missing output holds Blocked
         // (idle, resumable) rather than advancing downstream onto empty work,
@@ -292,6 +302,57 @@ mod tests {
             turn_complete: true,
         };
         assert_eq!(derive_job_status(&f), JobStatus::Complete);
+    }
+
+    /// cairn/4634: a turn the watchdog or the provider cut off rests exactly
+    /// as the `complete` it used to be recorded as, and never as Pending.
+    #[test]
+    fn a_truncated_turn_rests_as_a_completed_one_would() {
+        let f = facts! {
+            dag_ready: true,
+            turn_truncated: true,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Complete);
+        let f = facts! {
+            dag_ready: true,
+            turn_truncated: true,
+            requires_output: true,
+        };
+        assert_eq!(
+            derive_job_status(&f),
+            JobStatus::Blocked,
+            "a missing output is owed, so the task is re-prompted for it"
+        );
+        let f = facts! {
+            dag_ready: true,
+            turn_truncated: true,
+            long_running: true,
+        };
+        assert_eq!(
+            derive_job_status(&f),
+            JobStatus::Idle,
+            "a standing node keeps resting Idle"
+        );
+        let f = facts! {
+            dag_ready: false,
+            upstream_failed: true,
+            turn_truncated: true,
+        };
+        assert_eq!(
+            derive_job_status(&f),
+            JobStatus::Complete,
+            "a job that already ran is not cascade-failed"
+        );
+    }
+
+    #[test]
+    fn a_truncated_turn_with_live_work_stays_running() {
+        let f = facts! {
+            dag_ready: true,
+            live_turn: true,
+            turn_truncated: true,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Running);
     }
 
     #[test]

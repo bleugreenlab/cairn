@@ -103,7 +103,11 @@ fn send_interrupt_sets_cancel_flag() {
         cancel: cancel.clone(),
         provider: "OpenRouter".to_string(),
     };
-    SessionControl::interrupt(&mut control).expect("interrupt accepted");
+    SessionControl::interrupt(
+        &mut control,
+        cairn_models::interface::session::InterruptCause::OperatorStop,
+    )
+    .expect("interrupt accepted");
     assert!(cancel.load(Ordering::SeqCst));
 }
 

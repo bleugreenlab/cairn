@@ -784,7 +784,9 @@ pub fn interrupt_is_acknowledged_and_session_survives(env: &ContractEnv) -> Case
     });
     c.some(streaming, "the slow turn streaming")?;
     c.ok(
-        session.control.interrupt(),
+        session
+            .control
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "interrupting through ClaudeControl",
     )?;
     let response = acknowledgement(c, &mut session, "interrupt")?;

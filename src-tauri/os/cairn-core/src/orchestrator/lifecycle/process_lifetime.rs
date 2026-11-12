@@ -342,7 +342,7 @@ pub(crate) fn retire_unowned_idle(
             RetireCause::PipePressure
         }
     };
-    if let Err(error) = teardown_process(orch, run_id, TerminalPolicy::Keep) {
+    if let Err(error) = teardown_process(orch, run_id, TerminalPolicy::Keep, cause.exit_reason()) {
         return Err(NotRetired::TeardownFailed(error.to_string()));
     }
     drop(guard);

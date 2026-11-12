@@ -710,7 +710,16 @@ impl CodexHost for CodexReaderHost {
             crate::agent_process::process::PauseIntent::Stake(
                 crate::agent_process::process::GoalPause::Interrupted,
             ),
+            cairn_models::interface::session::InterruptCause::ArtifactHandoff,
         )
+    }
+    fn take_interrupt_cause(
+        &self,
+        provider_turn_id: &str,
+    ) -> Option<cairn_models::interface::session::InterruptCause> {
+        self.client
+            .as_ref()
+            .and_then(|client| client.take_interrupt_cause(provider_turn_id))
     }
     fn artifact_handoff(&self) {
         crate::orchestrator::lifecycle::transition_to_warm_state(
@@ -841,9 +850,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn terminal_notifications_flush_buffered_text_before_the_result_and_turn_transition() {
-        for terminal in [
-            json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
-            json!({"method":"turn/aborted","params":{"turnId":"p1","reason":"interrupted"}}),
+        for (terminal, settled) in [
+            (
+                json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
+                "complete",
+            ),
+            // An abort Cairn did not ask for cuts the turn off.
+            (
+                json!({"method":"turn/aborted","params":{"turnId":"p1","reason":"interrupted"}}),
+                "interrupted",
+            ),
         ] {
             let db = Arc::new(crate::storage::migrated_test_db("completion-stream-order").await);
             db.execute_script(
@@ -915,7 +931,7 @@ mod tests {
                     .await
                     .unwrap()
                     .as_deref(),
-                Some("complete")
+                Some(settled)
             );
             // This also catches a flush postponed until reader teardown, after
             // the host has already persisted its success result.
@@ -1231,6 +1247,232 @@ mod tests {
 
     async fn text(db: &LocalDb, sql: &str) -> Option<String> {
         db.query_opt_text(sql, ()).await.unwrap()
+    }
+
+    /// [`read_notifications`] through `client`, so a test can record an
+    /// interrupt's cause on it first and see what the reader asked of it.
+    fn read_through(
+        orch: &Orchestrator,
+        db: &Arc<LocalDb>,
+        client: Arc<AppServerClient>,
+        notifications: Vec<Value>,
+    ) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for notification in notifications {
+            tx.send(notification).unwrap();
+        }
+        drop(tx);
+        CodexBackend::reader_thread_app_server(
+            orch,
+            &orch.services.emitter,
+            "r",
+            Some("s".into()),
+            rx,
+            client,
+            Arc::new(Mutex::new(Some("p1".into()))),
+            None,
+            "codex".into(),
+            db.clone(),
+            None,
+        );
+    }
+
+    /// A client that has already sent one `turn/interrupt` for `p1` with
+    /// `cause`, and records anything the reader sends after.
+    fn client_that_interrupted(
+        cause: cairn_models::interface::session::InterruptCause,
+    ) -> (Arc<AppServerClient>, Arc<Mutex<Vec<Value>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = Arc::new(AppServerClient::for_test_scripted(
+            vec![Ok(Value::Null)],
+            requests.clone(),
+        ));
+        client
+            .interrupt_turn("native-thread", "p1", cause, None)
+            .unwrap();
+        requests.lock().unwrap().clear();
+        (client, requests)
+    }
+
+    fn aborted(reason: &str) -> Value {
+        json!({"method": "turn/aborted", "params": {"turnId": "p1", "reason": reason}})
+    }
+
+    async fn turn_row(db: &LocalDb) -> Option<String> {
+        text(
+            db,
+            "SELECT state || '/' || COALESCE(end_reason,'') FROM turns WHERE id='t'",
+        )
+        .await
+    }
+
+    async fn interrupted_record(db: &LocalDb) -> Option<String> {
+        text(
+            db,
+            "SELECT COALESCE(json_extract(data,'$.raw.interruptCause'),'none') || '/' || json_extract(data,'$.raw.providerReason') || '/' || json_extract(data,'$.raw.providerTurnId')
+               FROM events WHERE event_type='result:interrupted'",
+        )
+        .await
+    }
+
+    /// cairn/4634 acceptance 1 and 3: a read completes, the model reasons and
+    /// answers. Nothing interrupts the turn and it completes as itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_read_followed_by_reasoning_continues_to_completion() {
+        let (db, orch) = persistent_codex_turn("codex-read-then-reason", "").await;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = Arc::new(AppServerClient::for_test_scripted(vec![], requests.clone()));
+        read_through(
+            &orch,
+            &db,
+            client,
+            vec![
+                json!({"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"read-1","server":"cairn","tool":"read","arguments":{}}}}),
+                json!({"method":"item/completed","params":{"turnId":"p1","item":{"type":"mcpToolCall","id":"read-1","server":"cairn","tool":"read","status":"completed","result":{"content":[{"type":"text","text":"diff"}]}}}}),
+                json!({"method":"item/started","params":{"item":{"type":"reasoning","id":"r-1"}}}),
+                json!({"method":"item/completed","params":{"turnId":"p1","item":{"type":"reasoning","id":"r-1"}}}),
+                json!({"method":"item/completed","params":{"turnId":"p1","item":{"type":"agentMessage","id":"m-1","text":"Next I will edit."}}}),
+                json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
+            ],
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "turn/interrupt"),
+            "a completed read never interrupts the turn"
+        );
+        assert_eq!(turn_row(&db).await.as_deref(), Some("complete/"));
+        assert_eq!(interrupted_record(&db).await, None);
+    }
+
+    /// An abort Cairn never asked for is the provider's own: the turn is cut
+    /// off, never laundered into `complete`, and the ledger says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abort_with_no_recorded_cause_is_a_provider_interrupt() {
+        let (db, orch) = persistent_codex_turn("codex-unattributed-abort", "").await;
+        read_notifications(&orch, &db, vec![aborted("interrupted")]);
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("interrupted/provider_interrupt")
+        );
+        assert_eq!(
+            interrupted_record(&db).await.as_deref(),
+            Some("none/interrupted/p1")
+        );
+        assert_eq!(
+            text(&db, "SELECT status FROM runs WHERE id='r'")
+                .await
+                .as_deref(),
+            Some("live"),
+            "the session stays open for whatever continues the job"
+        );
+    }
+
+    /// The watchdog's post-tool interrupt, attributed through the client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watchdog_post_tool_interrupt_reads_as_the_watchdogs() {
+        let (db, orch) = persistent_codex_turn("codex-post-tool-abort", "").await;
+        let (client, _) = client_that_interrupted(
+            cairn_models::interface::session::InterruptCause::WatchdogPostTool,
+        );
+        read_through(&orch, &db, client.clone(), vec![aborted("interrupted")]);
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("interrupted/watchdog_recovery")
+        );
+        assert_eq!(
+            interrupted_record(&db).await.as_deref(),
+            Some("watchdog_post_tool/interrupted/p1")
+        );
+        assert_eq!(
+            client.take_interrupt_cause("p1"),
+            None,
+            "consumed by the abort"
+        );
+    }
+
+    /// An operator Stop settles the turn `user_stop` before it interrupts;
+    /// the abort that follows writes nothing over it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operator_stop_abort_leaves_the_stops_settlement() {
+        let (db, orch) = persistent_codex_turn("codex-stop-abort", "").await;
+        db.execute(
+            "UPDATE turns SET state='interrupted', end_reason='user_stop' WHERE id='t'",
+            (),
+        )
+        .await
+        .unwrap();
+        let (client, _) =
+            client_that_interrupted(cairn_models::interface::session::InterruptCause::OperatorStop);
+        read_through(&orch, &db, client, vec![aborted("interrupted")]);
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("interrupted/user_stop")
+        );
+        assert_eq!(
+            interrupted_record(&db).await.as_deref(),
+            Some("operator_stop/interrupted/p1")
+        );
+    }
+
+    /// A teardown's abort leaves the turn to the teardown's finalization, so
+    /// the outcome cannot depend on whether the abort beat the process exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_teardown_abort_leaves_the_turn_to_the_teardown() {
+        let (db, orch) = persistent_codex_turn("codex-teardown-abort", "").await;
+        let (client, _) =
+            client_that_interrupted(cairn_models::interface::session::InterruptCause::Teardown {
+                exit_reason: "provider_silence_recovery".into(),
+            });
+        read_through(&orch, &db, client, vec![aborted("interrupted")]);
+        assert_eq!(turn_row(&db).await.as_deref(), Some("running/"));
+        assert_eq!(
+            interrupted_record(&db).await.as_deref(),
+            Some("teardown/interrupted/p1")
+        );
+    }
+
+    /// A terminal tool's handoff still completes as a handoff.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_tool_turn_still_completes_as_a_handoff() {
+        let (db, orch) = persistent_codex_turn("codex-handoff-abort", "").await;
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .get("r")
+            .unwrap()
+            .terminal_tool_called
+            .store(true, std::sync::atomic::Ordering::Release);
+        read_notifications(&orch, &db, vec![aborted("interrupted")]);
+        assert_eq!(
+            turn_row(&db).await.as_deref(),
+            Some("complete/artifact_handoff")
+        );
+    }
+
+    /// cairn/4634 test 5: the watchdog's interrupt raced a natural completion.
+    /// The turn completes as itself, and the cause recorded for it is dropped
+    /// with it rather than left to misattribute a later turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_completes_while_its_interrupt_is_in_flight_stays_complete() {
+        let (db, orch) = persistent_codex_turn("codex-interrupt-completion-race", "").await;
+        let (client, _) = client_that_interrupted(
+            cairn_models::interface::session::InterruptCause::WatchdogPostTool,
+        );
+        read_through(
+            &orch,
+            &db,
+            client.clone(),
+            vec![
+                json!({"method":"turn/completed","params":{"turn":{"id":"p1","status":"completed"}}}),
+            ],
+        );
+        assert_eq!(turn_row(&db).await.as_deref(), Some("complete/"));
+        assert_eq!(client.take_interrupt_cause("p1"), None);
+        assert_eq!(interrupted_record(&db).await, None);
     }
 
     fn provider_error(message: &str) -> Value {

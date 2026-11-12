@@ -414,6 +414,7 @@ pub fn recover_provider_watchdog(
             &orch.process_state,
             &identity.run_id,
             &identity.provider_turn_id,
+            cairn_models::interface::session::InterruptCause::WatchdogPostTool,
         ) {
             Ok(outcome) => {
                 let reason = match outcome {

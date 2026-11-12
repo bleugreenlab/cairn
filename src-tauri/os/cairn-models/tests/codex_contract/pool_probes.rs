@@ -174,7 +174,8 @@ pub fn pool_interrupt_during_hung_mcp_call(env: &ContractEnv) -> CaseResult {
 
     let interrupted_at = Instant::now();
     c.ok(
-        hung.control().interrupt(),
+        hung.control()
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "CodexControl::interrupt while hang is in flight",
     )?;
     let done = c.some(
@@ -213,7 +214,9 @@ pub fn pool_interrupt_during_hung_mcp_call(env: &ContractEnv) -> CaseResult {
     let (_, next) = run_turn(c, &mut stream, &mut hung, "again")?;
     let next_done = next.last().cloned().unwrap_or_default();
     c.ok(
-        neighbour.control().interrupt(),
+        neighbour
+            .control()
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "interrupting the neighbour",
     )?;
     let neighbour_done = stream.until(Duration::from_secs(20), turn_completed(&neighbour_turn));
@@ -671,7 +674,9 @@ pub fn pool_goal_on_a_shared_server(env: &ContractEnv) -> CaseResult {
         .control()
         .set_goal(None, Some(GoalStatus::Paused), None)
         .map(|goal| format!("{:?}", goal.status));
-    let interrupted = session.control().interrupt();
+    let interrupted = session
+        .control()
+        .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop);
     let unsubscribed_again = unsubscribe_thread(&client, &thread).map(|s| format!("{s:?}"));
     std::thread::sleep(Duration::from_secs(1));
     let (c_before, c_after) = still_running(env, Duration::from_secs(5));
@@ -1354,7 +1359,9 @@ pub fn pool_active_goal_paused_before_resume_after_server_loss(env: &ContractEnv
     let _ = control
         .control()
         .set_goal(None, Some(GoalStatus::Paused), None);
-    let _ = control.control().interrupt();
+    let _ = control
+        .control()
+        .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop);
 
     record(
         "P3-recovery",

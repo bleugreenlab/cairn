@@ -202,6 +202,53 @@ mod codex_goal_admission_tests {
         assert_eq!(event_count(&db, "system:codex_goal_turn_started").await, 0);
     }
 
+    /// cairn/4634: the watchdog's post-tool interrupt leaves its turn
+    /// `interrupted/watchdog_recovery` and re-arms the provider's goal. The goal
+    /// turn that follows is the job's continuation, admitted as a successor
+    /// exactly as it was after the `complete` the interrupt used to write; only
+    /// an operator's `user_stop` defers it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_goal_turn_after_a_watchdog_interrupt_is_admitted_as_the_continuation() {
+        let db = seeded_db().await;
+        db.execute(
+            "UPDATE turns SET state='interrupted', end_reason='watchdog_recovery' WHERE id='t0'",
+            (),
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db.clone());
+
+        let admitted = admit_codex_goal_turn(
+            &orch,
+            db.clone(),
+            "r",
+            "s",
+            "j",
+            "provider-goal-after-watchdog",
+            Some("t0"),
+        )
+        .unwrap();
+        let CodexGoalTurnAdmission::Admitted(successor) = admitted else {
+            panic!("a watchdog interrupt must not fence the goal's continuation: {admitted:?}");
+        };
+        assert_ne!(successor, "t0");
+        assert_eq!(event_count(&db, "system:codex_goal_turn_started").await, 1);
+        assert_eq!(
+            admit_codex_goal_turn(
+                &orch,
+                db.clone(),
+                "r",
+                "s",
+                "j",
+                "provider-goal-after-watchdog",
+                Some(&successor),
+            )
+            .unwrap(),
+            CodexGoalTurnAdmission::Admitted(successor),
+            "a repeated notification for the same provider turn mints no second successor"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn provider_goal_turn_after_normal_completion_mints_successor() {
         let db = seeded_db().await;

@@ -11,7 +11,10 @@ use serde_json::{json, Value};
 use cairn_platform::services::process::{ChildProcess, ProcessSpawner, SpawnConfig};
 
 use crate::codex::stack_sample::{PendingSample, PlatformSampler, StackSampler, SAMPLE_AFTER};
-use crate::interface::session::ServerReply;
+use crate::interface::session::{InterruptCause, ServerReply};
+use crate::wire::codex_app_server::errors::{
+    active_turn_id_from_mismatch, is_no_active_turn_error,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -45,6 +48,9 @@ pub struct AppServerClient {
     sampler: Arc<dyn StackSampler>,
     /// `$CODEX_HOME/log`, where a sample's full report is written.
     log_dir: Option<PathBuf>,
+    /// Why each turn this server was asked to interrupt was interrupted, by
+    /// provider turn id, until that turn's terminal notification takes it.
+    interrupt_causes: Arc<Mutex<HashMap<String, InterruptCause>>>,
 }
 
 impl AppServerClient {
@@ -178,6 +184,7 @@ impl AppServerClient {
             timeouts: REQUEST_TIMEOUTS,
             sampler: Arc::new(PlatformSampler),
             log_dir,
+            interrupt_causes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -393,6 +400,57 @@ impl AppServerClient {
         );
         rx.recv_timeout(give_up.saturating_sub(sample_after))
             .map_err(|_| format!("{}\n{}", timed_out(), sample.report()))
+    }
+
+    /// Ask the server to stop `turn_id` on `thread_id` because of `cause`, and
+    /// keep the cause until that turn's terminal notification takes it
+    /// ([`Self::take_interrupt_cause`]). Every `turn/interrupt` Cairn sends
+    /// goes through here, so every abort Cairn caused can say why.
+    ///
+    /// The cause is recorded before the request is written, because the abort
+    /// can arrive before the answer does. The first cause recorded for a turn
+    /// stands: a later interrupt of the same turn (a pooled release after a
+    /// teardown) echoes it. A request refused because that turn is not the
+    /// active one takes its cause back; any other failure leaves it, since the
+    /// interrupt may still have been delivered. `deadline` bounds the wait for
+    /// the answer; `None` waits the client's full request timeout.
+    pub fn interrupt_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        cause: InterruptCause,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Value, String> {
+        let recorded = match self.interrupt_causes.lock() {
+            Ok(mut causes) if !causes.contains_key(turn_id) => {
+                causes.insert(turn_id.to_string(), cause);
+                true
+            }
+            _ => false,
+        };
+        let params = json!({ "threadId": thread_id, "turnId": turn_id });
+        let result = match deadline {
+            Some(deadline) => self.send_request_within("turn/interrupt", params, deadline),
+            None => self.send_request("turn/interrupt", params),
+        };
+        if let Err(error) = &result {
+            if recorded
+                && (is_no_active_turn_error(error) || active_turn_id_from_mismatch(error).is_some())
+            {
+                self.take_interrupt_cause(turn_id);
+            }
+        }
+        result
+    }
+
+    /// Why Cairn interrupted `turn_id`, removing the record: `None` when it
+    /// never asked. A reader calls this on each terminal notification, so a
+    /// record lives exactly as long as the turn it names.
+    pub fn take_interrupt_cause(&self, turn_id: &str) -> Option<InterruptCause> {
+        self.interrupt_causes
+            .lock()
+            .ok()
+            .and_then(|mut causes| causes.remove(turn_id))
     }
 
     pub fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {

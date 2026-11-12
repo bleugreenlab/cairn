@@ -186,10 +186,11 @@ fn run_release_job(job: ReleaseJob) {
         );
     }
     if let Some(turn_id) = live_turn {
-        let interrupted = client.send_request_within(
-            "turn/interrupt",
-            serde_json::json!({ "threadId": thread_id, "turnId": turn_id }),
-            Instant::now() + step,
+        let interrupted = client.interrupt_turn(
+            &thread_id,
+            &turn_id,
+            cairn_models::interface::session::InterruptCause::ThreadRelease,
+            Some(Instant::now() + step),
         );
         if let Err(error) = interrupted.as_ref() {
             if !is_no_active_turn_error(error) {

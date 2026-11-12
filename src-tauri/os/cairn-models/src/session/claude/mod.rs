@@ -392,7 +392,12 @@ impl SessionControl for ClaudeControl {
         )
     }
 
-    fn interrupt(&mut self) -> Result<(), String> {
+    /// Claude's stream carries no turn identity to attribute an abort to, so
+    /// the cause stays with the caller.
+    fn interrupt(
+        &mut self,
+        _cause: crate::interface::session::InterruptCause,
+    ) -> Result<(), String> {
         let request_id = uuid::Uuid::new_v4().to_string();
         claude_stream::send_interrupt_request(&mut self.stdin, &request_id)
     }
@@ -724,7 +729,9 @@ mod tests {
                 parent_tool_use_id: None,
             })
             .unwrap();
-        control.interrupt().unwrap();
+        control
+            .interrupt(crate::interface::session::InterruptCause::OperatorStop)
+            .unwrap();
 
         let sent = lines(&shared);
         assert_eq!(

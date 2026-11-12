@@ -1903,6 +1903,66 @@ async fn jobs_that_must_not_auto_resume_get_no_continuation() {
     }
 }
 
+/// A head the provider cut off (`provider_interrupt`) or a watchdog kill whose
+/// continuation budget ran out (`watchdog_recovery`) is truncated work, not a
+/// restart casualty: boot never selects it for a resume. Each head is seeded in
+/// the shape every other filter of the selection admits (job resting, no live
+/// run, turn ended after boot), beside a `host_restart` head of the same shape
+/// that is selected, so only the end reason keeps them out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_heads_are_not_selected_for_a_boot_resume() {
+    let (orch, db, _prompts, _backend) = host("restart-resume-truncated").await;
+    let heads = [
+        ("j-provider", "t-provider", "provider_interrupt"),
+        ("j-watchdog", "t-watchdog", "watchdog_recovery"),
+        ("j-restart", "t-restart", "host_restart"),
+    ];
+    for (number, (job, turn, end_reason)) in (1..).zip(heads) {
+        seed_node_job(&db, job, number, "active").await;
+        seed_turn(
+            &db,
+            turn,
+            job,
+            Some(&format!("r-{job}")),
+            1,
+            "interrupted",
+            "initial",
+            Some(end_reason),
+        )
+        .await;
+        db.execute(
+            "UPDATE runs SET status = 'exited' WHERE job_id = ?1",
+            params![job],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE jobs SET status = 'idle' WHERE id = ?1",
+            params![job],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE turns SET ended_at = ?1 WHERE id = ?2",
+            params![BOOT_AT + 5, turn],
+        )
+        .await
+        .unwrap();
+    }
+
+    let selector = orch.clone();
+    let selected =
+        tokio::task::spawn_blocking(move || super::select_restart_resumes(&selector, BOOT_AT))
+            .await
+            .unwrap()
+            .expect("the selection reads");
+    assert_eq!(
+        selected,
+        vec![("j-restart".to_string(), "t-restart".to_string())],
+        "only the restart casualty is resumed at boot"
+    );
+}
+
 /// A resume that fails (here: the job's agent cannot be resolved, so the launch
 /// is refused after its turn was minted) settles the job wants-to-run, and the
 /// step never tries it again. Covers both restart settlements.

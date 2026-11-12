@@ -24,6 +24,7 @@ pub(crate) fn store_usage_result_event(
     is_error: bool,
     counts: TokenCounts,
     store_when_empty: bool,
+    raw: Option<serde_json::Value>,
 ) {
     let host = super::runtime::codex_runtime(
         super::super::transcript_host::SessionTranscriptHost {
@@ -45,5 +46,6 @@ pub(crate) fn store_usage_result_event(
         is_error,
         counts,
         store_when_empty,
+        raw,
     );
 }

@@ -250,9 +250,25 @@ pub struct TurnFacts {
     /// state rather than of a pre-reduced flag, so the two questions below can
     /// never disagree about which turn they are describing.
     pub latest_state: Option<TurnState>,
+    /// End reason of the latest work turn (the turn `work_state` describes).
+    pub work_end_reason: Option<crate::models::TurnEndReason>,
+    /// End reason of the absolute latest turn (the turn `latest_state`
+    /// describes).
+    pub latest_end_reason: Option<crate::models::TurnEndReason>,
 }
 
 impl TurnFacts {
+    /// Whether the latest work turn was cut off mid-work by the watchdog or
+    /// the provider rather than by an operator
+    /// ([`crate::models::TurnEndReason::truncates_work`]).
+    pub fn work_truncated(&self) -> bool {
+        self.work_state == Some(TurnState::Interrupted)
+            && self
+                .work_end_reason
+                .as_ref()
+                .is_some_and(crate::models::TurnEndReason::truncates_work)
+    }
+
     /// Whether the absolute latest turn is live (Running/Pending/Yielded). Host
     /// waits (Yielded) read live, so a job waiting on one stays Running.
     pub fn live(&self) -> bool {
@@ -266,12 +282,19 @@ impl TurnFacts {
     /// two states after which nothing is owed until something new starts.
     /// `Yielded` is live work, and `Interrupted`/`Cancelled` are user-initiated
     /// pauses that leave the job resumable, so neither settles it (deliberately
-    /// narrower than `TurnState::is_terminal`).
+    /// narrower than `TurnState::is_terminal`). A turn the watchdog or the
+    /// provider cut off settles it as the completion it used to be recorded
+    /// as: otherwise a warm process would pin the job Running over it, and a
+    /// task owing its `return` would never be asked for it.
     fn latest_turn_settled(&self) -> bool {
         matches!(
             self.latest_state,
             Some(TurnState::Complete | TurnState::Failed)
-        )
+        ) || (self.latest_state == Some(TurnState::Interrupted)
+            && self
+                .latest_end_reason
+                .as_ref()
+                .is_some_and(crate::models::TurnEndReason::truncates_work))
     }
 
     /// Whether the job has work in flight, given whether a run row is
@@ -326,7 +349,13 @@ pub async fn turn_facts(
                EXISTS (
                  SELECT 1 FROM jobs j JOIN turns t ON t.id=j.current_turn_id AND t.job_id=j.id
                  WHERE j.id=?1 AND t.state='yielded' AND t.yield_reason='provider_limit'
-               )"
+               ),
+               (SELECT end_reason FROM turns
+                WHERE job_id = ?1 AND start_reason != 'memory_review' AND NOT {UNSERVED_LAUNCH}
+                ORDER BY created_at DESC, sequence DESC LIMIT 1),
+               (SELECT end_reason FROM turns
+                WHERE job_id = ?1 AND NOT {UNSERVED_LAUNCH}
+                ORDER BY created_at DESC, sequence DESC LIMIT 1)"
             ),
             (job_id,),
         )
@@ -349,10 +378,20 @@ pub async fn turn_facts(
         state(row.opt_text(1)?)
     };
     let outcome_state = state(row.opt_text(2)?);
+    let (work_end_reason, latest_end_reason) = if provider_held {
+        (None, None)
+    } else {
+        (
+            row.opt_text(4)?.and_then(|reason| reason.parse().ok()),
+            row.opt_text(5)?.and_then(|reason| reason.parse().ok()),
+        )
+    };
     Ok(TurnFacts {
         work_state,
         outcome_state,
         latest_state,
+        work_end_reason,
+        latest_end_reason,
     })
 }
 
@@ -640,6 +679,7 @@ async fn node_job_facts_conn(
         // Only a genuine agent/process failure terminalizes.
         turn_failed: matches!(turn.work_state, Some(TurnState::Failed)) || run_failed_without_turn,
         turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
+        turn_truncated: turn.work_truncated(),
         checkpoint: gate_for(node, confirm_policy),
         resolution: if artifact.unwrap_or(false) {
             Resolution::Confirmed
@@ -791,6 +831,7 @@ async fn node_less_terminal_status_conn(
         live_turn: false,
         turn_failed,
         turn_complete,
+        turn_truncated: false,
         checkpoint: CheckpointGate::None,
         resolution: Resolution::Pending,
         requires_output: true,
@@ -1867,6 +1908,7 @@ pub async fn reduce_delegated_child_job_conn(
             live_turn: !artifact_present && !run_terminal,
             turn_failed: !artifact_present && run_terminal,
             turn_complete: artifact_present,
+            turn_truncated: false,
             checkpoint: CheckpointGate::None,
             resolution: Resolution::Pending,
             requires_output,
@@ -1881,6 +1923,7 @@ pub async fn reduce_delegated_child_job_conn(
             live_turn: turn.live(),
             turn_failed: matches!(turn.work_state, Some(TurnState::Failed)),
             turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
+            turn_truncated: turn.work_truncated(),
             checkpoint: CheckpointGate::None,
             resolution: Resolution::Pending,
             requires_output,
@@ -2533,6 +2576,38 @@ mod gate_tests {
         );
     }
 
+    /// cairn/4634: a warm process is session availability, not work, past a
+    /// turn the watchdog or the provider cut off, exactly as past a completed
+    /// one. An operator's interrupt still reads as resumable, so a warm run
+    /// keeps it Running through the resume gap.
+    #[test]
+    fn a_truncated_turn_is_settled_so_a_warm_run_does_not_pin_it_running() {
+        for reason in [
+            crate::models::TurnEndReason::WatchdogRecovery,
+            crate::models::TurnEndReason::ProviderInterrupt,
+        ] {
+            let turn = TurnFacts {
+                work_state: Some(TurnState::Interrupted),
+                latest_state: Some(TurnState::Interrupted),
+                work_end_reason: Some(reason.clone()),
+                latest_end_reason: Some(reason),
+                ..Default::default()
+            };
+            assert!(turn.latest_turn_settled());
+            assert!(!turn.work_live(true));
+            assert!(turn.work_truncated());
+        }
+        let stopped = TurnFacts {
+            work_state: Some(TurnState::Interrupted),
+            latest_state: Some(TurnState::Interrupted),
+            work_end_reason: Some(crate::models::TurnEndReason::UserStop),
+            latest_end_reason: Some(crate::models::TurnEndReason::UserStop),
+            ..Default::default()
+        };
+        assert!(!stopped.latest_turn_settled());
+        assert!(stopped.work_live(true));
+    }
+
     #[test]
     fn provider_yield_is_live_work_without_an_authoritative_outcome() {
         let turn = TurnFacts {
@@ -2548,6 +2623,7 @@ mod gate_tests {
                 live_turn: turn.work_live(active_run),
                 turn_failed: matches!(turn.work_state, Some(TurnState::Failed)),
                 turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
+                turn_truncated: turn.work_truncated(),
                 checkpoint: CheckpointGate::None,
                 resolution: Resolution::Confirmed,
                 requires_output: true,

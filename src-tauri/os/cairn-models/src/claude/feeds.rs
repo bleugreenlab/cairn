@@ -458,7 +458,10 @@ mod tests {
         fn send(&mut self, _input: &SessionInput<'_>) -> Result<(), String> {
             Ok(())
         }
-        fn interrupt(&mut self) -> Result<(), String> {
+        fn interrupt(
+            &mut self,
+            _cause: crate::interface::session::InterruptCause,
+        ) -> Result<(), String> {
             Ok(())
         }
         fn set_model(&mut self, _model: &str) -> Result<(), String> {

@@ -797,7 +797,10 @@ impl SessionControl for Closed {
     fn send(&mut self, _: &SessionInput<'_>) -> Result<(), String> {
         Err("closed".to_string())
     }
-    fn interrupt(&mut self) -> Result<(), String> {
+    fn interrupt(
+        &mut self,
+        _cause: cairn_models::interface::session::InterruptCause,
+    ) -> Result<(), String> {
         Err("closed".to_string())
     }
     fn set_model(&mut self, _: &str) -> Result<(), String> {

@@ -872,7 +872,21 @@ pub(crate) fn interrupt_run_for_provider_depletion(orch: &Orchestrator, run_id: 
 }
 
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
-    if let Err(error) = finalize_run_inner(orch, run_id, status, FinalizeEffects::Ordinary) {
+    finalize_killed_run(orch, run_id, status, None);
+}
+
+/// [`finalize_run`] for a run a deliberate kill ended: a turn the kill cut off
+/// while it was still running ends `interrupted` with `cut_off` rather than by
+/// the exit's status (`super::kill_cut_off_reason`). `None` is an ordinary
+/// finalization.
+pub(crate) fn finalize_killed_run(
+    orch: &Orchestrator,
+    run_id: &str,
+    status: RunStatus,
+    cut_off: Option<TurnEndReason>,
+) {
+    if let Err(error) = finalize_run_inner(orch, run_id, status, FinalizeEffects::Ordinary, cut_off)
+    {
         log::error!("Failed to finalize run {run_id}: {error}");
     }
 }
@@ -902,7 +916,16 @@ pub(crate) fn finalize_run_for_recovery(
     run_id: &str,
     status: RunStatus,
 ) -> Result<(), String> {
-    finalize_run_inner(orch, run_id, status, FinalizeEffects::Ordinary)
+    // The watchdog killed the process to continue the job in a successor; a
+    // turn it cut off is the watchdog's, not a crash, whichever of the abort
+    // and the exit Cairn saw first.
+    finalize_run_inner(
+        orch,
+        run_id,
+        status,
+        FinalizeEffects::Ordinary,
+        Some(TurnEndReason::WatchdogRecovery),
+    )
 }
 
 /// Finalize a run an operator Compact killed. See
@@ -912,14 +935,17 @@ pub(crate) fn finalize_run_for_operator_compact(
     run_id: &str,
     status: RunStatus,
 ) -> Result<(), String> {
-    finalize_run_inner(orch, run_id, status, FinalizeEffects::OperatorCompact)
+    finalize_run_inner(orch, run_id, status, FinalizeEffects::OperatorCompact, None)
 }
 
+/// `cut_off`, when a deliberate kill names one, is the end reason of a turn
+/// still running when the run is finalized, whatever the exit's status.
 fn finalize_run_inner(
     orch: &Orchestrator,
     run_id: &str,
     status: RunStatus,
     effects: FinalizeEffects,
+    cut_off: Option<TurnEndReason>,
 ) -> Result<(), String> {
     let mut first_error = None;
     // A finalized run's agent must not keep acting through the HTTP MCP
@@ -1002,6 +1028,10 @@ fn finalize_run_inner(
                 // re-sweep after the kill settles it and counts it, so this
                 // must not read it as a clean exit.
                 Ok(())
+            } else if let (Some(reason), "running") = (cut_off.as_ref(), turn_state.as_str()) {
+                // A kill cut the turn off mid-work: it neither completed nor
+                // crashed, whichever of its abort and the exit came first.
+                interrupt_turn(orch, turn_id, Some(reason.clone()))
             } else if status == RunStatus::Exited {
                 // Clean exit: a Running turn completed; a turn that never reached
                 // Running (Pending) produced nothing, so fail it rather than

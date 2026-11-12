@@ -176,7 +176,9 @@ fn fold(
     };
     let stop = |control: &mut Option<Box<dyn SessionControl>>| {
         if let Some(control) = control.as_mut() {
-            if let Err(error) = control.interrupt() {
+            if let Err(error) =
+                control.interrupt(crate::interface::session::InterruptCause::OneShotStop)
+            {
                 log::debug!("one-shot: interrupting the Codex turn failed: {error}");
             }
         }
@@ -349,7 +351,10 @@ mod tests {
         fn send(&mut self, _: &SessionInput<'_>) -> Result<(), String> {
             Ok(())
         }
-        fn interrupt(&mut self) -> Result<(), String> {
+        fn interrupt(
+            &mut self,
+            _cause: crate::interface::session::InterruptCause,
+        ) -> Result<(), String> {
             self.0.interrupted.store(true, Ordering::SeqCst);
             Ok(())
         }

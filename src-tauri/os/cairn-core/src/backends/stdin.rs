@@ -7,7 +7,7 @@
 use crate::agent_process::process::{
     AgentProcessState, GoalPauseClaim, PauseIntent, SessionControl,
 };
-use cairn_models::interface::session::SessionInput;
+use cairn_models::interface::session::{InterruptCause, SessionInput};
 
 /// Lock a run's control and goal claim, then call `f` with them.
 fn with_session_control<T, F>(
@@ -108,9 +108,10 @@ pub(crate) fn interrupt_exact_codex_turn(
     process_state: &AgentProcessState,
     run_id: &str,
     provider_turn_id: &str,
+    cause: InterruptCause,
 ) -> Result<cairn_models::session::codex::ExactTurnInterrupt, String> {
     with_session_control(process_state, run_id, |stdin, _claim| {
-        super::codex::interrupt_exact_app_server_turn(stdin, provider_turn_id)
+        super::codex::interrupt_exact_app_server_turn(stdin, provider_turn_id, cause)
     })
 }
 
@@ -211,26 +212,39 @@ pub(crate) fn reconcile_goal(
     })
 }
 
-/// Send an interrupt to a running agent process.
+/// Send an interrupt to a running agent process, because of `cause`.
 pub(crate) fn send_interrupt(
     process_state: &AgentProcessState,
     run_id: &str,
     intent: PauseIntent,
+    cause: InterruptCause,
 ) -> Result<(), String> {
     with_session_control(process_state, run_id, |control, claim| {
-        if super::codex::pause_goal_and_interrupt_app_server_turn(control, claim, intent)? {
+        if super::codex::pause_goal_and_interrupt_app_server_turn(
+            control,
+            claim,
+            intent,
+            cause.clone(),
+        )? {
             return Ok(());
         }
-        control.interrupt()
+        control.interrupt(cause)
     })
 }
 
-/// A process that is being destroyed needs no surviving goal pause claim.
+/// A process that is being destroyed needs no surviving goal pause claim. The
+/// teardown's `exit_reason` is the interrupt's cause, so the abort it produces
+/// is read as the teardown's and left to the teardown to settle.
 pub(crate) fn send_interrupt_before_kill(
     process_state: &AgentProcessState,
     run_id: &str,
+    exit_reason: &str,
 ) -> Result<(), String> {
-    with_session_control(process_state, run_id, |control, _claim| control.interrupt())
+    with_session_control(process_state, run_id, |control, _claim| {
+        control.interrupt(InterruptCause::Teardown {
+            exit_reason: exit_reason.to_string(),
+        })
+    })
 }
 
 /// Send a model change to a running agent process.

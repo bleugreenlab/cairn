@@ -10,7 +10,6 @@ use std::sync::Mutex;
 use tokio::sync::broadcast;
 
 use super::common::*;
-use super::finalize::finalize_run;
 use super::unanswered_calls::{settle_unanswered_calls, InterruptCause};
 
 pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_waits: bool) {
@@ -854,6 +853,13 @@ impl StopReason {
     fn is_operator_stop(&self) -> bool {
         matches!(self, Self::OperatorStop)
     }
+
+    fn interrupt_cause(&self) -> cairn_models::interface::session::InterruptCause {
+        match self {
+            Self::OperatorStop => cairn_models::interface::session::InterruptCause::OperatorStop,
+            Self::Park(_) => cairn_models::interface::session::InterruptCause::DurablePark,
+        }
+    }
 }
 
 /// Internal stop without cascading (used by cascading stop)
@@ -892,7 +898,12 @@ fn stop_session_with_pause_intent(
     // Send interrupt via the backend-aware stdin handler. For Codex this pauses
     // the native goal under the same stdin lock before sending `turn/interrupt`,
     // so even an immediate provider idle notification cannot start a successor.
-    if let Err(e) = crate::backends::stdin::send_interrupt(&orch.process_state, run_id, intent) {
+    if let Err(e) = crate::backends::stdin::send_interrupt(
+        &orch.process_state,
+        run_id,
+        intent,
+        reason.interrupt_cause(),
+    ) {
         if e.starts_with("Process not found:") {
             log::warn!(
                 "Run {} missing from process map during stop; reconciling stale DB state",
@@ -1046,11 +1057,13 @@ pub enum TerminalPolicy {
 
 /// Release admission and stop the registered child without finalizing its run.
 /// The caller owns exit bookkeeping, which can resume the job and must happen
-/// outside the job launch lock.
+/// outside the job launch lock. `exit_reason` is what that bookkeeping will
+/// record; the interrupt sent first carries it as its cause.
 pub(super) fn teardown_process(
     orch: &Orchestrator,
     run_id: &str,
     terminals: TerminalPolicy,
+    exit_reason: &str,
 ) -> Result<(), String> {
     // Removal below destroys the handle carrying the release generation. Do not
     // proceed unless the terminal obligation has been durably recorded; the
@@ -1068,7 +1081,11 @@ pub(super) fn teardown_process(
         .unwrap_or(false);
 
     if !is_idle {
-        let _ = crate::backends::stdin::send_interrupt_before_kill(&orch.process_state, run_id);
+        let _ = crate::backends::stdin::send_interrupt_before_kill(
+            &orch.process_state,
+            run_id,
+            exit_reason,
+        );
 
         // Brief wait for graceful handling
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1167,7 +1184,7 @@ pub fn kill_session_with_reason(
             }
         })?;
     }
-    teardown_process(orch, run_id, terminals)?;
+    teardown_process(orch, run_id, terminals, exit_reason)?;
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
     let final_status = if matches!(
@@ -1186,10 +1203,33 @@ pub fn kill_session_with_reason(
     } else if exit_reason == OPERATOR_COMPACT_EXIT_REASON {
         super::finalize_run_for_operator_compact(orch, run_id, final_status)?;
     } else {
-        finalize_run(orch, run_id, final_status);
+        super::finalize::finalize_killed_run(
+            orch,
+            run_id,
+            final_status,
+            kill_cut_off_reason(exit_reason),
+        );
     }
 
     Ok(())
+}
+
+/// How a turn a kill with `exit_reason` cut off mid-work ends, so a deliberate
+/// kill never reads as a completion. `None` keeps finalization's own rule: a
+/// kill that only ever ends a finished call or an idle warm process has no
+/// running turn to cut off, and a crash (`crash`, `watchdog_arm_failed`) is a
+/// real failure that finalizes `crash`. No deliberate kill maps to `crash`.
+pub(crate) fn kill_cut_off_reason(exit_reason: &str) -> Option<TurnEndReason> {
+    match exit_reason {
+        PROVIDER_SILENCE_RECOVERY_EXIT_REASON => Some(TurnEndReason::WatchdogRecovery),
+        // A provider change is the operator's edit; its stop settles the live
+        // turn `user_stop` before the kill, and a turn started since ends so too.
+        "user_stop" | "provider_change" => Some(TurnEndReason::UserStop),
+        // Agrees with the boot sweep's writer, which settled the run's turns
+        // `host_restart` before this kill began.
+        RUNNER_SHUTDOWN_EXIT_REASON => Some(TurnEndReason::HostRestart),
+        _ => None,
+    }
 }
 
 /// The exit reason recorded for an agent stopped because its host is shutting

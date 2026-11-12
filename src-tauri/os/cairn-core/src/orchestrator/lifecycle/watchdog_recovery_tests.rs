@@ -981,3 +981,277 @@ async fn a_provider_still_serving_the_turn_is_killed_under_a_settled_cairn_turn(
         "recovery did not stand down"
     );
 }
+
+/// A Codex run whose app-server answers `turn/interrupt` only after the
+/// interrupted turn's abort has been handled by the real completion path, with
+/// whatever cause the client recorded for it: the cairn/4634 specimen's
+/// ordering, where the provider's abort beat the teardown's kill and finalize.
+fn register_codex_process_aborting_on_interrupt(
+    orch: &Orchestrator,
+) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    use crate::agent_process::completion::{
+        ProviderInterruption, SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
+    };
+    use crate::orchestrator::lifecycle::{apply_codex_turn_completion, CodexTurnContext};
+    use cairn_models::codex::app_server::AppServerClient;
+    use cairn_session::agent_process::completion::TurnFailureDisposition;
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client_slot: Arc<std::sync::OnceLock<std::sync::Weak<AppServerClient>>> = Arc::default();
+    let slot = client_slot.clone();
+    let aborting = orch.clone();
+    let client = Arc::new(AppServerClient::for_test_responding(
+        move |request| {
+            if request["method"] != "turn/interrupt" {
+                return Ok(serde_json::json!({ "error": {
+                    "code": -32601,
+                    "message": format!("fixture has no reply for {}", request["method"]),
+                } }));
+            }
+            let turn_id = request["params"]["turnId"].as_str().unwrap().to_string();
+            let cause = slot
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .and_then(|client| client.take_interrupt_cause(&turn_id));
+            apply_codex_turn_completion(
+                &aborting,
+                &aborting.db.local,
+                &aborting.services.emitter,
+                "run",
+                Some("session"),
+                SessionTurnCompletion {
+                    outcome: SessionTurnOutcome::Interrupted(ProviderInterruption {
+                        provider_turn_id: Some(turn_id),
+                        provider_reason: Some("interrupted".into()),
+                        cause,
+                    }),
+                    usage: crate::agent_process::stream::TokenCounts::default(),
+                    session_lifetime: SessionLifetime::Persistent,
+                },
+                CodexTurnContext {
+                    failure_disposition: TurnFailureDisposition::Unhandled,
+                },
+            );
+            // The specimen's job was a builder node: once its turn settled,
+            // recompute derived it Blocked, its create-pr still owed. This
+            // node-less fixture writes that projection directly.
+            let db = aborting.db.local.clone();
+            crate::storage::run_db_blocking(move || async move {
+                db.execute("UPDATE jobs SET status = 'blocked' WHERE id = 'job'", ())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+            Ok(serde_json::json!({ "result": {} }))
+        },
+        requests.clone(),
+    ));
+    client_slot.set(Arc::downgrade(&client)).unwrap();
+    let control = cairn_models::session::codex::CodexControl::new(
+        client,
+        "native-thread".to_string(),
+        "/tmp/project".to_string(),
+        None,
+        None,
+        None,
+        Arc::new(Mutex::new(Some("provider-turn".to_string()))),
+    );
+    let mut handle = RunHandle::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(Box::new(control)))),
+        Some("session".into()),
+        Some("job".into()),
+    );
+    handle.backend = Some("codex".into());
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run".into(), handle);
+    orch.process_state.set_current_turn_id("run", Some("turn"));
+    requests
+}
+
+/// The cairn/4634 specimen, replayed. A turn's lease sat in `provider_progress`
+/// past its deadline, so recovery reserved a successor and killed the run with
+/// `provider_silence_recovery`. The teardown's interrupt produced an abort that
+/// was handled before the kill finished, and that handler used to settle the
+/// turn `complete`: `finish_settled_recovery` then read the watchdog's own kill
+/// as a natural completion, closed the lease
+/// `provider_silence_already_terminal_reconciled`, and started no successor.
+/// The turn must instead read as the watchdog's, and recovery must carry on to
+/// its successor on the same session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watchdog_kill_whose_abort_lands_first_is_not_mistaken_for_a_completion() {
+    let db = migrated_test_db("watchdog-specimen-4634").await;
+    db.execute_script(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+           VALUES('project','w','Cairn','cairn','/tmp',1,1);
+         INSERT INTO jobs (id, project_id, status, current_session_id, current_turn_id, created_at, updated_at)
+           VALUES ('job', 'project', 'running', 'session', 'turn', 1, 1);
+         INSERT INTO sessions (id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+           VALUES ('session', 'job', 'codex', 'native-thread', 'open', 1, 1, 1);
+         INSERT INTO runs (id, job_id, session_id, status, created_at, updated_at)
+           VALUES ('run', 'job', 'session', 'live', 1, 1);
+         INSERT INTO turns (id, job_id, session_id, run_id, sequence, state, start_reason, created_at, updated_at)
+           VALUES ('turn', 'job', 'session', 'run', 1, 'running', 'initial', 1, 1);
+         PRAGMA foreign_keys = ON;",
+    )
+    .await
+    .unwrap();
+    let identity = WatchdogIdentity {
+        run_id: "run".into(),
+        session_id: "session".into(),
+        provider_turn_id: "provider-turn".into(),
+        generation: "generation".into(),
+    };
+    arm_watchdog(
+        &db,
+        NewWatchdogLease {
+            identity: identity.clone(),
+            runner_boot_id: "boot".into(),
+            phase: WatchdogPhase::ProviderProgress,
+            phase_deadline_at: 400,
+            now: 100,
+        },
+        "armed".into(),
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+    let requests = register_codex_process_aborting_on_interrupt(&orch);
+
+    let recovery = recover_provider_watchdog(&orch, &identity, 425);
+
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "turn/interrupt")
+            .count(),
+        1,
+        "the teardown interrupted the provider turn once"
+    );
+    let turn = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT state, end_reason FROM turns WHERE id = 'turn'",
+            (),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        turn,
+        Some(("interrupted".into(), Some("watchdog_recovery".into()))),
+        "the watchdog's kill is recorded as the watchdog's, not as a completion: {recovery:?}"
+    );
+    let lease = get_watchdog_lease(&orch.db.local, "run", "session", "provider-turn")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        lease.terminal_reason.as_deref(),
+        Some(ALREADY_TERMINAL_RECONCILED_REASON),
+        "the self-inflicted kill must not be reconciled as an already-terminal turn: {recovery:?}"
+    );
+    let lifecycle = list_watchdog_lifecycle(&orch.db.local, &identity)
+        .await
+        .unwrap();
+    assert!(
+        lifecycle.iter().any(|event| {
+            event.kind == WatchdogLifecycleKind::TerminalizationSucceeded
+                && event.reason.as_deref() == Some("provider_silence_recovery")
+        }),
+        "recovery reached its successor path: {lifecycle:?}"
+    );
+    // The ledger names who stopped the turn without the lease table.
+    let raw = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT json_extract(data, '$.raw.interruptCause'), json_extract(data, '$.raw.exitReason')
+               FROM events WHERE event_type = 'result:interrupted'",
+            (),
+            |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        raw,
+        Some((
+            Some("teardown".into()),
+            Some("provider_silence_recovery".into())
+        ))
+    );
+    // The native conversation is kept for whatever continues the job.
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt(
+                "SELECT status, backend_id FROM sessions WHERE id = 'session'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .unwrap(),
+        Some(("open".into(), Some("native-thread".into())))
+    );
+    let successor = match &recovery {
+        Ok(
+            ProviderWatchdogRecovery::Queued { reason, successor }
+            | ProviderWatchdogRecovery::Recovered {
+                reason,
+                successor: Some(successor),
+            },
+        ) if reason == "provider_silence_recovery" => successor.clone(),
+        other => panic!("recovery must continue the job in a successor: {other:?}"),
+    };
+    // Exactly one successor, on the same session.
+    let successors = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT COUNT(*), COUNT(DISTINCT session_id), MIN(session_id) FROM turns WHERE job_id = 'job' AND id != 'turn'",
+            (),
+            |row| Ok((row.get::<i64>(0)?, row.get::<i64>(1)?, row.opt_text(2)?)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(successors, (1, 1, Some("session".into())));
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt(
+                "SELECT session_id FROM turns WHERE id = ?1",
+                (successor.1.clone(),),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("session")
+    );
+    // A repeated recovery of the same lease mints nothing more.
+    assert_eq!(
+        recover_provider_watchdog(&orch, &identity, 900),
+        Ok(ProviderWatchdogRecovery::LostClaim)
+    );
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt(
+                "SELECT COUNT(*) FROM turns WHERE job_id = 'job' AND id != 'turn'",
+                (),
+                |row| Ok(row.get::<i64>(0)?),
+            )
+            .await
+            .unwrap(),
+        Some(1)
+    );
+}

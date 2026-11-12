@@ -165,6 +165,25 @@ pub enum TurnEndReason {
     /// on that same process. Distinct from [`Self::Crash`], which claims the
     /// process itself failed.
     ProviderFailure,
+    /// Cairn's provider-silence watchdog interrupted the turn, or killed the
+    /// process serving it. The turn was cut off, not finished; the native
+    /// conversation is intact and the job continues, through the provider's
+    /// own goal or a successor turn the recovery starts on the same session.
+    /// Not a failure.
+    WatchdogRecovery,
+    /// The provider aborted the turn (Codex `interrupted`, `replaced` or
+    /// `review_ended`) with no interrupt Cairn had asked for. The turn was cut
+    /// off; nothing continues it automatically. Not a failure.
+    ProviderInterrupt,
+}
+
+impl TurnEndReason {
+    /// A turn that was cut off mid-work by something other than an operator:
+    /// its work is unfinished, so the job rests resumable instead of either
+    /// completing (and firing downstream) or being claimed afresh.
+    pub fn truncates_work(&self) -> bool {
+        matches!(self, Self::WatchdogRecovery | Self::ProviderInterrupt)
+    }
 }
 
 impl std::fmt::Display for TurnEndReason {
@@ -182,6 +201,8 @@ impl std::fmt::Display for TurnEndReason {
             TurnEndReason::OperatorCompact => write!(f, "operator_compact"),
             TurnEndReason::HostRestart => write!(f, "host_restart"),
             TurnEndReason::ProviderFailure => write!(f, "provider_failure"),
+            TurnEndReason::WatchdogRecovery => write!(f, "watchdog_recovery"),
+            TurnEndReason::ProviderInterrupt => write!(f, "provider_interrupt"),
         }
     }
 }
@@ -203,6 +224,8 @@ impl std::str::FromStr for TurnEndReason {
             "operator_compact" => Ok(TurnEndReason::OperatorCompact),
             "host_restart" => Ok(TurnEndReason::HostRestart),
             "provider_failure" => Ok(TurnEndReason::ProviderFailure),
+            "watchdog_recovery" => Ok(TurnEndReason::WatchdogRecovery),
+            "provider_interrupt" => Ok(TurnEndReason::ProviderInterrupt),
             _ => Err(format!("Unknown turn end reason: {}", s)),
         }
     }
@@ -334,6 +357,8 @@ mod tests {
             TurnEndReason::ProviderFailure,
             TurnEndReason::PermissionResumeRefused,
             TurnEndReason::QuestionResumeRefused,
+            TurnEndReason::WatchdogRecovery,
+            TurnEndReason::ProviderInterrupt,
         ] {
             let parsed: TurnEndReason = reason.to_string().parse().unwrap();
             assert_eq!(parsed, reason);

@@ -1,7 +1,7 @@
 //! The one writer to a live Codex thread: its turns, interrupts, and native goal.
 
 use crate::codex::app_server::AppServerClient;
-use crate::interface::session::{ServerReply, SessionControl, SessionInput};
+use crate::interface::session::{InterruptCause, ServerReply, SessionControl, SessionInput};
 use crate::wire::codex_app_server::errors::{
     active_turn_id_from_mismatch, is_no_active_turn_error,
 };
@@ -87,8 +87,12 @@ impl CodexControl {
         &self.thread_id
     }
 
-    pub fn interrupt_untracked_turn(&self, turn_id: &str) -> Result<(), String> {
-        match self.send_interrupt_for_turn(turn_id) {
+    pub fn interrupt_untracked_turn(
+        &self,
+        turn_id: &str,
+        cause: InterruptCause,
+    ) -> Result<(), String> {
+        match self.send_interrupt_for_turn(turn_id, cause) {
             Ok(()) => Ok(()),
             Err(error) if is_no_active_turn_error(&error) => Ok(()),
             Err(error) => Err(error),
@@ -98,6 +102,7 @@ impl CodexControl {
     pub fn interrupt_exact_and_wait(
         &self,
         expected_turn_id: &str,
+        cause: InterruptCause,
     ) -> Result<ExactTurnInterrupt, String> {
         match self.cached_turn_id()? {
             None => {
@@ -112,7 +117,7 @@ impl CodexControl {
             }
             Some(_) => {}
         }
-        match self.send_interrupt_for_turn(expected_turn_id) {
+        match self.send_interrupt_for_turn(expected_turn_id, cause) {
             Ok(()) => {}
             Err(error) if is_no_active_turn_error(&error) => {
                 return Ok(ExactTurnInterrupt::AlreadyTerminal {
@@ -232,19 +237,19 @@ impl CodexControl {
         Ok(())
     }
 
-    pub fn interrupt(&self) -> Result<(), String> {
+    pub fn interrupt(&self, cause: InterruptCause) -> Result<(), String> {
         let Some(turn_id) = self.cached_turn_id()? else {
             return Ok(());
         };
 
-        match self.send_interrupt_for_turn(&turn_id) {
+        match self.send_interrupt_for_turn(&turn_id, cause.clone()) {
             Ok(()) => Ok(()),
             Err(error) if is_no_active_turn_error(&error) => Ok(()),
             Err(error) => {
                 if let Some(active_turn_id) = active_turn_id_from_mismatch(&error) {
                     if active_turn_id != turn_id {
                         self.remember_turn_id(&active_turn_id)?;
-                        return match self.send_interrupt_for_turn(&active_turn_id) {
+                        return match self.send_interrupt_for_turn(&active_turn_id, cause) {
                             Ok(()) => Ok(()),
                             Err(retry_error) if is_no_active_turn_error(&retry_error) => Ok(()),
                             Err(retry_error) => Err(retry_error),
@@ -273,13 +278,18 @@ impl CodexControl {
         Ok(())
     }
 
-    fn send_interrupt_for_turn(&self, turn_id: &str) -> Result<(), String> {
-        let params = serde_json::json!({
-            "threadId": self.thread_id,
-            "turnId": turn_id,
-        });
-        self.client.send_request("turn/interrupt", params)?;
+    /// Every interrupt this control sends, with the cause the client keeps for
+    /// the session's reader to attribute the abort by.
+    fn send_interrupt_for_turn(&self, turn_id: &str, cause: InterruptCause) -> Result<(), String> {
+        self.client
+            .interrupt_turn(&self.thread_id, turn_id, cause, None)?;
         Ok(())
+    }
+
+    /// Why Cairn interrupted `turn_id`, if it did; see
+    /// [`AppServerClient::take_interrupt_cause`].
+    pub fn take_interrupt_cause(&self, turn_id: &str) -> Option<InterruptCause> {
+        self.client.take_interrupt_cause(turn_id)
     }
 }
 
@@ -321,8 +331,8 @@ impl SessionControl for CodexControl {
         self.send_turn(input.content)
     }
 
-    fn interrupt(&mut self) -> Result<(), String> {
-        CodexControl::interrupt(self)
+    fn interrupt(&mut self, cause: InterruptCause) -> Result<(), String> {
+        CodexControl::interrupt(self, cause)
     }
 
     fn set_model(&mut self, _model: &str) -> Result<(), String> {
@@ -420,7 +430,9 @@ mod tests {
     #[test]
     fn exact_interrupt_refuses_to_retarget_a_different_turn() {
         let (stdin, requests, _) = scripted_stdin(Some("turn-other"), vec![]);
-        let error = stdin.interrupt_exact_and_wait("turn-leased").unwrap_err();
+        let error = stdin
+            .interrupt_exact_and_wait("turn-leased", InterruptCause::WatchdogPostTool)
+            .unwrap_err();
         assert!(error.contains("expected turn-leased, found turn-other"));
         assert!(requests.lock().unwrap().is_empty());
     }
@@ -435,7 +447,9 @@ mod tests {
             *clearing_turn.lock().unwrap() = None;
         });
         assert!(matches!(
-            stdin.interrupt_exact_and_wait("turn-leased").unwrap(),
+            stdin
+                .interrupt_exact_and_wait("turn-leased", InterruptCause::WatchdogPostTool)
+                .unwrap(),
             ExactTurnInterrupt::Acknowledged { .. }
         ));
         clearer.join().unwrap();
@@ -451,7 +465,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
             *replacing_turn.lock().unwrap() = Some("turn-other".to_string());
         });
-        let error = stdin.interrupt_exact_and_wait("turn-leased").unwrap_err();
+        let error = stdin
+            .interrupt_exact_and_wait("turn-leased", InterruptCause::WatchdogPostTool)
+            .unwrap_err();
         replacer.join().unwrap();
         assert!(error.contains("mismatch after interrupt"));
     }
@@ -462,7 +478,7 @@ mod tests {
             scripted_stdin(Some("turn-legitimate"), vec![Ok(Value::Null)]);
 
         stdin
-            .interrupt_untracked_turn("turn-premature")
+            .interrupt_untracked_turn("turn-premature", InterruptCause::GoalDeferral)
             .expect("premature provider turn is interrupted");
 
         assert_eq!(
@@ -490,7 +506,9 @@ mod tests {
             ],
         );
 
-        stdin.interrupt().expect("retry should land");
+        stdin
+            .interrupt(InterruptCause::OperatorStop)
+            .expect("retry should land");
 
         assert_eq!(
             request_turn_ids(&requests),
@@ -513,7 +531,9 @@ mod tests {
             .to_string())],
         );
 
-        stdin.interrupt().expect("already-stopped turn is success");
+        stdin
+            .interrupt(InterruptCause::OperatorStop)
+            .expect("already-stopped turn is success");
 
         assert_eq!(request_turn_ids(&requests), vec!["turn-ending".to_string()]);
     }
@@ -530,11 +550,96 @@ mod tests {
         );
 
         let error = stdin
-            .interrupt()
+            .interrupt(InterruptCause::OperatorStop)
             .expect_err("unrecoverable error should surface");
 
         assert!(error.contains("transport unavailable"));
         assert_eq!(request_turn_ids(&requests), vec!["turn-live".to_string()]);
+    }
+
+    #[test]
+    fn an_interrupt_leaves_its_cause_for_the_turns_terminal_notification() {
+        let (stdin, _, _) = scripted_stdin(Some("turn-live"), vec![Ok(Value::Null)]);
+        stdin
+            .interrupt(InterruptCause::Teardown {
+                exit_reason: "provider_silence_recovery".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            stdin.take_interrupt_cause("turn-live"),
+            Some(InterruptCause::Teardown {
+                exit_reason: "provider_silence_recovery".to_string()
+            })
+        );
+        assert_eq!(
+            stdin.take_interrupt_cause("turn-live"),
+            None,
+            "a cause is taken once, by the turn's one terminal notification"
+        );
+    }
+
+    #[test]
+    fn the_first_cause_recorded_for_a_turn_stands() {
+        let (stdin, _, _) =
+            scripted_stdin(Some("turn-live"), vec![Ok(Value::Null), Ok(Value::Null)]);
+        stdin
+            .interrupt(InterruptCause::Teardown {
+                exit_reason: "user_stop".to_string(),
+            })
+            .unwrap();
+        stdin
+            .interrupt_untracked_turn("turn-live", InterruptCause::ThreadRelease)
+            .unwrap();
+        assert_eq!(
+            stdin.take_interrupt_cause("turn-live"),
+            Some(InterruptCause::Teardown {
+                exit_reason: "user_stop".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_interrupt_of_an_already_ended_turn_records_nothing() {
+        let (stdin, _, _) = scripted_stdin(
+            Some("turn-ending"),
+            vec![Err(json!({
+                "code": -32600,
+                "message": "no active turn to interrupt"
+            })
+            .to_string())],
+        );
+        assert_eq!(
+            stdin
+                .interrupt_exact_and_wait("turn-ending", InterruptCause::WatchdogPostTool)
+                .map(|outcome| matches!(outcome, ExactTurnInterrupt::AlreadyTerminal { .. })),
+            Ok(true)
+        );
+        assert_eq!(
+            stdin.take_interrupt_cause("turn-ending"),
+            None,
+            "a turn that had already ended was not interrupted by Cairn"
+        );
+    }
+
+    #[test]
+    fn a_stale_target_takes_its_cause_back_and_the_retry_records_its_own() {
+        let (stdin, _, _) = scripted_stdin(
+            Some("turn-stale"),
+            vec![
+                Err(json!({
+                    "code": -32600,
+                    "message": "expected active turn id turn-stale but found turn-active"
+                })
+                .to_string()),
+                Ok(Value::Null),
+            ],
+        );
+        stdin.interrupt(InterruptCause::OperatorStop).unwrap();
+        assert_eq!(stdin.take_interrupt_cause("turn-stale"), None);
+        assert_eq!(
+            stdin.take_interrupt_cause("turn-active"),
+            Some(InterruptCause::OperatorStop)
+        );
     }
 
     #[test]

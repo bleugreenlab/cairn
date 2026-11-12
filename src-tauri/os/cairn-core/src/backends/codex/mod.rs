@@ -382,7 +382,10 @@ pub(crate) fn pause_goal_and_interrupt_provider_turn(
         return Ok(false);
     };
     pause_goal(app_stdin, claim, intent)?;
-    app_stdin.interrupt_untracked_turn(provider_turn_id)?;
+    app_stdin.interrupt_untracked_turn(
+        provider_turn_id,
+        cairn_models::interface::session::InterruptCause::GoalDeferral,
+    )?;
     Ok(true)
 }
 
@@ -445,6 +448,7 @@ pub(crate) fn pause_goal_and_interrupt_app_server_turn(
     stdin: &mut dyn crate::agent_process::process::SessionControl,
     claim: &mut GoalPauseClaim,
     intent: PauseIntent,
+    cause: cairn_models::interface::session::InterruptCause,
 ) -> Result<bool, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
@@ -453,7 +457,7 @@ pub(crate) fn pause_goal_and_interrupt_app_server_turn(
         return Ok(false);
     };
     pause_goal(app_stdin, claim, intent)?;
-    app_stdin.interrupt()?;
+    app_stdin.interrupt(cause)?;
     Ok(true)
 }
 
@@ -657,6 +661,7 @@ for await (const line of createInterface({{ input: process.stdin, crlfDelay: Inf
 pub(crate) fn interrupt_exact_app_server_turn(
     stdin: &mut dyn crate::agent_process::process::SessionControl,
     provider_turn_id: &str,
+    cause: cairn_models::interface::session::InterruptCause,
 ) -> Result<cairn_models::session::codex::ExactTurnInterrupt, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
@@ -664,7 +669,7 @@ pub(crate) fn interrupt_exact_app_server_turn(
     else {
         return Err("Codex app-server stdin unavailable".to_string());
     };
-    app_stdin.interrupt_exact_and_wait(provider_turn_id)
+    app_stdin.interrupt_exact_and_wait(provider_turn_id, cause)
 }
 
 /// Whether a Codex app-server thread is still serving `provider_turn_id`;
@@ -1247,7 +1252,8 @@ mod goal_status_tests {
         assert!(pause_goal_and_interrupt_app_server_turn(
             stdin.as_mut(),
             &mut claim,
-            PauseIntent::Stake(GoalPause::Interrupted)
+            PauseIntent::Stake(GoalPause::Interrupted),
+            cairn_models::interface::session::InterruptCause::OperatorStop,
         )
         .unwrap());
         {

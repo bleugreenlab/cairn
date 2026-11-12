@@ -257,6 +257,7 @@ pub fn store_usage_result_event(
     is_error: bool,
     counts: TokenCounts,
     store_when_empty: bool,
+    raw: Option<serde_json::Value>,
 ) {
     let has_usage = counts.input.unwrap_or(0) != 0
         || counts.output.unwrap_or(0) != 0
@@ -280,7 +281,7 @@ pub fn store_usage_result_event(
         is_error,
         thinking_ms: None,
         queued_message_id: None,
-        raw: None,
+        raw,
     };
     let event_id = ids::mint_child(run_id);
     store_event_with_id(host, run_id, session_id, &event_id, &event, counts);

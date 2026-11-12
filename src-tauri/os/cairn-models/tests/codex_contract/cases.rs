@@ -260,7 +260,9 @@ pub fn turn_interrupt_exact(env: &ContractEnv) -> CaseResult {
     let c = Check("turn_interrupt_exact");
     let (_client, mut session, mut stream, turn) = slow_turn(c, env)?;
     c.ok(
-        session.control().interrupt(),
+        session
+            .control()
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "CodexControl::interrupt on the live turn",
     )?;
     let done = c.some(
@@ -296,7 +298,9 @@ pub fn interrupt_after_completion_is_success(env: &ContractEnv) -> CaseResult {
         format!("Codex's text for interrupting a finished turn is {error}, which is_no_active_turn_error does not match")
     })?;
     c.ok(
-        session.control().interrupt(),
+        session
+            .control()
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "CodexControl::interrupt after the turn completed",
     )?;
     env.no_egress(c)
@@ -324,7 +328,9 @@ pub fn interrupt_mismatch_retries_found_id(env: &ContractEnv) -> CaseResult {
     })?;
     *session.current_turn.lock().unwrap() = Some(stale.to_string());
     c.ok(
-        session.control().interrupt(),
+        session
+            .control()
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "CodexControl::interrupt with a stale cached turn id",
     )?;
     let done = c.some(
@@ -915,7 +921,9 @@ pub fn protocol_surface_against(env: &ContractEnv, fixture: &std::path::Path) ->
     run_turn(c, &mut stream, &mut session, "second")?;
     c.ok(session.control().get_goal(), "reading the goal")?;
     c.ok(
-        session.control().interrupt(),
+        session
+            .control()
+            .interrupt(cairn_models::interface::session::InterruptCause::OperatorStop),
         "interrupting the finished turn",
     )?;
     let sent = sent_requests(&env.sent());

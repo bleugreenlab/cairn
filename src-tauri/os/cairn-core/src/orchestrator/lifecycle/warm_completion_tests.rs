@@ -1434,7 +1434,7 @@ async fn stop_job_idles_runless_suspended_job_and_stops_children() {
 mod backend_turn {
     use super::*;
     use crate::agent_process::completion::{
-        SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
+        ProviderInterruption, SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
     };
     use crate::agent_process::stream::TokenCounts;
     use crate::orchestrator::lifecycle::{apply_codex_turn_completion, CodexTurnContext};
@@ -1630,7 +1630,7 @@ mod backend_turn {
             complete(
                 &orch,
                 "run-child",
-                SessionTurnOutcome::Interrupted,
+                SessionTurnOutcome::Interrupted(ProviderInterruption::default()),
                 SessionLifetime::Persistent,
                 false,
             );
@@ -1649,7 +1649,13 @@ mod backend_turn {
                 )
                 .await
                 .as_deref(),
-                terminal_tool.then_some("artifact_handoff")
+                // With no interrupt Cairn asked for, the abort was the
+                // provider's own: the turn was cut off, not completed.
+                Some(if terminal_tool {
+                    "artifact_handoff"
+                } else {
+                    "provider_interrupt"
+                })
             );
             assert_usage_attached(&orch, "child-turn", "result:interrupted").await;
         }
@@ -1746,10 +1752,15 @@ mod backend_turn {
     }
 
     #[tokio::test]
-    async fn empty_usage_emits_success_but_no_interrupt_or_handled_error_result() {
+    async fn empty_usage_emits_success_and_interrupt_but_no_handled_error_result() {
         for (outcome, expected) in [
             (SessionTurnOutcome::Completed, 1),
-            (SessionTurnOutcome::Interrupted, 0),
+            // The interrupted result is the ledger's record of who stopped
+            // the turn, so it is kept even with nothing to bill.
+            (
+                SessionTurnOutcome::Interrupted(ProviderInterruption::default()),
+                1,
+            ),
             (
                 SessionTurnOutcome::Failed {
                     status: "failed".into(),

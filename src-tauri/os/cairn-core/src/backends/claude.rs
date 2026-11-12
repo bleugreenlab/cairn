@@ -3644,6 +3644,7 @@ impl ClaudeHost for ClaudeReaderHost {
             &self.orch.process_state,
             &self.run_id,
             crate::agent_process::process::PauseIntent::Reassert,
+            cairn_models::interface::session::InterruptCause::ArtifactHandoff,
         )
     }
     fn credential_rejected(&self) {

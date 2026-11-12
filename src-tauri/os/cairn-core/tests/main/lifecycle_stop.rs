@@ -554,6 +554,40 @@ async fn watchdog_arm_failure_crashes_run_and_does_not_complete_turn() {
     );
 }
 
+/// cairn/4634: a deliberate kill never records the turn it cut off as a
+/// completion, and never as a crash. Each exit reason settles a turn still
+/// running by who killed it.
+#[tokio::test]
+async fn a_kill_settles_the_turn_it_cut_off_by_its_exit_reason() {
+    for (exit_reason, expected) in [
+        ("provider_silence_recovery", "interrupted/watchdog_recovery"),
+        ("user_stop", "interrupted/user_stop"),
+        ("provider_change", "interrupted/user_stop"),
+        ("watchdog_arm_failed", "interrupted/crash"),
+    ] {
+        let (_temp, orch) = common::test_orchestrator().await;
+        insert_project_job_run_turn(&orch.db.local, "running").await;
+        lifecycle::kill_session_with_reason(
+            &orch,
+            "run-1",
+            exit_reason,
+            lifecycle::TerminalPolicy::Keep,
+        )
+        .unwrap();
+        assert_eq!(
+            common::scalar_text_by_id(
+                &orch.db.local,
+                "SELECT state || '/' || COALESCE(end_reason, '') FROM turns WHERE id = ?1",
+                "turn-1"
+            )
+            .await
+            .as_deref(),
+            Some(expected),
+            "{exit_reason}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn stop_session_fails_pending_run_tool_result() {
     let (_temp, orch) = common::test_orchestrator().await;

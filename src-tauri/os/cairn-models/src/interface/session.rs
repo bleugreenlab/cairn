@@ -545,6 +545,52 @@ pub enum ServerReply {
     Error { code: i32, message: String },
 }
 
+/// Why Cairn is stopping a session's current turn. Every interrupt names one,
+/// so the abort a provider reports afterwards can say who asked for it. A
+/// provider abort with no recorded cause was the provider's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptCause {
+    /// An operator Stop, or an internal stop that ends the turn the same way
+    /// (an interrupting message, a model switch, closing an issue). The stop
+    /// settles the Cairn turn `user_stop` before it interrupts.
+    OperatorStop,
+    /// A durable wait parks the run; the wait already yielded the turn.
+    DurablePark,
+    /// A provider-started goal turn arrived behind a Cairn turn that still
+    /// owns the job, and is stopped. It was never Cairn's turn.
+    GoalDeferral,
+    /// The agent called its terminal tool, so the turn ends at that tool's
+    /// boundary as a handoff.
+    ArtifactHandoff,
+    /// The provider-silence watchdog found the turn silent after its tool
+    /// results and interrupted it, leaving the provider's goal to continue.
+    WatchdogPostTool,
+    /// The process serving the turn is being torn down with this exit reason.
+    /// The teardown's finalization settles the turn.
+    Teardown { exit_reason: String },
+    /// A pooled thread is released from its shared server.
+    ThreadRelease,
+    /// A one-shot call is over: its answer arrived, its deadline passed, or
+    /// it tried a tool it may not use.
+    OneShotStop,
+}
+
+impl InterruptCause {
+    /// The cause's stable name, as recorded on the turn's result event.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OperatorStop => "operator_stop",
+            Self::DurablePark => "durable_park",
+            Self::GoalDeferral => "goal_deferral",
+            Self::ArtifactHandoff => "artifact_handoff",
+            Self::WatchdogPostTool => "watchdog_post_tool",
+            Self::Teardown { .. } => "teardown",
+            Self::ThreadRelease => "thread_release",
+            Self::OneShotStop => "one_shot_stop",
+        }
+    }
+}
+
 /// The only writer to a live session.
 pub trait SessionControl: Send + Any {
     /// The conversation's first turn. It is its own operation because each
@@ -554,8 +600,8 @@ pub trait SessionControl: Send + Any {
     fn open_turn(&mut self, content: &MessageContent) -> Result<(), String>;
     /// A later message.
     fn send(&mut self, input: &SessionInput<'_>) -> Result<(), String>;
-    /// Stop the current turn; the session stays open.
-    fn interrupt(&mut self) -> Result<(), String>;
+    /// Stop the current turn, because of `cause`; the session stays open.
+    fn interrupt(&mut self, cause: InterruptCause) -> Result<(), String>;
     fn set_model(&mut self, model: &str) -> Result<(), String>;
     fn set_permission_mode(&mut self, mode: &str) -> Result<(), String>;
     /// Hand the live process a renewed credential (`generation` of it), so it

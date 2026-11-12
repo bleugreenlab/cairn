@@ -4,16 +4,30 @@
 //! They form the completion boundary for the planned `cairn-session` crate.
 
 use super::stream::TokenCounts;
+use cairn_models::interface::session::InterruptCause;
 use cairn_models::turn::{SuspendKind, TurnExit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTurnOutcome {
     Completed,
-    Interrupted,
+    /// The provider stopped the turn before it finished.
+    Interrupted(ProviderInterruption),
     /// Preserve the provider status for the host's diagnostic event.
     Failed {
         status: String,
     },
+}
+
+/// Who stopped a provider turn, as the reader saw it end.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderInterruption {
+    pub provider_turn_id: Option<String>,
+    /// The provider's own word for why (Codex's abort reason or turn status),
+    /// verbatim.
+    pub provider_reason: Option<String>,
+    /// What Cairn recorded when it asked for the interrupt; `None` when Cairn
+    /// never asked, so the provider stopped the turn on its own.
+    pub cause: Option<InterruptCause>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -167,7 +167,12 @@ impl SessionControl for HttpTurnControl {
         ))
     }
 
-    fn interrupt(&mut self) -> Result<(), String> {
+    /// The loop owns its turn, so a stop needs no attribution beyond the
+    /// caller's own settlement.
+    fn interrupt(
+        &mut self,
+        _cause: cairn_models::interface::session::InterruptCause,
+    ) -> Result<(), String> {
         self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }

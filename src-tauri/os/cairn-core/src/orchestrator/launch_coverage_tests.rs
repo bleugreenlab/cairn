@@ -205,7 +205,10 @@ impl SessionControl for ScriptedCodexTurn {
     fn send(&mut self, _input: &SessionInput<'_>) -> Result<(), String> {
         Err("a one-shot takes one turn".to_string())
     }
-    fn interrupt(&mut self) -> Result<(), String> {
+    fn interrupt(
+        &mut self,
+        _cause: cairn_models::interface::session::InterruptCause,
+    ) -> Result<(), String> {
         self.recorder.record("codex:interrupt");
         Ok(())
     }
@@ -268,7 +271,10 @@ impl SessionControl for RecordingControl {
         self.recorder.record(format!("{}:send", self.provider));
         Ok(())
     }
-    fn interrupt(&mut self) -> Result<(), String> {
+    fn interrupt(
+        &mut self,
+        _cause: cairn_models::interface::session::InterruptCause,
+    ) -> Result<(), String> {
         self.recorder.record(format!("{}:interrupt", self.provider));
         Ok(())
     }
@@ -1048,8 +1054,13 @@ async fn every_catalog_provider_launches_through_the_facet() {
                     None,
                 )
                 .unwrap();
-                crate::backends::stdin::send_interrupt(&state, &run, PauseIntent::Reassert)
-                    .unwrap();
+                crate::backends::stdin::send_interrupt(
+                    &state,
+                    &run,
+                    PauseIntent::Reassert,
+                    cairn_models::interface::session::InterruptCause::OperatorStop,
+                )
+                .unwrap();
             })
             .await
             .unwrap();

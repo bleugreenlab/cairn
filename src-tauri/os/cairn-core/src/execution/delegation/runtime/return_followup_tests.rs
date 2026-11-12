@@ -614,6 +614,69 @@ async fn no_reprompt_for_a_turn_yielded_on_a_wait() {
     assert_ne!(job_status(&orch, &child).await, "failed");
 }
 
+/// cairn/4634: a Codex task its provider (or the watchdog) cut off before it
+/// called `return` is asked for it, exactly as when that turn was recorded
+/// `complete`. Without the re-prompt nothing would wake it, and its parent
+/// would wait on a live child forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_cut_off_by_its_provider_is_still_asked_for_its_return() {
+    use crate::agent_process::completion::{
+        ProviderInterruption, SessionLifetime, SessionTurnCompletion, SessionTurnOutcome,
+    };
+    use crate::orchestrator::lifecycle::{apply_codex_turn_completion, CodexTurnContext};
+
+    let (orch, child, _requests) = spawn_and_park("return-followup-provider-interrupt.db").await;
+    open_child_turn(&orch, &child, "run-child", "child-turn-1").await;
+    say(&orch, "run-child", "child-turn-1", LAST_WORDS).await;
+    on_blocking_thread(&orch, |orch| {
+        apply_codex_turn_completion(
+            orch,
+            &orch.db.local,
+            &orch.services.emitter,
+            "run-child",
+            Some("session-child"),
+            SessionTurnCompletion {
+                outcome: SessionTurnOutcome::Interrupted(ProviderInterruption {
+                    provider_turn_id: Some("provider-turn".into()),
+                    provider_reason: Some("interrupted".into()),
+                    cause: None,
+                }),
+                usage: crate::agent_process::stream::TokenCounts::default(),
+                session_lifetime: SessionLifetime::Persistent,
+            },
+            CodexTurnContext {
+                failure_disposition:
+                    cairn_session::agent_process::completion::TurnFailureDisposition::Unhandled,
+            },
+        );
+    })
+    .await;
+    assert_eq!(
+        text(
+            &orch,
+            "SELECT state || '/' || end_reason FROM turns WHERE id = 'child-turn-1'"
+        )
+        .await
+        .as_deref(),
+        Some("interrupted/provider_interrupt")
+    );
+    assert_eq!(
+        reprompts(&orch, &child).await,
+        1,
+        "the cut-off task is asked for its return"
+    );
+    assert_eq!(
+        text(
+            &orch,
+            &format!("SELECT return_followup_turn_id FROM jobs WHERE id = '{child}'")
+        )
+        .await
+        .as_deref(),
+        Some("child-turn-1"),
+        "the re-prompt answers the turn that was cut off"
+    );
+}
+
 /// The operator stopped the task: that is their call, not a missing return.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_reprompt_after_an_operator_stop() {

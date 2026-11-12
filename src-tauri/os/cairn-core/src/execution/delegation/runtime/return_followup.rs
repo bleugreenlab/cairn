@@ -91,6 +91,9 @@ struct WorkTurn {
     user_stopped: bool,
     created_at: i64,
     sequence: i64,
+    /// Cut off mid-work by the watchdog or the provider rather than ended by
+    /// anyone's decision: it owes its `return` as a completed turn does.
+    truncated: bool,
 }
 
 async fn latest_work_turn(
@@ -102,7 +105,7 @@ async fn latest_work_turn(
             "SELECT t.id, t.state,
                     COALESCE(t.end_reason, '') = 'user_stop'
                       OR COALESCE(r.exit_reason, '') = 'user_stop',
-                    t.created_at, t.sequence
+                    t.created_at, t.sequence, t.end_reason
              FROM turns t LEFT JOIN runs r ON r.id = t.run_id
              WHERE t.job_id = ?1 AND t.start_reason != 'memory_review'
              ORDER BY t.created_at DESC, t.sequence DESC
@@ -119,6 +122,10 @@ async fn latest_work_turn(
         user_stopped: row.i64(2)? != 0,
         created_at: row.i64(3)?,
         sequence: row.i64(4)?,
+        truncated: row
+            .opt_text(5)?
+            .and_then(|reason| reason.parse::<crate::models::TurnEndReason>().ok())
+            .is_some_and(|reason| reason.truncates_work()),
     }))
 }
 
@@ -229,7 +236,8 @@ async fn settle_conn(
     let Some(latest) = latest_work_turn(conn, job_id).await? else {
         return Ok(MissingReturn::NotOwed);
     };
-    if latest.state != "complete" || latest.user_stopped {
+    let ended = latest.state == "complete" || (latest.state == "interrupted" && latest.truncated);
+    if !ended || latest.user_stopped {
         return Ok(MissingReturn::NotOwed);
     }
     // A task whose own delegated children are still live is waiting on them,
