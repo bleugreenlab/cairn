@@ -27150,6 +27150,24 @@ test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out";
         }
     }
 
+    /// A daemon whose grant does not cover this runner still answers, and is
+    /// unfit only for the roots it was not granted: builds there compile
+    /// directly. Refusing check dispatch over it would turn a cache miss into
+    /// a machine-wide outage on every runner upgrade, since no daemon running
+    /// before grant records existed has one.
+    #[tokio::test]
+    #[serial_test::serial(build_service_port)]
+    async fn a_stale_grant_never_refuses_check_dispatch() {
+        let (snapshot, _harness) =
+            crate::orchestrator::build_services::tests::stale_grant_reconciled_without_destroy()
+                .await;
+        assert!(
+            snapshot.runtime.grant_stale.is_some(),
+            "the fixture must be the stale-grant state: {snapshot:?}"
+        );
+        assert_eq!(active_build_service_failure(&snapshot), None);
+    }
+
     #[test]
     fn active_build_service_failure_preflights_without_relabeling_spawn_outcomes() {
         let config_fingerprint = "active-config".to_string();

@@ -4280,6 +4280,23 @@ pub(crate) fn render_colocated_supervision(
     out
 }
 
+/// The compile cache's fitness on this machine: one line for each managed
+/// root its daemon may not serve, or nothing when it may serve them all.
+/// Rendered beside `local` because the daemon serves this machine's cells;
+/// the sentences come from the supervisor's record, never a probe.
+pub(crate) fn render_compile_cache_fitness(sentences: &[String]) -> String {
+    if sentences.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Compile cache\n\n");
+    for sentence in sentences {
+        out.push_str("- ");
+        out.push_str(sentence);
+        out.push('\n');
+    }
+    out
+}
+
 /// The runner's own lifecycle facts over the last hour, read from the
 /// `runner_events` journal: a local table read, never a probe.
 ///
@@ -12399,6 +12416,18 @@ mod supervision_tests {
         assert_eq!(
             render_colocated_supervision(None, &ColocatedSupervision::default(), true, NOW),
             ""
+        );
+    }
+
+    #[test]
+    fn compile_cache_fitness_names_each_root_it_may_not_serve() {
+        assert_eq!(super::render_compile_cache_fitness(&[]), "");
+        let rendered = super::render_compile_cache_fitness(&[
+            "unfit for /Volumes/Builds/cairn-executor/build-slots (write refused); clients compile directly".into(),
+        ]);
+        assert_eq!(
+            rendered,
+            "\n## Compile cache\n\n- unfit for /Volumes/Builds/cairn-executor/build-slots (write refused); clients compile directly\n"
         );
     }
 }

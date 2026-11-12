@@ -348,13 +348,20 @@ impl ExecutorPaths {
 
     /// Every directory that holds cell authorities: the machine authority
     /// first, then each project's, in directory order.
+    ///
+    /// A project directory never starts with a dot. Dot-entries beside the
+    /// projects are Cairn's own: the machine authority, and the build
+    /// service's capability-probe directory (`.compile-cache-probe`).
     pub fn cell_authority_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.machine_authority_dir()];
         if let Ok(projects) = std::fs::read_dir(self.cell_inventory()) {
             roots.extend(
                 projects
                     .flatten()
-                    .filter(|entry| entry.path().is_dir() && entry.file_name() != AUTHORITY_DIR)
+                    .filter(|entry| {
+                        entry.path().is_dir()
+                            && !entry.file_name().to_string_lossy().starts_with('.')
+                    })
                     .map(|entry| entry.path().join(AUTHORITY_DIR)),
             );
         }

@@ -265,12 +265,21 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         out.push_str("None configured.\n\n");
     } else {
         for service in &services {
+            // A daemon can answer and still be unfit for one of this runner's
+            // managed roots; builds there compile directly, which is the one
+            // fact the reachable flag cannot say.
+            let fitness: String = service
+                .fitness
+                .iter()
+                .map(|sentence| format!("; {sentence}"))
+                .collect();
             out.push_str(&format!(
-                "- `{}` — enabled={} installed={} reachable={}\n",
+                "- `{}` — enabled={} installed={} reachable={}{}\n",
                 service.name,
                 yes_no(service.enabled),
                 yes_no(service.installed),
-                yes_no(service.reachable)
+                yes_no(service.reachable),
+                fitness
             ));
         }
         out.push('\n');

@@ -1039,10 +1039,12 @@ dependencies = [
  "cairn-symbols",
  "cairn-uri",
  "dirs 5.0.1",
+ "hex",
  "log",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "uuid",
 ]

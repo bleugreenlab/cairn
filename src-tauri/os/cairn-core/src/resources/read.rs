@@ -2565,6 +2565,11 @@ async fn render_resource_body(
                                         captured_at,
                                     ),
                                 );
+                                rendered.push_str(
+                                    &crate::resources::executors::render_compile_cache_fitness(
+                                        &orch.compile_cache_fitness(),
+                                    ),
+                                );
                             }
                             rendered.push_str(&render_machine_services(orch, &name));
                             rendered

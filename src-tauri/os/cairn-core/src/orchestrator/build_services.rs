@@ -12,7 +12,7 @@
 //! `Orchestrator` methods are thin wrappers that read settings and hold the
 //! launcher handles.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -21,9 +21,11 @@ use std::time::Duration;
 use cairn_common::executor_protocol::{
     CompileCacheHealth, CompileCacheState, CompileCacheStats, Measurement, MeasurementGap,
 };
+use sha2::{Digest, Sha256};
 
 use crate::config::build_services::{
-    builds_in_managed_root, BuildServiceConfig, ReadyProbe, Templates,
+    cell_build_root, managed_build_roots, managed_root_containing, BuildServiceConfig,
+    LaunchFingerprint, ReadyProbe, Templates,
 };
 use crate::config::settings;
 use crate::services::sandbox::{self, SandboxPolicy};
@@ -32,6 +34,97 @@ use crate::services::{ChildProcess, ProcessSpawner, SpawnConfig};
 use super::Orchestrator;
 
 const BUILD_SERVICE_UNFIT_ENV: &str = "CAIRN_BUILD_SERVICE_UNFIT";
+
+/// A compile-cache service's claim on its own port: clients attach to the
+/// supervised daemon and never start one. Declared by the service's own env.
+const BUILD_SERVICE_CLIENT_ENV: &str = "CAIRN_BUILD_SERVICE_CLIENT";
+
+/// The cache wrapper this runner ships, delivered to `{cairnHome}/bin` so the
+/// output-directory gate travels with the runner that relies on it.
+const BUNDLED_CACHE_WRAPPER: &str = include_str!("../../../../../scripts/cache-wrapper.sh");
+
+/// The line a wrapper carries when it enforces the output-directory gate
+/// (`scripts/cache-wrapper.sh`). A wrapper without it ignores
+/// [`BUILD_SERVICE_ROOTS_ENV`] and would send every compile to the daemon,
+/// including ones whose output its grant does not cover.
+const WRAPPER_OUT_DIR_GATE: &str = "cairn-cache-wrapper-capability: out-dir-gate";
+
+const WRAPPER_ENV_KEYS: [&str; 2] = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"];
+
+fn installed_wrapper_path(templates: &Templates) -> PathBuf {
+    templates.cairn_home.join("bin").join("cache-wrapper.sh")
+}
+
+fn wrapper_has_gate(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|content| content.contains(WRAPPER_OUT_DIR_GATE))
+}
+
+/// Deliver this runner's wrapper to `path` when the copy there is missing or
+/// predates the gate. A gated copy is left alone: `scripts/rust-cache-env.ts`
+/// keeps it in step with the checkout, and the runner must not undo a newer
+/// one. Returns whether it wrote.
+fn install_cache_wrapper(path: &Path) -> Result<bool, String> {
+    if wrapper_has_gate(path) {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    let staging = path.with_extension(format!("{}.staging", std::process::id()));
+    std::fs::write(&staging, BUNDLED_CACHE_WRAPPER)
+        .map_err(|e| format!("write {}: {e}", staging.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", staging.display()))?;
+    }
+    std::fs::rename(&staging, path).map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        format!("install {}: {e}", path.display())
+    })?;
+    Ok(true)
+}
+
+/// Whether every wrapper `env` names enforces the output-directory gate. Only
+/// a compile-cache service that claims its port is asked; with no wrapper at
+/// all, nothing would enforce the gate either.
+fn wrapper_enforces_gate(env: &HashMap<String, String>) -> bool {
+    if !env.contains_key(BUILD_SERVICE_CLIENT_ENV) {
+        return true;
+    }
+    let wrappers: Vec<&String> = WRAPPER_ENV_KEYS
+        .iter()
+        .filter_map(|key| env.get(*key))
+        .filter(|value| !value.is_empty())
+        .collect();
+    !wrappers.is_empty()
+        && wrappers
+            .iter()
+            .all(|wrapper| wrapper_has_gate(Path::new(wrapper.as_str())))
+}
+
+/// Routing as the build's wrapper can honour it. A wrapper that predates the
+/// gate cannot keep an ungranted output away from the daemon, so it is routed
+/// nothing: `CAIRN_BUILD_SERVICE_UNFIT`, which every wrapper honours.
+fn routing_the_wrapper_can_enforce(routing: Routing, env: &HashMap<String, String>) -> Routing {
+    if wrapper_enforces_gate(env) {
+        routing
+    } else {
+        Routing {
+            daemon_unfit: true,
+            roots: Vec::new(),
+        }
+    }
+}
+
+/// The managed roots the daemon may serve right now, canonical and `:`-joined:
+/// granted, proven by this incarnation, and not since found unfit.
+/// `scripts/cache-wrapper.sh` attaches only for a compile whose output
+/// directory lies in a `target/` tree under one of them, and compiles directly
+/// otherwise, so a build that writes anywhere else never reaches the daemon.
+const BUILD_SERVICE_ROOTS_ENV: &str = "CAIRN_BUILD_SERVICE_ROOTS";
 
 /// Timeout for a TCP reachability probe. Short — this can gate fenced builds.
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -196,15 +289,18 @@ fn may_launch_service(
 /// Build the spawn config for launching a service daemon. Pure (no spawning), so
 /// it can be asserted directly in tests.
 ///
-/// Every configured service retains its declared service sandbox.
+/// Every configured service retains its declared service sandbox, whose write
+/// grant is [`BuildServiceConfig::launch_grant`] for `roots`: each managed
+/// root's `target/` trees by construction, then the configured extras.
 fn build_service_spawn_config(
     cfg: &BuildServiceConfig,
     templates: &Templates,
+    roots: &[PathBuf],
     deny_read: Vec<PathBuf>,
 ) -> Option<SpawnConfig> {
     let start = cfg.expanded_start(templates);
     let (program, args) = start.split_first()?;
-    let write_globs = cfg.expanded_write(templates);
+    let write_globs = cfg.launch_grant(templates, roots);
     let state_dir = cfg
         .expanded_state_dir(templates)
         .unwrap_or_else(|| templates.cairn_home.clone());
@@ -274,9 +370,10 @@ fn launch_service(
     spawner: &dyn ProcessSpawner,
     cfg: &BuildServiceConfig,
     templates: &Templates,
+    roots: &[PathBuf],
     deny_read: Vec<PathBuf>,
 ) -> Result<Box<dyn ChildProcess>, String> {
-    let config = build_service_spawn_config(cfg, templates, deny_read)
+    let config = build_service_spawn_config(cfg, templates, roots, deny_read)
         .ok_or_else(|| "build service has an empty start command".to_string())?;
     for dir in daemon_temp_dirs(cfg, templates) {
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -284,6 +381,292 @@ fn launch_service(
         }
     }
     spawner.spawn(config)
+}
+
+/// The record of what the running daemon was granted, written beside its state
+/// by the runner that launched it.
+///
+/// A sandbox grant is fixed when a process starts and cannot be read back from
+/// the kernel, so this record is the only account of it. It names the process
+/// it describes by pid and start token, so a record left by an earlier daemon
+/// never vouches for a later one on a reused pid.
+const DAEMON_GRANT_FILE: &str = ".cairn-daemon-grant.json";
+
+/// Where every runner sharing the daemon registers its managed roots, one file
+/// per Cairn home, so a launch by any of them grants all of them.
+const GRANT_ROOTS_DIR: &str = "grant-roots";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DaemonGrantRecord {
+    pub(crate) pid: u32,
+    pub(crate) start_token: String,
+    pub(crate) launch_fingerprint: LaunchFingerprint,
+    /// Canonical managed roots whose `target/` trees the daemon may write.
+    pub(crate) roots: Vec<String>,
+    /// The whole write grant, as handed to the sandbox, for an operator reading the file.
+    pub(crate) write_globs: Vec<String>,
+    pub(crate) launcher_cairn_home: String,
+    pub(crate) launched_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootRegistration {
+    cairn_home: String,
+    roots: Vec<String>,
+    runner_pid: u32,
+    runner_start_token: Option<String>,
+    updated_at_unix_ms: u64,
+}
+
+/// Where one service's grant record and root registry live: its state
+/// directory, which every runner on the machine resolves identically, or a
+/// per-service directory beside where [`machine_lock_path`] falls back to.
+fn grant_state_dir(cfg: &BuildServiceConfig, templates: &Templates, name: &str) -> PathBuf {
+    cfg.expanded_state_dir(templates).unwrap_or_else(|| {
+        templates
+            .home
+            .join(".cache")
+            .join(format!("cairn-build-service-{name}"))
+    })
+}
+
+fn root_strings(roots: &[PathBuf]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect()
+}
+
+fn write_json_atomically<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| format!("encode: {e}"))?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, bytes).map_err(|e| format!("write {}: {e}", temporary.display()))?;
+    std::fs::rename(&temporary, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("commit {}: {e}", path.display())
+    })
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn read_grant_record(dir: &Path) -> Option<DaemonGrantRecord> {
+    read_json(&dir.join(DAEMON_GRANT_FILE))
+}
+
+fn write_grant_record(dir: &Path, record: &DaemonGrantRecord) -> Result<(), String> {
+    write_json_atomically(&dir.join(DAEMON_GRANT_FILE), record)
+}
+
+fn registration_path(dir: &Path, cairn_home: &Path) -> PathBuf {
+    let digest = Sha256::digest(cairn_home.to_string_lossy().as_bytes());
+    let key: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    dir.join(GRANT_ROOTS_DIR).join(format!("{key}.json"))
+}
+
+/// Record this runner's managed roots beside the daemon, rewriting the file
+/// only when what it says has changed.
+fn register_runner_roots(
+    dir: &Path,
+    templates: &Templates,
+    roots: &[String],
+) -> Result<(), String> {
+    let path = registration_path(dir, &templates.cairn_home);
+    let cairn_home = templates.cairn_home.display().to_string();
+    let runner_pid = std::process::id();
+    let runner_start_token = cairn_common::process_identity::process_start_token(runner_pid);
+    let unchanged = read_json::<RootRegistration>(&path).is_some_and(|current| {
+        current.cairn_home == cairn_home
+            && current.roots == roots
+            && current.runner_pid == runner_pid
+            && current.runner_start_token == runner_start_token
+    });
+    if unchanged {
+        return Ok(());
+    }
+    write_json_atomically(
+        &path,
+        &RootRegistration {
+            cairn_home,
+            roots: roots.to_vec(),
+            runner_pid,
+            runner_start_token,
+            updated_at_unix_ms: unix_ms(),
+        },
+    )
+}
+
+fn registered_runner_gone(registration: &RootRegistration) -> bool {
+    match &registration.runner_start_token {
+        Some(token) => {
+            cairn_common::process_identity::process_presence(registration.runner_pid, token)
+                .is_gone()
+        }
+        None => !cairn_common::process_identity::process_is_alive(registration.runner_pid),
+    }
+}
+
+/// The managed roots a launch is granted: this runner's own, then every root
+/// registered by a runner that is still running, so runners that share the
+/// daemon converge on one grant instead of relaunching it for each other.
+/// Registrations whose runner is gone are pruned here.
+fn live_registered_roots(dir: &Path, own: &[String]) -> Vec<String> {
+    let mut others: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir.join(GRANT_ROOTS_DIR)) {
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Some(registration) = read_json::<RootRegistration>(&path) else {
+                continue;
+            };
+            if registered_runner_gone(&registration) {
+                log::debug!(
+                    "pruning the build-service root registration of {} (runner pid {} is gone)",
+                    registration.cairn_home,
+                    registration.runner_pid
+                );
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            others.extend(registration.roots);
+        }
+    }
+    others.sort();
+    let mut roots = own.to_vec();
+    for root in others {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Whether the listening daemon's recorded grant covers this runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GrantVerdict {
+    Covered(DaemonGrantRecord),
+    Stale(GrantStale),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantStale {
+    /// What differs, phrased for the operator log.
+    pub(crate) reason: String,
+    /// The record, when it does describe the listening daemon: its roots still
+    /// serve while the daemon cannot be replaced.
+    pub(crate) record: Option<DaemonGrantRecord>,
+}
+
+/// Judge the listening daemon's grant against this runner.
+///
+/// `Covered` needs a record naming the listener by pid and start token, all of
+/// this runner's managed roots in it, and — only when this runner launched it
+/// — an unchanged [`LaunchFingerprint`]. A daemon another runner launched from
+/// a different configuration is that runner's to replace, which is what keeps
+/// runners sharing one daemon from relaunching it for each other.
+fn running_grant_verdict(
+    control: &dyn ListenerProcessControl,
+    addr: &str,
+    cfg: &BuildServiceConfig,
+    templates: &Templates,
+    dir: &Path,
+) -> GrantVerdict {
+    let stale = |reason: String, record: Option<DaemonGrantRecord>| {
+        GrantVerdict::Stale(GrantStale { reason, record })
+    };
+    let listener = match control.listener(addr) {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            return stale(
+                format!("launch grant changed (no listener on {addr} could be identified)"),
+                None,
+            )
+        }
+        Err(e) => {
+            return stale(
+                format!(
+                    "launch grant changed (the listener on {addr} could not be identified: {e})"
+                ),
+                None,
+            )
+        }
+    };
+    let Some(record) = read_grant_record(dir) else {
+        return stale("launch grant changed (no grant record)".to_string(), None);
+    };
+    let token = control.start_token(listener.pid);
+    if record.pid != listener.pid || token.as_deref() != Some(record.start_token.as_str()) {
+        return stale(
+            format!(
+                "launch grant changed (the grant record describes pid {} started {}, not the listening pid {} started {})",
+                record.pid,
+                record.start_token,
+                listener.pid,
+                token.as_deref().unwrap_or("at an unreadable time")
+            ),
+            None,
+        );
+    }
+    let own = root_strings(&managed_build_roots(templates));
+    if let Some(missing) = own.iter().find(|root| !record.roots.contains(root)) {
+        let reason = format!("launch grant changed (missing root {missing})");
+        return stale(reason, Some(record));
+    }
+    if record.launcher_cairn_home == templates.cairn_home.display().to_string() {
+        let changed = cfg
+            .launch_fingerprint(templates)
+            .changed_parts(&record.launch_fingerprint);
+        if !changed.is_empty() {
+            let reason = format!("launch fingerprint changed ({})", changed.join(", "));
+            return stale(reason, Some(record));
+        }
+    }
+    GrantVerdict::Covered(record)
+}
+
+/// What a launch is granted, where that is recorded, and what it may not adopt.
+struct LaunchGrant<'a> {
+    /// Where the grant record lives ([`grant_state_dir`]).
+    dir: &'a Path,
+    /// The managed roots the daemon is granted ([`live_registered_roots`]).
+    roots: &'a [PathBuf],
+    /// An incarnation already proven unable to serve. It answers its health
+    /// round trip and its grant may be covered, so without this it would be
+    /// adopted straight back.
+    condemned: Option<&'a (u32, String)>,
+}
+
+/// Why a healthy listener must not be adopted, or `None` when it may be.
+fn adoption_refusal(
+    control: &dyn ListenerProcessControl,
+    addr: &str,
+    cfg: &BuildServiceConfig,
+    templates: &Templates,
+    grant: &LaunchGrant<'_>,
+) -> Option<String> {
+    match running_grant_verdict(control, addr, cfg, templates, grant.dir) {
+        GrantVerdict::Covered(record) => grant
+            .condemned
+            .filter(|(pid, token)| *pid == record.pid && *token == record.start_token)
+            .map(|_| {
+                format!(
+                    "listener pid {} is the incarnation already proven unable to serve",
+                    record.pid
+                )
+            }),
+        GrantVerdict::Stale(stale) => Some(stale.reason),
+    }
 }
 
 /// Whether the service's exit-0 `command` liveness probe succeeds. A cheap
@@ -349,6 +732,7 @@ fn probe_service(
             health: ServiceHealth::Down,
             round_trip: None,
             unfit: None,
+            grant: None,
         };
     }
     let Some(cmd) = &probe.round_trip else {
@@ -357,6 +741,7 @@ fn probe_service(
             health: ServiceHealth::Healthy,
             round_trip: None,
             unfit: None,
+            grant: None,
         };
     };
     let round_trip = run_round_trip(spawner, cmd, env, deadline);
@@ -368,6 +753,7 @@ fn probe_service(
         },
         round_trip: Some(round_trip),
         unfit: None,
+        grant: None,
     }
 }
 
@@ -395,6 +781,11 @@ pub(crate) struct ServiceObservation {
     /// sentence rather than a flag is what lets the panel and the agent
     /// advisory say the numbers that produced the verdict.
     pub(crate) unfit: Option<String>,
+    /// Whether the answering daemon's recorded grant covers this runner.
+    /// Judged only for a healthy, identifiable listener, and never a health
+    /// verdict: a stale grant leaves a daemon that answers, and is only unfit
+    /// for the roots it was not granted.
+    pub(crate) grant: Option<GrantVerdict>,
 }
 
 /// What a health round-trip did, as opposed to merely whether it passed.
@@ -652,11 +1043,18 @@ trait ListenerProcessControl: Send + Sync {
     /// daemon Cairn did not spawn — one adopted from an earlier runner, or
     /// auto-started by a client — is actually using.
     fn environ(&self, pid: u32) -> Result<HashMap<String, String>, String>;
+    /// The kernel start token of `pid`. With the pid it names one daemon
+    /// incarnation, which is what a grant record and a fitness verdict are about.
+    fn start_token(&self, pid: u32) -> Option<String>;
 }
 
 struct OsListenerProcessControl;
 
 impl ListenerProcessControl for OsListenerProcessControl {
+    fn start_token(&self, pid: u32) -> Option<String> {
+        cairn_common::process_identity::process_start_token(pid)
+    }
+
     fn listener(&self, addr: &str) -> Result<Option<ListenerProcess>, String> {
         let resolved: Vec<_> = addr
             .to_socket_addrs()
@@ -837,18 +1235,6 @@ fn listener_temp_dir_live(control: &dyn ListenerProcessControl, addr: &str) -> b
     })
 }
 
-/// Where the capability probe compiles to.
-///
-/// Outside every Cairn worktree and build-slot grant, deliberately. The shared
-/// daemon may be reached by a cache-enabled cargo invocation in an operator
-/// checkout, and rustc performs that client's output writes in the daemon. A
-/// probe inside a managed root therefore misses the exact poisoned state where a
-/// fenced daemon serves Cairn builds but returns EPERM everywhere else.
-///
-/// The user's stable cache directory is neutral with respect to every runner
-/// instance and survives slot reclamation. Passing a cache-miss compile here is
-/// the fitness claim a machine-wide daemon actually makes: it is not carrying a
-/// worktree fence inherited from, or explicitly added by, its launcher.
 const ADOPTION_ENV_KEYS: [&str; 5] = [
     "SCCACHE_DIR",
     "SCCACHE_SERVER_PORT",
@@ -880,13 +1266,15 @@ fn listener_environment_mismatch(
     })
 }
 
-fn capability_probe_dir(templates: &Templates) -> PathBuf {
-    templates
-        .home
-        .join(".cache")
-        .join("cairn-compile-cache-probe")
-        .join(".compile-cache-probe")
-        .join("target")
+/// Where the capability probe compiles for one managed root.
+///
+/// Inside that root's granted `target/` shape (`.compile-cache-probe` is what
+/// the grant's leading `**` matches), so a passing compile proves exactly the
+/// write every build under that root needs, and a failing one shows the root is
+/// missing from the daemon's grant. A dot-directory, so nothing that enumerates
+/// cells or worktrees under the root mistakes it for one.
+fn capability_probe_dir(root: &Path) -> PathBuf {
+    root.join(".compile-cache-probe").join("target")
 }
 
 /// A trivial compile is fast, but this runs on a loaded developer machine and a
@@ -894,15 +1282,111 @@ fn capability_probe_dir(templates: &Templates) -> PathBuf {
 /// false accusation against a shared daemon.
 const CAPABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Ask the daemon to do the one thing only it can do, and watch whether it can.
+/// How soon an inconclusive root is probed again, doubling per attempt.
+const PROBE_RETRY_MIN: Duration = Duration::from_secs(60);
+const PROBE_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+fn probe_retry_after(attempts: u32) -> Duration {
+    PROBE_RETRY_MIN
+        .saturating_mul(1u32 << attempts.saturating_sub(1).min(5))
+        .min(PROBE_RETRY_MAX)
+}
+
+/// What one managed root's probe established about the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootFitness {
+    /// The daemon compiled into the root.
+    Proven,
+    /// The daemon could not, while rustc run directly could. `summary` is the
+    /// few words the status line carries; `detail` is the whole account.
+    Unfit { summary: String, detail: String },
+    /// Nothing was learned (a busy daemon, a broken toolchain, an uncreatable
+    /// probe directory), so the root is retried later rather than judged.
+    Inconclusive(String),
+}
+
+/// The probe's findings for one daemon incarnation.
+#[derive(Debug, Default)]
+struct FitnessReport {
+    roots: BTreeMap<String, RootFitness>,
+    /// A failure that is about the daemon rather than any root: it wrote a
+    /// cache entry and could not serve it back.
+    daemon_unfit: Option<String>,
+}
+
+/// How the cache-hit leg went, when it ran.
+enum HitLeg {
+    Served,
+    Failed(String),
+}
+
+/// A name unique to one probe compile, so concurrent probes from several
+/// runners, or of several roots within one millisecond, never share a file.
+fn probe_nonce() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}_{}_{sequence}", unix_ms(), std::process::id())
+}
+
+/// The few words a status line carries for a failed probe compile.
+fn unfit_summary(attempt: &RoundTrip) -> String {
+    if attempt.diagnostic.contains("Operation not permitted") {
+        "write refused".to_string()
+    } else {
+        "compile failed".to_string()
+    }
+}
+
+/// Ask the daemon to compile into each of `roots`, and once in total to serve
+/// what it just compiled. See [`probe_root`] for the experiment and its guards.
 ///
-/// Returns `Some(reason)` only when the daemon is PROVEN unable to compile.
+/// The miss leg runs once per root because a write grant is per root. The hit
+/// leg exercises the cache directory, which no root changes, so it runs once.
+fn probe_daemon_fitness(
+    spawner: &dyn ProcessSpawner,
+    cfg: &BuildServiceConfig,
+    templates: &Templates,
+    env: &HashMap<String, String>,
+    roots: &[String],
+    deadline: Duration,
+) -> FitnessReport {
+    let mut report = FitnessReport::default();
+    let Some(client) = cfg.expanded_start(templates).into_iter().next() else {
+        return report;
+    };
+    let mut probe_env = env.clone();
+    probe_env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
+    let mut hit_settled = false;
+    for root in roots {
+        let (fitness, hit) = probe_root(
+            spawner,
+            &client,
+            Path::new(root),
+            &probe_env,
+            deadline,
+            !hit_settled,
+        );
+        match hit {
+            Some(HitLeg::Served) => hit_settled = true,
+            Some(HitLeg::Failed(reason)) => {
+                hit_settled = true;
+                report.daemon_unfit = Some(reason);
+            }
+            None => {}
+        }
+        report.roots.insert(root.clone(), fitness);
+    }
+    report
+}
+
+/// Ask the daemon to do the one thing only it can do, under one managed root,
+/// and watch whether it can.
 ///
 /// Rather than infer capability from statistics, this performs the experiment:
-/// hand the daemon a crate whose
-/// source is ours and trivially valid, ask it to write the output into a neutral
-/// directory outside Cairn's managed roots, and see what happens. A genuine compiler error is impossible for
-/// that source, so a failure is about the daemon and nothing else.
+/// hand the daemon a crate whose source is ours and trivially valid, ask it to
+/// write the output under the root, where every build under that root writes,
+/// and see what happens. A genuine compiler error is impossible for that source,
+/// so a failure is about the daemon and nothing else.
 ///
 /// The guard that keeps it from ever accusing a daemon for someone else's fault
 /// is a **control compile**, which is the fail-open discipline this module
@@ -928,27 +1412,34 @@ const CAPABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 /// that unfit had the supervisor try to kill a busy daemon four times in one
 /// release build on 11-11, and a daemon it had launched itself would have taken
 /// every compile on the machine down with it.
-fn prove_daemon_unfit(
+///
+/// `with_hit` asks for the cache-hit leg after a passing miss; its outcome is
+/// returned separately because it is about the daemon, not the root.
+fn probe_root(
     spawner: &dyn ProcessSpawner,
-    cfg: &BuildServiceConfig,
-    templates: &Templates,
+    client: &str,
+    root: &Path,
     env: &HashMap<String, String>,
     deadline: Duration,
-) -> Option<String> {
-    let client = cfg.expanded_start(templates).into_iter().next()?;
-    let dir = capability_probe_dir(templates);
+    with_hit: bool,
+) -> (RootFitness, Option<HitLeg>) {
+    let dir = capability_probe_dir(root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        log::debug!("compile cache capability probe: create {dir:?}: {e}");
-        return None;
+        return (
+            RootFitness::Inconclusive(format!("could not create {}: {e}", dir.display())),
+            None,
+        );
     }
     // A nonce makes every probe a cache MISS, which is the whole point: a hit
     // would be served without the daemon compiling anything, and compiling is
     // what is under test.
-    let nonce = unix_ms();
+    let nonce = probe_nonce();
     let source = dir.join(format!("probe_{nonce}.rs"));
-    if let Err(e) = std::fs::write(&source, format!("pub const PROBE: u64 = {nonce};\n")) {
-        log::debug!("compile cache capability probe: write {source:?}: {e}");
-        return None;
+    if let Err(e) = std::fs::write(&source, format!("pub const PROBE: &str = \"{nonce}\";\n")) {
+        return (
+            RootFitness::Inconclusive(format!("could not write {}: {e}", source.display())),
+            None,
+        );
     }
 
     let out = dir.join(format!("out_{nonce}"));
@@ -957,9 +1448,11 @@ fn prove_daemon_unfit(
         let _ = std::fs::remove_dir_all(&out);
     };
     if let Err(e) = std::fs::create_dir_all(&out) {
-        log::debug!("compile cache capability probe: create {out:?}: {e}");
         cleanup();
-        return None;
+        return (
+            RootFitness::Inconclusive(format!("could not create {}: {e}", out.display())),
+            None,
+        );
     }
 
     let rustc_args: Vec<String> = [
@@ -979,106 +1472,127 @@ fn prove_daemon_unfit(
     .chain([source.to_string_lossy().to_string()])
     .collect();
 
-    let mut probe_env = env.clone();
-    probe_env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
-
-    let mut through_daemon = vec![client, "rustc".to_string()];
+    let mut through_daemon = vec![client.to_string(), "rustc".to_string()];
     through_daemon.extend(rustc_args.iter().cloned());
-    let miss = run_round_trip(spawner, &through_daemon, &probe_env, deadline);
-    let failed_leg = if miss.healthy() {
-        let hit = run_round_trip(spawner, &through_daemon, &probe_env, deadline);
-        (!hit.healthy()).then_some(("serve the cache entry it had just written", hit))
-    } else {
-        Some(("compile a trivially valid crate", miss))
+    let direct_control = || {
+        let mut directly = vec!["rustc".to_string()];
+        directly.extend(rustc_args.iter().cloned());
+        run_round_trip(spawner, &directly, &HashMap::new(), deadline)
     };
-    let Some((capability, attempt)) = failed_leg else {
-        cleanup();
-        return None;
-    };
-    if attempt.outcome == RoundTripOutcome::TimedOut {
-        cleanup();
-        log::debug!(
-            "compile cache capability probe is inconclusive: the daemon had not finished a \
-             trivial compile when the probe gave up, which on a busy machine is a queue ({})",
+    let queued = |attempt: &RoundTrip| {
+        RootFitness::Inconclusive(format!(
+            "the daemon had not finished a trivial compile when the probe gave up, which on a \
+             busy machine is a queue ({})",
             attempt.summary()
-        );
-        return None;
-    }
+        ))
+    };
+    let toolchain = |control: &RoundTrip| {
+        RootFitness::Inconclusive(format!(
+            "rustc could not compile the probe source directly either ({})",
+            control.summary()
+        ))
+    };
 
-    let mut directly = vec!["rustc".to_string()];
-    directly.extend(rustc_args);
-    let control = run_round_trip(spawner, &directly, &HashMap::new(), deadline);
+    let miss = run_round_trip(spawner, &through_daemon, env, deadline);
+    if !miss.healthy() {
+        if miss.outcome == RoundTripOutcome::TimedOut {
+            cleanup();
+            return (queued(&miss), None);
+        }
+        let control = direct_control();
+        cleanup();
+        if !control.healthy() {
+            return (toolchain(&control), None);
+        }
+        return (
+            RootFitness::Unfit {
+                summary: unfit_summary(&miss),
+                detail: format!(
+                    "the daemon could not compile a trivially valid crate into {}, which rustc \
+                     compiled directly without complaint: {}",
+                    out.display(),
+                    miss.summary()
+                ),
+            },
+            None,
+        );
+    }
+    if !with_hit {
+        cleanup();
+        return (RootFitness::Proven, None);
+    }
+    let hit = run_round_trip(spawner, &through_daemon, env, deadline);
+    if hit.healthy() {
+        cleanup();
+        return (RootFitness::Proven, Some(HitLeg::Served));
+    }
+    if hit.outcome == RoundTripOutcome::TimedOut {
+        cleanup();
+        return (queued(&hit), None);
+    }
+    let control = direct_control();
     cleanup();
     if !control.healthy() {
-        log::debug!(
-            "compile cache capability probe is inconclusive: rustc could not compile the probe \
-             source directly either ({})",
-            control.summary()
-        );
-        return None;
+        return (toolchain(&control), None);
     }
+    (
+        RootFitness::Proven,
+        Some(HitLeg::Failed(format!(
+            "the daemon could not serve the cache entry it had just written into {}, which rustc \
+             compiled directly without complaint — so the compile cache is failing work it \
+             accepts rather than serving it: {}",
+            out.display(),
+            hit.summary()
+        ))),
+    )
+}
 
-    Some(format!(
-        "the daemon could not {capability} into {}, which rustc compiled directly without \
-         complaint — so the compile cache is failing work it accepts rather than serving it: {}",
-        out.display(),
-        attempt.summary()
-    ))
+/// Where a daemon's grant is recorded, for an assessment that should judge
+/// whether it covers this runner.
+#[derive(Clone, Copy)]
+struct GrantContext<'a> {
+    cfg: &'a BuildServiceConfig,
+    templates: &'a Templates,
+    dir: &'a Path,
 }
 
 /// Health as the supervisor acts on it: the [`probe_health`] verdict, downgraded
-/// to [`ServiceHealth::Wedged`] when the daemon that answered it cannot do its
-/// work — it can no longer use its temp directory (see [`listener_temp_dir_live`])
-/// or it cannot compile at all (see [`prove_daemon_cannot_compile`]). Recovery
-/// for all of them is the same — kill and relaunch — because all of them leave a
-/// listening daemon that fails the work it accepts.
+/// to [`ServiceHealth::Wedged`] when the daemon that answered it can no longer
+/// use its temp directory (see [`listener_temp_dir_live`]), plus — for a
+/// healthy, identifiable listener and a `grant` context — whether its recorded
+/// grant covers this runner ([`running_grant_verdict`]).
 ///
-/// Function is checked LAST and only on an otherwise-healthy daemon, so a
-/// verdict already explained by a hung round trip is never re-explained by
-/// counters that round trip failed to fetch.
-///
-/// `capability` is the site the compile probe may use, and passing `None`
-/// withholds the probe entirely — for callers that must not run a compiler as a
-/// side effect of being asked a question (the settings UI), and for tests. With
-/// no site, counters alone never condemn anything: they cannot.
+/// No compile runs here. The capability probe is bounded to once per daemon
+/// incarnation and per root, which only the supervisor's runtime record can
+/// track ([`probe_daemon_fitness`]); this is also what lets the settings UI ask
+/// without ever running a compiler.
 fn assess_service(
     spawner: &dyn ProcessSpawner,
     control: &dyn ListenerProcessControl,
     probe: &ReadyProbe,
     env: &HashMap<String, String>,
     deadline: Duration,
-    capability: Option<(&BuildServiceConfig, &Templates)>,
+    grant: Option<GrantContext<'_>>,
 ) -> ServiceObservation {
     let mut observation = probe_service(spawner, probe, env, deadline);
     if observation.health != ServiceHealth::Healthy {
         return observation;
     }
-    if let Some(addr) = probe.tcp.as_deref() {
-        if !listener_temp_dir_live(control, addr) {
-            observation.health = ServiceHealth::Wedged;
-            return observation;
-        }
-    }
-    let Some((cfg, templates)) = capability else {
+    let Some(addr) = probe.tcp.as_deref() else {
         return observation;
     };
-    // Liveness is not fitness. Prove the daemon can write this runner's managed
-    // build root before any client environment is allowed to route work to it.
-    if let Some(reason) =
-        prove_daemon_unfit(spawner, cfg, templates, env, CAPABILITY_PROBE_DEADLINE)
-    {
-        let identity = probe.tcp.as_deref().and_then(|addr| {
-            control.listener(addr).ok().flatten().map(|listener| {
-                format!(
-                    "listener pid {} at {}",
-                    listener.pid,
-                    listener.executable.display()
-                )
-            })
-        });
+    if !listener_temp_dir_live(control, addr) {
         observation.health = ServiceHealth::Wedged;
-        observation.unfit =
-            Some(identity.map_or(reason.clone(), |identity| format!("{identity}: {reason}")));
+        return observation;
+    }
+    if let Some(context) = grant {
+        observation.grant = Some(running_grant_verdict(
+            control,
+            addr,
+            context.cfg,
+            context.templates,
+            context.dir,
+        ));
     }
     observation
 }
@@ -1090,9 +1604,8 @@ fn assess_health(
     probe: &ReadyProbe,
     env: &HashMap<String, String>,
     deadline: Duration,
-    capability: Option<(&BuildServiceConfig, &Templates)>,
 ) -> ServiceHealth {
-    assess_service(spawner, control, probe, env, deadline, capability).health
+    assess_service(spawner, control, probe, env, deadline, None).health
 }
 
 #[cfg(target_os = "linux")]
@@ -1135,8 +1648,34 @@ fn expected_service_executable(cfg: &BuildServiceConfig, templates: &Templates) 
     Some(std::fs::canonicalize(&resolved).unwrap_or(resolved))
 }
 
+/// The configuration's identity, stable across loads.
+///
+/// Object keys are sorted before serializing: `env` and `launchEnv` are hash
+/// maps whose iteration order differs between two loads of the same file, so
+/// serializing them as iterated made equal configurations disagree, and with
+/// them every comparison against a recorded failure's fingerprint.
 fn service_config_fingerprint(cfg: &BuildServiceConfig) -> String {
-    serde_json::to_string(cfg).unwrap_or_else(|_| format!("{cfg:?}"))
+    fn sorted(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(String, serde_json::Value)> = map.into_iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                serde_json::Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted(value)))
+                        .collect(),
+                )
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(sorted).collect())
+            }
+            other => other,
+        }
+    }
+    serde_json::to_value(cfg)
+        .map(|value| sorted(value).to_string())
+        .unwrap_or_else(|_| format!("{cfg:?}"))
 }
 
 /// Whether an observed listener's executable names the program this service
@@ -1324,6 +1863,7 @@ fn reconcile_launched_service(
     control: &dyn ListenerProcessControl,
     cfg: &BuildServiceConfig,
     templates: &Templates,
+    grant: &LaunchGrant<'_>,
     deny_read: Vec<PathBuf>,
     may_destroy: bool,
 ) -> Result<Option<Box<dyn ChildProcess>>, String> {
@@ -1332,22 +1872,34 @@ fn reconcile_launched_service(
         control,
         cfg,
         templates,
+        grant,
         deny_read,
         may_destroy,
         STARTUP_RECONCILE_TIMEOUT,
     )
 }
 
+/// Launch the daemon and settle who ends up serving the port: our child, a
+/// compatible daemon adopted as it stands, or our child again after a
+/// replaced listener.
+///
+/// A listener is adopted only when its recorded grant covers this runner
+/// ([`adoption_refusal`]), in both places adoption happens: the startup loop,
+/// where our child lost the port to a healthy listener, and the replacement
+/// path after it. Adopting on health alone is how a daemon granted for another
+/// build root kept serving after the root moved.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_launched_service_with_timeout(
     spawner: &dyn ProcessSpawner,
     control: &dyn ListenerProcessControl,
     cfg: &BuildServiceConfig,
     templates: &Templates,
+    grant: &LaunchGrant<'_>,
     deny_read: Vec<PathBuf>,
     may_destroy: bool,
     startup_timeout: Duration,
 ) -> Result<Option<Box<dyn ChildProcess>>, String> {
-    let mut child = launch_service(spawner, cfg, templates, deny_read.clone())?;
+    let mut child = launch_service(spawner, cfg, templates, grant.roots, deny_read.clone())?;
     let submitted_to_user_service = false;
     let Some(probe) = cfg.ready.as_ref() else {
         return Ok(Some(child));
@@ -1388,20 +1940,31 @@ fn reconcile_launched_service_with_timeout(
                 .as_deref()
                 .is_none_or(|addr| listener_temp_dir_live(control, addr))
             {
-                return if submitted_to_user_service {
+                if submitted_to_user_service {
                     // `child` is launchctl, not the daemon. A successful submit
                     // hands lifetime ownership to launchd, so there is no child
                     // handle for this process to retain.
-                    Ok(None)
-                } else {
-                    match child.try_wait() {
-                        Ok(Some(_)) => Ok(None),
-                        Ok(None) | Err(_) => Ok(Some(child)),
+                    return Ok(None);
+                }
+                if !matches!(child.try_wait(), Ok(Some(_))) {
+                    return Ok(Some(child));
+                }
+                // Our child is gone, so whoever answered is another process,
+                // and answering says nothing about what it was granted.
+                match probe
+                    .tcp
+                    .as_deref()
+                    .and_then(|addr| adoption_refusal(control, addr, cfg, templates, grant))
+                {
+                    None => return Ok(None),
+                    Some(refusal) => {
+                        log::info!("not adopting the build service's listener: {refusal}");
                     }
-                };
+                }
             }
-            // Something is serving but cannot do work. Do not adopt it; fall
-            // through to the replacement path below.
+            // Something is serving but cannot do work, or does not hold a
+            // grant that covers this runner. Do not adopt it; fall through to
+            // the replacement path below.
             break;
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -1441,32 +2004,35 @@ fn reconcile_launched_service_with_timeout(
     // A compatible server that won the startup race is safe to adopt, but only if
     // it is healthy in the full sense: an adopted daemon's environment is not ours
     // to choose, so a stray one holding a reclaimed temp dir would otherwise be
-    // taken on as-is and fail every compile routed to it. Only an unhealthy
-    // listener whose executable is exactly the configured service binary is
-    // eligible for termination; unrelated listeners are never killed.
+    // taken on as-is and fail every compile routed to it, and its sandbox grant
+    // is fixed, so one granted for other roots would fail every compile under
+    // ours (CAIRN-3355, cairn/5556). Its grant record is the only account of that
+    // grant. Only an unhealthy listener whose executable is exactly the
+    // configured service binary is eligible for termination; unrelated listeners
+    // are never killed.
     let environment_mismatch = listener_environment_mismatch(control, addr, cfg, templates);
-    if environment_mismatch.is_none()
+    let grant_refusal = if environment_mismatch.is_none()
         && assess_health(
             spawner,
             control,
             probe,
             &client_env,
             HEALTH_ROUND_TRIP_DEADLINE,
-            // Adoption is exactly where the compile probe earns its cost: the daemon
-            // being adopted was launched by some other process, with a grant this one
-            // did not choose and cannot read. Taking on a daemon that cannot compile
-            // is how a stale generation came to own the machine (CAIRN-3355).
-            Some((cfg, templates)),
         ) == ServiceHealth::Healthy
     {
-        return Ok(None);
-    }
+        match adoption_refusal(control, addr, cfg, templates, grant) {
+            None => return Ok(None),
+            Some(refusal) => Some(refusal),
+        }
+    } else {
+        None
+    };
     // Health assessment can outlive the endpoint it assessed. Re-check the real
     // socket at the decision boundary before treating this as a bind conflict:
     // otherwise a child that exits during its round trip becomes a phantom
     // listener which no later retry can replace.
     if !tcp_reachable(addr) {
-        return launch_service(spawner, cfg, templates, deny_read).map(Some);
+        return launch_service(spawner, cfg, templates, grant.roots, deny_read).map(Some);
     }
 
     // Terminating the listener is the irreversible step, so it is the one the
@@ -1477,6 +2043,12 @@ fn reconcile_launched_service_with_timeout(
         if let Some(mismatch) = environment_mismatch {
             return Err(format!(
                 "refusing to adopt the reachable build-service daemon because {mismatch}; leaving it in place"
+            ));
+        }
+        if let Some(refusal) = grant_refusal {
+            return Err(format!(
+                "refusing to adopt the reachable build-service daemon because its grant does \
+                 not cover this runner ({refusal}); leaving it in place"
             ));
         }
         return Err(format!(
@@ -1490,7 +2062,7 @@ fn reconcile_launched_service_with_timeout(
     while tcp_reachable(addr) && std::time::Instant::now() < reap_deadline {
         std::thread::sleep(HEALTH_POLL_INTERVAL);
     }
-    launch_service(spawner, cfg, templates, deny_read).map(Some)
+    launch_service(spawner, cfg, templates, grant.roots, deny_read).map(Some)
 }
 
 /// The build a client env is being composed for.
@@ -1498,19 +2070,31 @@ fn reconcile_launched_service_with_timeout(
 /// Which builds may be pointed at the supervised daemon is decided by where they
 /// write, because the daemon runs each cache-miss compile itself: a build whose
 /// `target/` the service sandbox does not cover fails outright rather than
-/// missing the cache. See `config::build_services::MANAGED_BUILD_ROOTS`.
+/// missing the cache. The daemon is granted every managed root's `target/`
+/// trees by construction ([`BuildServiceConfig::launch_grant`]), and a build is
+/// routed by the managed root it falls under.
 #[derive(Debug, Clone, Copy)]
 enum ClientBuild<'a> {
     /// A spawn with a known build directory, admitted only when that directory
     /// lies inside a managed build root.
     At(&'a Path),
-    /// A command in an executor cell on this machine. A cell is materialized
-    /// under `{cairnHome}/build-slots` by construction, so it is inside a
-    /// managed root without a path test — which matters because the runner
-    /// composing a cell request knows the cell's repository but not the absolute
-    /// slot the executor will hand it. Its caller states the rest: not the
-    /// project's live checkout, and placed on the colocated executor.
+    /// A command in an executor cell on this machine. A cell lives under
+    /// `{buildRoot}/build-slots` (the colocated build root, cairn/5286), so it
+    /// is inside that managed root without a path test — which matters because
+    /// the runner composing a cell request knows the cell's repository but not
+    /// the absolute slot the executor will hand it. Its caller states the rest:
+    /// not the project's live checkout, and placed on the colocated executor.
     Cell,
+}
+
+/// Which managed roots the compile cache may serve right now, as the
+/// supervisor's runtime record says. See [`BuildServiceRuntimeDiagnostic::routing`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Routing {
+    /// The daemon as a whole was found failing the work it accepts.
+    pub(crate) daemon_unfit: bool,
+    /// Canonical roots that are granted, proven, and not found unfit.
+    pub(crate) roots: Vec<String>,
 }
 
 /// The client env every enabled service contributes to `build`, or nothing when
@@ -1520,22 +2104,35 @@ enum ClientBuild<'a> {
 /// they say: a service that claims its port against client auto-start declares
 /// [`BUILD_SERVICE_CLIENT_ENV`] in its own env, because that claim is true of one
 /// daemon rather than of build services in general.
+///
+/// The service env is always injected for an admitted build, so `RUSTC_WRAPPER`
+/// never moves and cargo's fingerprints stay valid however routing changes.
+/// What changes is [`BUILD_SERVICE_ROOTS_ENV`], the roots the wrapper may attach
+/// for, and [`BUILD_SERVICE_UNFIT_ENV`], set when this build's own root may not
+/// be served at all.
 fn client_env_for(
     services: &HashMap<String, BuildServiceConfig>,
     templates: &Templates,
     build: ClientBuild<'_>,
-    unfit: bool,
+    routing: &Routing,
 ) -> HashMap<String, String> {
-    if let ClientBuild::At(build_dir) = build {
-        if !builds_in_managed_root(templates, build_dir) {
-            return HashMap::new();
-        }
-    }
+    let root = match build {
+        ClientBuild::At(build_dir) => match managed_root_containing(templates, build_dir) {
+            Some(root) => root,
+            None => return HashMap::new(),
+        },
+        ClientBuild::Cell => cell_build_root(templates),
+    };
     let mut env = merge_client_env(services, templates);
     // Only meaningful beside a daemon this build was actually pointed at; an
     // empty merge means no service claimed this build and there is nothing to
     // withdraw it from.
-    if unfit && !env.is_empty() {
+    if env.is_empty() {
+        return env;
+    }
+    env.insert(BUILD_SERVICE_ROOTS_ENV.to_string(), routing.roots.join(":"));
+    let root = root.display().to_string();
+    if routing.daemon_unfit || !routing.roots.contains(&root) {
         env.insert(BUILD_SERVICE_UNFIT_ENV.to_string(), "1".to_string());
     }
     env
@@ -1636,9 +2233,170 @@ pub struct BuildServiceRuntimeDiagnostic {
     /// verdicts are not evidence about the daemon. See
     /// [`BuildServiceRuntimeDiagnostic::may_destroy`].
     pub(crate) round_trip_proven: bool,
+    /// The daemon incarnation — listener pid and kernel start token — that the
+    /// grant and fitness fields below describe. A new incarnation clears every
+    /// per-root verdict, so a fresh daemon routes nothing until each root is
+    /// proven, and a running one is probed once rather than on every tick: a
+    /// process's grant cannot change while it runs.
+    pub(crate) incarnation: Option<(u32, String)>,
+    /// This runner's managed roots, canonical, as of the last reconcile. Held
+    /// here so the hot reads that render them never touch the filesystem.
+    pub(crate) own_roots: Vec<String>,
+    /// The roots the running incarnation's grant record covers.
+    pub(crate) granted_roots: Vec<String>,
+    /// Roots this incarnation has compiled into.
+    pub(crate) proven_roots: Vec<String>,
+    /// Roots this incarnation was proven unable to write, with the few words
+    /// the status line carries. Never a reason to refuse a lane: clients
+    /// building there compile directly.
+    pub(crate) unfit_roots: BTreeMap<String, String>,
+    /// When an inconclusive root may be probed again.
+    pub(crate) inconclusive_retry_at: BTreeMap<String, u64>,
+    #[serde(skip)]
+    pub(crate) inconclusive_attempts: BTreeMap<String, u32>,
+    /// A verdict about the incarnation as a whole — it wrote a cache entry and
+    /// could not serve it back — kept so it holds without being re-probed.
+    pub(crate) incarnation_unfit: Option<String>,
+    /// Why the running daemon's grant does not cover this runner, while it
+    /// does not. Its own outcome, never `current_failure`: the daemon answers,
+    /// and is only unfit for the roots it was not granted.
+    pub(crate) grant_stale: Option<GrantStaleNote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GrantStaleNote {
+    pub(crate) reason: String,
+    /// Whether this runner will replace the daemon, as opposed to leaving it
+    /// running and compiling the uncovered roots directly.
+    pub(crate) relaunching: bool,
 }
 
 impl BuildServiceRuntimeDiagnostic {
+    /// Note which daemon incarnation is listening and what its record grants,
+    /// forgetting every per-root verdict when the incarnation is a new one.
+    fn observe_incarnation(&mut self, incarnation: Option<(u32, String)>, granted: &[String]) {
+        if self.incarnation != incarnation {
+            self.incarnation = incarnation;
+            self.proven_roots.clear();
+            self.unfit_roots.clear();
+            self.inconclusive_retry_at.clear();
+            self.inconclusive_attempts.clear();
+            self.incarnation_unfit = None;
+        }
+        self.granted_roots = granted.to_vec();
+    }
+
+    /// This runner's granted roots with no verdict for the current
+    /// incarnation, less those waiting out an inconclusive probe's backoff.
+    fn roots_awaiting_probe(&self, now_ms: u64) -> Vec<String> {
+        if self.incarnation.is_none() || self.incarnation_unfit.is_some() {
+            return Vec::new();
+        }
+        self.own_roots
+            .iter()
+            .filter(|root| self.granted_roots.contains(root))
+            .filter(|root| !self.proven_roots.contains(root))
+            .filter(|root| !self.unfit_roots.contains_key(*root))
+            .filter(|root| {
+                self.inconclusive_retry_at
+                    .get(*root)
+                    .is_none_or(|at| now_ms >= *at)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn apply_fitness(&mut self, report: FitnessReport, now_ms: u64) {
+        for (root, fitness) in report.roots {
+            match fitness {
+                RootFitness::Proven => {
+                    self.inconclusive_retry_at.remove(&root);
+                    self.inconclusive_attempts.remove(&root);
+                    if !self.proven_roots.contains(&root) {
+                        self.proven_roots.push(root);
+                    }
+                }
+                RootFitness::Unfit { summary, .. } => {
+                    self.inconclusive_retry_at.remove(&root);
+                    self.inconclusive_attempts.remove(&root);
+                    self.unfit_roots.insert(root, summary);
+                }
+                RootFitness::Inconclusive(_) => {
+                    let attempts = self.inconclusive_attempts.entry(root.clone()).or_default();
+                    *attempts = attempts.saturating_add(1);
+                    let wait = probe_retry_after(*attempts).as_millis() as u64;
+                    self.inconclusive_retry_at.insert(root, now_ms + wait);
+                }
+            }
+        }
+        if report.daemon_unfit.is_some() {
+            self.incarnation_unfit = report.daemon_unfit;
+        }
+    }
+
+    /// The roots a build may be routed to the daemon from right now.
+    fn routable_roots(&self) -> Vec<String> {
+        if self.unfit.is_some() || self.incarnation_unfit.is_some() || self.incarnation.is_none() {
+            return Vec::new();
+        }
+        self.proven_roots
+            .iter()
+            .filter(|root| self.granted_roots.contains(root))
+            .filter(|root| !self.unfit_roots.contains_key(*root))
+            .cloned()
+            .collect()
+    }
+
+    /// What a build is told about the daemon. Read from the same record the
+    /// panel reads, so what a build is told and what an operator sees can
+    /// never disagree.
+    pub(crate) fn routing(&self) -> Routing {
+        Routing {
+            daemon_unfit: self.unfit.is_some() || self.incarnation_unfit.is_some(),
+            roots: self.routable_roots(),
+        }
+    }
+
+    /// One sentence for each of this runner's roots the daemon may not serve,
+    /// or for the daemon as a whole. Assembled from the record alone: nothing
+    /// is probed to render it.
+    pub(crate) fn fitness(&self) -> Vec<String> {
+        if let Some(reason) = self.unfit.as_ref().or(self.incarnation_unfit.as_ref()) {
+            return vec![format!(
+                "unfit for every managed root ({}); clients compile directly",
+                bounded_tail(reason)
+            )];
+        }
+        if self.incarnation.is_none() && self.grant_stale.is_none() {
+            return Vec::new();
+        }
+        let routable = self.routable_roots();
+        self.own_roots
+            .iter()
+            .filter(|root| !routable.contains(root))
+            .map(|root| {
+                if let Some(reason) = self.unfit_roots.get(root) {
+                    return format!("unfit for {root} ({reason}); clients compile directly");
+                }
+                if !self.granted_roots.contains(root) {
+                    let next = match &self.grant_stale {
+                        Some(note) if note.relaunching => "relaunch pending",
+                        _ => "clients compile directly",
+                    };
+                    return format!("{root} is not in the running daemon's grant; {next}");
+                }
+                if self.inconclusive_retry_at.contains_key(root) {
+                    return format!(
+                        "fitness for {root} is unproven (the last probe was inconclusive); \
+                         clients compile directly"
+                    );
+                }
+                format!("fitness for {root} is not yet proven; clients compile directly")
+            })
+            .collect()
+    }
+
     /// Whether an unhealthy verdict is trustworthy enough to destroy a daemon
     /// over. See [`DESTRUCTIVE_ATTEMPT_LIMIT`] for why this is bounded at all.
     ///
@@ -1761,6 +2519,9 @@ pub struct BuildServiceStatus {
     /// The raw, template-unexpanded config — the editable source of truth the
     /// settings UI binds its form to (so edits round-trip `{worktrees}` etc.).
     config: BuildServiceConfig,
+    /// One sentence per managed root the daemon may not serve, from the
+    /// supervisor's record ([`BuildServiceRuntimeDiagnostic::fitness`]).
+    pub(crate) fitness: Vec<String>,
 }
 
 /// An advisory, machine-wide reconciliation lock for one service.
@@ -1932,6 +2693,54 @@ fn quarantine_zero_length_cache_entries(state_dir: &Path) -> Vec<PathBuf> {
     removed
 }
 
+/// One service's grant site for a reconcile: where its record and registry
+/// live, this runner's own managed roots, and the roots a launch is granted.
+struct GrantSite {
+    dir: PathBuf,
+    own_roots: Vec<String>,
+    launch_roots: Vec<PathBuf>,
+}
+
+/// Ensure the daemon's state dir exists before launch: sccache creates its
+/// SCCACHE_ERROR_LOG file (under stateDir) before starting the server, and a
+/// missing parent dir would fail that and take the whole server down on a
+/// fresh machine.
+fn ensure_state_dir(cfg: &BuildServiceConfig, templates: &Templates) {
+    if let Some(dir) = cfg.expanded_state_dir(templates) {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::debug!("create build service state dir {dir:?}: {e}");
+        }
+    }
+}
+
+/// Keep the statistics a healthy round trip carried. One round trip serves
+/// both purposes — the health verdict and the counters — and the UI never runs
+/// its own.
+fn record_stats_sample(
+    state: &mut BuildServiceRuntimeDiagnostic,
+    observation: &ServiceObservation,
+    now_ms: u64,
+) {
+    match observation.round_trip.as_ref() {
+        Some(round_trip) => match parse_cache_stats(&round_trip.stdout) {
+            Some(stats) => {
+                state.stats = Some(stats);
+                state.stats_at_unix_ms = Some(now_ms);
+                state.stats_gap = None;
+            }
+            None => {
+                state.stats_gap = Some(
+                    "the health round trip answered with no readable statistics report".to_string(),
+                );
+            }
+        },
+        None => {
+            state.stats_gap =
+                Some("this service has no statistics round trip configured".to_string())
+        }
+    }
+}
+
 fn compile_cache_service(
     services: &HashMap<String, BuildServiceConfig>,
 ) -> Option<(String, BuildServiceConfig)> {
@@ -2098,6 +2907,7 @@ impl Orchestrator {
         // panel that reports it must not be made stale by either.
         let services = settings::load_build_services(&self.config_dir);
         self.publish_compile_cache_service(&services);
+        self.deliver_cache_wrapper(&services);
         if !sandbox::is_available() {
             // No service sandbox on this host; clients run uncached (the
             // cache-wrapper guard never auto-starts a confined server).
@@ -2115,6 +2925,7 @@ impl Orchestrator {
         };
         let templates = self.build_service_templates();
         let deny_read = self.sandbox_deny_read();
+        let own_roots = root_strings(&managed_build_roots(&templates));
         for (name, cfg) in Self::launchable_services(services) {
             // Then serialize across processes. Without this the in-process lock
             // above only stops one runner from racing itself, while the four
@@ -2135,14 +2946,71 @@ impl Orchestrator {
                     continue;
                 }
             };
-            self.reconcile_build_service(
+            self.reconcile_registered_service(
+                &OsListenerProcessControl,
                 &name,
                 &cfg,
                 &templates,
+                &own_roots,
                 deny_read.clone(),
                 may_launch_service(&cfg, &templates, sandbox::current_process_is_confined()),
             );
         }
+    }
+
+    /// Install this runner's wrapper at `{cairnHome}/bin/cache-wrapper.sh` when
+    /// an enabled service routes builds through that path. Only this runner's
+    /// own home is ever written; a wrapper configured anywhere else is the
+    /// operator's, and routing through it waits until it carries the gate.
+    fn deliver_cache_wrapper(&self, services: &HashMap<String, BuildServiceConfig>) {
+        let templates = self.build_service_templates();
+        let path = installed_wrapper_path(&templates);
+        let named = services.values().filter(|cfg| cfg.enabled).any(|cfg| {
+            let env = cfg.expanded_env(&templates);
+            WRAPPER_ENV_KEYS
+                .iter()
+                .any(|key| env.get(*key).is_some_and(|value| Path::new(value) == path))
+        });
+        if !named {
+            return;
+        }
+        match install_cache_wrapper(&path) {
+            Ok(true) => log::info!("installed the cache wrapper at {}", path.display()),
+            Ok(false) => {}
+            Err(e) => log::warn!("could not install the cache wrapper: {e}"),
+        }
+    }
+
+    /// Register this runner's managed roots beside the daemon, then drive the
+    /// service one step. Runs under the machine-wide reconcile lock, which is
+    /// what keeps the registry and the grant record consistent across runners.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_registered_service(
+        &self,
+        control: &dyn ListenerProcessControl,
+        name: &str,
+        cfg: &BuildServiceConfig,
+        templates: &Templates,
+        own_roots: &[String],
+        deny_read: Vec<PathBuf>,
+        may_launch: bool,
+    ) {
+        let dir = grant_state_dir(cfg, templates, name);
+        if let Err(e) = register_runner_roots(&dir, templates, own_roots) {
+            log::warn!(
+                "build service '{name}' could not register this runner's managed roots: {e}"
+            );
+        }
+        let launch_roots = live_registered_roots(&dir, own_roots)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let site = GrantSite {
+            dir,
+            own_roots: own_roots.to_vec(),
+            launch_roots,
+        };
+        self.reconcile_build_service(control, name, cfg, templates, &site, deny_read, may_launch);
     }
 
     /// Drive one service one step toward health.
@@ -2154,19 +3022,29 @@ impl Orchestrator {
     /// (`recoveryFailed`). Only the last is a condition an operator must see.
     /// At that boundary active launch attempts stop, while health observation
     /// continues so an externally restored service is adopted immediately.
+    ///
+    /// A healthy daemon whose grant does not cover this runner is a fourth
+    /// situation with its own branch ([`Self::reconcile_stale_grant`]), because
+    /// it must never reach `current_failure`: that field refuses check dispatch,
+    /// and a daemon that answers is only unfit for the roots it was not granted.
+    #[allow(clippy::too_many_arguments)]
     fn reconcile_build_service(
         &self,
+        control: &dyn ListenerProcessControl,
         name: &str,
         cfg: &BuildServiceConfig,
         templates: &Templates,
+        site: &GrantSite,
         deny_read: Vec<PathBuf>,
         may_launch: bool,
     ) {
         let now_ms = unix_ms();
         let may_destroy;
+        let condemned;
         {
             let mut diagnostics = self.build_service_runtime.lock().unwrap();
             let state = diagnostics.entry(name.to_string()).or_default();
+            state.own_roots = site.own_roots.clone();
             if reset_recovery_for_changed_config(state, cfg, templates, now_ms) {
                 log::info!(
                     "build service '{name}' configuration changed; resetting exhausted recovery budget"
@@ -2199,14 +3077,18 @@ impl Orchestrator {
             .lock()
             .unwrap()
             .contains_key(name);
-        let observation = match &cfg.ready {
+        let mut observation = match &cfg.ready {
             Some(probe) => assess_service(
                 self.services.process.as_ref(),
-                &OsListenerProcessControl,
+                control,
                 probe,
                 &client_env,
                 HEALTH_ROUND_TRIP_DEADLINE,
-                Some((cfg, templates)),
+                Some(GrantContext {
+                    cfg,
+                    templates,
+                    dir: &site.dir,
+                }),
             ),
             // No probe to assess health: treat a service we already supervise as
             // fine, and one we don't as needing a launch.
@@ -2218,8 +3100,42 @@ impl Orchestrator {
                 },
                 round_trip: None,
                 unfit: None,
+                grant: None,
             },
         };
+        match observation.grant.take() {
+            Some(GrantVerdict::Stale(stale)) if observation.health == ServiceHealth::Healthy => {
+                self.reconcile_stale_grant(
+                    control,
+                    name,
+                    cfg,
+                    templates,
+                    site,
+                    deny_read,
+                    may_launch,
+                    &observation,
+                    stale,
+                    now_ms,
+                );
+                return;
+            }
+            Some(GrantVerdict::Covered(record)) => {
+                if let Some(reason) = self.prove_incarnation_fitness(
+                    name,
+                    cfg,
+                    templates,
+                    &client_env,
+                    &record,
+                    now_ms,
+                ) {
+                    // Liveness is not fitness: an incarnation proven unable to
+                    // serve is not healthy, whatever its round trip says.
+                    observation.health = ServiceHealth::Wedged;
+                    observation.unfit = Some(format!("listener pid {}: {reason}", record.pid));
+                }
+            }
+            _ => {}
+        }
         let health_name = match observation.health {
             ServiceHealth::Healthy => "healthy",
             ServiceHealth::Wedged => "wedged",
@@ -2236,32 +3152,13 @@ impl Orchestrator {
                 .clone()
                 .or_else(|| observation.round_trip.as_ref().map(RoundTrip::summary));
             if observation.health == ServiceHealth::Healthy {
-                // One round trip serves both purposes: the health verdict above
-                // and the counters below. The UI never runs its own.
-                match observation.round_trip.as_ref() {
-                    Some(round_trip) => match parse_cache_stats(&round_trip.stdout) {
-                        Some(stats) => {
-                            state.stats = Some(stats);
-                            state.stats_at_unix_ms = Some(now_ms);
-                            state.stats_gap = None;
-                        }
-                        None => {
-                            state.stats_gap = Some(
-                                "the health round trip answered with no readable statistics report"
-                                    .to_string(),
-                            );
-                        }
-                    },
-                    None => {
-                        state.stats_gap =
-                            Some("this service has no statistics round trip configured".to_string())
-                    }
-                }
+                record_stats_sample(state, &observation, now_ms);
                 state.consecutive_failures = 0;
                 state.next_attempt_unix_ms = None;
-                // This probe compiled a fresh nonce. It says the daemon works
-                // in general, not that a previously failing cache key was
-                // removed, so retain the stronger corruption diagnosis.
+                state.grant_stale = None;
+                // Healthy says the daemon works in general, not that a
+                // previously failing cache key was removed, so retain the
+                // stronger corruption diagnosis.
                 if !state.clear_unfit_after_healthy_probe(now_ms) {
                     log::warn!(
                         "build service '{name}' answered a generic health probe, but reported cache corruption remains unresolved"
@@ -2379,6 +3276,13 @@ impl Orchestrator {
             state.consecutive_failures = state.consecutive_failures.saturating_add(1);
             let wait = restart_backoff(state.consecutive_failures, clock_jitter());
             state.next_attempt_unix_ms = Some(now_ms + wait.as_millis() as u64);
+            // An incarnation proven unable to serve keeps answering its round
+            // trip, so the launch below must not adopt it straight back.
+            condemned = state
+                .incarnation_unfit
+                .is_some()
+                .then(|| state.incarnation.clone())
+                .flatten();
         }
 
         if observation.health == ServiceHealth::Wedged {
@@ -2406,80 +3310,28 @@ impl Orchestrator {
         } else {
             log::info!("build service '{name}' down; launching");
         }
-        // Ensure the daemon's state dir exists before launch: sccache creates
-        // its SCCACHE_ERROR_LOG file (under stateDir) before starting the
-        // server, and a missing parent dir would fail that and take the whole
-        // server down on a fresh machine.
-        if let Some(dir) = cfg.expanded_state_dir(templates) {
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                log::debug!("create build service state dir {dir:?}: {e}");
-            }
-        }
+        ensure_state_dir(cfg, templates);
 
+        let grant = LaunchGrant {
+            dir: &site.dir,
+            roots: &site.launch_roots,
+            condemned: condemned.as_ref(),
+        };
         let launched = reconcile_launched_service(
             self.services.process.as_ref(),
-            &OsListenerProcessControl,
+            control,
             cfg,
             templates,
+            &grant,
             deny_read,
             may_destroy,
         );
-        let mut diagnostics = self.build_service_runtime.lock().unwrap();
-        let state = diagnostics.entry(name.to_string()).or_default();
         match launched {
-            Ok(child) => {
-                let pid = child.as_ref().map(|child| child.id());
-                match &child {
-                    Some(_) => log::info!("started build service '{name}'"),
-                    None => log::info!("adopted existing healthy build service '{name}'"),
-                }
-                state.current_failure = None;
-                state.failure_config = None;
-                // A freshly launched daemon is not routable merely because spawn
-                // succeeded. Keep clients on direct rustc until the next tick's
-                // capability compile proves this incarnation can write a managed
-                // build root. An adopted daemon was proved by the reconcile probe.
-                state.unfit = pid.is_some().then(|| {
-                    "the newly launched daemon has not yet proved it can compile into a managed build root"
-                        .to_string()
-                });
-                state.restart_count += 1;
-                // A new incarnation means the daemon's counters restarted at
-                // zero. Retiring the sample with the generation is what keeps a
-                // reset from reading as a collapse in hit rate.
-                state.generation += 1;
-                state.stats = None;
-                state.stats_at_unix_ms = None;
-                state.stats_gap = Some(
-                    "the compile cache has just restarted and has not been sampled".to_string(),
-                );
-                state.supervised_pid = pid;
-                state.launched_at_unix_ms = Some(unix_ms());
-                state.launcher_cairn_home = Some(templates.cairn_home.display().to_string());
-                state.launcher_pid = Some(std::process::id());
-                state.launcher_confined = Some(false);
-                // Launched, NOT proven. A spawn that succeeds says nothing about
-                // whether the daemon serves; the next tick's probe decides, and
-                // only that clears the attempt streak. Declaring health here is
-                // how a spawn-then-exit loop would reset its own backoff on
-                // every attempt and never reach `recoveryFailed`.
-                state.enter(
-                    if state.consecutive_failures >= RECOVERY_FAILED_AFTER {
-                        "recoveryFailed"
-                    } else {
-                        "restarting"
-                    },
-                    unix_ms(),
-                );
-                if let Some(child) = child {
-                    self.build_service_children
-                        .lock()
-                        .unwrap()
-                        .insert(name.to_string(), child);
-                }
-            }
+            Ok(child) => self.record_launch(control, name, cfg, templates, site, child),
             Err(e) => {
                 log::warn!("failed to start build service '{name}': {e}");
+                let mut diagnostics = self.build_service_runtime.lock().unwrap();
+                let state = diagnostics.entry(name.to_string()).or_default();
                 state.current_failure = Some(bounded_tail(&e));
                 state.failure_config = Some(service_config_fingerprint(cfg));
                 state.supervised_pid = None;
@@ -2490,6 +3342,8 @@ impl Orchestrator {
                 }
             }
         }
+        let mut diagnostics = self.build_service_runtime.lock().unwrap();
+        let state = diagnostics.entry(name.to_string()).or_default();
         if recovery_exhausted(state.consecutive_failures) {
             let reason = state.current_failure.clone().unwrap_or_else(|| {
                 format!(
@@ -2512,6 +3366,311 @@ impl Orchestrator {
             state.failure_config = Some(service_config_fingerprint(cfg));
             state.next_attempt_unix_ms = None;
             state.enter("recoveryFailed", unix_ms());
+        }
+    }
+
+    /// A healthy daemon whose recorded grant does not cover this runner: no
+    /// record (every daemon that predates grant records), a record for another
+    /// process, a missing root, or this runner's own launch configuration
+    /// changed since it launched the daemon.
+    ///
+    /// When this runner may replace the daemon it relaunches it through the
+    /// ordinary launch path, counted against `consecutive_failures` and backoff
+    /// like any relaunch, so a relaunch that does not fix the grant cannot loop.
+    /// Otherwise the daemon is left serving the roots its record does cover, and
+    /// builds under the rest compile directly. Either way this never writes
+    /// `current_failure`, so no check lane is refused over it.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_stale_grant(
+        &self,
+        control: &dyn ListenerProcessControl,
+        name: &str,
+        cfg: &BuildServiceConfig,
+        templates: &Templates,
+        site: &GrantSite,
+        deny_read: Vec<PathBuf>,
+        may_launch: bool,
+        observation: &ServiceObservation,
+        stale: GrantStale,
+        now_ms: u64,
+    ) {
+        let relaunch = {
+            let mut diagnostics = self.build_service_runtime.lock().unwrap();
+            let state = diagnostics.entry(name.to_string()).or_default();
+            state.last_health = Some("healthy".to_string());
+            state.last_checked_at = Some(chrono::Utc::now().timestamp());
+            state.last_probe = observation.round_trip.as_ref().map(RoundTrip::summary);
+            record_stats_sample(state, observation, now_ms);
+            state.round_trip_proven |= observation
+                .round_trip
+                .as_ref()
+                .is_some_and(RoundTrip::healthy);
+            if state.generation == 0 {
+                state.generation = 1;
+            }
+            match &stale.record {
+                Some(record) => state.observe_incarnation(
+                    Some((record.pid, record.start_token.clone())),
+                    &record.roots,
+                ),
+                None => state.observe_incarnation(None, &[]),
+            }
+            // The daemon answers, so a launch or recovery failure recorded
+            // before it did no longer describes it, in memory or on disk; left
+            // standing it would refuse every check lane while builds here
+            // compile directly. Reported corruption is a verdict about the
+            // cache, not the process, and is kept exactly as health keeps it.
+            if state.clear_unfit_after_healthy_probe(now_ms) {
+                state.current_failure = None;
+                state.failure_config = None;
+                clear_recovery_failure(cfg, templates);
+            }
+            let may_relaunch = may_launch
+                && state.may_destroy()
+                && !recovery_exhausted(state.consecutive_failures);
+            let due = state.next_attempt_unix_ms.is_none_or(|next| now_ms >= next);
+            let note = GrantStaleNote {
+                reason: stale.reason.clone(),
+                relaunching: may_relaunch,
+            };
+            if state.grant_stale.as_ref() != Some(&note) {
+                if may_relaunch {
+                    log::warn!("build service '{name}' {}; relaunching", stale.reason);
+                } else {
+                    log::warn!(
+                        "build service '{name}' grant stale ({}); clients compile directly",
+                        stale.reason
+                    );
+                }
+            }
+            state.grant_stale = Some(note);
+            state.enter("degraded", now_ms);
+            let relaunch = may_relaunch && due;
+            if relaunch {
+                state.last_restart_at = Some(chrono::Utc::now().timestamp());
+                state.last_restart_reason = Some(stale.reason.clone());
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                let wait = restart_backoff(state.consecutive_failures, clock_jitter());
+                state.next_attempt_unix_ms = Some(now_ms + wait.as_millis() as u64);
+            }
+            relaunch
+        };
+
+        if !relaunch {
+            // The roots the record does cover still serve, once proven.
+            if let Some(record) = &stale.record {
+                let client_env = cfg.expanded_env(templates);
+                if let Some(reason) = self.prove_incarnation_fitness(
+                    name,
+                    cfg,
+                    templates,
+                    &client_env,
+                    record,
+                    now_ms,
+                ) {
+                    log::warn!(
+                        "build service '{name}' listener pid {} cannot serve: {reason}",
+                        record.pid
+                    );
+                }
+            }
+            return;
+        }
+
+        self.kill_build_service_child(name);
+        ensure_state_dir(cfg, templates);
+        let grant = LaunchGrant {
+            dir: &site.dir,
+            roots: &site.launch_roots,
+            condemned: None,
+        };
+        match reconcile_launched_service(
+            self.services.process.as_ref(),
+            control,
+            cfg,
+            templates,
+            &grant,
+            deny_read,
+            true,
+        ) {
+            Ok(child) => self.record_launch(control, name, cfg, templates, site, child),
+            Err(e) => {
+                log::warn!("build service '{name}' could not be relaunched for its grant: {e}");
+                let mut diagnostics = self.build_service_runtime.lock().unwrap();
+                let state = diagnostics.entry(name.to_string()).or_default();
+                state.grant_stale = Some(GrantStaleNote {
+                    reason: format!("{}; relaunch failed: {}", stale.reason, bounded_tail(&e)),
+                    relaunching: false,
+                });
+                if !self
+                    .build_service_children
+                    .lock()
+                    .unwrap()
+                    .contains_key(name)
+                {
+                    state.supervised_pid = None;
+                }
+            }
+        }
+    }
+
+    /// Prove, once per daemon incarnation, that it can compile into each of
+    /// this runner's managed roots its record grants. Returns the reason when
+    /// the incarnation as a whole was found unable to serve.
+    ///
+    /// A root with a verdict for this incarnation is never probed again, and an
+    /// inconclusive one waits out a backoff, so a healthy machine pays a few
+    /// trivial compiles per daemon launch rather than two every tick. What can
+    /// break mid-life is covered by the checks that do run every tick: the
+    /// temp-dir liveness check, the round trip, and reported corruption.
+    fn prove_incarnation_fitness(
+        &self,
+        name: &str,
+        cfg: &BuildServiceConfig,
+        templates: &Templates,
+        env: &HashMap<String, String>,
+        record: &DaemonGrantRecord,
+        now_ms: u64,
+    ) -> Option<String> {
+        let incarnation = Some((record.pid, record.start_token.clone()));
+        let awaiting: Vec<String> = {
+            let mut diagnostics = self.build_service_runtime.lock().unwrap();
+            let state = diagnostics.entry(name.to_string()).or_default();
+            state.observe_incarnation(incarnation.clone(), &record.roots);
+            state.roots_awaiting_probe(now_ms)
+        }
+        .into_iter()
+        // A root with nothing in it yet has no build to serve; it is probed
+        // once it exists.
+        .filter(|root| Path::new(root).is_dir())
+        .collect();
+        if !awaiting.is_empty() {
+            let report = probe_daemon_fitness(
+                self.services.process.as_ref(),
+                cfg,
+                templates,
+                env,
+                &awaiting,
+                CAPABILITY_PROBE_DEADLINE,
+            );
+            for (root, fitness) in &report.roots {
+                match fitness {
+                    RootFitness::Proven => {
+                        log::info!("build service '{name}' proved it can compile into {root}")
+                    }
+                    RootFitness::Unfit { detail, .. } => log::warn!(
+                        "build service '{name}' is unfit for {root}; builds there compile directly: {detail}"
+                    ),
+                    RootFitness::Inconclusive(why) => log::debug!(
+                        "build service '{name}' fitness probe for {root} was inconclusive: {why}"
+                    ),
+                }
+            }
+            let mut diagnostics = self.build_service_runtime.lock().unwrap();
+            let state = diagnostics.entry(name.to_string()).or_default();
+            if state.incarnation == incarnation {
+                state.apply_fitness(report, now_ms);
+            }
+        }
+        self.build_service_runtime
+            .lock()
+            .unwrap()
+            .get(name)
+            .and_then(|state| state.incarnation_unfit.clone())
+    }
+
+    /// Account for a launch that produced a daemon, or adopted one: a new
+    /// incarnation, whose grant is recorded beside the daemon's state so every
+    /// runner sharing it can judge it ([`running_grant_verdict`]).
+    #[allow(clippy::too_many_arguments)]
+    fn record_launch(
+        &self,
+        control: &dyn ListenerProcessControl,
+        name: &str,
+        cfg: &BuildServiceConfig,
+        templates: &Templates,
+        site: &GrantSite,
+        child: Option<Box<dyn ChildProcess>>,
+    ) {
+        let pid = child.as_ref().map(|child| child.id());
+        let record = pid.and_then(|pid| {
+            let Some(start_token) = control.start_token(pid) else {
+                log::warn!(
+                    "build service '{name}' launched pid {pid}, but its start token could not be read, so its grant cannot be recorded"
+                );
+                return None;
+            };
+            Some(DaemonGrantRecord {
+                pid,
+                start_token,
+                launch_fingerprint: cfg.launch_fingerprint(templates),
+                roots: root_strings(&site.launch_roots),
+                write_globs: cfg.launch_grant(templates, &site.launch_roots),
+                launcher_cairn_home: templates.cairn_home.display().to_string(),
+                launched_at_unix_ms: unix_ms(),
+            })
+        });
+        if let Some(record) = &record {
+            if let Err(e) = write_grant_record(&site.dir, record) {
+                log::warn!("build service '{name}' could not record its launch grant: {e}");
+            }
+        }
+        let mut diagnostics = self.build_service_runtime.lock().unwrap();
+        let state = diagnostics.entry(name.to_string()).or_default();
+        match &child {
+            Some(_) => log::info!("started build service '{name}'"),
+            None => log::info!("adopted existing healthy build service '{name}'"),
+        }
+        state.current_failure = None;
+        state.failure_config = None;
+        state.grant_stale = None;
+        // A launched daemon is not routable merely because spawn succeeded: its
+        // new incarnation has no verdicts, so clients compile directly until the
+        // next tick's capability compile proves each root. An adopted daemon
+        // keeps whatever its incarnation has already proven.
+        state.unfit = None;
+        if pid.is_some() {
+            match &record {
+                Some(record) => state.observe_incarnation(
+                    Some((record.pid, record.start_token.clone())),
+                    &record.roots,
+                ),
+                None => state.observe_incarnation(None, &[]),
+            }
+        }
+        state.restart_count += 1;
+        // A new incarnation means the daemon's counters restarted at
+        // zero. Retiring the sample with the generation is what keeps a
+        // reset from reading as a collapse in hit rate.
+        state.generation += 1;
+        state.stats = None;
+        state.stats_at_unix_ms = None;
+        state.stats_gap =
+            Some("the compile cache has just restarted and has not been sampled".to_string());
+        state.supervised_pid = pid;
+        state.launched_at_unix_ms = Some(unix_ms());
+        state.launcher_cairn_home = Some(templates.cairn_home.display().to_string());
+        state.launcher_pid = Some(std::process::id());
+        state.launcher_confined = Some(false);
+        // Launched, NOT proven. A spawn that succeeds says nothing about
+        // whether the daemon serves; the next tick's probe decides, and
+        // only that clears the attempt streak. Declaring health here is
+        // how a spawn-then-exit loop would reset its own backoff on
+        // every attempt and never reach `recoveryFailed`.
+        state.enter(
+            if state.consecutive_failures >= RECOVERY_FAILED_AFTER {
+                "recoveryFailed"
+            } else {
+                "restarting"
+            },
+            unix_ms(),
+        );
+        drop(diagnostics);
+        if let Some(child) = child {
+            self.build_service_children
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), child);
         }
     }
 
@@ -2630,6 +3789,9 @@ impl Orchestrator {
             .map(|(name, cfg)| {
                 let mut env_keys: Vec<String> = cfg.env.keys().cloned().collect();
                 env_keys.sort();
+                // No compile probe: `assess_health` never runs one, and
+                // rendering a list must never run a compiler. Fitness comes
+                // from what the supervisor already found.
                 let reachable = cfg
                     .ready
                     .as_ref()
@@ -2640,13 +3802,30 @@ impl Orchestrator {
                             probe,
                             &cfg.expanded_env(&templates),
                             HEALTH_ROUND_TRIP_DEADLINE,
-                            // No compile probe: this answers a settings screen,
-                            // and rendering a list must never run a compiler.
-                            None,
                         ) == ServiceHealth::Healthy
                     })
                     .unwrap_or(false);
+                let fitness = if cfg.enabled {
+                    let mut fitness: Vec<String> = self
+                        .build_service_runtime
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .map(BuildServiceRuntimeDiagnostic::fitness)
+                        .unwrap_or_default();
+                    if !wrapper_enforces_gate(&cfg.expanded_env(&templates)) {
+                        fitness.push(
+                            "the cache wrapper builds run predates the output-directory gate; \
+                             clients compile directly"
+                                .to_string(),
+                        );
+                    }
+                    fitness
+                } else {
+                    Vec::new()
+                };
                 BuildServiceStatus {
+                    fitness,
                     name,
                     enabled: cfg.enabled,
                     installed: service_on_path(&cfg),
@@ -2779,14 +3958,19 @@ impl Orchestrator {
             ),
         };
 
+        // A daemon can be healthy and still unfit for one of this runner's
+        // roots, and that is the sentence an operator needs: builds there
+        // compile directly.
+        let fitness = (!runtime.fitness().is_empty()).then(|| runtime.fitness().join("; "));
         let condition = match state {
-            CompileCacheState::Healthy => None,
+            CompileCacheState::Healthy => fitness,
             CompileCacheState::Disabled | CompileCacheState::NotInstalled => {
                 unsupervised.map(str::to_string)
             }
             _ => unsupervised
                 .map(str::to_string)
                 .or_else(|| runtime.current_failure.clone())
+                .or(fitness)
                 .or_else(|| runtime.last_exit.clone())
                 .or_else(|| runtime.last_probe.clone()),
         };
@@ -2811,65 +3995,84 @@ impl Orchestrator {
     /// Injection follows **where a spawn builds**, not whether it is supervised.
     /// The fence is a supervision policy and the compile cache is a performance
     /// mechanism; what actually binds a build to this daemon is whether the
-    /// daemon may write where that build writes (see
-    /// [`crate::config::build_services::MANAGED_BUILD_ROOTS`]). Keying this on
-    /// the fence instead left every build on an `allow`-dial workspace running
-    /// plain `rustc` against no cache at all.
+    /// daemon may write where that build writes, which is decided per managed
+    /// root ([`crate::config::build_services::managed_build_roots`]). Keying this
+    /// on the fence instead left every build on an `allow`-dial workspace
+    /// running plain `rustc` against no cache at all.
     pub(crate) fn build_service_client_env(&self, build_dir: &Path) -> HashMap<String, String> {
         let templates =
             settings::build_service_templates(&self.config_dir, Some(build_dir.to_path_buf()));
         let services = settings::load_build_services(&self.config_dir);
-        let unfit = self.compile_cache_is_unfit(&services);
-        client_env_for(&services, &templates, ClientBuild::At(build_dir), unfit)
+        let routing = routing_the_wrapper_can_enforce(
+            self.compile_cache_routing(&services),
+            &merge_client_env(&services, &templates),
+        );
+        client_env_for(&services, &templates, ClientBuild::At(build_dir), &routing)
     }
 
-    /// Whether the supervisor has positively observed this machine's compile
-    /// cache failing the compiles it accepts.
-    ///
-    /// Read from the same runtime record the panel reads, so what a build is
-    /// told and what an operator sees can never disagree.
-    fn compile_cache_is_unfit(&self, services: &HashMap<String, BuildServiceConfig>) -> bool {
+    /// Which roots this machine's compile cache may serve, from the same
+    /// runtime record the panel reads.
+    fn compile_cache_routing(&self, services: &HashMap<String, BuildServiceConfig>) -> Routing {
         let Some((name, _)) = compile_cache_service(services) else {
-            return false;
+            return Routing::default();
         };
         self.build_service_runtime
             .lock()
             .unwrap()
             .get(&name)
-            .is_some_and(|runtime| runtime.unfit.is_some())
+            .map(BuildServiceRuntimeDiagnostic::routing)
+            .unwrap_or_default()
+    }
+
+    /// One sentence per managed root this machine's compile cache may not
+    /// serve. A hot read: assembled from the supervisor's record, with no
+    /// settings parse, probe, or filesystem access.
+    pub(crate) fn compile_cache_fitness(&self) -> Vec<String> {
+        let Some(observed) = self.observed_compile_cache_service() else {
+            return Vec::new();
+        };
+        if !observed.enabled {
+            return Vec::new();
+        }
+        self.build_service_runtime
+            .lock()
+            .unwrap()
+            .get(&observed.name)
+            .map(BuildServiceRuntimeDiagnostic::fitness)
+            .unwrap_or_default()
     }
 
     /// The client env for a command running in an executor cell **on this
     /// machine**.
     ///
-    /// A cell is materialized under `{cairnHome}/build-slots` by construction, so
-    /// it is inside a managed build root without a path test — which matters
-    /// because the runner composing a cell request knows the cell's repository
-    /// but not the absolute slot the executor will hand it. The caller states the
-    /// two things this cannot see: that the batch is not running in the project's
-    /// live checkout, and that it was placed on the colocated executor (this
-    /// daemon answers on loopback and is named by this machine's paths).
+    /// A cell lives under `{buildRoot}/build-slots` (the colocated build root,
+    /// cairn/5286), so it is inside that managed root without a path test —
+    /// which matters because the runner composing a cell request knows the
+    /// cell's repository but not the absolute slot the executor will hand it.
+    /// The caller states the two things this cannot see: that the batch is not
+    /// running in the project's live checkout, and that it was placed on the
+    /// colocated executor (this daemon answers on loopback and is named by this
+    /// machine's paths).
     pub(crate) fn cell_build_service_client_env(&self) -> HashMap<String, String> {
         let services = settings::load_build_services(&self.config_dir);
-        let unfit = self.compile_cache_is_unfit(&services);
-        client_env_for(
-            &services,
-            &settings::build_service_templates(&self.config_dir, None),
-            ClientBuild::Cell,
-            unfit,
-        )
+        let templates = settings::build_service_templates(&self.config_dir, None);
+        let routing = routing_the_wrapper_can_enforce(
+            self.compile_cache_routing(&services),
+            &merge_client_env(&services, &templates),
+        );
+        client_env_for(&services, &templates, ClientBuild::Cell, &routing)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::config::build_services::{canonical_path, target_grant_glob};
     use crate::db::DbState;
     use crate::services::testing::{MockChildProcess, MockProcessSpawner, TestServicesBuilder};
     use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-
-    const BUILD_SERVICE_CLIENT_ENV: &str = "CAIRN_BUILD_SERVICE_CLIENT";
 
     fn default_sccache_service() -> BuildServiceConfig {
         BuildServiceConfig {
@@ -2940,6 +4143,25 @@ mod tests {
         assert!(!env.contains_key("DISABLED_ONLY"));
     }
 
+    /// Two loads of one configuration are one configuration, whatever order
+    /// their env maps iterate in.
+    #[test]
+    fn the_config_fingerprint_does_not_depend_on_map_order() {
+        let cfg = default_sccache_service();
+        // Each collect builds a map with a fresh random hasher, so these
+        // iterate in different orders, as two loads of settings do.
+        let fingerprints: std::collections::BTreeSet<String> = (0..16)
+            .map(|_| {
+                let mut copy = cfg.clone();
+                copy.env = cfg.env.clone().into_iter().collect();
+                copy.launch_env = cfg.launch_env.clone().into_iter().collect();
+                service_config_fingerprint(&copy)
+            })
+            .chain([service_config_fingerprint(&cfg)])
+            .collect();
+        assert_eq!(fingerprints.len(), 1, "{fingerprints:?}");
+    }
+
     #[test]
     fn recovery_exhaustion_survives_runtime_state_recreation() {
         let root = tempfile::tempdir().unwrap();
@@ -2978,16 +4200,21 @@ mod tests {
         assert!(runtime.current_failure.is_none());
     }
 
-    struct FakeListenerControl {
+    pub(crate) struct FakeListenerControl {
         /// Held open only when a test needs the port to answer a real TCP probe.
         /// Binding an ephemeral port is not free of consequence here — see the
         /// serialization note below — so tests that only exercise this control
         /// use [`FakeListenerControl::detached`] and bind nothing.
         socket: std::sync::Arc<std::sync::Mutex<Option<std::net::TcpListener>>>,
         listening: std::sync::Mutex<bool>,
-        process: ListenerProcess,
+        process: std::sync::Mutex<ListenerProcess>,
         environ: Result<HashMap<String, String>, String>,
         terminated: std::sync::Mutex<Vec<u32>>,
+    }
+
+    /// The start token the fake reports for `pid`: one incarnation per pid.
+    fn fake_token(pid: u32) -> String {
+        format!("start-{pid}")
     }
 
     impl FakeListenerControl {
@@ -2995,10 +4222,27 @@ mod tests {
             Self {
                 listening: std::sync::Mutex::new(socket.is_some()),
                 socket: std::sync::Arc::new(std::sync::Mutex::new(socket)),
-                process: ListenerProcess { pid, executable },
+                process: std::sync::Mutex::new(ListenerProcess { pid, executable }),
                 environ: Ok(HashMap::new()),
                 terminated: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn is_listening(&self) -> bool {
+            *self.listening.lock().unwrap()
+        }
+
+        /// A new daemon takes the port: what a relaunch does once the old
+        /// listener is gone.
+        fn relisten(&self, addr: &str, pid: u32) {
+            *self.socket.lock().unwrap() = Some(std::net::TcpListener::bind(addr).unwrap());
+            self.process.lock().unwrap().pid = pid;
+            *self.listening.lock().unwrap() = true;
+        }
+
+        /// The same port, answered by a different process.
+        fn set_pid(&self, pid: u32) {
+            self.process.lock().unwrap().pid = pid;
         }
 
         /// A listener this control reports without holding a real socket.
@@ -3024,7 +4268,15 @@ mod tests {
 
     impl ListenerProcessControl for FakeListenerControl {
         fn listener(&self, _addr: &str) -> Result<Option<ListenerProcess>, String> {
-            Ok(self.listening.lock().unwrap().then(|| self.process.clone()))
+            Ok(self
+                .listening
+                .lock()
+                .unwrap()
+                .then(|| self.process.lock().unwrap().clone()))
+        }
+
+        fn start_token(&self, pid: u32) -> Option<String> {
+            Some(fake_token(pid))
         }
 
         fn environ(&self, _pid: u32) -> Result<HashMap<String, String>, String> {
@@ -3070,6 +4322,14 @@ mod tests {
         HashMap::from([("sccache".to_string(), default_sccache_service())])
     }
 
+    /// A daemon proven for every managed root of `templates`.
+    fn fit_routing(templates: &Templates) -> Routing {
+        Routing {
+            daemon_unfit: false,
+            roots: root_strings(&managed_build_roots(templates)),
+        }
+    }
+
     /// The regression this whole change is about: the compile cache is a
     /// performance mechanism and the fence is a supervision policy, so a build
     /// inside a managed root is pointed at the daemon with no fence in sight.
@@ -3077,6 +4337,7 @@ mod tests {
     /// running plain `rustc` against no cache at all.
     #[test]
     fn a_build_inside_a_managed_root_is_pointed_at_the_daemon() {
+        let routing = fit_routing(&templates());
         for build_dir in [
             "/home/u/.cairn/worktrees/cairn-1/src-tauri",
             "/home/u/.cairn/build-slots/cairn/slot-3",
@@ -3085,7 +4346,7 @@ mod tests {
                 &sccache_services(),
                 &templates(),
                 ClientBuild::At(Path::new(build_dir)),
-                false,
+                &routing,
             );
             assert_eq!(
                 env.get("SCCACHE_SERVER_PORT").map(String::as_str),
@@ -3099,7 +4360,58 @@ mod tests {
                 env.get(BUILD_SERVICE_CLIENT_ENV).map(String::as_str),
                 Some("1")
             );
+            // And told which roots it may attach for, canonically spelled.
+            assert_eq!(
+                env.get(BUILD_SERVICE_ROOTS_ENV).cloned(),
+                Some(routing.roots.join(":"))
+            );
+            assert!(!env.contains_key(BUILD_SERVICE_UNFIT_ENV), "{env:?}");
         }
+    }
+
+    /// Routing is per root: a daemon proven for the worktrees but not for the
+    /// cells still serves the worktrees, and a cell compiles directly.
+    #[test]
+    fn a_build_is_routed_only_from_a_root_the_daemon_may_serve() {
+        let t = templates();
+        let worktrees = canonical_path(Path::new("/home/u/.cairn/worktrees"))
+            .display()
+            .to_string();
+        let routing = Routing {
+            daemon_unfit: false,
+            roots: vec![worktrees.clone()],
+        };
+        let cell = client_env_for(&sccache_services(), &t, ClientBuild::Cell, &routing);
+        assert_eq!(
+            cell.get(BUILD_SERVICE_UNFIT_ENV).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(cell.get(BUILD_SERVICE_ROOTS_ENV), Some(&worktrees));
+        let worktree = client_env_for(
+            &sccache_services(),
+            &t,
+            ClientBuild::At(Path::new("/home/u/.cairn/worktrees/cairn-1")),
+            &routing,
+        );
+        assert!(
+            !worktree.contains_key(BUILD_SERVICE_UNFIT_ENV),
+            "{worktree:?}"
+        );
+        // A daemon with no proven root routes nothing, and says so.
+        let unproven = client_env_for(
+            &sccache_services(),
+            &t,
+            ClientBuild::Cell,
+            &Routing::default(),
+        );
+        assert_eq!(
+            unproven.get(BUILD_SERVICE_ROOTS_ENV).map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            unproven.get(BUILD_SERVICE_UNFIT_ENV).map(String::as_str),
+            Some("1")
+        );
     }
 
     /// The other half, and the reason admission is by build directory at all: the
@@ -3112,7 +4424,7 @@ mod tests {
             &sccache_services(),
             &templates(),
             ClientBuild::At(Path::new("/home/u/projects/cairn")),
-            false,
+            &fit_routing(&templates()),
         );
         assert!(
             env.is_empty(),
@@ -3126,7 +4438,12 @@ mod tests {
     /// it.
     #[test]
     fn an_executor_cell_is_admitted_without_a_path() {
-        let env = client_env_for(&sccache_services(), &templates(), ClientBuild::Cell, false);
+        let env = client_env_for(
+            &sccache_services(),
+            &templates(),
+            ClientBuild::Cell,
+            &fit_routing(&templates()),
+        );
         assert_eq!(
             env.get("SCCACHE_SERVER_PORT").map(String::as_str),
             Some("4227")
@@ -3135,6 +4452,7 @@ mod tests {
             env.get(BUILD_SERVICE_CLIENT_ENV).map(String::as_str),
             Some("1")
         );
+        assert!(!env.contains_key(BUILD_SERVICE_UNFIT_ENV), "{env:?}");
     }
 
     /// With nothing to attach to, a build must be told nothing at all: a stray
@@ -3146,7 +4464,13 @@ mod tests {
         disabled.enabled = false;
         let services = HashMap::from([("sccache".to_string(), disabled)]);
 
-        assert!(client_env_for(&services, &templates(), ClientBuild::Cell, false).is_empty());
+        assert!(client_env_for(
+            &services,
+            &templates(),
+            ClientBuild::Cell,
+            &Routing::default()
+        )
+        .is_empty());
     }
 
     /// Build services are a generic facility, so "some service is enabled" is not
@@ -3169,7 +4493,12 @@ mod tests {
             ("mycache".to_string(), other),
         ]);
 
-        let env = client_env_for(&services, &templates(), ClientBuild::Cell, false);
+        let env = client_env_for(
+            &services,
+            &templates(),
+            ClientBuild::Cell,
+            &fit_routing(&templates()),
+        );
         assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
         assert!(
             !env.contains_key(BUILD_SERVICE_CLIENT_ENV),
@@ -3192,9 +4521,55 @@ mod tests {
             })
             .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(7, vec![]))));
 
-        let child = launch_service(&spawner, &default_sccache_service(), &templates(), vec![])
-            .expect("launch should succeed");
+        let child = launch_service(
+            &spawner,
+            &default_sccache_service(),
+            &templates(),
+            &[],
+            vec![],
+        )
+        .expect("launch should succeed");
         assert_eq!(child.id(), 7);
+    }
+
+    /// The grant comes from the managed roots by construction, so a moved
+    /// build root is granted with no `write` entry naming it — and nothing
+    /// broader than its `target/` trees is granted.
+    #[test]
+    fn a_daemon_is_granted_every_managed_roots_target_tree_by_construction() {
+        let mut cfg = default_sccache_service();
+        cfg.write.clear();
+        let t = Templates {
+            build_root: PathBuf::from("/Volumes/Builds/x"),
+            ..templates()
+        };
+        let roots = managed_build_roots(&t);
+        let expected: Vec<String> = roots
+            .iter()
+            .map(|root| sandbox::glob_to_regex(&target_grant_glob(root)))
+            .collect();
+        assert!(expected
+            .iter()
+            .any(|regex| regex.ends_with("/build-slots/.*/target/.*")));
+        assert!(expected
+            .iter()
+            .any(|regex| regex.ends_with("/worktrees/.*/target/.*")));
+        let config = build_service_spawn_config(&cfg, &t, &roots, vec![]).unwrap();
+        if let sandbox::Confinement::Fenced(policy) = &config.confinement {
+            assert_eq!(policy.writable_regex, expected);
+        }
+        // The probe's site is inside that shape, so a passing probe proves the
+        // exact write a build under the root makes.
+        for root in &roots {
+            let grant =
+                regex::Regex::new(&sandbox::glob_to_regex(&target_grant_glob(root))).unwrap();
+            assert!(grant.is_match(
+                &capability_probe_dir(root)
+                    .join("out_1/probe.d")
+                    .to_string_lossy()
+            ));
+            assert!(!grant.is_match(&root.join("cairn-1/src/lib.rs").to_string_lossy()));
+        }
     }
 
     /// Templates rooted at a real directory, so paths the launch path creates
@@ -3231,7 +4606,7 @@ mod tests {
         spawner
             .expect_spawn()
             .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(7, vec![]))));
-        launch_service(&spawner, &cfg, &templates, vec![]).expect("launch should succeed");
+        launch_service(&spawner, &cfg, &templates, &[], vec![]).expect("launch should succeed");
 
         for dir in &dirs {
             assert!(dir.is_dir(), "daemon temp dir {dir:?} was not created");
@@ -3263,10 +4638,107 @@ mod tests {
 
         let control =
             FakeListenerControl::new(Some(listener), 42, PathBuf::from("/unused/sccache"));
-        let child =
-            reconcile_launched_service(&spawner, &control, &cfg, &templates(), vec![], true)
-                .expect("healthy server should be adopted");
+        // Adoptable because its record covers this runner: launched by another
+        // runner, so only the roots are compared, never that runner's config.
+        let grant_dir = tempfile::tempdir().unwrap();
+        let t = templates();
+        write_grant_record(
+            grant_dir.path(),
+            &grant_record(
+                42,
+                root_strings(&managed_build_roots(&t)),
+                &cfg,
+                &t,
+                "/other",
+            ),
+        )
+        .unwrap();
+        let child = reconcile_launched_service(
+            &spawner,
+            &control,
+            &cfg,
+            &t,
+            &unrecorded(&grant_dir),
+            vec![],
+            true,
+        )
+        .expect("healthy server should be adopted");
         assert!(child.is_none());
+        assert!(control.terminated.lock().unwrap().is_empty());
+    }
+
+    /// A record for this daemon written by `launcher`.
+    fn grant_record(
+        pid: u32,
+        roots: Vec<String>,
+        cfg: &BuildServiceConfig,
+        templates: &Templates,
+        launcher: &str,
+    ) -> DaemonGrantRecord {
+        DaemonGrantRecord {
+            pid,
+            start_token: fake_token(pid),
+            launch_fingerprint: cfg.launch_fingerprint(templates),
+            roots,
+            write_globs: Vec::new(),
+            launcher_cairn_home: launcher.to_string(),
+            launched_at_unix_ms: 1,
+        }
+    }
+
+    /// A launch whose grant is recorded in `dir`, granting no roots.
+    fn unrecorded(dir: &tempfile::TempDir) -> LaunchGrant<'_> {
+        LaunchGrant {
+            dir: dir.path(),
+            roots: &[],
+            condemned: None,
+        }
+    }
+
+    /// Answering is not a grant. A healthy server that won the port with no
+    /// record covering this runner — every daemon that predates grant records,
+    /// or one granted for a build root that has since moved — is never adopted,
+    /// and one this runner may not destroy is left running with the reason.
+    #[test]
+    #[serial_test::serial(build_service_port)]
+    fn a_healthy_server_without_a_covering_grant_is_never_adopted() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("sccache");
+        std::fs::write(&executable, "fake").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut cfg = default_sccache_service();
+        cfg.start = vec![executable.to_string_lossy().to_string()];
+        cfg.ready.as_mut().unwrap().tcp = Some(addr);
+        let mut spawner = MockProcessSpawner::new();
+        spawner.expect_spawn().returning(|config| {
+            Ok(Box::new(
+                if config.env.contains_key("SCCACHE_START_SERVER") {
+                    MockChildProcess::failing(10, "Address already in use", 1)
+                } else {
+                    MockChildProcess::failing(11, "", 0)
+                },
+            ))
+        });
+        let control = FakeListenerControl::new(Some(listener), 42, executable);
+        let grant_dir = tempfile::tempdir().unwrap();
+        let refused = match reconcile_launched_service(
+            &spawner,
+            &control,
+            &cfg,
+            &templates(),
+            &unrecorded(&grant_dir),
+            vec![],
+            false,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a daemon with no grant record must not be adopted"),
+        };
+        assert!(
+            refused.contains("grant does not cover this runner"),
+            "{refused}"
+        );
+        assert!(refused.contains("no grant record"), "{refused}");
         assert!(control.terminated.lock().unwrap().is_empty());
     }
 
@@ -3306,10 +4778,18 @@ mod tests {
             .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(23, vec![]))));
 
         let control = FakeListenerControl::new(Some(listener), 4242, executable);
-        let child =
-            reconcile_launched_service(&spawner, &control, &cfg, &templates(), vec![], true)
-                .expect("verified orphan should be replaced")
-                .expect("replacement should be supervised");
+        let grant_dir = tempfile::tempdir().unwrap();
+        let child = reconcile_launched_service(
+            &spawner,
+            &control,
+            &cfg,
+            &templates(),
+            &unrecorded(&grant_dir),
+            vec![],
+            true,
+        )
+        .expect("verified orphan should be replaced")
+        .expect("replacement should be supervised");
         assert_eq!(child.id(), 23);
         assert_eq!(*control.terminated.lock().unwrap(), vec![4242]);
     }
@@ -3404,10 +4884,18 @@ mod tests {
 
         let control = FakeListenerControl::new(Some(listener), 777, executable)
             .with_env("TMPDIR", &reclaimed);
-        let child =
-            reconcile_launched_service(&spawner, &control, &cfg, &templates(), vec![], true)
-                .expect("a daemon that cannot use its temp dir must be replaced")
-                .expect("the replacement should be supervised");
+        let grant_dir = tempfile::tempdir().unwrap();
+        let child = reconcile_launched_service(
+            &spawner,
+            &control,
+            &cfg,
+            &templates(),
+            &unrecorded(&grant_dir),
+            vec![],
+            true,
+        )
+        .expect("a daemon that cannot use its temp dir must be replaced")
+        .expect("the replacement should be supervised");
         assert_eq!(child.id(), 33);
         assert_eq!(*control.terminated.lock().unwrap(), vec![777]);
     }
@@ -3442,12 +4930,19 @@ mod tests {
             .returning(|_| Ok(Box::new(MockChildProcess::failing(40, "unhealthy", 1))));
 
         let control = FakeListenerControl::new(Some(listener), 4242, executable);
-        let refused =
-            match reconcile_launched_service(&spawner, &control, &cfg, &templates(), vec![], false)
-            {
-                Err(refused) => refused,
-                Ok(_) => panic!("an unvouched verdict must not authorize termination"),
-            };
+        let grant_dir = tempfile::tempdir().unwrap();
+        let refused = match reconcile_launched_service(
+            &spawner,
+            &control,
+            &cfg,
+            &templates(),
+            &unrecorded(&grant_dir),
+            vec![],
+            false,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("an unvouched verdict must not authorize termination"),
+        };
         assert!(
             refused.contains("a TCP connection to")
                 && refused.contains("succeeded at the termination decision"),
@@ -3503,6 +4998,7 @@ mod tests {
             &control,
             &cfg,
             &templates_in(root.path()),
+            &unrecorded(&root),
             vec![],
             false,
         )
@@ -3948,29 +5444,35 @@ Max cache size                       50 GiB
         spawner
     }
 
-    /// A capability site rooted in a real directory.
+    /// A capability site rooted in a real directory, and its managed roots.
     ///
-    /// The probe compiles into a managed build root, so the site has to be a
-    /// place that can actually be created — with the fixture's `/home/u` it
+    /// The probe compiles into each managed build root, so the site has to be
+    /// a place that can actually be created — with the fixture's `/home/u` it
     /// cannot, and the probe correctly declines to accuse anyone, which would
     /// make these tests pass for the wrong reason. The `TempDir` is returned so
     /// the caller keeps it alive for the duration of the assertion.
-    fn capability_service() -> (BuildServiceConfig, Templates, tempfile::TempDir) {
+    fn capability_service() -> (
+        BuildServiceConfig,
+        Templates,
+        Vec<String>,
+        tempfile::TempDir,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let templates = templates_in(temp.path());
-        (default_sccache_service(), templates, temp)
+        let roots = root_strings(&managed_build_roots(&templates));
+        (default_sccache_service(), templates, roots, temp)
     }
 
     /// A daemon whose sandbox grant covers `granted` and nothing else — the
-    /// cross-home partial grant that actually caused CAIRN-3355, rather than a
-    /// daemon that fails everything.
+    /// partial grant that actually caused CAIRN-3355 and cairn/5556, rather
+    /// than a daemon that fails everything.
     ///
     /// It answers the statistics round trip, refuses a compile whose `--out-dir`
     /// falls outside its grant, and compiles anything inside it. The control
     /// (`rustc` directly) always succeeds, which is what the real control does:
     /// the supervisor's probe spawns carry no sandbox, so the unconfined rustc
     /// can write where the confined daemon cannot.
-    fn spawner_for_daemon_granted(granted: PathBuf) -> MockProcessSpawner {
+    fn spawner_for_daemon_granted(granted: Vec<PathBuf>) -> MockProcessSpawner {
         let mut spawner = MockProcessSpawner::new();
         spawner.expect_spawn().returning(move |config| {
             if config.program == "rustc" {
@@ -3986,50 +5488,90 @@ Max cache size                       50 GiB
                 .nth(1)
                 .cloned()
                 .unwrap_or_default();
-            Ok(Box::new(if Path::new(&out).starts_with(&granted) {
-                MockChildProcess::failing(1, "", 0)
-            } else {
-                MockChildProcess::failing(1, "error: Operation not permitted (os error 1)", 1)
-            }))
+            Ok(Box::new(
+                if granted.iter().any(|root| Path::new(&out).starts_with(root)) {
+                    MockChildProcess::failing(1, "", 0)
+                } else {
+                    MockChildProcess::failing(1, "error: Operation not permitted (os error 1)", 1)
+                },
+            ))
         });
         spawner
     }
 
-    /// The confinement-inheritance recurrence, modelled exactly.
-    ///
-    /// The daemon can write a Cairn build slot because its launcher granted that
-    /// tree, but cannot write anywhere else. The old managed-root probe called
-    /// this healthy; the neutral probe must condemn it before an operator build
-    /// can route a cache miss through the poisoned process.
+    /// The probe this replaces compiled into `~/.cache`, which every service
+    /// sandbox can write through its toolchain grants, so it passed for a
+    /// daemon granted nothing else — the daemon of cairn/5556, whose grant
+    /// named the home while its builds had moved to a build volume. Each managed
+    /// root is now its own experiment.
     #[test]
-    fn a_daemon_confined_to_cairn_roots_fails_machine_wide_fitness() {
-        let machine = tempfile::tempdir().unwrap();
-        let home = machine.path().join("installed-app");
-        let templates = templates_in(&home);
-        let cfg = default_sccache_service();
-        let granted = templates.cairn_home.join("build-slots");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe = probe_for(listener.local_addr().unwrap().to_string());
-        let spawner = spawner_for_daemon_granted(granted);
-        let control = FakeListenerControl::new(None, 1, PathBuf::from("/unused/sccache"));
+    fn a_daemon_granted_only_a_neutral_directory_is_unfit_for_every_managed_root() {
+        let (cfg, templates, roots, _site) = capability_service();
+        let spawner =
+            spawner_for_daemon_granted(vec![canonical_path(&templates.home.join(".cache"))]);
 
-        let observation = assess_service(
+        let report = probe_daemon_fitness(
             &spawner,
-            &control,
-            &probe,
+            &cfg,
+            &templates,
             &HashMap::new(),
+            &roots,
             Duration::from_secs(1),
-            Some((&cfg, &templates)),
         );
 
-        assert_eq!(observation.health, ServiceHealth::Wedged);
-        let reason = observation
-            .unfit
-            .expect("the fenced daemon must fail machine-wide fitness");
-        assert!(reason.contains("Operation not permitted"), "{reason}");
+        assert_eq!(report.roots.len(), 2, "{report:?}");
+        for root in &roots {
+            match &report.roots[root] {
+                RootFitness::Unfit { summary, detail } => {
+                    assert_eq!(summary, "write refused");
+                    assert!(detail.contains("Operation not permitted"), "{detail}");
+                    assert!(detail.contains(root.as_str()), "{detail}");
+                }
+                other => panic!("{root} must be unfit, not {other:?}"),
+            }
+            assert!(capability_probe_dir(Path::new(root)).starts_with(root));
+        }
+        assert_eq!(
+            report.daemon_unfit, None,
+            "a missing root is not a broken daemon"
+        );
+    }
+
+    /// Unfitness is per root: a daemon granted the worktrees but not the cells
+    /// keeps serving the worktrees.
+    #[test]
+    fn a_daemon_granted_one_root_is_unfit_only_for_the_other() {
+        let (cfg, templates, roots, _site) = capability_service();
+        let worktrees = roots[0].clone();
+        let cells = roots[1].clone();
+        let spawner = spawner_for_daemon_granted(vec![PathBuf::from(&worktrees)]);
+
+        let report = probe_daemon_fitness(
+            &spawner,
+            &cfg,
+            &templates,
+            &HashMap::new(),
+            &roots,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(report.roots[&worktrees], RootFitness::Proven);
         assert!(
-            capability_probe_dir(&templates).starts_with(home.join(".cache")),
-            "the probe must be outside the granted Cairn build-slot tree"
+            matches!(&report.roots[&cells], RootFitness::Unfit { summary, .. } if summary == "write refused"),
+            "{report:?}"
+        );
+        let mut state = BuildServiceRuntimeDiagnostic {
+            own_roots: roots.clone(),
+            ..BuildServiceRuntimeDiagnostic::default()
+        };
+        state.observe_incarnation(Some((7, fake_token(7))), &roots);
+        state.apply_fitness(report, 0);
+        assert_eq!(state.routable_roots(), vec![worktrees]);
+        assert_eq!(
+            state.fitness(),
+            vec![format!(
+                "unfit for {cells} (write refused); clients compile directly"
+            )]
         );
     }
 
@@ -4043,30 +5585,26 @@ Max cache size                       50 GiB
     /// routed to it, which is exactly what it did for a day while the panel
     /// showed a green cache line (CAIRN-3355).
     #[test]
-    fn a_daemon_proven_unable_to_compile_is_not_healthy() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe = probe_for(listener.local_addr().unwrap().to_string());
+    fn a_daemon_proven_unable_to_compile_is_unfit_for_the_root() {
         let spawner = spawner_where_the_probe(false, FAILING_STATS);
-        let control = FakeListenerControl::new(None, 1, PathBuf::from("/unused/sccache"));
-        let (cfg, templates, _site) = capability_service();
+        let (cfg, templates, roots, _site) = capability_service();
 
-        let observation = assess_service(
+        let report = probe_daemon_fitness(
             &spawner,
-            &control,
-            &probe,
+            &cfg,
+            &templates,
             &HashMap::new(),
+            &roots[..1],
             Duration::from_secs(1),
-            Some((&cfg, &templates)),
         );
 
-        assert_eq!(observation.health, ServiceHealth::Wedged);
-        let reason = observation
-            .unfit
-            .expect("the verdict must carry its reason");
-        assert!(
-            reason.contains("trivially valid"),
-            "the reason must name the experiment that produced it: {reason}"
-        );
+        match &report.roots[&roots[0]] {
+            RootFitness::Unfit { detail, .. } => assert!(
+                detail.contains("trivially valid"),
+                "the reason must name the experiment that produced it: {detail}"
+            ),
+            other => panic!("expected an unfit root, not {other:?}"),
+        }
     }
 
     /// The false positive the counters cannot see, and the probe settles.
@@ -4082,7 +5620,7 @@ Max cache size                       50 GiB
         let probe = probe_for(listener.local_addr().unwrap().to_string());
         let spawner = spawner_where_the_probe(true, WARM_CACHE_BROKEN_CRATE_STATS);
         let control = FakeListenerControl::new(None, 1, PathBuf::from("/unused/sccache"));
-        let (cfg, templates, _site) = capability_service();
+        let (cfg, templates, roots, _site) = capability_service();
 
         let observation = assess_service(
             &spawner,
@@ -4090,15 +5628,25 @@ Max cache size                       50 GiB
             &probe,
             &HashMap::new(),
             Duration::from_secs(1),
-            Some((&cfg, &templates)),
+            None,
         );
-
-        assert_eq!(
-            observation.health,
-            ServiceHealth::Healthy,
-            "the daemon compiled the probe, so the failures are the code's and not its own"
+        assert_eq!(observation.health, ServiceHealth::Healthy);
+        let report = probe_daemon_fitness(
+            &spawner,
+            &cfg,
+            &templates,
+            &HashMap::new(),
+            &roots,
+            Duration::from_secs(1),
         );
-        assert_eq!(observation.unfit, None);
+        assert!(
+            report
+                .roots
+                .values()
+                .all(|fitness| *fitness == RootFitness::Proven),
+            "the daemon compiled the probe, so the failures are the code's and not its own: {report:?}"
+        );
+        assert_eq!(report.daemon_unfit, None);
     }
 
     /// A busy daemon is not a broken one. The probe compile waits in line behind
@@ -4117,17 +5665,20 @@ Max cache size                       50 GiB
                 MockChildProcess::with_stdout(1, vec![])
             }))
         });
-        let (cfg, templates, _site) = capability_service();
-        assert_eq!(
-            prove_daemon_unfit(
-                &spawner,
-                &cfg,
-                &templates,
-                &HashMap::new(),
-                Duration::from_millis(40)
-            ),
-            None
+        let (cfg, templates, roots, _site) = capability_service();
+        let report = probe_daemon_fitness(
+            &spawner,
+            &cfg,
+            &templates,
+            &HashMap::new(),
+            &roots[..1],
+            Duration::from_millis(40),
         );
+        assert!(
+            matches!(report.roots[&roots[0]], RootFitness::Inconclusive(_)),
+            "{report:?}"
+        );
+        assert_eq!(report.daemon_unfit, None);
     }
 
     /// Counters alone never condemn: with no capability site there is no
@@ -4162,33 +5713,6 @@ Max cache size                       50 GiB
         assert_eq!(observation.unfit, None);
     }
 
-    /// The other half: a working daemon is left alone. Same probe, same path,
-    /// same instruments — only the counters differ.
-    #[test]
-    fn a_daemon_whose_compiles_succeed_stays_healthy() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe = probe_for(listener.local_addr().unwrap().to_string());
-        let mut spawner = MockProcessSpawner::new();
-        spawner
-            .expect_spawn()
-            .returning(|_| Ok(Box::new(answering_with(SAMPLE_STATS))));
-        let control = FakeListenerControl::new(None, 1, PathBuf::from("/unused/sccache"));
-        let (cfg, templates, _site) = capability_service();
-
-        let observation = assess_service(
-            &spawner,
-            &control,
-            &probe,
-            &HashMap::new(),
-            Duration::from_secs(1),
-            Some((&cfg, &templates)),
-        );
-        assert_eq!(observation.health, ServiceHealth::Healthy);
-        assert_eq!(observation.unfit, None);
-        // Fitness is proved even when the counters look healthy; statistics are
-        // not permission to route a compile.
-    }
-
     /// A build pointed at a daemon Cairn has watched fail is told so, and
     /// compiles directly rather than dying (see `scripts/cache-wrapper.sh`).
     ///
@@ -4198,7 +5722,16 @@ Max cache size                       50 GiB
     /// outage into a machine-wide rebuild.
     #[test]
     fn an_unfit_daemon_costs_a_build_its_cache_hits_and_not_its_lane() {
-        let unfit = client_env_for(&sccache_services(), &templates(), ClientBuild::Cell, true);
+        let unfit_daemon = Routing {
+            daemon_unfit: true,
+            ..fit_routing(&templates())
+        };
+        let unfit = client_env_for(
+            &sccache_services(),
+            &templates(),
+            ClientBuild::Cell,
+            &unfit_daemon,
+        );
         assert_eq!(
             unfit.get(BUILD_SERVICE_UNFIT_ENV).map(String::as_str),
             Some("1")
@@ -4209,9 +5742,13 @@ Max cache size                       50 GiB
             "the wrapper must not move, or degrading would rebuild the world"
         );
 
-        // A healthy daemon says nothing, so the marker's presence is always a
-        // positive observation rather than the absence of one.
-        let fit = client_env_for(&sccache_services(), &templates(), ClientBuild::Cell, false);
+        // A daemon proven for this build's root says nothing.
+        let fit = client_env_for(
+            &sccache_services(),
+            &templates(),
+            ClientBuild::Cell,
+            &fit_routing(&templates()),
+        );
         assert!(!fit.contains_key(BUILD_SERVICE_UNFIT_ENV));
 
         // A build no service claimed has nothing to be withdrawn from, and a
@@ -4220,7 +5757,7 @@ Max cache size                       50 GiB
             &sccache_services(),
             &templates(),
             ClientBuild::At(Path::new("/home/u/projects/cairn")),
-            true,
+            &unfit_daemon,
         );
         assert!(unclaimed.is_empty(), "{unclaimed:?}");
     }
@@ -4456,9 +5993,6 @@ Max cache size                       50 GiB
 
     #[test]
     fn cache_hit_read_failure_is_unfit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let probe = probe_for(listener.local_addr().unwrap().to_string());
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();
         let mut spawner = MockProcessSpawner::new();
@@ -4475,19 +6009,21 @@ Max cache size                       50 GiB
                 MockChildProcess::failing(1, "memory map must have a non-zero length", 1)
             }))
         });
-        let control = FakeListenerControl::detached(77, PathBuf::from("/bin/sccache"));
-        let (cfg, templates, _site) = capability_service();
-        let observation = assess_service(
+        let (cfg, templates, roots, _site) = capability_service();
+        let report = probe_daemon_fitness(
             &spawner,
-            &control,
-            &probe,
+            &cfg,
+            &templates,
             &HashMap::new(),
+            &roots[..1],
             Duration::from_secs(1),
-            Some((&cfg, &templates)),
         );
-        assert_eq!(observation.health, ServiceHealth::Wedged);
-        let reason = observation.unfit.unwrap();
-        assert!(reason.contains("listener pid 77"), "{reason}");
+        // The write succeeded, so the root is proven; serving what it wrote
+        // failed, which is about the daemon and not the root.
+        assert_eq!(report.roots[&roots[0]], RootFitness::Proven);
+        let reason = report
+            .daemon_unfit
+            .expect("a failed hit condemns the daemon");
         assert!(
             reason.contains("serve the cache entry it had just written"),
             "{reason}"
@@ -4703,5 +6239,678 @@ Max cache size                       50 GiB
             orch.compile_cache_health().map(|health| health.service),
             Some("sccache".to_string())
         );
+    }
+
+    #[test]
+    fn a_record_for_another_pid_or_start_token_is_not_this_daemons_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = templates();
+        let cfg = default_sccache_service();
+        let own = root_strings(&managed_build_roots(&t));
+        let control = FakeListenerControl::detached(42, PathBuf::from("/unused/sccache"));
+
+        write_grant_record(
+            dir.path(),
+            &grant_record(41, own.clone(), &cfg, &t, "/other"),
+        )
+        .unwrap();
+        match running_grant_verdict(&control, "127.0.0.1:1", &cfg, &t, dir.path()) {
+            GrantVerdict::Stale(stale) => {
+                assert!(
+                    stale.reason.contains("not the listening pid 42"),
+                    "{stale:?}"
+                );
+                assert_eq!(
+                    stale.record, None,
+                    "a record about another process covers nothing"
+                );
+            }
+            covered => panic!("{covered:?}"),
+        }
+
+        // Same pid, but a different lifetime: the pid was reused.
+        let mut reused = grant_record(42, own.clone(), &cfg, &t, "/other");
+        reused.start_token = "start-earlier".into();
+        write_grant_record(dir.path(), &reused).unwrap();
+        assert!(matches!(
+            running_grant_verdict(&control, "127.0.0.1:1", &cfg, &t, dir.path()),
+            GrantVerdict::Stale(GrantStale { record: None, .. })
+        ));
+
+        write_grant_record(dir.path(), &grant_record(42, own, &cfg, &t, "/other")).unwrap();
+        assert!(matches!(
+            running_grant_verdict(&control, "127.0.0.1:1", &cfg, &t, dir.path()),
+            GrantVerdict::Covered(_)
+        ));
+    }
+
+    #[test]
+    fn no_record_means_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = FakeListenerControl::detached(42, PathBuf::from("/unused/sccache"));
+        assert_eq!(
+            running_grant_verdict(
+                &control,
+                "127.0.0.1:1",
+                &default_sccache_service(),
+                &templates(),
+                dir.path()
+            ),
+            GrantVerdict::Stale(GrantStale {
+                reason: "launch grant changed (no grant record)".into(),
+                record: None,
+            })
+        );
+    }
+
+    /// Several runners share one daemon, each with its own home and build root.
+    /// The grant is the union of every live runner's roots, and a daemon
+    /// another runner launched from a different configuration is that runner's
+    /// to replace — otherwise runners would relaunch each other's daemon in a
+    /// loop.
+    #[test]
+    fn runners_sharing_a_daemon_converge_on_the_union_of_their_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = templates();
+        let dev = Templates {
+            cairn_home: PathBuf::from("/home/u/.cairn-dev-x"),
+            build_root: PathBuf::from("/Volumes/Builds/dev-x"),
+            ..templates()
+        };
+        let installed_roots = root_strings(&managed_build_roots(&installed));
+        let dev_roots = root_strings(&managed_build_roots(&dev));
+        register_runner_roots(dir.path(), &dev, &dev_roots).unwrap();
+        // A runner that has exited leaves its registration behind.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        let stale_path = registration_path(dir.path(), Path::new("/home/u/.cairn-gone"));
+        write_json_atomically(
+            &stale_path,
+            &RootRegistration {
+                cairn_home: "/home/u/.cairn-gone".into(),
+                roots: vec!["/gone/build-slots".into()],
+                runner_pid: gone_pid,
+                runner_start_token: Some("long-gone".into()),
+                updated_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+
+        let union = live_registered_roots(dir.path(), &installed_roots);
+        assert_eq!(&union[..installed_roots.len()], &installed_roots[..]);
+        for root in &dev_roots {
+            assert!(
+                union.contains(root),
+                "{union:?} lacks the live runner's {root}"
+            );
+        }
+        assert!(!union.contains(&"/gone/build-slots".to_string()));
+        assert!(
+            !stale_path.exists(),
+            "a gone runner's registration is pruned"
+        );
+
+        // The dev runner launched the daemon for the union, from a config the
+        // installed runner does not share. The installed runner is covered.
+        let mut dev_cfg = default_sccache_service();
+        dev_cfg.write.push("/dev/only/**".into());
+        let control = FakeListenerControl::detached(42, PathBuf::from("/unused/sccache"));
+        write_grant_record(
+            dir.path(),
+            &grant_record(42, union, &dev_cfg, &dev, "/home/u/.cairn-dev-x"),
+        )
+        .unwrap();
+        assert!(matches!(
+            running_grant_verdict(
+                &control,
+                "127.0.0.1:1",
+                &default_sccache_service(),
+                &installed,
+                dir.path()
+            ),
+            GrantVerdict::Covered(_)
+        ));
+        // The dev runner, whose own launch configuration this is, is covered too.
+        assert!(matches!(
+            running_grant_verdict(&control, "127.0.0.1:1", &dev_cfg, &dev, dir.path()),
+            GrantVerdict::Covered(_)
+        ));
+    }
+
+    /// A new incarnation has proven nothing, so it routes nothing until each
+    /// root is proven; the incarnation it replaced keeps none of its verdicts.
+    #[test]
+    fn a_fresh_incarnation_routes_nothing_until_each_root_is_proven() {
+        let roots = vec!["/r/worktrees".to_string(), "/r/build-slots".to_string()];
+        let mut state = BuildServiceRuntimeDiagnostic {
+            own_roots: roots.clone(),
+            ..BuildServiceRuntimeDiagnostic::default()
+        };
+        state.observe_incarnation(Some((1, fake_token(1))), &roots);
+        state.proven_roots = roots.clone();
+        assert_eq!(state.routable_roots(), roots);
+
+        state.observe_incarnation(Some((2, fake_token(2))), &roots);
+        assert!(state.routable_roots().is_empty());
+        assert_eq!(state.routing().roots, Vec::<String>::new());
+        assert_eq!(state.roots_awaiting_probe(0), roots);
+        assert_eq!(
+            state.fitness(),
+            vec![
+                "fitness for /r/worktrees is not yet proven; clients compile directly".to_string(),
+                "fitness for /r/build-slots is not yet proven; clients compile directly"
+                    .to_string(),
+            ]
+        );
+
+        state.apply_fitness(
+            FitnessReport {
+                roots: BTreeMap::from([(roots[0].clone(), RootFitness::Proven)]),
+                daemon_unfit: None,
+            },
+            0,
+        );
+        assert_eq!(state.routable_roots(), vec![roots[0].clone()]);
+
+        // An inconclusive root waits out its backoff, doubling each time.
+        let inconclusive = || FitnessReport {
+            roots: BTreeMap::from([(roots[1].clone(), RootFitness::Inconclusive("queued".into()))]),
+            daemon_unfit: None,
+        };
+        state.apply_fitness(inconclusive(), 1_000);
+        assert!(state.roots_awaiting_probe(1_000).is_empty());
+        assert_eq!(state.roots_awaiting_probe(61_000), vec![roots[1].clone()]);
+        state.apply_fitness(inconclusive(), 61_000);
+        assert!(state.roots_awaiting_probe(61_000 + 119_999).is_empty());
+        assert_eq!(
+            state.roots_awaiting_probe(61_000 + 120_000),
+            vec![roots[1].clone()]
+        );
+        assert_eq!(probe_retry_after(40), PROBE_RETRY_MAX);
+    }
+
+    /// A daemon on a real loopback port described by a fake listener control,
+    /// a spawner that plays that daemon (launch, statistics round trip, probe
+    /// compiles, and the direct-rustc control), and an orchestrator to drive
+    /// the real reconcile with.
+    pub(crate) struct DaemonHarness {
+        _machine: tempfile::TempDir,
+        config_dir: PathBuf,
+        templates: Templates,
+        cfg: BuildServiceConfig,
+        control: Arc<FakeListenerControl>,
+        launches: Arc<AtomicUsize>,
+        probe_compiles: Arc<AtomicUsize>,
+        orch: Orchestrator,
+    }
+
+    const LISTENING_PID: u32 = 4242;
+
+    /// A harness whose runner keeps its cells under `build_root(machine)`.
+    async fn daemon_harness(build_root: impl FnOnce(&Path) -> PathBuf) -> DaemonHarness {
+        let machine = tempfile::tempdir().unwrap();
+        let home = machine.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut templates = templates_in(&home);
+        templates.build_root = build_root(machine.path());
+        let executable = home.join("sccache");
+        std::fs::write(&executable, "fake").unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut cfg = default_sccache_service();
+        cfg.start = vec![executable.display().to_string()];
+        cfg.ready.as_mut().unwrap().tcp = Some(addr.clone());
+        cfg.state_dir = Some("{home}/state".into());
+        let control = Arc::new(FakeListenerControl::new(
+            Some(listener),
+            LISTENING_PID,
+            executable,
+        ));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let probe_compiles = Arc::new(AtomicUsize::new(0));
+        let mut spawner = MockProcessSpawner::new();
+        {
+            let control = control.clone();
+            let launches = launches.clone();
+            let probe_compiles = probe_compiles.clone();
+            spawner.expect_spawn().returning(move |config| {
+                if config.program == "rustc" {
+                    return Ok(Box::new(MockChildProcess::failing(1, "", 0)));
+                }
+                if config.args.iter().any(|arg| arg == "--show-stats") {
+                    return Ok(Box::new(answering_with(SAMPLE_STATS)));
+                }
+                if config.args.first().is_some_and(|arg| arg == "rustc") {
+                    probe_compiles.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::new(MockChildProcess::failing(1, "", 0)));
+                }
+                assert!(
+                    config.env.contains_key("SCCACHE_START_SERVER"),
+                    "unexpected spawn: {} {:?}",
+                    config.program,
+                    config.args
+                );
+                let launch = launches.fetch_add(1, Ordering::SeqCst) as u32 + 1;
+                if control.is_listening() {
+                    // The port is taken: the launch loses the bind race.
+                    return Ok(Box::new(MockChildProcess::failing(
+                        1_000 + launch,
+                        "Address already in use",
+                        1,
+                    )));
+                }
+                control.relisten(&addr, 2_000 + launch);
+                Ok(Box::new(MockChildProcess::with_stdout(
+                    2_000 + launch,
+                    vec![],
+                )))
+            });
+        }
+        let config_dir = machine.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        crate::config::settings::upsert_build_service(&config_dir, "sccache", &cfg).unwrap();
+        let orch = test_orchestrator_with(&config_dir, spawner).await;
+        DaemonHarness {
+            _machine: machine,
+            config_dir,
+            templates,
+            cfg,
+            control,
+            launches,
+            probe_compiles,
+            orch,
+        }
+    }
+
+    impl DaemonHarness {
+        fn grant_dir(&self) -> PathBuf {
+            grant_state_dir(&self.cfg, &self.templates, "sccache")
+        }
+
+        fn own_roots(&self) -> Vec<String> {
+            root_strings(&managed_build_roots(&self.templates))
+        }
+
+        fn record(&self, pid: u32, roots: Vec<String>, launcher: &str) {
+            write_grant_record(
+                &self.grant_dir(),
+                &grant_record(pid, roots, &self.cfg, &self.templates, launcher),
+            )
+            .unwrap();
+        }
+
+        fn own_launcher(&self) -> String {
+            self.templates.cairn_home.display().to_string()
+        }
+
+        fn reconcile(&self, cfg: &BuildServiceConfig) {
+            self.orch.reconcile_registered_service(
+                &*self.control,
+                "sccache",
+                cfg,
+                &self.templates,
+                &self.own_roots(),
+                vec![],
+                true,
+            );
+        }
+
+        fn runtime(&self) -> BuildServiceRuntimeDiagnostic {
+            self.orch
+                .build_service_runtime
+                .lock()
+                .unwrap()
+                .get("sccache")
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn cell_env(&self) -> HashMap<String, String> {
+            client_env_for(
+                &HashMap::from([("sccache".to_string(), self.cfg.clone())]),
+                &self.templates,
+                ClientBuild::Cell,
+                &self.runtime().routing(),
+            )
+        }
+    }
+
+    async fn test_orchestrator_with(
+        config_dir: &Path,
+        spawner: MockProcessSpawner,
+    ) -> Orchestrator {
+        let local = LocalDb::open_migrated_for_test(config_dir.join("build-services.db"))
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().with_process(spawner).build()),
+            config_dir.to_path_buf(),
+        )
+        .build()
+    }
+
+    /// The daemon of cairn/5556: launched while cells lived in the home, still
+    /// answering after the build root moved to a volume, with no grant there.
+    async fn harness_with_a_moved_build_root() -> DaemonHarness {
+        let harness = daemon_harness(|machine| machine.join("volume")).await;
+        let old_roots = root_strings(&managed_build_roots(&Templates {
+            build_root: harness.templates.cairn_home.clone(),
+            ..harness.templates.clone()
+        }));
+        harness.record(LISTENING_PID, old_roots, "/home/u/.cairn-other");
+        harness
+    }
+
+    /// The relaunch path, end to end through the real reconcile.
+    #[tokio::test]
+    #[serial_test::serial(build_service_port)]
+    async fn a_daemon_recorded_with_an_old_build_root_is_relaunched_without_refusing_a_lane() {
+        let harness = harness_with_a_moved_build_root().await;
+        let cell_root = cell_build_root(&harness.templates).display().to_string();
+
+        harness.reconcile(&harness.cfg);
+
+        let runtime = harness.runtime();
+        assert_eq!(runtime.current_failure, None);
+        assert_eq!(runtime.failure_config, None);
+        assert_eq!(
+            runtime.last_restart_reason,
+            Some(format!("launch grant changed (missing root {cell_root})"))
+        );
+        // Our launch lost the port, the stale listener was verified and
+        // terminated, and the relaunch took the port.
+        assert_eq!(harness.launches.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *harness.control.terminated.lock().unwrap(),
+            vec![LISTENING_PID]
+        );
+        let record =
+            read_grant_record(&harness.grant_dir()).expect("the relaunch records its grant");
+        assert_eq!(record.pid, 2_002);
+        assert_eq!(record.start_token, fake_token(2_002));
+        assert!(record.roots.contains(&cell_root), "{record:?}");
+        assert!(
+            record
+                .write_globs
+                .contains(&target_grant_glob(Path::new(&cell_root))),
+            "{record:?}"
+        );
+        assert_eq!(runtime.incarnation, Some((2_002, fake_token(2_002))));
+        // A fresh incarnation routes nothing until it is proven.
+        assert_eq!(
+            harness
+                .cell_env()
+                .get(BUILD_SERVICE_UNFIT_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+
+        // The next tick finds the relaunched daemon covered and healthy.
+        harness.reconcile(&harness.cfg);
+        let runtime = harness.runtime();
+        assert_eq!(runtime.lifecycle.as_deref(), Some("healthy"));
+        assert_eq!(runtime.grant_stale, None);
+        assert_eq!(runtime.consecutive_failures, 0);
+    }
+
+    /// The daemon after a no-destroy reconcile of a stale grant, for the
+    /// check-dispatch test in `execution::checks`, which must see no failure.
+    pub(crate) async fn stale_grant_reconciled_without_destroy(
+    ) -> (BuildServiceDiagnosticSnapshot, DaemonHarness) {
+        let harness = harness_with_a_moved_build_root().await;
+        // What exhausted recovery leaves behind, in memory and on disk: the
+        // failure refuses lanes until something says the daemon answers.
+        let exhausted = "the service remained down after 5 consecutive launch attempts";
+        write_recovery_failure(
+            &harness.cfg,
+            &harness.templates,
+            RECOVERY_FAILED_AFTER,
+            exhausted,
+        )
+        .unwrap();
+        {
+            let mut diagnostics = harness.orch.build_service_runtime.lock().unwrap();
+            let state = diagnostics.entry("sccache".to_string()).or_default();
+            state.round_trip_proven = true;
+            state.consecutive_failures = RECOVERY_FAILED_AFTER;
+            state.current_failure = Some(exhausted.to_string());
+            state.failure_config = Some(service_config_fingerprint(&harness.cfg));
+            state.enter("recoveryFailed", 1);
+        }
+        assert!(
+            harness
+                .orch
+                .build_service_diagnostic_snapshot("sccache")
+                .current_failure()
+                .is_some(),
+            "precondition: the exhausted recovery refuses lanes"
+        );
+        harness.reconcile(&harness.cfg);
+        assert!(
+            read_recovery_failure(&harness.cfg, &harness.templates).is_none(),
+            "the persisted failure no longer describes an answering daemon"
+        );
+        let snapshot = harness.orch.build_service_diagnostic_snapshot("sccache");
+        (snapshot, harness)
+    }
+
+    /// Where the daemon may not be replaced, it keeps serving the roots its
+    /// record covers, builds under the rest compile directly, and nothing
+    /// reaches `current_failure` — the field that refuses check dispatch.
+    #[tokio::test]
+    #[serial_test::serial(build_service_port)]
+    async fn a_daemon_recorded_with_an_old_build_root_is_not_adopted_and_never_refuses_a_lane() {
+        let (snapshot, harness) = stale_grant_reconciled_without_destroy().await;
+        let cell_root = cell_build_root(&harness.templates).display().to_string();
+
+        assert_eq!(harness.launches.load(Ordering::SeqCst), 0);
+        assert!(harness.control.terminated.lock().unwrap().is_empty());
+        let runtime = harness.runtime();
+        assert_eq!(runtime.current_failure, None);
+        assert_eq!(runtime.failure_config, None);
+        assert_eq!(snapshot.current_failure(), None);
+        assert_eq!(runtime.lifecycle.as_deref(), Some("degraded"));
+        assert_eq!(runtime.last_health.as_deref(), Some("healthy"));
+        let note = runtime
+            .grant_stale
+            .clone()
+            .expect("the stale grant is named");
+        assert_eq!(
+            note.reason,
+            format!("launch grant changed (missing root {cell_root})")
+        );
+        assert!(!note.relaunching);
+
+        let env = harness.cell_env();
+        assert_eq!(
+            env.get(BUILD_SERVICE_UNFIT_ENV).map(String::as_str),
+            Some("1")
+        );
+        let routed = env
+            .get(BUILD_SERVICE_ROOTS_ENV)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!routed.split(':').any(|root| root == cell_root), "{routed}");
+        assert!(runtime.fitness().contains(&format!(
+            "{cell_root} is not in the running daemon's grant; clients compile directly"
+        )));
+    }
+
+    /// The runner delivers the gate it relies on, and never downgrades a
+    /// gated copy a newer checkout synced.
+    #[test]
+    fn the_runner_installs_a_gated_wrapper_and_keeps_a_newer_one() {
+        assert!(BUNDLED_CACHE_WRAPPER.contains(WRAPPER_OUT_DIR_GATE));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bin").join("cache-wrapper.sh");
+        assert!(install_cache_wrapper(&path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            BUNDLED_CACHE_WRAPPER
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        // An old wrapper is replaced...
+        std::fs::write(&path, "#!/usr/bin/env bash\nexec \"$@\"\n").unwrap();
+        assert!(install_cache_wrapper(&path).unwrap());
+        assert!(wrapper_has_gate(&path));
+        // ...a newer gated one is not.
+        let newer = format!("#!/usr/bin/env bash\n# {WRAPPER_OUT_DIR_GATE}\n# newer\n");
+        std::fs::write(&path, &newer).unwrap();
+        assert!(!install_cache_wrapper(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    /// The upgrade path: a new runner beside a wrapper installed before the
+    /// gate existed. That wrapper ignores the roots, so it is routed nothing
+    /// and every build compiles directly, including a bare cargo build into a
+    /// target dir outside the grant.
+    #[test]
+    fn routing_is_withheld_while_the_wrapper_lacks_the_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("cache-wrapper.sh");
+        std::fs::write(&wrapper, "#!/usr/bin/env bash\nexec sccache \"$@\"\n").unwrap();
+        let mut cfg = default_sccache_service();
+        for key in WRAPPER_ENV_KEYS {
+            cfg.env.insert(key.into(), wrapper.display().to_string());
+        }
+        let services = HashMap::from([("sccache".to_string(), cfg)]);
+        let t = templates();
+        let env_for = |routing: Routing| {
+            let routing =
+                routing_the_wrapper_can_enforce(routing, &merge_client_env(&services, &t));
+            client_env_for(&services, &t, ClientBuild::Cell, &routing)
+        };
+
+        let old = env_for(fit_routing(&t));
+        assert_eq!(
+            old.get(BUILD_SERVICE_UNFIT_ENV).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            old.get(BUILD_SERVICE_ROOTS_ENV).map(String::as_str),
+            Some("")
+        );
+
+        std::fs::write(&wrapper, BUNDLED_CACHE_WRAPPER).unwrap();
+        let gated = env_for(fit_routing(&t));
+        assert!(!gated.contains_key(BUILD_SERVICE_UNFIT_ENV), "{gated:?}");
+
+        // A missing wrapper enforces nothing either.
+        std::fs::remove_file(&wrapper).unwrap();
+        assert_eq!(
+            env_for(fit_routing(&t))
+                .get(BUILD_SERVICE_UNFIT_ENV)
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    /// One probe per root per incarnation, not two compiles every tick.
+    #[tokio::test]
+    #[serial_test::serial(build_service_port)]
+    async fn the_capability_probe_runs_once_per_incarnation() {
+        let harness = daemon_harness(|machine| machine.join("volume")).await;
+        for root in harness.own_roots() {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        harness.record(LISTENING_PID, harness.own_roots(), &harness.own_launcher());
+
+        for _ in 0..3 {
+            harness.reconcile(&harness.cfg);
+        }
+        // A miss per root, and the hit once.
+        assert_eq!(harness.probe_compiles.load(Ordering::SeqCst), 3);
+        let runtime = harness.runtime();
+        assert_eq!(runtime.lifecycle.as_deref(), Some("healthy"));
+        assert_eq!(runtime.routing().roots, harness.own_roots());
+        assert!(runtime.fitness().is_empty(), "{:?}", runtime.fitness());
+        assert!(!harness.cell_env().contains_key(BUILD_SERVICE_UNFIT_ENV));
+        assert_eq!(harness.launches.load(Ordering::SeqCst), 0);
+
+        // Another process on the same port is another incarnation.
+        harness.control.set_pid(5_000);
+        harness.record(5_000, harness.own_roots(), &harness.own_launcher());
+        harness.reconcile(&harness.cfg);
+        assert_eq!(harness.probe_compiles.load(Ordering::SeqCst), 6);
+        harness.reconcile(&harness.cfg);
+        assert_eq!(harness.probe_compiles.load(Ordering::SeqCst), 6);
+    }
+
+    /// Settings are reloaded on every reconcile, so editing what a running
+    /// daemon was launched with relaunches it on the next one. Returns whether
+    /// `change` relaunched the daemon, and the reason recorded for it.
+    async fn reconcile_after_settings_change(
+        change: impl FnOnce(&mut BuildServiceConfig),
+    ) -> (bool, Option<String>) {
+        let harness = daemon_harness(|machine| machine.join("volume")).await;
+        harness.record(LISTENING_PID, harness.own_roots(), &harness.own_launcher());
+        let mut changed = harness.cfg.clone();
+        change(&mut changed);
+        crate::config::settings::upsert_build_service(&harness.config_dir, "sccache", &changed)
+            .unwrap();
+        let reloaded = crate::config::settings::load_build_services(&harness.config_dir)
+            .remove("sccache")
+            .expect("the upserted service");
+        assert_eq!(reloaded, changed);
+        harness.reconcile(&reloaded);
+        let relaunched = harness.launches.load(Ordering::SeqCst) > 0;
+        if relaunched {
+            let record = read_grant_record(&harness.grant_dir()).unwrap();
+            assert_eq!(
+                record.launch_fingerprint,
+                reloaded.launch_fingerprint(&harness.templates)
+            );
+            assert_eq!(harness.runtime().current_failure, None);
+        }
+        (relaunched, harness.runtime().last_restart_reason)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(build_service_port)]
+    async fn a_settings_upsert_that_changes_write_relaunches_the_service() {
+        let (relaunched, reason) =
+            reconcile_after_settings_change(|cfg| cfg.write.push("/opt/extra/**".into())).await;
+        assert!(relaunched);
+        assert_eq!(
+            reason.as_deref(),
+            Some("launch fingerprint changed (write)")
+        );
+
+        let (relaunched, reason) =
+            reconcile_after_settings_change(|cfg| cfg.start.push("--foreground".into())).await;
+        assert!(relaunched);
+        assert_eq!(
+            reason.as_deref(),
+            Some("launch fingerprint changed (start)")
+        );
+
+        let (relaunched, reason) = reconcile_after_settings_change(|cfg| {
+            cfg.launch_env.insert("SCCACHE_LOG".into(), "debug".into());
+        })
+        .await;
+        assert!(relaunched);
+        assert_eq!(
+            reason.as_deref(),
+            Some("launch fingerprint changed (launchEnv)")
+        );
+
+        // Client env is not what the daemon was launched with.
+        let (relaunched, reason) = reconcile_after_settings_change(|cfg| {
+            cfg.env.insert("SCCACHE_CACHE_SIZE".into(), "60G".into());
+        })
+        .await;
+        assert!(!relaunched);
+        assert_eq!(reason, None);
     }
 }
