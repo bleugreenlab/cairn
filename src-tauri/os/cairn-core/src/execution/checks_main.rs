@@ -399,6 +399,9 @@ pub(crate) struct CadenceSlots {
     /// Per project, the tip whose checks contract could not be read: one
     /// outcome per tip, announced once and not read again until the tip moves.
     unreadable_contracts: HashMap<String, String>,
+    /// Projects whose store could not resolve the default head: reported
+    /// loudly once, and not again until it resolves or the runner restarts.
+    unreadable_stores: HashSet<String>,
     /// Per project, the lanes the last restart cancelled that no pass has
     /// reported on since; see [`arm_at_boot`].
     interrupted: HashMap<String, Vec<Interruption>>,
@@ -476,6 +479,18 @@ impl CadenceSlots {
             self.unreadable_contracts
                 .insert(project_id.to_string(), commit.to_string());
         }
+    }
+
+    /// Record that `project_id`'s store could not resolve its default head.
+    /// `true` on the first such pass since it last resolved.
+    fn store_unreadable(&mut self, project_id: &str) -> bool {
+        self.unreadable_stores.insert(project_id.to_string())
+    }
+
+    /// Record that `project_id`'s store resolved its default head. `true` when
+    /// it had been reported unreadable.
+    fn store_resolved(&mut self, project_id: &str) -> bool {
+        self.unreadable_stores.remove(project_id)
     }
 
     /// Hold `interruption` for the next pass to cite. A lane holds one: a later
@@ -883,11 +898,16 @@ fn arm(
             .await;
             let failure = match pass {
                 Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(join) => Some(format!("the cadence pass panicked: {join}")),
+                Ok(Err(failure)) => Some(failure),
+                Err(join) => Some(PassFailure::from(format!(
+                    "the cadence pass panicked: {join}"
+                ))),
             };
-            if let Some(cause) = failure {
-                log::error!("main cadence pass for project {project_id} failed: {cause}");
+            if let Some(PassFailure { cause, level }) = failure {
+                log::log!(
+                    level,
+                    "main cadence pass for project {project_id} failed: {cause}"
+                );
                 announce_pass_failure(&orch, &project_id, &repo_path, &scope, &cause).await;
             }
             let next = orch
@@ -1621,6 +1641,89 @@ struct PassContext<'a> {
     trigger: Trigger,
 }
 
+/// Why a pass failed, and how loudly the runner logs it.
+#[derive(Debug, PartialEq)]
+struct PassFailure {
+    cause: String,
+    level: log::Level,
+}
+
+impl From<String> for PassFailure {
+    fn from(cause: String) -> Self {
+        Self {
+            cause,
+            level: log::Level::Error,
+        }
+    }
+}
+
+/// Whether the project checkout declares any cadence lane in `scope`. This is
+/// only the gate for whether a pass has anything to do; once the head
+/// resolves, the tip's contract decides which lanes run.
+fn checkout_declares_lanes(repo_root: &Path, scope: &LaneScope) -> bool {
+    crate::config::project_settings::load_checks(repo_root).is_some_and(|checks| {
+        cadence_lanes(&checks)
+            .iter()
+            .any(|lane| scope.includes(lane))
+    })
+}
+
+/// A pass with nothing to attest: the checkout declares no lane and there is no
+/// store whose tip could declare one. Such a pass touches neither the database,
+/// origin, nor the store.
+fn nothing_to_attest(checkout_declares: bool, repository: &Path) -> bool {
+    !checkout_declares && !repository.exists()
+}
+
+/// The default head a pass attests, or `None` when there is nothing to attest.
+///
+/// A checkout that declares no lane can lag a tip that does, so its existing
+/// store is still read and the tip's contract answers; but a store that cannot
+/// resolve is then nothing to do, not a failure. For a checkout that declares
+/// lanes, an unresolvable head fails the pass at ERROR on the first pass since
+/// the store last resolved and at DEBUG after, and a store that resolves again
+/// says so once.
+async fn pass_head<F, Fut, E>(
+    slots: &std::sync::Mutex<CadenceSlots>,
+    project_id: &str,
+    default_branch: &str,
+    checkout_declares: bool,
+    resolve: F,
+) -> Result<Option<String>, PassFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, E>>,
+    E: std::fmt::Display,
+{
+    match resolve().await {
+        Ok(commit) => {
+            if slots.lock().unwrap().store_resolved(project_id) {
+                log::info!(
+                    "main cadence for project {project_id}: default head '{default_branch}' resolves again"
+                );
+            }
+            Ok(Some(commit))
+        }
+        Err(error) if !checkout_declares => {
+            log::debug!(
+                "main cadence for project {project_id}: no lane declared and default head '{default_branch}' is unresolvable ({error}); nothing to attest"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            let first = slots.lock().unwrap().store_unreadable(project_id);
+            Err(PassFailure {
+                cause: format!("default head '{default_branch}' is unresolvable: {error}"),
+                level: if first {
+                    log::Level::Error
+                } else {
+                    log::Level::Debug
+                },
+            })
+        }
+    }
+}
+
 async fn run_pass(
     orch: &Orchestrator,
     project_id: &str,
@@ -1628,11 +1731,16 @@ async fn run_pass(
     default_branch: &str,
     trigger: Trigger,
     scope: &LaneScope,
-) -> Result<(), String> {
+) -> Result<(), PassFailure> {
+    let repo_root = PathBuf::from(repo_path);
+    let repository = crate::jj::project_store_dir(&orch.config_dir, &repo_root);
+    let checkout_declares = checkout_declares_lanes(&repo_root, scope);
+    if nothing_to_attest(checkout_declares, &repository) {
+        return Ok(());
+    }
     let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id)
         .await
         .map_err(|error| error.to_string())?;
-    let repo_root = PathBuf::from(repo_path);
     // Until the startup catch-up has observed origin, a fetch here would move
     // `<branch>@origin` under it. The catch-up reads that ref before and after
     // its own fetch to find an advance that landed while the runner was down,
@@ -1655,10 +1763,17 @@ async fn run_pass(
     }
     // Refresh above is the guarded writer. Capturing an existing coordinate
     // below must neither create a missing store nor reconcile a split log.
-    let repository = crate::jj::project_store_dir(&orch.config_dir, &repo_root);
-    let commit = cairn_vcs::resolve_coordinate(&repository, default_branch)
-        .await
-        .map_err(|error| format!("default head '{default_branch}' is unresolvable: {error}"))?;
+    let Some(commit) = pass_head(
+        &orch.main_cadence,
+        project_id,
+        default_branch,
+        checkout_declares,
+        || cairn_vcs::resolve_coordinate(&repository, default_branch),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let declared = tip_lanes(&orch.main_cadence, project_id, &commit, || {
         load_checks_contract_at_commit_detailed(&repo_root, &commit)
     })
@@ -6840,6 +6955,83 @@ mod tests {
         assert_eq!(
             tip_lanes(&slots, "rs", "tip-1", no_config).await,
             Ok(Vec::new())
+        );
+    }
+
+    /// A project whose checkout declares no cadence lane and has no store never
+    /// opens one, and a store it does have that cannot resolve is not a failure.
+    #[tokio::test]
+    async fn a_checkout_with_no_cadence_lane_is_nothing_to_attest() {
+        let checkout = tempfile::tempdir().unwrap();
+        let missing_store = checkout.path().join("jj-stores/absent");
+        let declares = checkout_declares_lanes(checkout.path(), &LaneScope::All);
+        assert!(!declares, "no config declares no lane");
+        assert!(nothing_to_attest(declares, &missing_store));
+        assert!(
+            !nothing_to_attest(true, &missing_store),
+            "a declared lane is owed the failure"
+        );
+
+        let slots = std::sync::Mutex::new(CadenceSlots::default());
+        let unreadable = || async { Err::<String, _>("load jj repository: Cannot read the repo") };
+        assert_eq!(
+            pass_head(&slots, "p", "main", false, unreadable).await,
+            Ok(None)
+        );
+        assert!(
+            slots.lock().unwrap().unreadable_stores.is_empty(),
+            "nothing is held against a project with no lane"
+        );
+    }
+
+    /// A project with lanes whose store cannot resolve fails every pass, but
+    /// logs at ERROR once until the store resolves, which it says once.
+    #[tokio::test]
+    async fn an_unreadable_store_is_reported_once_until_it_resolves() {
+        let slots = std::sync::Mutex::new(CadenceSlots::default());
+        let unreadable = || async { Err::<String, _>("load jj repository: Cannot read the repo") };
+        let mut levels = Vec::new();
+        for _ in 0..3 {
+            let failure = pass_head(&slots, "cairn", "main", true, unreadable)
+                .await
+                .unwrap_err();
+            assert!(
+                failure
+                    .cause
+                    .contains("default head 'main' is unresolvable: load jj repository"),
+                "{failure:?}"
+            );
+            levels.push(failure.level);
+        }
+        assert_eq!(
+            levels,
+            [log::Level::Error, log::Level::Debug, log::Level::Debug]
+        );
+        assert_eq!(
+            pass_head(&slots, "other", "main", true, unreadable)
+                .await
+                .unwrap_err()
+                .level,
+            log::Level::Error,
+            "projects are independent"
+        );
+
+        let resolves = || async { Ok::<_, String>("abc123".to_string()) };
+        assert_eq!(
+            pass_head(&slots, "cairn", "main", true, resolves).await,
+            Ok(Some("abc123".to_string()))
+        );
+        assert!(
+            !slots.lock().unwrap().store_resolved("cairn"),
+            "recovery is said once"
+        );
+        assert_eq!(
+            pass_head(&slots, "cairn", "main", true, unreadable)
+                .await
+                .unwrap_err()
+                .level,
+            log::Level::Error,
+            "a store that breaks again is reported again"
         );
     }
 
