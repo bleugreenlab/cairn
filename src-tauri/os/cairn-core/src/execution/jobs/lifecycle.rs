@@ -4583,19 +4583,17 @@ const RESEED_SEED_HEADER: &str = "Your underlying agent session was rebuilt, so 
 /// What a cold native resume makes the provider recreate, in bytes.
 ///
 /// The one denominator both rebuild paths price against, so "what does native
-/// resume send" has a single answer rather than two that can drift. `None` when
-/// the job has no transcript to measure, which keeps the caller on native resume
-/// rather than rebuilding against a number it does not have.
-fn verbatim_prefix_bytes(owning_db: &Arc<LocalDb>, job_id: &str) -> Option<i64> {
+/// resume send" has a single answer rather than two that can drift. `Ok(None)`
+/// when the job's transcript was read and holds nothing to measure; `Err` when
+/// it could not be read. Either keeps the caller on native resume rather than
+/// rebuilding against a number it does not have, but only the second is a
+/// failure worth reporting.
+fn verbatim_prefix_bytes(owning_db: &Arc<LocalDb>, job_id: &str) -> Result<Option<i64>, String> {
     run_db({
         let db = owning_db.clone();
         let job_id = job_id.to_string();
-        async move {
-            Ok::<_, String>(crate::resources::reseed_verbatim_baseline_bytes(&db, &job_id).await)
-        }
+        async move { crate::resources::reseed_verbatim_baseline_bytes(&db, &job_id).await }
     })
-    .ok()
-    .flatten()
 }
 
 /// The seed content delivered and stored on a non-thread reseed: the header,
@@ -4856,8 +4854,16 @@ fn attempt_session_reseed(
     // would send instead — the budgeted seed, framed, the very string rotation
     // delivers below. Composing at all costs a transcript read, which is why
     // nothing above this line pays for it.
-    let Some(prefix_bytes) = verbatim_prefix_bytes(owning_db, &job.id) else {
-        return ReseedDecision::NativeResume(None);
+    let prefix_bytes = match verbatim_prefix_bytes(owning_db, &job.id) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return ReseedDecision::NativeResume(None),
+        Err(error) => {
+            log::warn!(
+                "Cold-cache baseline read failed for job {}; resuming natively: {error}",
+                &job.id[..job.id.len().min(8)]
+            );
+            return ReseedDecision::NativeResume(None);
+        }
     };
 
     let framed = match compose_forced_reseed(orch, owning_db, job, session) {
@@ -5078,9 +5084,11 @@ fn compose_forced_reseed(
             .map_err(ComposeRefusal::Failed)?
     };
     let Some(composed) = composed.filter(|body| !body.trim().is_empty()) else {
-        // The loader drops rows it cannot read, so an empty load is not
-        // evidence of an empty history. Only a direct count of the job's event
-        // rows can say there is nothing to carry; anything else fails closed.
+        // A read error already refused above, but an empty digest is still not
+        // evidence of an empty history: the loader skips run rows whose id does
+        // not parse, and rows can render to nothing. Only a direct count of the
+        // job's event rows can say there is nothing to carry; anything else
+        // fails closed.
         return Err(empty_digest_refusal(job_event_rows_exist(
             owning_db, &job.id,
         )));
@@ -5556,8 +5564,16 @@ fn attempt_thread_compaction(
         // seed's OWN digest projection, which already elides tool-result bodies,
         // so pricing against it would compare a seed with a seed and hide most
         // of what a compaction actually saves.
-        let Some(prefix_bytes) = verbatim_prefix_bytes(owning_db, &job.id) else {
-            return ReseedDecision::NativeResume(None);
+        let prefix_bytes = match verbatim_prefix_bytes(owning_db, &job.id) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return ReseedDecision::NativeResume(None),
+            Err(error) => {
+                log::warn!(
+                    "Cold-cache baseline read failed for thread {}; resuming natively: {error}",
+                    &job.id[..job.id.len().min(8)]
+                );
+                return ReseedDecision::NativeResume(None);
+            }
         };
         let decision = match price_cold_rebuild(seed_bytes, prefix_bytes) {
             ColdRebuild::Pays(decision) => decision,
@@ -8715,6 +8731,7 @@ mod tests {
         // loudly if the digest ever stops eliding what it elides today.
         let prefix_bytes = crate::resources::reseed_verbatim_baseline_bytes(&db, "j")
             .await
+            .expect("the transcript is readable")
             .expect("a job with a transcript has a verbatim baseline");
         assert!(
             prefix_bytes > 100_000,
@@ -8768,6 +8785,91 @@ mod tests {
         assert!(raw["seedBytes"].as_u64().unwrap() > 0);
         assert_eq!(raw["cacheState"], "cold");
         assert!(raw["reseedSkipped"].is_null());
+    }
+
+    /// Break every later read of the transcript: the `events` table is gone, so
+    /// any load of a job's history fails rather than returning rows.
+    async fn make_the_transcript_unreadable(db: &Arc<crate::storage::LocalDb>) {
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("ALTER TABLE events RENAME TO events_gone", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The cold-rebuild baseline says which of three things it found: a
+    /// transcript to measure, a readable history with nothing in it, or a
+    /// history it could not read. The last is never reported as the second.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_verbatim_baseline_tells_an_unreadable_transcript_from_an_empty_one() {
+        let (_orch, db) = node_with_a_rebuildable_prefix("baseline-empty-vs-unreadable").await;
+
+        assert!(matches!(
+            crate::resources::reseed_verbatim_baseline_bytes(&db, "j").await,
+            Ok(Some(bytes)) if bytes > 0
+        ));
+        assert_eq!(
+            crate::resources::reseed_verbatim_baseline_bytes(&db, "no-such-job").await,
+            Ok(None),
+            "a readable job with no runs has nothing to measure"
+        );
+
+        make_the_transcript_unreadable(&db).await;
+        let unreadable = crate::resources::reseed_verbatim_baseline_bytes(&db, "j").await;
+        assert!(
+            unreadable.is_err(),
+            "an unreadable transcript was reported as {unreadable:?}"
+        );
+    }
+
+    /// A cold prefix whose transcript cannot be read is not rebuilt: there is no
+    /// baseline to price against, so the session stays open and nothing rotates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreadable_transcript_refuses_a_cold_rebuild_and_keeps_the_session() {
+        use crate::sessions::queries::get as get_session;
+
+        let (orch, db) = node_with_a_rebuildable_prefix("cold-prefix-unreadable").await;
+        let job = super::load_job(db.clone(), "j".to_string(), "unreadable cold prefix")
+            .await
+            .unwrap();
+        let session = get_session(&db, "s1").await.unwrap();
+        let now = 2 * 60 * 60;
+        let prefix_cache = cache_state_at(&db, now).await;
+        assert_eq!(prefix_cache, PrefixCacheState::Cold);
+
+        make_the_transcript_unreadable(&db).await;
+        let decision = super::attempt_session_reseed(
+            &orch,
+            &db,
+            &job,
+            &session,
+            now,
+            Some("claude"),
+            prefix_cache,
+        );
+        assert!(
+            matches!(decision, ReseedDecision::NativeResume(None)),
+            "an unreadable transcript must resume natively with no cache decision"
+        );
+
+        let kept = get_session(&db, "s1").await.unwrap();
+        assert_eq!(kept.status, crate::models::SessionStatus::Open);
+        assert!(kept.terminal_reason.is_none());
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM sessions WHERE job_id='j'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("1"),
+            "no successor session may exist"
+        );
     }
 
     /// A backend Cairn has no published horizon for never expires, however long

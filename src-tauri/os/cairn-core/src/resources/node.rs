@@ -2681,17 +2681,23 @@ fn grep_turn_rows(
 /// `cairn_models::continuation::verbatim_bytes`, so the two sides of the
 /// comparison describe the same history in the same terms.
 ///
-/// `None` when the job has no transcript to measure, or it could not be read,
-/// which leaves the caller on native resume rather than rebuilding against a
-/// number it does not have.
-pub(crate) async fn reseed_verbatim_baseline_bytes(db: &LocalDb, job_id: &str) -> Option<i64> {
-    let event_rows = load_job_events_ordered(db, job_id).await.ok()?;
+/// `Ok(None)` when the transcript was read and holds nothing to measure; `Err`
+/// when it could not be read. The two are kept apart so a caller never mistakes
+/// an unreadable history for an empty one; what each means for the rebuild is
+/// the caller's decision.
+pub(crate) async fn reseed_verbatim_baseline_bytes(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<i64>, String> {
+    let event_rows = load_job_events_ordered(db, job_id)
+        .await
+        .map_err(|error| format!("the transcript could not be read: {error}"))?;
     if event_rows.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(cairn_models::continuation::verbatim_bytes(
+    Ok(Some(cairn_models::continuation::verbatim_bytes(
         &transcript_from_rows(&event_rows, "", &HashMap::new()),
-    ))
+    )))
 }
 
 pub(super) async fn read_node_chat_raw(
