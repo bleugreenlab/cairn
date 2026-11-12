@@ -179,6 +179,8 @@ pub fn parse_pack_mcp_file(path: &Path) -> Result<PackMcpFile, String> {
             // entry reaches, and the entry is withheld unless its own pack ships it.
             service: _,
             agent_plugin_runtime: _,
+            // Set by the runner on a resolved fleet entry, never authored.
+            fleet_launch: _,
         } = config;
         if secrets.is_empty() {
             continue;

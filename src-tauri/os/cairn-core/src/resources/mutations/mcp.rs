@@ -226,6 +226,7 @@ fn base_config() -> McpServerConfig {
         cwd: None,
         service: None,
         agent_plugin_runtime: None,
+        fleet_launch: None,
     }
 }
 

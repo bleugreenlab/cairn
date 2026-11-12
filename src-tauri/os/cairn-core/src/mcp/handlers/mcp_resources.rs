@@ -862,6 +862,12 @@ fn describe_machine_service(
             out.push_str(&format!("- Version: {version}\n"));
         }
         out.push_str(&format!("- Runs: {}\n", instance.provenance));
+        if let Some(launch) = crate::project_services::launches::latest_sentence(
+            &instance.key.to_string(),
+            &instance.machine,
+        ) {
+            out.push_str(&format!("- Last launch: {launch}\n"));
+        }
         if crate::mcp::handlers::run::machine_service_takes_named_call(instance)
             && !machine_service_serves(instance)
         {
@@ -1858,6 +1864,7 @@ mod tests {
             cwd: None,
             service: None,
             agent_plugin_runtime: None,
+            fleet_launch: None,
         };
         // Reverse insertion order must not affect the rendered order.
         let servers = HashMap::from([
@@ -1941,6 +1948,7 @@ mod tests {
             provenance: "installed 0.3.6 (pack)".into(),
             installed_version: Some("0.3.6".into()),
             override_command: None,
+            set_by: None,
             catalog: tools
                 .iter()
                 .map(|name| tool(name, serde_json::json!({})))

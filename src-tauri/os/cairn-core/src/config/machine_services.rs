@@ -25,6 +25,8 @@ pub struct InstanceView {
     pub state: InstanceState,
     pub installed_version: Option<String>,
     pub override_command: Option<String>,
+    /// Who made the selection, when the row recorded it.
+    pub set_by: Option<cairn_config::fleet::SetBy>,
     /// The instance's own sentence for what it runs and who chose it.
     pub provenance: String,
     /// Whether it serves MCP to this runner's gateway.
@@ -96,6 +98,7 @@ impl MachineServiceSnapshot {
                     state: instance.state,
                     installed_version: instance.installed_version,
                     override_command: instance.override_command,
+                    set_by: instance.set_by,
                     provenance: instance.provenance,
                     serves_mcp: instance.serves_mcp,
                     fleet: instance.fleet,
@@ -152,13 +155,18 @@ impl MachineServiceSnapshot {
         })
     }
 
-    /// What the host launches for the fleet service `key`, when it is ready
-    /// there. Read by MCP resolution, so it stays in memory and credential-free.
-    pub(crate) fn host_launch(&self, key: &MachineServiceKey) -> Option<&NativeLaunch> {
+    /// The host's ready view of the fleet service `key` and what it launches:
+    /// the launch with the machine, the override and the setter beside it, so
+    /// the gateway's spawn can be floored and recorded. Read by MCP
+    /// resolution, so it stays in memory and credential-free.
+    pub(crate) fn host_launch(
+        &self,
+        key: &MachineServiceKey,
+    ) -> Option<(&InstanceView, &NativeLaunch)> {
         self.views(key)
             .iter()
             .filter(|view| view.state == InstanceState::Ready && view.serves_mcp)
-            .find_map(|view| view.launch.as_ref())
+            .find_map(|view| view.launch.as_ref().map(|launch| (view, launch)))
     }
 }
 

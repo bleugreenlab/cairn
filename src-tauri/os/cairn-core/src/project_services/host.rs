@@ -83,12 +83,18 @@ pub(crate) fn launch_for(spec: &LaunchSpec) -> Result<ResidentLaunch, String> {
     Ok(launch)
 }
 
-/// A machine service's resident: its pinned executable, unconfined like every
-/// helper a lease ran before project services, because it exists to reach the
-/// machine (Axon talks to the accessibility daemon's socket). It carries no
-/// environment of Cairn's and no relay: a native resident holds no bearer.
+/// A machine service's resident: outside any fence, because it exists to
+/// reach the machine (Axon talks to the accessibility daemon's socket). The
+/// pack's pinned artifact runs unconfined; an override runs under the
+/// operator credential floor, so a binary of someone's naming cannot read the
+/// operator's authority secret. It carries no environment of Cairn's and no
+/// relay: a native resident holds no bearer.
 fn native_launch(native: &super::declaration::NativeLaunch) -> ResidentLaunch {
-    ResidentLaunch::command(native.program.clone(), native.args.clone())
+    ResidentLaunch::with_mode(
+        native.program.clone(),
+        native.args.clone(),
+        native.sandbox_mode,
+    )
 }
 
 fn process_for(spec: &LaunchSpec) -> ResidentLaunch {
@@ -295,6 +301,19 @@ impl ServiceHost for LeaseHost {
             .start_resident(&key, SERVICE_ROLE, &launch)
             .await
             .map_err(launch_error)?;
+        if let (Some(native), ServiceOwner::Pack { pack, machine, .. }) =
+            (&spec.native, &spec.owner)
+        {
+            super::launches::record(
+                orch,
+                super::launches::MachineServiceLaunch::resident(
+                    &format!("{pack}/{}", spec.service),
+                    machine,
+                    native,
+                ),
+            )
+            .await;
+        }
         let (sender, events) = mpsc::unbounded_channel();
         let mut machine_lost = lease.machine_lost_signal();
         tokio::spawn(async move {
@@ -486,6 +505,11 @@ mod tests {
     /// entry's bare import resolving, and the protocol over the real pipe.
     #[tokio::test]
     async fn the_echo_service_boots_answers_and_drains_as_a_real_process() {
+        if cairn_sandbox::skip_without_nested_sandbox(
+            "the_echo_service_boots_answers_and_drains_as_a_real_process",
+        ) {
+            return;
+        }
         let (orch, _config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
         let host = LeaseHost::default();
         let spec = echo_spec();
@@ -555,6 +579,11 @@ mod tests {
         ) {
             return;
         }
+        if cairn_sandbox::skip_without_nested_sandbox(
+            "a_relayed_service_carries_no_callback_credential",
+        ) {
+            return;
+        }
         let socket = crate::fleet::service_placement::tests::name_callback_socket();
         let (orch, _config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
         let package = crate::project_services::declaration::package_from_files(
@@ -610,6 +639,12 @@ mod tests {
         };
         launch_canary::assert_no_credential("a relayed project service", &env, &[BEARER]);
         launch_canary::assert_names_socket("a relayed project service", &env, &socket);
+        // What the executor applied, not only what was declared: the fence
+        // marks every spawn it confines.
+        assert!(
+            env.contains("\"CAIRN_SANDBOXED\":\"1\""),
+            "a project service runs fenced: {env}"
+        );
         host.release(&orch, "p", &ServiceOwner::Project, "probe")
             .await;
     }
@@ -670,6 +705,11 @@ mod tests {
                 SecretMaterial::from_bytes(b"\nQ7m2Zx9-RedTeam-service"),
             )
             .expect("registerable");
+        if cairn_sandbox::skip_without_nested_sandbox(
+            "a_service_answers_when_a_registered_secret_begins_with_a_newline",
+        ) {
+            return;
+        }
         let (orch, _config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
         let host = LeaseHost::default();
         let spec = echo_spec();
@@ -835,6 +875,27 @@ mod tests {
         };
         let launch = process_for(&spec);
         assert_eq!(launch.sandbox_mode, ProcessSandboxMode::Confined);
+
+        // A machine service's override runs under the credential floor, the
+        // pack's pinned artifact unconfined, and neither carries a policy.
+        use crate::project_services::declaration::NativeLaunch;
+        let overriding = native_launch(&NativeLaunch::overriding(
+            "/opt/probe".to_string(),
+            vec!["mcp".to_string()],
+            None,
+        ));
+        assert_eq!(overriding.sandbox_mode, ProcessSandboxMode::CredentialFloor);
+        assert_eq!(
+            overriding.spec().sandbox_mode,
+            ProcessSandboxMode::CredentialFloor
+        );
+        assert!(overriding.spec().sandbox_policy.is_none());
+        let artifact = native_launch(&NativeLaunch::artifact(
+            "managed:kit/probe".to_string(),
+            vec!["mcp".to_string()],
+            None,
+        ));
+        assert_eq!(artifact.sandbox_mode, ProcessSandboxMode::Unconfined);
         assert_eq!(launch.spec().io, ResidentProcessIoMode::Pipe);
         assert!(launch.spec().sandbox_policy.is_none());
         assert_eq!(service_selector(&spec).name, None);

@@ -21,6 +21,7 @@ mod channels;
 mod events;
 mod executions;
 mod executors;
+pub(crate) use executors::machine_services_authority;
 mod feed;
 mod grants;
 mod inference;

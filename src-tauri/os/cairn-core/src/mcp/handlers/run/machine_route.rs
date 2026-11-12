@@ -369,6 +369,7 @@ mod tests {
             provenance: "installed 0.3.6 (pack)".into(),
             installed_version: Some("0.3.6".into()),
             override_command: None,
+            set_by: None,
             catalog: tools.iter().map(|name| tool(name)).collect(),
             probed_at_ms: None,
             serves_mcp: true,

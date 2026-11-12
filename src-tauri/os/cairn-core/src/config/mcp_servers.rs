@@ -296,11 +296,10 @@ pub(crate) fn resolve_mcp_server_entries(
                     );
                     return None;
                 }
-                if let Some(launch) = entry
-                    .service_key()
-                    .and_then(|key| machines.host_launch(&key))
-                {
-                    config = fleet_stdio(&entry.config, launch);
+                if let Some(key) = entry.service_key() {
+                    if let Some((view, launch)) = machines.host_launch(&key) {
+                        config = fleet_stdio(&entry.config, &key, view, launch);
+                    }
                 }
             } else if let Some(pack_id) = &entry.pack_id {
                 if let Some(reason) = entry
@@ -342,18 +341,32 @@ pub fn fleet_launch_config(
         .then_some(entry.config)
 }
 
-/// A fleet service's entry as the gateway connects it: an ordinary stdio
-/// launch of the absolute program the host resolved, which is never looked up
-/// on PATH.
+/// A fleet service's entry as the gateway connects it: a stdio launch of the
+/// absolute program the host resolved, which is never looked up on PATH,
+/// marked so the gateway floors an override and records the launch.
 fn fleet_stdio(
     authored: &McpServerConfig,
+    key: &MachineServiceKey,
+    view: &super::machine_services::InstanceView,
     launch: &crate::project_services::declaration::NativeLaunch,
 ) -> McpServerConfig {
+    use crate::project_services::declaration::LaunchSource;
     let mut config = authored.clone();
     config.transport = "stdio".to_string();
     config.command = Some(launch.program.clone());
     config.args = launch.args.clone();
     config.service = None;
+    config.fleet_launch = Some(FleetLaunchMark {
+        service_key: key.to_string(),
+        machine: view.machine.clone(),
+        overridden: launch.source == LaunchSource::Override,
+        credential_floor: launch.sandbox_mode
+            == cairn_common::executor_protocol::ProcessSandboxMode::CredentialFloor,
+        set_by_json: view
+            .set_by
+            .as_ref()
+            .and_then(|set_by| serde_json::to_string(set_by).ok()),
+    });
     config
 }
 
@@ -875,6 +888,7 @@ mod tests {
                     state: state.clone(),
                     installed_version: None,
                     override_command: None,
+                    set_by: None,
                     provenance: "installed 1.0.0 (pack)".to_string(),
                     serves_mcp: true,
                     fleet: false,
@@ -1035,16 +1049,18 @@ mod tests {
         /// carries a launch.
         fn fleet_snapshot(host: InstanceState) -> MachineServiceSnapshot {
             let launch = (host == InstanceState::Ready).then(|| {
-                crate::project_services::declaration::NativeLaunch {
-                    program: "/home/u/.cairn/tools/kit-probe-eb5765e715747cac/probe".to_string(),
-                    args: vec!["serve".to_string()],
-                }
+                crate::project_services::declaration::NativeLaunch::artifact(
+                    "/home/u/.cairn/tools/kit-probe-eb5765e715747cac/probe".to_string(),
+                    vec!["serve".to_string()],
+                    None,
+                )
             });
             let view = |machine: &str, state: InstanceState, launch| InstanceView {
                 machine: machine.to_string(),
                 state,
                 installed_version: Some("1.0.0".to_string()),
                 override_command: None,
+                set_by: None,
                 provenance: "installed 1.0.0 (pack)".to_string(),
                 serves_mcp: machine == "local",
                 fleet: true,
@@ -1086,6 +1102,64 @@ mod tests {
                         reason: Some("the machine has not reported it yet".to_string()),
                     }],
                 })
+            );
+        }
+
+        /// The gateway floors a fleet override's spawn and records every
+        /// fleet launch, so resolution marks the entry with what it launches:
+        /// an override is floored and names who set it, the pack's artifact is
+        /// not floored, and no authored configuration can claim a mark.
+        #[test]
+        fn a_fleet_entry_is_marked_with_its_launch_and_an_override_is_floored() {
+            let (_dir, home) = installed(&[("probe", fleet_manifest())], ENTRY);
+            let artifact = fleet_snapshot(InstanceState::Ready);
+            let mark = resolve_mcp_server_entries(&home, None, &artifact)["probe-mcp"]
+                .config
+                .fleet_launch
+                .clone()
+                .expect("a fleet entry is marked");
+            assert_eq!(mark.service_key, "kit/probe");
+            assert_eq!(mark.machine, "local");
+            assert!(!mark.overridden);
+            assert!(!mark.credential_floor, "the pinned artifact is not floored");
+
+            let set_by = cairn_config::fleet::SetBy {
+                kind: cairn_config::fleet::SetByKind::Operator,
+                principal: "op".to_string(),
+                node_uri: None,
+                approval: None,
+                at_unix_ms: 1,
+            };
+            let mut overridden = artifact.clone();
+            for view in overridden.instances.get_mut(&key()).unwrap() {
+                if view.machine == "local" {
+                    view.override_command = Some("/opt/probe".to_string());
+                    view.set_by = Some(set_by.clone());
+                    view.launch = Some(
+                        crate::project_services::declaration::NativeLaunch::overriding(
+                            "/opt/probe".to_string(),
+                            vec!["serve".to_string()],
+                            Some(set_by.clone()),
+                        ),
+                    );
+                }
+            }
+            let entry = &resolve_mcp_server_entries(&home, None, &overridden)["probe-mcp"];
+            assert_eq!(entry.config.command.as_deref(), Some("/opt/probe"));
+            let mark = entry.config.fleet_launch.clone().unwrap();
+            assert!(mark.overridden && mark.credential_floor);
+            assert_eq!(
+                mark.set_by_json,
+                Some(serde_json::to_string(&set_by).unwrap())
+            );
+
+            let authored: McpServerConfig = serde_yaml::from_str(
+                "command: /opt/probe\nfleetLaunch:\n  credentialFloor: false\n",
+            )
+            .unwrap();
+            assert_eq!(
+                authored.fleet_launch, None,
+                "no configuration can set the mark"
             );
         }
 
@@ -1858,6 +1932,7 @@ args: ["@playwright/mcp@latest"]
             cwd: None,
             service: None,
             agent_plugin_runtime: None,
+            fleet_launch: None,
         };
         let e = cfg.expand_vars(&|var| match var {
             "BIN" => "server".to_string(),
@@ -1893,6 +1968,7 @@ args: ["@playwright/mcp@latest"]
             secrets: Vec::new(),
             service: None,
             agent_plugin_runtime: None,
+            fleet_launch: None,
         };
         let vars = cfg.referenced_vars();
         assert!(vars.contains("BIN"));
@@ -1920,6 +1996,7 @@ args: ["@playwright/mcp@latest"]
             cwd: None,
             service: None,
             agent_plugin_runtime: None,
+            fleet_launch: None,
         }
     }
 

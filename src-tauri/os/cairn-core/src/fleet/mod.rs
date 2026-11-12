@@ -4553,6 +4553,7 @@ impl Fleet {
                 page_call_programs: None,
                 github_credential: None,
                 machine_services: Vec::new(),
+                credential_floor_service_residents: false,
             },
             current_load: 0,
             observed_at_unix_ms: unix_time_ms(),
@@ -25786,6 +25787,7 @@ mod tests {
             page_call_programs: None,
             github_credential: None,
             machine_services: Vec::new(),
+            credential_floor_service_residents: false,
         }
     }
 
@@ -25921,6 +25923,7 @@ mod tests {
             page_call_programs: None,
             github_credential: None,
             machine_services: Vec::new(),
+            credential_floor_service_residents: false,
         }
     }
 
@@ -29049,6 +29052,7 @@ mod tests {
                         page_call_programs: None,
                         github_credential: None,
                         machine_services: Vec::new(),
+                        credential_floor_service_residents: false,
                     },
                     current_load: load,
                     observed_at_unix_ms,
@@ -31366,6 +31370,7 @@ mod tests {
                     page_call_programs: None,
                     github_credential: None,
                     machine_services: Vec::new(),
+                    credential_floor_service_residents: false,
                 },
             ),
             None,

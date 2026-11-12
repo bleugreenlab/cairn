@@ -32,7 +32,11 @@ struct ConfigureRequest {
     role: Option<cairn_common::executor_protocol::MachineRole>,
     /// Pack-declared machine services to select (`{}`, or
     /// `{override:{command}}`) or unselect (`null`) on this machine, keyed
-    /// `<pack>/<service>`. Stored fleet configuration, not an authorization gate.
+    /// `<pack>/<service>`. An authorization gate: selecting runs a standing
+    /// process outside the caller's fence that outlives the run, so a change
+    /// that widens what runs is the operator's to approve, one exact act at a
+    /// time ([`machine_services_authority`]); unselecting and clearing an
+    /// override are not.
     #[serde(alias = "machine_services")]
     machine_services: Option<management::MachineServiceChanges>,
     /// Declare this machine repaired, re-arming every check its old environment
@@ -51,6 +55,20 @@ struct ConfigureRequest {
 }
 
 impl ConfigureRequest {
+    /// Whether the patch changes anything besides its machine services. A
+    /// widening selection must come alone, so the card that approves it shows
+    /// one act and nothing else rides on its approval.
+    fn changes_more_than_machine_services(&self) -> bool {
+        self.new_name.is_some()
+            || self.runtime_policy.is_some()
+            || self.draining.is_some()
+            || self.reason.is_some()
+            || self.role.is_some()
+            || self.repaired.is_some()
+            || self.build_root.is_some()
+            || self.memory_diagnostic.is_some()
+    }
+
     fn diagnostic_generation(&self) -> Result<u64, &'static str> {
         if self.new_name.is_some()
             || self.runtime_policy.is_some()
@@ -97,6 +115,102 @@ struct ListenerRotationRequest {
     confirm: bool,
 }
 
+/// Refused alongside other fields: see
+/// [`ConfigureRequest::changes_more_than_machine_services`].
+const SELECT_ALONE: &str = "Refused: a machineServices change that selects a service needs the operator's approval of exactly that act, so send machineServices on its own patch and the other fields in another. Nothing changed.";
+
+/// The authority a `machineServices` patch crosses, for
+/// `authorization::prepare`: `None` unless the patch selects something that
+/// was not running. The dispatcher derives the same request from the same plan
+/// and admits it immediately before the write.
+///
+/// A patch that cannot be planned names no authority here; the dispatcher
+/// refuses it with the planner's reason, so no card is raised for a change
+/// that could not be made.
+pub(crate) async fn machine_services_authority(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    item: &ChangeItem,
+) -> Option<crate::authorization::prepare::Prepared> {
+    use crate::authorization::prepare::Prepared;
+    if item.mode != ChangeMode::Patch {
+        return None;
+    }
+    let CairnResource::Executor { name } =
+        super::super::target_resource_for_request(orch, request, item)
+            .await
+            .ok()?
+    else {
+        return None;
+    };
+    let configure: ConfigureRequest = serde_json::from_value(item.payload.clone()?).ok()?;
+    let changes = configure.machine_services.as_ref()?;
+    let plan = management::plan_machine_services(orch, &name, changes).ok()?;
+    if !plan.widens() {
+        return None;
+    }
+    if configure.changes_more_than_machine_services() {
+        return Some(Prepared::Refused(SELECT_ALONE.to_string()));
+    }
+    Some(Prepared::Authority(management::machine_service_request(
+        orch, &plan,
+    )))
+}
+
+/// Who is making a `machineServices` change through the resource door, as its
+/// plan requires: the approved agent for a widening plan, admitted here
+/// against the request the card was raised for; anyone for reductions.
+async fn machine_service_authority(
+    orch: &Orchestrator,
+    callback: &McpCallbackRequest,
+    plan: &management::MachineServicePlan,
+) -> Result<management::MachineServiceAuthority, String> {
+    use cairn_common::authorization::AuthorityDecision;
+    let actor = crate::authorization::resolve_actor(orch, callback).await;
+    let asker = actor.as_ref().and_then(|actor| {
+        actor
+            .principal
+            .node_uri
+            .clone()
+            .or_else(|| actor.principal.run_id.clone())
+    });
+    if !plan.widens() {
+        return Ok(management::MachineServiceAuthority::Reduction(
+            match asker {
+                Some(node_uri) => management::ReductionActor::Agent { node_uri },
+                None => management::ReductionActor::Unproven {
+                    label: "a caller with no run".to_string(),
+                },
+            },
+        ));
+    }
+    let request = management::machine_service_request(orch, plan);
+    let Some(actor) = actor else {
+        return Err(format!(
+            "Denied: selecting a machine service is the operator's to approve, and this request comes from no run that could ask. The operator selects it from Settings, or an agent asks with this same patch, which raises their card. Asked: {}",
+            request.summary
+        ));
+    };
+    let (decision, _event) = crate::authorization::authorize_recorded(&actor, &request).await?;
+    match decision {
+        AuthorityDecision::AllowedByGrant { grant_id, .. } => {
+            Ok(management::MachineServiceAuthority::Approved {
+                node_uri: asker.unwrap_or_else(|| "an unnamed run".to_string()),
+                approval: grant_id,
+            })
+        }
+        // Policy classifies every machine-service selection as a boundary,
+        // so direct here would be a classification nobody made.
+        AuthorityDecision::Direct => Err(
+            "Refused: a machine-service selection was classified as direct work, which it never is; nothing changed"
+                .to_string(),
+        ),
+        AuthorityDecision::ApprovalRequired(reason) | AuthorityDecision::Forbidden(reason) => {
+            Err(crate::authorization::refusal_message(&request, reason))
+        }
+    }
+}
+
 pub(super) async fn dispatch(
     orch: &Orchestrator,
     callback: &McpCallbackRequest,
@@ -111,12 +225,12 @@ pub(super) async fn dispatch(
     ) {
         return Ok(None);
     }
-    // No separate authorization gate here, deliberately. This write arrives over
-    // the runner's MCP callback, authenticated by its own local secret — and a
-    // caller holding that secret can already run arbitrary commands on this host
-    // through `run`, which is strictly more than enrolling an SSH executor. The
-    // operator check that does mean something lives on `/api/invoke`, where a
-    // request carries a person.
+    // Holding the runner's MCP callback secret is not authority. A run's
+    // `run` is fenced, and so is everything it starts, so an act that starts
+    // something outside the fence is gated here: selecting a machine service
+    // (`machine_service_authority`) is admitted only on the operator's
+    // approval of exactly that act. The person-carrying check for the other
+    // controls lives on `/api/invoke`.
 
     let summary = match (resource, item.mode) {
         (CairnResource::Executors, ChangeMode::Create) => {
@@ -302,21 +416,24 @@ pub(super) async fn dispatch(
                     "runtimePolicy is a live control: send the expectedGeneration you read from cairn://executors/<name>, so an edit cannot land on a connection that has since been replaced",
                 ));
             }
+            let machine_plan = match &request.machine_services {
+                Some(changes) => {
+                    let plan = management::plan_machine_services(orch, name, changes)
+                        .map_err(|error| build_failure(index, item, error))?;
+                    if plan.widens() && request.changes_more_than_machine_services() {
+                        return Err(build_failure(index, item, SELECT_ALONE));
+                    }
+                    Some(plan)
+                }
+                None => None,
+            };
             if dry_run {
                 let mut planned = Vec::new();
                 if let Some(new_name) = &request.new_name {
                     planned.push(format!("rename {name} to {new_name}"));
                 }
-                for (key, selection) in request.machine_services.iter().flatten() {
-                    planned.push(
-                        match selection.as_ref().map(|chosen| chosen.override_command()) {
-                            Some(Some(command)) => {
-                                format!("select {key} on {name} running {command}")
-                            }
-                            Some(None) => format!("select {key} on {name}"),
-                            None => format!("unselect {key} on {name}"),
-                        },
-                    );
+                if let Some(plan) = &machine_plan {
+                    planned.extend(plan.sentences());
                 }
                 if request.runtime_policy.is_some() {
                     planned.push("apply a runtime policy".to_string());
@@ -354,9 +471,14 @@ pub(super) async fn dispatch(
                 format!("Would {}", planned.join(", "))
             } else {
                 let mut applied = Vec::new();
-                if let Some(changes) = &request.machine_services {
-                    let summaries = management::set_machine_services(orch, name, changes)
+                if let (Some(changes), Some(plan)) = (&request.machine_services, &machine_plan) {
+                    let authority = machine_service_authority(orch, callback, plan)
+                        .await
                         .map_err(|error| build_failure(index, item, error))?;
+                    let summaries =
+                        management::set_machine_services(orch, name, changes, &authority, plan)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?;
                     applied.extend(summaries);
                 }
                 if let Some(policy) = request.runtime_policy {
@@ -610,5 +732,218 @@ mod memory_diagnostic_tests {
             "memoryDiagnostic": {"pid":42,"durationMs":60000}
         }))
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod machine_service_door_tests {
+    use super::super::issue_mutation_tests::{change_item, seed_running_node};
+    use super::*;
+    use crate::authorization::prepare::Prepared;
+    use crate::authorization::{issue_grant, resolve_actor, GrantIssue};
+    use cairn_common::authorization::{
+        AuthorityConstraintSet, AuthorityLifetimeKind, AuthorityProvenance, AuthorityRequest,
+    };
+    use serde_json::json;
+
+    const FLEET_PROBE: &str = "name: Probe\nruntime: native\nplacement: fleet\ntransport: mcp-stdio\nargs: [serve]\nartifacts:\n  version: 1.0.0\n  prove: [--version]\n  targets:\n    x86_64-unknown-linux-gnu:\n      url: https://example.invalid/probe\n      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54\n      size: 10\n      executable: probe\n";
+
+    fn as_run(run_id: &str) -> McpCallbackRequest {
+        McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp".to_string(),
+            run_id: Some(run_id.to_string()),
+            tool: "change".to_string(),
+            payload: json!({}),
+            tool_use_id: None,
+            origin: None,
+        }
+    }
+
+    async fn fixture() -> (
+        Orchestrator,
+        String,
+        tempfile::TempDir,
+        tokio::sync::mpsc::UnboundedReceiver<cairn_common::executor_protocol::ExecutorMessage>,
+    ) {
+        let orch = crate::orchestrator::models::tests::seeded_orchestrator().await;
+        let (_number, _job, run_id) = seed_running_node(&orch).await;
+        let (sender, link) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let resources = tempfile::tempdir().unwrap();
+        let root = resources.path().join("packs/kit");
+        std::fs::create_dir_all(root.join("services/probe")).unwrap();
+        std::fs::write(
+            root.join("cairn-pack.yaml"),
+            "id: kit\nname: Kit\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("services/probe/service.yaml"), FLEET_PROBE).unwrap();
+        cairn_packs::sync_one_pack(
+            &crate::services::RealGitClient,
+            &crate::services::RealFileSystem,
+            resources.path(),
+            &orch.config_dir,
+            "kit",
+        )
+        .unwrap();
+        (orch, run_id, resources, link)
+    }
+
+    fn patch(command: Option<&str>) -> ChangeItem {
+        let selection = match command {
+            Some(command) => json!({"override": {"command": command}}),
+            None => serde_json::Value::Null,
+        };
+        change_item(
+            "cairn://executors/local",
+            ChangeMode::Patch,
+            Some(json!({"machineServices": {"kit/probe": selection}})),
+        )
+    }
+
+    async fn write(orch: &Orchestrator, run_id: &str, item: &ChangeItem) -> Result<String, String> {
+        dispatch(
+            orch,
+            &as_run(run_id),
+            0,
+            item,
+            false,
+            &CairnResource::Executor {
+                name: "local".to_string(),
+            },
+        )
+        .await
+        .map(|summary| summary.unwrap_or_default())
+        .map_err(|failure| failure.error)
+    }
+
+    async fn card(orch: &Orchestrator, run_id: &str, item: &ChangeItem) -> AuthorityRequest {
+        match machine_services_authority(orch, &as_run(run_id), item).await {
+            Some(Prepared::Authority(request)) => request,
+            other => panic!("a widening patch raises a card: {other:?}"),
+        }
+    }
+
+    fn held(orch: &Orchestrator) -> Option<cairn_config::fleet::MachineSelection> {
+        crate::config::settings::load_fleet(&orch.config_dir)
+            .machine_services
+            .selection(&"kit/probe".parse().unwrap(), "local")
+            .cloned()
+    }
+
+    async fn approve_once(orch: &Orchestrator, run_id: &str, request: &AuthorityRequest) -> String {
+        let actor = resolve_actor(orch, &as_run(run_id)).await.unwrap();
+        issue_grant(
+            &orch.db.local,
+            GrantIssue {
+                request: request.clone(),
+                principal: actor.principal.clone(),
+                audience: actor.audience.clone(),
+                lifetime: AuthorityLifetimeKind::Once,
+                request_id: Some("perm-1".to_string()),
+                turn_id: actor.context.turn_id.clone(),
+                session_id: actor.context.session_id.clone(),
+                expires_at: None,
+                provenance: AuthorityProvenance {
+                    issuer: "operator_prompt".to_string(),
+                    ..Default::default()
+                },
+                constraints: AuthorityConstraintSet::for_approval(
+                    request,
+                    request.bind_act().as_ref(),
+                    AuthorityLifetimeKind::Once,
+                )
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// An agent's override raises a card naming the machine, the key, the
+    /// action and the command, and writes nothing until it is approved; the
+    /// approval admits exactly that act, and the row then names the agent and
+    /// the grant. Another command is not covered. Clearing needs no card.
+    #[tokio::test]
+    async fn an_agents_override_is_carded_written_only_on_approval_and_attributed() {
+        let (orch, run_id, _resources, _link) = fixture().await;
+        let item = patch(Some("/opt/probe"));
+        let request = card(&orch, &run_id, &item).await;
+        assert!(request.requires_act_binding());
+        for says in [
+            "select kit/probe on local, running /opt/probe",
+            "on this runner's host as a child of the runner",
+            "Cairn approves this path, not the file's bytes",
+        ] {
+            assert!(
+                request.summary.contains(says),
+                "{says}: {}",
+                request.summary
+            );
+        }
+
+        let error = write(&orch, &run_id, &item).await.unwrap_err();
+        assert!(
+            error.contains("Refused") || error.contains("approv"),
+            "{error}"
+        );
+        assert!(held(&orch).is_none(), "nothing is written before approval");
+
+        let grant = approve_once(&orch, &run_id, &request).await;
+        let other = patch(Some("/opt/other"));
+        assert!(
+            write(&orch, &run_id, &other).await.is_err(),
+            "another command is not covered"
+        );
+        assert!(held(&orch).is_none());
+
+        let summary = write(&orch, &run_id, &item).await.unwrap();
+        assert!(summary.contains("runs override /opt/probe"), "{summary}");
+        assert!(
+            summary.contains(&format!("approved by the operator ({grant})")),
+            "{summary}"
+        );
+        let set_by = held(&orch).unwrap().set_by.unwrap();
+        assert_eq!(set_by.kind, cairn_config::fleet::SetByKind::Agent);
+        assert_eq!(set_by.approval.as_deref(), Some(grant.as_str()));
+        assert!(set_by.node_uri.is_some());
+
+        // Clearing it is a reduction: no card, no grant.
+        assert!(
+            machine_services_authority(&orch, &as_run(&run_id), &patch(None))
+                .await
+                .is_none()
+        );
+        write(&orch, &run_id, &patch(None)).await.unwrap();
+        assert!(held(&orch).is_none());
+    }
+
+    /// A widening selection must come alone, so the card shows one act.
+    #[tokio::test]
+    async fn a_widening_selection_beside_other_fields_is_refused() {
+        let (orch, run_id, _resources, _link) = fixture().await;
+        let item = change_item(
+            "cairn://executors/local",
+            ChangeMode::Patch,
+            Some(json!({
+                "machineServices": {"kit/probe": {"override": {"command": "/opt/probe"}}},
+                "role": "general"
+            })),
+        );
+        match machine_services_authority(&orch, &as_run(&run_id), &item).await {
+            Some(Prepared::Refused(reason)) => {
+                assert!(
+                    reason.contains("send machineServices on its own"),
+                    "{reason}"
+                )
+            }
+            other => panic!("refused before any card: {other:?}"),
+        }
+        let error = write(&orch, &run_id, &item).await.unwrap_err();
+        assert!(error.contains("send machineServices on its own"), "{error}");
+        assert!(held(&orch).is_none());
     }
 }

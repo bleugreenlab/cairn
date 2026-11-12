@@ -10,6 +10,7 @@
 pub(crate) mod authority;
 pub(crate) mod declaration;
 pub(crate) mod host;
+pub(crate) mod launches;
 pub(crate) mod log;
 pub(crate) mod pack_source;
 pub(crate) mod protocol;

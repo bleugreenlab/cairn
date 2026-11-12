@@ -109,13 +109,23 @@ pub(crate) struct ResidentLaunch {
 
 impl ResidentLaunch {
     pub(crate) fn command(program: impl Into<String>, args: Vec<String>) -> Self {
+        Self::with_mode(program, args, ProcessSandboxMode::Unconfined)
+    }
+
+    /// [`Self::command`] under `sandbox_mode`: a machine-service override
+    /// asks for the operator credential floor.
+    pub(crate) fn with_mode(
+        program: impl Into<String>,
+        args: Vec<String>,
+        sandbox_mode: ProcessSandboxMode,
+    ) -> Self {
         Self {
             program: program.into(),
             args,
             env: Vec::new(),
             runtime_assets: Vec::new(),
             runtime_packages: Vec::new(),
-            sandbox_mode: ProcessSandboxMode::Unconfined,
+            sandbox_mode,
             cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
             relay: None,
             stdout_framing: ResidentStreamFraming::Bytes,

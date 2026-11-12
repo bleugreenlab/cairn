@@ -1501,6 +1501,20 @@ impl ProvenOperator {
             provenance: serde_json::to_string(&appearance).map_err(|error| error.to_string())?,
         })
     }
+
+    /// The operator as a record names them: the signed-in person, or this
+    /// install's desktop operator.
+    pub fn label(&self) -> String {
+        use cairn_common::identity::PrincipalRef;
+        match &self.principal {
+            PrincipalRef::Human {
+                issuer, subject, ..
+            } => format!("{subject} ({issuer})"),
+            PrincipalRef::Machine { device_id } => format!("the desktop operator ({device_id})"),
+            PrincipalRef::Agent { node, .. } => node.clone(),
+            PrincipalRef::External { provider, id, .. } => format!("{id} ({provider})"),
+        }
+    }
 }
 
 /// Removal authority cannot be supplied as JSON or inferred from a missing run.
@@ -2117,19 +2131,513 @@ pub fn mutate_fleet<T>(
 pub type MachineServiceChanges =
     std::collections::BTreeMap<String, Option<cairn_config::fleet::MachineSelection>>;
 
-/// Select and unselect machine services on one machine, in one fleet write.
+/// What one machine-service change would do to the row as it stands now.
 ///
-/// This is the one write path for the row: the resource patch and the Library
-/// UI both reach it. It reads, changes and writes the row under the fleet lock,
-/// so two selections made at once cannot lose one another. Returns a sentence
-/// per change.
-pub fn set_machine_services(
+/// Only the two selections widen what runs on a machine, and only they cross
+/// an authority boundary. Unselecting stops a resident and clearing an
+/// override stops a binary of somebody's naming in favour of the pack's pinned
+/// artifact, so neither asks anyone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineServiceChange {
+    /// Run the pack's pinned artifact where the service was not selected.
+    /// `program` names that artifact as the card shows it.
+    SelectArtifact { program: String },
+    /// Run `command` instead of the pack's artifact, newly or in place of
+    /// another selection.
+    SelectOverride { command: String },
+    /// Replace the override `command` with the pack's own artifact.
+    ClearOverride { command: String },
+    /// Stop running the service on this machine.
+    Unselect,
+    /// Already selected that way, or unselecting what is not selected.
+    Unchanged,
+}
+
+impl MachineServiceChange {
+    pub fn widens(&self) -> bool {
+        matches!(
+            self,
+            Self::SelectArtifact { .. } | Self::SelectOverride { .. }
+        )
+    }
+
+    /// The action as the approval's act names it.
+    fn action(&self) -> &'static str {
+        match self {
+            Self::SelectArtifact { .. } => "select",
+            Self::SelectOverride { .. } => "override",
+            Self::ClearOverride { .. } => "clear",
+            Self::Unselect => "unselect",
+            Self::Unchanged => "unchanged",
+        }
+    }
+
+    /// What would run, or what stops running: the artifact or the command.
+    fn program(&self) -> &str {
+        match self {
+            Self::SelectArtifact { program } => program,
+            Self::SelectOverride { command } | Self::ClearOverride { command } => command,
+            Self::Unselect | Self::Unchanged => "",
+        }
+    }
+}
+
+/// One machine's machine-service changes, resolved against its current row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineServicePlan {
+    pub executor_id: String,
+    pub device_id: String,
+    /// The machine's public name, which is what the row is keyed by.
+    pub machine: String,
+    /// The machine's artifact-plane target, when it is known.
+    pub target: Option<&'static str>,
+    pub changes: Vec<(cairn_config::fleet::MachineServiceKey, MachineServiceChange)>,
+    /// The keys that are `placement: fleet` services, which the runner's MCP
+    /// gateway launches on its own host rather than a resident on the machine.
+    pub fleet_keys: std::collections::BTreeSet<cairn_config::fleet::MachineServiceKey>,
+}
+
+impl MachineServicePlan {
+    /// Whether any change starts something that was not running.
+    pub fn widens(&self) -> bool {
+        self.changes.iter().any(|(_, change)| change.widens())
+    }
+
+    /// Each change as the operator should read it, in key order.
+    pub fn sentences(&self) -> Vec<String> {
+        let machine = &self.machine;
+        self.changes
+            .iter()
+            .map(|(key, change)| match change {
+                MachineServiceChange::SelectArtifact { program } => {
+                    format!("select {key} on {machine}, running the pack's pinned artifact {program}")
+                }
+                MachineServiceChange::SelectOverride { command } => {
+                    format!("select {key} on {machine}, running {command}")
+                }
+                MachineServiceChange::ClearOverride { command } => format!(
+                    "clear the override {command} for {key} on {machine}, running the pack's pinned artifact instead"
+                ),
+                MachineServiceChange::Unselect => format!("unselect {key} on {machine}"),
+                MachineServiceChange::Unchanged => format!("leave {key} on {machine} as it is"),
+            })
+            .collect()
+    }
+
+    /// What the operator is asked to approve: each change, then for each
+    /// widening one where it runs and what it can read there.
+    pub fn card_summary(&self) -> String {
+        let mut summary = format!("{}.", self.sentences().join("; "));
+        for (key, change) in &self.changes {
+            let risk = match change {
+                MachineServiceChange::SelectArtifact { .. } => format!(
+                    "{key} runs as a standing resident on {machine}, outside any fence and restarted until it is unselected, outliving the run that asked. The pack's artifact is pinned by sha256 and does not run under the credential floor: it can read the operator's authority secret on {machine}.",
+                    machine = self.machine
+                ),
+                MachineServiceChange::SelectOverride { command } => {
+                    let (place, floor) = if self.fleet_keys.contains(key) {
+                        (
+                            format!(
+                                "{key} runs {command} on this runner's host as a child of the runner, with its environment, whenever a session uses it."
+                            ),
+                            floor_sentence(host_target(), "this runner's host"),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{key} runs {command} as a standing resident on {machine}, outside any fence and restarted until it is unselected, outliving the run that asked.",
+                                machine = self.machine
+                            ),
+                            floor_sentence(self.target, &self.machine),
+                        )
+                    };
+                    format!(
+                        "{place} {floor} Cairn approves this path, not the file's bytes: whatever is at {command} when it starts is what runs."
+                    )
+                }
+                _ => continue,
+            };
+            summary.push(' ');
+            summary.push_str(&risk);
+        }
+        summary
+    }
+}
+
+/// What the credential floor does for an override on a machine of `target`.
+/// Only macOS enforces it; elsewhere it cannot stop a read (cairn/5492).
+fn floor_sentence(target: Option<&str>, machine: &str) -> String {
+    match target_os(target) {
+        Some("macos") => format!(
+            "It runs under the operator credential floor: it cannot read the operator's authority secret on {machine}."
+        ),
+        Some("linux") => format!(
+            "Linux cannot enforce the credential floor (cairn/5492): this binary can read the operator's authority secret on {machine}."
+        ),
+        Some("windows") => format!(
+            "Windows cannot enforce the credential floor: this binary can read the operator's authority secret on {machine}."
+        ),
+        _ => format!(
+            "{machine}'s platform is not known yet, so assume this binary can read the operator's authority secret there."
+        ),
+    }
+}
+
+/// The operating system an artifact-plane target names.
+fn target_os(target: Option<&str>) -> Option<&'static str> {
+    let target = target?;
+    if target.contains("apple-darwin") {
+        Some("macos")
+    } else if target.contains("linux") {
+        Some("linux")
+    } else if target.contains("windows") {
+        Some("windows")
+    } else {
+        None
+    }
+}
+
+/// This runner's own target, where a fleet service's gateway child runs.
+fn host_target() -> Option<&'static str> {
+    cairn_common::executor_protocol::RemotePlatform::from_os_arch(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+    .map(|platform| platform.target())
+}
+
+/// Who may make a machine-service change, as its door authenticated them.
+///
+/// Each door decides this from the [`MachineServicePlan`] it judged, and the
+/// writer holds it to that: only the first two may make a plan that widens.
+pub enum MachineServiceAuthority {
+    /// A credential-proven operator: a signed-in owner or admin, or the
+    /// desktop operator credential.
+    Operator(ProvenOperator),
+    /// An agent whose exact act an operator approved.
+    Approved {
+        node_uri: String,
+        /// The grant that covered the act.
+        approval: String,
+    },
+    /// A caller making only reductions, which need no approval.
+    Reduction(ReductionActor),
+}
+
+/// Who made a reduction.
+pub enum ReductionActor {
+    /// An agent run, by its node.
+    Agent { node_uri: String },
+    /// A caller the runner could not prove: on a no-JWT install, the runner's
+    /// ordinary session token, which any local process can present.
+    Unproven { label: String },
+}
+
+impl MachineServiceAuthority {
+    fn may_widen(&self) -> bool {
+        !matches!(self, Self::Reduction(_))
+    }
+
+    fn set_by(&self, at_unix_ms: u64) -> cairn_config::fleet::SetBy {
+        use cairn_config::fleet::{SetBy, SetByKind};
+        match self {
+            Self::Operator(operator) => SetBy {
+                kind: SetByKind::Operator,
+                principal: operator.label(),
+                node_uri: None,
+                approval: None,
+                at_unix_ms,
+            },
+            Self::Approved { node_uri, approval } => SetBy {
+                kind: SetByKind::Agent,
+                principal: node_uri.clone(),
+                node_uri: Some(node_uri.clone()),
+                approval: Some(approval.clone()),
+                at_unix_ms,
+            },
+            Self::Reduction(ReductionActor::Agent { node_uri }) => SetBy {
+                kind: SetByKind::Agent,
+                principal: node_uri.clone(),
+                node_uri: Some(node_uri.clone()),
+                approval: None,
+                at_unix_ms,
+            },
+            Self::Reduction(ReductionActor::Unproven { label }) => SetBy {
+                kind: SetByKind::Unproven,
+                principal: label.clone(),
+                node_uri: None,
+                approval: None,
+                at_unix_ms,
+            },
+        }
+    }
+}
+
+/// "the operator", or the agent and the approval that let it, as a summary
+/// and the executor page say who chose a selection.
+pub fn describe_setter(set_by: Option<&cairn_config::fleet::SetBy>) -> String {
+    use cairn_config::fleet::SetByKind;
+    let Some(set_by) = set_by else {
+        return "set before attribution was recorded".to_string();
+    };
+    let at = chrono::DateTime::from_timestamp_millis(set_by.at_unix_ms as i64)
+        .map(|at| {
+            at.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    match (set_by.kind, set_by.approval.as_deref()) {
+        (SetByKind::Operator, _) => format!("set by the operator, {}, {at}", set_by.principal),
+        (SetByKind::Agent, Some(approval)) => format!(
+            "set by agent {}, approved by the operator ({approval}), {at}",
+            set_by.principal
+        ),
+        (SetByKind::Agent, None) => format!("set by agent {}, {at}", set_by.principal),
+        (SetByKind::Unproven, _) => format!("set by {}, {at}", set_by.principal),
+    }
+}
+
+/// Classify each change against the machine's current row, without writing.
+///
+/// Comparing with the row is what tells `{}` that selects a service apart from
+/// `{}` that clears an override: the payload is the same and only one of them
+/// widens what runs. A change that could not be made is refused here, so no
+/// approval is ever asked for one.
+pub fn plan_machine_services(
     orch: &Orchestrator,
     reference: &str,
     changes: &MachineServiceChanges,
-) -> Result<Vec<String>, String> {
+) -> Result<MachineServicePlan, String> {
+    use cairn_config::fleet::MachineServiceKey;
     let executor_id = resolve_executor_reference(orch, reference)?;
     let machine = public_name(orch, &executor_id);
+    let target = machine_target(orch, &executor_id, &machine);
+    let current = crate::config::settings::load_fleet(&orch.config_dir).machine_services;
+    let mut planned = Vec::new();
+    let mut fleet_keys = std::collections::BTreeSet::new();
+    for (key, wanted) in changes {
+        let key = key.parse::<MachineServiceKey>()?;
+        if wanted
+            .as_ref()
+            .is_some_and(|selection| selection.set_by.is_some())
+        {
+            return Err(format!(
+                "{key}: setBy is recorded by the runner from who made the change; send the selection without it"
+            ));
+        }
+        let fleet = is_fleet_service(orch, &key);
+        if fleet {
+            fleet_keys.insert(key.clone());
+        }
+        if let Some(selection) = wanted {
+            check_selectable(orch, &key, &machine, target, selection)?;
+        }
+        let artifact = artifact_program(orch, &key, &machine, target);
+        let change = classify_change(
+            wanted.as_ref(),
+            current.selection(&key, &machine),
+            fleet,
+            &artifact,
+        );
+        planned.push((key, change));
+    }
+    Ok(MachineServicePlan {
+        device_id: executor_device_id(orch, &executor_id),
+        executor_id,
+        machine,
+        target,
+        changes: planned,
+        fleet_keys,
+    })
+}
+
+/// What setting `wanted` (`None` to unselect) does where `held` stands.
+fn classify_change(
+    wanted: Option<&cairn_config::fleet::MachineSelection>,
+    held: Option<&cairn_config::fleet::MachineSelection>,
+    fleet: bool,
+    artifact: &str,
+) -> MachineServiceChange {
+    match (wanted, held) {
+        (None, None) => MachineServiceChange::Unchanged,
+        // A fleet service's row entry is only ever an override, so removing
+        // it puts the pack's artifact back.
+        (None, Some(held)) => match held.override_command() {
+            Some(command) if fleet => MachineServiceChange::ClearOverride {
+                command: command.to_string(),
+            },
+            _ => MachineServiceChange::Unselect,
+        },
+        (Some(wanted), Some(held)) if wanted.same_choice(held) => MachineServiceChange::Unchanged,
+        (Some(wanted), held) => match (
+            wanted.override_command(),
+            held.and_then(|held| held.override_command()),
+        ) {
+            (Some(command), _) => MachineServiceChange::SelectOverride {
+                command: command.to_string(),
+            },
+            (None, Some(previous)) => MachineServiceChange::ClearOverride {
+                command: previous.to_string(),
+            },
+            (None, None) => MachineServiceChange::SelectArtifact {
+                program: artifact.to_string(),
+            },
+        },
+    }
+}
+
+/// The pack's artifact for `machine` as a card names it: the version, the
+/// executable inside it and its pinned digest, from the same declaration the
+/// supervisor resolves the program from.
+fn artifact_program(
+    orch: &Orchestrator,
+    key: &cairn_config::fleet::MachineServiceKey,
+    machine: &str,
+    target: Option<&str>,
+) -> String {
+    let native =
+        crate::project_services::pack_source::declared_machine_service(&orch.config_dir, key)
+            .and_then(|declared| declared.package.ok())
+            .and_then(|package| package.declaration.native().cloned());
+    let Some(native) = native else {
+        return format!("{key}");
+    };
+    match target.and_then(|target| {
+        native
+            .targets
+            .get(target)
+            .map(|artifact| (target, artifact))
+    }) {
+        Some((target, artifact)) => format!(
+            "{key} {} for {target} ({}, sha256 {})",
+            native.version,
+            artifact.executable,
+            artifact.sha256.get(..12).unwrap_or(&artifact.sha256)
+        ),
+        None => format!(
+            "{key} {} for {machine}'s platform, which is not known yet",
+            native.version
+        ),
+    }
+}
+
+/// The device an executor's enrollment names, or its live identity's for the
+/// runner's own machine.
+fn executor_device_id(orch: &Orchestrator, executor_id: &str) -> String {
+    if let Some(config) = crate::config::settings::load_fleet(&orch.config_dir)
+        .remote_executors
+        .get(executor_id)
+    {
+        return config.device_id.clone();
+    }
+    orch.fleet
+        .inspect_executors(unix_time_ms())
+        .into_iter()
+        .find(|executor| executor.health.identity.executor_id == executor_id)
+        .map(|executor| executor.health.identity.device_id)
+        .unwrap_or_default()
+}
+
+/// The authority request a widening plan raises: `Executor + Write` at the
+/// machine, bound to the act of exactly these changes.
+///
+/// The gate and the dispatcher both derive it here from the plan, so they name
+/// the same act. The act covers the runner, the machine's identity and public
+/// name, and each key's action and program: approving `local` does not
+/// approve a renamed or re-enrolled machine, and approving one command does
+/// not approve another.
+pub fn machine_service_request(
+    orch: &Orchestrator,
+    plan: &MachineServicePlan,
+) -> cairn_common::authorization::AuthorityRequest {
+    use cairn_common::authorization::{
+        ActDigest, AuthorityAction, AuthorityMutation, AuthorityPlace, AuthorityRequest,
+        AuthorityScope,
+    };
+    let runner = orch.anon_device_manager.device_id();
+    let act = ActDigest::of("executor.machine_services", |encoder| {
+        encoder.field("runner", &runner);
+        encoder.field("executor", &plan.executor_id);
+        encoder.field("device", &plan.device_id);
+        encoder.field("machine", &plan.machine);
+        encoder.field("changes", &plan.changes.len().to_string());
+        for (index, (key, change)) in plan.changes.iter().enumerate() {
+            encoder.field(&format!("changes[{index}].key"), &key.to_string());
+            encoder.field(&format!("changes[{index}].action"), change.action());
+            encoder.field(&format!("changes[{index}].program"), change.program());
+        }
+    });
+    AuthorityRequest::new(
+        AuthorityScope::new(
+            AuthorityPlace::Executor {
+                runner_device_id: runner,
+                executor_id: plan.executor_id.clone(),
+                device_id: plan.device_id.clone(),
+            },
+            AuthorityAction::Write,
+        ),
+        AuthorityMutation::Update,
+        plan.card_summary(),
+    )
+    .with_act(act)
+}
+
+/// Select and unselect machine services on one machine, in one fleet write.
+///
+/// This is the one write path for the row: the resource patch, the typed
+/// invoke and the desktop's Settings all reach it. It reads, changes and
+/// writes the row under the fleet lock, so two selections made at once cannot
+/// lose one another. Returns a sentence per change, naming who made it.
+///
+/// Deciding whether `authority` may is the door's, on `judged`, the
+/// [`plan_machine_services`] it authorized. The writer holds it to that: the
+/// plan must still be what was judged, under the lock as well as before it,
+/// or an unselect landing in between would turn an approved "clear the
+/// override" into a new selection nobody approved; a plan that widens needs an
+/// authority that may widen; and an override is refused inside any place an
+/// agent can write, whoever asks, because an approval binds a path and not the
+/// bytes found there.
+pub async fn set_machine_services(
+    orch: &Orchestrator,
+    reference: &str,
+    changes: &MachineServiceChanges,
+    authority: &MachineServiceAuthority,
+    judged: &MachineServicePlan,
+) -> Result<Vec<String>, String> {
+    let plan = plan_machine_services(orch, reference, changes)?;
+    if plan.executor_id != judged.executor_id || plan.machine != judged.machine {
+        return Err(format!(
+            "{reference} resolves to {} now, not the {} this change was judged for; nothing changed",
+            plan.machine, judged.machine
+        ));
+    }
+    if plan.changes != judged.changes {
+        return Err(format!(
+            "{} changed since this change was judged; nothing changed. Read cairn://executors/{} and ask again",
+            plan.machine, plan.machine
+        ));
+    }
+    if plan.widens() && !authority.may_widen() {
+        return Err(format!(
+            "Refused: {}. Selecting a machine service runs it outside any fence, so it is the operator's to approve; nothing changed",
+            plan.sentences().join("; ")
+        ));
+    }
+    let projects = project_checkouts(orch).await;
+    for (key, change) in &plan.changes {
+        if let MachineServiceChange::SelectOverride { command } = change {
+            if let Some(place) = agent_writable_place(orch, &plan, command, &projects) {
+                return Err(format!(
+                    "Refused: {command} is inside {place}, which agents can write. An approval binds a path, not the bytes found there, so Cairn will not run {key} from it on {}. Put the binary somewhere only the operator writes (such as /Applications or /usr/local/bin) and name that path; nothing changed",
+                    plan.machine
+                ));
+            }
+        }
+    }
+    let set_by = authority.set_by(unix_time_ms());
+    let setter = describe_setter(Some(&set_by));
+    let machine = plan.machine.clone();
     let parsed = changes
         .iter()
         .map(|(key, selection)| {
@@ -2137,29 +2645,49 @@ pub fn set_machine_services(
                 .map(|key| (key, selection.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let target = machine_target(orch, &executor_id, &machine);
-    let mut fleet_keys = std::collections::BTreeSet::new();
-    for (key, selection) in &parsed {
-        if is_fleet_service(orch, key) {
-            fleet_keys.insert(key.clone());
-        }
-        if let Some(selection) = selection {
-            check_selectable(orch, key, &machine, target, selection)?;
-        }
-    }
     let summaries = mutate_fleet(orch, |config| {
+        for (key, selection) in &parsed {
+            let judged_change = judged
+                .changes
+                .iter()
+                .find(|(judged_key, _)| judged_key == key)
+                .map(|(_, change)| change);
+            let artifact = match judged_change {
+                Some(MachineServiceChange::SelectArtifact { program }) => program.as_str(),
+                _ => "",
+            };
+            let now = classify_change(
+                selection.as_ref(),
+                config.machine_services.selection(key, &machine),
+                judged.fleet_keys.contains(key),
+                artifact,
+            );
+            if judged_change != Some(&now) {
+                return Err(format!(
+                    "{key} on {machine} changed since this change was judged; nothing changed. Read cairn://executors/{machine} and ask again"
+                ));
+            }
+        }
         let mut summaries = Vec::new();
         for (key, selection) in parsed {
-            if fleet_keys.contains(&key) {
+            let selection = selection.map(|mut selection| {
+                selection.set_by = Some(set_by.clone());
+                selection
+            });
+            if judged.fleet_keys.contains(&key) {
                 let command = selection
                     .as_ref()
                     .and_then(|selection| selection.override_command().map(str::to_string));
                 summaries.push(match (command, selection) {
                     (Some(command), Some(selection)) => {
-                        config
+                        if config
                             .machine_services
-                            .select(key.clone(), &machine, selection)?;
-                        format!("{key} on {machine} runs override {command} (operator)")
+                            .select(key.clone(), &machine, selection)?
+                        {
+                            format!("{key} on {machine} runs override {command} ({setter})")
+                        } else {
+                            format!("{key} on {machine} already ran override {command}")
+                        }
                     }
                     _ if config.machine_services.unselect(&key, &machine) => {
                         format!(
@@ -2173,15 +2701,16 @@ pub fn set_machine_services(
             match selection {
                 Some(selection) => {
                     let provenance = match selection.override_command() {
-                        Some(command) => format!("override {command} (operator)"),
+                        Some(command) => format!("override {command}"),
                         None => "the pack's artifact".to_string(),
                     };
                     if config
                         .machine_services
                         .select(key.clone(), &machine, selection)?
                     {
-                        summaries
-                            .push(format!("selected {key} on {machine}, running {provenance}"));
+                        summaries.push(format!(
+                            "selected {key} on {machine}, running {provenance} ({setter})"
+                        ));
                     } else {
                         summaries.push(format!("{key} was already selected on {machine} that way"));
                     }
@@ -2200,6 +2729,255 @@ pub fn set_machine_services(
     crate::project_services::supervisor::machine::spawn_apply(orch, "machine-service selection");
     orch.emit_machine_service_change();
     Ok(summaries)
+}
+
+/// Every project checkout this runner has registered, from every database it
+/// holds. A checkout is where agents' branches land, so an override inside one
+/// is a binary an agent's merge could replace.
+async fn project_checkouts(orch: &Orchestrator) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for db in orch.db.all_dbs().await {
+        let paths = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query("SELECT repo_path FROM projects", ()).await?;
+                    let mut paths = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        paths.push(row.text(0)?);
+                    }
+                    Ok(paths)
+                })
+            })
+            .await
+            .unwrap_or_default();
+        roots.extend(
+            paths
+                .into_iter()
+                .filter(|path| !path.trim().is_empty())
+                .map(std::path::PathBuf::from),
+        );
+    }
+    roots
+}
+
+/// Temp roots on every platform a machine could run, by their usual spellings.
+const TEMP_ROOTS: &[&str] = &[
+    "/tmp",
+    "/private/tmp",
+    "/var/tmp",
+    "/private/var/tmp",
+    "/var/folders",
+    "/private/var/folders",
+    "/dev/shm",
+];
+
+/// The agent-writable place `command` lies inside on the plan's machine, named
+/// for the refusal, or `None` when it lies in none Cairn knows of.
+///
+/// Matched on whole path components. On the runner's own machine the path is
+/// checked as written and as it resolves (through its deepest existing
+/// ancestor), so a `/var` or symlinked spelling of a scratch path is still
+/// refused. A remote machine's path is checked only as written: the runner
+/// cannot resolve it there.
+fn agent_writable_place(
+    orch: &Orchestrator,
+    plan: &MachineServicePlan,
+    command: &str,
+    projects: &[std::path::PathBuf],
+) -> Option<String> {
+    let local = plan.executor_id == super::COLOCATED_EXECUTOR_ID;
+    let windows = target_os(plan.target) == Some("windows")
+        || cairn_config::fleet::is_absolute_command_path(command) && !command.starts_with('/');
+    let mut spellings = vec![command.to_string()];
+    if local {
+        let resolved = resolve_existing(std::path::Path::new(command));
+        spellings.push(resolved.to_string_lossy().into_owned());
+    }
+    let mut roots: Vec<(String, String)> = TEMP_ROOTS
+        .iter()
+        .map(|root| (root.to_string(), "a temp directory ($TMPDIR)".to_string()))
+        .collect();
+    if local {
+        let temp = std::env::temp_dir();
+        roots.push((
+            temp.to_string_lossy().into_owned(),
+            "a temp directory ($TMPDIR)".to_string(),
+        ));
+        match cairn_sandbox::OperatorCredentialFloor::for_this_machine().known_homes() {
+            Ok(homes) => roots.extend(
+                homes
+                    .into_iter()
+                    .map(|home| (home.to_string_lossy().into_owned(), String::new())),
+            ),
+            Err(error) => {
+                return Some(format!(
+                    "no Cairn home Cairn can rule out: it could not list this machine's Cairn homes ({error})"
+                ))
+            }
+        }
+        roots.push((
+            cairn_common::paths::cairn_home()
+                .to_string_lossy()
+                .into_owned(),
+            String::new(),
+        ));
+        if let Some(build_root) =
+            crate::config::settings::load_fleet(&orch.config_dir).colocated_build_root
+        {
+            roots.push((
+                build_root.path.to_string_lossy().into_owned(),
+                "this machine's build root".to_string(),
+            ));
+        }
+        for project in projects {
+            roots.push((
+                project.to_string_lossy().into_owned(),
+                "a project checkout".to_string(),
+            ));
+        }
+        if let Some(home) = cairn_common::paths::os_home_dir() {
+            for cache in cairn_sandbox::toolchain_writable_dirs_in(&home) {
+                roots.push((
+                    cache.to_string_lossy().into_owned(),
+                    "a fence-writable cache".to_string(),
+                ));
+            }
+        }
+    } else if let Some(config) = crate::config::settings::load_fleet(&orch.config_dir)
+        .remote_executors
+        .get(&plan.executor_id)
+    {
+        roots.push((config.cairn_home.clone(), String::new()));
+    }
+    // The deepest root that holds the path names it, so a Cairn home that
+    // sits inside a temp directory is still named for what it is.
+    let mut found: Option<(usize, String)> = None;
+    // A root may be spelled through a symlink (a checkout registered as
+    // `~/projects/app` that is `/Volumes/work/app`), so on the runner's own
+    // machine each root is matched as written and as it resolves, against
+    // both spellings of the command.
+    if local {
+        let resolved: Vec<(String, String)> = roots
+            .iter()
+            .map(|(root, place)| {
+                (
+                    resolve_existing(std::path::Path::new(root))
+                        .to_string_lossy()
+                        .into_owned(),
+                    place.clone(),
+                )
+            })
+            .filter(|resolved| !roots.contains(resolved))
+            .collect();
+        roots.extend(resolved);
+    }
+    for spelling in &spellings {
+        let path = components(spelling, windows);
+        let mut candidates: Vec<(usize, String)> = roots
+            .iter()
+            .filter_map(|(root, place)| {
+                let root = components(root, windows);
+                (!root.is_empty() && path.len() > root.len() && path.starts_with(&root)).then(
+                    || {
+                        let named = if place.is_empty() {
+                            cairn_home_place(&path[root.len()..])
+                        } else {
+                            place.clone()
+                        };
+                        (root.len(), named)
+                    },
+                )
+            })
+            .collect();
+        // Any Cairn home by shape, on any machine: `.cairn` or `.cairn-*`
+        // directly in a user's home.
+        if let Some(at) = cairn_home_by_shape(&path) {
+            candidates.push((at + 1, cairn_home_place(&path[at + 1..])));
+        }
+        for candidate in candidates {
+            if found.as_ref().is_none_or(|(depth, _)| candidate.0 > *depth) {
+                found = Some(candidate);
+            }
+        }
+    }
+    found.map(|(_, place)| place)
+}
+
+/// `path` resolved through its deepest existing ancestor, the rest appended.
+fn resolve_existing(path: &std::path::Path) -> std::path::PathBuf {
+    let mut rest = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(resolved) = current.canonicalize() {
+            return rest
+                .iter()
+                .rev()
+                .fold(resolved, |acc: std::path::PathBuf, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// A path's components, separators of either kind, empty ones dropped, and
+/// case folded for a Windows path.
+fn components(path: &str, windows: bool) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(|part| {
+            if windows {
+                part.to_lowercase()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Where a Cairn home sits in `path` by shape: the index of a `.cairn` or
+/// `.cairn-*` component directly inside a user's home (`/Users/<name>`,
+/// `/home/<name>`, `C:\Users\<name>`, `/root`, `/var/root`).
+fn cairn_home_by_shape(path: &[String]) -> Option<usize> {
+    path.iter().enumerate().find_map(|(at, part)| {
+        let is_home = part == ".cairn" || part.starts_with(".cairn-");
+        let in_user_home = match &path[..at] {
+            [base, name] => {
+                base.eq_ignore_ascii_case("users")
+                    || base == "home"
+                    || (base == "var" && name == "root")
+            }
+            [drive, base, _] => drive.ends_with(':') && base.eq_ignore_ascii_case("users"),
+            [root] => root == "root",
+            _ => false,
+        };
+        (is_home && in_user_home).then_some(at)
+    })
+}
+
+/// What a path inside a Cairn home is, by the layout `ExecutorPaths` and the
+/// runner keep there.
+fn cairn_home_place(rest: &[String]) -> String {
+    match rest {
+        [first, ..] if first == cairn_common::runtime::BUILD_SLOTS_DIR => "a build cell",
+        [first, second, ..]
+            if first == cairn_common::executor_paths::SCRATCH_TREES_DIR
+                && second.starts_with('c') =>
+        {
+            "a build cell's scratch"
+        }
+        [first, ..] if first == cairn_common::executor_paths::SCRATCH_TREES_DIR => {
+            "a node scratch or residence"
+        }
+        [first, ..] if first == "scratch" => "a node scratch",
+        [first, ..] if first == "worktrees" => "a worktree",
+        _ => "the Cairn home",
+    }
+    .to_string()
 }
 
 /// The artifact-plane target a machine runs, from its live advertisement, else
@@ -2273,7 +3051,7 @@ fn check_selectable(
     }
     if package.declaration.placement == crate::project_services::declaration::Placement::Fleet {
         return Err(format!(
-            "{key} is delivered to every machine it ships for; there is nothing to install. Set an override to run your own build."
+            "{key} is delivered to every machine it ships for; there is nothing to install. A binary of the operator's own choosing can run in its place with the operator's approval (`override: {{command}}`), outside any agent-writable directory."
         ));
     }
     if let Some(refusal) = declared.refusal {
@@ -2287,7 +3065,7 @@ fn check_selectable(
     }
     let declared: Vec<&str> = native.targets.keys().map(String::as_str).collect();
     Err(format!(
-        "{key} ships no artifact for {machine}'s target {target} (it declares {}); select it with override: {{command: /abs/path}} to run a binary of your own there",
+        "{key} ships no artifact for {machine}'s target {target} (it declares {}); a binary of the operator's own choosing can run there with the operator's approval (`override: {{command}}`), outside any agent-writable directory",
         declared.join(", ")
     ))
 }
@@ -2461,6 +3239,7 @@ mod tests {
                 page_call_programs: None,
                 github_credential: None,
                 machine_services: Vec::new(),
+                credential_floor_service_residents: false,
             },
             current_load: 0,
             observed_at_unix_ms: 0,
@@ -3239,57 +4018,509 @@ mod tests {
     /// clears every override it had.
     #[tokio::test]
     async fn a_fleet_service_takes_an_override_or_null_and_refuses_an_install() {
-        use cairn_config::fleet::{CommandOverride, MachineSelection};
+        use cairn_config::fleet::{MachineSelection, SetByKind};
         let temp = tempfile::tempdir().unwrap();
         let orch = test_orchestrator(temp.path()).await;
         let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
         orch.fleet.attach_executor(sender);
         let _resources = install_fleet_pack(&orch.config_dir);
         let key: cairn_config::fleet::MachineServiceKey = "kit/probe".parse().unwrap();
-        let change = |selection: Option<MachineSelection>| {
-            MachineServiceChanges::from([("kit/probe".to_string(), selection)])
-        };
-        let overriding = || {
-            Some(MachineSelection {
-                override_: Some(CommandOverride {
-                    command: "/opt/probe".into(),
-                }),
-            })
-        };
+        let operator = || MachineServiceAuthority::Operator(test_operator());
         let row = || crate::config::settings::load_fleet(&orch.config_dir).machine_services;
 
-        let error =
-            set_machine_services(&orch, "local", &change(Some(MachineSelection::default())))
-                .unwrap_err();
-        assert_eq!(
-            error,
-            "kit/probe is delivered to every machine it ships for; there is nothing to install. Set an override to run your own build."
+        let error = plan_machine_services(
+            &orch,
+            "local",
+            &probe_change(Some(MachineSelection::default())),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("kit/probe is delivered to every machine it ships for; there is nothing to install. A binary of the operator's own choosing can run in its place with the operator's approval"),
+            "{error}"
         );
+        assert!(!error.contains("your own build"), "{error}");
         assert!(row().is_empty());
 
-        assert_eq!(
-            set_machine_services(&orch, "local", &change(overriding())).unwrap(),
-            ["kit/probe on local runs override /opt/probe (operator)"]
+        let summaries = write(&orch, &probe_change(overriding("/opt/probe")), &operator())
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(
+            summaries[0].starts_with(
+                "kit/probe on local runs override /opt/probe (set by the operator, the desktop operator (device-1), "
+            ),
+            "{summaries:?}"
         );
+        assert!(!summaries[0].contains("(operator)"), "{summaries:?}");
+        let held = row().selection(&key, "local").cloned().unwrap();
+        assert_eq!(held.override_command(), Some("/opt/probe"));
+        assert_eq!(held.set_by.unwrap().kind, SetByKind::Operator);
+
+        // Clearing a fleet override is a reduction anyone may make.
+        let reduction = MachineServiceAuthority::Reduction(ReductionActor::Agent {
+            node_uri: "cairn://p/cairn/1/1/builder".to_string(),
+        });
         assert_eq!(
-            row()
-                .selection(&key, "local")
-                .and_then(MachineSelection::override_command),
-            Some("/opt/probe")
-        );
-        assert_eq!(
-            set_machine_services(&orch, "local", &change(None)).unwrap(),
+            write(&orch, &probe_change(None), &reduction).await.unwrap(),
             ["cleared kit/probe's override on local; it runs the pack's artifact"]
         );
         assert!(row().is_empty());
         assert_eq!(
-            set_machine_services(&orch, "local", &change(None)).unwrap(),
+            write(&orch, &probe_change(None), &reduction).await.unwrap(),
             ["kit/probe had no override on local"]
         );
 
-        set_machine_services(&orch, "local", &change(overriding())).unwrap();
+        write(&orch, &probe_change(overriding("/opt/probe")), &operator())
+            .await
+            .unwrap();
         crate::config::machine_services::delete_pack_service(&orch, "kit", "probe").unwrap();
         assert!(row().is_empty(), "removing the item clears its overrides");
+    }
+
+    fn test_operator() -> ProvenOperator {
+        drain_test_operator("device-1", "desktop_operator_credential").unwrap()
+    }
+
+    fn probe_change(
+        selection: Option<cairn_config::fleet::MachineSelection>,
+    ) -> MachineServiceChanges {
+        MachineServiceChanges::from([("kit/probe".to_string(), selection)])
+    }
+
+    fn overriding(command: &str) -> Option<cairn_config::fleet::MachineSelection> {
+        Some(cairn_config::fleet::MachineSelection::overriding(command))
+    }
+
+    /// Plan and write on `local`, as a door does.
+    async fn write(
+        orch: &Orchestrator,
+        changes: &MachineServiceChanges,
+        authority: &MachineServiceAuthority,
+    ) -> Result<Vec<String>, String> {
+        let plan = plan_machine_services(orch, "local", changes)?;
+        set_machine_services(orch, "local", changes, authority, &plan).await
+    }
+
+    #[test]
+    fn a_change_is_classified_against_the_row_whoever_set_it() {
+        use cairn_config::fleet::{MachineSelection, SetBy, SetByKind};
+        let artifact = MachineSelection::default();
+        let mut attributed = MachineSelection::overriding("/opt/a");
+        attributed.set_by = Some(SetBy {
+            kind: SetByKind::Operator,
+            principal: "op".to_string(),
+            node_uri: None,
+            approval: None,
+            at_unix_ms: 1,
+        });
+        let a = MachineSelection::overriding("/opt/a");
+        let b = MachineSelection::overriding("/opt/b");
+        let classify = |wanted, held, fleet| classify_change(wanted, held, fleet, "kit/probe 1.0");
+        assert_eq!(
+            classify(Some(&artifact), None, false),
+            MachineServiceChange::SelectArtifact {
+                program: "kit/probe 1.0".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Some(&a), None, false),
+            MachineServiceChange::SelectOverride {
+                command: "/opt/a".to_string()
+            }
+        );
+        assert_eq!(
+            classify(Some(&b), Some(&attributed), false),
+            MachineServiceChange::SelectOverride {
+                command: "/opt/b".to_string()
+            },
+            "changing one override to another is a new selection"
+        );
+        assert_eq!(
+            classify(Some(&a), Some(&attributed), false),
+            MachineServiceChange::Unchanged,
+            "re-sending what runs is unchanged whoever chose it"
+        );
+        assert_eq!(
+            classify(Some(&artifact), Some(&attributed), false),
+            MachineServiceChange::ClearOverride {
+                command: "/opt/a".to_string()
+            }
+        );
+        assert_eq!(
+            classify(None, Some(&attributed), false),
+            MachineServiceChange::Unselect
+        );
+        assert_eq!(
+            classify(None, Some(&attributed), true),
+            MachineServiceChange::ClearOverride {
+                command: "/opt/a".to_string()
+            }
+        );
+        assert_eq!(classify(None, None, false), MachineServiceChange::Unchanged);
+        for (change, widens) in [
+            (classify(Some(&artifact), None, false), true),
+            (classify(Some(&a), None, false), true),
+            (classify(Some(&artifact), Some(&attributed), false), false),
+            (classify(None, Some(&attributed), false), false),
+            (classify(Some(&a), Some(&attributed), false), false),
+        ] {
+            assert_eq!(change.widens(), widens, "{change:?}");
+        }
+    }
+
+    /// Selecting is the operator's: a reduction-only caller is refused a
+    /// widening plan and writes nothing; it may still clear and unselect, and
+    /// re-sending what runs keeps who chose it. A caller cannot name the
+    /// setter.
+    #[tokio::test]
+    async fn only_an_authority_that_may_widen_selects_and_the_row_names_who_did() {
+        use cairn_config::fleet::{SetBy, SetByKind};
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let _resources = install_fleet_pack(&orch.config_dir);
+        let key: cairn_config::fleet::MachineServiceKey = "kit/probe".parse().unwrap();
+        let row = || crate::config::settings::load_fleet(&orch.config_dir).machine_services;
+        let node = "cairn://p/cairn/6097/1/builder".to_string();
+        let reduction = MachineServiceAuthority::Reduction(ReductionActor::Agent {
+            node_uri: node.clone(),
+        });
+
+        let error = write(&orch, &probe_change(overriding("/opt/probe")), &reduction)
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("Refused: select kit/probe on local, running /opt/probe"),
+            "{error}"
+        );
+        assert!(row().is_empty(), "a refusal writes nothing");
+
+        let approved = MachineServiceAuthority::Approved {
+            node_uri: node.clone(),
+            approval: "grant-7".to_string(),
+        };
+        let summaries = write(&orch, &probe_change(overriding("/opt/probe")), &approved)
+            .await
+            .unwrap();
+        assert!(
+            summaries[0].contains(&format!(
+                "set by agent {node}, approved by the operator (grant-7)"
+            )),
+            "{summaries:?}"
+        );
+        let set_by = row()
+            .selection(&key, "local")
+            .unwrap()
+            .set_by
+            .clone()
+            .unwrap();
+        assert_eq!(set_by.kind, SetByKind::Agent);
+        assert_eq!(set_by.node_uri.as_deref(), Some(node.as_str()));
+        assert_eq!(set_by.approval.as_deref(), Some("grant-7"));
+
+        // The operator re-sending the same override changes nothing, so the
+        // agent and its approval stay on the row.
+        let summaries = write(
+            &orch,
+            &probe_change(overriding("/opt/probe")),
+            &MachineServiceAuthority::Operator(test_operator()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            summaries,
+            ["kit/probe on local already ran override /opt/probe"]
+        );
+        assert_eq!(
+            row().selection(&key, "local").unwrap().set_by.as_ref(),
+            Some(&set_by)
+        );
+
+        let mut forged = cairn_config::fleet::MachineSelection::overriding("/opt/other");
+        forged.set_by = Some(SetBy {
+            kind: SetByKind::Operator,
+            principal: "me".to_string(),
+            node_uri: None,
+            approval: None,
+            at_unix_ms: 1,
+        });
+        let error = plan_machine_services(&orch, "local", &probe_change(Some(forged))).unwrap_err();
+        assert!(error.contains("setBy is recorded by the runner"), "{error}");
+    }
+
+    /// An approval of one plan is not an approval of what the row has become
+    /// since: a plan judged before another write landed is refused whole.
+    #[tokio::test]
+    async fn a_plan_that_no_longer_matches_the_row_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let _resources = install_fleet_pack(&orch.config_dir);
+        let operator = MachineServiceAuthority::Operator(test_operator());
+        write(&orch, &probe_change(overriding("/opt/probe")), &operator)
+            .await
+            .unwrap();
+        // Judged: clearing the override, a reduction.
+        let clearing = probe_change(None);
+        let judged = plan_machine_services(&orch, "local", &clearing).unwrap();
+        assert!(!judged.widens());
+        // Meanwhile the override is replaced.
+        write(&orch, &probe_change(overriding("/opt/other")), &operator)
+            .await
+            .unwrap();
+        let error = set_machine_services(
+            &orch,
+            "local",
+            &clearing,
+            &MachineServiceAuthority::Reduction(ReductionActor::Agent {
+                node_uri: "cairn://p/cairn/1/1/builder".to_string(),
+            }),
+            &judged,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("changed since this change was judged"),
+            "{error}"
+        );
+        let key: cairn_config::fleet::MachineServiceKey = "kit/probe".parse().unwrap();
+        assert_eq!(
+            crate::config::settings::load_fleet(&orch.config_dir)
+                .machine_services
+                .selection(&key, "local")
+                .and_then(|selection| selection.override_command().map(str::to_string)),
+            Some("/opt/other".to_string())
+        );
+    }
+
+    /// An approval binds a path, not bytes, so an override inside a place an
+    /// agent can write is refused by name whoever asks, the operator included.
+    #[tokio::test]
+    async fn an_override_an_agent_could_rewrite_is_refused_by_name_whoever_asks() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let _resources = install_fleet_pack(&orch.config_dir);
+        let home = cairn_common::paths::cairn_home();
+        let at = |rest: &str| home.join(rest).to_string_lossy().into_owned();
+        let temp_dir = std::env::temp_dir().join("probe");
+        let cases = [
+            (at("worktrees/cairn-1/bin/probe"), "a worktree"),
+            (at("build-slots/cairn/slot-1/probe"), "a build cell"),
+            (
+                at("tmp/n922831e5cd6/tree/probe"),
+                "a node scratch or residence",
+            ),
+            (at("tmp/c94c5a8dd531/probe"), "a build cell's scratch"),
+            (at("scratch/cairn.1.1.builder/probe"), "a node scratch"),
+            (
+                temp_dir.to_string_lossy().into_owned(),
+                "a temp directory ($TMPDIR)",
+            ),
+            (
+                "/var/folders/k1/xyz/T/probe".to_string(),
+                "a temp directory ($TMPDIR)",
+            ),
+            ("/tmp/probe".to_string(), "a temp directory ($TMPDIR)"),
+            // Another machine's home, by shape.
+            (
+                "/home/dev/.cairn-exec/build-slots/cairn/slot-2/probe".to_string(),
+                "a build cell",
+            ),
+        ];
+        for authority in [
+            MachineServiceAuthority::Operator(test_operator()),
+            MachineServiceAuthority::Approved {
+                node_uri: "cairn://p/cairn/1/1/builder".to_string(),
+                approval: "grant-1".to_string(),
+            },
+        ] {
+            for (path, place) in &cases {
+                let error = write(&orch, &probe_change(overriding(path)), &authority)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.starts_with(&format!(
+                        "Refused: {path} is inside {place}, which agents can write"
+                    )),
+                    "{path}: {error}"
+                );
+            }
+        }
+        assert!(crate::config::settings::load_fleet(&orch.config_dir)
+            .machine_services
+            .is_empty());
+    }
+
+    /// A writable root registered through a symlink is still refused when the
+    /// override names the root's real target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_override_through_a_symlinked_roots_real_target_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let _resources = install_fleet_pack(&orch.config_dir);
+        // The real checkout lives outside every other forbidden root (not
+        // under a temp directory or a Cairn home), and is registered through
+        // a symlink that lives elsewhere.
+        let base_dir = tempfile::Builder::new()
+            .prefix("symlinked-root-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let base = base_dir.path().to_path_buf();
+        let real = base.join("real-app");
+        std::fs::create_dir_all(real.join("bin")).unwrap();
+        let alias = base.join("alias-app");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let insert = format!(
+            "INSERT OR IGNORE INTO workspaces (id, name, created_at, updated_at) VALUES ('w-sym', 'W', 1, 1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-sym', 'w-sym', 'sym', 'sym', '{}', 1, 1);",
+            alias.display()
+        );
+        orch.db.local.execute_script(insert).await.unwrap();
+        let target = real.canonicalize().unwrap().join("bin/service");
+        let result = write(
+            &orch,
+            &probe_change(overriding(&target.to_string_lossy())),
+            &MachineServiceAuthority::Operator(test_operator()),
+        )
+        .await;
+        drop(base_dir);
+        let error = result.unwrap_err();
+        assert!(error.contains("is inside a project checkout"), "{error}");
+    }
+
+    fn plan_on(
+        target: Option<&'static str>,
+        fleet: bool,
+        change: MachineServiceChange,
+    ) -> MachineServicePlan {
+        let key: cairn_config::fleet::MachineServiceKey = "kit/probe".parse().unwrap();
+        MachineServicePlan {
+            executor_id: "exec".to_string(),
+            device_id: "device".to_string(),
+            machine: "lab".to_string(),
+            target,
+            fleet_keys: if fleet {
+                std::collections::BTreeSet::from([key.clone()])
+            } else {
+                Default::default()
+            },
+            changes: vec![(key, change)],
+        }
+    }
+
+    /// The card names the machine, the key, the action and the command, says
+    /// the bytes are not pinned, and says per platform what the binary can
+    /// read; a fleet override says it runs as a child of the runner.
+    #[test]
+    fn the_card_says_what_runs_where_and_what_it_can_read() {
+        let command = MachineServiceChange::SelectOverride {
+            command: "/opt/probe".to_string(),
+        };
+        let mac = plan_on(Some("aarch64-apple-darwin"), false, command.clone()).card_summary();
+        assert!(
+            mac.starts_with("select kit/probe on lab, running /opt/probe."),
+            "{mac}"
+        );
+        assert!(
+            mac.contains("cannot read the operator's authority secret on lab"),
+            "{mac}"
+        );
+        assert!(
+            mac.contains("Cairn approves this path, not the file's bytes"),
+            "{mac}"
+        );
+        let linux =
+            plan_on(Some("x86_64-unknown-linux-gnu"), false, command.clone()).card_summary();
+        assert!(
+            linux.contains("Linux cannot enforce the credential floor (cairn/5492): this binary can read the operator's authority secret on lab"),
+            "{linux}"
+        );
+        assert_ne!(mac, linux);
+        let unknown = plan_on(None, false, command.clone()).card_summary();
+        assert!(unknown.contains("assume this binary can read"), "{unknown}");
+        let fleet = plan_on(Some("x86_64-unknown-linux-gnu"), true, command).card_summary();
+        assert!(
+            fleet.contains("on this runner's host as a child of the runner, with its environment"),
+            "{fleet}"
+        );
+        let artifact = plan_on(
+            Some("aarch64-apple-darwin"),
+            false,
+            MachineServiceChange::SelectArtifact {
+                program: "kit/probe 1.0 (probe, sha256 abc)".to_string(),
+            },
+        )
+        .card_summary();
+        assert!(
+            artifact.contains("running the pack's pinned artifact kit/probe 1.0"),
+            "{artifact}"
+        );
+        assert!(
+            artifact.contains("it can read the operator's authority secret on lab"),
+            "{artifact}"
+        );
+    }
+
+    #[test]
+    fn the_setter_is_rendered_as_recorded_and_never_assumed() {
+        use cairn_config::fleet::{SetBy, SetByKind};
+        assert_eq!(describe_setter(None), "set before attribution was recorded");
+        let agent = SetBy {
+            kind: SetByKind::Agent,
+            principal: "cairn://p/cairn/1/1/builder".to_string(),
+            node_uri: Some("cairn://p/cairn/1/1/builder".to_string()),
+            approval: Some("grant-1".to_string()),
+            at_unix_ms: 0,
+        };
+        assert!(describe_setter(Some(&agent)).starts_with(
+            "set by agent cairn://p/cairn/1/1/builder, approved by the operator (grant-1)"
+        ));
+        let operator = SetBy {
+            kind: SetByKind::Operator,
+            principal: "op@example.com (issuer)".to_string(),
+            node_uri: None,
+            approval: None,
+            at_unix_ms: 0,
+        };
+        assert!(describe_setter(Some(&operator)).starts_with("set by the operator, op@example.com"));
+    }
+
+    /// The act binds the command: approving one override is not approving
+    /// another, nor the same command on another machine.
+    #[tokio::test]
+    async fn a_machine_service_request_is_bound_to_its_exact_act() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let override_of = |command: &str| {
+            plan_on(
+                Some("aarch64-apple-darwin"),
+                false,
+                MachineServiceChange::SelectOverride {
+                    command: command.to_string(),
+                },
+            )
+        };
+        let shown = machine_service_request(&orch, &override_of("/opt/probe"));
+        assert!(shown.requires_act_binding());
+        assert_eq!(shown.summary, override_of("/opt/probe").card_summary());
+        let approval = cairn_common::authorization::AuthorityConstraintSet::for_approval(
+            &shown,
+            shown.bind_act().as_ref(),
+            cairn_common::authorization::AuthorityLifetimeKind::Session,
+        )
+        .unwrap();
+        assert!(approval.covers(&machine_service_request(&orch, &override_of("/opt/probe"))));
+        assert!(!approval.covers(&machine_service_request(&orch, &override_of("/opt/other"))));
+        let mut renamed = override_of("/opt/probe");
+        renamed.machine = "lab-2".to_string();
+        assert!(!approval.covers(&machine_service_request(&orch, &renamed)));
     }
 
     #[tokio::test]

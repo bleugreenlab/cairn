@@ -1130,7 +1130,9 @@ fn toolchain_writable_dirs() -> Vec<PathBuf> {
     }
 }
 
-fn toolchain_writable_dirs_in(home: &Path) -> Vec<PathBuf> {
+/// [`toolchain_writable_dirs`] for the home `home`. Public so a check that a
+/// path lies outside every fence-writable place uses this same list.
+pub fn toolchain_writable_dirs_in(home: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = [
         ".cargo",
         ".rustup",

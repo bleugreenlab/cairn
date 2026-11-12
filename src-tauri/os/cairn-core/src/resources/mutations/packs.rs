@@ -1228,11 +1228,7 @@ mod tests {
             config.machine_services.select(
                 key.clone(),
                 "alpha",
-                cairn_config::fleet::MachineSelection {
-                    override_: Some(cairn_config::fleet::CommandOverride {
-                        command: "/opt/probe".to_string(),
-                    }),
-                },
+                cairn_config::fleet::MachineSelection::overriding("/opt/probe"),
             )
         })
         .unwrap();
@@ -1321,6 +1317,7 @@ mod tests {
                     },
                     installed_version: None,
                     override_command: Some("/opt/solo".to_string()),
+                    set_by: None,
                     provenance: "override /opt/solo (someone)".to_string(),
                     serves_mcp: true,
                     fleet: false,

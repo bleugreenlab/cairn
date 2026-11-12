@@ -3982,7 +3982,7 @@ fn machine_services_section(
 ) -> String {
     if instances.is_empty() {
         return format!(
-            "\n## Machine services\n- None selected on this machine. Select one with `write cairn://executors/{name}` and `{{machineServices: {{\"<pack>/<service>\": {{}}}}}}`.\n"
+            "\n## Machine services\n- None selected on this machine. Select one with `write cairn://executors/{name}` and `{{machineServices: {{\"<pack>/<service>\": {{}}}}}}`; an agent's selection asks the operator with a card for exactly that act.\n"
         );
     }
     let mut out = "\n## Machine services\n".to_string();
@@ -3993,6 +3993,12 @@ fn machine_services_section(
             instance.sentence(),
             instance.provenance
         ));
+        if let Some(launch) = crate::project_services::launches::latest_sentence(
+            &instance.key.to_string(),
+            &instance.machine,
+        ) {
+            out.push_str(&format!("  - Last launch: {launch}\n"));
+        }
         if let Some(at) = instance.probed_at_ms {
             out.push_str(&format!("  - Probed: {}\n", crate::clock::age_millis(at)));
         }
@@ -4100,6 +4106,7 @@ mod tests {
             provenance: provenance.into(),
             installed_version: None,
             override_command: None,
+            set_by: None,
             catalog: vec![crate::mcp::gateway::McpToolDef {
                 name: "look".into(),
                 description: None,
@@ -4148,7 +4155,7 @@ mod tests {
                 instance(
                     "local",
                     InstanceState::Ready,
-                    "override /Applications/Axon.app/Contents/Resources/bin/axon (operator)",
+                    "override /Applications/Axon.app/Contents/Resources/bin/axon (set by the operator, the desktop operator (device-1), 11-12 01:10)",
                 ),
                 instance("local", InstanceState::Ready, "installed 0.3.6 (pack)"),
                 instance(
@@ -4163,7 +4170,7 @@ mod tests {
         );
         for line in [
             "- axon/axon: ready",
-            "  - Runs: override /Applications/Axon.app/Contents/Resources/bin/axon (operator)",
+            "  - Runs: override /Applications/Axon.app/Contents/Resources/bin/axon (set by the operator, the desktop operator (device-1), 11-12 01:10)",
             "  - Runs: installed 0.3.6 (pack)",
             "- axon/axon: not installed: artifact unavailable",
             "  - Runs: not installed: artifact unavailable",

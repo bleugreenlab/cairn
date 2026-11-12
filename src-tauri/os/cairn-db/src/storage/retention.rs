@@ -670,6 +670,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("jj_branch_recoveries", SMALL),
     keep("branch_catch_up_modes", SMALL),
     keep("branch_catch_up_events", SECURITY),
+    // What an approved path actually ran, and under what confinement.
+    keep("machine_service_launches", SECURITY),
     keep("job_presence", SMALL),
     keep("landing_allocations", SMALL),
     keep("pending_injections", SMALL),

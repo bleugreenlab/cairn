@@ -115,6 +115,14 @@ pub mod fleet {
     pub use crate::fleet::*;
 }
 
+/// What the MCP gateway needs to launch a fleet machine service the way the
+/// supervisor resolved it: the confinement to wrap it in, and the record of
+/// the launch.
+pub mod machine_service_launches {
+    pub use crate::project_services::launches::{record_gateway_spawn, MachineServiceLaunch};
+    pub use cairn_sandbox::Confinement;
+}
+
 pub mod browsers {
     pub use crate::browsers::*;
 }

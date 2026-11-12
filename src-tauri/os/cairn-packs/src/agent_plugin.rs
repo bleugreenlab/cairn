@@ -388,6 +388,7 @@ fn convert_server(root: &Path, value: &Value) -> Result<AgentPluginServer, Strin
         secrets: Vec::new(),
         service: None,
         agent_plugin_runtime: None,
+        fleet_launch: None,
     };
     if kind == "stdio" {
         let command = text(value, "command").unwrap();

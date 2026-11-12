@@ -128,7 +128,10 @@ pub enum AuthorityPlace {
     /// One project.
     Project { project_id: String },
     /// One enrolled executor, identified by the runner that holds its
-    /// enrollment plus the machine it names. Not wired in v1.
+    /// enrollment plus the machine it names. `Write` here is selecting a
+    /// machine service on it, always bound to its exact act
+    /// ([`AuthorityRequest::requires_act_binding`]); enrollment and revocation
+    /// are not wired yet.
     Executor {
         runner_device_id: String,
         executor_id: String,
@@ -718,6 +721,22 @@ impl AuthorityRequest {
     pub fn requires_thread_binding(&self) -> bool {
         matches!(self.scope.place, AuthorityPlace::ExecutionQueue { .. })
     }
+
+    /// Whether this request may only be authorized by a grant bound to its
+    /// exact act, whatever that grant's lifetime.
+    ///
+    /// Decided by the scope alone, so a stored request, which has lost its
+    /// act, is still known to need one. The only write at an executor place
+    /// is selecting a machine service there (`executor.machine_services`),
+    /// which starts a standing process outside every fence: an approval of
+    /// "write executor X" says nothing about what would run, so no grant that
+    /// does not name the act covers one.
+    pub fn requires_act_binding(&self) -> bool {
+        matches!(
+            (&self.scope.place, self.scope.action),
+            (AuthorityPlace::Executor { .. }, AuthorityAction::Write)
+        )
+    }
 }
 
 // ============================================================================
@@ -854,7 +873,10 @@ impl AuthorityConstraintSet {
     /// - for `Once`, the act itself, so the single use is spent only by the act
     ///   the card described. `act` is the binding the card was raised with
     ///   ([`AuthorityRequest::bind_act`]), because a stored request no longer
-    ///   carries its unsalted act.
+    ///   carries its unsalted act;
+    /// - for an act-bound request ([`AuthorityRequest::requires_act_binding`]),
+    ///   the act at every lifetime, so a turn, session or standing approval of
+    ///   one machine-service selection is an approval of that selection only.
     ///
     /// A request missing a fact its approval must bind is an error rather than
     /// a wider grant: minting without the binding would either authorize more
@@ -880,9 +902,9 @@ impl AuthorityConstraintSet {
             })?;
             constraints.push(AuthorityConstraint::ActingThread { thread_id });
         }
-        if lifetime == AuthorityLifetimeKind::Once {
+        if lifetime == AuthorityLifetimeKind::Once || request.requires_act_binding() {
             let digest = act.cloned().ok_or_else(|| {
-                "this approval does not name the exact act it would authorize once".to_string()
+                "this approval does not name the exact act it would authorize".to_string()
             })?;
             constraints.push(AuthorityConstraint::ExactAct { digest });
         }
@@ -943,6 +965,12 @@ impl AuthorityConstraintSet {
                 .iter()
                 .any(AuthorityConstraint::is_acting_thread)
         {
+            return false;
+        }
+        // And for an act-bound request: a grant that names no act, whatever
+        // its lifetime and however it was minted, was not an approval of this
+        // one. The `ExactAct` constraint itself then requires the act to match.
+        if request.requires_act_binding() && !self.binds_exact_act() {
             return false;
         }
         self.constraints
@@ -1399,6 +1427,11 @@ pub enum AuthorityReason {
     /// tools, hooks and scripts to every agent that resolves them, so only the
     /// operator decides (cairn/6323).
     ProjectLibraryTrust,
+    /// Selecting a machine service on a machine, its pack's artifact or a
+    /// binary of someone's naming: a standing process outside every fence that
+    /// outlives the run that asked. Only the operator may start one, one exact
+    /// act at a time (cairn/6097).
+    MachineServiceSelection,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -1421,6 +1454,7 @@ impl AuthorityReason {
             AuthorityReason::StoredContentRemoval => "stored_content_removal",
             AuthorityReason::BranchCatchUpMode => "branch_catch_up_mode",
             AuthorityReason::ProjectLibraryTrust => "project_library_trust",
+            AuthorityReason::MachineServiceSelection => "machine_service_selection",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }
@@ -2606,5 +2640,76 @@ mod thread_constraint_tests {
             AuthorityReason::BranchCatchUpMode.as_str(),
             "branch_catch_up_mode"
         );
+        assert_eq!(
+            AuthorityReason::MachineServiceSelection.as_str(),
+            "machine_service_selection"
+        );
+    }
+
+    fn machine_service_selection(command: &str) -> AuthorityRequest {
+        AuthorityRequest::new(
+            AuthorityScope::new(
+                AuthorityPlace::Executor {
+                    runner_device_id: "runner".to_string(),
+                    executor_id: "alpha".to_string(),
+                    device_id: "device".to_string(),
+                },
+                AuthorityAction::Write,
+            ),
+            AuthorityMutation::Update,
+            format!("select kit/probe on alpha, running {command}"),
+        )
+        .with_act(ActDigest::of("executor.machine_services", |encoder| {
+            encoder.field("machine", "alpha");
+            encoder.field("key", "kit/probe");
+            encoder.field("action", "select");
+            encoder.field("command", command);
+        }))
+    }
+
+    /// A machine-service selection is covered only by a grant bound to its
+    /// exact act: never by an unconstrained grant, a grant minted for another
+    /// command, or one that names no act, at any lifetime.
+    #[test]
+    fn only_the_exact_act_covers_a_machine_service_selection() {
+        let shown = machine_service_selection("/opt/probe");
+        let other = machine_service_selection("/opt/other");
+        assert!(shown.requires_act_binding());
+        let stored: AuthorityRequest =
+            serde_json::from_value(serde_json::to_value(&shown).unwrap()).unwrap();
+        assert!(stored.facts.act.is_none());
+        assert!(
+            stored.requires_act_binding(),
+            "a stored request still needs its act"
+        );
+        assert!(!AuthorityConstraintSet::default().covers(&shown));
+        assert!(
+            !AuthorityConstraintSet::new(vec![AuthorityConstraint::MutationModes {
+                modes: vec![AuthorityMutation::Update],
+            }])
+            .covers(&shown)
+        );
+        let binding = shown.bind_act().unwrap();
+        for lifetime in [
+            AuthorityLifetimeKind::Once,
+            AuthorityLifetimeKind::Turn,
+            AuthorityLifetimeKind::Session,
+            AuthorityLifetimeKind::Standing,
+        ] {
+            assert!(
+                AuthorityConstraintSet::for_approval(&stored, None, lifetime).is_err(),
+                "{lifetime:?}: an approval that names no act mints nothing"
+            );
+            let constraints =
+                AuthorityConstraintSet::for_approval(&stored, Some(&binding), lifetime).unwrap();
+            assert!(constraints.binds_exact_act(), "{lifetime:?}");
+            assert!(constraints.covers(&shown), "{lifetime:?}");
+            assert!(!constraints.covers(&other), "{lifetime:?}");
+        }
+        // Running an existing executor's work is not a write and stays
+        // unbound.
+        let mut run = shown.clone();
+        run.scope.action = AuthorityAction::Run;
+        assert!(!run.requires_act_binding());
     }
 }

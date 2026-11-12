@@ -407,10 +407,66 @@ pub(crate) struct ServicePackage {
 /// The native executable one machine runs, and how it was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeLaunch {
-    /// The operator's absolute override, or a managed-program intent the
-    /// executor resolves under its home.
+    /// The absolute override, or a managed-program intent the executor
+    /// resolves under its home.
     pub program: String,
     pub args: Vec<String>,
+    /// `CredentialFloor` for an override, a binary of someone's naming whose
+    /// bytes nothing pins; `Unconfined` for the pack's pinned artifact.
+    pub sandbox_mode: cairn_common::executor_protocol::ProcessSandboxMode,
+    pub source: LaunchSource,
+    /// Who selected it, as the row records.
+    pub set_by: Option<cairn_config::fleet::SetBy>,
+}
+
+/// Whether a native launch runs the pack's artifact or an override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchSource {
+    Artifact,
+    Override,
+}
+
+impl LaunchSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Artifact => "artifact",
+            Self::Override => "override",
+        }
+    }
+}
+
+impl NativeLaunch {
+    /// The pack's pinned artifact, unconfined: it is pinned by sha256 and
+    /// reviewed, and the pack-artifact floor waits on its own measurement
+    /// (`docs/services.md`).
+    pub(crate) fn artifact(
+        program: String,
+        args: Vec<String>,
+        set_by: Option<cairn_config::fleet::SetBy>,
+    ) -> Self {
+        Self {
+            program,
+            args,
+            sandbox_mode: cairn_common::executor_protocol::ProcessSandboxMode::Unconfined,
+            source: LaunchSource::Artifact,
+            set_by,
+        }
+    }
+
+    /// An override, under the operator credential floor whoever set it.
+    pub(crate) fn overriding(
+        program: String,
+        args: Vec<String>,
+        set_by: Option<cairn_config::fleet::SetBy>,
+    ) -> Self {
+        Self {
+            program,
+            args,
+            sandbox_mode: cairn_common::executor_protocol::ProcessSandboxMode::CredentialFloor,
+            source: LaunchSource::Override,
+            set_by,
+        }
+    }
 }
 
 /// One entry in a source's listing. A malformed declaration is listed with its

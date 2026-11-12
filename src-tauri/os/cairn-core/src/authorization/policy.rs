@@ -173,6 +173,16 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
             AuthorityPolicy::RequiresApproval(AuthorityReason::BranchCatchUpMode)
         }
 
+        // ── Machine services ──────────────────────────────────────────
+        // The only write at an executor place is selecting a machine service
+        // there: a standing process outside every fence, restarted until it
+        // is unselected and outliving the run that asked. That is never the
+        // asking agent's own to start (cairn/6097), and the request is always
+        // bound to its exact act (`AuthorityRequest::requires_act_binding`).
+        (AuthorityPlace::Executor { .. }, AuthorityAction::Write) => {
+            AuthorityPolicy::RequiresApproval(AuthorityReason::MachineServiceSelection)
+        }
+
         // ── Stored content ───────────────────────────────────────────
         // Removing a stored object deletes its bytes for every reader, which
         // no one can undo, and decides over whatever private matter it shows.
@@ -188,10 +198,9 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
         // Ordinary work stays direct: project reads, writes, and runs; project
         // settings and project MCP configuration under the project's own
         // authority; invoking an already-configured server; using an external
-        // account's credential. Executor places are
-        // deliberately unclassified in v1 — placement is not authorization, and
-        // enrollment has no adapter yet, so nothing here should start prompting
-        // for a routine remote command.
+        // account's credential. Running work on an executor stays direct:
+        // placement is not authorization, and enrollment has no adapter yet,
+        // so nothing here should start prompting for a routine remote command.
         _ => AuthorityPolicy::Direct,
     }
 }
@@ -249,6 +258,31 @@ mod tests {
             AuthorityAction::Write,
         );
         assert_eq!(classify(&other, false), AuthorityPolicy::Direct);
+    }
+
+    #[test]
+    fn selecting_a_machine_service_always_requires_approval_and_running_work_does_not() {
+        let place = AuthorityPlace::Executor {
+            runner_device_id: "runner".to_string(),
+            executor_id: "exec".to_string(),
+            device_id: "device".to_string(),
+        };
+        for owned in [false, true] {
+            assert_eq!(
+                classify(
+                    &AuthorityScope::new(place.clone(), AuthorityAction::Write),
+                    owned
+                ),
+                AuthorityPolicy::RequiresApproval(AuthorityReason::MachineServiceSelection)
+            );
+            assert_eq!(
+                classify(
+                    &AuthorityScope::new(place.clone(), AuthorityAction::Run),
+                    owned
+                ),
+                AuthorityPolicy::Direct
+            );
+        }
     }
 
     #[test]

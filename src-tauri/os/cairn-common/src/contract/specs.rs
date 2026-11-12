@@ -47,7 +47,7 @@ pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
 );
 pub(crate) const EXECUTOR_MACHINE_SERVICES: KeySpec = KeySpec::with_aliases(
     "machineServices", &["machine_services"], KeyType::Object,
-    "{\"<pack>/<service>\": {} | {override:{command:\"/abs/path\"}} | null}: select a pack-declared machine service on this machine (running the pack's artifact, or the operator's own absolute binary) or unselect it. Stored fleet configuration, not an authorization gate; the service's state is read from cairn://executors/<name>",
+    "{\"<pack>/<service>\": {} | {override:{command:\"/abs/path\"}} | null}: select a pack-declared machine service on this machine (running the pack's pinned artifact, or an absolute binary of the operator's choosing outside any agent-writable directory) or unselect it. Selecting runs a standing process outside every fence, so an agent's selection raises an operator card for exactly that machine, service, action and command, and is written only once approved; unselecting and clearing an override never ask. Send it on its own patch. The service's state and who set it are read from cairn://executors/<name>",
 );
 pub(crate) const EXECUTOR_REPAIRED: KeySpec = KeySpec::new(
     "repaired",

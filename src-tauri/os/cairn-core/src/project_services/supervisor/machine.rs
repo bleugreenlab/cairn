@@ -54,7 +54,15 @@ pub(crate) struct MachineView {
     pub target: Option<String>,
     /// What its executor reports holding.
     pub installed: Vec<InstalledMachineService>,
+    /// Whether its executor keeps a service resident's credential floor. One
+    /// that predates it runs every service resident unconfined, so no override
+    /// is started there.
+    pub floors_service_residents: bool,
 }
+
+/// Why an override is not started on a machine whose executor cannot floor it.
+const OVERRIDE_NEEDS_FLOOR: &str =
+    "this executor predates floored overrides, so the override is not started; update it";
 
 /// The machines attached to this runner now.
 pub(crate) fn attached_machines(orch: &Orchestrator) -> Vec<MachineView> {
@@ -67,6 +75,7 @@ pub(crate) fn attached_machines(orch: &Orchestrator) -> Vec<MachineView> {
                 target: RemotePlatform::from_os_arch(&capabilities.os, &capabilities.arch)
                     .map(|platform| platform.target().to_string()),
                 installed: capabilities.machine_services.clone(),
+                floors_service_residents: capabilities.credential_floor_service_residents,
                 name: executor.name,
             }
         })
@@ -218,9 +227,10 @@ impl ServiceSource for MachineSource {
         hasher.update([0]);
         hasher.update(provenance.as_bytes());
         package.source_hash = format!("{:x}", hasher.finalize());
-        package.launch = Some(NativeLaunch {
-            program,
-            args: native.args.clone(),
+        let set_by = selection.set_by.clone();
+        package.launch = Some(match selection.override_command() {
+            Some(_) => NativeLaunch::overriding(program, native.args.clone(), set_by),
+            None => NativeLaunch::artifact(program, native.args.clone(), set_by),
         });
         Ok(Some(package))
     }
@@ -236,6 +246,9 @@ fn resolve_program(
     view: Option<&MachineView>,
 ) -> Result<(String, String), String> {
     if let Some(command) = selection.override_command() {
+        if view.is_some_and(|view| !view.floors_service_residents) {
+            return Err(OVERRIDE_NEEDS_FLOOR.to_string());
+        }
         return Ok((command.to_string(), format!("override:{command}")));
     }
     let view = view.ok_or_else(|| MACHINE_ABSENT.to_string())?;
@@ -969,13 +982,15 @@ pub(crate) struct MachineServiceInstance {
     pub key: MachineServiceKey,
     pub machine: String,
     pub state: InstanceState,
-    /// `override <path> (operator)`, `installed <version> (pack)`, or
-    /// `not installed: <reason>`.
+    /// `override <path> (set by ...)`, `installed <version> (pack)`, or
+    /// `not installed: <reason>`, naming who chose it as the row records.
     pub provenance: String,
     /// The pack artifact this machine holds, when it is the one declared.
     pub installed_version: Option<String>,
     /// The binary the selection runs instead of the pack's artifact.
     pub override_command: Option<String>,
+    /// Who made the selection, when the row recorded it.
+    pub set_by: Option<cairn_config::fleet::SetBy>,
     pub catalog: Vec<McpToolDef>,
     pub probed_at_ms: Option<i64>,
     /// Whether it serves MCP to this runner's gateway: a per-machine resident
@@ -1169,15 +1184,15 @@ fn fleet_instance(
     views: &[MachineView],
 ) -> MachineServiceInstance {
     let view = views.iter().find(|view| view.name == machine);
-    let override_command = row
-        .selection(key, machine)
-        .and_then(MachineSelection::override_command);
+    let selection = row.selection(key, machine);
+    let override_command = selection.and_then(MachineSelection::override_command);
+    let set_by = selection.and_then(|selection| selection.set_by.clone());
     let (artifact_sha, report) = holding(key, declared, view);
     let installed_version = installed_version(report, artifact_sha);
     let provenance = provenance(
         key,
         machine,
-        override_command,
+        selection,
         installed_version.as_deref(),
         report,
         view,
@@ -1207,6 +1222,7 @@ fn fleet_instance(
                     key,
                     native,
                     override_command,
+                    set_by.as_ref(),
                     target.as_deref(),
                 )
             }) {
@@ -1228,6 +1244,7 @@ fn fleet_instance(
         provenance,
         installed_version,
         override_command: override_command.map(str::to_string),
+        set_by,
         catalog: Vec::new(),
         probed_at_ms: None,
         serves_mcp: host && declared.transport() == Some(Transport::McpStdio),
@@ -1314,10 +1331,17 @@ pub(crate) fn fleet_launch(
     key: &MachineServiceKey,
     native: &NativeSpec,
     override_command: Option<&str>,
+    set_by: Option<&cairn_config::fleet::SetBy>,
     target: Option<&str>,
 ) -> Result<NativeLaunch, String> {
     let program = match override_command {
-        Some(command) => command.to_string(),
+        Some(command) => {
+            return Ok(NativeLaunch::overriding(
+                command.to_string(),
+                native.args.clone(),
+                set_by.cloned(),
+            ))
+        }
         None => {
             let target = target.ok_or_else(|| {
                 "not installed: this machine runs a platform no pack artifact targets".to_string()
@@ -1337,10 +1361,11 @@ pub(crate) fn fleet_launch(
                 .into_owned()
         }
     };
-    Ok(NativeLaunch {
+    Ok(NativeLaunch::artifact(
         program,
-        args: native.args.clone(),
-    })
+        native.args.clone(),
+        set_by.cloned(),
+    ))
 }
 
 /// What the installed packs say about one key.
@@ -1403,7 +1428,7 @@ fn instance(
     let provenance = provenance(
         key,
         machine,
-        selection.override_command(),
+        Some(selection),
         installed_version.as_deref(),
         report,
         view,
@@ -1415,7 +1440,7 @@ fn instance(
         key,
         selection,
         declared,
-        view.is_some(),
+        view,
         report,
         cell.as_deref(),
         probe.as_ref(),
@@ -1427,6 +1452,7 @@ fn instance(
         provenance,
         installed_version,
         override_command: selection.override_command().map(str::to_string),
+        set_by: selection.set_by.clone(),
         catalog: probe
             .as_ref()
             .map(|probe| probe.catalog.clone())
@@ -1454,15 +1480,23 @@ fn installed_version(
 fn provenance(
     key: &MachineServiceKey,
     machine: &str,
-    override_command: Option<&str>,
+    selection: Option<&MachineSelection>,
     installed_version: Option<&str>,
     report: Option<&InstalledMachineService>,
     view: Option<&MachineView>,
     artifact_sha: Option<&str>,
 ) -> String {
+    let setter = crate::fleet::management::describe_setter;
+    let override_command = selection.and_then(MachineSelection::override_command);
+    let set_by = selection.and_then(|selection| selection.set_by.as_ref());
     match (override_command, installed_version, report) {
-        (Some(command), _, _) => format!("override {command} (operator)"),
-        (None, Some(version), _) => format!("installed {version} (pack)"),
+        (Some(command), _, _) => format!("override {command} ({})", setter(set_by)),
+        // A fleet service's artifact has no row entry and so no setter; a
+        // selection made before attribution says nothing rather than guess.
+        (None, Some(version), _) => match set_by {
+            Some(set_by) => format!("installed {version} (pack; {})", setter(Some(set_by))),
+            None => format!("installed {version} (pack)"),
+        },
         (None, None, Some(report)) => match &report.outcome {
             MachineServiceInstallOutcome::NotInstalled { reason } => {
                 format!("not installed: {reason}")
@@ -1517,12 +1551,20 @@ fn derive_state(
     key: &MachineServiceKey,
     selection: &MachineSelection,
     declared: &Declared,
-    attached: bool,
+    view: Option<&MachineView>,
     report: Option<&InstalledMachineService>,
     cell: Option<&Cell>,
     probe: Option<&ProbeReport>,
 ) -> InstanceState {
+    let attached = view.is_some();
+    // A machine away from the runner has no executor to judge yet.
+    let floors = view.is_none_or(|view| view.floors_service_residents);
     let runs_artifact = selection.override_command().is_none();
+    if !runs_artifact && !floors {
+        return InstanceState::Failed {
+            reason: OVERRIDE_NEEDS_FLOOR.to_string(),
+        };
+    }
     match (&declared.package, &declared.refusal) {
         (None, _) => InstanceState::NotInstalled {
             reason: format!("no installed pack declares {key}"),
@@ -1574,7 +1616,7 @@ pub(super) fn announce_state(orch: &Orchestrator, cell: &Arc<Cell>) -> bool {
         key,
         selection,
         &declared,
-        view.is_some(),
+        view.as_ref(),
         report,
         current.as_deref(),
         probe.as_ref(),

@@ -383,6 +383,7 @@ fn test_executor_advertisement(
             page_call_programs: None,
             github_credential: None,
             machine_services: Vec::new(),
+            credential_floor_service_residents: false,
         },
         current_load: 0,
         node_scratches: pool.map(ExecutorPool::node_scratches).unwrap_or_default(),

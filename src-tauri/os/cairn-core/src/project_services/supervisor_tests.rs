@@ -2983,6 +2983,7 @@ struct MachineHarness {
 
 fn view(name: &str) -> machine::MachineView {
     machine::MachineView {
+        floors_service_residents: true,
         name: name.to_string(),
         target: Some("x86_64-unknown-linux-gnu".to_string()),
         installed: Vec::new(),
@@ -3050,6 +3051,7 @@ fn reporting(
     outcome: cairn_common::executor_protocol::MachineServiceInstallOutcome,
 ) -> machine::MachineView {
     machine::MachineView {
+        floors_service_residents: true,
         name: name.to_string(),
         target: Some(target.to_string()),
         installed: vec![cairn_common::executor_protocol::InstalledMachineService {
@@ -3126,6 +3128,7 @@ async fn a_fleet_services_state_on_each_machine_is_its_install_report() {
             },
         ),
         machine::MachineView {
+            floors_service_residents: true,
             name: "bginf-sp1".to_string(),
             target: Some("aarch64-unknown-linux-gnu".to_string()),
             installed: Vec::new(),
@@ -3175,7 +3178,7 @@ async fn a_fleet_services_state_on_each_machine_is_its_install_report() {
     assert_eq!(
         snapshot
             .host_launch(&probe_key())
-            .map(|launch| launch.program.clone()),
+            .map(|(_, launch)| launch.program.clone()),
         Some(program.to_string_lossy().into_owned())
     );
 }
@@ -3208,7 +3211,7 @@ async fn the_host_is_ready_only_with_a_marked_install_or_an_override() {
     assert_eq!(overridden.state, machine::InstanceState::Ready);
     assert_eq!(
         overridden.provenance,
-        "override /opt/probe/bin/probe (operator)"
+        "override /opt/probe/bin/probe (set before attribution was recorded)"
     );
     assert_eq!(
         overridden.launch.map(|launch| launch.program),
@@ -3257,11 +3260,7 @@ fn select(h: &Harness, machine: &str) {
             config.machine_services.select(
                 probe_key(),
                 machine,
-                cairn_config::fleet::MachineSelection {
-                    override_: Some(cairn_config::fleet::CommandOverride {
-                        command: "/opt/probe/bin/probe".to_string(),
-                    }),
-                },
+                cairn_config::fleet::MachineSelection::overriding("/opt/probe/bin/probe"),
             )
         },
         |_| {},
@@ -3331,7 +3330,10 @@ async fn a_selection_of_two_machines_starts_one_resident_on_each() {
         .into_iter()
         .find(|instance| instance.machine == "alpha")
         .unwrap();
-    assert_eq!(alpha.provenance, "override /opt/probe/bin/probe (operator)");
+    assert_eq!(
+        alpha.provenance,
+        "override /opt/probe/bin/probe (set before attribution was recorded)"
+    );
 
     // An unchanged row is a no-op.
     machine::apply_machine_services(&m.h.orch, "test").await;

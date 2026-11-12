@@ -88,6 +88,28 @@ pub struct McpServerConfig {
     /// Installation-only Agent Plugin launch context.
     #[serde(skip)]
     pub agent_plugin_runtime: Option<AgentPluginRuntime>,
+    /// Set only by the runner, for a `placement: fleet` machine service's
+    /// entry the gateway launches as stdio: never read from or written to any
+    /// configuration, so no authored server can claim it.
+    #[serde(skip)]
+    pub fleet_launch: Option<FleetLaunchMark>,
+}
+
+/// How the gateway launches a fleet machine service's program, and what it
+/// records of the launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetLaunchMark {
+    /// `<pack>/<service>`.
+    pub service_key: String,
+    /// The machine whose view served it: the runner's own host.
+    pub machine: String,
+    /// Whether the program is an override rather than the pack's artifact.
+    pub overridden: bool,
+    /// Whether to spawn it under the operator credential floor, which an
+    /// override always is.
+    pub credential_floor: bool,
+    /// The row's setter for the selection, as JSON.
+    pub set_by_json: Option<String>,
 }
 
 /// Non-secret OAuth configuration persisted in `settings.yaml`. The interactive
@@ -192,6 +214,9 @@ pub fn fingerprint_mcp_config(
                 secrets,
                 service,
                 agent_plugin_runtime: _,
+                // A runner-set launch mark is not part of what was authored,
+                // so it never changes a server's identity.
+                fleet_launch: _,
             } = config;
             encoder.field("config", "present");
             encoder.field("transport", transport);
@@ -486,6 +511,8 @@ impl McpServerConfig {
             secrets: self.secrets.clone(),
             service: self.service.clone(),
             agent_plugin_runtime: None,
+            // Runner-set, never a `${VAR}`: it survives expansion as it is.
+            fleet_launch: self.fleet_launch.clone(),
         }
     }
 
@@ -544,6 +571,7 @@ impl McpServerConfig {
             service,
             enabled: _,
             agent_plugin_runtime: _,
+            fleet_launch: _,
             command,
             args,
             env,
@@ -757,6 +785,7 @@ mod fingerprint_tests {
             cwd: None,
             service: None,
             agent_plugin_runtime: None,
+            fleet_launch: None,
         }
     }
 
@@ -888,6 +917,7 @@ mod fingerprint_secret_tests {
             cwd: None,
             service: None,
             agent_plugin_runtime: None,
+            fleet_launch: None,
         }
     }
 

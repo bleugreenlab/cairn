@@ -6212,6 +6212,18 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/6097 does not move the number. `ExecutorCapabilities` gains the
+/// defaulted `credentialFloorServiceResidents`, and an executor that sets it
+/// confines a service-held resident exactly as its declared sandbox mode says
+/// (`Confined` fenced, `CredentialFloor` floored, `Unconfined` unconfined)
+/// instead of forcing every one unconfined. No frame changes shape. What a
+/// runner gets wrong talking to an older executor: it never sends that
+/// executor a floored machine-service override, because it reads the key's
+/// absence fail-closed and the instance says the executor must be updated;
+/// and an older executor still runs a project or thread service's `Confined`
+/// declaration unconfined, as it always has, until it is rebuilt. An older
+/// runner ignores the key.
+///
 /// cairn/6440 does not move the number. The fresh-pipe floor now holds an
 /// agent-interactive command cell only while the latest reading is below
 /// the degraded floor, not through recovery hysteresis, and both peers apply
@@ -9517,6 +9529,16 @@ pub struct ExecutorCapabilities {
     /// services, which the runner reads as nothing installed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub machine_services: Vec<InstalledMachineService>,
+    /// Whether this executor confines a service-held resident as its declared
+    /// [`ProcessSandboxMode`] says, so one asking for
+    /// [`ProcessSandboxMode::CredentialFloor`] runs under the operator
+    /// credential floor and one asking for `Confined` is fenced. An executor
+    /// built before it forced every service-held resident unconfined, so the
+    /// runner reads the key's absence fail-closed: it never starts a floored
+    /// machine-service override on a machine that does not advertise it, and
+    /// says so on the instance. Additive and defaulted, so not a wire boundary.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credential_floor_service_residents: bool,
 }
 
 /// What the executor's GitHub credential probe measured: whether git, run as
@@ -24876,6 +24898,7 @@ mod tests {
                 page_call_programs: None,
                 github_credential: None,
                 machine_services: Vec::new(),
+                credential_floor_service_residents: false,
             },
             current_load: 1,
             observed_at_unix_ms: 4,

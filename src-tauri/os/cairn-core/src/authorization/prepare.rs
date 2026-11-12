@@ -24,6 +24,9 @@ use crate::mcp::types::{ChangeItem, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 
 /// One item's preparation outcome.
+// Short-lived, one per batch item, and almost always the request variant;
+// boxing it would cost an allocation for each item to shrink a refusal.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Prepared {
     /// A named authority boundary to adjudicate.
@@ -118,6 +121,14 @@ pub async fn prepare_batch(
         // the operator allows it, whoever owns the issue it was attached in.
         if let Some(outcome) =
             crate::resources::mutations::attachment_removal_authority(orch, request, item).await
+        {
+            prepared.push((index, outcome));
+        }
+        // Selecting a machine service runs a standing process outside every
+        // fence, so an agent's `machineServices` patch that widens what runs
+        // on a machine asks the operator with a card for exactly that act.
+        if let Some(outcome) =
+            crate::resources::mutations::machine_services_authority(orch, request, item).await
         {
             prepared.push((index, outcome));
         }

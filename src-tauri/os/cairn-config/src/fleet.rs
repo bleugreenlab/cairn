@@ -366,20 +366,73 @@ pub struct MachineServiceSelection {
 }
 
 /// One machine's selection of a service. An empty selection runs the pack's
-/// own artifact; an override runs the operator's binary instead and is shown
-/// as such. There is deliberately no `enabled` flag: presence is the
-/// selection, and a second way to say "off" is a second way to be wrong.
+/// own artifact; an override runs a binary of the operator's choosing instead
+/// and is shown as such. There is deliberately no `enabled` flag: presence is
+/// the selection, and a second way to say "off" is a second way to be wrong.
+///
+/// `set_by` is written by the runner when the selection is made, never taken
+/// from a caller: the one writer refuses a change that carries it. A row
+/// written before attribution existed has none, and reads as unattributed
+/// rather than as the operator's. An older runner refuses a row carrying it
+/// (`deny_unknown_fields`), so downgrading past this field needs the row
+/// rewritten.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MachineSelection {
     #[serde(default, rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<CommandOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_by: Option<SetBy>,
 }
 
 impl MachineSelection {
+    /// A selection running `command` instead of the pack's artifact, with no
+    /// setter recorded yet.
+    pub fn overriding(command: impl Into<String>) -> Self {
+        Self {
+            override_: Some(CommandOverride {
+                command: command.into(),
+            }),
+            set_by: None,
+        }
+    }
+
     pub fn override_command(&self) -> Option<&str> {
         self.override_.as_ref().map(|value| value.command.as_str())
     }
+
+    /// Whether `other` runs the same thing, whoever chose either.
+    pub fn same_choice(&self, other: &MachineSelection) -> bool {
+        self.override_ == other.override_
+    }
+}
+
+/// Who made a selection, as the runner authenticated them when it was made.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetBy {
+    pub kind: SetByKind,
+    /// The principal as its appearance named it: the signed-in person or the
+    /// desktop operator, or the agent's node.
+    pub principal: String,
+    /// The asking agent's node, for an agent's selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_uri: Option<String>,
+    /// The authorization decision that admitted an agent's selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    pub at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetByKind {
+    Operator,
+    Agent,
+    /// A caller that proved no operator credential and is no run: on a
+    /// no-JWT install, the runner's ordinary session token. It can only ever
+    /// have reduced what runs.
+    Unproven,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -453,7 +506,15 @@ impl MachineServicesConfig {
             .ok_or_else(|| format!("{machine:?} has no public name: {EXECUTOR_NAME_RULE}"))?;
         validate_machine_selection(&key, &machine, &selection)?;
         let machines = &mut self.0.entry(key).or_default().machines;
-        Ok(machines.insert(machine, selection.clone()) != Some(selection))
+        if machines
+            .get(&machine)
+            .is_some_and(|held| held.same_choice(&selection))
+        {
+            // Re-selecting what runs keeps who chose it.
+            return Ok(false);
+        }
+        machines.insert(machine, selection);
+        Ok(true)
     }
 
     /// Remove `key` from `machine`. A service selected nowhere leaves the row
@@ -526,9 +587,28 @@ fn validate_machine_selection(
     selection: &MachineSelection,
 ) -> Result<(), String> {
     if let Some(command) = selection.override_command() {
+        let field = format!("machineServices.{key}.machines.{machine}.override.command");
         if command.trim() != command || !is_absolute_command_path(command) {
             return Err(format!(
-                "machineServices.{key}.machines.{machine}.override.command must be an absolute path, not {command:?}: a bare name would be a PATH lookup, and the pack's managed artifact is what runs without an override"
+                "{field} must be an absolute path, not {command:?}: a bare name would be a PATH lookup, and the pack's managed artifact is what runs without an override"
+            ));
+        }
+        // Refused rather than normalized: the path approved is the path
+        // checked and the path run, character for character.
+        if command.contains('\0') {
+            return Err(format!("{field} must not contain a NUL byte"));
+        }
+        if command.ends_with(['/', '\\']) {
+            return Err(format!(
+                "{field} names a directory ({command:?}); it must name the executable"
+            ));
+        }
+        if command
+            .split(['/', '\\'])
+            .any(|component| component == "..")
+        {
+            return Err(format!(
+                "{field} must not contain a `..` component ({command:?}): name the executable's own path"
             ));
         }
     }
@@ -1094,10 +1174,14 @@ impl FleetConfig {
                 }
                 None => None,
             };
-            if let Err(error) =
-                self.machine_services
-                    .select(key.clone(), &name, MachineSelection { override_ })
-            {
+            if let Err(error) = self.machine_services.select(
+                key.clone(),
+                &name,
+                MachineSelection {
+                    override_,
+                    set_by: None,
+                },
+            ) {
                 notes.push(format!("{name}: not converted: {error}"));
             }
         }
@@ -1397,11 +1481,7 @@ machineServices:
         row.select(
             axon(),
             "BGLab Win",
-            MachineSelection {
-                override_: Some(CommandOverride {
-                    command: r"C:\axon\axon-win.exe".into(),
-                }),
-            },
+            MachineSelection::overriding(r"C:\axon\axon-win.exe"),
         )
         .unwrap();
         row.select(other.clone(), "bglab-win", MachineSelection::default())
@@ -1440,18 +1520,22 @@ machineServices:
         let mut row = MachineServicesConfig::default();
         for bare in ["axon", "bin/axon", " /abs/with/space", ""] {
             let error = row
-                .select(
-                    axon(),
-                    "local",
-                    MachineSelection {
-                        override_: Some(CommandOverride {
-                            command: bare.into(),
-                        }),
-                    },
-                )
+                .select(axon(), "local", MachineSelection::overriding(bare))
                 .unwrap_err();
             assert!(error.contains("must be an absolute path"), "{error}");
         }
+        for (ambiguous, says) in [
+            ("/opt/axon/../tmp/axon", "`..` component"),
+            (r"C:\axon\..\x.exe", "`..` component"),
+            ("/opt/axon/", "names a directory"),
+            ("/opt/ax\0on", "NUL byte"),
+        ] {
+            let error = row
+                .select(axon(), "local", MachineSelection::overriding(ambiguous))
+                .unwrap_err();
+            assert!(error.contains(says), "{ambiguous:?}: {error}");
+        }
+        assert!(row.is_empty(), "a refused path writes nothing");
         for absolute in [
             "/opt/axon",
             r"C:\Axon\axon.exe",
@@ -1582,11 +1666,7 @@ desktopAutomation:
             config.machine_services.machines_for(&axon()),
             vec![(
                 "bglab-win",
-                &MachineSelection {
-                    override_: Some(CommandOverride {
-                        command: r"C:\Axon\axon-win.exe".into()
-                    })
-                }
+                &MachineSelection::overriding(r"C:\Axon\axon-win.exe")
             )],
             "an inherited false and an explicit false both select nothing"
         );

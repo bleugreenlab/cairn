@@ -2247,6 +2247,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "subscription_periods",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // What this install's machines ran as machine services, who chose it and
+    // under what confinement (cairn/6097): about this install's own hardware,
+    // so never synced.
+    (
+        "machine_service_launches",
+        TableScope::Private(PrivateReason::HostConfiguration),
+    ),
     // Execution offers belong to one runner incarnation, never a team replica.
     (
         "execution_queue",
