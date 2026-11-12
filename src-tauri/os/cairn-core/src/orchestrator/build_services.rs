@@ -920,11 +920,20 @@ const CAPABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 /// `CARGO_INCREMENTAL=0` is set explicitly: sccache refuses an incremental
 /// invocation with exit 1 before running anything, and a probe defeated by an
 /// ambient env var would read as a broken daemon.
+///
+/// A probe still running at `deadline` proves nothing either way. The daemon
+/// answered its statistics round trip moments before (that is what reaching
+/// this probe means), and it runs at most one compile per core, so on a machine
+/// whose builds hold every slot the probe waits in line behind them. Calling
+/// that unfit had the supervisor try to kill a busy daemon four times in one
+/// release build on 11-11, and a daemon it had launched itself would have taken
+/// every compile on the machine down with it.
 fn prove_daemon_unfit(
     spawner: &dyn ProcessSpawner,
     cfg: &BuildServiceConfig,
     templates: &Templates,
     env: &HashMap<String, String>,
+    deadline: Duration,
 ) -> Option<String> {
     let client = cfg.expanded_start(templates).into_iter().next()?;
     let dir = capability_probe_dir(templates);
@@ -975,19 +984,9 @@ fn prove_daemon_unfit(
 
     let mut through_daemon = vec![client, "rustc".to_string()];
     through_daemon.extend(rustc_args.iter().cloned());
-    let miss = run_round_trip(
-        spawner,
-        &through_daemon,
-        &probe_env,
-        CAPABILITY_PROBE_DEADLINE,
-    );
+    let miss = run_round_trip(spawner, &through_daemon, &probe_env, deadline);
     let failed_leg = if miss.healthy() {
-        let hit = run_round_trip(
-            spawner,
-            &through_daemon,
-            &probe_env,
-            CAPABILITY_PROBE_DEADLINE,
-        );
+        let hit = run_round_trip(spawner, &through_daemon, &probe_env, deadline);
         (!hit.healthy()).then_some(("serve the cache entry it had just written", hit))
     } else {
         Some(("compile a trivially valid crate", miss))
@@ -996,15 +995,19 @@ fn prove_daemon_unfit(
         cleanup();
         return None;
     };
+    if attempt.outcome == RoundTripOutcome::TimedOut {
+        cleanup();
+        log::debug!(
+            "compile cache capability probe is inconclusive: the daemon had not finished a \
+             trivial compile when the probe gave up, which on a busy machine is a queue ({})",
+            attempt.summary()
+        );
+        return None;
+    }
 
     let mut directly = vec!["rustc".to_string()];
     directly.extend(rustc_args);
-    let control = run_round_trip(
-        spawner,
-        &directly,
-        &HashMap::new(),
-        CAPABILITY_PROBE_DEADLINE,
-    );
+    let control = run_round_trip(spawner, &directly, &HashMap::new(), deadline);
     cleanup();
     if !control.healthy() {
         log::debug!(
@@ -1061,7 +1064,9 @@ fn assess_service(
     };
     // Liveness is not fitness. Prove the daemon can write this runner's managed
     // build root before any client environment is allowed to route work to it.
-    if let Some(reason) = prove_daemon_unfit(spawner, cfg, templates, env) {
+    if let Some(reason) =
+        prove_daemon_unfit(spawner, cfg, templates, env, CAPABILITY_PROBE_DEADLINE)
+    {
         let identity = probe.tcp.as_deref().and_then(|addr| {
             control.listener(addr).ok().flatten().map(|listener| {
                 format!(
@@ -4094,6 +4099,35 @@ Max cache size                       50 GiB
             "the daemon compiled the probe, so the failures are the code's and not its own"
         );
         assert_eq!(observation.unfit, None);
+    }
+
+    /// A busy daemon is not a broken one. The probe compile waits in line behind
+    /// the machine's own compiles, and one still waiting at the deadline says
+    /// nothing about whether the daemon can compile, while rustc run directly,
+    /// which waits for no one, succeeds. Reading that as unfit is what had the
+    /// supervisor trying to kill a daemon in the middle of a release build.
+    #[test]
+    fn a_daemon_still_compiling_the_probe_at_the_deadline_is_not_condemned() {
+        let mut spawner = MockProcessSpawner::new();
+        spawner.expect_spawn().returning(|config| {
+            Ok(Box::new(if config.program == "rustc" {
+                MockChildProcess::failing(1, "", 0)
+            } else {
+                // Never exits: queued behind the compiles that hold every slot.
+                MockChildProcess::with_stdout(1, vec![])
+            }))
+        });
+        let (cfg, templates, _site) = capability_service();
+        assert_eq!(
+            prove_daemon_unfit(
+                &spawner,
+                &cfg,
+                &templates,
+                &HashMap::new(),
+                Duration::from_millis(40)
+            ),
+            None
+        );
     }
 
     /// Counters alone never condemn: with no capability site there is no

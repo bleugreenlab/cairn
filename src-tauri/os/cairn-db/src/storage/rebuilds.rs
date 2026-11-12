@@ -581,11 +581,24 @@ pub async fn unacknowledged_launches(db: &LocalDb) -> DbResult<Vec<RebuildRecord
         .collect())
 }
 
-/// Completed `build` phase durations, newest rebuilds first, in seconds.
+/// The release-tree design a rebuild's build phase measures, as the actor
+/// reports it in its `releaseTreeGeneration` fact (`RELEASE_TREE_GENERATION` in
+/// `scripts/rebuild-lib.ts`). Builds before generation 2 compiled in a tree of
+/// their own, apart from the hand build's, so they describe a cost a rebuild no
+/// longer pays.
+pub const RELEASE_TREE_GENERATION: i64 = 2;
+
+/// Completed `build` phase durations of rebuilds at the current release-tree
+/// generation, newest rebuilds first, in seconds.
 pub async fn build_durations(db: &LocalDb, limit: usize) -> DbResult<Vec<i64>> {
     let rows = list(db, limit, 0).await?;
     Ok(rows
         .iter()
+        .filter(|row| {
+            row.facts["releaseTreeGeneration"]
+                .as_i64()
+                .is_some_and(|generation| generation >= RELEASE_TREE_GENERATION)
+        })
         .filter_map(|row| {
             let phase =
                 row.phases.iter().rev().find(|phase| {
@@ -970,12 +983,30 @@ mod tests {
             }
             (id.to_string(), value.to_string(), value)
         };
+        let generation = |id: &str, rebuild: &str| {
+            let value = json!({"event":id,"rebuild":rebuild,"at":"2026-11-07T13:59:00Z","type":"fact","facts":{"releaseTreeGeneration":RELEASE_TREE_GENERATION}});
+            (id.to_string(), value.to_string(), value)
+        };
         ingest(
             &db,
             "r",
             vec![
+                generation("g", "r"),
                 at("a", "build", "started", "2026-11-07T14:00:00Z", None),
                 at("b", "build", "ended", "2026-11-07T14:10:00Z", Some("ok")),
+            ],
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        // A build from before the shared release tree: its own colder tree.
+        ingest(
+            &db,
+            "separate-tree",
+            vec![
+                at("e", "build", "started", "2026-11-06T14:00:00Z", None),
+                at("f", "build", "ended", "2026-11-06T16:30:00Z", Some("ok")),
             ],
             vec![],
             false,
@@ -986,6 +1017,7 @@ mod tests {
             &db,
             "failed-build",
             vec![
+                generation("h", "failed-build"),
                 at("c", "build", "started", "2026-11-07T14:00:00Z", None),
                 at(
                     "d",

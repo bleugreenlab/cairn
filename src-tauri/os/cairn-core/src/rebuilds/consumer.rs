@@ -481,7 +481,9 @@ pub(crate) fn assemble_facts(inputs: FactsInputs, now: i64) -> ActorFacts {
         Some(seconds) => {
             json!({"medianBuildSeconds": seconds, "samples": inputs.build_seconds.len()})
         }
-        None => json!({"unknown": "no completed build phase in the rebuilds ledger"}),
+        None => {
+            json!({"unknown": "no rebuild has completed a build in the shared release tree yet"})
+        }
     };
     let document = json!({
         "observedAt": now,
