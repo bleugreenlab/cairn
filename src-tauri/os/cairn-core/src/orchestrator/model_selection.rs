@@ -10,8 +10,7 @@ use cairn_config::library::LibraryRoots;
 use std::collections::BTreeMap;
 
 use cairn_config::allotment::{
-    model_ref, parse_allotment, AllotmentEntry, Band, EffortPlacement, LevelSource, ModelsConfig,
-    PoolKind,
+    model_ref, parse_allotment, AllotmentEntry, Band, LevelSource, ModelsConfig, PoolKind,
 };
 use cairn_config::project_settings::{convert_project_tiers, load_project_settings_read_only};
 use cairn_config::settings::{convert_settings_tiers, load_settings_file};
@@ -29,7 +28,7 @@ use crate::execution::model_selection::{
     select, BenchmarkPlacer, ResolvedConstraints, SelectionContext, SelectionRecord,
     SelectionRefusal, SelectionSubject, TopOfAllotment, CALIBRATE_BENCHMARKS,
 };
-use crate::models::{ModelSelection, PresetOptionValue};
+use crate::models::PresetOptionValue;
 
 /// What a selection preview was asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,30 +239,9 @@ pub struct LadderRung {
     /// (`provider/model`, the newest), when there is one.
     pub superseded_by: Option<String>,
     pub maker: Option<String>,
-    /// Position on the model's effort scale, 0..1.
-    pub effort: Option<f64>,
-    /// The level the entry launches at: its position's, else its kept word's
-    /// when that is one of the model's levels.
-    pub effort_level: Option<String>,
-    /// An effort word kept from the tier grid, placed on the model's scale
-    /// at launch (the entry's `effortLevel`). Written back unchanged by an
-    /// edit that does not set an effort.
-    pub effort_word: Option<String>,
-    /// The model's effort levels, lowest first, each at the position the
-    /// facet gives it. Empty for a model that takes no effort.
-    pub effort_scale: Vec<EffortStep>,
     pub options: BTreeMap<String, PresetOptionValue>,
     /// The hand-picked pools it is a member of.
     pub pools: Vec<String>,
-}
-
-/// One level of a model's effort scale and the 0..1 position that launches at
-/// it, as the facet's `position()` answers: what an editor writes to choose it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EffortStep {
-    pub level: String,
-    pub position: f64,
 }
 
 /// The ladder view of `models` against `catalog`.
@@ -298,7 +276,6 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
         .map(|rung| {
             let model = rung.model.model.as_str();
             let on = provider(&rung.model.backend);
-            let scale = on.and_then(|provider| provider.effort_scale(model));
             let benchmark = benchmark_hint(&placer, &rung.model.backend, model);
             LadderRung {
                 model: model_ref(&rung.model),
@@ -316,34 +293,6 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
                 benchmark,
                 superseded_by: on.and_then(|provider| superseded_by(provider, model)),
                 maker: on.and_then(|provider| provider.maker(model)),
-                effort: rung.effort,
-                effort_level: match (rung.effort, scale.as_ref()) {
-                    (Some(x), Some(scale)) => Some(scale.at(x).to_string()),
-                    (None, Some(scale)) => rung
-                        .effort_level
-                        .clone()
-                        .filter(|word| scale.position(word).is_some()),
-                    (_, None) => None,
-                },
-                effort_word: rung
-                    .effort_level
-                    .clone()
-                    .filter(|_| rung.effort.is_none()),
-                effort_scale: on
-                    .zip(scale.as_ref())
-                    .map(|(provider, scale)| {
-                        scale
-                            .levels
-                            .iter()
-                            .filter_map(|level| {
-                                Some(EffortStep {
-                                    level: level.clone(),
-                                    position: provider.position(model, level)?,
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
                 options: rung.options.clone(),
                 pools: models
                     .pools
@@ -454,26 +403,6 @@ pub fn preview_verb(raw: Option<&str>) -> Result<VerbKind, String> {
     }
 }
 
-/// Where an effort word sits on its model's own scale, as `catalog` answers.
-/// A provider the catalog does not list has no scale.
-pub(crate) fn position_in(
-    catalog: &Catalog,
-    selection: &ModelSelection,
-    level: &str,
-) -> EffortPlacement {
-    let scale = catalog
-        .providers
-        .iter()
-        .find(|provider| provider.descriptor.key.as_ref() == selection.backend)
-        .and_then(|provider| provider.effort_scale(selection.model.as_str()));
-    match scale {
-        None => EffortPlacement::ScaleUnknown,
-        Some(scale) => scale
-            .position(level)
-            .map_or(EffortPlacement::NotALevel, EffortPlacement::At),
-    }
-}
-
 impl Orchestrator {
     /// The pools and ladder a launch in `project_id` selects within: the
     /// workspace's `models`, with the project's overlay laid over it.
@@ -482,29 +411,13 @@ impl Orchestrator {
     /// converted here in memory, the same conversion the one-time migration
     /// writes, so a preview never reads an empty ladder.
     pub fn effective_models(&self, project_id: Option<&str>) -> Result<ModelsConfig, String> {
-        let catalog = self.catalog(&ModelScope {
-            project_id: project_id.map(str::to_string),
-        })?;
-        self.effective_models_in(project_id, &catalog)
-    }
-
-    fn effective_models_in(
-        &self,
-        project_id: Option<&str>,
-        catalog: &Catalog,
-    ) -> Result<ModelsConfig, String> {
         let settings = self.get_settings();
-        let position =
-            |selection: &ModelSelection, level: &str| position_in(catalog, selection, level);
         // Until the one-time conversion has written `models` (it runs at
         // startup), the file's tier grid is converted here the same way.
         let workspace_file = || load_settings_file(&self.config_dir).unwrap_or_default();
         let mut models = match &settings.models {
             Some(models) => models.clone(),
-            None => {
-                convert_settings_tiers(&workspace_file(), &settings.enabled_providers, &position)
-                    .models
-            }
+            None => convert_settings_tiers(&workspace_file(), &settings.enabled_providers).models,
         };
         if let Some(project_id) = project_id {
             let file = load_project_settings_read_only(&self.project_path(project_id)?);
@@ -514,7 +427,6 @@ impl Orchestrator {
                     &file,
                     &cairn_config::settings::workspace_legacy_grid(&self.config_dir)?,
                     &settings.enabled_providers,
-                    &position,
                 )
                 .map(|(overlay, _)| overlay),
             };
@@ -530,7 +442,7 @@ impl Orchestrator {
         let catalog = self.catalog(&ModelScope {
             project_id: project_id.map(str::to_string),
         })?;
-        let models = self.effective_models_in(project_id, &catalog)?;
+        let models = self.effective_models(project_id)?;
         Ok(ladder_view(&models, &catalog))
     }
 
@@ -669,7 +581,7 @@ impl Orchestrator {
         let offer = catalog
             .offer_for(OfferQuery::new(VerbKind::Decide))
             .map_err(|refusal| refusal.to_string())?;
-        let models = self.effective_models_in(project_id, &catalog)?;
+        let models = self.effective_models(project_id)?;
         let chosen = cairn_config::allotment::parse_model_ref(&format!(
             "{}/{}",
             offer.provider, offer.model
@@ -700,7 +612,7 @@ impl Orchestrator {
         let catalog = self.catalog(&ModelScope {
             project_id: project_id.map(str::to_string),
         })?;
-        let models = self.effective_models_in(project_id, &catalog)?;
+        let models = self.effective_models(project_id)?;
         let mut record = self.with_supply(project_id, |supply| {
             let ctx = SelectionContext {
                 models: &models,
@@ -787,7 +699,7 @@ impl Orchestrator {
         let catalog = self.catalog(&ModelScope {
             project_id: project_id.map(str::to_string),
         })?;
-        let models = self.effective_models_in(project_id, &catalog)?;
+        let models = self.effective_models(project_id)?;
         let reference = cairn_config::allotment::model_ref(pin);
         if let Some(provider) = catalog
             .providers
@@ -903,40 +815,6 @@ mod tests {
     use super::*;
     use crate::execution::model_selection::tests::{catalog, models, run, windows};
     use crate::resources::models::{render_ladder, render_selection};
-
-    /// The ladder view shows a kept effort word, and names it as the level
-    /// once the model's scale has it.
-    #[test]
-    fn the_ladder_view_shows_a_kept_effort_word() {
-        let catalog = catalog();
-        let terra = |word: &str| {
-            ladder_view(
-                &crate::execution::model_selection::tests::models_keeping(word),
-                &catalog,
-            )
-            .rungs
-            .into_iter()
-            .find(|rung| rung.model == "codex/gpt-5.6-terra")
-            .unwrap()
-        };
-        let on = terra("medium");
-        assert_eq!(on.effort, None);
-        assert_eq!(on.effort_word.as_deref(), Some("medium"));
-        assert_eq!(on.effort_level.as_deref(), Some("medium"));
-        let off = terra("ultra");
-        assert_eq!(off.effort_word.as_deref(), Some("ultra"));
-        assert_eq!(off.effort_level, None);
-        let rendered = render_ladder(&[], || {
-            Ok(ladder_view(
-                &crate::execution::model_selection::tests::models_keeping("ultra"),
-                &catalog,
-            ))
-        });
-        assert!(
-            rendered.contains("effort 'ultra' kept from the tier grid"),
-            "{rendered}"
-        );
-    }
 
     #[test]
     fn alias_provenance_survives_without_a_benchmark_and_never_changes_stored_levels() {
@@ -1107,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_view_places_rungs_in_bands_with_maker_and_effort() {
+    fn the_ladder_view_places_rungs_in_bands_with_maker() {
         let view = ladder_view(&models(), &catalog());
         let bands: Vec<&str> = view.bands.iter().map(|band| band.id.as_str()).collect();
         assert_eq!(bands, ["sm", "md", "lg"]);
@@ -1116,9 +994,6 @@ mod tests {
         assert_eq!(sol.band.as_deref(), Some("lg"));
         assert_eq!(sol.maker.as_deref(), Some("openai"));
         assert_eq!(sol.level_source, Some(LevelSource::Set));
-        // 0.5 on a five-level scale lands on the third level.
-        assert_eq!(sol.effort_level.as_deref(), Some("high"));
-        assert_eq!(sol.effort_scale.len(), 5);
         let glm = view
             .rungs
             .iter()
@@ -1185,8 +1060,6 @@ mod tests {
             models.ladder.push(cairn_config::allotment::Rung {
                 model: cairn_config::allotment::parse_model_ref(native).unwrap(),
                 level: Some(cairn_config::allotment::Level::set(level)),
-                effort: None,
-                effort_level: None,
                 options: BTreeMap::new(),
             });
         }
@@ -1269,8 +1142,6 @@ mod tests {
         let stored = |model: &str, level: f64| cairn_config::allotment::Rung {
             model: cairn_config::allotment::parse_model_ref(model).unwrap(),
             level: Some(cairn_config::allotment::Level::set(level)),
-            effort: None,
-            effort_level: None,
             options: BTreeMap::new(),
         };
         let shipped = cairn_models::types::benchmarks::shipped();
@@ -1445,59 +1316,6 @@ mod tests {
         assert!(rendered.contains("map onto this ladder"), "{rendered}");
     }
 
-    /// An editor writes the position a level's step carries, so each step must
-    /// be exactly where the facet puts that level, and must launch at it.
-    #[test]
-    fn each_effort_step_is_the_facets_position_and_an_effortless_model_has_none() {
-        let mut catalog = catalog();
-        let opencode = catalog
-            .providers
-            .iter_mut()
-            .find(|provider| provider.descriptor.key.as_ref() == "opencode-go")
-            .unwrap();
-        let listed = opencode.models.as_mut().unwrap();
-        listed.models[0].supported_reasoning_efforts.clear();
-        let view = ladder_view(&models(), &catalog);
-
-        let sol = view
-            .rungs
-            .iter()
-            .find(|rung| rung.model == "codex/gpt-5.6-sol")
-            .unwrap();
-        let codex = catalog
-            .providers
-            .iter()
-            .find(|provider| provider.descriptor.key.as_ref() == "codex")
-            .unwrap();
-        let levels: Vec<&str> = sol
-            .effort_scale
-            .iter()
-            .map(|step| step.level.as_str())
-            .collect();
-        assert_eq!(levels, ["low", "medium", "high", "xhigh", "ultra"]);
-        for step in &sol.effort_scale {
-            assert_eq!(
-                Some(step.position),
-                codex.position("gpt-5.6-sol", &step.level),
-                "{}",
-                step.level
-            );
-            let launched = codex.effort("gpt-5.6-sol", step.position).unwrap();
-            assert_eq!(
-                launched.reasoning_effort.as_deref(),
-                Some(step.level.as_str())
-            );
-        }
-
-        let glm = view
-            .rungs
-            .iter()
-            .find(|rung| rung.model == "opencode-go/glm-5.3")
-            .unwrap();
-        assert!(glm.effort_scale.is_empty(), "{:?}", glm.effort_scale);
-        assert_eq!(glm.effort_level, None);
-    }
-
     #[test]
     fn the_ladder_renders_bands_highest_first_with_each_rungs_facts() {
         let text = render_ladder(&[], || Ok(ladder_view(&models(), &catalog())));
@@ -1505,9 +1323,11 @@ mod tests {
         let sm = text.find("### sm (0–0.34)").expect(&text);
         assert!(lg < sm, "{text}");
         assert!(
-            text.contains("- `codex/gpt-5.6-sol` 0.85 (set) — by openai, effort 0.5 → high of low|medium|high|xhigh|ultra"),
+            text.lines()
+                .any(|line| line == "- `codex/gpt-5.6-sol` 0.85 (set) — by openai"),
             "{text}"
         );
+        assert!(!text.contains("effort"), "{text}");
         assert!(
             text.contains("- `myth` set [claude/fable]: hand-picked"),
             "{text}"
@@ -1544,10 +1364,8 @@ mod tests {
             },
         );
         assert!(text.contains("[sm, md, lg] for session"), "{text}");
-        assert!(
-            text.contains("Chosen: `codex/gpt-5.6-sol` @ high"),
-            "{text}"
-        );
+        assert!(text.contains("Chosen: `codex/gpt-5.6-sol`,"), "{text}");
+        assert!(text.contains("; effort: provider default**"), "{text}");
         assert!(text.contains("band lg"), "{text}");
         assert!(
             text.contains("set aside: outside the chosen band"),

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use cairn_config::allotment::{
-    parse_allotment, parse_model_ref, Level, LevelMap, ModelsConfig, Pool, PoolKind, Rung,
+    parse_allotment, parse_model_ref, ExpandedAllotment, Level, LevelMap, ModelsConfig, Pool,
+    PoolKind, Rung,
 };
 use cairn_models::interface::{Catalog, CatalogProvider};
 use cairn_models::supply::SupplyInputs;
@@ -70,37 +71,34 @@ pub(crate) fn catalog() -> Catalog {
     }
 }
 
-fn rung(model: &str, level: f64, effort: Option<f64>) -> Rung {
+fn rung(model: &str, level: f64) -> Rung {
     Rung {
         model: parse_model_ref(model).unwrap(),
         level: Some(Level::set(level)),
-        effort,
-        effort_level: None,
         options: BTreeMap::new(),
     }
 }
 
-/// A ladder whose terra entry keeps `word` from the tier grid, no position.
-pub(crate) fn models_keeping(word: &str) -> ModelsConfig {
-    let mut models = models();
-    models.ladder.push(Rung {
-        model: parse_model_ref("codex/gpt-5.6-terra").unwrap(),
-        level: Some(Level::set(0.4)),
-        effort: None,
-        effort_level: Some(word.to_string()),
-        options: BTreeMap::new(),
-    });
-    models
+/// A requirement that sets an effort on top of [`TopOfAllotment`]'s choice.
+struct TopAtEffort(f64);
+
+impl RequirementResolver for TopAtEffort {
+    fn requirement(&self, allotment: &ExpandedAllotment) -> Requirement {
+        Requirement {
+            effort: Some(self.0),
+            ..TopOfAllotment.requirement(allotment)
+        }
+    }
 }
 
-/// An effort word kept from the tier grid is placed on the model's scale at
-/// selection, once the catalog knows it; a word off that scale launches at
-/// the provider's default, and the provenance says so.
+/// Effort is the requirement's alone: set, it is placed on the chosen
+/// model's scale; unset, the launch runs at the provider's default and the
+/// provenance says so.
 #[test]
-fn a_kept_effort_word_is_placed_on_the_scale_at_selection() {
+fn effort_comes_from_the_requirement_else_the_providers_default() {
     let catalog = catalog();
-    let select_keeping = |word: &str| {
-        let models = models_keeping(word);
+    let models = models();
+    let select_with = |resolver: &dyn RequirementResolver| {
         let ctx = SelectionContext {
             models: &models,
             catalog: &catalog,
@@ -114,29 +112,35 @@ fn a_kept_effort_word_is_placed_on_the_scale_at_selection() {
         };
         select(
             &ctx,
-            &parse_allotment(&["codex/gpt-5.6-terra"]).unwrap(),
+            &parse_allotment(&["codex/gpt-5.6-sol"]).unwrap(),
             VerbKind::Session,
             &ResolvedConstraints::default(),
-            &TopOfAllotment,
+            resolver,
         )
         .unwrap()
     };
-    let placed = select_keeping("medium");
-    assert_eq!(placed.extras.reasoning_effort.as_deref(), Some("medium"));
+    // 0.5 on sol's five-level scale lands on the third level.
+    let placed = select_with(&TopAtEffort(0.5));
+    assert_eq!(placed.extras.reasoning_effort.as_deref(), Some("high"));
     assert!(
-        placed.provenance.contains(" @ medium: "),
+        placed.provenance.contains(" @ high: "),
+        "{}",
+        placed.provenance
+    );
+    assert!(
+        !placed.provenance.contains(PROVIDER_DEFAULT_EFFORT),
         "{}",
         placed.provenance
     );
 
-    let off = select_keeping("ultra");
-    assert_eq!(off.extras.reasoning_effort, None);
+    let default = select_with(&TopOfAllotment);
+    assert_eq!(default.extras.reasoning_effort, None);
     assert!(
-        off.provenance.ends_with(
-            "; effort 'ultra' is not one of codex/gpt-5.6-terra's levels, so it launches at the provider's default"
-        ),
+        default
+            .provenance
+            .ends_with(&format!("; {PROVIDER_DEFAULT_EFFORT}")),
         "{}",
-        off.provenance
+        default.provenance
     );
 }
 
@@ -163,11 +167,11 @@ pub(crate) fn models() -> ModelsConfig {
             },
         ],
         ladder: vec![
-            rung("claude/haiku", 0.17, None),
-            rung("claude/sonnet", 0.5, Some(0.625)),
-            rung("opencode-go/glm-5.3", 0.45, Some(0.75)),
-            rung("claude/opus", 0.83, Some(0.9)),
-            rung("codex/gpt-5.6-sol", 0.85, Some(0.5)),
+            rung("claude/haiku", 0.17),
+            rung("claude/sonnet", 0.5),
+            rung("opencode-go/glm-5.3", 0.45),
+            rung("claude/opus", 0.83),
+            rung("codex/gpt-5.6-sol", 0.85),
         ],
         ..ModelsConfig::default()
     }
@@ -253,10 +257,10 @@ fn the_top_of_the_allotment_runs_and_supply_orders_the_band() {
     assert_eq!(record.band.as_deref(), Some("lg"));
     // Codex's expiring week beats Claude's headroom, despite opus' level.
     assert_eq!(chosen(&record), "codex/gpt-5.6-sol");
-    assert_eq!(record.extras.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(record.extras.reasoning_effort, None);
     assert_eq!(
         record.provenance,
-        "lg = top of [sm, md, lg] → codex/gpt-5.6-sol @ high: OpenAI: Week 64% left, resets in 14h, ~61% would expire unused"
+        "lg = top of [sm, md, lg] → codex/gpt-5.6-sol: OpenAI: Week 64% left, resets in 14h, ~61% would expire unused; effort: provider default"
     );
     // Without usage, both are unpriced metered and the higher level wins.
     let flat = run(
@@ -269,7 +273,6 @@ fn the_top_of_the_allotment_runs_and_supply_orders_the_band() {
     let small = run(&["sm", "md"], &ResolvedConstraints::default(), &windows).unwrap();
     assert_eq!(small.band.as_deref(), Some("md"));
     assert_eq!(chosen(&small), "claude/sonnet");
-    assert_eq!(small.extras.reasoning_effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -337,12 +340,10 @@ fn a_named_model_off_the_ladder_takes_its_benchmark_level() {
         assert_eq!((opus.level, opus.level_source), (None, None));
     }
     // Two calibration rungs on the user's ladder set the scale.
+    models.ladder.push(rung("openrouter/openai/gpt-5.5", 0.9));
     models
         .ladder
-        .push(rung("openrouter/openai/gpt-5.5", 0.9, None));
-    models
-        .ladder
-        .push(rung("openrouter/anthropic/claude-opus-4.5", 0.6, None));
+        .push(rung("openrouter/anthropic/claude-opus-4.5", 0.6));
     let point = |id: &str, level: f64| {
         let placed = shipped.model(id).expect("shipped");
         cairn_config::allotment::CalibrationPoint {
@@ -392,7 +393,7 @@ fn a_named_model_off_the_ladder_takes_its_benchmark_level() {
     // A level the user set stands, whatever the benchmarks say.
     models
         .ladder
-        .push(rung("openrouter/anthropic/claude-opus-4.6", 0.2, None));
+        .push(rung("openrouter/anthropic/claude-opus-4.6", 0.2));
     let held = ctx(&models);
     let opus = held
         .candidates
@@ -422,7 +423,6 @@ fn a_named_model_is_never_substituted() {
     );
     let alone = run(&["claude/opus"], &ResolvedConstraints::default(), &windows).unwrap();
     assert_eq!(chosen(&alone), "claude/opus");
-    assert_eq!(alone.extras.reasoning_effort.as_deref(), Some("xhigh"));
 }
 
 /// Every provider spent, each resetting at its own hour: Codex soonest.
@@ -515,7 +515,7 @@ fn a_reviewer_takes_its_builders_band_from_another_maker() {
     assert!(
         record
             .provenance
-            .ends_with("maker openai differs from builder-1's anthropic"),
+            .contains("; maker openai differs from builder-1's anthropic;"),
         "{}",
         record.provenance
     );

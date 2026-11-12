@@ -34,7 +34,7 @@ pub enum RequirementSource {
 pub struct Requirement {
     pub capability: Capability,
     /// The position on the chosen model's effort scale, when the requirement
-    /// sets one; otherwise the model's ladder entry decides.
+    /// sets one; otherwise the launch runs at its provider's default.
     pub effort: Option<f64>,
     pub source: RequirementSource,
     /// One readable clause: why this capability.

@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use cairn_common::logging::LogLevel;
 
 use crate::allotment::{
-    convert_decision_model, convert_tiers, Conversion, LegacyTiers, ModelsConfig, PositionFn,
+    convert_decision_model, convert_tiers, Conversion, LegacyTiers, ModelsConfig,
 };
 use crate::legacy_presets::{
     default_claude_presets, default_grid, tier_defaults_from_single_backend, LEGACY_TIERS,
@@ -1629,16 +1629,11 @@ fn drop_removed_providers(settings: &mut Settings, enabled_before: &[String]) {
 /// grid is the effective one ([`SettingsFile::legacy_grid`]), so shipped
 /// cells the user never edited count, and a legacy `activeBackend` has
 /// already become each tier's default.
-pub fn convert_settings_tiers(
-    file: &SettingsFile,
-    enabled: &[String],
-    position: PositionFn<'_>,
-) -> Conversion {
+pub fn convert_settings_tiers(file: &SettingsFile, enabled: &[String]) -> Conversion {
     let mut conversion = convert_tiers(
         &file.legacy_grid().as_tiers(),
         enabled,
         non_blank(&file.decision_model).as_deref(),
-        position,
     );
     let skipped = cells_of_disabled_providers(file.backends.as_ref(), enabled);
     // The Models page notice reads `conversion_notes`, so the skipped cells
@@ -1697,15 +1692,13 @@ const TIER_GRID_KEYS: &[&str] = &["tierDefaults", "tiers", "backends", "activeBa
 /// already has a `models` key, which is the whole guard: running it again
 /// never revisits the user's pools. A workspace with no file, or one that
 /// never touched the grid, converts the shipped cells, which is the seed a
-/// fresh install starts from. `position` places a stored effort word on its
-/// model's own scale (the catalog provider's `position`).
+/// fresh install starts from.
 ///
 /// The tier keys stay on disk; [`retire_tier_keys`] removes them once nothing
 /// resolves against them.
 pub fn migrate_models(
     config_dir: &std::path::Path,
     enabled: &[String],
-    position: PositionFn<'_>,
 ) -> Result<Option<Vec<String>>, String> {
     mutate_workspace_settings(config_dir, "cairn: convert tiers to model pools", |root| {
         let key = serde_yaml::Value::String(MODELS_KEY.to_string());
@@ -1715,7 +1708,7 @@ pub fn migrate_models(
         let file: SettingsFile =
             serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
                 .map_err(|error| format!("Failed to parse settings file: {error}"))?;
-        let conversion = convert_settings_tiers(&file, enabled, position);
+        let conversion = convert_settings_tiers(&file, enabled);
         conversion.models.validate().map_err(|error| {
             format!("the tier grid converts to models that do not validate: {error}")
         })?;
@@ -1743,6 +1736,38 @@ pub fn retire_tier_keys(config_dir: &std::path::Path) -> Result<bool, String> {
         }
         retire_grid_in(config_dir, root)
     })
+}
+
+/// The ladder-entry keys that once gave a model its own launch effort.
+const RETIRED_RUNG_KEYS: &[&str] = &["effort", "effortLevel"];
+
+/// Remove the per-model efforts earlier versions stored on ladder entries.
+///
+/// Effort is chosen for the work, never for the model, so nothing reads these
+/// keys; but a settings write edits the file in place, so without this they
+/// would stay on disk indefinitely. Returns whether anything was removed.
+pub fn retire_rung_efforts(config_dir: &std::path::Path) -> Result<bool, String> {
+    mutate_workspace_settings(
+        config_dir,
+        "cairn: remove per-model efforts from the ladder",
+        |root| {
+            let Some(serde_yaml::Value::Mapping(models)) = root.get_mut(MODELS_KEY) else {
+                return Ok(false);
+            };
+            let Some(serde_yaml::Value::Sequence(ladder)) = models.get_mut("ladder") else {
+                return Ok(false);
+            };
+            let mut removed = false;
+            for rung in ladder.iter_mut() {
+                if let serde_yaml::Value::Mapping(rung) = rung {
+                    for key in RETIRED_RUNG_KEYS {
+                        removed |= rung.remove(*key).is_some();
+                    }
+                }
+            }
+            Ok(removed)
+        },
+    )
 }
 
 /// The file in the config directory that keeps the workspace's tier grid as
@@ -4554,32 +4579,12 @@ routeCallsViaOpenRouter: true
 
     use crate::allotment::{model_ref, parse_model_ref, AllotmentEntry};
 
-    /// Each provider's effort scale as its catalog answers when discovery has
-    /// not run: Claude's static four, Codex's static four (no `ultra`), Go's
-    /// per model.
-    fn position(
-        selection: &crate::models::ModelSelection,
-        level: &str,
-    ) -> crate::allotment::EffortPlacement {
-        use crate::allotment::EffortPlacement;
-        let levels: &[&str] = match (selection.backend.as_str(), selection.model.as_str()) {
-            ("claude" | "codex", _) => &["low", "medium", "high", "xhigh"],
-            ("opencode-go", "kimi-k3") => &["none", "low", "high", "max"],
-            ("opencode-go", _) => &["low", "high"],
-            _ => return EffortPlacement::ScaleUnknown,
-        };
-        match levels.iter().position(|known| *known == level) {
-            Some(index) => EffortPlacement::At((index as f64 + 0.5) / levels.len() as f64),
-            None => EffortPlacement::NotALevel,
-        }
-    }
-
     fn enabled(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|key| key.to_string()).collect()
     }
 
     fn migrate(dir: &std::path::Path, keys: &[&str]) -> Option<Vec<String>> {
-        migrate_models(dir, &enabled(keys), &position).unwrap()
+        migrate_models(dir, &enabled(keys)).unwrap()
     }
 
     fn converted(dir: &std::path::Path) -> ModelsConfig {
@@ -4597,21 +4602,6 @@ routeCallsViaOpenRouter: true
             .iter()
             .map(|candidate| model_ref(&candidate.model))
             .collect()
-    }
-
-    fn word(models: &ModelsConfig, model: &str) -> Option<String> {
-        models
-            .rung(&parse_model_ref(model).unwrap())
-            .unwrap()
-            .effort_level
-            .clone()
-    }
-
-    fn effort(models: &ModelsConfig, model: &str) -> Option<f64> {
-        models
-            .rung(&parse_model_ref(model).unwrap())
-            .unwrap()
-            .effort
     }
 
     /// MD defaults to OpenCode Go's glm while MD on Claude is still the
@@ -4644,14 +4634,6 @@ routeCallsViaOpenRouter: true
             .ladder
             .iter()
             .all(|rung| rung.model.backend != "openrouter"));
-        // Efforts are kept as the configured words, placed at launch.
-        assert_eq!(effort(&models, "opencode-go/glm-5.3"), None);
-        assert_eq!(
-            word(&models, "opencode-go/glm-5.3").as_deref(),
-            Some("high")
-        );
-        assert_eq!(effort(&models, "claude/sonnet"), None);
-        assert_eq!(word(&models, "claude/sonnet").as_deref(), Some("high"));
         assert!(
             notes
                 .iter()
@@ -4794,8 +4776,6 @@ routeCallsViaOpenRouter: true
         let models = converted(temp.path());
         assert_eq!(band(&models, "lg"), ["claude/sonnet"]);
         assert!(band(&models, "md").is_empty());
-        assert_eq!(effort(&models, "claude/sonnet"), None);
-        assert_eq!(word(&models, "claude/sonnet").as_deref(), Some("xhigh"));
         assert!(
             notes
                 .iter()
@@ -4805,11 +4785,9 @@ routeCallsViaOpenRouter: true
     }
 
     /// The operator's real grid configured OpenCode Go and OpenRouter cells
-    /// with only OpenRouter enabled: the disabled provider's cells are named,
-    /// and an OpenRouter effort is kept as its word, not raised, while its
-    /// scale is unknown.
+    /// with only OpenRouter enabled: the disabled provider's cells are named.
     #[test]
-    fn disabled_providers_cells_are_named_and_unknown_scales_keep_the_effort_word() {
+    fn disabled_providers_cells_are_named() {
         let temp = TempDir::new().unwrap();
         write_settings(
             temp.path(),
@@ -4819,58 +4797,44 @@ routeCallsViaOpenRouter: true
         let models = converted(temp.path());
         // The Models page notice shows exactly what the log was told.
         assert_eq!(models.conversion_notes, notes);
-        assert_eq!(
-            effort(&models, "openrouter/anthropic/claude-haiku-5.5"),
-            None
-        );
-        let haiku =
-            crate::allotment::parse_model_ref("openrouter/anthropic/claude-haiku-5.5").unwrap();
-        assert_eq!(
-            models
-                .rung(&haiku)
-                .and_then(|rung| rung.effort_level.as_deref()),
-            Some("medium")
-        );
+        assert!(models
+            .rung(&parse_model_ref("openrouter/anthropic/claude-haiku-5.5").unwrap())
+            .is_some());
         assert!(
             notes.iter().any(|note| note
                 == "opencode-go is not enabled, so its cells were not converted (md glm-5.3); add them on the Models page if you enable it"),
             "{notes:?}"
         );
         assert!(
-            notes.iter().any(|note| note.starts_with(
-                "openrouter/anthropic/claude-haiku-5.5: effort 'medium' is kept as a word"
-            )),
-            "{notes:?}"
-        );
-        assert!(
-            !notes.iter().any(|note| note.contains("top of its scale")),
+            !notes.iter().any(|note| note.contains("effort")),
             "{notes:?}"
         );
     }
 
-    /// Claude `max` is a subagent mode and Codex `ultra` is not on a scale
-    /// discovery has not reported: both become the top of the model's scale,
-    /// each with a note.
+    /// A ladder that still holds the per-model efforts of an earlier version
+    /// loads with them ignored, and the retirement removes them from the file
+    /// and nothing else.
     #[test]
-    fn claude_max_and_codex_ultra_become_the_top_of_the_scale() {
+    fn stored_rung_efforts_load_and_are_retired_from_the_file() {
         let temp = TempDir::new().unwrap();
         write_settings(
             temp.path(),
-            "backends:\n  claude:\n    lg: {model: opus, options: {reasoningEffort: max}}\n",
+            "models:\n  pools:\n  - id: lg\n    description: large\n    band: {min: 0.5}\n  ladder:\n  - model: claude/opus\n    level: 0.8\n    effort: 0.9\n    options: {fastMode: true}\n  - model: codex/gpt-6-astra\n    level: 0.7\n    effortLevel: high\n  - model: claude/haiku\n    level: 0.1\n  defaultModels: [lg]\n",
         );
-        let notes = migrate(temp.path(), &["claude", "codex"]).unwrap();
-        let models = converted(temp.path());
-        assert_eq!(effort(&models, "claude/opus"), Some(1.0));
-        // The shipped Codex lg cell is gpt-5.6-sol at `ultra`.
-        assert_eq!(effort(&models, "codex/gpt-5.6-sol"), Some(1.0));
-        for model in ["claude/opus", "codex/gpt-5.6-sol"] {
-            assert!(
-                notes
-                    .iter()
-                    .any(|note| note.starts_with(&format!("{model}: effort"))),
-                "{notes:?}"
-            );
-        }
+        let before = converted(temp.path());
+        assert_eq!(before.ladder.len(), 3);
+
+        assert!(retire_rung_efforts(temp.path()).unwrap());
+        let written = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        assert!(!written.contains("effort"), "{written}");
+        assert!(written.contains("fastMode: true"), "{written}");
+        assert_eq!(converted(temp.path()), before);
+
+        assert!(!retire_rung_efforts(temp.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(get_settings_path(temp.path())).unwrap(),
+            written
+        );
     }
 
     #[test]

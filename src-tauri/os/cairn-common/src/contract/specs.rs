@@ -965,7 +965,7 @@ pub(crate) const TASK_MESSAGES_RELATED: &[RelatedSpec] = &[RelatedSpec {
 pub(crate) const SETTINGS_MODELS: KeySpec = KeySpec::new(
     "models",
     KeyType::Object,
-    "pools, ladder and defaultModels, replaced whole: {pools: [{id, description, band: {min}} | {id, description, members: [provider/model]}], ladder: [{model: provider/model, level, effort, options}], defaultModels: [md]}; read the current value at cairn://models/ladder",
+    "pools, ladder and defaultModels, replaced whole: {pools: [{id, description, band: {min}} | {id, description, members: [provider/model]}], ladder: [{model: provider/model, level, options}], defaultModels: [md]}; read the current value at cairn://models/ladder",
 );
 pub(crate) const SETTINGS_ENABLED_PROVIDERS: KeySpec = KeySpec::new(
     "enabledProviders",

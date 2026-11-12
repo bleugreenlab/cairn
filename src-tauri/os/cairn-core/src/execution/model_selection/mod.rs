@@ -581,43 +581,24 @@ pub fn select(
         }
     }
 
-    // 5. Effort and options.
+    // 5. Effort and options. Effort belongs to the work, so it comes from the
+    // requirement alone; a ladder entry contributes only its other options.
     let chosen = first.candidate.model.clone();
-    let rung = first.candidate.rung.as_ref();
-    let mut extras = rung.map(|rung| rung.option_extras()).unwrap_or_default();
-    let mut effort_note: Option<String> = None;
-    match requirement
-        .effort
-        .or_else(|| rung.and_then(|rung| rung.effort))
-    {
+    let mut extras = first
+        .candidate
+        .rung
+        .as_ref()
+        .map(|rung| rung.option_extras())
+        .unwrap_or_default();
+    let effort_note = match requirement.effort {
         Some(x) => {
             if let Some(effort) = first.provider.effort(chosen.model.as_str(), x) {
                 extras.reasoning_effort = effort.reasoning_effort;
             }
+            None
         }
-        // A word kept from the tier grid is placed now that the catalog may
-        // know the model's scale.
-        None => {
-            if let Some(word) = rung.and_then(|rung| rung.effort_level.as_deref()) {
-                let model = model_ref(&chosen);
-                match first.provider.effort_scale(chosen.model.as_str()) {
-                    Some(scale) if scale.position(word).is_some() => {
-                        extras.reasoning_effort = Some(word.to_string());
-                    }
-                    Some(_) => {
-                        effort_note = Some(format!(
-                            "effort '{word}' is not one of {model}'s levels, so it launches at the provider's default"
-                        ));
-                    }
-                    None => {
-                        effort_note = Some(format!(
-                            "effort '{word}' waits for {model}'s levels to be known, so it launches at the provider's default"
-                        ));
-                    }
-                }
-            }
-        }
-    }
+        None => Some(PROVIDER_DEFAULT_EFFORT.to_string()),
+    };
 
     let clause = supply::describe(&first.provider.descriptor.display_name, first_supply);
     let mut notes = relaxations.clone();
@@ -668,6 +649,9 @@ pub fn select(
         subject: SelectionSubject::default(),
     })
 }
+
+/// The provenance note of a launch whose requirement sets no effort.
+pub const PROVIDER_DEFAULT_EFFORT: &str = "effort: provider default";
 
 /// The record a pinned job stores: the pin itself, in the band of its ladder
 /// entry (none when it is off the ladder) and with the catalog's maker, so a

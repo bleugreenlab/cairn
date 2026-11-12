@@ -494,34 +494,6 @@ pub(crate) fn render_ladder(
             Some(maker) => format!("by {maker}"),
             None => "maker unknown".to_string(),
         });
-        let scale = rung
-            .effort_scale
-            .iter()
-            .map(|step| step.level.as_str())
-            .collect::<Vec<_>>()
-            .join("|");
-        match (
-            scale.is_empty(),
-            rung.effort,
-            &rung.effort_level,
-            &rung.effort_word,
-        ) {
-            (false, Some(x), Some(level), _) => {
-                facts.push(format!("effort {} → {level} of {scale}", level_text(x)))
-            }
-            (_, None, Some(level), Some(_)) => {
-                facts.push(format!("effort {level} (kept from the tier grid) of {scale}"))
-            }
-            (_, None, None, Some(word)) => facts.push(format!(
-                "effort '{word}' kept from the tier grid, not one of this model's known levels; it launches at the provider's default"
-            )),
-            (false, None, _, _) => facts.push(format!("effort default of {scale}")),
-            (true, Some(x), _, _) => facts.push(format!(
-                "effort {} (this model takes no effort)",
-                level_text(x)
-            )),
-            _ => {}
-        }
         for (key, value) in &rung.options {
             let value = match value {
                 crate::models::PresetOptionValue::Str(value) => value.clone(),

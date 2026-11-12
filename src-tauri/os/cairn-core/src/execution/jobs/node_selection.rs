@@ -424,8 +424,6 @@ pub(super) mod tests {
         Rung {
             model: parse_model_ref(model).unwrap(),
             level: Some(Level::set(level)),
-            effort: None,
-            effort_level: None,
             options: Default::default(),
         }
     }

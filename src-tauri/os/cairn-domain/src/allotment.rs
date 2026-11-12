@@ -141,6 +141,9 @@ impl From<Pool> for PoolFile {
 }
 
 /// One model's place on the ladder and how it launches.
+///
+/// A rung carries no effort: effort is a property of the work, so a launch
+/// takes its requirement's effort, else the provider's default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Rung {
@@ -153,16 +156,6 @@ pub struct Rung {
     /// entry's launch options without placing it on the ladder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<Level>,
-    /// The position on this model's own effort scale it launches at, 0..1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<f64>,
-    /// An effort word kept from the tier grid because this model's scale was
-    /// not known when it converted. Selection places it on the scale at
-    /// launch; when the scale is known and the word is not one of its levels,
-    /// the model launches at its provider's default and the provenance says
-    /// so. `effort`, when set, wins over it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort_level: Option<String>,
     /// Launch options other than effort (`serviceTier`, `fastMode`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, PresetOptionValue>,
@@ -837,17 +830,12 @@ impl ModelsConfig {
                     model_ref(&rung.model)
                 ));
             }
-            for (what, value) in [
-                ("level", rung.level.as_ref().map(|level| level.value)),
-                ("effort", rung.effort),
-            ] {
-                if let Some(value) = value {
-                    if !(0.0..=1.0).contains(&value) {
-                        return Err(format!(
-                            "{}'s {what} is {value}; it is a position in 0..1",
-                            model_ref(&rung.model)
-                        ));
-                    }
+            if let Some(value) = rung.level.as_ref().map(|level| level.value) {
+                if !(0.0..=1.0).contains(&value) {
+                    return Err(format!(
+                        "{}'s level is {value}; it is a position in 0..1",
+                        model_ref(&rung.model)
+                    ));
                 }
             }
         }
@@ -998,24 +986,6 @@ pub struct Conversion {
     pub notes: Vec<String>,
 }
 
-/// Where an effort word from the tier grid falls on its model's own scale.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EffortPlacement {
-    /// A level of the model's scale, at this 0..1 position.
-    At(f64),
-    /// The model's scale is known and the word is not one of its levels.
-    NotALevel,
-    /// The model's scale is not known: a provider whose levels come per model
-    /// from discovery, before discovery has listed this model, or a model that
-    /// takes no effort at all.
-    ScaleUnknown,
-}
-
-/// Places an effort word on its model's scale. Supplied by the caller (the
-/// catalog's `CatalogProvider::effort_scale`), because this crate cannot see
-/// discovery.
-pub type PositionFn<'a> = &'a dyn Fn(&ModelSelection, &str) -> EffortPlacement;
-
 /// Convert a tier grid into pools and ladder entries.
 ///
 /// - A grid's `tiers` list was always an ordered capability list, so every
@@ -1027,16 +997,15 @@ pub type PositionFn<'a> = &'a dyn Fn(&ModelSelection, &str) -> EffortPlacement;
 /// - Every cell on an installed provider becomes a ladder entry at its
 ///   band's centre; a model in several tiers keeps the highest tier's level
 ///   and options.
-/// - A cell's `reasoningEffort` becomes a position on that model's scale; a
-///   level off the scale (a mode, or a word the model does not use) becomes
-///   the top, 1.0. Other options move across unchanged.
+/// - A cell's `reasoningEffort` is not carried over: effort comes from the
+///   work a launch is for, else the provider's default. Other options move
+///   across unchanged.
 /// - A `decisionModel` naming a tier becomes that pool; `provider/tier`
 ///   becomes the model of that cell.
 pub fn convert_tiers(
     legacy: &LegacyTiers<'_>,
     enabled: &[String],
     decision_model: Option<&str>,
-    position: PositionFn<'_>,
 ) -> Conversion {
     let mut notes: Vec<String> = Vec::new();
     let mut tiers: Vec<&str> = Vec::new();
@@ -1068,45 +1037,6 @@ pub fn convert_tiers(
             .get(backend)
             .and_then(|tiers| tiers.get(tier))
     };
-    // A cell's effort as a position on its model's scale, or as the word
-    // itself when that scale is not known yet.
-    let effort_of = |selection: &ModelSelection,
-                     preset: &Preset,
-                     notes: &mut Vec<String>|
-     -> (Option<f64>, Option<String>) {
-        let Some(level) = preset
-            .options
-            .get(EFFORT_OPTION)
-            .and_then(|value| value.as_str())
-        else {
-            return (None, None);
-        };
-        match position(selection, level) {
-            // The word, not its position: a scale known before discovery may
-            // grow once discovery lists the model (Codex's static four become
-            // six), and a stored position would then name a higher level.
-            // The word is placed on the model's own scale at each launch.
-            EffortPlacement::At(_) => (None, Some(level.to_string())),
-            EffortPlacement::NotALevel => {
-                notes.push(format!(
-                    "{}: effort '{level}' is not one of this model's levels, so it now launches at the top of its scale",
-                    model_ref(selection)
-                ));
-                (Some(1.0), None)
-            }
-            // An unknown scale is not evidence the word is off it, so the
-            // word is neither pushed to the top (which would silently raise
-            // cost once discovery lists the model's levels) nor dropped: it
-            // is kept and placed when the model launches.
-            EffortPlacement::ScaleUnknown => {
-                notes.push(format!(
-                    "{}: effort '{level}' is kept as a word because this model's levels were not known when the conversion ran; it is placed on them when the model launches, or the model launches at its provider's default effort if it is not one of them",
-                    model_ref(selection)
-                ));
-                (None, Some(level.to_string()))
-            }
-        }
-    };
     let options_of = |preset: &Preset| -> BTreeMap<String, PresetOptionValue> {
         preset
             .options
@@ -1124,16 +1054,12 @@ pub fn convert_tiers(
                 continue;
             };
             let selection = ModelSelection::new(backend.clone(), preset.model.clone());
-            let mut effort_notes = Vec::new();
-            let (effort, effort_level) = effort_of(&selection, preset, &mut effort_notes);
             let rung = Rung {
                 model: selection.clone(),
                 level: Some(Level::seeded(
                     band.centre(),
                     format!("converted from the {} tier", band.id),
                 )),
-                effort,
-                effort_level,
                 options: options_of(preset),
             };
             let here = format!("{backend}/{}", band.id);
@@ -1146,13 +1072,9 @@ pub fn convert_tiers(
                     existing.2.push(previous);
                     existing.0 = rank;
                     existing.1 = rung;
-                    notes.extend(effort_notes);
                 }
                 Some(existing) => existing.2.push(here),
-                None => {
-                    ladder.push((rank, rung, Vec::new()));
-                    notes.extend(effort_notes);
-                }
+                None => ladder.push((rank, rung, Vec::new())),
             }
         }
     }
@@ -1259,8 +1181,6 @@ mod tests {
         Rung {
             model: parse_model_ref(model).unwrap(),
             level: Some(Level::set(level)),
-            effort: None,
-            effort_level: None,
             options: BTreeMap::new(),
         }
     }
@@ -1563,7 +1483,6 @@ pools:
 ladder:
   - model: openrouter/anthropic/claude-sonnet-4.5
     level: 0.5
-    effort: 0.5
     options: { serviceTier: priority }
 defaultModels: [sm]
 "#;
@@ -1633,24 +1552,6 @@ defaultModels: [sm]
         backends
     }
 
-    /// Each provider's scale as its catalog would answer: Claude's static four,
-    /// Codex's discovered list (only sol lists `ultra`), Go's per model, and
-    /// nothing yet for OpenRouter, which lists levels per model on discovery.
-    fn position(selection: &ModelSelection, level: &str) -> EffortPlacement {
-        let levels: &[&str] = match (selection.backend.as_str(), selection.model.as_str()) {
-            ("claude", _) => &["low", "medium", "high", "xhigh"],
-            ("codex", "gpt-5.6-sol") => &["low", "medium", "high", "xhigh", "ultra"],
-            ("codex", _) => &["low", "medium", "high", "xhigh"],
-            ("opencode-go", "kimi-k3") => &["none", "low", "high", "max"],
-            ("opencode-go", _) => &["low", "high"],
-            _ => return EffortPlacement::ScaleUnknown,
-        };
-        match levels.iter().position(|known| *known == level) {
-            Some(index) => EffortPlacement::At((index as f64 + 0.5) / levels.len() as f64),
-            None => EffortPlacement::NotALevel,
-        }
-    }
-
     fn strings(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|s| s.to_string()).collect()
     }
@@ -1676,7 +1577,6 @@ defaultModels: [sm]
             },
             &strings(enabled),
             decision,
-            &position,
         )
     }
 
@@ -1740,34 +1640,8 @@ defaultModels: [sm]
             .ladder
             .iter()
             .all(|rung| rung.model.backend != "openrouter"));
-        let sol = models
-            .rung(&parse_model_ref("codex/gpt-5.6-sol").unwrap())
-            .unwrap();
-        assert_eq!(
-            (sol.effort, sol.effort_level.as_deref()),
-            (None, Some("ultra"))
-        );
-        let sonnet = models
-            .rung(&parse_model_ref("claude/sonnet").unwrap())
-            .unwrap();
-        assert_eq!(
-            (sonnet.effort, sonnet.effort_level.as_deref()),
-            (None, Some("high"))
-        );
         // MYTH is the band above LG, and fable sits in it.
         assert_eq!(band_models(models, "myth"), ["claude/fable"]);
-        let fable = models
-            .rung(&parse_model_ref("claude/fable").unwrap())
-            .unwrap();
-        assert_eq!(fable.effort, Some(1.0));
-        assert!(
-            converted
-                .notes
-                .iter()
-                .any(|n| n.contains("claude/fable: effort 'max'")),
-            "{:?}",
-            converted.notes
-        );
         assert!(converted
             .notes
             .iter()
@@ -1895,7 +1769,6 @@ defaultModels: [sm]
                 "actual",
             ]),
             Some("typesafe/jev-1.14"),
-            &position,
         );
         let models = &converted.models;
         models.validate().unwrap();
@@ -1937,7 +1810,6 @@ defaultModels: [sm]
             fable.level,
             Some(Level::seeded(0.88, "converted from the myth tier"))
         );
-        assert_eq!(fable.effort_level.as_deref(), Some("high"));
 
         // LG holds exactly the LG cells it held before, so an `lg` allotment
         // selects among the same models and never reaches MYTH.
@@ -2023,10 +1895,6 @@ defaultModels: [sm]
         let sonnet = &converted.models.ladder[0];
         assert_eq!(converted.models.ladder.len(), 1);
         assert_eq!(
-            (sonnet.effort, sonnet.effort_level.as_deref()),
-            (None, Some("xhigh"))
-        );
-        assert_eq!(
             converted
                 .models
                 .band_of(sonnet.level.as_ref().unwrap().value)
@@ -2036,73 +1904,44 @@ defaultModels: [sm]
         );
     }
 
+    /// Effort belongs to the work, not the model: a cell's effort, on or off
+    /// its model's scale, leaves nothing on the ladder entry and needs no
+    /// note, while the cell's other options carry over.
     #[test]
-    fn an_effort_off_the_models_scale_becomes_its_top_with_a_note() {
-        let converted = convert(
-            &["sm", "md", "lg"],
-            &[],
-            &[
-                ("claude", "lg", "opus", Some("max")),
-                ("codex", "md", "gpt-5.6-terra", Some("ultra")),
-                ("opencode-go", "lg", "kimi-k3", Some("max")),
-            ],
-            &["claude", "codex", "opencode-go"],
+    fn a_cells_effort_is_not_carried_onto_the_ladder() {
+        let mut backends = grid(&[
+            ("claude", "lg", "opus", Some("max")),
+            ("codex", "md", "gpt-5.6-terra", Some("high")),
+        ]);
+        backends
+            .get_mut("codex")
+            .unwrap()
+            .get_mut("md")
+            .unwrap()
+            .options
+            .insert("fastMode".into(), PresetOptionValue::Bool(true));
+        let tiers = strings(&["sm", "md", "lg"]);
+        let converted = convert_tiers(
+            &LegacyTiers {
+                tiers: &tiers,
+                tier_defaults: &HashMap::new(),
+                backends: &backends,
+            },
+            &strings(&["claude", "codex"]),
             None,
         );
-        let effort = |model: &str| {
-            converted
-                .models
-                .rung(&parse_model_ref(model).unwrap())
-                .unwrap()
-                .effort
-        };
-        assert_eq!(effort("claude/opus"), Some(1.0));
-        assert_eq!(effort("codex/gpt-5.6-terra"), Some(1.0));
-        // Kimi's max is a level, so it is kept as that word and gets no note.
-        assert_eq!(effort("opencode-go/kimi-k3"), None);
-        assert_eq!(
-            converted
-                .models
-                .rung(&parse_model_ref("opencode-go/kimi-k3").unwrap())
-                .unwrap()
-                .effort_level
-                .as_deref(),
-            Some("max")
-        );
-        assert_eq!(converted.notes.len(), 2, "{:?}", converted.notes);
-    }
-
-    /// Before discovery OpenRouter knows no model's levels, which says nothing
-    /// about whether the stored word is one of them: the word is kept for
-    /// selection to place.
-    #[test]
-    fn an_effort_on_a_scale_not_yet_known_is_kept_as_a_word_with_a_note() {
-        let converted = convert(
-            &["sm", "md", "lg"],
-            &[],
-            &[(
-                "openrouter",
-                "md",
-                "anthropic/claude-haiku-5.5",
-                Some("medium"),
-            )],
-            &["openrouter"],
-            None,
-        );
-        let haiku = converted
+        assert!(converted.notes.is_empty(), "{:?}", converted.notes);
+        let terra = converted
             .models
-            .rung(&parse_model_ref("openrouter/anthropic/claude-haiku-5.5").unwrap())
+            .rung(&parse_model_ref("codex/gpt-5.6-terra").unwrap())
             .unwrap();
-        assert_eq!(haiku.effort, None);
-        assert_eq!(haiku.effort_level.as_deref(), Some("medium"));
-        assert_eq!(converted.notes.len(), 1, "{:?}", converted.notes);
-        assert!(
-            converted.notes[0].starts_with(
-                "openrouter/anthropic/claude-haiku-5.5: effort 'medium' is kept as a word"
-            ),
-            "{:?}",
-            converted.notes
+        assert_eq!(
+            terra.options.keys().collect::<Vec<_>>(),
+            ["fastMode"],
+            "only the non-effort option carries over"
         );
+        let written = serde_yaml::to_string(&converted.models).unwrap();
+        assert!(!written.contains("effort"), "{written}");
     }
 
     #[test]

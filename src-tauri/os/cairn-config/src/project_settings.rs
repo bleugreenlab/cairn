@@ -1430,7 +1430,6 @@ pub fn convert_project_tiers(
     file: &ProjectSettingsFile,
     workspace: &crate::settings::LegacyGrid,
     enabled: &[String],
-    position: crate::allotment::PositionFn<'_>,
 ) -> Option<(crate::allotment::ModelsOverlay, Vec<String>)> {
     if !file.has_tier_grid() {
         return None;
@@ -1453,8 +1452,8 @@ pub fn convert_project_tiers(
             }
         }
     }
-    let base = crate::allotment::convert_tiers(&workspace.as_tiers(), enabled, None, position);
-    let target = crate::allotment::convert_tiers(&project.as_tiers(), enabled, None, position);
+    let base = crate::allotment::convert_tiers(&workspace.as_tiers(), enabled, None);
+    let target = crate::allotment::convert_tiers(&project.as_tiers(), enabled, None);
     let notes = target
         .notes
         .into_iter()
@@ -3282,21 +3281,6 @@ activeBackend: codex
 
     // === A project's tier overrides converted to a `models` overlay ===
 
-    fn position(
-        selection: &crate::models::ModelSelection,
-        level: &str,
-    ) -> crate::allotment::EffortPlacement {
-        use crate::allotment::EffortPlacement;
-        let levels: &[&str] = match selection.backend.as_str() {
-            "claude" | "codex" => &["low", "medium", "high", "xhigh"],
-            _ => return EffortPlacement::ScaleUnknown,
-        };
-        match levels.iter().position(|known| *known == level) {
-            Some(index) => EffortPlacement::At((index as f64 + 0.5) / levels.len() as f64),
-            None => EffortPlacement::NotALevel,
-        }
-    }
-
     fn workspace() -> crate::settings::LegacyGrid {
         crate::settings::SettingsFile::default().legacy_grid()
     }
@@ -3334,12 +3318,10 @@ activeBackend: codex
             "backends:\n  codex:\n    lg: {model: gpt-5.5, options: {reasoningEffort: high}}\n",
         )
         .unwrap();
-        let (overlay, _) =
-            convert_project_tiers(&file, &workspace(), &installed(), &position).unwrap();
+        let (overlay, _) = convert_project_tiers(&file, &workspace(), &installed()).unwrap();
         let mut effective = crate::settings::convert_settings_tiers(
             &crate::settings::SettingsFile::default(),
             &installed(),
-            &position,
         )
         .models;
         assert_eq!(lg_of(&effective), ["claude/opus", "codex/gpt-5.6-sol"]);
@@ -3352,11 +3334,10 @@ activeBackend: codex
     #[test]
     fn a_project_that_overrides_nothing_converts_to_nothing() {
         let file: ProjectSettingsFile = serde_yaml::from_str("defaultBranch: main\n").unwrap();
-        assert!(convert_project_tiers(&file, &workspace(), &installed(), &position).is_none());
+        assert!(convert_project_tiers(&file, &workspace(), &installed()).is_none());
         // A default alone moves no model: every installed cell is a candidate.
         let file: ProjectSettingsFile = serde_yaml::from_str("activeBackend: codex\n").unwrap();
-        let (overlay, notes) =
-            convert_project_tiers(&file, &workspace(), &installed(), &position).unwrap();
+        let (overlay, notes) = convert_project_tiers(&file, &workspace(), &installed()).unwrap();
         assert!(overlay.is_empty(), "{overlay:?}");
         assert!(
             notes
@@ -3389,6 +3370,6 @@ activeBackend: codex
         assert!(!written.contains("models:"), "{written}");
         let file = load_project_settings_read_only(temp.path());
         assert!(file.has_tier_grid());
-        assert!(convert_project_tiers(&file, &workspace(), &installed(), &position).is_some());
+        assert!(convert_project_tiers(&file, &workspace(), &installed()).is_some());
     }
 }

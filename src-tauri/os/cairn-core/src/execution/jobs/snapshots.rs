@@ -1099,8 +1099,8 @@ mod host_snapshot_tests {
 
     /// A thread session job minted with no model (an agent appending to a
     /// project's threads, a reopened thread) chooses one from its agent's
-    /// allotment at its first launch, stores it, runs every turn on it at its
-    /// effort, and keeps it on later launches.
+    /// allotment at its first launch, stores it, runs every turn on it with
+    /// its stored launch options, and keeps it on later launches.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_thread_session_with_no_model_selects_from_its_agents_allotment() {
         use super::super::config_loading::load_agent_config;
@@ -1109,12 +1109,7 @@ mod host_snapshot_tests {
 
         let fx = fixture("host-select-thread.db").await;
         seed_thread_session(&fx, None).await;
-        let mut models = selection::two_makers();
-        models
-            .ladder
-            .iter_mut()
-            .for_each(|rung| rung.effort = Some(0.9));
-        selection::serve_claude_and_codex(&fx.orch, models);
+        selection::serve_claude_and_codex(&fx.orch, selection::two_makers());
 
         select_job_model(&fx.orch, &fx.db, &fx.job("j").await, None).unwrap();
         let stored = fx
@@ -1128,7 +1123,12 @@ mod host_snapshot_tests {
             "{}",
             stored.provenance
         );
-        assert!(stored.extras.reasoning_effort.is_some(), "{stored:?}");
+        assert!(
+            stored.provenance.ends_with("effort: provider default"),
+            "{}",
+            stored.provenance
+        );
+        assert_eq!(stored.extras.reasoning_effort, None, "{stored:?}");
         assert_eq!(fx.job("j").await.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(
             fx.db

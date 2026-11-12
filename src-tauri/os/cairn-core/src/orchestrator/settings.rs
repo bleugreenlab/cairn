@@ -138,18 +138,12 @@ impl Orchestrator {
     /// not been converted yet, and log what did not carry over exactly.
     ///
     /// Runs at startup after the installed-provider set is recorded, since
-    /// only installed providers' cells become ladder entries. Effort words are
-    /// placed on each model's scale by the catalog, which before discovery
-    /// answers from each provider's static vocabulary. Idempotent: once
-    /// `models` is on disk this never revisits it.
+    /// only installed providers' cells become ladder entries. Idempotent: once
+    /// `models` is on disk this never revisits it. Also removes the per-model
+    /// efforts earlier versions stored on ladder entries.
     pub fn migrate_models(&self) -> Result<Option<Vec<String>>, String> {
-        use cairn_models::interface::Models;
-        let catalog = self.catalog(&cairn_models::interface::ModelScope::default())?;
-        let position = |selection: &crate::models::ModelSelection, level: &str| {
-            super::model_selection::position_in(&catalog, selection, level)
-        };
         let enabled = self.enabled_providers();
-        let migrated = settings::migrate_models(&self.config_dir, &enabled, &position)?;
+        let migrated = settings::migrate_models(&self.config_dir, &enabled)?;
         if let Some(notes) = &migrated {
             log::info!("Converted this workspace's model tiers to pools and a ladder");
             for note in notes {
@@ -157,7 +151,7 @@ impl Orchestrator {
             }
         }
         // A project's tier overrides convert in memory whenever they are read
-        // (`effective_models_in`), against the workspace grid, which retiring
+        // (`effective_models`), against the workspace grid, which retiring
         // archives rather than loses. A project's repository is never written
         // to: these are the notes its conversion would give.
         let workspace_grid = settings::workspace_legacy_grid(&self.config_dir)?;
@@ -171,7 +165,6 @@ impl Orchestrator {
                 &file,
                 &workspace_grid,
                 &enabled,
-                &position,
             ) {
                 log::info!(
                     "Project {project_id}'s model tiers convert to a models overlay in memory; its .cairn/config.yaml is left as written"
@@ -185,7 +178,13 @@ impl Orchestrator {
         if retired {
             log::info!("Removed the retired tier grid from this workspace's settings");
         }
-        if migrated.is_some() || retired {
+        let efforts_retired = settings::retire_rung_efforts(&self.config_dir)?;
+        if efforts_retired {
+            log::info!(
+                "Removed per-model efforts from this workspace's ladder; effort now comes from each launch's task, else its provider's default"
+            );
+        }
+        if migrated.is_some() || retired || efforts_retired {
             let _ = self.services.emitter.emit(
                 "config-changed",
                 serde_json::json!({"entity_type": "settings"}),
