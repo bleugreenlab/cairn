@@ -1564,6 +1564,7 @@ mod tests {
                 base_branch: "main".into(),
                 base_commit: "b".repeat(40),
                 budget: std::time::Duration::from_secs(30),
+                blocker: None,
             },
             PreparationRefusal::Cooldown {
                 fingerprint: "tip:destination".into(),

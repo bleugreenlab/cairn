@@ -350,6 +350,53 @@ pub(super) fn export_fails(store: &Path) -> bool {
     failing_exports().lock().unwrap().contains(store)
 }
 
+fn compute_hooks() -> &'static Mutex<HashMap<PathBuf, Barrier>> {
+    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Barrier>>> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+/// Called on the blocking worker as detached computation starts, with no
+/// store lock held. A hook is taken out while it runs, so a preparation it
+/// starts does not run it again.
+pub(in crate::orchestrator::base_advance) fn during_compute(store: &Path) {
+    let hook = compute_hooks().lock().unwrap().remove(store);
+    if let Some(mut hook) = hook {
+        hook(0);
+        compute_hooks()
+            .lock()
+            .unwrap()
+            .insert(store.to_path_buf(), hook);
+    }
+}
+
+pub(in crate::orchestrator::base_advance) fn on_compute(store: &Path, hook: Barrier) {
+    compute_hooks()
+        .lock()
+        .unwrap()
+        .insert(store.to_path_buf(), hook);
+}
+
+fn starved_computes() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static STARVED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    STARVED.get_or_init(Default::default)
+}
+
+/// Fault injection: every detached computation of `store` runs with no time
+/// at all and reports its budget exhausted, while the allowance its cost
+/// evidence records stays the real one.
+pub(super) fn compute_starved(store: &Path) -> bool {
+    starved_computes().lock().unwrap().contains(store)
+}
+
+pub(in crate::orchestrator::base_advance) fn starve_compute(store: &Path, starved: bool) {
+    let mut stores = starved_computes().lock().unwrap();
+    if starved {
+        stores.insert(store.to_path_buf());
+    } else {
+        stores.remove(store);
+    }
+}
+
 /// Two suites of one `cairn check run` prepare the same branch at once. The
 /// one that reaches the install while its sibling's preparation still holds
 /// the branch's reservation waits for it and then installs, rather than

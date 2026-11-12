@@ -477,7 +477,7 @@ fn millis(duration: Duration) -> u64 {
 
 /// The running executable's content identity, computed once per process. It
 /// hashes the whole binary, so it is only ever computed off the async runtime.
-fn build_id() -> &'static str {
+pub(crate) fn build_id() -> &'static str {
     static BUILD: OnceLock<String> = OnceLock::new();
     BUILD.get_or_init(|| {
         cairn_common::build_identity::current_executable_build_id()

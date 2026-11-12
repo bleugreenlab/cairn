@@ -359,6 +359,18 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "deleted with its workflow run",
     ),
     owned_by(
+        "replay_cost_samples",
+        "cairn-core orchestrator::base_advance::replay_cost::record_sample",
+        "the newest 500 samples per project, trimmed on every insert",
+    )
+    .budget(32),
+    owned_by(
+        "replay_timeout_blockers",
+        "cairn-core orchestrator::base_advance::replay_cost",
+        "at most one coordinate's rows per branch: rows at another head or base are deleted on \
+         the next lookup, and an install of the branch deletes all of them",
+    ),
+    owned_by(
         "storage_census",
         "cairn-db storage::census::record",
         "the newest KEPT_CENSUSES censuses",

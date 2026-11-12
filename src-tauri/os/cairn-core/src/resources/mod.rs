@@ -76,6 +76,8 @@ pub(crate) use node::{
 pub(crate) use read::open_thread_store;
 pub(crate) use read::run_condition_sql;
 pub(crate) use read::{produce_cairn_resource, read_cairn_resource};
+#[cfg(test)]
+pub(crate) use rebase::read_node_rebase;
 pub(crate) use rebase::{node_base_branch, NodeRebaseRows};
 pub(crate) use thread_seed::{
     compose_node_seed, compose_thread_seed_with_policy, seed_tokens, SeedPolicy, ThreadSeed,

@@ -469,6 +469,8 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("jj_branch_recoveries", "project_id = ?1"),
     delete_only("branch_catch_up_modes", "project_id = ?1"),
     delete_only("branch_catch_up_events", "project_id = ?1"),
+    delete_only("replay_cost_samples", "project_id = ?1"),
+    delete_only("replay_timeout_blockers", "project_id = ?1"),
     delete_only("pack_catalog", "project_id = ?1"),
     delete_only("pack_catalog_references", "project_id = ?1"),
     delete_only("posts", "project_id = ?1"),
@@ -1706,6 +1708,10 @@ pub(super) mod tests {
               VALUES ('project-delete', '/store', 'bookmark', 'merge', 'job-delete', 'human', 1, '[]', 'base', 'human', 1);
             INSERT INTO branch_catch_up_events(project_id, store_path, bookmark, kind, actor, detail, at)
               VALUES ('project-delete', '/store', 'bookmark', 'set', 'human', '{}', 1);
+            INSERT INTO replay_cost_samples(project_id, store_path, branch, engine_version, budget_class, outcome, recorded_at, evidence_json)
+              VALUES ('project-delete', '/store', 'bookmark', 1, 'explicit', 'installed', 1, '{}');
+            INSERT INTO replay_timeout_blockers(project_id, store_path, branch, head, base, mode, resolution, engine_version, base_branch, recorded_at, evidence_json)
+              VALUES ('project-delete', '/store', 'bookmark', 'head', 'base', 'replay', 'none', 1, 'main', 1, '{}');
             INSERT INTO job_browsers(id, job_id, project_id, slug, webview_label, status, created_at)
               VALUES ('browser-delete', 'job-delete', 'project-delete', 'browser', 'browser', 'closed', 1);
             INSERT INTO job_repls(id, job_id, project_id, slug, interpreter, generation, status, created_at)

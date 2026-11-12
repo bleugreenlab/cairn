@@ -2516,6 +2516,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // and the audit trail of its every set, clear, use and review.
     ("branch_catch_up_modes", TableScope::ProjectScoped),
     ("branch_catch_up_events", TableScope::ProjectScoped),
+    // cairn/6456: measured replay costs of this store's branches, and the
+    // explicit compute timeouts that refuse an identical repeat.
+    ("replay_cost_samples", TableScope::ProjectScoped),
+    ("replay_timeout_blockers", TableScope::ProjectScoped),
     // cairn/5222: the identifiers this installation's store bound at landing.
     // A landing runs against this machine's store, so the record of what it
     // allocated is this installation's own.
@@ -3500,6 +3504,14 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "branch_catch_up_events",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "replay_cost_samples",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "replay_timeout_blockers",
         id_columns: &["project_id"],
     },
     // job_file_activity.id is the composite `{event_id}:{tool_use_id}:{ordinal}`

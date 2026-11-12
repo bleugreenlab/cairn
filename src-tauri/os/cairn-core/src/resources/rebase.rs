@@ -218,13 +218,20 @@ pub(crate) async fn read_node_rebase(
     );
     // The owner's own request, whatever any session says: a held plain
     // request has no session at all, and a closed request's reason outlives one.
-    let request_section = explicit_request_section(orch, &db, &rows.job_id, &branch).await;
+    // What a replay of this branch costs follows it, before any request is made.
+    // One decision of whether the recorded evidence refuses a fresh replay,
+    // and every replay recommendation below follows it.
+    let (cost_section, blocked) = replay_cost_section(orch, &db, &rows, &view, &branch).await;
+    let request_section = format!(
+        "{}{cost_section}",
+        explicit_request_section(orch, &db, &rows.job_id, &branch).await,
+    );
     let session = match load_active_session(&db, &branch).await {
         Ok(Some(session)) => session,
         Ok(None) => {
             return format!(
                 "{name_section}{request_section}{}",
-                render_closed_session(orch, &db, &rows, &view, &branch).await
+                render_closed_session(orch, &db, &rows, &view, &branch, blocked.as_deref()).await
             )
         }
         Err(error) => return error,
@@ -245,6 +252,7 @@ pub(crate) async fn read_node_rebase(
                 &standing,
                 &request_section,
                 &view,
+                blocked.as_deref(),
             )
         }
         RebaseView::Merged => render_merged(
@@ -280,6 +288,48 @@ async fn explicit_request_section(
              ({error}).\n\n"
         ),
     }
+}
+
+/// What a replay of this branch costs, from the evidence earlier attempts
+/// recorded (cairn/6456): never a scan of the branch's history on a read. The
+/// live head, base tip and catch-up mode only decide whether that evidence is
+/// current. The second value replaces the page's replay next action when a
+/// recorded timeout refuses a fresh request.
+async fn replay_cost_section(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    rows: &NodeRebaseRows,
+    view: &StoreView,
+    branch: &str,
+) -> (String, Option<String>) {
+    use crate::orchestrator::base_advance::replay_cost;
+    let (Some(project_id), Ok(store)) = (rows.project_id(), rows.store_path(orch).await) else {
+        return (String::new(), None);
+    };
+    let mode = crate::orchestrator::catch_up::mode_for(db, project_id, &store, branch)
+        .await
+        .ok()
+        .map(|mode| replay_cost::ReplayMode::of(mode.is_some()));
+    let samples = replay_cost::branch_samples(db, project_id, &store, branch, 1).await;
+    let engine = replay_cost::engine_samples(db, project_id).await;
+    let blockers = replay_cost::branch_blockers(db, project_id, &store, branch).await;
+    let head = view.bookmark_commit(branch);
+    let base_tip = |base_branch: &str| view.bookmark_commit(base_branch);
+    let live = replay_cost::LiveCoordinates {
+        head: head.as_deref(),
+        base_tip: &base_tip,
+        mode,
+    };
+    (
+        replay_cost::render_cost_section(
+            &samples,
+            &engine,
+            &blockers,
+            &live,
+            chrono::Utc::now().timestamp(),
+        ),
+        replay_cost::blocked_next_action(&blockers, &live),
+    )
 }
 
 /// A durable recovery fence on this branch, first on the page: while it
@@ -380,13 +430,26 @@ fn render_request_section(
                         ),
                         false,
                     ),
+                    // No unconditional invitation: whether an identical repeat
+                    // is now refused, and what would make a different attempt,
+                    // is the replay cost section's to say from the record.
                     (_, Some(crate::jj::RECONCILE_TIMEOUT)) => (
                         format!(
                             "**timed out** onto `{destination}`. Nothing retries an explicit \
-                             attempt on its own; inspect the phase and rollback diagnostic below \
-                             before requesting it again"
+                             attempt on its own. The replay cost section below says whether an \
+                             identical attempt is now refused, what would make a different \
+                             one, and what the attempt measured"
                         ),
-                        true,
+                        false,
+                    ),
+                    (_, Some(crate::orchestrator::base_advance::REPEAT_REFUSED)) => (
+                        format!(
+                            "was **refused as an identical repeat** of an explicit replay onto \
+                             `{destination}` that already exhausted its compute budget; nothing \
+                             was attempted. The replay cost section below says what would make \
+                             a different attempt"
+                        ),
+                        false,
                     ),
                     (_, Some("not_attempted")) => {
                         ("was **closed without replaying**".to_string(), true)
@@ -442,6 +505,7 @@ async fn render_closed_session(
     rows: &NodeRebaseRows,
     view: &StoreView,
     branch: &str,
+    blocked: Option<&str>,
 ) -> String {
     let job_id = rows.job_id.as_str();
     let latest = match load_latest_session(db, branch).await {
@@ -449,7 +513,7 @@ async fn render_closed_session(
         Err(error) => return error,
     };
     let Some(session) = latest.filter(|session| !session.is_open()) else {
-        return render_no_session(orch, db, rows, view, branch).await;
+        return render_no_session(orch, db, rows, view, branch, blocked).await;
     };
 
     let closed_at = crate::clock::stamp(session.updated_at)
@@ -487,7 +551,7 @@ async fn render_closed_session(
             standing.destination,
             load_advance_state(orch, db, job_id, branch, standing).await,
             standing.superseded_note(),
-            replay_next_action(&standing.base_branch),
+            replay_next_action(&standing.base_branch, blocked),
         ),
         Ok(standing) if standing.origin_drift.is_some() => format!(
             "\nThe branch carries its base's tip as the store holds it, but the store's copy of \
@@ -514,8 +578,12 @@ async fn render_closed_session(
 }
 
 /// The one sanctioned way to move a branch's ancestry, rendered for a page that
-/// has no session to quote a fingerprint from.
-fn replay_next_action(base_branch: &str) -> String {
+/// has no session to quote a fingerprint from; or, when a recorded timeout
+/// refuses that exact request, what to do instead.
+fn replay_next_action(base_branch: &str, blocked: Option<&str>) -> String {
+    if let Some(blocked) = blocked {
+        return blocked.to_string();
+    }
     format!(
         "## Next action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",\
          payload:{{action:\"replay\"}}}}]}})\n```\n\nThis asks the store to replay this branch \
@@ -1267,6 +1335,7 @@ async fn render_no_session(
     rows: &NodeRebaseRows,
     view: &StoreView,
     branch: &str,
+    blocked: Option<&str>,
 ) -> String {
     let job_id = rows.job_id.as_str();
     let standing = match load_base_standing(orch, rows, view, branch).await {
@@ -1320,7 +1389,7 @@ async fn render_no_session(
          fix it. Your branch's ANCESTRY is what \
          is stale, and slot refs are downstream exports of the runner's store, so nothing you \
          commit moves it.\n{superseded}\n{next}\n",
-        next = replay_next_action(&base_branch),
+        next = replay_next_action(&base_branch, blocked),
     )
 }
 
@@ -1445,6 +1514,7 @@ fn render_summary(
     standing: &Result<LiveStanding, String>,
     request_section: &str,
     view: &StoreView,
+    blocked: Option<&str>,
 ) -> String {
     let base = format!("cairn://p/{project}/{number}/{exec_seq}/{node_id}/rebase");
     let conflicting: Vec<&SessionFile> = session.conflicting().collect();
@@ -1561,12 +1631,19 @@ fn render_summary(
          merged line-wise, with everything non-overlapping already resolved. Add `file=PATH` for \
          the complete merged file to commit.{merged_warning}\n- `{base}?view=base-ours` — what your branch \
          did\n- `{base}?view=base-theirs` — what arrived\n\nAll three accept `file=PATH`, \
-         `offset=N`, and `limit=N`.\n{resolution_section}{conflicting_table}{dropped_section}{collision_section}{clean_table}\n## Next \
-         action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",payload:{{{replay_payload}}}}}]}})\n```\n\nThis \
-         asks the store to replay your branch onto `{dest}`. It is the only way the branch's \
-         ancestry moves — never rebase, reset, or force-push by hand. A clean replay publishes the \
-         branch and closes this session; a conflicting one refreshes this page.\n\nSession \
+         `offset=N`, and `limit=N`.\n{resolution_section}{conflicting_table}{dropped_section}{collision_section}{clean_table}\n{next}\n\nSession \
          fingerprint `{fingerprint}`, recorded {recorded}.\n",
+        next = match blocked {
+            Some(blocked) => blocked.to_string(),
+            None => format!(
+                "## Next action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",\
+                 payload:{{{replay_payload}}}}}]}})\n```\n\nThis asks the store to replay your \
+                 branch onto `{}`. It is the only way the branch's ancestry moves — never \
+                 rebase, reset, or force-push by hand. A clean replay publishes the branch and \
+                 closes this session; a conflicting one refreshes this page.",
+                session.destination_commit
+            ),
+        },
         branch = session.bookmark,
         incoming = incoming_line(session),
         markers = marker_line(session),
@@ -1584,11 +1661,9 @@ fn render_summary(
             "Also arriving with this change, cleanly on replay",
             &clean
         ),
-        dest = session.destination_commit,
         fingerprint = session.fingerprint(),
         recorded = crate::clock::stamp(session.updated_at)
             .unwrap_or_else(|| "at an unrecorded time".to_string()),
-        replay_payload = replay_payload,
         merged_warning = merged_warning,
     )
 }
@@ -2793,9 +2868,10 @@ mod tests {
         );
     }
 
-    /// An explicit attempt that timed out quotes its phases and promises no
-    /// automatic retry; one whose rollback did not complete says not to publish
-    /// and offers no retry at all.
+    /// An explicit attempt that timed out quotes its phases, promises no
+    /// automatic retry and no longer invites an identical one: whether a repeat
+    /// is refused is the cost section's to say from the record. One whose
+    /// rollback did not complete says not to publish and offers no retry at all.
     #[test]
     fn a_timed_out_or_unrolled_back_request_says_what_to_do_before_asking_again() {
         use crate::orchestrator::conflict_session::{ReplayPass, ReplayRequestState};
@@ -2815,29 +2891,50 @@ mod tests {
         let timed_out = render_request_section(
             &served(
                 crate::jj::RECONCILE_TIMEOUT,
-                "jj restore (ancestry heal) timed out: operation budget exhausted before spawning; \
-                 remaining 18ms, minimum 100ms. The rebase was rolled back, so the branch is \
-                 unchanged.\nExplicit replay timed out under its cumulative forward budget. No \
-                 automatic cooldown was recorded. A new explicit request may run immediately.\n\
-                 Store-lock phases: plan resolution carry 1.4s, rebase and export 9.9s; jj op \
-                 restore [cleanup] 100ms",
+                "Explicit replay of `agent/test` at `c9bcf33c` onto `main` at `b5461a3b` exceeded \
+                 the 57.8s left of its explicit budget during the rebase, export and ancestry \
+                 heal. Nothing was installed and `agent/test` is unchanged. No automatic cooldown \
+                 was recorded.\nAn identical attempt would do the same work under the same \
+                 budget, so it is refused before computing anything.",
             ),
             &Ok(None),
         );
         for expected in [
             "**timed out** onto `b5461a3b`",
             "Nothing retries an explicit attempt on its own",
-            "> jj restore (ancestry heal) timed out",
-            "remaining 18ms",
-            "> Store-lock phases: plan resolution carry 1.4s",
-            "jj op restore [cleanup]",
-            "rebase was rolled back",
-            "may run immediately",
-            "Request it again",
+            "The replay cost section below says whether an identical attempt is now refused",
+            "> Explicit replay of `agent/test` at `c9bcf33c`",
+            "> An identical attempt would do the same work",
         ] {
             assert!(timed_out.contains(expected), "{expected}: {timed_out}");
         }
         assert!(!timed_out.contains("retried automatically"), "{timed_out}");
+        assert!(
+            !timed_out.contains("Request it again") && !timed_out.contains("may run immediately"),
+            "a timeout is never followed by an unconditional invitation: {timed_out}"
+        );
+
+        let refused = render_request_section(
+            &served(
+                crate::orchestrator::base_advance::REPEAT_REFUSED,
+                "Explicit replay of `agent/test` was not attempted.",
+            ),
+            &Ok(None),
+        );
+        assert!(
+            refused.contains("**refused as an identical repeat**")
+                && refused.contains("nothing was attempted")
+                && refused.contains("replay cost section below")
+                && !refused.contains("Request it again"),
+            "{refused}"
+        );
+
+        // A transient close still says how to ask again.
+        let transient = render_request_section(
+            &served("not_attempted", "`agent/test` stayed reserved by a landing"),
+            &Ok(None),
+        );
+        assert!(transient.contains("Request it again"), "{transient}");
 
         let unsafe_line = render_request_section(
             &served(

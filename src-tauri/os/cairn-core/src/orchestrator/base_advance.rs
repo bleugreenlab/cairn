@@ -40,12 +40,13 @@ pub(crate) mod preparation;
 mod publication_tests;
 #[cfg(test)]
 mod recovery_tests;
+pub(crate) mod replay_cost;
 mod replay_requests;
 pub(crate) mod retirement;
 
 pub(crate) use replay_requests::{
     on_branch_hold_released, on_branch_hold_released_for_run, request_branch_replay,
-    serve_pending_replay_requests,
+    serve_pending_replay_requests, REPEAT_REFUSED,
 };
 
 /// The one project whose store holds a branch, the database that owns its

@@ -26,6 +26,13 @@ pub const RECONCILE_CLEANUP_BUDGET: Duration = Duration::from_secs(20);
 /// Cleanup is deliberately exempt so this guard cannot prevent rollback.
 pub const JJ_FORWARD_SUBPROCESS_MINIMUM: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+thread_local! {
+    /// `jj` commands built on this thread, for tests that pin which phases may
+    /// spawn the CLI at all. Per thread, so parallel tests never share a count.
+    pub(crate) static COMMANDS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Default)]
 struct OperationPhase {
     context: String,
@@ -496,6 +503,8 @@ impl JjEnv {
 
     /// A `jj` command rooted at `cwd`, wired for non-interactive use.
     fn cmd(&self, cwd: &Path) -> Command {
+        #[cfg(test)]
+        COMMANDS_BUILT.with(|built| built.set(built.get() + 1));
         self.ensure_config();
         let mut c = cairn_platform::env::command(&self.bin);
         c.current_dir(cwd)

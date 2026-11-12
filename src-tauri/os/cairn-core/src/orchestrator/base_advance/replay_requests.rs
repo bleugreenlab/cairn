@@ -32,7 +32,10 @@
 //! step is not started with less than [`EXPLICIT_STEP_MINIMUM`] left; the answer
 //! names the step and what it had. An explicit timeout never records the
 //! automatic cooldown, and an automatic cooldown never blocks an explicit
-//! request (both enforced by the preparer on `explicit_replay`).
+//! request (both enforced by the preparer on `explicit_replay`). An explicit
+//! compute exhaustion does record a blocker that refuses only an identical
+//! repeat ([`super::replay_cost`]); the answer and the rebase page say so in
+//! the same words.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -66,6 +69,10 @@ pub(crate) const EXPLICIT_STEP_MINIMUM: Duration = Duration::from_secs(1);
 /// How many times the request re-assesses and re-plans after the branch or
 /// its base moves under it before reporting the race instead of chasing it.
 const REPLAY_ATTEMPTS: u32 = 3;
+
+/// The close kind of a request refused as an identical repeat of an explicit
+/// compute timeout; the rebase page reads it back.
+pub(crate) const REPEAT_REFUSED: &str = "repeat_refused";
 
 /// The sanctioned store-side replay of one branch onto its current base.
 ///
@@ -389,6 +396,12 @@ async fn replay(
         request.compute_budget = compute_budget;
         request.lock_wait = compute_budget;
         request.deadline = Some(budget.deadline);
+        request.explicit_cost = Some(super::replay_cost::ExplicitCost {
+            started: budget.deadline - budget.total,
+            budget: budget.total,
+            take_committed_tip: ask.take_committed_tip,
+            drop_incoming: ask.drop_incoming_reason.is_some(),
+        });
         // A recovered request is for exactly the tip it was accepted at,
         // checked under the snapshot guard.
         request.expected_head = ask
@@ -445,6 +458,9 @@ async fn replay(
             }
             Err(refusal) => {
                 let how = match &refusal {
+                    PreparationRefusal::RepeatTimeout(_) => Settle::Closed {
+                        kind: REPEAT_REFUSED,
+                    },
                     PreparationRefusal::Conflict(conflict) => Settle::Served {
                         base_branch: conflict.base_branch.clone(),
                         base_commit: conflict.base_commit.clone(),
@@ -1340,9 +1356,11 @@ async fn plan_take_committed_tip(
 fn timed_out_step(branch: &str, step: &str, error: &str) -> String {
     format!(
         "Explicit replay of `{branch}` timed out in {step}: {error}. Nothing was installed and \
-         `{branch}` is unchanged. No automatic cooldown was recorded; the replay can be \
-         requested again at once, but the same stack will need the same time, so if it times \
-         out again report it on cairn://p/cairn/execution rather than repeating it."
+         `{branch}` is unchanged. This step is not the replay's computation, so no automatic \
+         cooldown and no repeat block was recorded. An unchanged branch needs the same time for \
+         it again: if it times out again, report it on cairn://p/cairn/execution rather than \
+         repeating it.\n\n{}",
+        super::replay_cost::merge_catch_up_exit()
     )
 }
 
@@ -1433,19 +1451,26 @@ fn not_landed(
             }
             Ok(out)
         }
+        // Guidance from the exact blocker this attempt recorded, never one
+        // matched by head and base alone.
         PreparationRefusal::TimedOut {
             head,
             base_branch,
             base_commit,
             budget,
+            blocker,
         } => Ok(format!(
             "Explicit replay of `{branch}` at `{head}` onto `{base_branch}` at `{base_commit}` \
              exceeded the {:.1}s left of its explicit budget during the rebase, export and \
              ancestry heal. Nothing was installed and `{branch}` is unchanged. No automatic \
-             cooldown was recorded; the replay can be requested again at once, but the same \
-             stack will need the same time, so if it times out again report it on \
-             cairn://p/cairn/execution rather than repeating it.",
-            budget.as_secs_f64()
+             cooldown was recorded. cairn:~/rebase shows what this attempt measured.\n\n{}",
+            budget.as_secs_f64(),
+            super::replay_cost::timeout_guidance(blocker.as_deref())
+        )),
+        PreparationRefusal::RepeatTimeout(blocker) => Err(format!(
+            "Explicit replay of `{branch}` was not attempted, and `{branch}` is unchanged. {}\n\n{}",
+            super::replay_cost::blocked_guidance(&blocker),
+            super::replay_cost::merge_catch_up_exit()
         )),
         PreparationRefusal::Busy(BusyReason::RunBatch(batch)) => Err(format!(
             "{batch} may still commit to `{branch}`, so it is not rewritten under it and no \

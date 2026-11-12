@@ -208,6 +208,10 @@ pub(crate) struct PreparationRequest {
     /// refused as moved under the snapshot guard, before anything else answers:
     /// a request accepted at one tip never applies to commits made after it.
     pub(crate) expected_head: Option<String>,
+    /// The explicit request this preparation serves, for its cost evidence and
+    /// its timeout key: when its budget started, how large it is, and the
+    /// resolution semantics the carry alone does not show.
+    pub(crate) explicit_cost: Option<super::replay_cost::ExplicitCost>,
 }
 
 /// `bound`, clamped to what is left of the request's deadline.
@@ -243,6 +247,7 @@ impl PreparationRequest {
             write_replay: None,
             deadline: None,
             expected_head: None,
+            explicit_cost: None,
         }
     }
 
@@ -533,7 +538,14 @@ pub(crate) enum PreparationRefusal {
         base_branch: String,
         base_commit: String,
         budget: Duration,
+        /// The blocker this timeout recorded, when it was an explicit replay's
+        /// compute exhaustion: what an identical repeat now meets.
+        blocker: Option<Box<super::replay_cost::TimeoutBlocker>>,
     },
+    /// An explicit replay identical to one whose detached computation already
+    /// exhausted its compute budget (cairn/6456). Refused before computing;
+    /// nothing was recorded or changed. Boxed for the refusal's size.
+    RepeatTimeout(Box<super::replay_cost::TimeoutBlocker>),
     RetriesExhausted {
         attempts: u32,
         last: String,
@@ -574,6 +586,7 @@ impl PreparationRefusal {
             Self::BaseConflicted { .. } => "base conflicted",
             Self::HeldByParentConflict(_) => "held by parent conflict",
             Self::TimedOut { .. } => "timed out",
+            Self::RepeatTimeout(_) => "identical repeat of a timeout",
             Self::RetriesExhausted { .. } => "retries exhausted",
             Self::Moved { .. } => "moved",
             Self::AlreadyPublished => "already published",
@@ -681,11 +694,18 @@ impl std::fmt::Display for PreparationRefusal {
                 base_branch,
                 base_commit,
                 budget,
+                ..
             } => write!(
                 f,
                 "preparing {head} onto `{base_branch}` at {base_commit} exceeded its {}s budget; \
                  nothing was installed",
                 budget.as_secs()
+            ),
+            Self::RepeatTimeout(blocker) => write!(
+                f,
+                "an identical explicit replay of {} onto `{}` at {} already exhausted its \
+                 compute budget, so this one was refused before computing; nothing changed",
+                blocker.key.head, blocker.key.base_branch, blocker.key.base
             ),
             Self::RetriesExhausted { attempts, last } => write!(
                 f,
@@ -834,8 +854,12 @@ async fn prepare_branch_unobserved(
         owned: std::sync::Mutex::new(request.reservation.clone()),
         recorded: std::sync::atomic::AtomicBool::new(false),
         fenced_here: std::sync::Mutex::new(None),
+        started: std::time::Instant::now(),
+        cost: std::sync::Mutex::new(AttemptCost::default()),
     };
     let result = prepare_in(&context).await;
+    // Durable before the result is served to anyone.
+    context.record_cost_sample(&result).await;
     // Every guard is released by now; each fence was durable before its was.
     if context.recorded.load(std::sync::atomic::Ordering::SeqCst) {
         crate::orchestrator::branch_recovery::deliver_pending_notices(orch, &db).await;
@@ -1828,9 +1852,204 @@ struct Context<'a> {
     /// The fence this preparation recorded itself. Nothing more is spawned
     /// against the store through it: a writer it killed may still run.
     fenced_here: std::sync::Mutex<Option<String>>,
+    started: std::time::Instant,
+    /// What the latest attempt cost, for its replay cost sample.
+    cost: std::sync::Mutex<AttemptCost>,
+}
+
+/// What one attempt has cost so far. `coordinate` is set only once the
+/// attempt reaches detached computation; an attempt that never computes
+/// records no sample.
+#[derive(Default)]
+struct AttemptCost {
+    attempt_started: Option<std::time::Instant>,
+    coordinate: Option<crate::jj::AdvanceCoordinate>,
+    merge_mode: bool,
+    allowance: Option<Duration>,
+    probe: Option<crate::jj::ReplayCostProbe>,
+    phases: super::replay_cost::PhaseTimings,
+    compute_exhausted: bool,
+    failure_phase: Option<String>,
+}
+
+/// Where a preparation ran out of time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutPhase {
+    /// The already-current probe under the snapshot guard.
+    Probe,
+    /// Reading earlier installs' drop claims.
+    InheritedDrops,
+    /// Detached computation: the only exhaustion that may block a repeat.
+    Compute,
+    /// The candidate expired before its install, behind lock or reservation
+    /// waits.
+    InstallExpiry,
+}
+
+impl TimeoutPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Probe => "the already-current probe",
+            Self::InheritedDrops => "reading earlier installs' drop claims",
+            Self::Compute => "detached computation",
+            Self::InstallExpiry => "waiting to install",
+        }
+    }
 }
 
 impl Context<'_> {
+    fn with_cost(&self, update: impl FnOnce(&mut AttemptCost)) {
+        if let Ok(mut cost) = self.cost.lock() {
+            update(&mut cost);
+        }
+    }
+
+    /// The effective resolution of this preparation, as a timeout key holds it.
+    fn resolution(&self) -> String {
+        let (take, drop) = self
+            .request
+            .explicit_cost
+            .as_ref()
+            .map_or((false, false), |cost| {
+                (cost.take_committed_tip, cost.drop_incoming)
+            });
+        super::replay_cost::resolution_fingerprint(take, drop, self.request.carry.as_deref())
+    }
+
+    fn timeout_key(
+        &self,
+        coordinate: &crate::jj::AdvanceCoordinate,
+        merge_mode: bool,
+    ) -> super::replay_cost::TimeoutKey {
+        super::replay_cost::TimeoutKey {
+            project_id: self.request.project_id.clone(),
+            store_path: self.store.to_string_lossy().into_owned(),
+            branch: coordinate.branch.clone(),
+            head: coordinate.head.clone(),
+            base_branch: coordinate.base_branch.clone(),
+            base: coordinate.base.clone(),
+            mode: super::replay_cost::ReplayMode::of(merge_mode),
+            resolution: self.resolution(),
+            engine_version: crate::jj::REPLAY_ENGINE_VERSION,
+        }
+    }
+
+    /// The budget the whole request was given: the explicit request's, or this
+    /// preparation's own compute budget.
+    fn request_budget(&self) -> Duration {
+        self.request
+            .explicit_cost
+            .as_ref()
+            .map_or(self.request.compute_budget, |cost| cost.budget)
+    }
+
+    /// Record that an explicit replay's detached computation exhausted the
+    /// allowance it had at `coordinate`. The blocker refuses only an attempt
+    /// that could not compute materially longer, so time this attempt lost to
+    /// waits never refuses a later one with that time back.
+    async fn record_timeout_blocker(
+        &self,
+        coordinate: &crate::jj::AdvanceCoordinate,
+    ) -> Result<Option<super::replay_cost::TimeoutBlocker>, String> {
+        use super::replay_cost;
+        let (allowance, compute_ms, observed, merge_mode) = {
+            let cost = self.cost.lock().map_err(|error| error.to_string())?;
+            (
+                cost.allowance,
+                cost.phases.compute_ms,
+                cost.probe
+                    .as_ref()
+                    .map(crate::jj::ReplayCostProbe::observation)
+                    .unwrap_or_default(),
+                cost.merge_mode,
+            )
+        };
+        let Some(allowance) = allowance else {
+            return Ok(None);
+        };
+        let budget = self.request_budget();
+        let (host, _) = replay_cost::host_context();
+        let blocker = replay_cost::TimeoutBlocker {
+            key: self.timeout_key(coordinate, merge_mode),
+            phase: observed.phase,
+            compute_ms: compute_ms.unwrap_or_default(),
+            allowance_ms: replay_cost::millis(allowance),
+            budget_ms: replay_cost::millis(budget),
+            observed,
+            build: replay_cost::build_identity().await,
+            host,
+            recorded_at: chrono::Utc::now().timestamp(),
+        };
+        replay_cost::record_blocker(self.db, &blocker).await?;
+        Ok(Some(blocker))
+    }
+
+    /// Persist what the last attempt that reached detached computation cost.
+    /// A failure is logged: a sample is evidence, never a gate.
+    async fn record_cost_sample(&self, result: &Result<PreparedBranch, PreparationRefusal>) {
+        use super::replay_cost::{self, BudgetClass, CostOutcome, ReplayCostEvidence};
+        let Ok(mut cost) = self.cost.lock().map(|mut cost| std::mem::take(&mut *cost)) else {
+            return;
+        };
+        let Some(coordinate) = cost.coordinate.take() else {
+            return;
+        };
+        let request = self.request;
+        let started = request
+            .explicit_cost
+            .as_ref()
+            .map_or(self.started, |explicit| explicit.started);
+        cost.phases.proof_ms = request.explicit_cost.as_ref().map(|explicit| {
+            replay_cost::millis(self.started.saturating_duration_since(explicit.started))
+        });
+        cost.phases.total_ms = replay_cost::millis(started.elapsed());
+        let outcome = match result {
+            Ok(prepared) if prepared.advanced => CostOutcome::Installed,
+            Ok(_) => CostOutcome::AlreadyCurrent,
+            Err(PreparationRefusal::Conflict(_)) => CostOutcome::Conflicted,
+            Err(PreparationRefusal::TimedOut { .. }) if cost.compute_exhausted => {
+                CostOutcome::ComputeExhausted
+            }
+            Err(PreparationRefusal::TimedOut { .. }) => CostOutcome::TimedOut,
+            Err(other) => CostOutcome::Refused(other.kind().to_string()),
+        };
+        let (host, load1) = replay_cost::host_context();
+        let evidence = ReplayCostEvidence {
+            version: replay_cost::EVIDENCE_VERSION,
+            engine_version: crate::jj::REPLAY_ENGINE_VERSION,
+            build: replay_cost::build_identity().await,
+            recorded_at: chrono::Utc::now().timestamp(),
+            host,
+            load1,
+            branch: coordinate.branch.clone(),
+            head: coordinate.head.clone(),
+            base_branch: coordinate.base_branch.clone(),
+            base: coordinate.base.clone(),
+            mode: replay_cost::ReplayMode::of(cost.merge_mode),
+            budget_class: if request.explicit_replay {
+                BudgetClass::Explicit
+            } else {
+                BudgetClass::Background
+            },
+            resolution: self.resolution(),
+            observed: cost
+                .probe
+                .as_ref()
+                .map(crate::jj::ReplayCostProbe::observation)
+                .unwrap_or_default(),
+            phases: cost.phases,
+            budget_ms: replay_cost::millis(self.request_budget()),
+            compute_allowance_ms: cost.allowance.map(replay_cost::millis),
+            outcome,
+            failure_phase: cost.failure_phase,
+        };
+        if let Err(error) =
+            replay_cost::record_sample(self.db, &request.project_id, &self.store, &evidence).await
+        {
+            log::warn!("replay cost of `{}`: {error}", request.branch);
+        }
+    }
+
     fn fence_action(&self) -> String {
         if self.request.explicit_replay {
             format!("Replaying `{}`", self.request.branch)
@@ -1978,6 +2197,12 @@ impl Context<'_> {
     ) -> Result<Attempt, PreparationRefusal> {
         let request = self.request;
         let branch = request.branch.as_str();
+        self.with_cost(|cost| {
+            *cost = AttemptCost {
+                attempt_started: Some(std::time::Instant::now()),
+                ..AttemptCost::default()
+            }
+        });
 
         // Phase 1: snapshot under the writer lock.
         let guard = self.lock("snapshot").await?;
@@ -2055,7 +2280,9 @@ impl Context<'_> {
             // and coordinate-keyed cooldown as a timed-out replay.
             Err(crate::jj::AdvanceComputeError::TimedOut) => {
                 drop(guard);
-                return self.timed_out(&relationship, &coordinate).await;
+                return self
+                    .timed_out(&relationship, &coordinate, TimeoutPhase::Probe)
+                    .await;
             }
             Err(crate::jj::AdvanceComputeError::Repository(error)) => {
                 return Err(PreparationRefusal::Repository(error));
@@ -2294,6 +2521,22 @@ impl Context<'_> {
                 });
             }
         }
+        // An owner's explicit replay identical to one whose computation
+        // already exhausted its budget would do the same work under the same
+        // budget: refused here, before the dependent traversal and every
+        // expensive step after it. Recovery and pending exports were handled
+        // above, so they still take precedence.
+        if request.explicit_replay {
+            let key = self.timeout_key(&coordinate, merge_mode);
+            let allowance = within_deadline(request, request.compute_budget);
+            if let Some(blocker) = super::replay_cost::matching_blocker(self.db, &key, allowance)
+                .await
+                .map_err(PreparationRefusal::Repository)?
+            {
+                drop(guard);
+                return Err(PreparationRefusal::RepeatTimeout(Box::new(blocker)));
+            }
+        }
         // Only now is a replay certain: the fast path and the bound-session
         // shortcut have both passed, so an up-to-date branch never pays for,
         // or is refused by, the dependent traversal.
@@ -2303,7 +2546,11 @@ impl Context<'_> {
         // every claim until the branch publishes.
         let (guard, snapshot, inherited) = match self.inherited_drops(guard, snapshot).await? {
             Inherited::Claims(guard, snapshot, claims) => (guard, *snapshot, claims),
-            Inherited::TimedOut => return self.timed_out(&relationship, &coordinate).await,
+            Inherited::TimedOut => {
+                return self
+                    .timed_out(&relationship, &coordinate, TimeoutPhase::InheritedDrops)
+                    .await
+            }
         };
         drop(guard);
 
@@ -2312,7 +2559,31 @@ impl Context<'_> {
         let jj = self.jj.clone();
         let carry = request.carry.clone();
         let budget = within_deadline(request, request.compute_budget);
+        let probe = crate::jj::ReplayCostProbe::default();
+        let snapshot = snapshot.with_cost_probe(probe.clone());
+        self.with_cost(|cost| {
+            cost.phases.capture_ms = cost
+                .attempt_started
+                .map(|started| super::replay_cost::millis(started.elapsed()));
+            cost.coordinate = Some(coordinate.clone());
+            cost.merge_mode = merge_mode;
+            cost.allowance = Some(budget);
+            cost.probe = Some(probe);
+        });
+        // Fault injection: the computation itself gets no time, while the
+        // allowance recorded above stays the real one.
+        #[cfg(test)]
+        let budget = if tests::compute_starved(&self.store) {
+            Duration::ZERO
+        } else {
+            budget
+        };
+        let compute_started = std::time::Instant::now();
+        #[cfg(test)]
+        let hook_store = self.store.clone();
         let computed = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            tests::during_compute(&hook_store);
             if merge_mode {
                 crate::jj::compute_branch_merge_advance(&jj, snapshot, carry.as_deref(), budget)
             } else {
@@ -2327,6 +2598,9 @@ impl Context<'_> {
         })
         .await
         .map_err(|error| PreparationRefusal::Repository(format!("preparation worker: {error}")))?;
+        self.with_cost(|cost| {
+            cost.phases.compute_ms = Some(super::replay_cost::millis(compute_started.elapsed()));
+        });
 
         let candidate = match computed {
             Ok(candidate) => candidate,
@@ -2370,7 +2644,10 @@ impl Context<'_> {
                 return Err(PreparationRefusal::Repository(error));
             }
             Err(crate::jj::AdvanceComputeError::TimedOut) => {
-                let timed_out = self.timed_out(&relationship, &coordinate).await;
+                self.with_cost(|cost| cost.compute_exhausted = true);
+                let timed_out = self
+                    .timed_out(&relationship, &coordinate, TimeoutPhase::Compute)
+                    .await;
                 return self
                     .with_catch_up_pending(
                         merge_mode,
@@ -2472,6 +2749,7 @@ impl Context<'_> {
 
         // Phase 3: install under the writer lock, holding the branch's
         // reservation (taken before the lock).
+        let install_started = std::time::Instant::now();
         self.ensure_reserved().await?;
         let guard = self.lock("install").await?;
         self.refuse_published(&guard).await?;
@@ -2519,7 +2797,9 @@ impl Context<'_> {
             Err(crate::jj::AdvanceInstallError::Expired) => {
                 self.abandon_acceptance(&acceptance).await;
                 drop(guard);
-                return self.timed_out(&relationship, &coordinate).await;
+                return self
+                    .timed_out(&relationship, &coordinate, TimeoutPhase::InstallExpiry)
+                    .await;
             }
             // Whether the install committed is unknown: the row stays pending
             // and the next preparation settles it from the literal head.
@@ -2529,6 +2809,10 @@ impl Context<'_> {
         };
         // From here the install is accepted: nothing below may turn it into a
         // refusal. Bookkeeping that fails is reported on the coordinate.
+        self.with_cost(|cost| {
+            cost.phases.install_ms = Some(super::replay_cost::millis(install_started.elapsed()));
+        });
+        let export_started = std::time::Instant::now();
         let mut warnings = Vec::new();
         // A changed candidate always commits an operation; none means the
         // install did not happen as journaled, so the row stays pending and
@@ -2576,6 +2860,9 @@ impl Context<'_> {
             installed.export = Err(fenced);
         }
         let (guard, export) = self.settle_export(guard, &installed, &acceptance).await;
+        self.with_cost(|cost| {
+            cost.phases.export_ms = Some(super::replay_cost::millis(export_started.elapsed()));
+        });
         // The install stands; a fence left by its export is reported on it,
         // and every publication of the branch refuses until it is repaired.
         if let Some(fenced) = self.take_fenced_here() {
@@ -2592,6 +2879,12 @@ impl Context<'_> {
             &mut warnings,
             "release the timeout cooldown",
             release_reconcile_quarantine(self.db, &request.project_id, &self.store, branch).await,
+        );
+        keep(
+            &mut warnings,
+            "release the explicit replay timeout blockers",
+            super::replay_cost::clear_blockers(self.db, &request.project_id, &self.store, branch)
+                .await,
         );
         let jobs = match load_on_branch_jobs(self.db, &request.project_id, branch).await {
             Ok(jobs) => jobs,
@@ -2984,8 +3277,9 @@ impl Context<'_> {
     }
 
     async fn lock(&self, phase: &str) -> Result<JjStoreGuard, PreparationRefusal> {
-        // An explicit replay holds the lock longer by design; its hold line
-        // says so and names the budget it ran under.
+        // An explicit replay's locked phases (snapshot, install, export) run
+        // under its larger budget; its detached computation holds no lock. The
+        // hold line names the explicit replay and the budget it ran under.
         let purpose = if self.request.explicit_replay {
             format!(
                 "explicit replay, budget={}s",
@@ -3801,6 +4095,7 @@ impl Context<'_> {
         &self,
         relationship: &BaseRelationship,
         coordinate: &crate::jj::AdvanceCoordinate,
+        phase: TimeoutPhase,
     ) -> Result<Attempt, PreparationRefusal> {
         let guard = self.lock("record timeout").await?;
         if let Some(raced) = self.moved_since(relationship, coordinate).await? {
@@ -3808,15 +4103,50 @@ impl Context<'_> {
         }
         let budget = self.request.compute_budget;
         let error = format!(
-            "{}: detached preparation exceeded its {}s budget",
+            "{}: detached preparation exceeded its {}s budget in {}",
             crate::jj::RECONCILE_TIMEOUT,
-            budget.as_secs()
+            budget.as_secs(),
+            phase.label()
         );
+        self.with_cost(|cost| {
+            let reached = cost
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.observation().phase)
+                .filter(|_| phase == TimeoutPhase::Compute);
+            cost.failure_phase = Some(match reached {
+                Some(reached) => format!("{} ({})", phase.label(), reached.label()),
+                None => phase.label().to_string(),
+            });
+        });
+        let mut blocker = None;
         if self.request.explicit_replay {
-            log::warn!(
-                "explicit replay of `{}` timed out without a cooldown: {error}",
-                self.request.branch
-            );
+            // Only the explicit budget's own compute exhaustion blocks an
+            // identical explicit repeat; the automatic cooldown never does.
+            let blocked = if phase == TimeoutPhase::Compute {
+                self.record_timeout_blocker(coordinate).await
+            } else {
+                Ok(None)
+            };
+            match blocked {
+                Ok(Some(recorded)) => {
+                    log::warn!(
+                        "explicit replay of `{}` exhausted its compute budget; an identical \
+                         repeat is now refused: {error}",
+                        self.request.branch
+                    );
+                    blocker = Some(Box::new(recorded));
+                }
+                Ok(None) => log::warn!(
+                    "explicit replay of `{}` timed out without a cooldown or blocker: {error}",
+                    self.request.branch
+                ),
+                Err(record) => log::warn!(
+                    "explicit replay of `{}` timed out ({error}); its blocker could not be \
+                     recorded: {record}",
+                    self.request.branch
+                ),
+            }
         } else {
             record_reconcile_timeout(
                 self.db,
@@ -3836,6 +4166,7 @@ impl Context<'_> {
             base_branch: coordinate.base_branch.clone(),
             base_commit: coordinate.base.clone(),
             budget,
+            blocker,
         })
     }
 

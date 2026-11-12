@@ -92,10 +92,25 @@ pub struct BranchAdvanceSnapshot {
     coordinate: AdvanceCoordinate,
     local_base: bool,
     dependent_bookmarks: Option<HashSet<String>>,
+    cost: Option<ReplayCostProbe>,
     _lease: super::object_lease::ObjectLease,
 }
 
 impl BranchAdvanceSnapshot {
+    /// Report what computation from this snapshot costs into `probe`, phase by
+    /// phase as it runs, so a computation that runs out of budget still leaves
+    /// how far it got.
+    pub fn with_cost_probe(mut self, probe: ReplayCostProbe) -> Self {
+        self.cost = Some(probe);
+        self
+    }
+
+    fn note(&self, update: impl FnOnce(&mut ReplayCostObservation)) {
+        if let Some(cost) = &self.cost {
+            cost.record(update);
+        }
+    }
+
     /// Supply the complete transitive declared-dependent closure captured under
     /// the same store guard. These names are not independent ownership anchors.
     /// They still protect older versions during literal divergence inspection.
@@ -386,6 +401,7 @@ fn capture_replay_typed(
         coordinate,
         local_base,
         dependent_bookmarks: None,
+        cost: None,
         _lease: lease,
     })
 }
@@ -710,6 +726,97 @@ impl Deadline {
     }
 }
 
+/// The version of the native replay and ancestry-heal algorithm a cost
+/// measurement or a timeout describes.
+///
+/// Bump it whenever a change alters how much work the engine does for the same
+/// branch and base: measurements and timeout evidence recorded under one
+/// version are never compared with, or allowed to block, another. A rebuild
+/// that leaves the algorithm alone keeps the version.
+pub const REPLAY_ENGINE_VERSION: u32 = 1;
+
+/// The step a detached computation last entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputePhase {
+    /// Reading the captured branch, its replay boundaries and their mutability.
+    Scope,
+    /// Rewriting the branch's own commits onto the base.
+    Rebase,
+    /// Carrying a resolution and passing the declared-merge, parse and
+    /// conflict-scaffolding gates.
+    Validate,
+    /// Resolving the branch's conflict-flagged intermediate commits in place.
+    Heal,
+    /// Proving which source commits the candidate removed.
+    Claims,
+    /// Building a merge-mode catch-up commit.
+    Merge,
+    /// Computation finished.
+    Done,
+}
+
+impl ComputePhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scope => "scope",
+            Self::Rebase => "rebase",
+            Self::Validate => "validation",
+            Self::Heal => "ancestry heal",
+            Self::Claims => "drop claims",
+            Self::Merge => "catch-up merge",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// What one detached computation observed about its own cost. Every count is
+/// what this computation saw at its captured coordinate; `None` is a step it
+/// never reached, never zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplayCostObservation {
+    /// The step entered last: where a computation that ran out of budget was.
+    pub phase: Option<ComputePhase>,
+    /// The branch's own commits (head's ancestors not in the base's).
+    pub branch_commits: Option<u64>,
+    /// Of those, the commits already conflict-flagged in the captured history.
+    pub flagged_in_history: Option<u64>,
+    /// Commits conflict-flagged after the rebase onto this base, as the heal
+    /// found them: the history's own flags plus any this base introduced. A
+    /// different base may introduce more or fewer.
+    pub flagged_after_rebase: Option<u64>,
+    /// Commits whose conflicted paths the heal restored so far.
+    pub restored_commits: u64,
+    /// Distinct paths the heal restored in previously conflicted commits.
+    pub affected_paths: Option<u64>,
+    pub rebase_ms: Option<u64>,
+    pub heal_ms: Option<u64>,
+}
+
+/// A shared sink a computation reports its [`ReplayCostObservation`] into as
+/// it goes. The caller keeps a clone and reads it whatever the outcome.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayCostProbe(Arc<std::sync::Mutex<ReplayCostObservation>>);
+
+impl ReplayCostProbe {
+    pub fn observation(&self) -> ReplayCostObservation {
+        self.0
+            .lock()
+            .map(|observed| observed.clone())
+            .unwrap_or_default()
+    }
+
+    fn record(&self, update: impl FnOnce(&mut ReplayCostObservation)) {
+        if let Ok(mut observed) = self.0.lock() {
+            update(&mut observed);
+        }
+    }
+}
+
+fn elapsed_ms(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Text already proven by a destination's declared structural merge rules.
 /// This is distinct from a human conflict-session resolution carry. The host
 /// validates rule authority; VCS validates coordinates, affected paths and trees.
@@ -800,6 +907,7 @@ pub(super) fn compute_branch_merge_with_message(
     )
     .map_err(compute_error)??;
     deadline.check()?;
+    snapshot.note(|observed| observed.phase = Some(ComputePhase::Done));
     Ok(BranchAdvanceCandidate {
         snapshot,
         healing: super::AncestryHeal {
@@ -821,6 +929,7 @@ async fn compute_merge_candidate(
     deadline: &Deadline,
 ) -> Result<Commit, AdvanceComputeError> {
     deadline.check()?;
+    snapshot.note(|observed| observed.phase = Some(ComputePhase::Merge));
     let repo = &snapshot.repo;
     let ours = repo
         .store()
@@ -1785,9 +1894,25 @@ async fn heal_branch(
     pinned: &HashSet<CommitId>,
     dropped_ids: &mut HashSet<CommitId>,
     deadline: &Deadline,
+    cost: Option<&ReplayCostProbe>,
 ) -> Result<(Commit, super::AncestryHeal), AdvanceComputeError> {
+    let started = Instant::now();
+    let note = |update: &dyn Fn(&mut ReplayCostObservation)| {
+        if let Some(cost) = cost {
+            cost.record(|observed| {
+                update(observed);
+                observed.heal_ms = Some(elapsed_ms(started));
+            });
+        }
+    };
+    note(&|observed| observed.phase = Some(ComputePhase::Heal));
     let before = branch_commits(repo, head.id(), base.id(), deadline, None).await?;
-    if !before.iter().any(Commit::has_conflict) {
+    let flagged = before.iter().filter(|commit| commit.has_conflict()).count() as u64;
+    note(&|observed| {
+        observed.flagged_after_rebase = Some(flagged);
+        observed.affected_paths = Some(0);
+    });
+    if flagged == 0 {
         return Ok((
             head.clone(),
             super::AncestryHeal {
@@ -1799,7 +1924,10 @@ async fn heal_branch(
     let mut mapping: HashMap<CommitId, CommitId> = HashMap::new();
     let mut healed = Vec::new();
     let mut dropped = Vec::new();
+    let mut affected: HashSet<String> = HashSet::new();
     for old in &before {
+        let affected_now = affected.len() as u64;
+        note(&|observed| observed.affected_paths = Some(affected_now));
         deadline.check()?;
         if pinned.contains(old.id()) {
             if old.has_conflict() {
@@ -1830,7 +1958,9 @@ async fn heal_branch(
             let source = if old.has_conflict() { head } else { old };
             current = restore_paths(repo, &current, source, &paths, deadline).await?;
             super::reached_step("ancestry heal: commit resolved");
+            note(&|observed| observed.restored_commits += 1);
             if old.has_conflict() {
+                affected.extend(paths.iter().cloned());
                 resolved_paths = Some(paths);
             }
         }
@@ -1855,6 +1985,8 @@ async fn heal_branch(
             mapping.insert(old.id().clone(), current.id().clone());
         }
     }
+    let affected_now = affected.len() as u64;
+    note(&|observed| observed.affected_paths = Some(affected_now));
     let final_id = mapping.get(head.id()).unwrap_or(head.id()).clone();
     let final_head = repo.store().get_commit(&final_id).map_err(compute_error)?;
     if final_head.tree_ids() != head.tree_ids() {
@@ -1884,6 +2016,7 @@ async fn heal_branch(
     let mut annotated = HashMap::new();
     let mut first = true;
     for old in final_commits {
+        note(&|_| {});
         deadline.check()?;
         if pinned.contains(old.id()) {
             annotated.insert(old.id().clone(), old.id().clone());
@@ -1929,6 +2062,7 @@ async fn heal_branch(
         healed: healed_report,
         dropped,
     };
+    note(&|_| {});
     Ok((result, report))
 }
 
@@ -2250,6 +2384,7 @@ async fn compute_candidate(
     deadline: &Deadline,
 ) -> Result<(Commit, super::AncestryHeal, Vec<String>), AdvanceComputeError> {
     deadline.check()?;
+    snapshot.note(|observed| observed.phase = Some(ComputePhase::Scope));
     let repo = &snapshot.repo;
     let ours = repo
         .store()
@@ -2284,6 +2419,14 @@ async fn compute_candidate(
             .is_ancestor(ours.id(), base.id())
             .map_err(compute_error)?;
     let commits = branch_commits(repo.as_ref(), ours.id(), base.id(), deadline, None).await?;
+    let flagged_in_history = commits
+        .iter()
+        .filter(|commit| commit.has_conflict())
+        .count() as u64;
+    snapshot.note(|observed| {
+        observed.branch_commits = Some(commits.len() as u64);
+        observed.flagged_in_history = Some(flagged_in_history);
+    });
     let (pinned, mut mapping) =
         replay_boundaries(snapshot, &commits, &ours, &base, deadline).await?;
     let proven_base_versions: HashSet<_> = mapping.keys().cloned().collect();
@@ -2346,6 +2489,11 @@ async fn compute_candidate(
     let mut transaction = repo.start_transaction();
     let mut candidate = ours.clone();
     let mut replay_dropped = Vec::new();
+    let rebase_started = Instant::now();
+    snapshot.note(|observed| {
+        observed.phase = Some(ComputePhase::Rebase);
+        observed.rebase_ms = Some(0);
+    });
     if !repo
         .index()
         .is_ancestor(base.id(), ours.id())
@@ -2369,6 +2517,7 @@ async fn compute_candidate(
                     continue;
                 }
                 super::reached_step("advance: before hidden rewrite");
+                snapshot.note(|observed| observed.rebase_ms = Some(elapsed_ms(rebase_started)));
                 deadline.check()?;
                 let mut parents = Vec::new();
                 for parent in old.parent_ids() {
@@ -2449,6 +2598,10 @@ async fn compute_candidate(
             }
         }
     }
+    snapshot.note(|observed| {
+        observed.rebase_ms = Some(elapsed_ms(rebase_started));
+        observed.phase = Some(ComputePhase::Validate);
+    });
     if transaction
         .repo()
         .index()
@@ -2593,8 +2746,10 @@ async fn compute_candidate(
         &pinned,
         &mut dropped_ids,
         deadline,
+        snapshot.cost.as_ref(),
     )
     .await?;
+    snapshot.note(|observed| observed.phase = Some(ComputePhase::Claims));
     if !transaction
         .repo()
         .index()
@@ -2622,6 +2777,7 @@ async fn compute_candidate(
     let dropped_commit_ids = accepted_source_claims(actual_drops, &proven_base_versions, deadline)?;
     validate_removed_claims(transaction.repo(), &head, &dropped_commit_ids, deadline)?;
     deadline.check()?;
+    snapshot.note(|observed| observed.phase = Some(ComputePhase::Done));
     Ok((head, healing, dropped_commit_ids))
 }
 
@@ -4508,6 +4664,426 @@ mod tests {
             Err(AdvanceComputeError::TimedOut)
         ));
         assert_eq!(operation_id(&fixture.jj, &fixture.store).unwrap(), before);
+    }
+
+    /// A branch of `prefix` commits touching only their own files, then `hot`
+    /// commits that each rewrite one of `hot_paths` paths the base also changes
+    /// AND a file of their own, then `tail` commits touching only their own
+    /// files. Every commit keeps a change of its own, so a healed commit is never
+    /// emptied away and retained history is paid for in full.
+    ///
+    /// The store holds the branch rebased onto `prior` (the base that changed the
+    /// hot paths) with the original tip's resolution restored into the last hot
+    /// commit: `hot - 1` conflict-flagged intermediate commits under a clean tip,
+    /// which is how an owner's resolved branch is left. `main` is one unrelated
+    /// commit past `prior`, so a replay onto `main` is a divergent-base replay
+    /// that rebases every commit and then heals.
+    struct HealFixture {
+        _home: TempDir,
+        project: TempDir,
+        jj: JjEnv,
+        store: PathBuf,
+        total: usize,
+        flagged: usize,
+        hot_paths: usize,
+    }
+
+    impl HealFixture {
+        fn new(prefix: usize, hot: usize, tail: usize, hot_paths: usize) -> Option<Self> {
+            assert!(hot >= 2 && hot_paths >= 1);
+            let bin = jj_bin()?;
+            let home = TempDir::new().unwrap();
+            let project = TempDir::new().unwrap();
+            let root = project.path();
+            init_project(root);
+            let hot_path = |index: usize| format!("hot{}.txt", index % hot_paths);
+            for path in 0..hot_paths {
+                std::fs::write(root.join(hot_path(path)), "original\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-qm", "common ancestor"]);
+            git(root, &["checkout", "-qb", "feature"]);
+            let total = prefix + hot + tail;
+            for index in 0..total {
+                let hot_index = index.checked_sub(prefix).filter(|at| *at < hot);
+                if let Some(at) = hot_index {
+                    std::fs::write(root.join(hot_path(at)), format!("owner {at}\n")).unwrap();
+                }
+                std::fs::write(
+                    root.join(format!("own{index}.txt")),
+                    format!("own {index}\n"),
+                )
+                .unwrap();
+                git(root, &["add", "-A"]);
+                git(root, &["commit", "-qm", &format!("feature {index}")]);
+            }
+            git(root, &["checkout", "-q", "main"]);
+            for path in 0..hot_paths {
+                std::fs::write(root.join(hot_path(path)), "incoming\n").unwrap();
+            }
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-qm", "advanced base"]);
+            git(root, &["branch", "prior"]);
+            std::fs::write(root.join("later.txt"), "later\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-qm", "unrelated later base"]);
+            let jj = JjEnv::resolve(&bin, home.path());
+            let store = home.path().join("store");
+            ensure_project_store(&jj, &store, root).unwrap();
+            let fixture = Self {
+                _home: home,
+                project,
+                jj,
+                store,
+                total,
+                flagged: hot - 1,
+                hot_paths,
+            };
+            let original = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+            fixture.run(&["rebase", "-b", "feature", "-o", "prior"]);
+            // jj's revset parent operator, never Git's `~N`.
+            let last_hot = format!("feature{}", "-".repeat(tail));
+            let mut restore = vec![
+                "restore".to_string(),
+                "--from".to_string(),
+                original,
+                "--into".to_string(),
+                last_hot,
+                "--".to_string(),
+            ];
+            restore.extend((0..hot_paths).map(hot_path));
+            fixture.run(&restore.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(
+                conflicted_commits(&fixture.jj, &fixture.store, "prior..feature").len(),
+                fixture.flagged,
+                "the fixture leaves exactly the intermediate hot commits conflict-flagged"
+            );
+            Some(fixture)
+        }
+
+        fn run(&self, args: &[&str]) -> String {
+            let mut args = args.to_vec();
+            args.push("--ignore-working-copy");
+            self.jj.run(&self.store, &args, "heal fixture").unwrap()
+        }
+
+        fn commands_built() -> usize {
+            super::super::env::COMMANDS_BUILT.with(std::cell::Cell::get)
+        }
+
+        /// The heal alone on the already-rebased branch, as the engine runs it,
+        /// asserting the heal contract. (milliseconds, jj commands, observation)
+        fn direct_heal(&self) -> (f64, usize, ReplayCostObservation) {
+            let snapshot = capture_branch_advance(&self.store, "feature", "prior").unwrap();
+            let repo = snapshot.repo.clone();
+            let commit = |hex: &str| {
+                repo.store()
+                    .get_commit(&CommitId::try_from_hex(hex).unwrap())
+                    .unwrap()
+            };
+            let head = commit(&snapshot.coordinate.head);
+            let base = commit(&snapshot.coordinate.base);
+            let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+            let before = futures::executor::block_on(branch_commits(
+                repo.as_ref(),
+                head.id(),
+                base.id(),
+                &deadline,
+                None,
+            ))
+            .unwrap();
+            let clean_prefix: Vec<_> = before
+                .iter()
+                .take_while(|commit| !commit.has_conflict())
+                .map(|commit| commit.id().clone())
+                .collect();
+            let mut transaction = repo.start_transaction();
+            let probe = ReplayCostProbe::default();
+            let commands = Self::commands_built();
+            let started = Instant::now();
+            let (healed, report) = futures::executor::block_on(heal_branch(
+                transaction.repo_mut(),
+                &head,
+                &base,
+                &HashSet::new(),
+                &mut HashSet::new(),
+                &deadline,
+                Some(&probe),
+            ))
+            .unwrap();
+            let millis = started.elapsed().as_secs_f64() * 1000.0;
+            let commands = Self::commands_built() - commands;
+            assert_eq!(healed.tree_ids(), head.tree_ids(), "the tip tree is exact");
+            let after = futures::executor::block_on(branch_commits(
+                transaction.repo(),
+                healed.id(),
+                base.id(),
+                &deadline,
+                None,
+            ))
+            .unwrap();
+            assert!(after.iter().all(|commit| !commit.has_conflict()));
+            assert_eq!(
+                after.len(),
+                self.total,
+                "no commit with its own change is dropped"
+            );
+            assert_eq!(
+                after[..clean_prefix.len()]
+                    .iter()
+                    .map(|commit| commit.id().clone())
+                    .collect::<Vec<_>>(),
+                clean_prefix,
+                "the clean prefix keeps its commit ids"
+            );
+            // A commit whose conflict was only inherited is cured by rewriting
+            // it onto its healed parent and needs no restore of its own.
+            assert!(
+                (1..=self.flagged).contains(&report.healed.len()),
+                "{} healed of {} flagged",
+                report.healed.len(),
+                self.flagged
+            );
+            assert!(report.dropped.is_empty(), "{:?}", report.dropped);
+            (millis, commands, probe.observation())
+        }
+
+        /// A divergent-base replay onto `main` under `budget`, from a fresh
+        /// capture: (milliseconds, jj commands, observation, candidate).
+        fn divergent_compute(
+            &self,
+            budget: Duration,
+        ) -> (
+            f64,
+            usize,
+            ReplayCostObservation,
+            Result<BranchAdvanceCandidate, AdvanceComputeError>,
+        ) {
+            let probe = ReplayCostProbe::default();
+            let snapshot = capture_branch_advance(&self.store, "feature", "main")
+                .unwrap()
+                .with_cost_probe(probe.clone());
+            let commands = Self::commands_built();
+            let started = Instant::now();
+            let candidate = compute_branch_advance(&self.jj, snapshot, None, budget);
+            let millis = started.elapsed().as_secs_f64() * 1000.0;
+            (
+                millis,
+                Self::commands_built() - commands,
+                probe.observation(),
+                candidate,
+            )
+        }
+
+        /// Install and export `candidate`, asserting the published branch:
+        /// (milliseconds, jj commands).
+        fn install_and_verify(&self, candidate: BranchAdvanceCandidate) -> (f64, usize) {
+            let commands = Self::commands_built();
+            let started = Instant::now();
+            let local = install_branch_advance_local(&self.jj, candidate).unwrap();
+            let installed = export_installed_branch_advance(&self.jj, local);
+            let millis = started.elapsed().as_secs_f64() * 1000.0;
+            let commands = Self::commands_built() - commands;
+            installed.export.unwrap();
+            let root = self.project.path();
+            assert_eq!(
+                git_stdout(root, &["rev-parse", "feature"]),
+                installed.head,
+                "the exported Git ref is the installed head"
+            );
+            assert!(
+                conflicted_commits(&self.jj, &self.store, "main..feature").is_empty(),
+                "no conflict-flagged commit remains in the published ancestry"
+            );
+            assert_eq!(
+                self.run(&[
+                    "log",
+                    "-r",
+                    "main..feature & empty()",
+                    "--no-graph",
+                    "-T",
+                    "commit_id"
+                ])
+                .trim(),
+                "",
+                "no retained commit was emptied"
+            );
+            for index in 0..self.total {
+                let back = self.total - 1 - index;
+                assert_eq!(
+                    git_stdout(root, &["show", &format!("feature~{back}:own{index}.txt")]),
+                    format!("own {index}"),
+                    "commit {index} keeps its unrelated change"
+                );
+            }
+            assert_eq!(git_stdout(root, &["show", "feature:later.txt"]), "later");
+            (millis, commands)
+        }
+    }
+
+    /// The native heal on a realistic shape: conflict-flagged commits that each
+    /// keep a change of their own, a clean prefix, two hot paths, and a base
+    /// that diverged again since. It never spawns a jj command per commit, keeps
+    /// the exact tip tree and the clean prefix's ids, preserves every
+    /// intermediate commit's unrelated change, reports each healed commit, and
+    /// publishes a conflict-free ancestry whose Git ref is the installed head.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn native_heal_keeps_retained_history_exact_and_spawns_no_cli_per_commit() {
+        let Some(fixture) = HealFixture::new(2, 6, 2, 2) else {
+            return;
+        };
+        let (_, heal_commands, healed) = fixture.direct_heal();
+        assert_eq!(heal_commands, 0, "the heal is native: no jj command at all");
+        assert_eq!(healed.flagged_after_rebase, Some(5));
+        assert_eq!(healed.affected_paths, Some(2));
+        assert!((1..=5).contains(&healed.restored_commits), "{healed:?}");
+        assert_eq!(healed.phase, Some(ComputePhase::Heal));
+
+        let (_, compute_commands, observed, candidate) =
+            fixture.divergent_compute(Duration::from_secs(60));
+        let candidate = candidate.unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(
+            compute_commands <= 2,
+            "computation spawns a constant handful of jj commands, not one per commit: \
+             {compute_commands}"
+        );
+        assert_eq!(observed.phase, Some(ComputePhase::Done));
+        assert_eq!(observed.branch_commits, Some(10));
+        assert_eq!(observed.flagged_in_history, Some(5));
+        assert_eq!(observed.flagged_after_rebase, Some(5));
+        assert_eq!(observed.affected_paths, Some(2));
+        assert!(observed.rebase_ms.is_some() && observed.heal_ms.is_some());
+        assert!((1..=5).contains(&candidate.healing.healed.len()));
+        assert!(candidate.healing.dropped.is_empty());
+        fixture.install_and_verify(candidate);
+    }
+
+    /// A computation that runs out of budget still reports where it was.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn an_exhausted_computation_reports_the_phase_it_reached() {
+        let Some(fixture) = HealFixture::new(0, 3, 0, 1) else {
+            return;
+        };
+        let (_, _, observed, outcome) = fixture.divergent_compute(Duration::ZERO);
+        assert!(matches!(outcome, Err(AdvanceComputeError::TimedOut)));
+        assert_eq!(
+            observed.branch_commits, None,
+            "nothing past entry was reached"
+        );
+        let live = bookmark_commit(&fixture.jj, &fixture.store, "feature").unwrap();
+        assert_eq!(
+            conflicted_commits(&fixture.jj, &fixture.store, "prior..feature").len(),
+            2,
+            "the live branch at {live} is untouched"
+        );
+    }
+
+    /// Opt-in measurement of the native engine (cairn/6456). Set
+    /// `CAIRN_REPLAY_BENCH=1` (and optionally `CAIRN_REPLAY_BENCH_SAMPLES`) and
+    /// run `bun run test:rust -p cairn-vcs --lib benchmark_current_native_heal
+    /// -- --nocapture`. Each sample builds a fresh fixture, so samples are
+    /// independent; within a sample the order is heal alone, the divergent
+    /// replay under a real 10 s deadline, then under a real 60 s deadline with
+    /// install and verified export (the later phases run warm). Prints one
+    /// `BENCH` line per phase; it fits nothing and asserts no threshold.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn benchmark_current_native_heal() {
+        if std::env::var_os("CAIRN_REPLAY_BENCH").is_none() {
+            return;
+        }
+        let samples: usize = std::env::var("CAIRN_REPLAY_BENCH_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+        let host = std::process::Command::new("hostname")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        let load = || {
+            let mut averages = [0f64; 3];
+            // SAFETY: getloadavg writes at most the three doubles it is given.
+            let read = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
+            if read == 3 {
+                format!("{:.2}", averages[0])
+            } else {
+                "unavailable".to_string()
+            }
+        };
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        println!(
+            "BENCH env host={host} profile={profile} engine={REPLAY_ENGINE_VERSION} samples={samples}"
+        );
+        // (prefix, hot, tail, hot paths): hot - 1 commits end conflict-flagged.
+        let shapes = [
+            (0, 17, 0, 1),
+            (0, 51, 0, 1),
+            (0, 101, 0, 1),
+            (0, 15, 235, 1),
+            (0, 51, 0, 4),
+        ];
+        for (prefix, hot, tail, paths) in shapes {
+            for sample in 1..=samples {
+                let built = Instant::now();
+                let Some(fixture) = HealFixture::new(prefix, hot, tail, paths) else {
+                    return;
+                };
+                let shape = format!(
+                    "total={} flagged={} hot_paths={} sample={sample}",
+                    fixture.total, fixture.flagged, fixture.hot_paths
+                );
+                println!(
+                    "BENCH fixture {shape} build_ms={:.0} load1={}",
+                    built.elapsed().as_secs_f64() * 1000.0,
+                    load()
+                );
+                let (ms, jj, observed) = fixture.direct_heal();
+                println!(
+                    "BENCH heal {shape} order=1 ms={ms:.1} jj={jj} restored={} affected_paths={:?} \
+                     load1={} tree_equal=true ancestry_clean=true",
+                    observed.restored_commits,
+                    observed.affected_paths,
+                    load()
+                );
+                for (order, budget) in [(2, 10), (3, 60)] {
+                    let (ms, jj, observed, outcome) =
+                        fixture.divergent_compute(Duration::from_secs(budget));
+                    let verdict = match &outcome {
+                        Ok(_) => "completed".to_string(),
+                        Err(AdvanceComputeError::TimedOut) => "timed_out".to_string(),
+                        Err(other) => format!("refused:{other}"),
+                    };
+                    let mut line = format!(
+                        "BENCH divergent {shape} order={order} budget_s={budget} outcome={verdict} \
+                         compute_ms={ms:.1} jj={jj} phase={:?} rebase_ms={:?} heal_ms={:?} \
+                         flagged_after_rebase={:?} restored={} load1={}",
+                        observed.phase.map(ComputePhase::label),
+                        observed.rebase_ms,
+                        observed.heal_ms,
+                        observed.flagged_after_rebase,
+                        observed.restored_commits,
+                        load()
+                    );
+                    if let (Ok(candidate), 60) = (outcome, budget) {
+                        let (install_ms, install_jj) = fixture.install_and_verify(candidate);
+                        line.push_str(&format!(
+                            " install_export_ms={install_ms:.1} install_export_jj={install_jj} \
+                             total_ms={:.1} exported=true ancestry_clean=true",
+                            ms + install_ms
+                        ));
+                    }
+                    // One write per line: nextest's progress notices must not
+                    // split a sample.
+                    println!("{line}");
+                }
+            }
+        }
     }
 
     /// Construct a hidden object without publishing a transaction. Production
