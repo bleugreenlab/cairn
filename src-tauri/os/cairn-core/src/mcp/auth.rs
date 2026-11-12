@@ -601,6 +601,13 @@ mod tests {
             // only in the request header; the module forwards its arguments and
             // returns only the runner's payload.
             "src-tauri/src/commands/tenets.rs",
+            // The headline read cursor: a main-webview-only proxy shaped like
+            // the tenet one. It forwards `mark_headlines_seen` arguments
+            // unchanged through `runner_client::invoke_as_operator`, so the
+            // credential rides only in the loopback request header and the
+            // module returns only the runner's payload. Its test names the
+            // header only to assert it is sent.
+            "src-tauri/src/commands/headlines.rs",
             // Phone-approval enrollment and the human base-merge policy: both
             // commands route through `operator_target` before anything else,
             // so only the main webview reaches the local runner or a

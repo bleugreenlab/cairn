@@ -302,6 +302,7 @@ impl CairnResource {
                 in_project(project, format!("{slug} camp posts"))
             }
             Self::ProjectHome { project } => in_project(project, "home"),
+            Self::ProjectHeadlines { project } => in_project(project, "headlines"),
             Self::ProjectPages { project } => in_project(project, "pages"),
             Self::ProjectCodemap { project } => in_project(project, "codemap"),
             Self::ProjectMap { project } => in_project(project, "map"),

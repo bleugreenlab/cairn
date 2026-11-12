@@ -171,6 +171,11 @@ pub struct OperatorRequest {
     pub attempts: Vec<RequestAttempt>,
     pub available: bool,
     pub unavailable_reason: Option<String>,
+    /// The newest live headline the asking thread's project holds about this
+    /// request, its origin, or the origin's issue. Supplied by the runner when
+    /// it serves the request; absent when no thread wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headline: Option<crate::headlines::HeadlineAbout>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]

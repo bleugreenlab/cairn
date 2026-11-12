@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use crate::orchestrator::Orchestrator;
 use crate::security::Sanitizer;
 use crate::storage::RowExt;
+use crate::threads::headlines;
 use registry::{ActorFacts, ConsumerReport, ReleaseVersion, RequestConsumer};
 
 fn now() -> i64 {
@@ -96,7 +97,74 @@ pub async fn list(
     for request in requests {
         out.push(decorate(orch, request).await);
     }
+    attach_headlines(orch, &mut out).await;
     Ok(out)
+}
+
+/// The thread or issue that asked: the first requester still asking, else the first.
+fn asking_origin(request: &OperatorRequest) -> Option<&str> {
+    request
+        .requesters
+        .iter()
+        .find(|asker| asker.active)
+        .or(request.requesters.first())
+        .map(|asker| asker.origin_uri.as_str())
+}
+
+/// Give each request the line a thread in its asker's project wrote about it,
+/// its origin, or the origin's issue (`threads::headlines::about`, the rule
+/// notification entries use). Each project's headlines are read once per
+/// call; an unreadable project costs the line, never the request.
+async fn attach_headlines(orch: &Orchestrator, requests: &mut [OperatorRequest]) {
+    use std::collections::HashMap;
+    let mut indexes: HashMap<String, Option<(String, HashMap<String, headlines::HeadlineAbout>)>> =
+        HashMap::new();
+    for request in requests.iter_mut() {
+        let Some(origin) = asking_origin(request).map(str::to_string) else {
+            continue;
+        };
+        let Some(key) = parse_uri(&origin).and_then(|r| r.project().map(str::to_ascii_lowercase))
+        else {
+            continue;
+        };
+        if !indexes.contains_key(&key) {
+            let index = headline_index(orch, &key).await;
+            indexes.insert(key.clone(), index);
+        }
+        if let Some(Some((project_key, index))) = indexes.get(&key) {
+            request.headline = headlines::about(index, project_key, &[&request.uri, &origin]);
+        }
+    }
+}
+
+/// One project's live headlines by `ref`, read from the database that owns it.
+async fn headline_index(
+    orch: &Orchestrator,
+    key: &str,
+) -> Option<(
+    String,
+    std::collections::HashMap<String, headlines::HeadlineAbout>,
+)> {
+    for db in orch.db.all_dbs().await {
+        let found = db
+            .query_all(
+                "SELECT id, key FROM projects WHERE key = ?1 COLLATE NOCASE",
+                cairn_db::turso::params![key.to_string()],
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await;
+        let Ok(Some((id, project_key))) = found.map(|rows| rows.into_iter().next()) else {
+            continue;
+        };
+        return match headlines::by_ref(&db, &id, &project_key).await {
+            Ok(index) => Some((project_key, index)),
+            Err(error) => {
+                log::warn!("request headlines for {project_key} unavailable: {error}");
+                None
+            }
+        };
+    }
+    None
 }
 
 pub async fn get(orch: &Orchestrator, id: &str) -> Result<Option<OperatorRequest>, String> {
@@ -104,7 +172,12 @@ pub async fn get(orch: &Orchestrator, id: &str) -> Result<Option<OperatorRequest
         .await
         .map_err(|error| error.to_string())?
     {
-        Some(request) => Ok(Some(decorate(orch, request).await)),
+        Some(request) => {
+            let mut one = [decorate(orch, request).await];
+            attach_headlines(orch, &mut one).await;
+            let [request] = one;
+            Ok(Some(request))
+        }
         None => Ok(None),
     }
 }

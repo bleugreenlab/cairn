@@ -69,6 +69,7 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
         | K::ProjectPages
         | K::NodePageLog
         | K::ProjectHome
+        | K::ProjectHeadlines
         | K::ProjectMessages
         | K::ChannelsAmbientFeedback
         | K::IssueMessages

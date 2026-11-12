@@ -2858,6 +2858,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::Posts => "cairn://posts",
         K::Post => "cairn://posts/1",
         K::ProjectTenets => "cairn://p/cairn/tenets",
+        K::ProjectHeadlines => "cairn://p/cairn/headlines",
         K::ProjectTenet => "cairn://p/cairn/tenets/1",
         K::ProjectCamps => "cairn://p/cairn/camps",
         K::ProjectCamp => "cairn://p/cairn/camps/rebuild",
@@ -3850,6 +3851,33 @@ fn tenet_item(target: &str, mode: ChangeMode, payload: serde_json::Value) -> Cha
         target: target.to_string(),
         mode,
         payload: Some(payload),
+    }
+}
+
+/// Moving the operator's headline cursor is his: no caller of the resource
+/// surface does it, not a thread's run and not a request with no run identity.
+#[tokio::test]
+async fn the_headlines_seen_patch_is_refused_to_every_resource_caller() {
+    let orch = seeded_orch().await;
+    let (issue_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &issue_id).await;
+    let (_, _, run) = seed_thread_session_run(&orch, &project_id, "design").await;
+    let seen = tenet_item(
+        "cairn://p/cairn/headlines",
+        ChangeMode::Patch,
+        serde_json::json!({"seen": {"thread": "design", "through": 3}}),
+    );
+    for refusal in [
+        apply_as_run(&orch, &seen, &run).await.unwrap_err(),
+        apply(&orch, &seen).await.unwrap_err(),
+    ] {
+        assert!(
+            refusal
+                .error
+                .contains(crate::threads::headlines::OPERATOR_ONLY_REFUSAL),
+            "{}",
+            refusal.error
+        );
     }
 }
 

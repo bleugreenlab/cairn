@@ -284,9 +284,12 @@ impl CairnResource {
             Self::ProjectThreads { project } => Surface::ProjectThreads {
                 project: project.clone(),
             },
-            Self::ProjectHome { project } => Surface::ProjectHome {
-                project: project.clone(),
-            },
+            // Home is where the operator reads the merged headlines.
+            Self::ProjectHome { project } | Self::ProjectHeadlines { project } => {
+                Surface::ProjectHome {
+                    project: project.clone(),
+                }
+            }
             // One tenet opens the tab, which renders every tenet in full.
             Self::ProjectTenets { project } | Self::ProjectTenet { project, .. } => {
                 Surface::ProjectTenets {

@@ -211,6 +211,11 @@ pub enum CairnResource {
     ProjectHome {
         project: String,
     },
+    /// The live headlines of every active thread in a project, each marked
+    /// new or seen against the operator's read cursor on its thread.
+    ProjectHeadlines {
+        project: String,
+    },
     /// Immutable check observations addressed by a revision coordinate.
     ProjectCheckResults {
         project: String,
@@ -1231,6 +1236,7 @@ impl CairnResource {
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,
             Self::ProjectQueue { .. } => ResourceKind::ProjectQueue,
             Self::ProjectHome { .. } => ResourceKind::ProjectHome,
+            Self::ProjectHeadlines { .. } => ResourceKind::ProjectHeadlines,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
             Self::ProjectVcsDiff { .. } => ResourceKind::ProjectVcsDiff,
             Self::ProjectVcsAncestry { .. } => ResourceKind::ProjectVcsAncestry,

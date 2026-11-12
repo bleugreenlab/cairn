@@ -28,8 +28,9 @@ const PLACE_JOINS: &str = "LEFT JOIN jobs parent ON parent.id = j.parent_job_id
     LEFT JOIN issues i ON i.id = j.issue_id
     LEFT JOIN threads th ON th.id = COALESCE(j.thread_id, parent.thread_id)";
 
+/// Read from [`PLACE_COLUMNS`] after its leading `j.id`, which a caller reads
+/// on its own to tell whether the job row exists at all.
 struct JobPlace {
-    job_id: String,
     node_name: Option<String>,
     segment: Option<String>,
     parent_segment: Option<String>,
@@ -43,7 +44,6 @@ struct JobPlace {
 impl JobPlace {
     fn read(row: &Row, at: usize) -> Result<Self, DbError> {
         Ok(Self {
-            job_id: row.text(at)?,
             node_name: row.opt_text(at + 1)?,
             segment: row.opt_text(at + 2)?,
             parent_segment: row.opt_text(at + 3)?,
@@ -146,6 +146,7 @@ fn truncate(text: &str) -> String {
     cut
 }
 
+#[allow(clippy::too_many_arguments)]
 fn entry(
     project: &ProjectRef,
     key: String,
@@ -175,6 +176,40 @@ fn entry(
         action: if open { action } else { None },
         deferred_until: None,
         stale: false,
+        headline: None,
+    }
+}
+
+/// Give each entry the line a thread wrote about its cause: the newest live
+/// headline whose `ref` is the entry's source, or failing that the issue the
+/// source sits under (a PR's artifact, a node's review).
+///
+/// Any thread in the project counts, not only the one the entry's job lives
+/// in: a builder's PR has no thread of its own, and the thread that writes
+/// about it is the one coordinating the work. The `ref` is what binds them.
+/// An unreadable headline store costs the line, never the entry.
+pub(super) async fn attach_headlines(
+    db: &LocalDb,
+    project: &ProjectRef,
+    entries: &mut [OperatorNotification],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let about = match crate::threads::headlines::by_ref(db, &project.id, &project.key).await {
+        Ok(about) if !about.is_empty() => about,
+        Ok(_) => return,
+        Err(error) => {
+            log::warn!(
+                "notification headlines for {} unavailable: {error}",
+                project.key
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        entry.headline =
+            crate::threads::headlines::about(&about, &project.key, &[&entry.source_uri]);
     }
 }
 

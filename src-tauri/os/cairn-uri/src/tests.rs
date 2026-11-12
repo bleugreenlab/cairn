@@ -1976,6 +1976,24 @@ fn camp_uris_parse_build_route_by_project_and_reserve_their_segment() {
 }
 
 #[test]
+fn the_headlines_uri_parses_builds_and_reserves_its_segment() {
+    let headlines = parse_uri("cairn://p/CAIRN/headlines").unwrap();
+    assert_eq!(
+        headlines,
+        CairnResource::ProjectHeadlines {
+            project: "cairn".into()
+        }
+    );
+    assert_eq!(headlines.to_uri(), "cairn://p/cairn/headlines");
+    assert_eq!(headlines.kind(), ResourceKind::ProjectHeadlines);
+    assert_eq!(headlines.project_key(), Some("cairn"));
+    assert!(
+        crate::thread_name::validate_thread_name("headlines").is_err(),
+        "a thread named `headlines` would shadow the project's merged headlines"
+    );
+}
+
+#[test]
 fn page_uris_parse_build_and_reserve_their_segment() {
     let index = parse_uri("cairn://p/CAIRN/pages").unwrap();
     assert_eq!(

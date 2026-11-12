@@ -2714,6 +2714,9 @@ async fn render_resource_body(
         CairnResource::ProjectHome { project } => {
             super::home::read_project_home(db, &project, &params).await
         }
+        CairnResource::ProjectHeadlines { project } => {
+            super::headlines::read_project_headlines(db, &project, &params).await
+        }
         CairnResource::ProjectThreads { project } => {
             if let Some(error) = reject_query_params("project threads", &params) {
                 error

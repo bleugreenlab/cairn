@@ -265,6 +265,25 @@ pub async fn apply_write(
             }),
         );
     }
+    // The merged headlines read every thread's `headlines` table, so a write
+    // that could have touched it (or SQL that could not be attributed) moves
+    // the project's merged view too.
+    if changes.iter().any(|change| {
+        change
+            .table
+            .as_deref()
+            .is_none_or(|table| table == "headlines")
+    }) {
+        let _ = emitter.emit(
+            "db-change",
+            serde_json::json!({
+                "table": super::headlines::HEADLINES_PROJECTION,
+                "action": "update",
+                "projectId": scope.project_id,
+                "threadId": scope.thread_id,
+            }),
+        );
+    }
     let row_uris: Vec<String> = rows.iter().flatten().cloned().collect();
     crate::orchestrator::wakes::conditions::notify_thread_db_written(&scope.thread_id, &row_uris);
     Ok(WriteOutcome {
@@ -526,10 +545,13 @@ impl ClaimedName {
     }
 }
 
-/// Before the starter-record migration installs `intent` and `journal`, move a
-/// thread's own table of either name to `<name>_own` (`_own_2`, … when that is
-/// taken). Rows, indexes and triggers go with it. A store that has applied the
-/// migration is never touched again, so a rename happens at most once.
+/// Before the migration that introduces an app-known table runs, move a
+/// thread's own table of that name to `<name>_own` (`_own_2`, … when that is
+/// taken). Rows, indexes and triggers go with it. Each name is keyed to its own
+/// migration: once that migration is applied the name is Cairn's and is never
+/// touched again, so a rename happens at most once per name, and a name a
+/// later migration introduces is still claimed on a store that ran the earlier
+/// ones.
 async fn claim_app_table_names(db: &LocalDb) -> crate::storage::DbResult<Vec<ClaimedName>> {
     async fn named(db: &LocalDb, name: &str, table_only: bool) -> crate::storage::DbResult<bool> {
         let sql = if table_only {
@@ -542,20 +564,20 @@ async fn claim_app_table_names(db: &LocalDb) -> crate::storage::DbResult<Vec<Cla
             .await?
             .is_some())
     }
-    if named(db, "cairn_schema_migrations", true).await?
-        && db
-            .query_opt_i64(
-                "SELECT 1 FROM cairn_schema_migrations WHERE version = ?1",
-                cairn_db::turso::params![super::db_schema::THREAD_RECORD],
-            )
-            .await?
-            .is_some()
-    {
-        return Ok(Vec::new());
-    }
+    let applied: HashSet<String> = if named(db, "cairn_schema_migrations", true).await? {
+        db.query_all("SELECT version FROM cairn_schema_migrations", (), |row| {
+            row.text(0)
+        })
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        HashSet::new()
+    };
     let mut claimed = Vec::new();
-    for &name in super::db_schema::APP_TABLES {
-        if !named(db, name, true).await? {
+    for table in super::db_schema::APP_TABLES {
+        let name = table.name;
+        if applied.contains(table.since) || !named(db, name, true).await? {
             continue;
         }
         let mut moved_to = format!("{name}_own");
@@ -881,9 +903,7 @@ fn validate_write_statement(statement: &str) -> Result<(), String> {
         let known = || {
             ddl_reshaped_names(statement).into_iter().find(|name| {
                 name.eq_ignore_ascii_case("cairn_schema_migrations")
-                    || super::db_schema::APP_TABLES
-                        .iter()
-                        .any(|table| name.eq_ignore_ascii_case(table))
+                    || super::db_schema::is_app_table(name)
             })
         };
         if let Some(identifier) = prefixed.or_else(known) {
@@ -1360,12 +1380,163 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_store_past_the_starter_record_still_has_its_own_headlines_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headlines-collide.db");
+        let staged = stage_store_for_test(&path, crate::threads::db_schema::THREAD_RECORD).await;
+        staged
+            .execute_batch(
+                "CREATE TABLE headlines(id INTEGER PRIMARY KEY, line TEXT, link TEXT, created_at TEXT, retired_at TEXT);
+                 CREATE TABLE headline_cursor(id INTEGER);",
+            )
+            .await
+            .unwrap();
+        staged
+            .execute_script(
+                "INSERT INTO headlines(line, link) VALUES ('Mine', 'cairn://p/cairn/1');
+                 INSERT INTO journal(kind, note) VALUES ('decision', 'Kept');",
+            )
+            .await
+            .unwrap();
+        drop(staged);
+
+        let db = open_path(path.clone()).await.unwrap();
+        assert_eq!(applied_versions(&db).await, every_version_but(&[]));
+        assert_eq!(
+            db.query_opt_text("SELECT line FROM headlines_own", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Mine")
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM headlines", ())
+                .await
+                .unwrap(),
+            Some(0),
+            "the starter `headlines` took the name"
+        );
+        let notices = db
+            .query_all("SELECT note FROM journal WHERE kind = 'event'", (), |row| {
+                row.text(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("claimed `headlines`"), "{}", notices[0]);
+        assert!(notices[0].contains("now `headlines_own`"), "{}", notices[0]);
+        // `intent` and `journal` were Cairn's already and stay put.
+        assert_eq!(
+            db.query_opt_text("SELECT note FROM journal WHERE kind = 'decision'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Kept")
+        );
+
+        drop(db);
+        cache().write().await.remove(&path);
+        let again = open_path(path).await.unwrap();
+        assert_eq!(
+            again
+                .query_opt_i64("SELECT COUNT(*) FROM journal WHERE kind = 'event'", ())
+                .await
+                .unwrap(),
+            Some(1),
+            "a second open claims nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn headlines_are_capped_bounded_and_canonically_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_path(dir.path().join("headlines.db")).await.unwrap();
+        let insert = |line: String, link: &str| {
+            let db = db.clone();
+            let link = link.to_string();
+            async move {
+                db.execute(
+                    "INSERT INTO headlines(line, ref) VALUES (?1, ?2)",
+                    cairn_db::turso::params![line, link],
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        };
+        let refused = insert("x".repeat(251), "cairn://p/cairn/1")
+            .await
+            .unwrap_err();
+        assert!(refused.contains("CHECK"), "{refused}");
+        assert!(insert("   ".into(), "cairn://p/cairn/1").await.is_err());
+        for relative in ["cairn:~/db/journal/1", "cairn:@/issues", "6768"] {
+            let refused = insert("Line".into(), relative).await.unwrap_err();
+            assert!(refused.contains("cairn://p/"), "{relative}: {refused}");
+        }
+        insert("x".repeat(250), "https://example.com")
+            .await
+            .unwrap();
+        for n in 2..=10 {
+            insert(format!("Line {n}"), "cairn://p/cairn/1")
+                .await
+                .unwrap();
+        }
+        let refused = insert("Eleventh".into(), "cairn://p/cairn/1")
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("10 headlines are live: retire one"),
+            "{refused}"
+        );
+
+        // Rows are addressed by line: a refused insert may still spend an id.
+        let refused = db
+            .execute(
+                "UPDATE headlines SET until = '2099-11-11 08:00:00' WHERE line = 'Line 2'",
+                (),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("YYYY-MM-DDTHH:MM:SSZ"), "{refused}");
+        let refused = db
+            .execute(
+                "UPDATE headlines SET ref = 'cairn:~/db' WHERE line = 'Line 2'",
+                (),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("cairn://p/"), "{refused}");
+
+        // Retiring one is a patch of `until`, and makes room.
+        let retired = db
+            .execute(
+                "UPDATE headlines SET until = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE line = 'Line 2'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retired, 1);
+        insert("Eleventh".into(), "cairn://p/cairn/1")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM headlines", ())
+                .await
+                .unwrap(),
+            Some(11),
+            "a retired line is kept"
+        );
+    }
+
     #[test]
     fn the_census_predicate_names_every_app_table() {
         for table in crate::threads::db_schema::APP_TABLES {
             assert!(
-                USER_TABLE_PREDICATE.contains(&format!("'{table}'")),
-                "the census predicate must leave out `{table}`"
+                USER_TABLE_PREDICATE.contains(&format!("'{}'", table.name)),
+                "the census predicate must leave out `{}`",
+                table.name
             );
         }
     }
@@ -1416,6 +1587,7 @@ mod tests {
         assert!(!names.iter().any(|name| name == "_cairn_open_questions"));
         assert!(names.iter().any(|name| name == "intent"));
         assert!(names.iter().any(|name| name == "journal"));
+        assert!(names.iter().any(|name| name == "headlines"));
         assert!(names.iter().any(|name| name == "cairn_schema_migrations"));
         assert!(names
             .iter()

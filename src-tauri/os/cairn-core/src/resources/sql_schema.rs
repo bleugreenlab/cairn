@@ -8,7 +8,7 @@ const OVERVIEW_MAX_COLUMNS: usize = 8;
 
 /// The tables a database's catalog lists: everything but engine storage and
 /// the `_cairn_`-prefixed app contract. In a thread database that includes the
-/// app-known starter record (`intent`, `journal`), which is addressable through
+/// app-known starter record (`intent`, `journal`, `headlines`), which is addressable through
 /// the row grammar like any table the thread made.
 ///
 /// Prefix comparison is deliberate: `_` is a wildcard in SQL `LIKE`, which
@@ -26,14 +26,14 @@ pub(crate) const USER_TABLE_PREDICATE: &str = "type = 'table'
   AND substr(name, 1, 17) <> '__turso_internal_'
   AND substr(name, 1, 7) <> '_cairn_'
   AND name <> 'cairn_schema_migrations'
-  AND name NOT IN ('intent', 'journal')";
+  AND name NOT IN ('intent', 'journal', 'headlines')";
 
 /// Whether `name` is schema Cairn owns: the `_cairn_` contract, the migration
 /// ledger, and the app-known starter record.
 pub(crate) fn is_cairn_owned(name: &str) -> bool {
     name.starts_with("_cairn_")
         || name == "cairn_schema_migrations"
-        || crate::threads::db_schema::APP_TABLES.contains(&name)
+        || crate::threads::db_schema::is_app_table(name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +200,7 @@ async fn read_catalog(db: &LocalDb) -> DbResult<Catalog> {
     // Stable, so each half keeps its name order.
     catalog
         .tables
-        .sort_by_key(|name| !crate::threads::db_schema::APP_TABLES.contains(&name.as_str()));
+        .sort_by_key(|name| !crate::threads::db_schema::is_app_table(name));
     Ok(catalog)
 }
 

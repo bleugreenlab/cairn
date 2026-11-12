@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
-use crate::threads::record::{Intent, JournalRow, ThreadRecord};
+use crate::threads::record::{HeadlineRow, Intent, JournalRow, ThreadRecord};
 
 use super::common::{job_status_icon, read_resource};
 use super::transcript::DigestCoordinate;
@@ -107,6 +107,15 @@ const JOURNAL_EMPTY_NOTICE: &str = "_The journal is empty. Append what this thre
 const JOURNAL_OPEN_URI: &str = "cairn:~/db?sql=SELECT * FROM journal WHERE resolved_at IS NULL AND kind IN ('watch','question','queue') ORDER BY id DESC";
 
 const JOURNAL_FULL_LINE: &str = "Full journal: `cairn:~/db/journal?order=-id`\n";
+
+const HEADLINES_EMPTY_NOTICE: &str = "_No live headlines. When something happens that an operator away for eight hours should know, append one line with its link to `cairn:~/db/headlines`; see cairn://skills/thread-db._";
+
+/// Where the live headlines past the seed's read are, newest first.
+const HEADLINES_LIVE_URI: &str = "cairn:~/db?sql=SELECT * FROM headlines WHERE until > strftime('%Y-%m-%dT%H:%M:%SZ','now') ORDER BY id DESC";
+
+/// A live headline closer than this to its `until` says so, so the thread
+/// renews it or lets it go on purpose.
+const HEADLINE_EXPIRY_NOTICE_SECS: i64 = 24 * 3600;
 
 /// What the journal section may weigh.
 pub(crate) const JOURNAL_BUDGET_TOKENS: usize = 2_000;
@@ -1273,7 +1282,8 @@ async fn render_record(db: &LocalDb, job_id: &str, now: i64) -> String {
 }
 
 /// Render a thread's record: `## Intent` verbatim, `## Journal` under
-/// [`JOURNAL_BUDGET_TOKENS`], then `## Tenets` (awaiting a verdict, the
+/// [`JOURNAL_BUDGET_TOKENS`], `## Headlines` (the live lines, which the
+/// insert cap holds to a screen), then `## Tenets` (awaiting a verdict, the
 /// selected ones in full under [`TENET_FULL_BUDGET_TOKENS`], related tenets
 /// from other threads, and a one-line index of the rest).
 pub(crate) fn render_thread_record(record: &ThreadRecord, ranked: &[RankedTenet]) -> String {
@@ -1281,6 +1291,8 @@ pub(crate) fn render_thread_record(record: &ThreadRecord, ranked: &[RankedTenet]
     out.push_str(&render_intent(&record.intent));
     out.push_str("\n## Journal\n\n");
     out.push_str(&render_journal(record));
+    out.push_str("\n## Headlines\n\n");
+    out.push_str(&render_headlines(record));
     let tenets = render_tenets(record, ranked);
     if !tenets.is_empty() {
         out.push_str("\n## Tenets\n");
@@ -1363,6 +1375,60 @@ fn journal_line(row: &JournalRow) -> String {
     let mut line = format!("- **{}** #{} · {date} — {note}", row.kind, row.id);
     if !row.refs.is_empty() {
         line.push_str(&format!(" (refs: {})", row.refs.join(", ")));
+    }
+    line.push('\n');
+    line
+}
+
+/// The live headlines, newest first. Live lines past the read are counted on
+/// one line with the query that lists them.
+fn render_headlines(record: &ThreadRecord) -> String {
+    let cursor = record.headline_cursor.as_ref();
+    let read_through = format!(
+        "{}\n",
+        crate::threads::headlines::read_through_line(cursor, record.read_at)
+    );
+    if record.headlines.is_empty() && record.headlines_live == 0 {
+        // Past lines may all have expired; how far he read them still says
+        // whether he knows.
+        let mut out = format!("{HEADLINES_EMPTY_NOTICE}\n");
+        if cursor.is_some() {
+            out.push_str(&read_through);
+        }
+        return out;
+    }
+    let mut out = read_through;
+    out.extend(
+        record
+            .headlines
+            .iter()
+            .map(|row| headline_line(row, cursor)),
+    );
+    let hidden = record.headlines_live.saturating_sub(record.headlines.len());
+    if hidden > 0 {
+        out.push_str(&format!("_{hidden} more live → `{HEADLINES_LIVE_URI}`_\n"));
+    }
+    out
+}
+
+/// `- #3 · new — line (link) · expires in 5h`, on one line: `new` until the
+/// operator's cursor passes the line, then `seen`; the expiry only within
+/// [`HEADLINE_EXPIRY_NOTICE_SECS`].
+fn headline_line(
+    row: &HeadlineRow,
+    cursor: Option<&crate::threads::headlines::HeadlineCursor>,
+) -> String {
+    let text = row.line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mark = if cursor.is_some_and(|cursor| cursor.has_seen(row.id)) {
+        "seen"
+    } else {
+        "new"
+    };
+    let mut line = format!("- #{} · {mark} — {text} ({})", row.id, row.link);
+    if row.seconds_left <= HEADLINE_EXPIRY_NOTICE_SECS {
+        // Rounded up, so a line never reads as expiring sooner than it does.
+        let hours = ((row.seconds_left + 3599) / 3600).max(1);
+        line.push_str(&format!(" · expires in {hours}h"));
     }
     line.push('\n');
     line
@@ -3201,6 +3267,10 @@ mod tests {
             journal_open: vec![journal_row(3, "question", "What next?")],
             open_total: 1,
             journal_recent: Vec::new(),
+            headlines: Vec::new(),
+            headlines_live: 0,
+            headline_cursor: None,
+            read_at: 0,
             tenets,
             thread_id: "thread".into(),
             project_id: "p".into(),
@@ -3450,6 +3520,120 @@ mod tests {
         assert!(!rendered.contains("## Tenets"), "{rendered}");
     }
 
+    fn headline(id: i64, line: &str, seconds_left: i64) -> HeadlineRow {
+        HeadlineRow {
+            id,
+            line: line.into(),
+            link: format!("cairn://p/prj/{id}"),
+            seconds_left,
+        }
+    }
+
+    #[test]
+    fn live_headlines_render_after_the_journal_and_name_a_near_expiry() {
+        let mut record = record(vec![tenet(4, TenetStatus::Approved, "Ship it")]);
+        record.headlines = vec![
+            headline(7, "Decided to hold   the\nrelease.", 3 * 86_400),
+            headline(5, "Stopped the bench run.", 5 * 3600 - 1),
+        ];
+        record.headlines_live = 2;
+        let ranked = recency_rank(&record.tenets);
+        let rendered = render_thread_record(&record, &ranked);
+        let journal = rendered.find("## Journal").unwrap();
+        let section = rendered.find("## Headlines").unwrap();
+        let tenets = rendered.find("## Tenets").unwrap();
+        assert!(journal < section && section < tenets, "{rendered}");
+        assert!(
+            rendered.contains(
+                "## Headlines\n\nOperator has never read your headlines\n- #7 · new — Decided to hold the release. (cairn://p/prj/7)\n- #5 · new — Stopped the bench run. (cairn://p/prj/5) · expires in 5h\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(HEADLINES_EMPTY_NOTICE), "{rendered}");
+        assert!(!rendered.contains("more live"), "{rendered}");
+
+        record.headlines_live = 12;
+        let rendered = render_thread_record(&record, &ranked);
+        assert!(rendered.contains("_10 more live → `"), "{rendered}");
+    }
+
+    #[test]
+    fn each_headline_is_marked_against_the_operators_cursor_with_how_long_ago_he_read() {
+        let mut record = record(Vec::new());
+        record.headlines = vec![
+            headline(7, "Decided to hold the release.", 3 * 86_400),
+            headline(5, "Stopped the bench run.", 3 * 86_400),
+        ];
+        record.headlines_live = 2;
+        record.headline_cursor = Some(crate::threads::headlines::HeadlineCursor {
+            seen_through_id: 5,
+            seen_at: 1_000,
+            seen_on: Some("ios".into()),
+        });
+        record.read_at = 1_000 + 3 * 3600;
+        let rendered = render_thread_record(&record, &[]);
+        assert!(
+            rendered.contains(
+                "## Headlines\n\nOperator has read through #5, 3h ago\n- #7 · new — Decided to hold the release. (cairn://p/prj/7)\n- #5 · seen — Stopped the bench run. (cairn://p/prj/5)\n"
+            ),
+            "{rendered}"
+        );
+
+        // Every line expired: the notice, and still how far he read them.
+        record.headlines.clear();
+        record.headlines_live = 0;
+        let rendered = render_thread_record(&record, &[]);
+        assert!(
+            rendered.contains(&format!(
+                "## Headlines\n\n{HEADLINES_EMPTY_NOTICE}\nOperator has read through #5, 3h ago\n"
+            )),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn no_live_headlines_points_at_the_skill() {
+        let rendered = render_thread_record(&record(Vec::new()), &[]);
+        assert!(
+            rendered.contains(&format!("## Headlines\n\n{HEADLINES_EMPTY_NOTICE}\n")),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_headline_five_hours_from_expiry_says_so_and_a_retired_one_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::threads::db_store::open_path(dir.path().join("headlines.db"))
+            .await
+            .unwrap();
+        store
+            .execute_script(
+                "INSERT INTO headlines(line, ref, until) VALUES
+                   ('Assuming the lease holds.', 'cairn://p/cairn/1',
+                    strftime('%Y-%m-%dT%H:%M:%SZ','now','+5 hours'));
+                 INSERT INTO headlines(line, ref) VALUES ('Merged the cap.', 'https://example.com/pr');
+                 INSERT INTO headlines(line, ref) VALUES ('Retired.', 'cairn://p/cairn/3');
+                 UPDATE headlines SET until = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE line = 'Retired.';",
+            )
+            .await
+            .unwrap();
+        let (headlines, live) = crate::threads::record::read_headlines(&store)
+            .await
+            .unwrap();
+        assert_eq!(live, 2);
+        let mut record = record(Vec::new());
+        record.headlines = headlines;
+        record.headlines_live = live;
+        let rendered = render_thread_record(&record, &[]);
+        assert!(
+            rendered.contains(
+                "- #2 · new — Merged the cap. (https://example.com/pr)\n- #1 · new — Assuming the lease holds. (cairn://p/cairn/1) · expires in 5h\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Retired."), "{rendered}");
+    }
+
     #[test]
     fn the_journal_budget_never_displaces_intent_or_tenets() {
         let mut record = record(vec![tenet(
@@ -3468,7 +3652,7 @@ mod tests {
         assert_eq!(rendered.matches("LONG_INTENT").count(), 800);
         assert!(rendered.contains("- **#4** (approved"), "{rendered}");
         let journal =
-            &rendered[rendered.find("## Journal").unwrap()..rendered.find("## Tenets").unwrap()];
+            &rendered[rendered.find("## Journal").unwrap()..rendered.find("## Headlines").unwrap()];
         assert!(seed_tokens(journal) <= JOURNAL_BUDGET_TOKENS + 10);
     }
 
@@ -4671,6 +4855,7 @@ mod tests {
                     "resolved_at",
                 ][..],
             ),
+            ("headlines", &["id", "line", "ref", "until"][..]),
         ] {
             let declared = store
                 .query_all(

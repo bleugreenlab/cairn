@@ -238,6 +238,11 @@ pub fn build_project_home_uri(project: &str) -> String {
     format!("{}/home", build_project_uri(project))
 }
 
+/// A project's merged headlines.
+pub fn build_project_headlines_uri(project: &str) -> String {
+    format!("{}/headlines", build_project_uri(project))
+}
+
 pub fn build_issue_uri(project: &str, number: i32) -> String {
     format!("{}/{}", build_project_uri(project), number)
 }
@@ -1178,6 +1183,7 @@ impl CairnResource {
             Self::ProjectQueue { project } => build_project_queue_uri(project),
             Self::ProjectMap { project } => build_project_map_uri(project),
             Self::ProjectHome { project } => build_project_home_uri(project),
+            Self::ProjectHeadlines { project } => build_project_headlines_uri(project),
             Self::ProjectCheckResults { project, revision } => {
                 build_project_check_results_uri(project, revision)
             }

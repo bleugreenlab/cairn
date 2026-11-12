@@ -265,6 +265,57 @@ fn report(outcome: RequestAttemptOutcome, verified: bool, settled: bool) -> Cons
         built_commit: Some(commit('b')),
     }
 }
+/// A request carries the newest line its asking thread's project holds about
+/// it, read through the rule notification entries use; a request nothing
+/// points at carries none.
+#[tokio::test]
+async fn a_request_carries_the_headline_written_about_it() {
+    let orch = fixture().await;
+    for statement in [
+        "INSERT INTO threads(id,project_id,name,created_at,updated_at) VALUES('hl-writer','project','writer',1,1)",
+        "INSERT INTO jobs(id,project_id,thread_id,node_name,status,created_at,updated_at,uri_segment) VALUES('hl-job','project','hl-writer','Writer','running',1,1,'writer')",
+        "INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at,start_mode) VALUES('hl-run','project','hl-job','live',1,1,'resume')",
+    ] {
+        sql(&orch, statement).await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    crate::threads::db_store::use_test_path("hl-writer", dir.path().join("hl-writer.db"));
+    register(&orch, RequestKind::Rebuild);
+    let request = file_rebuild(&orch, "hl-run", "ship the fix").await;
+    assert_eq!(request.requesters[0].origin_uri, "cairn://p/project/writer");
+    let read = |id: String| {
+        let orch = &orch;
+        async move { get(orch, &id).await.unwrap().unwrap().headline }
+    };
+    assert_eq!(read(request.id.clone()).await, None);
+
+    let store = crate::threads::db_store::open("hl-writer").await.unwrap();
+    for (ts, line, link) in [
+        ("2026-11-10T01:00:00Z", "Older word.", request.uri.as_str()),
+        (
+            "2026-11-10T02:00:00Z",
+            "Rebuilding lands the drain fix.",
+            request.uri.as_str(),
+        ),
+        ("2026-11-10T03:00:00Z", "Unrelated.", "cairn://p/project/99"),
+    ] {
+        store
+            .execute(
+                "INSERT INTO headlines(ts, line, ref, until) VALUES (?1, ?2, ?3, '2099-01-01T00:00:00Z')",
+                cairn_db::turso::params![ts, line, link],
+            )
+            .await
+            .unwrap();
+    }
+    let expected = Some(headlines::HeadlineAbout {
+        line: "Rebuilding lands the drain fix.".into(),
+        uri: "cairn://p/project/writer/db/headlines/2".into(),
+    });
+    assert_eq!(read(request.id.clone()).await, expected);
+    let listed = list(&orch, RequestFilter::default()).await.unwrap();
+    assert_eq!(listed[0].headline, expected);
+}
+
 async fn file_rebuild(orch: &Orchestrator, run: &str, rationale: &str) -> OperatorRequest {
     file(
         orch,

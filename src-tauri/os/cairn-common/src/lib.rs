@@ -18,6 +18,7 @@ pub mod executor_paths;
 pub mod executor_protocol;
 pub mod executor_protocol_ledger;
 pub mod git_credential;
+pub mod headlines;
 pub mod identity;
 pub mod ids;
 pub mod imports;

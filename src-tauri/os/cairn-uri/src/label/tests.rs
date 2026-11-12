@@ -90,6 +90,11 @@ fn the_frontend_labels_are_reproduced() {
         ("cairn://p/CAIRN/messages".into(), plain.clone(), "cairn"),
         ("cairn://p/CAIRN/home".into(), plain.clone(), "cairn / home"),
         (
+            "cairn://p/CAIRN/headlines".into(),
+            plain.clone(),
+            "cairn / headlines",
+        ),
+        (
             "cairn://p/CAIRN/threads".into(),
             plain.clone(),
             "cairn / threads",

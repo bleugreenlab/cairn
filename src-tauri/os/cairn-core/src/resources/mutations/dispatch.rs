@@ -45,6 +45,7 @@ pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
 mod rebase;
 pub(crate) use rebase::{acceptance_debt_section, rebase_authority};
 mod camps;
+mod headlines;
 mod recipes;
 mod repls;
 mod requests;
@@ -434,7 +435,9 @@ pub(crate) async fn dispatch_resource_change_under_store(
     let mut promoted_memory = None;
     let mut deferred_pr_sync = None;
 
-    let summary = if let Some(summary) =
+    let summary = if let Some(summary) = headlines::dispatch(index, item, &resource)? {
+        summary
+    } else if let Some(summary) =
         off_frame(|| posts::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary

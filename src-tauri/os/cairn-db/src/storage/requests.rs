@@ -162,6 +162,7 @@ async fn get_conn(conn: &TrackedConnection, request: &str) -> DbResult<Option<Op
         unavailable_reason: Some(
             "consumer availability is supplied by the registered runner service".into(),
         ),
+        headline: None,
     };
     drop(rows);
     out.member_request_ids = members(conn, &out.cohort_id).await?;

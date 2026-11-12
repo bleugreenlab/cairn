@@ -347,6 +347,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("tenet_evidence_events", "project_id = ?1"),
     spec("tenet_evidence", "project_id = ?1"),
     owned("thread_read_positions", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
+    owned("headline_read_cursors", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("thread_services", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("wake_schedules", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     owned("wake_conditions", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),

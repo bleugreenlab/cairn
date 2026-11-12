@@ -615,15 +615,25 @@ mod tests {
                    (SELECT COUNT(*) FROM sqlite_schema WHERE name = '_cairn_rulings'),
                    (SELECT COUNT(*) FROM intent WHERE id = 1 AND updated_at IS NULL),
                    (SELECT COUNT(*) FROM journal WHERE resolved_at IS NULL),
-                   (SELECT COUNT(*) FROM cairn_schema_migrations WHERE version IN ('0001', '0002', '0005'))",
+                   (SELECT COUNT(*) FROM headlines),
+                   (SELECT COUNT(*) FROM cairn_schema_migrations WHERE version IN ('0001', '0002', '0005', '0006'))",
                 (),
-                |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?, row.i64(3)?)),
+                |row| {
+                    Ok((
+                        row.i64(0)?,
+                        row.i64(1)?,
+                        row.i64(2)?,
+                        row.i64(3)?,
+                        row.i64(4)?,
+                    ))
+                },
             )
             .await
             .unwrap();
         // A fresh store passes the import guard (0002 runs on an empty table)
-        // and is born with an unwritten intent row and an empty journal.
-        assert_eq!(shape, (0, 1, 0, 3));
+        // and is born with an unwritten intent row, an empty journal and no
+        // headlines.
+        assert_eq!(shape, (0, 1, 0, 0, 4));
     }
 
     /// An absent name is the server's cue to allocate, and allocation counts

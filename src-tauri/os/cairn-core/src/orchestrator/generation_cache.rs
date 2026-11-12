@@ -228,6 +228,8 @@ const OPERATOR_NOTIFICATION_INPUT_TABLES: &[&str] = &[
     "ask_conditions",
     "action_runs",
     "threads",
+    // An entry carries the headline a thread wrote about its cause.
+    crate::threads::headlines::HEADLINES_PROJECTION,
     crate::notifications::DISMISSALS_TABLE,
     crate::notifications::HOLDS_TABLE,
 ];

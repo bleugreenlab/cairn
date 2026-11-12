@@ -2563,6 +2563,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "thread_read_positions",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // How far this operator has read each thread's headlines: the same kind
+    // of fact as the transcript read position beside it, and private for the
+    // same reason.
+    (
+        "headline_read_cursors",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     // What THIS operator closed in their notification center. The facts behind
     // the entries are shared; the decision to stop looking at one is not.
     // Replicating it would let a teammate's dismissal hide an entry from someone

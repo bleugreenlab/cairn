@@ -48,6 +48,10 @@ fn each_address_opens_the_view_the_app_has_for_it() {
             Surface::ProjectHome { project: p() },
         ),
         (
+            "cairn://p/cairn/headlines",
+            Surface::ProjectHome { project: p() },
+        ),
+        (
             "cairn://p/cairn/tenets",
             Surface::ProjectTenets { project: p() },
         ),

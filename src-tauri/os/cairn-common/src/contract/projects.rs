@@ -147,6 +147,34 @@ pub(crate) const PROJECT_HOME_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+const HEADLINES_SEEN: KeySpec = KeySpec::new(
+    "seen",
+    KeyType::Object,
+    "{thread, through, on?}: the operator has been shown thread's lines through headline id `through` (on: desktop | ios, for diagnosis). Only moves forward, and never past the thread's newest line. Operator only, moved by the desktop app as lines come on screen; refused to agents",
+);
+
+pub(crate) const PROJECT_HEADLINES_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectHeadlines,
+    uri_template: "cairn://p/{project}/headlines",
+    name: "Project headlines",
+    description: "The live headlines of every active thread in the project, read from each thread's own `headlines` table: lines new to the operator first, newest first, then the lines he has seen, newest first. A line is new while its id is past the operator's read cursor on its thread. Read-only to agents: a thread writes its own lines at cairn:~/db/headlines and reads how far he has read in its seed and overview",
+    read_projections: &[
+        ProjectionSpec { key: "thread", values: "a thread name (or its canonical URI): only that thread's lines" },
+        ProjectionSpec { key: "seen", values: "false: only the lines new to the operator" },
+        ProjectionSpec { key: "limit", values: "N lines (default 100, maximum 500)" },
+        ProjectionSpec { key: "format", values: "json for the structured projection" },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[HEADLINES_SEEN],
+        optional: &[],
+        label: "mark a thread's lines seen (operator only, in the desktop app)",
+        example: "write({changes:[{target:\"cairn://p/PROJECT/headlines\",mode:\"patch\",payload:{seen:{thread:\"execution\",through:12,on:\"desktop\"}}}]})",
+    }],
+};
+
 pub(crate) const PROJECT_MAP_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectMap,
     uri_template: "cairn://p/{project}/map",

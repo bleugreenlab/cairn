@@ -289,6 +289,16 @@ pub(super) async fn read_thread(
             out.push_str(&format!(
                 "- [intent]({canonical}/db/intent/1) · [journal]({canonical}/db/journal)\n"
             ));
+            let read_through = match crate::threads::headlines::cursor_conn(conn, &id).await {
+                Ok(cursor) => crate::threads::headlines::read_through_line(
+                    cursor.as_ref(),
+                    chrono::Utc::now().timestamp(),
+                ),
+                Err(error) => format!("How far the operator has read is unknown: {error}"),
+            };
+            out.push_str(&format!(
+                "- [headlines]({canonical}/db/headlines) · {read_through}\n"
+            ));
             match session {
                 Some((job_id, segment, session_status)) => out.push_str(&format!(
                     "- Live session: {}{} ({})\n",
@@ -505,6 +515,26 @@ mod tests {
         );
         assert!(overview.contains("[12 — Child issue](cairn://p/thr/12)"));
         assert!(overview.contains("Live session: not started"));
+        // The overview says what the seed says about the thread's reader.
+        assert!(
+            overview.contains(
+                "- [headlines](cairn://p/thr/design-review/db/headlines) · Operator has never read your headlines\n"
+            ),
+            "{overview}"
+        );
+        let two_hours_ago = chrono::Utc::now().timestamp() - 2 * 3600 - 30;
+        db.execute(
+            "INSERT INTO headline_read_cursors (reader, thread_id, seen_through_id, seen_at, seen_on)
+             VALUES ('operator', 't-design', 4, ?1, 'desktop')",
+            (two_hours_ago,),
+        )
+        .await
+        .unwrap();
+        let overview = read_thread(&db, "thr", "design-review", &[], 4).await;
+        assert!(
+            overview.contains("· Operator has read through #4, 2h ago\n"),
+            "{overview}"
+        );
         // The page a caller appends to says what an append does to the session.
         assert!(
             overview.contains("An idle session starts a turn on the message at once"),

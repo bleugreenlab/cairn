@@ -113,6 +113,7 @@ resource_samples! {
     ProjectQueue { project: project() } => Parser,
     ProjectMap { project: project() } => Parser,
     ProjectHome { project: project() } => Parser,
+    ProjectHeadlines { project: project() } => Parser,
     ProjectCheckResults { project: project(), revision: "main".to_string() } => Parser,
     ProjectVcsDiff { project: project() } => Parser,
     ProjectVcsAncestry { project: project() } => Parser,

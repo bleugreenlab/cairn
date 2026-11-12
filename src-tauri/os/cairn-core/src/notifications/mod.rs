@@ -147,6 +147,11 @@ pub struct OperatorNotification {
     /// never a wake.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
+    /// The newest live headline a thread wrote about this entry's cause (its
+    /// `ref` is the entry's source or that source's issue), so the operator
+    /// reads why before he merges. Absent when no thread wrote one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headline: Option<crate::threads::headlines::HeadlineAbout>,
 }
 
 impl OperatorNotification {
@@ -233,6 +238,7 @@ pub(crate) async fn derive_snapshot(
     let since = now - RECENT_WINDOW_SECS;
     let (mut entries, next_change_at) = derive::from_sources(db, &project, since, now).await?;
     entries.extend(derive::holds(holds, &project));
+    derive::attach_headlines(db, &project, &mut entries).await;
     for entry in &mut entries {
         // A resolved entry stays resolved: that it was handled says more than
         // that the operator also closed it.
