@@ -25,7 +25,7 @@
 //!    entry are deleted. Derived from the declarations, so no provider is
 //!    named here.
 //! 4. **Settings** need nothing: the scalars and `webSearch.<pack>` /
-//!    `webFetch.<pack>` options already have the right shape. A stored select
+//!    `webFetch.<pack>` / `pdf.<pack>` options already have the right shape. A stored select
 //!    value a declaration no longer offers falls back to its default at use.
 //!
 //! An installed bundled pack that gains a provider in a new app version needs
@@ -126,7 +126,7 @@ pub fn migrate_workspace(
         }
     }
 
-    for slot in [Slot::WebSearch, Slot::WebFetch] {
+    for slot in Slot::ALL {
         let Some(name) = super::active_name(config_dir, slot) else {
             continue;
         };

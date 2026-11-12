@@ -39,6 +39,26 @@ fn fixture_pack(resources: &Path, id: &str, var: &str) {
     );
 }
 
+/// A resource dir holding one PDF provider pack named `id`: an MCP server of
+/// the same name, and a binding that hands the URL to its `extract` tool.
+fn fixture_pdf_pack(resources: &Path, id: &str) {
+    let root = resources.join("packs").join(id);
+    write(
+        &root.join("cairn-pack.yaml"),
+        &format!("cairnVersion: 1\nid: {id}\nname: Fixture {id}\nversion: 1.0.0\ndescription: d\ndefault: false\n"),
+    );
+    write(
+        &root.join("mcp.yaml"),
+        &format!("mcpServers:\n  {id}:\n    type: http\n    url: https://mcp.{id}.test/mcp\n"),
+    );
+    write(
+        &root.join("providers/pdf.yaml"),
+        &format!(
+            "label: Fixture\nprovides: pdf\nadapter:\n  mcp:\n    server: {id}\n    tool: extract\n    arguments: {{ source: \"${{target}}\" }}\n    result: text\n"
+        ),
+    );
+}
+
 fn settings(config: &Path, text: &str) {
     write(&crate::config::settings::get_settings_path(config), text);
 }
@@ -584,9 +604,15 @@ fn an_installed_old_cloudflare_gains_browser_run_at_the_boot_sync() {
 /// The last tool call a [`MockGateway`] saw: server, tool, arguments, timeout.
 type RecordedCall = (String, String, serde_json::Value, Option<u32>);
 
+/// The text every [`MockGateway`] tool call returns.
+const MOCK_TEXT: &str = "# bmd markdown";
+
 #[derive(Default)]
 struct MockGateway {
     last: std::sync::Mutex<Option<RecordedCall>>,
+    /// The server name and URL the last call was handed: which definition of
+    /// a server won shows here.
+    endpoint: std::sync::Mutex<Option<(String, Option<String>)>>,
 }
 
 #[async_trait::async_trait]
@@ -619,16 +645,16 @@ impl crate::mcp::gateway::McpGateway for MockGateway {
     async fn call_tool(
         &self,
         session: &str,
-        _server: &str,
-        _config: &crate::security::BrokeredMcpConfig,
+        server: &str,
+        config: &crate::security::BrokeredMcpConfig,
         tool: &str,
         args: serde_json::Value,
         timeout: Option<u32>,
     ) -> Result<crate::mcp::gateway::McpToolCallResult, String> {
         *self.last.lock().unwrap() = Some((session.into(), tool.into(), args, timeout));
-        Ok(crate::mcp::gateway::McpToolCallResult::from_text(
-            "# bmd markdown",
-        ))
+        *self.endpoint.lock().unwrap() =
+            Some((server.into(), config.resolved_for_connect().url.clone()));
+        Ok(crate::mcp::gateway::McpToolCallResult::from_text(MOCK_TEXT))
     }
     async fn close_session(&self, _: &str) {}
 }
@@ -698,6 +724,62 @@ async fn a_bmd_workspace_binds_the_bmd_server_fetch_tool() {
     assert_eq!(timeout, Some(120_000));
 }
 
+/// `activePdf: bmd` keeps working after upgrade with no click: the migration
+/// installs the bundled pack that provides the slot, and the binding calls the
+/// same `fetch` tool with `{source}` the compiled provider did. The built-in
+/// `local` extractor stays selectable by name and installs nothing.
+#[tokio::test]
+async fn an_active_pdf_bmd_workspace_binds_the_bmd_server_fetch_tool() {
+    use crate::config::mcp_servers::McpServerConfigExt;
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("home");
+    settings(&config, "activePdf: bmd\n");
+
+    let report = migrate_workspace(&RealGitClient, &RealFileSystem, &config, &app_resources());
+    assert!(report.installed.contains(&"bmd".to_string()), "{report:?}");
+    let pdf = provider_of(resolve(&config, Slot::Pdf));
+    let Adapter::Mcp(binding) = &pdf.provider.provider.adapter else {
+        panic!("bmd's pdf provider is not an MCP binding");
+    };
+
+    let gateway = MockGateway::default();
+    let authored: crate::config::mcp_servers::McpServerConfig =
+        serde_json::from_value(serde_json::json!({"type": "http", "url": "https://bmd.test/mcp"}))
+            .unwrap();
+    let brokered = authored.brokered("bmd", "test").unwrap();
+    let text = call_binding(
+        &gateway,
+        &brokered,
+        "bmd",
+        &pdf.provider,
+        binding,
+        &Inputs {
+            query: None,
+            target: Some("https://example.com/paper.pdf"),
+            credential: "",
+            options: &pdf.options,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(text, "# bmd markdown");
+    let (session, tool, args, timeout) = gateway.last.lock().unwrap().clone().unwrap();
+    assert_eq!(session, "cairn-pdf");
+    assert_eq!(tool, "fetch");
+    assert_eq!(
+        args,
+        serde_json::json!({"source": "https://example.com/paper.pdf"})
+    );
+    assert_eq!(timeout, Some(120_000));
+
+    settings(&config, "activePdf: local\n");
+    assert!(matches!(
+        resolve(&config, Slot::Pdf),
+        Resolved::Unconfigured
+    ));
+}
+
 #[test]
 fn an_uninstalled_pack_is_not_reinstalled() {
     mock_keychain::install();
@@ -717,30 +799,59 @@ fn an_uninstalled_pack_is_not_reinstalled() {
 }
 
 /// A slot scalar is writable with the session token, so it must never become
-/// a way to install a pack that runs a machine service.
+/// a way to install a pack that runs a machine service, whichever slot names
+/// it.
 #[test]
 fn a_pack_carrying_a_machine_service_is_never_installed_by_the_migration() {
     mock_keychain::install();
-    let temp = TempDir::new().unwrap();
-    let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
-    fixture_pack(&resources, "wp-service", "WP_SERVICE_KEY");
-    write(
-        &resources.join("packs/wp-service/services/helper/service.yaml"),
-        "name: Helper\n",
-    );
-    settings(&config, "activeWebSearch: wp-service\n");
+    for (slot, id) in [
+        (Slot::WebSearch, "wp-service"),
+        (Slot::Pdf, "wp-pdf-service"),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+        if slot == Slot::Pdf {
+            fixture_pdf_pack(&resources, id);
+        } else {
+            fixture_pack(&resources, id, "WP_SERVICE_KEY");
+        }
+        // The migration skips silently past a pack whose provider does not
+        // load, so the fixture must be one it would otherwise install.
+        assert!(
+            matches!(
+                cairn_packs::provider::load_pack_provider(
+                    &resources.join("packs").join(id),
+                    id,
+                    slot
+                ),
+                Ok(Some(_))
+            ),
+            "{id}: the fixture's {slot:?} provider must load"
+        );
+        write(
+            &resources
+                .join("packs")
+                .join(id)
+                .join("services/helper/service.yaml"),
+            "name: Helper\n",
+        );
+        settings(&config, &format!("{}: {id}\n", scalar_key(slot)));
 
-    let report = migrate_workspace(&RealGitClient, &RealFileSystem, &config, &resources);
-    assert!(report.installed.is_empty());
-    assert!(cairn_packs::lock::read_lock(&config, "wp-service").is_none());
-    assert_eq!(
-        active_name(&config, Slot::WebSearch).as_deref(),
-        Some("wp-service"),
-        "the scalar is left alone"
-    );
-    assert!(report
-        .skipped
-        .contains(&"wp-service: carries a machine service".to_string()));
+        let report = migrate_workspace(&RealGitClient, &RealFileSystem, &config, &resources);
+        assert!(report.installed.is_empty(), "{id}: {report:?}");
+        assert!(cairn_packs::lock::read_lock(&config, id).is_none(), "{id}");
+        assert_eq!(
+            active_name(&config, slot).as_deref(),
+            Some(id),
+            "the scalar is left alone"
+        );
+        assert!(
+            report
+                .skipped
+                .contains(&format!("{id}: carries a machine service")),
+            "{id}: {report:?}"
+        );
+    }
 }
 
 /// `{pack}/{VAR}` is also the account a workspace MCP server named `{pack}`
@@ -862,4 +973,139 @@ async fn a_search_with_a_blank_required_option_sends_nothing() {
         .unwrap();
     assert!(guidance.contains("needs its Account"), "{guidance}");
     assert!(guidance.contains(LIBRARY_LOCATION), "{guidance}");
+}
+
+/// Read `target` the way `read` does for an `http(s)://` target.
+async fn read_web(
+    orch: &crate::orchestrator::Orchestrator,
+    target: &str,
+) -> Result<String, String> {
+    let request = crate::mcp::types::McpCallbackRequest {
+        tool: "read_web".to_string(),
+        payload: serde_json::json!({ "target": target }),
+        ..read_request()
+    };
+    crate::mcp::handlers::web::read_web_markdown(orch, &request).await
+}
+
+/// A workspace whose `activePdf: bmd` the migration has carried onto the
+/// bundled bmd pack, with a recording gateway installed on its orchestrator.
+async fn bmd_pdf_workspace(
+    temp: &TempDir,
+) -> (
+    PathBuf,
+    crate::orchestrator::Orchestrator,
+    std::sync::Arc<MockGateway>,
+) {
+    let config = temp.path().join("home");
+    settings(&config, "activePdf: bmd\n");
+    let report = migrate_workspace(&RealGitClient, &RealFileSystem, &config, &app_resources());
+    assert!(report.installed.contains(&"bmd".to_string()), "{report:?}");
+    let orch = orchestrator(&config).await;
+    let gateway = std::sync::Arc::new(MockGateway::default());
+    assert!(orch.set_mcp_gateway(gateway.clone()).is_ok());
+    (config, orch, gateway)
+}
+
+/// A remote PDF read with `activePdf: bmd` goes through the bmd pack's binding
+/// on the orchestrator's (sanitizing) gateway, and the reader gets exactly what
+/// the compiled bmd provider returned for the same call. A `bmd` server the
+/// user authored in settings is the one connected, not the pack's.
+#[tokio::test]
+async fn a_remote_pdf_read_goes_through_the_bmd_pack_and_returns_its_text_verbatim() {
+    use crate::config::mcp_servers::McpServerConfigExt;
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let (config, orch, gateway) = bmd_pdf_workspace(&temp).await;
+    settings(
+        &config,
+        "activePdf: bmd\nmcpServers:\n  bmd:\n    type: http\n    url: https://bmd.workspace.test/mcp\n",
+    );
+    let url = "https://example.com/paper.pdf?rev=2";
+
+    let text = read_web(&orch, url).await.unwrap();
+
+    let (session, tool, args, timeout) = gateway.last.lock().unwrap().clone().unwrap();
+    assert_eq!(session, "cairn-pdf");
+    assert_eq!(tool, "fetch");
+    assert_eq!(args, serde_json::json!({ "source": url }));
+    assert_eq!(timeout, Some(120_000));
+    assert_eq!(
+        gateway.endpoint.lock().unwrap().clone(),
+        Some((
+            "bmd".to_string(),
+            Some("https://bmd.workspace.test/mcp".to_string())
+        )),
+        "the settings server shadows the pack's https://api.become.md/mcp"
+    );
+
+    // The compiled provider's call: the `bmd` key, session `cairn-pdf`, tool
+    // `fetch` with `{source}`, 120 s, and `result.text`, through the same
+    // installed gateway, so sanitization applies to both sides alike.
+    let authored: crate::config::mcp_servers::McpServerConfig = serde_json::from_value(
+        serde_json::json!({ "type": "http", "url": "https://bmd.workspace.test/mcp" }),
+    )
+    .unwrap();
+    let legacy = orch
+        .mcp_gateway()
+        .unwrap()
+        .call_tool(
+            "cairn-pdf",
+            "bmd",
+            &authored.brokered("bmd", "bmd PDF").unwrap(),
+            "fetch",
+            serde_json::json!({ "source": url }),
+            Some(120_000),
+        )
+        .await
+        .unwrap()
+        .text;
+    assert_eq!(text, legacy);
+    assert_eq!(text, MOCK_TEXT);
+}
+
+/// The pack's own bmd server needs OAuth, so until it is connected a PDF read
+/// is guidance naming the server, and nothing reaches the gateway.
+#[tokio::test]
+async fn a_remote_pdf_read_with_bmd_unconnected_is_guidance() {
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let (_config, orch, gateway) = bmd_pdf_workspace(&temp).await;
+
+    let guidance = read_web(&orch, "https://example.com/paper.pdf")
+        .await
+        .unwrap();
+    assert_eq!(
+        guidance,
+        format!(
+            "bmd PDF extraction needs its MCP server `bmd` connected. Connect it in {LIBRARY_LOCATION}."
+        )
+    );
+    assert!(gateway.last.lock().unwrap().is_none());
+}
+
+/// A selected pack that is not installed is guidance, not a quiet fall back to
+/// the local extractor: a lost installation stays visible. The `.test` host
+/// cannot resolve, so a local download would have been an `Err`.
+#[tokio::test]
+async fn a_remote_pdf_read_with_its_pack_missing_is_guidance_not_local() {
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("home");
+    settings(&config, "activePdf: wp-pdf-gone\n");
+    let orch = orchestrator(&config).await;
+    let gateway = std::sync::Arc::new(MockGateway::default());
+    assert!(orch.set_mcp_gateway(gateway.clone()).is_ok());
+
+    let guidance = read_web(&orch, "https://pdf.wp-pdf-gone.test/paper.pdf")
+        .await
+        .unwrap();
+    assert_eq!(
+        guidance,
+        format!(
+            "The PDF provider `wp-pdf-gone` is selected but not installed. Install it from \
+             {LIBRARY_LOCATION}, or select Local there."
+        )
+    );
+    assert!(gateway.last.lock().unwrap().is_none());
 }

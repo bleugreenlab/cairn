@@ -526,7 +526,7 @@ pub fn slot_view(config_dir: &Path, slot: Slot) -> SlotView {
 
 /// The view of every slot a pack provider can fill today.
 pub fn slot_views(config_dir: &Path) -> Vec<SlotView> {
-    [Slot::WebSearch, Slot::WebFetch]
+    Slot::ALL
         .into_iter()
         .map(|slot| slot_view(config_dir, slot))
         .collect()

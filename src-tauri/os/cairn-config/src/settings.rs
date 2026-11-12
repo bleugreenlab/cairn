@@ -530,9 +530,9 @@ pub struct SettingsFile {
     /// (YAML, not in the Settings DTO). Absent = web search is unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_web_search: Option<String>,
-    /// Typed PDF-extraction provider options, keyed by provider id
-    /// (`local`/`bmd`) then option key. Config-only (YAML, not in the Settings
-    /// DTO). Validated against core’s `config::pdf`. See `docs/settings.md`.
+    /// PDF-extraction provider options, keyed by the provider's pack id, then
+    /// option key. Config-only (YAML, not in the Settings DTO). Validated
+    /// against the options the pack declares. See `docs/settings.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
     /// Which PDF-extraction provider backs `.pdf` reads. Config-only (YAML, not

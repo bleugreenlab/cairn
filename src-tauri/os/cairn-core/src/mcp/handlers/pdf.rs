@@ -8,15 +8,19 @@
 //!   is deliberately no PDF-specific path to disk here: a second one would need
 //!   its own copy of the protected-path, deny-read and logical-root checks.
 //! - A **remote** `.pdf` URL routes here from [`super::web`], and the active
-//!   provider (`config::pdf`) decides how it becomes text. **Local** (the
-//!   default) downloads the bytes and extracts them in-process; **bmd** routes
-//!   the URL through bmd's `fetch` tool on the `bmd` MCP server.
+//!   `pdf` slot's provider ([`crate::web_providers`]) decides how it becomes
+//!   text. **Local** (the zero-config default) downloads the bytes and
+//!   extracts them in-process; a pack's `providers/pdf.yaml` MCP binding
+//!   instead hands the URL to a tool on the pack's MCP server.
 
 use std::borrow::Cow;
 use std::path::Path;
 
-use crate::config::pdf::{self, PdfProviderId};
+use cairn_packs::provider::http::Inputs;
+use cairn_packs::provider::{Adapter, Slot};
+
 use crate::orchestrator::Orchestrator;
+use crate::web_providers::{self, McpOutcome, Resolved, LIBRARY_LOCATION};
 
 /// Whether a URL's path ends in `.pdf` (ignoring any query).
 pub(crate) fn is_pdf_url(url: &str) -> bool {
@@ -49,49 +53,63 @@ pub(crate) fn extract_text(bytes: &[u8]) -> Result<String, String> {
         .map_err(|error| format!("Failed to extract text from PDF: {error}"))
 }
 
-/// Extract a remote PDF URL to text via the active PDF provider.
+/// Extract a remote PDF URL to text via the `pdf` slot's provider: the
+/// built-in local extractor unless the scalar names an installed pack, whose
+/// MCP binding then answers. Nothing here names a provider.
 pub(crate) async fn read_pdf_url_markdown(
     orch: &Orchestrator,
     url: &str,
 ) -> Result<String, String> {
-    match pdf::resolve_active_pdf(&orch.config_dir) {
-        PdfProviderId::Local => download_and_extract(url).await,
-        PdfProviderId::Bmd => bmd_pdf(orch, url).await,
+    match web_providers::resolve(&orch.config_dir, Slot::Pdf) {
+        Resolved::Unconfigured => download_and_extract(url).await,
+        Resolved::NotInstalled { name } => Ok(format!(
+            "The PDF provider `{name}` is selected but not installed. Install it from \
+             {LIBRARY_LOCATION}, or select Local there."
+        )),
+        Resolved::Invalid { name, error } => Err(format!(
+            "The PDF provider `{name}` is installed, but its declaration does not load: \
+             {error}. Update or reinstall it from {LIBRARY_LOCATION}."
+        )),
+        Resolved::Provider(active) => pack_pdf(orch, &active, url).await,
     }
 }
 
-/// bmd's `fetch` tool through the host MCP gateway, reusing the OAuth
-/// connection of the `bmd` MCP server. Removed when the PDF slot moves to a
-/// pack provider, as web fetch did.
-async fn bmd_pdf(orch: &Orchestrator, source: &str) -> Result<String, String> {
-    use crate::config::mcp_servers::McpServerConfigExt;
-    let Some(gateway) = orch.mcp_gateway() else {
-        return Err(
-            "The bmd PDF provider needs the MCP gateway, which is not available in this host."
-                .to_string(),
-        );
+/// A pack's PDF provider: a required option left blank is guidance, then its
+/// MCP binding runs. The parser admits no other adapter for this slot.
+async fn pack_pdf(
+    orch: &Orchestrator,
+    active: &web_providers::Active,
+    url: &str,
+) -> Result<String, String> {
+    let provider = &active.provider;
+    let label = provider.provider.label.as_str();
+    if let Some(option) =
+        cairn_packs::provider_options::missing_required(&provider.provider.options, &active.options)
+    {
+        return Ok(format!(
+            "{label} PDF extraction needs its {}. Set it in {LIBRARY_LOCATION}.",
+            option.label
+        ));
+    }
+    let Adapter::Mcp(binding) = &provider.provider.adapter else {
+        return Err(format!(
+            "The {label} PDF provider is not an MCP binding, which is the only form the PDF slot runs"
+        ));
     };
-    let servers = crate::config::mcp_servers::load_workspace_mcp_servers(&orch.config_dir);
-    let Some(config) = servers.get("bmd") else {
-        return Ok(
-            "The bmd PDF provider is not configured. Install and connect bmd in the Library, \
-             or switch the PDF provider to Local."
-                .to_string(),
-        );
+    let inputs = Inputs {
+        query: None,
+        target: Some(url),
+        credential: "",
+        options: &active.options,
     };
-    let credential_key = crate::config::secrets::credential_key("bmd", None);
-    let expanded = config.brokered(&credential_key, "bmd pdf")?;
-    gateway
-        .call_tool(
-            "cairn-pdf",
-            &credential_key,
-            &expanded,
-            "fetch",
-            serde_json::json!({ "source": source }),
-            Some(120_000),
-        )
-        .await
-        .map(|result| result.text)
+    match web_providers::mcp_call(orch, provider, binding, &inputs).await? {
+        McpOutcome::Text(text) => Ok(text),
+        McpOutcome::NotConnected => Ok(format!(
+            "{label} PDF extraction needs its MCP server `{}` connected. Connect it in \
+             {LIBRARY_LOCATION}.",
+            binding.server
+        )),
+    }
 }
 
 /// Pure-Rust extraction of a remote PDF: download the bytes and pull out the text.

@@ -29,7 +29,7 @@
 //! credential to a host the credential lists, an MCP binding may only name a
 //! server in its own pack, and every interpolation must be one the slot
 //! defines. Forms that are reserved for later (`run`/`tool:` accessors, the
-//! `tool` adapter, the `pdf` slot) parse and are refused as not supported yet,
+//! `tool` adapter, an `http` adapter for `pdf`) parse and are refused as not supported yet,
 //! so adopting them is not a schema change.
 
 pub mod binding;
@@ -600,6 +600,12 @@ fn parse_adapter(
     }
     let (form, body) = adapter.into_iter().next().expect("one entry");
     match form.as_str() {
+        // A PDF is extracted by a tool that takes the URL; the app has no
+        // path that would run a declared HTTP request for the slot, so a
+        // declaration of one would install, show ready, and never run.
+        Some("http") if slot == Slot::Pdf => Err(format!(
+            "adapter `http` for `pdf` is {NOT_SUPPORTED_YET}: it serves the `mcp` form"
+        )),
         Some("http") => {
             let credential = named_credential(slot, credential, credentials)?;
             http::parse_adapter(slot, options, credential, body).map(Adapter::Http)
@@ -651,9 +657,6 @@ pub fn parse_provider(
             "`provides: {}` must match the file name `{stem}.yaml`",
             slot.as_str()
         ));
-    }
-    if slot == Slot::Pdf {
-        return Err(format!("a `pdf` provider is {NOT_SUPPORTED_YET}"));
     }
     let mut keys = BTreeSet::new();
     let mut options = Vec::new();

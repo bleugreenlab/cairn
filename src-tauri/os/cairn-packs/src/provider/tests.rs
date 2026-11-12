@@ -190,7 +190,7 @@ fn reserved_forms_parse_and_are_refused_as_not_supported_yet() {
 }
 
 #[test]
-fn a_pdf_provider_is_not_supported_yet() {
+fn an_http_pdf_provider_is_not_supported_yet() {
     let cred = "label: K\nkind: secret\nvar: API_KEY\nhosts: [api.example.test]\naccessors: [provider:web-fetch, provider:pdf]\n";
     let fetch = |markdown: &str| {
         format!(
@@ -218,6 +218,32 @@ fn a_pdf_provider_is_not_supported_yet() {
     .unwrap();
     let error = load_pack_providers(&root, "example").unwrap_err();
     assert!(error.contains(NOT_SUPPORTED_YET), "{error}");
+}
+
+#[test]
+fn the_bundled_bmd_pack_binds_its_fetch_tool_to_the_pdf_slot() {
+    let pdf = bundled("bmd", Slot::Pdf);
+    let Adapter::Mcp(binding) = &pdf.provider.adapter else {
+        panic!("bmd's pdf provider is an MCP binding");
+    };
+    assert_eq!(
+        (binding.server.as_str(), binding.tool.as_str()),
+        ("bmd", "fetch")
+    );
+    let arguments = binding::arguments(
+        &pdf.provider,
+        binding,
+        &Inputs {
+            query: None,
+            target: Some("https://x.test/a.pdf"),
+            credential: "",
+            options: &Default::default(),
+        },
+    );
+    assert_eq!(
+        arguments,
+        serde_json::json!({ "source": "https://x.test/a.pdf" })
+    );
 }
 
 #[test]

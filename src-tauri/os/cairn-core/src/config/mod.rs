@@ -46,7 +46,6 @@ pub mod mcp_servers;
 pub mod mcp_setup;
 pub mod mcp_tools;
 pub mod pack;
-pub mod pdf;
 pub mod project_settings;
 pub mod recipes;
 pub mod responses;
