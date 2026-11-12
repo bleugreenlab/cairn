@@ -23882,7 +23882,7 @@ cairn-common = { path = "../cairn-common" }
 
     fn rust_lint_json(complete: bool) -> String {
         format!(
-            r#"{{"schemaVersion":1,"parser":"rust-lint","complete":{complete},"selection":"unknown","tests":[],"undeclaredSkips":0,"failures":[],"report":"✓ rustfmt: no formatting drift\n✓ clippy: no new findings in your diff"}}"#
+            r#"{{"schemaVersion":1,"parser":"rust-lint","complete":{complete},"selection":"unknown","tests":[],"undeclaredSkips":0,"failures":[],"report":"✓ rustfmt: no formatting drift\n✓ clippy: no findings in files your diff changed"}}"#
         )
     }
 
@@ -23895,10 +23895,10 @@ cairn-common = { path = "../cairn-common" }
 
 ❌ rustfmt: formatting drift — run `bun run fmt` to fix.
 Diff in /slots/slot-10/src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2805:
-❌ clippy: 1 new finding(s) in your diff
+❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)
 warning: this call to `clone` can be replaced with `std::slice::from_ref`
     --> os/cairn-core/src/execution/checks_turn_end.rs:2811:20
-  ℹ 15 pre-existing finding(s) on the base (not gating)";
+  ℹ 15 finding(s) in files your diff did not change (not gating)";
         let mut stderr = String::new();
         let mut crate_index = 0;
         while stderr.len() < 20_000 {
@@ -24003,11 +24003,14 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             observation.output_tail.as_str(),
         ] {
             assert!(
-                text.contains("❌ clippy: 1 new finding(s) in your diff"),
+                text.contains("❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)"),
                 "{text}"
             );
             assert!(text.contains("checks_turn_end.rs:2811"), "{text}");
-            assert!(text.contains("15 pre-existing"), "{text}");
+            assert!(
+                text.contains("15 finding(s) in files your diff did not change"),
+                "{text}"
+            );
             assert!(
                 text.find("❌ clippy").unwrap() < text.find("Final output:").unwrap(),
                 "the verdict leads the chatter: {text}"
@@ -24041,10 +24044,13 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "{summary}"
         );
         assert!(
-            summary.contains("```\n❌ clippy: 1 new finding(s) in your diff"),
+            summary.contains("```\n❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)"),
             "the excerpt is the lint's own report: {summary}"
         );
-        assert!(summary.contains("15 pre-existing"), "{summary}");
+        assert!(
+            summary.contains("15 finding(s) in files your diff did not change"),
+            "{summary}"
+        );
         assert!(
             !summary.contains("Checking crate-"),
             "the chatter after the report stays out of the inline summary: {summary}"
@@ -24408,7 +24414,7 @@ test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out";
     async fn a_complete_rust_lint_pass_is_a_verified_manual_verdict() {
         let db = cache_db().await;
         let body = format!(
-            "✓ clippy: no new findings in your diff\n{RESULT_ARTIFACT_JSON_MARKER}{}",
+            "✓ clippy: no findings in files your diff changed\n{RESULT_ARTIFACT_JSON_MARKER}{}",
             rust_lint_json(true)
         );
         let outcome = run_rust_lint(db.clone(), "ih-lint-pass", 0, body).await;

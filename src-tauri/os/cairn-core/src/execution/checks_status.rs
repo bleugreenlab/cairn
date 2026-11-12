@@ -4671,7 +4671,7 @@ mod tests {
                 suite_failures: 0,
                 phases: None,
                 deferred: 0,
-                report: Some("✓ clippy: no new findings in your diff".to_string()),
+                report: Some("✓ clippy: no findings in files your diff changed".to_string()),
                 failures: failures
                     .iter()
                     .map(|name| crate::execution::check_parsers::CheckFailure {
@@ -4759,7 +4759,7 @@ mod tests {
         );
     }
 
-    const LINT_REPORT: &str = "❌ clippy: 1 new finding(s) in your diff\n  b.rs:2  clippy::needless_clone  redundant clone\n  ℹ 15 pre-existing finding(s) on the base (not gating)\n❌ rustfmt: formatting drift in 1 file(s) — run `bun run fmt` to fix.\n  a.rs:1";
+    const LINT_REPORT: &str = "❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)\n  b.rs:2  clippy::needless_clone  redundant clone\n  ℹ 15 finding(s) in files your diff did not change (not gating)\n❌ rustfmt: formatting drift in 1 file(s) — run `bun run fmt` to fix.\n  a.rs:1";
 
     /// A rust-lint red whose stored excerpt is `lead` (a classification, or
     /// nothing), the report, then compile chatter, as the lane composes it.
@@ -4803,10 +4803,15 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("❌ clippy: 1 new finding(s) in your diff"),
+            body.contains(
+                "❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)"
+            ),
             "{body}"
         );
-        assert!(body.contains("15 pre-existing"), "{body}");
+        assert!(
+            body.contains("15 finding(s) in files your diff did not change"),
+            "{body}"
+        );
         assert!(!body.contains("Checking crate-7"), "{body}");
     }
 

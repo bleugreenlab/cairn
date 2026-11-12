@@ -3199,14 +3199,16 @@ real work
             Some("this call to `clone` can be replaced with `std::slice::from_ref`")
         );
         let report = parsed.report.as_deref().unwrap();
-        assert!(report.starts_with("❌ clippy: 1 new finding(s) in your diff"));
+        assert!(report.starts_with(
+            "❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)"
+        ));
         assert!(report.contains("❌ rustfmt: formatting drift in 1 file(s)"));
-        assert!(report.contains("15 pre-existing finding(s)"));
+        assert!(report.contains("15 finding(s) in files your diff did not change"));
     }
 
     #[test]
     fn a_report_excerpt_keeps_its_lead_and_drops_the_chatter_after_it() {
-        let report = "❌ clippy: 1 new finding(s) in your diff\n  b.rs:2  clippy::x";
+        let report = "❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)\n  b.rs:2  clippy::x";
         let stored = format!("infra reason\nEvidence:\nline\n\n{report}\n\nFinal output:\nchatter");
         assert_eq!(
             report_excerpt(report, &stored, 1_500),
@@ -3219,10 +3221,15 @@ real work
             parse_check_output("bun run check:rust", &result_line(RUST_LINT_FIXTURE)).unwrap();
         let excerpt = format_failure_excerpt(Some(&parsed), "chatter only");
         assert!(
-            excerpt.starts_with("❌ clippy: 1 new finding(s) in your diff"),
+            excerpt.starts_with(
+                "❌ clippy: 1 finding(s) in files your diff changed (lint every file you touch)"
+            ),
             "{excerpt}"
         );
-        assert!(excerpt.contains("15 pre-existing"), "{excerpt}");
+        assert!(
+            excerpt.contains("15 finding(s) in files your diff did not change"),
+            "{excerpt}"
+        );
         parsed.report = None;
         assert!(
             format_failure_excerpt(Some(&parsed), "chatter only").starts_with(
