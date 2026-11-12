@@ -98,6 +98,8 @@ mod team_connect;
 mod team_sync_loop;
 mod tenet_ruling_import;
 mod terminal_exit_wakes;
+#[cfg(unix)]
+mod test_litter;
 mod thread_db_resources;
 mod thread_db_rows;
 mod thread_dormancy;

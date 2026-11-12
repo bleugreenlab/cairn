@@ -765,11 +765,9 @@ mod callback_socket {
     pub(super) fn serve(relay: &TestMcpRelay) {
         RELAYS.lock().unwrap().push(relay.clone());
         SERVED.get_or_init(|| {
-            // Short and fixed under /tmp: a socket path has a ~104-byte limit,
-            // which a macOS per-user temp directory can exceed.
-            let dir = PathBuf::from(format!("/tmp/cairn-test-cb-{}", std::process::id()));
+            let dir = socket_dir();
             std::fs::create_dir_all(&dir).expect("create the test callback socket's directory");
-            let path = dir.join("executor.sock");
+            let path = dir.join(SOCKET_NAME);
             let listener =
                 cairn_common::lineage::bind(&path).expect("bind the test callback socket");
             listener
@@ -800,6 +798,78 @@ mod callback_socket {
             });
             path
         });
+    }
+
+    const SOCKET_NAME: &str = "executor.sock";
+
+    /// Under `sun_path`'s cap: 104 bytes on macOS and 108 on Linux, NUL included.
+    const SOCKET_PATH_MAX: usize = 100;
+
+    /// The short per-process directory under `/tmp`, named by pid so a later
+    /// process can tell whose it is.
+    pub(crate) const SHORT_DIR_PREFIX: &str = "cairn-test-cb-";
+
+    /// Where this process binds its callback socket, removed when it exits.
+    ///
+    /// The sealed temp directory when the socket's path fits there, because a
+    /// process killed before exit leaves it inside the seal root the runner
+    /// deletes. A deeper temp directory (a bare `cargo test` seals itself one
+    /// level down, and a macOS per-user temp directory starts long) falls back
+    /// to a short directory under `/tmp`, which nothing else would ever remove:
+    /// so each process sweeps the ones whose process is gone before adding its
+    /// own. A shared tmpfs `/tmp` once filled its inode table with these.
+    fn socket_dir() -> PathBuf {
+        let pid = std::process::id();
+        let sealed = std::env::temp_dir().join(format!("cb-{pid}"));
+        let dir = if sealed.join(SOCKET_NAME).as_os_str().len() <= SOCKET_PATH_MAX {
+            sealed
+        } else {
+            sweep_orphaned_short_dirs();
+            PathBuf::from(format!("/tmp/{SHORT_DIR_PREFIX}{pid}"))
+        };
+        remove_at_exit(dir.clone());
+        dir
+    }
+
+    /// Remove every short socket directory whose process no longer exists.
+    fn sweep_orphaned_short_dirs() {
+        let Ok(entries) = std::fs::read_dir("/tmp") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let pid = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix(SHORT_DIR_PREFIX))
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok());
+            if pid.is_some_and(|pid| pid > 0 && !process_exists(pid)) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    /// EPERM means the process exists under another user; only ESRCH is gone.
+    fn process_exists(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 delivers nothing; it only checks that `pid` exists.
+        let delivered = unsafe { libc::kill(pid, 0) } == 0;
+        delivered || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    /// Statics are never dropped, so the socket's directory goes at exit.
+    fn remove_at_exit(dir: PathBuf) {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        extern "C" fn remove_dir() {
+            if let Some(dir) = DIR.get() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        if DIR.set(dir).is_ok() {
+            // SAFETY: `remove_dir` is a plain `extern "C" fn()` that reads only a
+            // `OnceLock` set before registration.
+            unsafe {
+                libc::atexit(remove_dir);
+            }
+        }
     }
 
     async fn answer(

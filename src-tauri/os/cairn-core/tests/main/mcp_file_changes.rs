@@ -996,7 +996,7 @@ impl ChangeTestRepo {
         let dir = tempfile::tempdir().unwrap();
         let project = tempfile::Builder::new()
             .prefix("cairn-change-project-")
-            .tempdir_in("/tmp")
+            .tempdir()
             .unwrap();
         init_git_repo(project.path());
         prepare_base(project.path());
