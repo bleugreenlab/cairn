@@ -21995,6 +21995,7 @@ fn adopted_release_metadata(
         sandbox: None,
         containment: None,
         stop: None,
+        test_phase: None,
     }
 }
 

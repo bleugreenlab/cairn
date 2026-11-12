@@ -6004,8 +6004,9 @@ pub struct LearnedResourceEstimate {
 /// produces and only runner surfaces render: no executor decodes a placement
 /// rejection, so an executor of any version is unaffected. On the executor
 /// side, a colocated executor now lowers every child it spawns rather than
-/// compile classes only, and on macOS starts it under a utility QoS clamp with
-/// throttled disk I/O. That is how the executor schedules its own children,
+/// compile classes only, at nice 10 with throttled disk I/O (a macOS utility
+/// QoS clamp it first added confined lowered work to the efficiency cluster
+/// and was dropped by cairn/6990). That is how the executor schedules its own children,
 /// not anything it posts or admits: an older colocated executor lowers less,
 /// which is exactly what every runner has had until now.
 ///

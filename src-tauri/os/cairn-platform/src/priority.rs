@@ -2,9 +2,9 @@
 //! work they place on their own host.
 //!
 //! A runner shares its machine with the builds and test binaries its colocated
-//! executor runs. Those are lowered (nice 10, a utility QoS clamp and throttled
-//! disk I/O on macOS, the idle-adjacent I/O class on Linux; see the executor's
-//! child spawn), and the runner's own runtime threads are raised here, so under
+//! executor runs. Those are lowered (nice 10, with throttled disk I/O on macOS
+//! and the idle-adjacent I/O class on Linux; see the executor's child spawn),
+//! and the runner's own runtime threads are raised here, so under
 //! a saturated host the scheduler keeps choosing the process every agent's tool
 //! call is waiting on. On 10-16 the runner competed on equal terms with the
 //! rustc processes it placed and lost for minutes at a time.
@@ -54,8 +54,8 @@ pub fn raise_current_thread_for_orchestration() {
 /// cells at nice 10. Under Linux's CFS each step is a 1.25x weight, so five
 /// steps give the runner about three times an agent's CPU share and an agent
 /// about three times a cell's. On macOS each step lowers the base scheduling
-/// priority by about one level (measured: 31 at nice 0, 26 at nice 5, 20 for a
-/// cell at nice 10 under its utility clamp), with the runner's runtime threads
+/// priority by about one level (measured: 31 at nice 0, 26 at nice 5, 21 for a
+/// cell at nice 10), with the runner's runtime threads
 /// raised above all of them to user-initiated QoS.
 ///
 /// Relative rather than absolute, so an agent is below its runner whatever
