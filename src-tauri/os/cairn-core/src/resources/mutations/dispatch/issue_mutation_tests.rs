@@ -2862,7 +2862,7 @@ fn sample_resource(kind: cairn_uri::ResourceKind, mode: ChangeMode) -> CairnReso
         K::ProjectTenet => "cairn://p/cairn/tenets/1",
         K::ProjectCamps => "cairn://p/cairn/camps",
         K::ProjectCamp => "cairn://p/cairn/camps/rebuild",
-        K::ProjectCampParticipants => "cairn://p/cairn/camps/rebuild/participants",
+        K::ProjectCampMembers => "cairn://p/cairn/camps/rebuild/members",
         K::ProjectCampPosts => "cairn://p/cairn/camps/rebuild/posts",
         K::ChannelsConversations => "cairn://channels/conversations",
         K::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback",

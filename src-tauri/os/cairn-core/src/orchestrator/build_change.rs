@@ -2,8 +2,8 @@
 //!
 //! A rebuild concerns every thread, so it is addressed to each active
 //! project's base camp once, never to a list of threads: the fact log expands
-//! base camp to its participants by role (`crate::camps`), so a participant at
-//! `watch` reads it with its next run and one at `wake` is woken by it.
+//! base camp to its members, every open thread (`crate::camps`), and each
+//! reads it passively with its next run.
 //!
 //! A project outside the activity window is still told when a rebuild
 //! subscription of one of its threads fires on this boot: the firing
@@ -186,6 +186,7 @@ pub async fn announce_project(
             identity: notice_identity(change, project_id),
             summary: render(change),
             detail_uri: None,
+            actor_job_id: None,
         },
     )
     .await

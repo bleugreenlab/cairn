@@ -568,10 +568,10 @@ pub struct WakeWindow {
     pub max_window_ms: i64,
 }
 
-/// The clause-ref prefix of a passive route: a camp participant at `watch`.
-/// A wake's level, not this prefix, decides how it is delivered; the prefix
-/// survives so the delivered line can say which camp role reached it.
-pub const PASSIVE_FACT_REF_PREFIX: &str = "camp-watch:";
+/// The clause-ref namespace of a base camp delivery. A wake's level, not this
+/// prefix, decides how it is delivered; the prefix is identity only, distinct
+/// from direct addressing so a node can mute base camp apart from it.
+pub const PASSIVE_CAMP_FACT_REF_PREFIX: &str = "camp-passive:";
 
 /// Rank of a stored wake level, for `level = max(level, new)` in SQL.
 const LEVEL_RANK_SQL: &str = "CASE {} WHEN 'interrupt' THEN 2 WHEN 'wake' THEN 1 ELSE 0 END";
@@ -1156,7 +1156,7 @@ mod tests {
         let db = crate::storage::migrated_test_db("fact-log-coalesce-level.db").await;
         let passive = |job: &str, row: i64, at: i64| {
             let mut m = matched(job, "s", row, at);
-            m.clause_ref = format!("{PASSIVE_FACT_REF_PREFIX}s.mentions@watch");
+            m.clause_ref = format!("{PASSIVE_CAMP_FACT_REF_PREFIX}s.camp");
             m.level = "passive".into();
             m
         };

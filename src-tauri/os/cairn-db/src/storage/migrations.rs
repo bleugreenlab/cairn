@@ -2565,7 +2565,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("sessions", TableScope::ProjectScoped),
     ("skill_configs", TableScope::ProjectScoped),
     ("camps", TableScope::ProjectScoped),
-    ("camp_events", TableScope::ProjectScoped),
     ("suppressed_wakes", TableScope::ProjectScoped),
     // Where THIS operator has read up to in each thread's transcript. The thread
     // is shared; the reading of it is not. Replicating this would let a
@@ -2580,6 +2579,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // same reason.
     (
         "headline_read_cursors",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    // How far this operator has read each camp's posts, private like the
+    // posts it counts and for the same reason as the read positions above.
+    (
+        "camp_read_cursors",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
     // What THIS operator closed in their notification center. The facts behind
@@ -3471,7 +3476,6 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
             "parent_issue_id",
             "parent_job_id",
             "parent_thread_id",
-            "camp_id",
         ],
     },
     RekeyTableManifest {
@@ -3744,11 +3748,7 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "camps",
-        id_columns: &["id", "project_id", "lead_thread_id"],
-    },
-    RekeyTableManifest {
-        table: "camp_events",
-        id_columns: &["camp_id", "subject_key"],
+        id_columns: &["id", "project_id"],
     },
     // workflow_progress.id is the composite `{job_id}:{seq}` (a non-uuid, so
     // rekey_to_team leaves it as-is); job_id is the routable column that gets
@@ -6949,5 +6949,146 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod camps_conversations_migration_tests {
+    use super::*;
+    use crate::storage::{LocalDb, MigrationRunner, RowExt};
+
+    async fn text(db: &LocalDb, sql: &str) -> Option<String> {
+        db.query_opt_text(sql, ()).await.unwrap()
+    }
+
+    async fn count(db: &LocalDb, sql: &str) -> i64 {
+        db.query_opt_i64(sql, ()).await.unwrap().unwrap_or_default()
+    }
+
+    /// A database as the camps of cairn/6255 left it (a led base camp with
+    /// seated threads, a pitched camp with a wake thread and a human, an issue
+    /// joined to it, a queued receipt with a role reason, a pending wake on a
+    /// `camp-watch:` ref and a node's mute row on one) migrates to the
+    /// conversations shape with every one of those carried or retired.
+    #[tokio::test]
+    async fn camps_migrate_to_conversations_and_keep_their_mutes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join("camps-conversations.db"))
+            .await
+            .unwrap();
+        let at = TURSO_MIGRATIONS
+            .iter()
+            .position(|migration| migration.name() == "camps_conversations")
+            .expect("the camps conversations migration is registered");
+        MigrationRunner::new(TURSO_MIGRATIONS[..at].to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p', 'default', 'P', 'prj', '/tmp/p', 1, 1);
+             INSERT INTO threads(id, project_id, name, status, created_at, updated_at)
+               VALUES ('ta', 'p', 'alpha', 'active', 1, 1), ('tb', 'p', 'beta', 'active', 1, 1);
+             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+               VALUES ('j1', 'p', 'running', 1, 1);
+             INSERT INTO camps(id, project_id, slug, title, kind, lead_thread_id, status, created_at, updated_at)
+               VALUES ('cb', 'p', 'base', 'Base camp', 'base', 'ta', 'pitched', 1, 1),
+                      ('cx', 'p', 'x', 'X', 'camp', 'ta', 'pitched', 2, 2);
+             INSERT INTO camp_events(camp_id, policy_epoch, kind, created_at) VALUES ('cx', 0, 'pitched', 2);
+             INSERT INTO wake_subscriptions(id, source_kind, camp_id, subject_key, subject_json, camp_level, reason, created_at, updated_at)
+               VALUES ('b-ta', 'camp', 'cb', 'ta', '{}', 'watch', 'seated', 1, 1),
+                      ('b-tb', 'camp', 'cb', 'tb', '{}', 'watch', 'seated', 1, 1),
+                      ('x-tb', 'camp', 'cx', 'tb', '{}', 'wake', 'owns it', 3, 3),
+                      ('x-h', 'camp', 'cx', 'human:issuer' || char(31) || 'op', '{}', 'wake', 'watching', 4, 4);
+             INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at)
+               VALUES ('mute', 'j1', 'fact', 'camp-watch:post_created.camp@watch', 'muted', 'agent', 5, 5);
+             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at, camp_id)
+               VALUES ('i1', 'p', 1, 'Joined', 'active', 1, 1, 'cx');
+             INSERT INTO delivery_receipts(id, fact_key, recipient_kind, recipient_id, project_id, fact_row_id, level, reasons_json, state, created_at, updated_at)
+               VALUES ('r1', 'fact_log:post_created:1', 'thread', 'tb', 'p', 1, 'passive',
+                       '[{\"kind\":\"camp_role\",\"camp\":\"cb\",\"role\":\"watch\",\"level\":\"passive\"}]', 'queued', 1, 1);
+             INSERT INTO fact_log_wakes(recipient_key, level, source, clause_ref, project_id, first_row_id, last_row_id, count, opened_at, deliver_after)
+               VALUES ('thread:tb', 'passive', 'post_created', 'camp-watch:post_created.camp@watch', 'p', 1, 1, 1, 1, 1),
+                      ('thread:ta', 'wake', 'post_created', 'addressed:post_created.camp@lead', 'p', 1, 1, 1, 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS[at..].to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM camps WHERE status = 'active'").await,
+            2,
+            "base camp survives and a pitched camp is active"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM wake_subscriptions WHERE camp_id = 'cb'"
+            )
+            .await,
+            0,
+            "base camp keeps no member rows"
+        );
+        let members = db
+            .query_all(
+                "SELECT subject_key FROM wake_subscriptions WHERE camp_id = 'cx' ORDER BY subject_key",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            members,
+            ["operator", "ta", "tb"],
+            "the camp keeps its thread members and its lead, and its human is the operator"
+        );
+        assert!(
+            db.query_opt_text("SELECT camp_id FROM issues", ())
+                .await
+                .is_err(),
+            "issues.camp_id is gone"
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM issues").await, 1);
+        assert!(db
+            .query_opt_i64("SELECT COUNT(*) FROM camp_events", ())
+            .await
+            .is_err());
+        let reasons = text(
+            &db,
+            "SELECT reasons_json FROM delivery_receipts WHERE id = 'r1'",
+        )
+        .await
+        .unwrap();
+        assert!(reasons.contains("\"kind\":\"camp\""), "{reasons}");
+        assert!(!reasons.contains("camp_role"), "{reasons}");
+        assert_eq!(
+            text(
+                &db,
+                "SELECT source_ref FROM wake_subscriptions WHERE id = 'mute'"
+            )
+            .await
+            .as_deref(),
+            Some("camp-passive:post_created.camp"),
+            "the node's mute names the ref base camp now delivers under"
+        );
+        let clauses = db
+            .query_all(
+                "SELECT clause_ref FROM fact_log_wakes ORDER BY recipient_key",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            clauses,
+            [
+                "addressed:post_created.camp",
+                "camp-passive:post_created.camp"
+            ]
+        );
     }
 }

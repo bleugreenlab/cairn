@@ -161,12 +161,13 @@ async fn route_targeted(
     let Some(subscription) = persisted.or_else(|| match &event.source {
         WakeSource::Fact { clause_ref }
             if clause_ref.starts_with(ADDRESSED_FACT_REF_PREFIX)
-                || clause_ref.starts_with(CAMP_WATCH_FACT_REF_PREFIX) =>
+                || clause_ref.starts_with(PASSIVE_CAMP_FACT_REF_PREFIX) =>
         {
             Some(addressed_fact_subscription(
                 subscriber_job_id,
                 clause_ref,
                 &event.fact_kind,
+                event.urgency,
             ))
         }
         _ => None,
@@ -275,7 +276,7 @@ async fn route_broadcast_to(
     // How loudly: a candidate reached only through muted rows hears an
     // interrupt (marked), a ride-along event passively, and nothing else; any
     // other reason delivers at the event's own urgency, or passively when the
-    // loudest reason is a camp watch.
+    // loudest reason is passive (a base camp line).
     let (urgency, prefix, action) = if candidate.only_muted() {
         if event.urgency == DeliveryUrgency::Interrupt {
             (

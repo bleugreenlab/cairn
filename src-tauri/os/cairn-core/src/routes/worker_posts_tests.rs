@@ -1009,16 +1009,16 @@ async fn a_rotated_author_home_is_not_woken_by_its_own_post() {
     assert!(events_received(&db, "watcher-b-run").await.is_empty());
 }
 
-/// A post that names base camp reaches each participant by role, and a
-/// participant it also names directly is woken: base camp's passive `watch`
-/// never lowers what a direct mention gives it.
+/// A post that names base camp reaches every open thread passively, and a
+/// thread it also names directly is woken: base camp's passive line never
+/// lowers what a direct mention gives it.
 #[tokio::test]
-async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outranks_watch() {
+async fn a_post_naming_base_camp_reaches_every_thread_passively_and_a_mention_outranks_it() {
     let temp = tempfile::tempdir().unwrap();
     let (orch, db) = orchestrator(temp.path(), &[]).await;
     homes(&db).await;
-    // `other` (watcher2) leads; `ui` (watcher) and `feed` (reader) are at watch.
-    db.ensure_base_camp("p", "t2", 1).await.unwrap();
+    // `other` (watcher2), `ui` (watcher) and `feed` (reader) are base camp's.
+    db.ensure_base_camp("p", 1).await.unwrap();
 
     post(
         &orch,
@@ -1045,7 +1045,7 @@ async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outrank
         vec![
             (
                 "reader".to_string(),
-                "camp-watch:post_created.mentions@watch".to_string()
+                "camp-passive:post_created.mentions".to_string()
             ),
             (
                 "watcher".to_string(),
@@ -1053,10 +1053,10 @@ async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outrank
             ),
             (
                 "watcher2".to_string(),
-                "addressed:post_created.mentions@lead".to_string()
+                "camp-passive:post_created.mentions".to_string()
             ),
         ],
-        "one wake per participant, at the highest level any route reached it"
+        "one wake per thread, at the highest level any route reached it"
     );
     assert!(
         !clauses
@@ -1065,7 +1065,7 @@ async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outrank
         "another project's thread and the writer itself are never reached"
     );
 
-    // The watch participant reads the camp's line, from the camp, with the
+    // A base camp member reads the camp's line, from the camp, with the
     // author's words quoted beneath it; the mentioned thread, reached louder
     // by its mention, reads an event.
     let (sender, told) = db
@@ -1076,10 +1076,10 @@ async fn a_post_naming_a_camp_reaches_participants_by_role_and_a_mention_outrank
         )
         .await
         .unwrap()
-        .expect("the watch participant was told");
+        .expect("the base camp member was told");
     assert_eq!(sender, "cairn://p/cairn/camps/base");
     assert!(
-        told.starts_with("From camp base (your role: watch): Rebuild interface \u{2014} "),
+        told.starts_with("From camp base: Rebuild interface \u{2014} "),
         "{told}"
     );
     assert!(

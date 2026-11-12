@@ -107,7 +107,7 @@ resource_samples! {
     ProjectTenet { project: project(), key: "3".to_string() } => Parser,
     ProjectCamps { project: project() } => Parser,
     ProjectCamp { project: project(), slug: "rebuild".to_string() } => Parser,
-    ProjectCampParticipants { project: project(), slug: "base".to_string() } => Parser,
+    ProjectCampMembers { project: project(), slug: "base".to_string() } => Parser,
     ProjectCampPosts { project: project(), slug: "rebuild".to_string() } => Parser,
     ProjectPages { project: project() } => Parser,
     ProjectCodemap { project: project() } => Parser,

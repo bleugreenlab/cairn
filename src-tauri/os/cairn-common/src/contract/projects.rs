@@ -416,7 +416,7 @@ pub(crate) const PROJECT_ISSUES_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[TITLE],
-            optional: &[DESCRIPTION, EXECUTION, PARENT, ISSUE_CAMP, LABELS],
+            optional: &[DESCRIPTION, EXECUTION, PARENT, LABELS],
             label: "create issue",
             example: "write({changes:[{target:\"cairn://p/PROJECT/issues\",mode:\"append\",payload:{title:\"...\"}}]})",
         }],

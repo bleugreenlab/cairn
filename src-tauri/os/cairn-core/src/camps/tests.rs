@@ -1,5 +1,5 @@
 use super::*;
-use crate::models::{CampRole, CreateProject};
+use crate::models::{CampSubject, CreateProject};
 use crate::services::Clock;
 use crate::storage::{migrated_test_db, RowExt};
 
@@ -11,137 +11,6 @@ impl Clock for FixedClock {
     fn now_u64(&self) -> u64 {
         1234
     }
-}
-
-async fn project(db: &LocalDb, id: &str, key: &str) {
-    crate::projects::crud::create_db(
-        db,
-        &FixedClock,
-        &CreateProject {
-            id: Some(id.to_string()),
-            name: key.to_string(),
-            key: key.to_string(),
-            repo_path: String::new(),
-            team_id: None,
-        },
-    )
-    .await
-    .unwrap();
-}
-
-async fn thread(db: &LocalDb, project_id: &str, name: &str) -> String {
-    crate::threads::crud::create(
-        db,
-        CreateThread {
-            project_id: project_id.to_string(),
-            name: Some(name.to_string()),
-            jurisdiction: None,
-            definition: None,
-            migrated_from_number: None,
-            model: None,
-        },
-    )
-    .await
-    .unwrap()
-    .id
-}
-
-#[tokio::test]
-async fn a_project_without_threads_is_given_a_general_thread_that_leads_base_camp() {
-    let db = migrated_test_db("camps-birth-empty").await;
-    project(&db, "p-empty", "empty").await;
-
-    let camp = ensure_project_base_camp(&db, "p-empty").await.unwrap();
-    let general = db
-        .query_opt_text(
-            "SELECT id FROM threads WHERE project_id = 'p-empty' AND name = 'general'",
-            (),
-        )
-        .await
-        .unwrap()
-        .expect("birth created the general thread");
-    assert_eq!(camp.lead_thread_id, general);
-    let participants = db.camp_participants(&camp).await.unwrap();
-    assert_eq!(participants.len(), 1);
-    assert_eq!(participants[0].role, CampRole::Lead);
-
-    let again = ensure_project_base_camp(&db, "p-empty").await.unwrap();
-    assert_eq!(again.id, camp.id, "birth is idempotent");
-    let threads = db
-        .query_all(
-            "SELECT id FROM threads WHERE project_id = 'p-empty'",
-            (),
-            |row| row.get::<String>(0).map_err(Into::into),
-        )
-        .await
-        .unwrap();
-    assert_eq!(threads.len(), 1, "a retry creates no second general thread");
-}
-
-#[tokio::test]
-async fn existing_threads_are_seated_and_later_threads_join_at_birth() {
-    let db = migrated_test_db("camps-birth-existing").await;
-    project(&db, "p-full", "full").await;
-    let general = thread(&db, "p-full", "general").await;
-    let devops = thread(&db, "p-full", "devops").await;
-
-    let camp = ensure_project_base_camp(&db, "p-full").await.unwrap();
-    assert_eq!(
-        camp.lead_thread_id, general,
-        "an existing general thread is reused"
-    );
-
-    let later = thread(&db, "p-full", "later").await;
-    let participants = db.camp_participants(&camp).await.unwrap();
-    // The lead first; the watchers seated in the same second tie on time.
-    assert_eq!(participants[0].subject_key, general);
-    let mut watchers: Vec<_> = participants[1..]
-        .iter()
-        .map(|p| p.subject_key.clone())
-        .collect();
-    watchers.sort();
-    let mut expected = vec![devops.clone(), later.clone()];
-    expected.sort();
-    assert_eq!(watchers, expected);
-    assert!(participants[1..].iter().all(|p| p.role == CampRole::Watch));
-    assert_eq!(
-        db.camps_for_thread(&later).await.unwrap()[0].1,
-        CampRole::Watch,
-        "a thread born after base camp joins it inside its own creation"
-    );
-}
-
-#[tokio::test]
-async fn a_project_with_threads_but_no_general_is_given_one_to_lead_base_camp() {
-    let db = migrated_test_db("camps-birth-no-general").await;
-    // A project whose threads predate base camp, as at the first boot.
-    bare_project(&db, "p-busy", "busy", &[]).await;
-    let main = thread(&db, "p-busy", "main").await;
-    let coaching = thread(&db, "p-busy", "coaching").await;
-
-    let camp = ensure_project_base_camp(&db, "p-busy").await.unwrap();
-    let general = db
-        .query_opt_text(
-            "SELECT id FROM threads WHERE project_id = 'p-busy' AND name = 'general'",
-            (),
-        )
-        .await
-        .unwrap()
-        .expect("birth mints general beside the existing threads");
-    assert_eq!(
-        camp.lead_thread_id, general,
-        "general leads, not the oldest thread"
-    );
-    let participants = db.camp_participants(&camp).await.unwrap();
-    assert_eq!(participants[0].subject_key, general);
-    let mut watchers: Vec<_> = participants[1..]
-        .iter()
-        .map(|p| (p.subject_key.clone(), p.role))
-        .collect();
-    watchers.sort();
-    let mut expected = vec![(main, CampRole::Watch), (coaching, CampRole::Watch)];
-    expected.sort();
-    assert_eq!(watchers, expected);
 }
 
 async fn bare_project(db: &LocalDb, id: &str, key: &str, threads: &[(&str, &str)]) {
@@ -169,58 +38,50 @@ async fn bare_project(db: &LocalDb, id: &str, key: &str, threads: &[(&str, &str)
     }
 }
 
-async fn general_of(db: &LocalDb, project_id: &str) -> Option<String> {
-    db.query_opt_text(
-        "SELECT id FROM threads WHERE project_id = ?1 AND name = 'general'",
-        (project_id.to_string(),),
+/// A project is born with its general thread and its base camp, whose one
+/// member is that thread; establishing base camp again writes nothing.
+#[tokio::test]
+async fn a_project_is_born_with_a_general_thread_and_base_camp() {
+    let db = migrated_test_db("camps-birth").await;
+    crate::projects::crud::create(
+        &db,
+        &FixedClock,
+        CreateProject {
+            id: Some("p-new".to_string()),
+            name: "new".to_string(),
+            key: "new".to_string(),
+            repo_path: String::new(),
+            team_id: None,
+        },
+        None,
+        None,
     )
     .await
-    .unwrap()
-}
-
-/// Base camps an earlier birth led by the project's oldest thread are moved to
-/// a general thread minted at boot; a lead that was handed over is not, and a
-/// second boot writes nothing.
-#[tokio::test]
-async fn boot_repairs_fallback_led_base_camps_once_and_leaves_handed_leads() {
-    use cairn_db::storage::camps::{accept_lead_conn, offer_lead_conn};
-    let local = std::sync::Arc::new(migrated_test_db("camps-boot-repair").await);
-    // As the oldest-thread fallback left them: `rs` led by `main`, and `crs`
-    // led by `coaching` until it handed the lead to `hardware`.
-    bare_project(&local, "p-rs", "rs", &[("rs-main", "main"), ("rs-x", "x")]).await;
-    bare_project(
-        &local,
-        "p-crs",
-        "crs",
-        &[("crs-coaching", "coaching"), ("crs-hw", "hardware")],
-    )
-    .await;
-    local.ensure_base_camp("p-rs", "rs-main", 10).await.unwrap();
-    let (crs, _) = local
-        .ensure_base_camp("p-crs", "crs-coaching", 10)
-        .await
-        .unwrap();
-    let c = crs.clone();
-    local
-        .write(move |conn| {
-            let c = c.clone();
-            Box::pin(async move { offer_lead_conn(conn, &c, "crs-hw", None, 11).await })
-        })
-        .await
-        .unwrap();
-    let offered = local
-        .camp_by_slug("p-crs", BASE_CAMP_SLUG)
+    .unwrap();
+    let general = db
+        .query_opt_text(
+            "SELECT id FROM threads WHERE project_id = 'p-new' AND name = 'general'",
+            (),
+        )
         .await
         .unwrap()
-        .unwrap();
-    local
-        .write(move |conn| {
-            let o = offered.clone();
-            Box::pin(async move { accept_lead_conn(conn, &o, "crs-hw", None, 12).await })
-        })
-        .await
-        .unwrap();
-    // A project that has no base camp yet is born with general as lead.
+        .expect("birth created the general thread");
+    let camp = ensure_project_base_camp(&db, "p-new").await.unwrap();
+    assert!(camp.is_base());
+    let members = db.camp_members(&camp).await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].subject_key, general);
+    let again = ensure_project_base_camp(&db, "p-new").await.unwrap();
+    assert_eq!(again.id, camp.id, "birth is idempotent");
+}
+
+/// The boot backfill gives a project with no base camp one and leaves every
+/// other alone; a second boot writes nothing.
+#[tokio::test]
+async fn boot_establishes_missing_base_camps_once() {
+    let local = std::sync::Arc::new(migrated_test_db("camps-boot").await);
+    bare_project(&local, "p-old", "old", &[("old-a", "a")]).await;
+    local.ensure_base_camp("p-old", 10).await.unwrap();
     bare_project(&local, "p-new", "fresh", &[("new-a", "a")]).await;
 
     let search = std::sync::Arc::new(
@@ -229,154 +90,96 @@ async fn boot_repairs_fallback_led_base_camps_once_and_leaves_handed_leads() {
     let dbs = DbState::new(local.clone(), search);
     let report = bootstrap_base_camps(&dbs).await;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
-    assert_eq!(report.repaired, ["rs"]);
     assert_eq!(report.established, ["fresh"]);
-
-    let rs_general = general_of(&local, "p-rs")
-        .await
-        .expect("general minted for rs");
-    let rs = local
-        .camp_by_slug("p-rs", BASE_CAMP_SLUG)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(rs.lead_thread_id, rs_general);
-    let participants = local.camp_participants(&rs).await.unwrap();
-    assert_eq!(participants.len(), 3);
-    assert_eq!(participants[0].subject_key, rs_general);
-    assert!(participants[1..]
-        .iter()
-        .all(|p| p.role == CampRole::Watch && !p.lead));
-    let (kind, old, new) = local
-        .query_opt(
-            "SELECT kind, old_value, new_value FROM camp_events
-             WHERE camp_id = ?1 ORDER BY id DESC LIMIT 1",
-            (rs.id.clone(),),
-            |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(kind, "lead_changed");
-    assert_eq!(
-        old.as_deref(),
-        Some("rs-main"),
-        "the history names the old lead"
-    );
-    assert_eq!(new, Some(rs_general));
-
-    let crs_after = local
-        .camp_by_slug("p-crs", BASE_CAMP_SLUG)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(crs_after.lead_thread_id, "crs-hw", "a handed lead stays");
-    assert_eq!(
-        general_of(&local, "p-crs").await,
-        None,
-        "nothing minted there"
-    );
     let fresh = local
         .camp_by_slug("p-new", BASE_CAMP_SLUG)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        Some(fresh.lead_thread_id),
-        general_of(&local, "p-new").await
-    );
+    assert_eq!(local.camp_members(&fresh).await.unwrap().len(), 1);
 
     let count = |sql: &'static str| {
         let local = local.clone();
         async move { local.query_opt_i64(sql, ()).await.unwrap().unwrap() }
     };
-    let (events, threads, camps) = (
-        count("SELECT COUNT(*) FROM camp_events").await,
+    let (threads, camps) = (
         count("SELECT COUNT(*) FROM threads").await,
         count("SELECT MAX(updated_at) FROM camps").await,
     );
     let again = bootstrap_base_camps(&dbs).await;
-    assert!(again.errors.is_empty() && again.repaired.is_empty() && again.established.is_empty());
-    assert_eq!(count("SELECT COUNT(*) FROM camp_events").await, events);
+    assert!(again.errors.is_empty() && again.established.is_empty());
     assert_eq!(count("SELECT COUNT(*) FROM threads").await, threads);
     assert_eq!(count("SELECT MAX(updated_at) FROM camps").await, camps);
 }
 
-/// One base camp notice is one fact row, and it reaches each participant at
-/// its own role: the lead and a `wake` participant are woken with the camp's
-/// framing, a `watch` participant is told passively.
-#[tokio::test]
-async fn a_camp_notice_is_one_fact_delivered_to_each_participant_by_role() {
-    use crate::models::CampLevel;
-    use cairn_db::storage::camps::{set_camp_level_conn, CampAssignedBy};
+fn rebuild_notice<'a>(camp_slug: &'a str, identity: &str) -> CampNotice<'a> {
+    CampNotice {
+        project_id: "p",
+        project_key: "cairn",
+        camp_slug,
+        kind: "rebuild",
+        identity: identity.to_string(),
+        summary: "Cairn was rebuilt.".into(),
+        detail_uri: None,
+        actor_job_id: None,
+    }
+}
 
+/// The fixture's thread `t` (session `watcher`), plus `tl` and `tq` with
+/// running sessions and a closed thread `tc`.
+async fn notice_fixture() -> (
+    tempfile::TempDir,
+    crate::orchestrator::Orchestrator,
+    std::sync::Arc<LocalDb>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
-    // `t`/`watcher` is the fixture's thread session; add a lead and a quiet one.
     db.execute_batch(
         "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('tl','p','general','active',1,1);
          INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('lead-job','tl','p','running','thread',1,1);
          INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('lead-run','lead-job','running',1,1);
          INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('tq','p','quiet','active',1,1);
          INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('quiet-job','tq','p','running','thread',1,1);
-         INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('quiet-run','quiet-job','running',1,1);",
+         INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('quiet-run','quiet-job','running',1,1);
+         INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('tc','p','closed','closed',1,1);
+         INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('closed-job','tc','p','idle','thread',1,1);",
     )
     .await
     .unwrap();
-    let (base, _) = db.ensure_base_camp("p", "tl", 1).await.unwrap();
-    let camp = base.clone();
-    db.write(move |conn| {
-        let camp = camp.clone();
-        Box::pin(async move {
-            set_camp_level_conn(
-                conn,
-                &camp,
-                &crate::models::CampSubject::Thread {
-                    thread_id: "t".into(),
-                },
-                CampLevel::Wake,
-                "rebuilds change what I route",
-                CampAssignedBy::Agent,
-                None,
-                2,
-            )
-            .await
-        })
-    })
-    .await
-    .unwrap();
+    (temp, orch, db)
+}
 
-    let id = notify_camp(
-        &orch,
-        CampNotice {
-            project_id: "p",
-            project_key: "cairn",
-            camp_slug: crate::models::BASE_CAMP_SLUG,
-            kind: "rebuild",
-            identity: "build-change:test".into(),
-            summary: "Cairn was rebuilt.".into(),
-            detail_uri: None,
-        },
-    )
-    .await
-    .unwrap()
-    .expect("a new identity mints a row");
-    assert!(
-        notify_camp(
-            &orch,
-            CampNotice {
-                project_id: "p",
-                project_key: "cairn",
-                camp_slug: crate::models::BASE_CAMP_SLUG,
-                kind: "rebuild",
-                identity: "build-change:test".into(),
-                summary: "Cairn was rebuilt.".into(),
-                detail_uri: None,
-            },
+async fn wakes_of(db: &LocalDb, row: i64) -> Vec<(String, String, Option<String>)> {
+    let mut wakes = db
+        .query_all(
+            "SELECT recipient_key, clause_ref, delivered_action FROM fact_log_wakes
+             WHERE first_row_id = ?1",
+            (row,),
+            |row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)),
         )
         .await
+        .unwrap();
+    wakes.sort();
+    wakes
+}
+
+/// One base camp notice is one fact row, and it reaches every open thread
+/// passively: it rides along at each one's next turn and wakes none. A closed
+/// thread is not told.
+#[tokio::test]
+async fn a_base_camp_notice_is_one_fact_told_passively_to_every_open_thread() {
+    let (_temp, orch, db) = notice_fixture().await;
+    db.ensure_base_camp("p", 1).await.unwrap();
+
+    let id = notify_camp(&orch, rebuild_notice(BASE_CAMP_SLUG, "build-change:test"))
+        .await
         .unwrap()
-        .is_none(),
+        .expect("a new identity mints a row");
+    assert!(
+        notify_camp(&orch, rebuild_notice(BASE_CAMP_SLUG, "build-change:test"))
+            .await
+            .unwrap()
+            .is_none(),
         "the same notice minted twice is one fact"
     );
     crate::routes::drain_fact_log(&orch).await;
@@ -389,37 +192,19 @@ async fn a_camp_notice_is_one_fact_delivered_to_each_participant_by_role() {
         .await
         .unwrap(),
         Some(1),
-        "one row however many participants"
+        "one row however many members"
     );
-    let mut wakes = db
-        .query_all(
-            "SELECT job_id, clause_ref, delivered_action FROM fact_log_wakes
-             WHERE first_row_id = ?1 ORDER BY job_id",
-            (id,),
-            |row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)),
+    let passive = |thread: &str| {
+        (
+            format!("thread:{thread}"),
+            "camp-passive:camp_notice.camp".to_string(),
+            Some("suppressed".to_string()),
         )
-        .await
-        .unwrap();
-    wakes.sort();
+    };
     assert_eq!(
-        wakes,
-        vec![
-            (
-                "lead-job".to_string(),
-                "addressed:camp_notice.camp@lead".to_string(),
-                Some("delivered".to_string())
-            ),
-            (
-                "quiet-job".to_string(),
-                "camp-watch:camp_notice.camp@watch".to_string(),
-                Some("suppressed".to_string())
-            ),
-            (
-                "watcher".to_string(),
-                "addressed:camp_notice.camp@wake".to_string(),
-                Some("delivered".to_string())
-            ),
-        ]
+        wakes_of(&db, id).await,
+        vec![passive("t"), passive("tl"), passive("tq")],
+        "every open thread is told passively; the closed one is not told"
     );
     let told = db
         .query_opt_text(
@@ -428,19 +213,76 @@ async fn a_camp_notice_is_one_fact_delivered_to_each_participant_by_role() {
         )
         .await
         .unwrap()
-        .expect("the wake participant was told");
+        .expect("the thread was told");
     assert!(
-        told.starts_with("From camp base (your role: wake): Cairn was rebuilt."),
+        told.starts_with("From camp base: Cairn was rebuilt."),
+        "{told}"
+    );
+}
+
+/// A notice to a camp wakes each of its thread members once, named by the
+/// camp, and reaches no other thread.
+#[tokio::test]
+async fn a_camp_notice_wakes_each_thread_member() {
+    let (_temp, orch, db) = notice_fixture().await;
+    db.write(|conn| {
+        Box::pin(async move {
+            cairn_db::storage::camps::create_camp_conn(
+                conn,
+                &cairn_db::storage::camps::NewCamp {
+                    project_id: "p".into(),
+                    slug: "talk".into(),
+                    title: "Talk".into(),
+                },
+                &CampSubject::Thread {
+                    thread_id: "tl".into(),
+                },
+                &[
+                    CampSubject::Thread {
+                        thread_id: "t".into(),
+                    },
+                    CampSubject::Operator,
+                ],
+                1,
+            )
+            .await
+        })
+    })
+    .await
+    .unwrap();
+    let id = notify_camp(&orch, rebuild_notice("talk", "talk:test"))
+        .await
+        .unwrap()
+        .unwrap();
+    crate::routes::drain_fact_log(&orch).await;
+    let woke = |thread: &str| {
+        (
+            format!("thread:{thread}"),
+            "addressed:camp_notice.camp".to_string(),
+            Some("delivered".to_string()),
+        )
+    };
+    assert_eq!(wakes_of(&db, id).await, vec![woke("t"), woke("tl")]);
+    let told = db
+        .query_opt_text(
+            "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'watcher-run') ORDER BY created_at DESC LIMIT 1",
+            (),
+        )
+        .await
+        .unwrap()
+        .expect("a member was woken");
+    assert!(
+        told.starts_with("From camp talk: Cairn was rebuilt."),
         "{told}"
     );
 }
 
 /// A team project's base camp lives in its team replica, and so do its
-/// participants' jobs. The notice reaches them: their jurisdiction is the
-/// team project the camp named, not a private-database lookup that cannot
-/// find them.
+/// threads' jobs. The notice reaches them: their jurisdiction is the team
+/// project the camp named, not a private-database lookup that cannot find
+/// them.
 #[tokio::test]
-async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica() {
+async fn a_team_camp_notice_reaches_threads_that_exist_only_in_the_replica() {
     let temp = tempfile::tempdir().unwrap();
     let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
     let team = std::sync::Arc::new(migrated_test_db("camps-team-replica").await);
@@ -456,7 +298,7 @@ async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica(
     ))
     .await
     .unwrap();
-    team.ensure_base_camp(project, thread, 1).await.unwrap();
+    team.ensure_base_camp(project, 1).await.unwrap();
     orch.db
         .register_team_db_for_test("teamT".to_string(), team.clone())
         .await;
@@ -467,11 +309,7 @@ async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica(
         CampNotice {
             project_id: project,
             project_key: "tp",
-            camp_slug: crate::models::BASE_CAMP_SLUG,
-            kind: "rebuild",
-            identity: "build-change:team".into(),
-            summary: "Cairn was rebuilt.".into(),
-            detail_uri: None,
+            ..rebuild_notice(BASE_CAMP_SLUG, "build-change:team")
         },
     )
     .await
@@ -485,7 +323,7 @@ async fn a_team_camp_notice_reaches_participants_that_exist_only_in_the_replica(
         )
         .await
         .unwrap();
-    assert_eq!(reached, ["addressed:camp_notice.camp@lead"]);
+    assert_eq!(reached, ["camp-passive:camp_notice.camp"]);
 }
 
 /// A coalesced camp wake carrying several facts shows each fact's camp line,
@@ -501,7 +339,7 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
     )
     .await
     .unwrap();
-    db.ensure_base_camp("p", "t", 1).await.unwrap();
+    db.ensure_base_camp("p", 1).await.unwrap();
     let mut rows = Vec::new();
     for (identity, summary) in [
         ("drain:a", "bgsrv-ub drains."),
@@ -511,13 +349,9 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
             notify_camp(
                 &orch,
                 CampNotice {
-                    project_id: "p",
-                    project_key: "cairn",
-                    camp_slug: crate::models::BASE_CAMP_SLUG,
                     kind: "drain",
-                    identity: identity.into(),
                     summary: summary.into(),
-                    detail_uri: None,
+                    ..rebuild_notice(BASE_CAMP_SLUG, identity)
                 },
             )
             .await
@@ -539,7 +373,7 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
     assert_eq!(
         told[0].1,
         format!(
-            "From camp base (your role: watch): bgsrv-ub drains. \u{2014} cairn://p/cairn/events/{}\nFrom camp base (your role: watch): bgsrv-ub is back. \u{2014} cairn://p/cairn/events/{}",
+            "From camp base: bgsrv-ub drains. \u{2014} cairn://p/cairn/events/{}\nFrom camp base: bgsrv-ub is back. \u{2014} cairn://p/cairn/events/{}",
             rows[0], rows[1]
         )
     );
@@ -562,8 +396,8 @@ async fn a_coalesced_camp_wake_shows_each_fact_s_camp_line() {
 }
 
 /// Specimen 4: one base camp notice is one fact row and one receipt per
-/// participant, however many threads the project has, and neither a second
-/// drain nor a restart's recovery adds a message or loses a receipt.
+/// thread, however many threads the project has, and neither a second drain
+/// nor a restart's recovery adds a message or loses a receipt.
 #[tokio::test]
 async fn a_camp_notice_is_one_row_and_one_receipt_per_thread_at_any_size() {
     for threads in [1usize, 3, 25] {
@@ -578,18 +412,10 @@ async fn a_camp_notice_is_one_row_and_one_receipt_per_thread_at_any_size() {
             ));
         }
         db.execute_batch(&seed).await.unwrap();
-        db.ensure_base_camp("p", "t", 1).await.unwrap();
+        db.ensure_base_camp("p", 1).await.unwrap();
         notify_camp(
             &orch,
-            CampNotice {
-                project_id: "p",
-                project_key: "cairn",
-                camp_slug: crate::models::BASE_CAMP_SLUG,
-                kind: "rebuild",
-                identity: format!("build-change:{threads}"),
-                summary: "Cairn was rebuilt.".into(),
-                detail_uri: None,
-            },
+            rebuild_notice(BASE_CAMP_SLUG, &format!("build-change:{threads}")),
         )
         .await
         .unwrap();
@@ -598,27 +424,27 @@ async fn a_camp_notice_is_one_row_and_one_receipt_per_thread_at_any_size() {
             let db = db.clone();
             async move { db.query_opt_i64(sql, ()).await.unwrap().unwrap() }
         };
-        let participants = threads as i64 + 1;
+        let members = threads as i64 + 1;
         assert_eq!(
             count("SELECT COUNT(*) FROM fact_log WHERE source = 'camp_notice'").await,
             1
         );
         assert_eq!(
             count("SELECT COUNT(*) FROM delivery_receipts WHERE state = 'delivered'").await,
-            participants,
+            members,
             "{threads} threads"
         );
         let told = "SELECT COUNT(*) FROM messages WHERE content LIKE 'From camp base%'";
-        assert_eq!(count(told).await, participants);
+        assert_eq!(count(told).await, members);
 
         crate::storage::recover_fact_log(&db, i64::MAX / 2, 0)
             .await
             .unwrap();
         crate::routes::drain_fact_log(&orch).await;
-        assert_eq!(count(told).await, participants, "recovery adds nothing");
+        assert_eq!(count(told).await, members, "recovery adds nothing");
         assert_eq!(
             count("SELECT COUNT(*) FROM delivery_receipts").await,
-            participants
+            members
         );
     }
 }

@@ -2484,7 +2484,7 @@ mod rebuild {
     const TARGET: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const CONTAINING: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const OLDER: &str = "cccccccccccccccccccccccccccccccccccccccc";
-    const WAKE_LINE: &str = "From camp base (your role: wake \u{2014} rebuild subscription): Cairn was rebuilt: 0.13.8 (content-v1:test) \u{2192} 0.13.9 (content-v2:test)";
+    const WAKE_LINE: &str = "From camp base: Cairn was rebuilt: 0.13.8 (content-v1:test) \u{2192} 0.13.9 (content-v2:test)";
     const BASE_CAMP: &str = "cairn://p/cairn/camps/base";
 
     /// `CONTAINING` contains `TARGET`; nothing else contains anything.
@@ -2990,9 +2990,9 @@ mod rebuild {
         );
     }
 
-    /// Base camp with a `watch` participant, thread `n0`, beside the routes
-    /// fixture's thread `t` (base camp's lead). The project took no turns, so
-    /// it is outside the rebuild announcement's activity window.
+    /// Base camp, whose members are thread `n0` and the routes fixture's
+    /// thread `t`. The project took no turns, so it is outside the rebuild
+    /// announcement's activity window.
     async fn camp_fixture(temp: &std::path::Path) -> (Orchestrator, Arc<LocalDb>) {
         let (orch, db) = crate::routes::fixture::orchestrator(temp, &[]).await;
         db.execute_batch(
@@ -3002,7 +3002,7 @@ mod rebuild {
         )
         .await
         .unwrap();
-        db.ensure_base_camp("p", "t", 1).await.unwrap();
+        db.ensure_base_camp("p", 1).await.unwrap();
         (orch, db)
     }
 
@@ -3085,8 +3085,8 @@ mod rebuild {
         .expect("the subscription or its firing")
     }
 
-    /// (a) A boot firing for a base-camp `watch` participant is one message at
-    /// wake, framed by camp, when the camp fact was indexed first.
+    /// (a) A boot firing for a base camp member is one message at wake, framed
+    /// by camp, when the camp fact was indexed first.
     #[tokio::test]
     async fn a_boot_firing_beside_an_indexed_camp_fact_is_one_camp_message_at_wake() {
         let temp = tempfile::tempdir().unwrap();
@@ -3169,7 +3169,7 @@ mod rebuild {
         assert!(
             passive[0]
                 .1
-                .starts_with("From camp base (your role: watch): Cairn was rebuilt"),
+                .starts_with("From camp base: Cairn was rebuilt"),
             "{}",
             passive[0].1
         );
@@ -3302,7 +3302,7 @@ mod rebuild {
                 ));
             }
             db.execute_batch(&seed).await.unwrap();
-            db.ensure_base_camp("p", "t", 1).await.unwrap();
+            db.ensure_base_camp("p", 1).await.unwrap();
             for n in 0..threads {
                 subscribe_rebuild_once(
                     &orch,

@@ -292,11 +292,6 @@ pub(crate) const PARENT: KeySpec = KeySpec::new(
     KeyType::Str,
     "canonical issue URI (cairn://p/PROJECT/N) or thread URI (cairn://p/PROJECT/thread-name) of the parent: an issue parent also confers branch ancestry (the child branches from / PRs into it), a thread parent routes attention only; defaults to the thread the creating agent is acting for, and to unparented outside a thread",
 );
-pub(crate) const ISSUE_CAMP: KeySpec = KeySpec::new(
-    "camp",
-    KeyType::Str,
-    "canonical camp URI (cairn://p/PROJECT/camps/SLUG) to join the issue to, separately from its parent; your thread must take part in the camp. An issue is in at most one camp; null takes it out",
-);
 pub(crate) const TODOS: KeySpec = KeySpec::new("todos", KeyType::Array, "");
 pub(crate) const CONFIRMED: KeySpec = KeySpec::new(
     "confirmed",
@@ -1234,12 +1229,12 @@ pub(crate) const POST_TITLE: KeySpec =
 pub(crate) const POST_SCOPE: KeySpec = KeySpec::new(
     "scope",
     KeyType::Str,
-    "project or the authenticated caller's own project key; camp (with `camp`) addresses one camp of your project, reaching its participants by role",
+    "project or the authenticated caller's own project key; camp (with `camp`) addresses one camp of your project, reaching its members",
 );
 pub(crate) const POST_CAMP: KeySpec = KeySpec::new(
     "camp",
     KeyType::Str,
-    "with scope:\"camp\" only: canonical camp URI of your own project (cairn://p/PROJECT/camps/SLUG); your thread must take part in it, and every thread takes part in base camp",
+    "with scope:\"camp\" only: canonical camp URI of your own project (cairn://p/PROJECT/camps/SLUG); your thread must be a member; every open thread is in base camp",
 );
 pub(crate) const FEED_ACK: KeySpec = KeySpec::new(
     "ack",

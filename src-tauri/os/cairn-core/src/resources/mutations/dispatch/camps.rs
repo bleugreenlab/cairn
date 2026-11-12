@@ -1,22 +1,21 @@
-//! Camp mutations: a thread pitches a camp, retitles one it leads, and joins,
-//! changes its own level in, or leaves a camp.
+//! Camp mutations, a thread's side: create a camp with its first members,
+//! rename or archive one it is a member of, add a member, or leave.
 //!
 //! Every act here is a thread's, taken by its authenticated run. A resource
-//! write carries no verified operator credential, so the operator's camp
-//! authority (reassigning a lead, assigning a confirm role) is not reachable
-//! through this surface.
+//! write carries no verified operator credential, so the operator acts through
+//! the desktop's camp commands instead (`sync_commands/camps.rs`).
 
 use super::super::{build_failure, ResourceMutationResult};
 use super::append_payload;
 use crate::camps::ActingThread;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
-use crate::models::{Camp, CampLevel, CampSubject};
+use crate::models::{Camp, CampStatus, CampSubject};
 use crate::orchestrator::Orchestrator;
 use cairn_db::storage::camps::{
-    camp_by_slug_conn, leave_camp_conn, pitch_camp_conn, retitle_camp_conn, set_camp_level_conn,
-    CampAssignedBy, CampLevelChange, NewCamp,
+    add_camp_member_conn, camp_by_slug_conn, create_camp_conn, is_camp_member_conn,
+    leave_camp_conn, MemberAdded, NewCamp,
 };
-use cairn_uri::{build_project_camp_participants_uri, build_project_camp_uri, CairnResource};
+use cairn_uri::{build_project_camp_members_uri, build_project_camp_uri, CairnResource};
 
 async fn acting_thread(
     orch: &Orchestrator,
@@ -55,6 +54,43 @@ async fn camp(
         })
 }
 
+/// Refuse an act on a camp the acting thread is not a member of.
+async fn require_member(
+    acting: &ActingThread,
+    camp: &Camp,
+    project: &str,
+    index: usize,
+    item: &ChangeItem,
+) -> ResourceMutationResult<()> {
+    let (camp_row, subject) = (camp.clone(), acting_subject(acting));
+    let member = acting
+        .db
+        .read(move |conn| {
+            let (camp, subject) = (camp_row.clone(), subject.clone());
+            Box::pin(async move { is_camp_member_conn(conn, &camp, &subject).await })
+        })
+        .await
+        .map_err(|error| build_failure(index, item, error.to_string()))?;
+    if member {
+        return Ok(());
+    }
+    Err(build_failure(
+        index,
+        item,
+        format!(
+            "your thread is not a member of camp `{}`; a member adds you, or add yourself by appending {{member: \"<your thread URI>\"}} to {}",
+            camp.slug,
+            build_project_camp_members_uri(project, &camp.slug)
+        ),
+    ))
+}
+
+fn acting_subject(acting: &ActingThread) -> CampSubject {
+    CampSubject::Thread {
+        thread_id: acting.thread_id.clone(),
+    }
+}
+
 fn text<'a>(
     payload: &'a serde_json::Value,
     key: &str,
@@ -73,98 +109,6 @@ fn text<'a>(
                 format!("payload.{key} is required and must be a non-empty string"),
             )
         })
-}
-
-/// `{lead: <thread URI>}`: the lead offers the camp's lead to that thread, and
-/// that thread, writing the same patch naming itself, accepts it.
-#[allow(clippy::too_many_arguments)]
-async fn handoff(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    index: usize,
-    item: &ChangeItem,
-    dry_run: bool,
-    project: &str,
-    slug: &str,
-    lead: &str,
-    now: i64,
-) -> ResourceMutationResult<String> {
-    let uri = build_project_camp_uri(project, slug);
-    let name = match cairn_uri::parse_uri(lead) {
-        Some(CairnResource::Thread {
-            project: thread_project,
-            name,
-            path,
-        }) if path.is_empty() && thread_project == cairn_uri::canonical_project(project) => name,
-        _ => {
-            return Err(build_failure(
-                index,
-                item,
-                format!(
-                    "payload.lead must be the canonical URI of a thread of this project, like {}",
-                    cairn_uri::build_thread_uri(project, "NAME")
-                ),
-            ))
-        }
-    };
-    if dry_run {
-        return Ok(format!("Would hand camp {uri}'s lead to {lead}"));
-    }
-    let acting = acting_thread(orch, request, project, index, item).await?;
-    let camp = camp(&acting, project, slug, index, item).await?;
-    let target = acting
-        .db
-        .query_opt_text(
-            "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
-            (acting.project_id.clone(), name.clone()),
-        )
-        .await
-        .map_err(|error| build_failure(index, item, error.to_string()))?
-        .ok_or_else(|| build_failure(index, item, format!("no thread `{name}` in this project")))?;
-    let actor = acting.actor.clone();
-    let offering = acting.thread_id == camp.lead_thread_id;
-    if !offering && acting.thread_id != target {
-        return Err(build_failure(
-            index,
-            item,
-            format!("only camp `{slug}`'s lead offers its lead, and only the thread it was offered to accepts it"),
-        ));
-    }
-    let (camp_row, target_id) = (camp.clone(), target.clone());
-    acting
-        .db
-        .write(move |conn| {
-            let (camp, target, actor) = (camp_row.clone(), target_id.clone(), actor.clone());
-            Box::pin(async move {
-                if offering {
-                    cairn_db::storage::camps::offer_lead_conn(
-                        conn,
-                        &camp,
-                        &target,
-                        Some(&actor),
-                        now,
-                    )
-                    .await
-                } else {
-                    cairn_db::storage::camps::accept_lead_conn(
-                        conn,
-                        &camp,
-                        &target,
-                        Some(&actor),
-                        now,
-                    )
-                    .await
-                }
-            })
-        })
-        .await
-        .map_err(|error| build_failure(index, item, error.to_string()))?;
-    emit_change(orch, "update");
-    Ok(if offering {
-        format!("Offered camp {uri}'s lead to {lead}; it becomes lead when that thread accepts by patching {uri} {{lead: {lead}}}.")
-    } else {
-        format!("Took the lead of camp {uri}.")
-    })
 }
 
 fn emit_change(orch: &Orchestrator, action: &str) {
@@ -194,29 +138,64 @@ pub(super) async fn dispatch(
             let title = text(payload, "title", index, item)?.to_string();
             crate::models::validate_camp_slug(&slug)
                 .map_err(|error| build_failure(index, item, error))?;
+            let named: Vec<String> = match payload.get("members") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(serde_json::Value::Array(values)) => values
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            build_failure(
+                                index,
+                                item,
+                                "payload.members must be an array of thread URIs or `operator`",
+                            )
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        "payload.members must be an array of thread URIs or `operator`",
+                    ))
+                }
+            };
             let uri = build_project_camp_uri(project, &slug);
-            let participants_uri = build_project_camp_participants_uri(project, &slug);
             if dry_run {
-                return Ok(Some(format!("Would pitch camp {uri}: {title}")));
+                return Ok(Some(format!("Would create camp {uri}: {title}")));
             }
             let acting = acting_thread(orch, request, project, index, item).await?;
+            let mut members = Vec::with_capacity(named.len());
+            for value in &named {
+                let (subject, _) =
+                    crate::camps::parse_member(&acting.db, &acting.project_id, project, value)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                members.push(subject);
+            }
             let input = NewCamp {
                 project_id: acting.project_id.clone(),
                 slug,
                 title,
-                lead_thread_id: acting.thread_id.clone(),
             };
-            let actor = acting.actor.clone();
-            acting
+            let creator = acting_subject(&acting);
+            let created = acting
                 .db
                 .write(move |conn| {
-                    let (input, actor) = (input.clone(), actor.clone());
-                    Box::pin(async move { pitch_camp_conn(conn, &input, Some(&actor), now).await })
+                    let (input, creator, members) =
+                        (input.clone(), creator.clone(), members.clone());
+                    Box::pin(async move {
+                        let camp = create_camp_conn(conn, &input, &creator, &members, now).await?;
+                        let count = cairn_db::storage::camps::camp_members_conn(conn, &camp)
+                            .await?
+                            .len();
+                        Ok((camp, count))
+                    })
                 })
                 .await
                 .map_err(|error| build_failure(index, item, error.to_string()))?;
             emit_change(orch, "insert");
-            format!("Pitched camp {uri}, led by your thread. Other threads join it at {participants_uri}.")
+            format!("Created camp {uri} with {} members.", created.1)
         }
         (CairnResource::ProjectCamp { project, slug }, ChangeMode::Patch) => {
             let payload = item
@@ -225,162 +204,141 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
             if let Some(key) = payload.as_object().and_then(|map| {
                 map.keys()
-                    .find(|key| !matches!(key.as_str(), "title" | "lead"))
+                    .find(|key| !matches!(key.as_str(), "title" | "status"))
             }) {
                 return Err(build_failure(
                     index,
                     item,
-                    format!("a camp patch takes title or lead; `{key}` is not something a thread changes here"),
+                    format!("a camp patch takes title or status; `{key}` is not something a member changes here"),
                 ));
             }
-            if payload.get("lead").is_some() {
-                if payload.get("title").is_some() {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        "handing over the lead and retitling are separate acts; send each in its own patch",
-                    ));
+            let title = match payload.get("title") {
+                None => None,
+                Some(_) => Some(text(payload, "title", index, item)?.to_string()),
+            };
+            let status = match payload.get("status") {
+                None => None,
+                Some(_) => {
+                    let value = text(payload, "status", index, item)?;
+                    Some(CampStatus::parse(value).ok_or_else(|| {
+                        build_failure(
+                            index,
+                            item,
+                            format!("payload.status must be active or archived, not {value}"),
+                        )
+                    })?)
                 }
-                let lead = text(payload, "lead", index, item)?.to_string();
-                return handoff(
-                    orch, request, index, item, dry_run, project, slug, &lead, now,
-                )
-                .await
-                .map(Some);
-            }
-            let title = text(payload, "title", index, item)?.to_string();
-            let uri = build_project_camp_uri(project, slug);
-            if dry_run {
-                return Ok(Some(format!("Would retitle camp {uri} to \"{title}\"")));
-            }
-            let acting = acting_thread(orch, request, project, index, item).await?;
-            let camp = camp(&acting, project, slug, index, item).await?;
-            if camp.lead_thread_id != acting.thread_id {
+            };
+            if title.is_none() && status.is_none() {
                 return Err(build_failure(
                     index,
                     item,
-                    format!("only camp `{slug}`'s lead retitles it"),
+                    "a camp patch needs title or status",
                 ));
             }
-            let actor = acting.actor.clone();
-            let changed = acting
-                .db
-                .write(move |conn| {
-                    let (camp, title, actor) = (camp.clone(), title.clone(), actor.clone());
-                    Box::pin(async move {
-                        retitle_camp_conn(conn, &camp, &title, Some(&actor), now).await
-                    })
-                })
-                .await
-                .map_err(|error| build_failure(index, item, error.to_string()))?;
-            if changed {
-                emit_change(orch, "update");
-                format!("Retitled camp {uri}.")
-            } else {
-                format!("Camp {uri} already has that title; nothing changed.")
-            }
-        }
-        (CairnResource::ProjectCampParticipants { project, slug }, ChangeMode::Append) => {
-            let payload = append_payload(index, item)?;
-            let level_text = text(payload, "level", index, item)?;
-            let level = CampLevel::parse(level_text).ok_or_else(|| {
-                build_failure(
-                    index,
-                    item,
-                    format!("payload.level must be watch or wake, not {level_text}; a confirm role is assigned by the camp's lead or the operator"),
-                )
-            })?;
-            let reason = text(payload, "reason", index, item)?.to_string();
             let uri = build_project_camp_uri(project, slug);
             if dry_run {
-                return Ok(Some(format!(
-                    "Would take part in camp {uri} at {}",
-                    level.as_str()
-                )));
+                return Ok(Some(format!("Would update camp {uri}")));
             }
             let acting = acting_thread(orch, request, project, index, item).await?;
             let camp = camp(&acting, project, slug, index, item).await?;
-            let subject = CampSubject::Thread {
-                thread_id: acting.thread_id.clone(),
-            };
-            let actor = acting.actor.clone();
-            let change = acting
+            if camp.is_base() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "base camp cannot be renamed or archived",
+                ));
+            }
+            require_member(&acting, &camp, project, index, item).await?;
+            let update = crate::camps::update_camp(&acting.db, &camp, title, status, now)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            if update.retitled || update.status.is_some() {
+                emit_change(orch, "update");
+            }
+            if update.status == Some(CampStatus::Archived) {
+                let by = crate::camps::thread_label(&acting.db, &acting.thread_id).await;
+                if let Err(error) =
+                    crate::camps::announce_archived(orch, &camp, project, &by, now).await
+                {
+                    tracing::warn!(%error, camp = %uri, "failed to mint the archived notice");
+                }
+                format!("Archived camp {uri}.")
+            } else if update.status.is_some() {
+                format!("Unarchived camp {uri}.")
+            } else if update.retitled {
+                format!("Renamed camp {uri}.")
+            } else {
+                format!("Camp {uri} already reads that way; nothing changed.")
+            }
+        }
+        (CairnResource::ProjectCampMembers { project, slug }, ChangeMode::Append) => {
+            let payload = append_payload(index, item)?;
+            let value = text(payload, "member", index, item)?.to_string();
+            let uri = build_project_camp_uri(project, slug);
+            if dry_run {
+                return Ok(Some(format!("Would add {value} to camp {uri}")));
+            }
+            let acting = acting_thread(orch, request, project, index, item).await?;
+            let camp = camp(&acting, project, slug, index, item).await?;
+            let (subject, label) =
+                crate::camps::parse_member(&acting.db, &acting.project_id, project, &value)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+            let actor = acting_subject(&acting);
+            if subject != actor {
+                require_member(&acting, &camp, project, index, item).await?;
+            }
+            let (camp_row, subject_row, actor_row) = (camp.clone(), subject.clone(), actor.clone());
+            let added = acting
                 .db
                 .write(move |conn| {
-                    let (camp, subject, reason, actor) =
-                        (camp.clone(), subject.clone(), reason.clone(), actor.clone());
+                    let (camp, subject, actor) =
+                        (camp_row.clone(), subject_row.clone(), actor_row.clone());
                     Box::pin(async move {
-                        set_camp_level_conn(
-                            conn,
-                            &camp,
-                            &subject,
-                            level,
-                            &reason,
-                            CampAssignedBy::Agent,
-                            Some(&actor),
-                            now,
-                        )
-                        .await
+                        add_camp_member_conn(conn, &camp, &subject, &actor, now).await
                     })
                 })
                 .await
                 .map_err(|error| build_failure(index, item, error.to_string()))?;
-            match change {
-                CampLevelChange::Joined(level) => {
+            match added {
+                MemberAdded::Added => {
                     emit_change(orch, "insert");
-                    format!("Joined camp {uri} at {}.", level.as_str())
-                }
-                CampLevelChange::Changed { from, to } => {
-                    emit_change(orch, "update");
-                    format!(
-                        "Moved from {} to {} in camp {uri}.",
-                        from.as_str(),
-                        to.as_str()
+                    let by = crate::camps::thread_label(&acting.db, &acting.thread_id).await;
+                    if let Err(error) = crate::camps::announce_member_added(
+                        orch,
+                        &camp,
+                        project,
+                        &subject.key(),
+                        &label,
+                        &by,
+                        Some(&acting.job_id),
+                        now,
                     )
+                    .await
+                    {
+                        tracing::warn!(%error, camp = %uri, "failed to mint the member-added notice");
+                    }
+                    format!("Added {value} to camp {uri}.")
                 }
-                CampLevelChange::Unchanged(level) => format!(
-                    "Already in camp {uri} at {} with that reason; nothing changed.",
-                    level.as_str()
-                ),
+                MemberAdded::AlreadyMember => {
+                    format!("{value} is already a member of camp {uri}; nothing changed.")
+                }
             }
         }
-        (CairnResource::ProjectCampParticipants { project, slug }, ChangeMode::Delete) => {
-            let reason = match item
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("reason"))
-            {
-                None | Some(serde_json::Value::Null) => None,
-                Some(value) => Some(
-                    value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
-                            build_failure(index, item, "payload.reason must be a non-empty string")
-                        })?
-                        .to_string(),
-                ),
-            };
+        (CairnResource::ProjectCampMembers { project, slug }, ChangeMode::Delete) => {
             let uri = build_project_camp_uri(project, slug);
             if dry_run {
                 return Ok(Some(format!("Would leave camp {uri}")));
             }
             let acting = acting_thread(orch, request, project, index, item).await?;
             let camp = camp(&acting, project, slug, index, item).await?;
-            let subject = CampSubject::Thread {
-                thread_id: acting.thread_id.clone(),
-            };
-            let actor = acting.actor.clone();
+            let subject = acting_subject(&acting);
             let left = acting
                 .db
                 .write(move |conn| {
-                    let (camp, subject, reason, actor) =
-                        (camp.clone(), subject.clone(), reason.clone(), actor.clone());
-                    Box::pin(async move {
-                        leave_camp_conn(conn, &camp, &subject, reason.as_deref(), Some(&actor), now)
-                            .await
-                    })
+                    let (camp, subject) = (camp.clone(), subject.clone());
+                    Box::pin(async move { leave_camp_conn(conn, &camp, &subject).await })
                 })
                 .await
                 .map_err(|error| build_failure(index, item, error.to_string()))?;
@@ -388,7 +346,7 @@ pub(super) async fn dispatch(
                 emit_change(orch, "delete");
                 format!("Left camp {uri}.")
             } else {
-                format!("Your thread is not a participant of camp {uri}; nothing changed.")
+                format!("Your thread is not a member of camp {uri}; nothing changed.")
             }
         }
         _ => return Ok(None),

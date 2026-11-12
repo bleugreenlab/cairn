@@ -622,9 +622,9 @@ impl Default for FactRegistry {
             ]),
         };
         // A notice addressed to a camp rather than to a list of threads: one
-        // row, which the index lane expands to the camp's participants by
-        // role. Its writer is Cairn itself (a rebuild, a drain), so the
-        // summary is trusted, and a participant at `watch` is told passively.
+        // row, which the index lane expands to the camp's members. Its writer
+        // is Cairn itself (a rebuild, a drain), so the summary is trusted, and
+        // a base camp member is told passively.
         let camp_notice = SourceSpec {
             dedupe: LogDedupe::Unique,
             audience: Audience::AllProviders,
@@ -1339,9 +1339,8 @@ mod tests {
     }
 
     /// Every source declares what a muted recipient gets. Camp notices and
-    /// the post sources ride along (a camp's `watch` participant is told
-    /// passively); the rest keep the drop that standing triggers have always
-    /// had.
+    /// the post sources ride along (a base camp member is told passively);
+    /// the rest keep the drop that standing triggers have always had.
     #[test]
     fn every_source_declares_its_muted_delivery() {
         let registry = FactRegistry::default();

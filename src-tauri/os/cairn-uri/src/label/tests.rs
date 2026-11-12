@@ -140,9 +140,9 @@ fn the_frontend_labels_are_reproduced() {
             "cairn / camp rebuild",
         ),
         (
-            "cairn://p/CAIRN/camps/rebuild/participants".into(),
+            "cairn://p/CAIRN/camps/rebuild/members".into(),
             plain.clone(),
-            "cairn / camp rebuild / participants",
+            "cairn / camp rebuild / members",
         ),
         (
             "cairn://p/CAIRN/camps/rebuild/posts".into(),

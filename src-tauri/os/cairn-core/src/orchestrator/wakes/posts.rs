@@ -11,8 +11,8 @@
 //!
 //! A camp post stores its camp's canonical URI as `camp`, and a comment on one
 //! stores its post's camp the same way, so the lane reaches the camp's
-//! participants by role (lead and wake woken, watch told passively) just as it
-//! does a camp notice.
+//! members (woken for a camp, told passively for base camp) just as it does
+//! a camp notice.
 //!
 //! **A row stores addresses, never recipients.** An author is stored as the
 //! home URI its principal names and a mention as the canonical URI the text

@@ -376,10 +376,6 @@ pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnEr
                 // roll back together — a durable named thread with no job
                 // would be deaf, and its taken name would make a retry fail.
                 super::ensure_thread_session_conn(conn, &id, input.model.as_ref()).await?;
-                // Every thread is a base camp participant from birth. A project
-                // whose base camp is not established yet seats it at bootstrap.
-                cairn_db::storage::camps::join_base_camp_conn(conn, &input.project_id, &id, now)
-                    .await?;
                 Ok(thread)
             })
         })
@@ -451,20 +447,6 @@ pub async fn update(db: &LocalDb, input: UpdateThread) -> Result<ThreadUpdate, C
             // Closing is dormancy, not deletion: the session can reopen, so its
             // durable thread database deliberately survives this transition.
             let reopening = status.is_active() && !previous.status.is_active();
-            // A camp's lead is its one always-woken participant, and a closed
-            // thread is a dormant recipient: closing a lead would leave the
-            // camp led by nobody who hears it. Refused before anything moves.
-            if !status.is_active() && previous.status.is_active() {
-                let led = cairn_db::storage::camps::camps_led_by_conn(conn, &id).await?;
-                if !led.is_empty() {
-                    return Err(DbError::Row(format!(
-                        "thread {} leads camp{} {}; hand each lead to another thread first (its lead patches cairn:@/camps/SLUG {{lead: <thread URI>}} and that thread accepts with the same patch)",
-                        previous.name,
-                        if led.len() == 1 { "" } else { "s" },
-                        led.iter().map(|slug| format!("`{slug}`")).collect::<Vec<_>>().join(", ")
-                    )));
-                }
-            }
 
             conn.execute(
                 "UPDATE threads SET name=?1, jurisdiction=?2, definition=?3, status=?4, updated_at=unixepoch() WHERE id=?5",

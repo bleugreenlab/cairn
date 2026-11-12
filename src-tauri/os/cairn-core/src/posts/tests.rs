@@ -2,14 +2,14 @@
 //! whom it reaches.
 
 use super::*;
-use crate::models::{CampLevel, CampSubject};
+use crate::models::CampSubject;
 use crate::routes::fixture::orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::identity::{
     Address, AppearanceEvidence, AppearanceTransport, VerificationMethod, VerificationRecord,
     VerificationStatus, VerificationStrength,
 };
-use cairn_db::storage::camps::{pitch_camp_conn, set_camp_level_conn, CampAssignedBy, NewCamp};
+use cairn_db::storage::camps::{create_camp_conn, NewCamp};
 
 fn author(
     principal: PrincipalRef,
@@ -70,9 +70,8 @@ fn operator() -> (PrincipalRef, AppearanceSnapshot) {
 }
 
 /// Beside the fixture's `ui` thread (job `watcher`) and issue node (`writer`):
-/// `general` leads base camp and a pitched `rebuild` camp; `quiet` sits in
-/// base camp at watch and in no other camp; `ui` takes part in `rebuild` at
-/// wake.
+/// `general` and `quiet`, all three in base camp; `general` and `ui` are the
+/// thread members of camp `rebuild`, beside the operator.
 async fn camps(db: &LocalDb) -> (Camp, Camp) {
     db.execute_batch(
         "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('tl','p','general','active',1,1);
@@ -85,36 +84,29 @@ async fn camps(db: &LocalDb) -> (Camp, Camp) {
     )
     .await
     .unwrap();
-    let (base, _) = db.ensure_base_camp("p", "tl", 1).await.unwrap();
+    let (base, _) = db.ensure_base_camp("p", 1).await.unwrap();
     let rebuild = db
         .write(|conn| {
             Box::pin(async move {
-                let camp = pitch_camp_conn(
+                create_camp_conn(
                     conn,
                     &NewCamp {
                         project_id: "p".into(),
                         slug: "rebuild".into(),
                         title: "Rebuild".into(),
-                        lead_thread_id: "tl".into(),
                     },
-                    None,
+                    &CampSubject::Thread {
+                        thread_id: "tl".into(),
+                    },
+                    &[
+                        CampSubject::Thread {
+                            thread_id: "t".into(),
+                        },
+                        CampSubject::Operator,
+                    ],
                     2,
                 )
-                .await?;
-                set_camp_level_conn(
-                    conn,
-                    &camp,
-                    &CampSubject::Thread {
-                        thread_id: "t".into(),
-                    },
-                    CampLevel::Wake,
-                    "the rebuild changes what I render",
-                    CampAssignedBy::Agent,
-                    None,
-                    3,
-                )
-                .await?;
-                Ok(camp)
+                .await
             })
         })
         .await
@@ -166,12 +158,11 @@ async fn count(db: &LocalDb, sql: &str) -> i64 {
     db.query_opt_i64(sql, ()).await.unwrap().unwrap_or_default()
 }
 
-/// One camp post is one row and one fact, and the fact reaches the camp's
-/// participants by role: the lead and a wake participant are woken with the
-/// camp's framing, and the author's own job never. A comment on it reaches the
-/// camp the same way.
+/// One camp post is one row and one fact, and the fact wakes every other
+/// thread member of the camp, never the author's own thread. A comment on it
+/// reaches the camp the same way.
 #[tokio::test]
-async fn a_camp_post_is_one_row_and_one_fact_delivered_by_role() {
+async fn a_camp_post_is_one_row_and_one_fact_that_wakes_the_other_members() {
     let temp = tempfile::tempdir().unwrap();
     let (orch, db) = orchestrator(temp.path(), &[]).await;
     let (_, rebuild) = camps(&db).await;
@@ -211,16 +202,16 @@ async fn a_camp_post_is_one_row_and_one_fact_delivered_by_role() {
         wakes(&db, "post_created").await,
         vec![(
             "lead-job".to_string(),
-            "addressed:post_created.camp@lead".to_string()
+            "addressed:post_created.camp".to_string()
         )],
-        "the lead is woken; the author, a wake participant, is not woken by its own post"
+        "the other member is woken; the author is not woken by its own post"
     );
 
     publish_comment(
         &orch,
         PublishComment {
             post_id: published.record.id,
-            content: "Agreed from the lead.".into(),
+            content: "Agreed from general.".into(),
             author: thread_author("general").0,
             appearance: thread_author("general").1,
             actor_job_id: Some("lead-job".into()),
@@ -232,9 +223,9 @@ async fn a_camp_post_is_one_row_and_one_fact_delivered_by_role() {
     let told = wakes(&db, "post_commented").await;
     assert!(
         told.iter().any(|(job, clause)| job == "watcher"
-            && (clause == "addressed:post_commented.camp@wake"
+            && (clause == "addressed:post_commented.camp"
                 || clause == "addressed:post_commented.postAuthor")),
-        "the post's author, a wake participant, hears the comment: {told:?}"
+        "the post's author, a member, hears the comment: {told:?}"
     );
     assert!(
         !told.iter().any(|(job, _)| job == "lead-job"),
@@ -242,11 +233,11 @@ async fn a_camp_post_is_one_row_and_one_fact_delivered_by_role() {
     );
 }
 
-/// The operator posts to a camp as an implicit participant. The fact has no
-/// actor job and reaches each participant through the camp's roles, never as
-/// a direct message from the operator.
+/// The operator posts to base camp. The fact has no actor job and reaches
+/// every open thread passively through the camp, never as a direct message
+/// from the operator, and wakes none of them.
 #[tokio::test]
-async fn an_operator_camp_post_reaches_the_camp_by_role_with_no_actor() {
+async fn an_operator_base_camp_post_reaches_every_thread_passively() {
     let temp = tempfile::tempdir().unwrap();
     let (orch, db) = orchestrator(temp.path(), &[]).await;
     let (base, _) = camps(&db).await;
@@ -266,35 +257,34 @@ async fn an_operator_camp_post_reaches_the_camp_by_role_with_no_actor() {
     assert!(
         reached
             .iter()
-            .all(|(_, clause)| clause.contains("post_created.camp@")),
-        "every delivery is a camp-role delivery: {reached:?}"
+            .all(|(_, clause)| clause == "camp-passive:post_created.camp"),
+        "every delivery is a passive base camp delivery: {reached:?}"
     );
-    assert!(
-        reached
-            .iter()
-            .any(|(job, clause)| job == "lead-job" && clause.ends_with("@lead")),
-        "{reached:?}"
-    );
-    assert!(
-        reached
-            .iter()
-            .any(|(job, clause)| job == "quiet-job" && clause.ends_with("@watch")),
-        "{reached:?}"
+    let jobs: Vec<_> = reached.iter().map(|(job, _)| job.as_str()).collect();
+    assert_eq!(jobs, ["lead-job", "quiet-job", "watcher"], "{reached:?}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM fact_log_wakes WHERE source = 'post_created' AND level != 'passive'"
+        )
+        .await,
+        0,
+        "no thread is woken"
     );
 }
 
 /// Every refusal leaves no row: a run that acts for no thread, a thread that
-/// does not take part in the camp, a struck camp, and a camp of another
+/// is not a member of the camp, an archived camp, and a camp of another
 /// project. Base camp takes any thread of its project.
 #[tokio::test]
-async fn refused_camp_posts_write_nothing_and_base_camp_is_a_room() {
+async fn refused_camp_posts_write_nothing_and_base_camp_takes_any_thread() {
     let temp = tempfile::tempdir().unwrap();
     let (orch, db) = orchestrator(temp.path(), &[]).await;
     let (base, rebuild) = camps(&db).await;
 
     let refusals = [
         (to(&rebuild), "writer", "acts for no thread"),
-        (to(&rebuild), "quiet-job", "does not take part"),
+        (to(&rebuild), "quiet-job", "is not a member"),
         (
             PostTarget::Camp {
                 project_id: "q".into(),
@@ -316,14 +306,14 @@ async fn refused_camp_posts_write_nothing_and_base_camp_is_a_room() {
         }
     }
     db.execute_batch(&format!(
-        "UPDATE camps SET status = 'struck', struck_at = 5 WHERE id = '{}'",
+        "UPDATE camps SET status = 'archived', archived_at = 5 WHERE id = '{}'",
         rebuild.id
     ))
     .await
     .unwrap();
     assert!(matches!(
         publish(&orch, to(&rebuild), thread_author("ui"), Some("watcher")).await,
-        Err(PublishError::Refused(message)) if message.contains("struck")
+        Err(PublishError::Refused(message)) if message.contains("archived")
     ));
     assert_eq!(count(&db, "SELECT COUNT(*) FROM posts").await, 0);
 

@@ -595,8 +595,8 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 slug: (*slug).to_string(),
             })
         }
-        [PROJECT_SCOPE, project, "camps", slug, "participants"] if is_camp_slug(slug) => {
-            Some(CairnResource::ProjectCampParticipants {
+        [PROJECT_SCOPE, project, "camps", slug, "members"] if is_camp_slug(slug) => {
+            Some(CairnResource::ProjectCampMembers {
                 project: canonical_project(project),
                 slug: (*slug).to_string(),
             })

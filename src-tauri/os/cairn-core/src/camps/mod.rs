@@ -1,50 +1,57 @@
-//! Camps: durable project-level coordination (cairn/6255).
+//! Camps: a project's named conversations (cairn/6255, cut down by cairn/7002).
 //!
-//! A camp owns intent and references; issues, posts, PRs, checks and gates
-//! supply its live state. Every project is born with base camp, led by its
-//! general thread, with every thread of the project a participant at `watch`.
-//! Storage and the participant census live in `cairn_db::storage::camps`; this
-//! module owns what needs the rest of core: establishing a project's general
-//! thread (which has a database file of its own) and the boot backfill.
+//! Every project is born with base camp, the passive channel every open
+//! thread of the project is in. A camp is a group conversation among the
+//! threads and the operator that are its members: each post to it wakes every
+//! other member. Storage and the member census live in
+//! `cairn_db::storage::camps`; this module owns what needs the rest of core:
+//! the notices a camp's own changes mint, the boot backfill, and resolving
+//! the thread a run acts for. See `docs/camps.md`.
 
 use crate::db::DbState;
 use crate::error::CairnError;
-use crate::models::{Camp, CreateThread, BASE_CAMP_SLUG};
+use crate::models::{Camp, BASE_CAMP_SLUG};
 use crate::storage::LocalDb;
 
 pub mod view;
 
-/// The thread every project is born with, and base camp's first lead.
-pub const GENERAL_THREAD_NAME: &str = "general";
-
 /// The fact source a notice addressed to a camp is minted on.
 pub const CAMP_NOTICE: &str = "camp_notice";
+
+/// The notice kind minted when a member is added to a camp.
+pub const MEMBER_ADDED_NOTICE: &str = "member_added";
+/// The notice kind minted when a camp is archived.
+pub const ARCHIVED_NOTICE: &str = "archived";
 
 /// A notice owed to everyone in a camp.
 pub struct CampNotice<'a> {
     pub project_id: &'a str,
     pub project_key: &'a str,
     pub camp_slug: &'a str,
-    /// What happened, as a short label (`rebuild`, `drain`).
+    /// What happened, as a short label (`rebuild`, `member_added`).
     pub kind: &'a str,
     /// Unique per notice: minting the same identity twice is one fact.
     pub identity: String,
-    /// The line each participant reads, in Cairn's own words.
+    /// The line each member reads, in Cairn's own words.
     pub summary: String,
     pub detail_uri: Option<String>,
+    /// The job whose act this notice records, which its own thread is never
+    /// told about.
+    pub actor_job_id: Option<&'a str>,
 }
 
 /// Mint one fact addressed to a camp, and nothing else. Who it reaches is the
-/// fact log's to decide, by the camp's roles at indexing: the producer never
-/// names a recipient, and the notice is one row however many threads exist.
-/// Returns the row id, or `None` when the log already holds this identity.
+/// fact log's to decide, by the camp's members at indexing: passively for
+/// base camp, as a wake for a camp. The producer never names a recipient, and
+/// the notice is one row however many threads exist. Returns the row id, or
+/// `None` when the log already holds this identity.
 ///
 /// **The producer contract.** A notice owed to every thread of a project is
 /// ONE base-camp fact per project, minted here. No producer enumerates
-/// threads or jobs to deliver it: the camp's participants, their roles and
-/// their sessions are resolved by the fact log, and a thread's own one-shot
-/// subscription on the same event (a rebuild wake) is its own fact whose
-/// receipt rides beside this one. See `docs/camps.md`.
+/// threads or jobs to deliver it: the camp's members and their sessions are
+/// resolved by the fact log, and a thread's own one-shot subscription on the
+/// same event (a rebuild wake) is its own fact whose receipt rides beside
+/// this one. See `docs/camps.md`.
 pub async fn notify_camp(
     orch: &crate::orchestrator::Orchestrator,
     notice: CampNotice<'_>,
@@ -63,7 +70,7 @@ pub async fn notify_camp(
     if let Some(detail) = &notice.detail_uri {
         fields.insert("detailUri".to_string(), Value::String(detail.clone()));
     }
-    crate::routes::mint(
+    let minted = crate::routes::mint(
         orch,
         crate::routes::Mint {
             fact: crate::routes::RouteFact {
@@ -78,61 +85,195 @@ pub async fn notify_camp(
             record_id: None,
             project_id: Some(notice.project_id),
             presence: crate::routes::log::operator_presence().await,
+            actor_job_id: notice.actor_job_id,
+        },
+    )
+    .await?;
+    // A notice is a line of the camp's conversation, so an open camp page
+    // refreshes once the fact is committed.
+    if minted.is_some() {
+        if let Err(error) = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({ "table": "camps", "action": "notice" }),
+        ) {
+            tracing::warn!(%error, "failed to announce a camp notice");
+        }
+    }
+    Ok(minted)
+}
+
+/// Tell a camp that `member` joined it, added by `by`. The new member hears it
+/// too, which is how a thread learns it was added; the adder does not.
+#[allow(clippy::too_many_arguments)]
+pub async fn announce_member_added(
+    orch: &crate::orchestrator::Orchestrator,
+    camp: &Camp,
+    project_key: &str,
+    subject_key: &str,
+    member: &str,
+    by: &str,
+    actor_job_id: Option<&str>,
+    now: i64,
+) -> Result<Option<i64>, String> {
+    let summary = if member == by {
+        format!("{member} joined the camp.")
+    } else {
+        format!("{by} added {member} to the camp.")
+    };
+    notify_camp(
+        orch,
+        CampNotice {
+            project_id: &camp.project_id,
+            project_key,
+            camp_slug: &camp.slug,
+            kind: MEMBER_ADDED_NOTICE,
+            identity: format!("camp:{}:added:{subject_key}:{now}", camp.id),
+            summary,
+            detail_uri: None,
+            actor_job_id,
+        },
+    )
+    .await
+}
+
+/// Record in a camp's conversation that `by` archived it. An archived camp
+/// delivers nothing, so the notice is a line on the camp's page and wakes no
+/// one.
+pub async fn announce_archived(
+    orch: &crate::orchestrator::Orchestrator,
+    camp: &Camp,
+    project_key: &str,
+    by: &str,
+    now: i64,
+) -> Result<Option<i64>, String> {
+    notify_camp(
+        orch,
+        CampNotice {
+            project_id: &camp.project_id,
+            project_key,
+            camp_slug: &camp.slug,
+            kind: ARCHIVED_NOTICE,
+            identity: format!("camp:{}:archived:{now}", camp.id),
+            summary: format!("{by} archived the camp."),
+            detail_uri: None,
             actor_job_id: None,
         },
     )
     .await
 }
 
-/// The project's general thread, created if the project has none. It is base
-/// camp's lead whether or not it is open: whether the lead hears its camp is
-/// the lead-offer path's and the operator's concern, not birth's.
-async fn general_thread_id(db: &LocalDb, project_id: &str) -> Result<String, CairnError> {
-    let find = || async {
-        db.query_opt_text(
+/// The member a written value names, with the name it reads by: `operator`,
+/// or the canonical URI of a thread of `project_key`'s project.
+pub async fn parse_member(
+    db: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    value: &str,
+) -> Result<(crate::models::CampSubject, String), String> {
+    use crate::models::{CampSubject, OPERATOR_MEMBER_KEY};
+    let value = value.trim();
+    if value == OPERATOR_MEMBER_KEY {
+        return Ok((CampSubject::Operator, "the operator".to_string()));
+    }
+    let name = match cairn_uri::parse_uri(value) {
+        Some(cairn_uri::CairnResource::Thread {
+            project: thread_project,
+            name,
+            path,
+        }) if path.is_empty() && thread_project == cairn_uri::canonical_project(project_key) => {
+            name
+        }
+        _ => {
+            return Err(format!(
+                "a member is `operator` or the canonical URI of a thread of this project, like {}; got {value:?}",
+                cairn_uri::build_thread_uri(project_key, "NAME")
+            ))
+        }
+    };
+    let thread_id = db
+        .query_opt_text(
             "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
-            (project_id.to_string(), GENERAL_THREAD_NAME),
+            (project_id.to_string(), name.clone()),
         )
         .await
-    };
-    if let Some(id) = find().await? {
-        return Ok(id);
-    }
-    let created = crate::threads::crud::create(
-        db,
-        CreateThread {
-            project_id: project_id.to_string(),
-            name: Some(GENERAL_THREAD_NAME.to_string()),
-            jurisdiction: None,
-            definition: None,
-            migrated_from_number: None,
-            model: None,
-        },
-    )
-    .await;
-    match created {
-        Ok(thread) => Ok(thread.id),
-        // A concurrent bootstrap created it first; its thread is ours too.
-        Err(error) => match find().await? {
-            Some(id) => Ok(id),
-            None => Err(error),
-        },
-    }
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("no thread `{name}` in this project"))?;
+    Ok((CampSubject::Thread { thread_id }, name))
 }
 
-/// Establish a project's general thread and base camp, returning base camp.
+/// The name a thread reads by in a notice: its current name, or its id when
+/// the row is gone.
+pub async fn thread_label(db: &LocalDb, thread_id: &str) -> String {
+    db.query_opt_text(
+        "SELECT name FROM threads WHERE id = ?1",
+        (thread_id.to_string(),),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| thread_id.to_string())
+}
+
+/// What [`update_camp`] changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CampUpdate {
+    pub retitled: bool,
+    /// Set when the status moved, to the status it moved to.
+    pub status: Option<crate::models::CampStatus>,
+}
+
+/// Rename a camp and archive or unarchive it, in one transaction. An archived
+/// camp is read-only, so it is unarchived before it is renamed and archived
+/// after. Base camp is refused by storage. Authorization is the caller's.
+pub async fn update_camp(
+    db: &LocalDb,
+    camp: &Camp,
+    title: Option<String>,
+    status: Option<crate::models::CampStatus>,
+    now: i64,
+) -> Result<CampUpdate, String> {
+    use crate::models::CampStatus;
+    use cairn_db::storage::camps::{camp_by_id_conn, retitle_camp_conn, set_camp_status_conn};
+    if camp.is_base() {
+        return Err("base camp cannot be renamed or archived".to_string());
+    }
+    let camp = camp.clone();
+    db.write(move |conn| {
+        let (camp, title) = (camp.clone(), title.clone());
+        Box::pin(async move {
+            let mut update = CampUpdate::default();
+            if status == Some(CampStatus::Active)
+                && set_camp_status_conn(conn, &camp, CampStatus::Active, now).await?
+            {
+                update.status = Some(CampStatus::Active);
+            }
+            let current = camp_by_id_conn(conn, &camp.id).await?.unwrap_or(camp);
+            if let Some(title) = &title {
+                update.retitled = retitle_camp_conn(conn, &current, title, now).await?;
+            }
+            if status == Some(CampStatus::Archived)
+                && set_camp_status_conn(conn, &current, CampStatus::Archived, now).await?
+            {
+                update.status = Some(CampStatus::Archived);
+            }
+            Ok(update)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Establish a project's base camp, returning it.
 ///
 /// The one birth helper every project creation path and the boot backfill
 /// share. Idempotent: a project that already has base camp is answered with a
-/// read and nothing is written, so neither its lead nor its participants'
-/// chosen levels are touched.
+/// read and nothing is written.
 pub async fn ensure_project_base_camp(db: &LocalDb, project_id: &str) -> Result<Camp, CairnError> {
     if let Some(camp) = db.camp_by_slug(project_id, BASE_CAMP_SLUG).await? {
         return Ok(camp);
     }
-    let lead = general_thread_id(db, project_id).await?;
     let (camp, _) = db
-        .ensure_base_camp(project_id, &lead, chrono::Utc::now().timestamp())
+        .ensure_base_camp(project_id, chrono::Utc::now().timestamp())
         .await?;
     Ok(camp)
 }
@@ -142,39 +283,7 @@ pub async fn ensure_project_base_camp(db: &LocalDb, project_id: &str) -> Result<
 pub struct BaseCampBootstrap {
     pub projects: usize,
     pub established: Vec<String>,
-    /// Projects whose base camp lead moved to a general thread minted for it.
-    pub repaired: Vec<String>,
     pub errors: Vec<String>,
-}
-
-/// Give a base camp born before birth always minted `general` the general
-/// thread it should have been led by. Returns the displaced lead, if any.
-///
-/// Earlier births seated the project's oldest active thread as lead when the
-/// project had no general thread. Such a camp gets `general` minted through
-/// the ordinary thread birth (which seats it in base camp) and the lead moved
-/// to it, unless the lead was ever offered or handed over. A camp general
-/// already leads is only read.
-async fn repair_base_camp_lead(db: &LocalDb, camp: &Camp) -> Result<Option<String>, CairnError> {
-    let general = db
-        .query_opt_text(
-            "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
-            (camp.project_id.clone(), GENERAL_THREAD_NAME),
-        )
-        .await?;
-    if general.as_deref() == Some(camp.lead_thread_id.as_str()) {
-        return Ok(None);
-    }
-    if db.camp_lead_was_handed(&camp.id).await? {
-        return Ok(None);
-    }
-    let general = match general {
-        Some(id) => id,
-        None => general_thread_id(db, &camp.project_id).await?,
-    };
-    Ok(db
-        .repair_base_camp_lead(&camp.project_id, &general, chrono::Utc::now().timestamp())
-        .await?)
 }
 
 /// Give every project in every open database its base camp, before anything
@@ -195,26 +304,13 @@ pub async fn bootstrap_base_camps(dbs: &DbState) -> BaseCampBootstrap {
         };
         for project in projects {
             report.projects += 1;
-            let existing = match db.camp_by_slug(&project.id, BASE_CAMP_SLUG).await {
-                Ok(camp) => camp,
+            match db.camp_by_slug(&project.id, BASE_CAMP_SLUG).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
                 Err(error) => {
                     report.errors.push(format!("{}: {error}", project.key));
                     continue;
                 }
-            };
-            if let Some(camp) = existing {
-                match repair_base_camp_lead(&db, &camp).await {
-                    Ok(Some(displaced)) => {
-                        tracing::info!(project = %project.key, %displaced, "base camp lead moved to general");
-                        report.repaired.push(project.key.clone());
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::error!(project = %project.key, %error, "base camp lead repair failed");
-                        report.errors.push(format!("{}: {error}", project.key));
-                    }
-                }
-                continue;
             }
             match ensure_project_base_camp(&db, &project.id).await {
                 Ok(_) => report.established.push(project.key.clone()),
@@ -229,17 +325,18 @@ pub async fn bootstrap_base_camps(dbs: &DbState) -> BaseCampBootstrap {
 }
 
 /// The thread acting through an authenticated run, in the database that owns
-/// `project`. Camps are a thread's act: a run that acts for no thread (an issue
-/// node, an unauthenticated shell) is refused, and so is a thread of another
-/// project.
+/// `project`. A thread's camp acts are its own: a run that acts for no thread
+/// (an issue node, an unauthenticated shell) is refused, and so is a thread of
+/// another project.
 pub(crate) struct ActingThread {
     pub db: std::sync::Arc<LocalDb>,
     pub project_id: String,
     pub thread_id: String,
-    pub actor: cairn_db::storage::camps::CampActor,
+    /// The authenticated job the thread acts through.
+    pub job_id: String,
 }
 
-const NON_THREAD_REFUSAL: &str = "only a thread acts on camps: this run acts for no thread. Ask the thread that owns this work to pitch or join the camp.";
+const NON_THREAD_REFUSAL: &str = "only a thread acts on camps: this run acts for no thread. Ask the thread that owns this work to create or join the camp.";
 
 pub(crate) async fn acting_thread(
     orch: &crate::orchestrator::Orchestrator,
@@ -252,7 +349,6 @@ pub(crate) async fn acting_thread(
         .map_err(|error| {
             format!("camps are a thread's act and need its authenticated run: {error}")
         })?;
-    let (principal, appearance) = agent.appearance(orch.services.clock.now())?;
     let db = orch.db.for_project(project).await;
     let lineage = db
         .query_opt(
@@ -269,168 +365,14 @@ pub(crate) async fn acting_thread(
     };
     let project_id = crate::mcp::handlers::run_context::project_id_by_key(&db, project).await?;
     if thread_project != project_id {
-        return Err("a thread takes part in its own project's camps only".to_string());
+        return Err("a thread is a member of its own project's camps only".to_string());
     }
     Ok(ActingThread {
         db,
         project_id,
         thread_id,
-        actor: cairn_db::storage::camps::CampActor {
-            principal,
-            appearance,
-        },
+        job_id: agent.job_id,
     })
-}
-
-/// The camp a `camp:` value on an issue write names, checked before anything
-/// is written: a canonical camp URI of the issue's own project, live, and one
-/// the acting thread takes part in.
-pub(crate) async fn camp_for_issue_join(
-    orch: &crate::orchestrator::Orchestrator,
-    request: &crate::mcp::types::McpCallbackRequest,
-    project: &str,
-    camp_uri: &str,
-) -> Result<(ActingThread, Camp), String> {
-    let Some(cairn_uri::CairnResource::ProjectCamp {
-        project: camp_project,
-        slug,
-    }) = cairn_uri::parse_uri(camp_uri.trim())
-    else {
-        return Err(format!(
-            "payload.camp must be a canonical camp URI like {}, or null",
-            cairn_uri::build_project_camp_uri(project, "SLUG")
-        ));
-    };
-    if camp_project != cairn_uri::canonical_project(project) {
-        return Err("an issue joins a camp of its own project only".to_string());
-    }
-    let acting = acting_thread(orch, request, project).await?;
-    let camp = acting
-        .db
-        .camp_by_slug(&acting.project_id, &slug)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("no camp `{slug}` in project {project}"))?;
-    if camp.is_struck() {
-        return Err(format!("camp `{slug}` is struck; it takes no new issues"));
-    }
-    let takes_part = acting
-        .db
-        .camp_participants(&camp)
-        .await
-        .map_err(|error| error.to_string())?
-        .iter()
-        .any(|participant| participant.subject.thread_id() == Some(acting.thread_id.as_str()));
-    if !takes_part {
-        return Err(format!(
-            "your thread does not take part in camp `{slug}`; join it at {} first",
-            cairn_uri::build_project_camp_participants_uri(project, &slug)
-        ));
-    }
-    Ok((acting, camp))
-}
-
-/// A camp transition for an existing issue, validated in full: who acts, which
-/// issue, and the camp it moves to (`None` takes it out).
-pub(crate) struct IssueCampPlan {
-    pub acting: ActingThread,
-    pub issue_id: String,
-    pub camp: Option<Camp>,
-}
-
-/// Check every refusal an issue's camp change can meet before anything about
-/// the issue is written: a canonical, live target camp the caller takes part
-/// in; an issue not already in another camp; and, to take an issue out, a
-/// caller taking part in the camp it leaves.
-pub(crate) async fn plan_issue_camp(
-    orch: &crate::orchestrator::Orchestrator,
-    request: &crate::mcp::types::McpCallbackRequest,
-    project: &str,
-    number: i32,
-    target: Option<&str>,
-) -> Result<IssueCampPlan, String> {
-    let (acting, camp) = match target {
-        Some(uri) => {
-            let (acting, camp) = camp_for_issue_join(orch, request, project, uri).await?;
-            (acting, Some(camp))
-        }
-        None => (acting_thread(orch, request, project).await?, None),
-    };
-    let issue_id =
-        crate::issues::relations::issue_id_for_project_number(&acting.db, project, number)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("Issue {project}/{number} not found"))?;
-    let current = acting
-        .db
-        .query_opt_text(
-            "SELECT camp_id FROM issues WHERE id = ?1",
-            (issue_id.clone(),),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    match (&camp, current) {
-        (Some(target), Some(current)) if current != target.id => {
-            let slug = acting
-                .db
-                .query_opt_text("SELECT slug FROM camps WHERE id = ?1", (current.clone(),))
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or(current);
-            return Err(format!(
-                "issue #{number} is already joined to camp `{slug}`; take it out first (camp: null), then join the other"
-            ));
-        }
-        (None, Some(current)) => {
-            let takes_part = acting
-                .db
-                .camps_for_thread(&acting.thread_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .iter()
-                .any(|(camp, _)| camp.id == current);
-            if !takes_part {
-                return Err(
-                    "only a thread taking part in the issue's camp takes the issue out of it"
-                        .to_string(),
-                );
-            }
-        }
-        _ => {}
-    }
-    Ok(IssueCampPlan {
-        acting,
-        issue_id,
-        camp,
-    })
-}
-
-/// Join issue `issue_id` to `camp`, or take it out of its camp, as `acting`.
-pub(crate) async fn set_issue_camp(
-    acting: &ActingThread,
-    issue_id: &str,
-    camp: Option<Camp>,
-    now: i64,
-) -> Result<cairn_db::storage::camps::IssueCampChange, String> {
-    let (issue_id, actor) = (issue_id.to_string(), acting.actor.clone());
-    acting
-        .db
-        .write(move |conn| {
-            let (issue_id, actor, camp) = (issue_id.clone(), actor.clone(), camp.clone());
-            Box::pin(async move {
-                cairn_db::storage::camps::set_issue_camp_conn(
-                    conn,
-                    &issue_id,
-                    camp.as_ref(),
-                    Some(&actor),
-                    now,
-                )
-                .await
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

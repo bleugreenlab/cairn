@@ -8,19 +8,19 @@
 //!    ([`super::child::gate_owner_for_child_conn`]);
 //! 2. persisted subscriptions on the fact's source, filtered by each row's
 //!    fact kinds;
-//! 3. camps: every participant of a camp the fact addresses, and of the camp
-//!    an issue-sourced fact's issue is joined to (`issues.camp_id`);
+//! 3. camps: every thread member of a camp the fact addresses, passively for
+//!    base camp and at the watcher level for a camp;
 //! 4. standing triggers and direct addressees, which the host resolves (they
 //!    are application concepts) and offers here.
 //!
 //! Candidates merge by [`StableRecipient`]: a thread, never one of its
 //! sessions, or a non-session job. Each keeps the **maximum** level any reason
-//! reaches it at and **every** reason, so a camp watch never lowers a wake and
-//! a mute removes only its own subscription's reason. The session that
+//! reaches it at and **every** reason, so a passive base camp line never
+//! lowers a wake and a mute removes only its own subscription's reason. The session that
 //! receives a delivery is resolved at delivery, never here.
 //!
 //! Exclusions (the fact's own actors, the producing node, the subject issue's
-//! own jobs) and jurisdiction are applied here too, on every call. A struck
+//! own jobs) and jurisdiction are applied here too, on every call. An archived
 //! camp contributes nothing, which every retry re-checks because every retry
 //! resolves again.
 
@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_db::storage::{DbResult, LocalDb, RowExt, TrackedConnection};
 use cairn_db::turso::params;
-use cairn_domain::{CampRole, CampSubject};
+use cairn_domain::{Camp, CampSubject};
 use serde::{Deserialize, Serialize};
 
 use crate::push::Wake;
@@ -92,10 +92,9 @@ pub enum Reason {
         #[serde(default)]
         muted: bool,
     },
-    /// The lead of a camp the fact addresses or its issue is joined to.
-    CampLead { camp: String },
-    /// A camp participant at `watch`, `wake` or `confirm`.
-    CampRole { camp: String, role: String },
+    /// A member of a camp the fact addresses. The level is the camp's kind:
+    /// passive for base camp, the watcher level for a camp.
+    Camp { camp: String },
     /// A thread standing trigger; `consumer` is its clause ref.
     Trigger { consumer: String },
     /// The fact names the recipient's home in one of its addressee fields.
@@ -110,10 +109,7 @@ impl Reason {
     /// trigger each name their subject deliberately, and a trigger applies its
     /// own `project` test before it is offered.
     fn is_jurisdictional(&self) -> bool {
-        matches!(
-            self,
-            Self::CampLead { .. } | Self::CampRole { .. } | Self::Addressed { .. }
-        )
+        matches!(self, Self::Camp { .. } | Self::Addressed { .. })
     }
 }
 
@@ -249,14 +245,14 @@ pub struct FactAudience {
     /// The fact's project, for jurisdiction.
     pub project_id: Option<String>,
     /// The subscription source the fact is on. An `issue` source also brings
-    /// the issue's parent edge and the camp the issue is joined to.
+    /// the issue's parent edge.
     pub source: Option<SourceRef>,
     pub fact_kind: String,
     /// Camps (by id, in the database being resolved against) the fact
     /// addresses directly.
     pub camps: Vec<String>,
-    /// The level of an explicit subscription and of a camp lead, wake or
-    /// confirm participant. A camp watch is always passive.
+    /// The level of an explicit subscription and of a camp member. A base
+    /// camp member is always passive.
     pub watcher_level: Wake,
     /// The level of the parent/coordinator edge.
     pub parent_level: Wake,
@@ -346,9 +342,6 @@ pub async fn resolve_recipients_conn(
                         audience.parent_level,
                     );
                 }
-            }
-            if let Some(camp_id) = issue_camp_conn(conn, &issue_id).await? {
-                camp_census_conn(conn, &camp_id, audience.watcher_level, &mut found).await?;
             }
             subject_issue_id = Some(issue_id);
         }
@@ -497,22 +490,9 @@ async fn parent_recipient_conn(
     )
 }
 
-async fn issue_camp_conn(conn: &TrackedConnection, issue_id: &str) -> DbResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT camp_id FROM issues WHERE id = ?1 LIMIT 1",
-            params![issue_id],
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => row.opt_text(0),
-        None => Ok(None),
-    }
-}
-
-/// Offer every thread participant of a pitched camp. A struck camp offers
-/// nothing; a human participant produces no delivery (the operator is
-/// implicit).
+/// Offer every thread member of an active camp. An archived camp offers
+/// nothing, and the operator, who is never a delivery recipient, is skipped:
+/// a camp the operator is in shows an unread count instead.
 async fn camp_census_conn(
     conn: &TrackedConnection,
     camp_id: &str,
@@ -522,48 +502,39 @@ async fn camp_census_conn(
     let Some(camp) = cairn_db::storage::camps::camp_by_id_conn(conn, camp_id).await? else {
         return Ok(());
     };
-    if camp.is_struck() {
+    if camp.is_archived() {
         return Ok(());
     }
-    for participant in cairn_db::storage::camps::camp_participants_conn(conn, &camp).await? {
-        let CampSubject::Thread { thread_id } = &participant.subject else {
+    for member in cairn_db::storage::camps::camp_members_conn(conn, &camp).await? {
+        let CampSubject::Thread { thread_id } = &member.subject else {
             continue;
         };
-        let (reason, level) = camp_reason(&camp.id, participant.role, watcher_level);
+        let (reason, level) = camp_reason(&camp, watcher_level);
         found.offer(StableRecipient::Thread(thread_id.clone()), reason, level);
     }
     Ok(())
 }
 
-fn camp_reason(camp_id: &str, role: CampRole, watcher_level: Wake) -> (Reason, Wake) {
-    match role {
-        CampRole::Lead => (
-            Reason::CampLead {
-                camp: camp_id.to_string(),
-            },
-            watcher_level,
-        ),
-        CampRole::Watch => (
-            Reason::CampRole {
-                camp: camp_id.to_string(),
-                role: role.as_str().to_string(),
-            },
-            Wake::Passive,
-        ),
-        CampRole::Wake | CampRole::Confirm => (
-            Reason::CampRole {
-                camp: camp_id.to_string(),
-                role: role.as_str().to_string(),
-            },
-            watcher_level,
-        ),
-    }
+/// A camp member's reason and level: base camp is always passive, and a camp
+/// reaches its members at the watcher level.
+fn camp_reason(camp: &Camp, watcher_level: Wake) -> (Reason, Wake) {
+    let level = if camp.is_base() {
+        Wake::Passive
+    } else {
+        watcher_level
+    };
+    (
+        Reason::Camp {
+            camp: camp.id.clone(),
+        },
+        level,
+    )
 }
 
 /// Re-check a queued receipt's camp reasons against the camp as it stands at
-/// delivery: a struck camp, or a subject that has left it, withdraws the
-/// reason; a changed role re-levels only that reason (never above what was
-/// stored). Every other reason stands as stored.
+/// delivery: an archived camp, or a member that has left it (or closed),
+/// withdraws the reason, and the level is never raised above what was stored.
+/// Every other reason stands as stored.
 pub async fn revalidate_reasons_conn(
     conn: &TrackedConnection,
     recipient: &StableRecipient,
@@ -572,7 +543,7 @@ pub async fn revalidate_reasons_conn(
     let mut kept = Vec::with_capacity(reasons.len());
     for reached in reasons {
         let camp_id = match &reached.reason {
-            Reason::CampLead { camp } | Reason::CampRole { camp, .. } => camp.clone(),
+            Reason::Camp { camp } => camp.clone(),
             _ => {
                 kept.push(reached);
                 continue;
@@ -584,18 +555,16 @@ pub async fn revalidate_reasons_conn(
         let Some(camp) = cairn_db::storage::camps::camp_by_id_conn(conn, &camp_id).await? else {
             continue;
         };
-        if camp.is_struck() {
+        if camp.is_archived() {
             continue;
         }
-        let role = cairn_db::storage::camps::camp_participants_conn(conn, &camp)
-            .await?
-            .into_iter()
-            .find(|participant| participant.subject_key == *thread_id)
-            .map(|participant| participant.role);
-        let Some(role) = role else {
-            continue;
+        let member = CampSubject::Thread {
+            thread_id: thread_id.clone(),
         };
-        let (reason, level) = camp_reason(&camp.id, role, reached.level);
+        if !cairn_db::storage::camps::is_camp_member_conn(conn, &camp, &member).await? {
+            continue;
+        }
+        let (reason, level) = camp_reason(&camp, reached.level);
         kept.push(Reached {
             reason,
             level: level.min(reached.level),
@@ -808,8 +777,9 @@ mod tests {
 
     const CHILD: &str = "cairn://p/proj/2";
 
-    /// A coordinator on the parent issue, and a child issue joined to camp
-    /// `work`, led by `lead` with `waker` at wake and `quiet` at watch.
+    /// A coordinator on the parent issue, a child issue, camp `work` with
+    /// members `lead`, `waker` and the operator, and base camp, whose members
+    /// are the open threads `lead`, `waker` and `quiet` (`gone` is closed).
     async fn fixture() -> LocalDb {
         let db = cairn_db::storage::migrated_test_db("recipients.db").await;
         db.execute_script(
@@ -817,11 +787,11 @@ mod tests {
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','proj','/tmp',1,1);
              INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('i1','p',1,'Parent','active','active','none',1,1);
              INSERT INTO jobs(id,project_id,issue_id,status,current_session_id,started_at,created_at,updated_at) VALUES('coord','p','i1','running','s',1,1,1);
-             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('lead','p','lead','active','none',1,1),('waker','p','waker','active','none',1,1),('quiet','p','quiet','active','none',1,1);
+             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('lead','p','lead','active','none',1,1),('waker','p','waker','active','none',1,1),('quiet','p','quiet','active','none',1,1),('gone','p','gone','closed','none',1,1);
              INSERT INTO jobs(id,project_id,thread_id,uri_segment,status,created_at,updated_at) VALUES('lead-session','p','lead','thread','idle',1,1),('waker-session','p','waker','thread','idle',1,1),('quiet-session','p','quiet','thread','idle',1,1);
-             INSERT INTO camps(id,project_id,slug,title,kind,lead_thread_id,status,created_at,updated_at) VALUES('c1','p','work','Work','camp','lead','pitched',1,1);
-             INSERT INTO wake_subscriptions(id,source_kind,camp_id,subject_key,subject_json,camp_level,reason,created_at,updated_at) VALUES('cw','camp','c1','waker','{}','wake','r',1,1),('cq','camp','c1','quiet','{}','watch','r',1,1);
-             INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_issue_id,camp_id,created_at,updated_at) VALUES('i2','p',2,'Child','active','active','none','i1','c1',2,2);",
+             INSERT INTO camps(id,project_id,slug,title,kind,status,created_at,updated_at) VALUES('c1','p','work','Work','camp','active',1,1),('b','p','base','Base camp','base','active',1,1);
+             INSERT INTO wake_subscriptions(id,source_kind,camp_id,subject_key,subject_json,created_at,updated_at) VALUES('cl','camp','c1','lead','{}',1,1),('cw','camp','c1','waker','{}',1,1),('co','camp','c1','operator','{}',1,1),('cg','camp','c1','gone','{}',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_issue_id,created_at,updated_at) VALUES('i2','p',2,'Child','active','active','none','i1',2,2);",
         )
         .await
         .unwrap();
@@ -847,43 +817,110 @@ mod tests {
         StableRecipient::Thread(id.into())
     }
 
+    fn addressing(camp: &str) -> FactAudience {
+        let mut audience = audience("question");
+        audience.camps.push(camp.into());
+        audience
+    }
+
     #[tokio::test]
-    async fn a_joined_issues_facts_reach_its_camp_by_role_beside_the_parent_edge() {
+    async fn a_camp_wakes_its_members_and_base_camp_reaches_every_open_thread_passively() {
         let db = fixture().await;
+        let coord = (StableRecipient::Job("coord".into()), Wake::Wake);
         assert_eq!(
-            resolve(&db, &audience("question")).await,
+            resolve(&db, &addressing("c1")).await,
             vec![
                 (thread("lead"), Wake::Wake),
-                (thread("quiet"), Wake::Passive),
                 (thread("waker"), Wake::Wake),
-                (StableRecipient::Job("coord".into()), Wake::Wake),
+                coord.clone(),
+            ],
+            "the operator and a closed thread receive nothing"
+        );
+        assert_eq!(
+            resolve(&db, &addressing("b")).await,
+            vec![
+                (thread("lead"), Wake::Passive),
+                (thread("quiet"), Wake::Passive),
+                (thread("waker"), Wake::Passive),
+                coord.clone(),
             ]
         );
 
         db.execute(
-            "UPDATE camps SET status='struck', struck_at=2 WHERE id='c1'",
+            "UPDATE camps SET status='archived', archived_at=2 WHERE id='c1'",
             (),
         )
         .await
         .unwrap();
         assert_eq!(
-            resolve(&db, &audience("question")).await,
-            vec![(StableRecipient::Job("coord".into()), Wake::Wake)],
-            "a struck camp reaches no one; the parent edge still delivers"
+            resolve(&db, &addressing("c1")).await,
+            vec![coord],
+            "an archived camp reaches no one; the parent edge still delivers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_camp_reason_is_withdrawn_once_its_member_or_camp_is_gone() {
+        let db = fixture().await;
+        let reached = |camp: &str| Reached {
+            reason: Reason::Camp { camp: camp.into() },
+            level: Wake::Wake,
+        };
+        let revalidate = |recipient: &'static str, reasons: Vec<Reached>| {
+            let db = &db;
+            async move {
+                db.read(move |conn| {
+                    let reasons = reasons.clone();
+                    Box::pin(async move {
+                        revalidate_reasons_conn(conn, &thread(recipient), reasons).await
+                    })
+                })
+                .await
+                .unwrap()
+            }
+        };
+        let kept = revalidate("waker", vec![reached("c1"), reached("b")]).await;
+        assert_eq!(
+            kept.iter().map(|r| r.level).collect::<Vec<_>>(),
+            vec![Wake::Wake, Wake::Passive],
+            "base camp re-levels to passive at delivery"
+        );
+        assert!(revalidate("quiet", vec![reached("c1")]).await.is_empty());
+        db.execute(
+            "UPDATE camps SET status='archived', archived_at=2 WHERE id='c1'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(revalidate("waker", vec![reached("c1")]).await.is_empty());
+    }
+
+    /// A receipt queued before cairn/7002, rewritten by its migration, keeps
+    /// the role field it was stored with; it still reads as a camp reason.
+    #[test]
+    fn a_migrated_camp_reason_reads_with_its_leftover_role() {
+        let stored = r#"[{"kind":"camp","camp":"cb","role":"watch","level":"passive"}]"#;
+        let reasons: Vec<Reached> = serde_json::from_str(stored).unwrap();
+        assert_eq!(
+            reasons,
+            vec![Reached {
+                reason: Reason::Camp { camp: "cb".into() },
+                level: Wake::Passive,
+            }]
         );
     }
 
     #[tokio::test]
     async fn one_recipient_keeps_the_loudest_level_and_every_reason() {
         let db = fixture().await;
-        // The watch participant is also addressed directly, and mutes the issue.
+        // A base camp member is also addressed directly, and mutes the issue.
         db.execute_script(
             "INSERT INTO wake_subscriptions(id,job_id,source_kind,source_ref,state,created_by,created_at,updated_at)
                VALUES('mute','quiet-session','issue','cairn://p/proj/2','muted','agent',1,1);",
         )
         .await
         .unwrap();
-        let mut audience = audience("question");
+        let mut audience = addressing("b");
         audience.offered.push((
             thread("quiet"),
             Reason::Addressed {
@@ -900,7 +937,7 @@ mod tests {
         assert_eq!(
             quiet.level,
             Wake::Wake,
-            "a watch or a mute never lowers a wake"
+            "a passive camp line or a mute never lowers a wake"
         );
         let reasons: Vec<_> = quiet
             .reasons
@@ -917,13 +954,7 @@ mod tests {
                     },
                     Wake::Passive
                 ),
-                (
-                    Reason::CampRole {
-                        camp: "c1".into(),
-                        role: "watch".into()
-                    },
-                    Wake::Passive
-                ),
+                (Reason::Camp { camp: "b".into() }, Wake::Passive),
                 (
                     Reason::Addressed {
                         field: "mentions".into()
@@ -981,19 +1012,20 @@ mod tests {
     #[tokio::test]
     async fn a_retried_push_delivers_nothing_and_a_recurrence_delivers_again() {
         let db = fixture().await;
-        let audience = audience("resolved");
+        let mut audience = audience("resolved");
+        audience.camps.push("c1".into());
         let first = push_to_audience(Arc::new(Host), &db, &audience, &push("resolved#a"))
             .await
             .unwrap();
-        assert_eq!(first.len(), 4);
+        assert_eq!(first.len(), 3);
         assert!(first.iter().all(|delivery| delivery.fresh));
-        assert_eq!(pushes(&db).await, 4);
+        assert_eq!(pushes(&db).await, 3);
 
         let retry = push_to_audience(Arc::new(Host), &db, &audience, &push("resolved#a"))
             .await
             .unwrap();
         assert!(retry.iter().all(|delivery| !delivery.fresh));
-        assert_eq!(pushes(&db).await, 4, "the same fact is never pushed twice");
+        assert_eq!(pushes(&db).await, 3, "the same fact is never pushed twice");
 
         let again = push_to_audience(Arc::new(Host), &db, &audience, &push("resolved#b"))
             .await

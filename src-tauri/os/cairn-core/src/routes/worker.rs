@@ -43,8 +43,8 @@ use cairn_attention::message_render::{render_camp_line, render_wake_lines};
 use cairn_attention::push::Wake;
 use cairn_attention::runtime::{DeliveryOutcome, DeliveryRequest};
 use cairn_attention::wakes::{
-    receipt_state, Admission, Candidate, Coverage, DeferUntil, FactAudience, NewReceipt, Reason,
-    Receipt, ReceiptWrite, SourceRef, StableRecipient,
+    receipt_state, Admission, Candidate, Coverage, DeferUntil, FactAudience, NewReceipt, Reached,
+    Reason, Receipt, ReceiptWrite, SourceRef, StableRecipient,
 };
 
 use super::log::{clauses_need_hydration, hydrate, stored_fact, Hydrated};
@@ -52,8 +52,8 @@ use super::{matches, Audience, Fact, FactRegistry, RouteContext};
 use crate::models::DeliveryUrgency;
 use crate::orchestrator::wakes::{
     render_rebuild_firing, Addressed, MutedDelivery, WakeSubscriptionState,
-    ADDRESSED_FACT_REF_PREFIX, CAMP_WATCH_FACT_REF_PREFIX, REBUILD_WAKE_KEY_PREFIX,
-    REBUILD_WAKE_ROLE, SOURCE_KIND_FACT,
+    ADDRESSED_FACT_REF_PREFIX, PASSIVE_CAMP_FACT_REF_PREFIX, REBUILD_WAKE_KEY_PREFIX,
+    SOURCE_KIND_FACT,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{route_state, FactRow, FactWake, WakeMatch, WakeWindow};
@@ -637,8 +637,14 @@ async fn apply_clause_rows(
 }
 
 /// The clause a recipient's wake reads as: its loudest reason, an addressee
-/// field before a camp role before a subscription or the parent edge before a
+/// field before a camp before a subscription or the parent edge before a
 /// trigger on a tie, so the delivered line names the most specific route.
+///
+/// A camp member is addressed under the camp's field like a direct addressee,
+/// except that base camp's lines take [`PASSIVE_CAMP_FACT_REF_PREFIX`] so a
+/// node can mute base camp on its own. A camp reason is passive exactly when
+/// its camp is base camp (`camp_reason` in the resolver), so the level names
+/// the namespace here; the namespace never names the level.
 fn wake_clause(
     source: &str,
     candidate: &Candidate,
@@ -647,12 +653,11 @@ fn wake_clause(
 ) -> String {
     let rank = |reason: &Reason| match reason {
         Reason::Addressed { .. } => 0,
-        Reason::CampLead { .. } => 1,
-        Reason::CampRole { .. } => 2,
-        Reason::Subscription { .. } => 3,
-        Reason::Parent { .. } => 4,
-        Reason::Trigger { .. } => 5,
-        Reason::Backfilled { .. } => 6,
+        Reason::Camp { .. } => 1,
+        Reason::Subscription { .. } => 2,
+        Reason::Parent { .. } => 3,
+        Reason::Trigger { .. } => 4,
+        Reason::Backfilled { .. } => 5,
     };
     let loudest = candidate.reasons.iter().max_by(|a, b| {
         a.level
@@ -661,34 +666,37 @@ fn wake_clause(
     });
     let field = field.unwrap_or("addressee");
     let camp_field = |camp: &str| camp_fields.get(camp).copied().unwrap_or(field);
-    match loudest.map(|reached| &reached.reason) {
-        Some(Reason::Trigger { consumer }) => consumer.clone(),
-        Some(Reason::Addressed { field }) => format!("{ADDRESSED_FACT_REF_PREFIX}{source}.{field}"),
-        Some(Reason::CampLead { camp }) => format!(
-            "{ADDRESSED_FACT_REF_PREFIX}{source}.{}{CAMP_ROLE_SEPARATOR}lead",
-            camp_field(camp)
-        ),
-        Some(Reason::CampRole { camp, role }) => {
-            let prefix = if role == "watch" {
-                CAMP_WATCH_FACT_REF_PREFIX
+    match loudest {
+        Some(Reached {
+            reason: Reason::Trigger { consumer },
+            ..
+        }) => consumer.clone(),
+        Some(Reached {
+            reason: Reason::Addressed { field },
+            ..
+        }) => format!("{ADDRESSED_FACT_REF_PREFIX}{source}.{field}"),
+        Some(Reached {
+            reason: Reason::Camp { camp },
+            level,
+        }) => {
+            let prefix = if *level == Wake::Passive {
+                PASSIVE_CAMP_FACT_REF_PREFIX
             } else {
                 ADDRESSED_FACT_REF_PREFIX
             };
-            format!(
-                "{prefix}{source}.{}{CAMP_ROLE_SEPARATOR}{role}",
-                camp_field(camp)
-            )
+            format!("{prefix}{source}.{}", camp_field(camp))
         }
-        Some(Reason::Backfilled { clause }) => clause.clone(),
-        Some(Reason::Subscription { .. } | Reason::Parent { .. }) | None => {
-            format!("{ADDRESSED_FACT_REF_PREFIX}{source}.{field}")
-        }
+        Some(Reached {
+            reason: Reason::Backfilled { clause },
+            ..
+        }) => clause.clone(),
+        Some(Reached {
+            reason: Reason::Subscription { .. } | Reason::Parent { .. },
+            ..
+        })
+        | None => format!("{ADDRESSED_FACT_REF_PREFIX}{source}.{field}"),
     }
 }
-
-/// Separates a camp-delivered clause ref from the role its recipient was
-/// reached at, so the delivered line can say which camp it came from and why.
-const CAMP_ROLE_SEPARATOR: &str = "@";
 
 /// The recipients whose own write a row is: the job that minted it, and the
 /// home the source's declared actor field names. Both are stable recipients,
@@ -1390,10 +1398,9 @@ struct WakeText {
 /// (a recipient's receipts for one row are one fact, at their loudest), then
 /// the writing the newest post row points at.
 ///
-/// A fact a camp reached the recipient through reads as the camp's line, with
-/// the recipient's highest camp reason as its role; a rebuild firing beside
-/// its boot's camp fact reads as that fact with the role
-/// [`REBUILD_WAKE_ROLE`]. A firing with no camp fact reads in its own words,
+/// A fact a camp reached the recipient through reads as the camp's line, and
+/// so does a rebuild firing beside its boot's camp fact. A firing with no camp
+/// fact reads in its own words,
 /// and any other row as an `[Event]` line. Past
 /// [`cairn_attention::message_render::MAX_WAKE_LINES`] the rest is counted and
 /// pointed at: the camp when one camp said everything, otherwise the events
@@ -1443,13 +1450,10 @@ async fn wake_message(orch: &Orchestrator, wake: &FactWake, receipts: &[Receipt]
         };
         let uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
         let summary = row.summary.as_deref().unwrap_or(row.identity.as_str());
-        let role = match &firing {
-            Some(_) => Some(REBUILD_WAKE_ROLE.to_string()),
-            None => camp_role(group),
-        };
-        match (row_camp(&row), role) {
-            (Some((camp, slug)), Some(role)) => {
-                lines.push(render_camp_line(&slug, &role, summary, &uri));
+        let framed = firing.is_some() || camp_reached(group);
+        match row_camp(&row) {
+            Some((camp, slug)) if framed => {
+                lines.push(render_camp_line(&slug, summary, &uri));
                 camps.insert(camp);
             }
             _ => {
@@ -1493,37 +1497,23 @@ async fn wake_message(orch: &Orchestrator, wake: &FactWake, receipts: &[Receipt]
     }
 }
 
-/// The camp role a fact's receipts reach the recipient at, when a camp is
-/// what reaches it as loudly as anything: its highest camp reason (`lead`
-/// before `wake` before `confirm` before `watch` at one level). `None` when a
-/// louder route reached it, or a direct address at the same level, so the
-/// line names the route that actually woke it.
-fn camp_role(receipts: &[&Receipt]) -> Option<String> {
+/// Whether a camp is what reaches the recipient with a fact's receipts, as
+/// loudly as anything. Not when a louder route reached it, or a direct address
+/// at the same level, so the line names the route that actually woke it.
+fn camp_reached(receipts: &[&Receipt]) -> bool {
     let reasons = || receipts.iter().flat_map(|receipt| receipt.reasons.iter());
-    let loudest = reasons().map(|reached| reached.level).max()?;
-    let rank = |role: &str| match role {
-        "lead" => 0,
-        "wake" => 1,
-        "confirm" => 2,
-        _ => 3,
+    let Some(loudest) = reasons().map(|reached| reached.level).max() else {
+        return false;
     };
-    let mut best: Option<(Wake, &str)> = None;
-    for reached in reasons() {
-        let role = match &reached.reason {
-            Reason::CampLead { .. } => "lead",
-            Reason::CampRole { role, .. } => role.as_str(),
-            Reason::Addressed { .. } if reached.level == loudest => return None,
-            _ => continue,
-        };
-        let better = best.is_none_or(|(level, held)| {
-            reached.level > level || (reached.level == level && rank(role) < rank(held))
-        });
-        if better {
-            best = Some((reached.level, role));
+    let mut camp = false;
+    for reached in reasons().filter(|reached| reached.level == loudest) {
+        match &reached.reason {
+            Reason::Addressed { .. } => return false,
+            Reason::Camp { .. } => camp = true,
+            _ => {}
         }
     }
-    let (level, role) = best?;
-    (level == loudest).then(|| role.to_string())
+    camp
 }
 
 /// The camp a row names, as (canonical URI, slug): its `camp` field, or else

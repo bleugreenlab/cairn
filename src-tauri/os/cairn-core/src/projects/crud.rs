@@ -135,7 +135,13 @@ pub async fn create(
     // A project is born with its general thread and base camp, or not at all:
     // a usable project without base camp would have nowhere to deliver a
     // notice owed to all of its threads.
-    if let Err(error) = crate::camps::ensure_project_base_camp(db, &db_project.id).await {
+    let born = match ensure_general_thread(db, &db_project.id).await {
+        Ok(_) => crate::camps::ensure_project_base_camp(db, &db_project.id)
+            .await
+            .map(|_| ()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = born {
         if let Err(rollback_error) = delete_db(db, &db_project.id).await {
             return Err(CairnError::Internal(format!(
                 "failed to establish base camp for project {}: {error}; additionally failed to roll back project row: {rollback_error}",
@@ -149,6 +155,45 @@ pub async fn create(
     }
 
     Ok(db_project)
+}
+
+/// The thread every project is born with: the project's general thread, and
+/// the one a restriction of base camp's posting would leave beside the
+/// operator (`docs/camps.md`).
+pub const GENERAL_THREAD_NAME: &str = "general";
+
+/// The project's general thread, created if the project has none.
+async fn ensure_general_thread(db: &LocalDb, project_id: &str) -> Result<String, CairnError> {
+    let find = || async {
+        db.query_opt_text(
+            "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
+            (project_id.to_string(), GENERAL_THREAD_NAME),
+        )
+        .await
+    };
+    if let Some(id) = find().await? {
+        return Ok(id);
+    }
+    let created = crate::threads::crud::create(
+        db,
+        crate::models::CreateThread {
+            project_id: project_id.to_string(),
+            name: Some(GENERAL_THREAD_NAME.to_string()),
+            jurisdiction: None,
+            definition: None,
+            migrated_from_number: None,
+            model: None,
+        },
+    )
+    .await;
+    match created {
+        Ok(thread) => Ok(thread.id),
+        // A concurrent birth created it first; its thread is ours too.
+        Err(error) => match find().await? {
+            Some(id) => Ok(id),
+            None => Err(error),
+        },
+    }
 }
 
 /// Repair project rows created before repository bootstrapping was enforced.

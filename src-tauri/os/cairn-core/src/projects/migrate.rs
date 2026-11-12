@@ -352,7 +352,6 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     owned("wake_schedules", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     owned("wake_conditions", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     spec("camps", "project_id = ?1"),
-    spec("camp_events", "camp_id IN (SELECT id FROM camps WHERE project_id = ?1)"),
     spec("issues", "project_id = ?1"),
     spec("main_incident_budget", "project_id = ?1"),
     spec("main_incidents", "project_id = ?1"),
@@ -474,6 +473,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("pack_catalog", "project_id = ?1"),
     delete_only("pack_catalog_references", "project_id = ?1"),
     delete_only("posts", "project_id = ?1"),
+    delete_only("camp_read_cursors", "camp_id IN (SELECT id FROM camps WHERE project_id = ?1)"),
     delete_only("post_comments", "post_id IN (SELECT id FROM posts WHERE project_id = ?1)"),
     delete_only("landing_allocations", "project_id = ?1"),
     delete_only("service_log", "project_id = ?1"),
@@ -1645,14 +1645,12 @@ pub(super) mod tests {
               VALUES ('skill-config-delete', 'skill', 'prompt', 'project-delete', 1, 1);
             INSERT INTO threads(id, project_id, name, created_at, updated_at)
               VALUES ('thread-delete', 'project-delete', 'thread', 1, 1);
-            INSERT INTO camps(id, project_id, slug, title, kind, lead_thread_id, created_at, updated_at)
-              VALUES ('camp-delete', 'project-delete', 'base', 'Base camp', 'base', 'thread-delete', 1, 1);
-            INSERT INTO camp_events(camp_id, policy_epoch, kind, subject_key, created_at)
-              VALUES ('camp-delete', 0, 'pitched', 'thread-delete', 1);
-            INSERT INTO wake_subscriptions(id, job_id, source_kind, created_at, updated_at, camp_id, subject_key, subject_json, camp_level, reason)
-              VALUES ('camp-subscription-delete', NULL, 'camp', 1, 1, 'camp-delete', 'thread-delete', '{}', 'watch', 'member');
-            INSERT INTO issues(id, project_id, number, title, created_at, updated_at, parent_thread_id, camp_id)
-              VALUES ('issue-delete', 'project-delete', 1, 'Issue', 1, 1, 'thread-delete', 'camp-delete');
+            INSERT INTO camps(id, project_id, slug, title, kind, created_at, updated_at)
+              VALUES ('camp-delete', 'project-delete', 'talk', 'Talk', 'camp', 1, 1);
+            INSERT INTO wake_subscriptions(id, job_id, source_kind, created_at, updated_at, camp_id, subject_key, subject_json)
+              VALUES ('camp-subscription-delete', NULL, 'camp', 1, 1, 'camp-delete', 'thread-delete', '{}');
+            INSERT INTO issues(id, project_id, number, title, created_at, updated_at, parent_thread_id)
+              VALUES ('issue-delete', 'project-delete', 1, 'Issue', 1, 1, 'thread-delete');
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
               VALUES ('execution-delete', 'recipe', 'issue-delete', 'project-delete', 'completed', 1, 1);
             INSERT INTO jobs(id, execution_id, issue_id, project_id, thread_id, status, created_at, updated_at)

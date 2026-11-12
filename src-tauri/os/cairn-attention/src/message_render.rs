@@ -43,19 +43,21 @@ use crate::models::Message;
 /// What every camp line opens with.
 pub const CAMP_LINE_PREFIX: &str = "From camp ";
 
-/// One fact as a camp delivers it: `From camp <slug> (your role: <role>):
-/// <summary> — <link>`. `role` is the recipient's loudest camp reason
-/// (`lead`, `wake`, `confirm`, `watch`), or a phrase naming a role and the
-/// reason it was raised, such as `wake — rebuild subscription`.
-pub fn render_camp_line(slug: &str, role: &str, summary: &str, link: &str) -> String {
-    format!("{CAMP_LINE_PREFIX}{slug} (your role: {role}): {summary} \u{2014} {link}")
+/// One fact as a camp delivers it: `From camp <slug>: <summary> — <link>`.
+pub fn render_camp_line(slug: &str, summary: &str, link: &str) -> String {
+    format!("{CAMP_LINE_PREFIX}{slug}: {summary} \u{2014} {link}")
 }
 
 /// The slug of the camp a framed message leads with, or `None` when the text
-/// does not open with a camp line.
+/// does not open with a camp line. A slug is lowercase letters, digits and
+/// hyphens, so it never holds the `: ` that ends it.
 pub fn camp_line_slug(text: &str) -> Option<&str> {
-    let (slug, rest) = text.strip_prefix(CAMP_LINE_PREFIX)?.split_once(' ')?;
-    rest.starts_with("(your role: ").then_some(slug)
+    let (slug, _) = text.strip_prefix(CAMP_LINE_PREFIX)?.split_once(": ")?;
+    (!slug.is_empty()
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
+    .then_some(slug)
 }
 
 /// Whether a direct's sender is a camp: a wake a camp delivered persists the
@@ -387,31 +389,22 @@ mod tests {
     }
 
     #[test]
-    fn a_camp_line_names_its_camp_role_summary_and_link() {
-        let line = render_camp_line(
-            "base",
-            "wake",
-            "Cairn was rebuilt.",
-            "cairn://p/cairn/events/7",
-        );
+    fn a_camp_line_names_its_camp_summary_and_link() {
+        let line = render_camp_line("base", "Cairn was rebuilt.", "cairn://p/cairn/events/7");
         assert_eq!(
             line,
-            "From camp base (your role: wake): Cairn was rebuilt. \u{2014} cairn://p/cairn/events/7"
+            "From camp base: Cairn was rebuilt. \u{2014} cairn://p/cairn/events/7"
         );
         assert_eq!(camp_line_slug(&line), Some("base"));
         assert_eq!(camp_line_slug("From camp fire tonight"), None);
+        assert_eq!(camp_line_slug("From camp fire tonight: who comes"), None);
     }
 
     /// A camp's direct leads with its camp line, not `[Direct message from
     /// system]`, and offers no reply address a camp does not have.
     #[test]
     fn a_camp_sender_renders_as_its_camp_line() {
-        let content = render_camp_line(
-            "base",
-            "watch",
-            "Cairn was rebuilt.",
-            "cairn://p/cairn/events/7",
-        );
+        let content = render_camp_line("base", "Cairn was rebuilt.", "cairn://p/cairn/events/7");
         let msg = direct_from("cairn://p/cairn/camps/base", &content);
         assert!(is_camp_sender(&msg.sender_name));
         assert_eq!(render_direct_message(&msg, READER), content);

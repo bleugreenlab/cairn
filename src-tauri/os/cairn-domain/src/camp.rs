@@ -1,12 +1,12 @@
-//! Camps: durable project-level coordination containers (cairn/6255).
+//! Camps: named conversations of a project (cairn/6255, cut down by cairn/7002).
 //!
-//! A camp owns intent and references. Who is involved is stored once, in the
-//! place each kind of involvement already lives: the lead on the camp row,
-//! watch/wake as camp-subject wake subscriptions, confirm with the artifact
-//! gate. [`CampParticipant`] is the census that projects those sources into one
-//! effective role per principal; it is never stored.
+//! There are two kinds. Base camp is the project's one passive channel: every
+//! open thread of the project is in it, implicitly, and what reaches it rides
+//! along at each thread's next turn. A camp is a group conversation among the
+//! threads and the operator that are its members, stored as camp-owned wake
+//! subscription rows, and each post to it wakes every other member. The
+//! delivery level is a property of the kind, never of a member.
 
-use cairn_common::identity::PrincipalRef;
 use serde::{Deserialize, Serialize};
 
 /// Every project's one base camp is addressed by this slug, and no ordinary
@@ -20,7 +20,7 @@ pub const CAMP_SLUG_MAX_LEN: usize = 64;
 ///
 /// A slug is a stable URI segment: lowercase ASCII letters, digits and single
 /// hyphens, starting with a letter. `base` is reserved for the project's base
-/// camp, which is born with the project rather than pitched.
+/// camp, which is born with the project rather than created by anyone.
 pub fn validate_camp_slug(slug: &str) -> Result<(), String> {
     if slug.is_empty() || slug.len() > CAMP_SLUG_MAX_LEN {
         return Err(format!(
@@ -74,153 +74,74 @@ impl CampKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CampStatus {
-    Pitched,
-    Struck,
+    Active,
+    Archived,
 }
 
 impl CampStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Pitched => "pitched",
-            Self::Struck => "struck",
+            Self::Active => "active",
+            Self::Archived => "archived",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "pitched" => Some(Self::Pitched),
-            "struck" => Some(Self::Struck),
+            "active" => Some(Self::Active),
+            "archived" => Some(Self::Archived),
             _ => None,
         }
     }
 }
 
-/// How involved a principal is in a camp.
-///
-/// The order is the attention order: each role receives at least what every
-/// role below it receives, which is why a census can take the maximum of a
-/// principal's sources and never needs to combine them otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CampRole {
-    /// Passive lines only.
-    Watch,
-    /// The camp's facts wake it as they wake the lead.
-    Wake,
-    /// A veto: the camp's gated artifacts wait on this principal's signature.
-    Confirm,
-    /// The camp's one lead thread.
-    Lead,
-}
+/// The stored key of the operator's membership. The literal the system already
+/// attributes operator authorship to (`headline_read_cursors.reader`), until an
+/// operator principal id exists to carry instead.
+pub const OPERATOR_MEMBER_KEY: &str = "operator";
 
-impl CampRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Watch => "watch",
-            Self::Wake => "wake",
-            Self::Confirm => "confirm",
-            Self::Lead => "lead",
-        }
-    }
-}
-
-/// The level a camp-subject subscription stores. Confirm and lead are not
-/// levels: they live with the artifact gate and on the camp row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CampLevel {
-    Watch,
-    Wake,
-}
-
-impl CampLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Watch => "watch",
-            Self::Wake => "wake",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "watch" => Some(Self::Watch),
-            "wake" => Some(Self::Wake),
-            _ => None,
-        }
-    }
-
-    pub fn role(self) -> CampRole {
-        match self {
-            Self::Watch => CampRole::Watch,
-            Self::Wake => CampRole::Wake,
-        }
-    }
-}
-
-/// The stable identity a camp role is keyed by.
+/// A camp member's stable identity.
 ///
 /// A thread is its `threads.id`, never its name or a session job, so a rename
-/// or a session replacement changes nothing about its involvement. A human is
-/// issuer plus subject: the same subject string under two issuers is two
-/// people.
+/// or a session replacement changes nothing about its membership.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CampSubject {
-    Thread {
-        thread_id: String,
-    },
-    Human {
-        issuer: String,
-        subject: String,
-        organization: Option<String>,
-    },
+    Thread { thread_id: String },
+    Operator,
 }
 
-/// Separates issuer from subject in a human's key. A control character, so no
-/// validated principal field can contain it (`PrincipalRef` validation refuses
-/// control characters), which keeps the key unambiguous.
-const HUMAN_KEY_SEPARATOR: char = '\u{1f}';
-const HUMAN_KEY_PREFIX: &str = "human:";
-
 impl CampSubject {
-    /// The durable key a role row stores. A thread's key is its bare id, which
-    /// move-to-team rekeys like any other id column; a human's key is not an
-    /// id and is left alone.
+    /// The durable key a member row stores. A thread's key is its bare id,
+    /// which move-to-team rekeys like any other id column; the operator's is
+    /// [`OPERATOR_MEMBER_KEY`], which it leaves alone.
     pub fn key(&self) -> String {
         match self {
             Self::Thread { thread_id } => thread_id.clone(),
-            Self::Human {
-                issuer, subject, ..
-            } => format!("{HUMAN_KEY_PREFIX}{issuer}{HUMAN_KEY_SEPARATOR}{subject}"),
+            Self::Operator => OPERATOR_MEMBER_KEY.to_string(),
         }
     }
 
     pub fn thread_id(&self) -> Option<&str> {
         match self {
             Self::Thread { thread_id } => Some(thread_id),
-            Self::Human { .. } => None,
+            Self::Operator => None,
         }
     }
 
-    /// Whether a stored key names a thread rather than a human.
+    /// Whether a stored key names a thread rather than the operator.
     pub fn key_is_thread(key: &str) -> bool {
-        !key.starts_with(HUMAN_KEY_PREFIX)
+        key != OPERATOR_MEMBER_KEY
     }
 
-    /// The human subject a principal names, if it names one. Thread subjects
-    /// are resolved from their URI by the caller, which owns the thread table.
-    pub fn human_from_principal(principal: &PrincipalRef) -> Option<Self> {
-        match principal {
-            PrincipalRef::Human {
-                issuer,
-                subject,
-                organization,
-            } => Some(Self::Human {
-                issuer: issuer.clone(),
-                subject: subject.clone(),
-                organization: organization.clone(),
-            }),
-            _ => None,
+    /// The subject a stored key names.
+    pub fn from_key(key: &str) -> Self {
+        if Self::key_is_thread(key) {
+            Self::Thread {
+                thread_id: key.to_string(),
+            }
+        } else {
+            Self::Operator
         }
     }
 }
@@ -233,13 +154,8 @@ pub struct Camp {
     pub slug: String,
     pub title: String,
     pub kind: CampKind,
-    pub lead_thread_id: String,
-    /// The thread the lead has been offered to and has not yet accepted.
-    pub lead_offer_thread_id: Option<String>,
     pub status: CampStatus,
-    pub policy_epoch: i64,
-    pub struck_at: Option<i64>,
-    pub struck_reason: Option<String>,
+    pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -249,66 +165,20 @@ impl Camp {
         self.kind == CampKind::Base
     }
 
-    pub fn is_struck(&self) -> bool {
-        self.status == CampStatus::Struck
+    pub fn is_archived(&self) -> bool {
+        self.status == CampStatus::Archived
     }
 }
 
-/// One principal's effective involvement in one camp, projected from every
-/// source that records it.
+/// One member of a camp. Never stored as such: base camp's members are its
+/// project's open threads, and a camp's are its member rows minus closed
+/// threads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CampParticipant {
+pub struct CampMember {
     pub subject_key: String,
     pub subject: CampSubject,
-    /// The principal as recorded when it joined. A thread's current name is
-    /// resolved from `subject` on the way to a surface, not from this.
-    pub principal: Option<PrincipalRef>,
-    /// The maximum of every source below.
-    pub role: CampRole,
-    pub lead: bool,
-    pub level: Option<CampLevel>,
-    pub reason: Option<String>,
-    /// Who set this participant's level, when someone did: absent for the
-    /// system's own seating (birth, backfill) and for the lead edge.
-    pub assigned_by: Option<PrincipalRef>,
     pub since: i64,
-}
-
-/// What a camp journal row records. Every kind the journal's CHECK admits is
-/// named here, so a history line is generated from a known kind; a stored kind
-/// this build does not know reads as [`CampEventKind::Other`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CampEventKind {
-    Pitched,
-    Joined,
-    RoleChanged,
-    Left,
-    LeadOffered,
-    LeadChanged,
-    Retitled,
-    Struck,
-    IssueJoined,
-    IssueLeft,
-    Other(String),
-}
-
-impl CampEventKind {
-    pub fn parse(kind: &str) -> Self {
-        match kind {
-            "pitched" => Self::Pitched,
-            "joined" => Self::Joined,
-            "role_changed" => Self::RoleChanged,
-            "left" => Self::Left,
-            "lead_offered" => Self::LeadOffered,
-            "lead_changed" => Self::LeadChanged,
-            "retitled" => Self::Retitled,
-            "struck" => Self::Struck,
-            "issue_joined" => Self::IssueJoined,
-            "issue_left" => Self::IssueLeft,
-            other => Self::Other(other.to_string()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -316,22 +186,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roles_order_by_attention() {
-        assert!(CampRole::Watch < CampRole::Wake);
-        assert!(CampRole::Wake < CampRole::Confirm);
-        assert!(CampRole::Confirm < CampRole::Lead);
-        assert_eq!(CampLevel::Wake.role(), CampRole::Wake);
-    }
-
-    #[test]
-    fn the_same_subject_under_two_issuers_is_two_humans() {
-        let alice = |issuer: &str| CampSubject::Human {
-            issuer: issuer.into(),
-            subject: "alice".into(),
-            organization: None,
-        };
-        assert_ne!(alice("github").key(), alice("google").key());
-        assert!(!CampSubject::key_is_thread(&alice("github").key()));
+    fn member_keys_round_trip() {
+        assert_eq!(CampSubject::Operator.key(), OPERATOR_MEMBER_KEY);
+        assert!(!CampSubject::key_is_thread(OPERATOR_MEMBER_KEY));
+        assert_eq!(CampSubject::from_key("operator"), CampSubject::Operator);
         let thread = CampSubject::Thread {
             thread_id: "6f1c0a52-8f0e-4d55-9c1a-2b8d3a1e7f00".into(),
         };

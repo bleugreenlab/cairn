@@ -56,7 +56,7 @@ pub use fact_log::{
     raise_wake_level_conn as raise_fact_wake_level_conn, recover_on_start as recover_fact_log,
     requeue_wake as requeue_fact_wake, route_state, set_index_outcome, FactFilter, FactRow,
     FactScope, FactWake, LogDedupe, NewFact, PruneSelector, Recovery, WakeMatch, WakeWindow,
-    PASSIVE_FACT_REF_PREFIX,
+    PASSIVE_CAMP_FACT_REF_PREFIX,
 };
 pub use failed_dependencies::{failed_dependency_candidates, failed_dependency_candidates_conn};
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};

@@ -209,8 +209,8 @@ pub fn build_project_camp_uri(project: &str, slug: &str) -> String {
     format!("{}/{slug}", build_project_camps_uri(project))
 }
 
-pub fn build_project_camp_participants_uri(project: &str, slug: &str) -> String {
-    format!("{}/participants", build_project_camp_uri(project, slug))
+pub fn build_project_camp_members_uri(project: &str, slug: &str) -> String {
+    format!("{}/members", build_project_camp_uri(project, slug))
 }
 
 pub fn build_project_camp_posts_uri(project: &str, slug: &str) -> String {
@@ -1200,8 +1200,8 @@ impl CairnResource {
             Self::ProjectTenet { project, key } => build_project_tenet_uri(project, key),
             Self::ProjectCamps { project } => build_project_camps_uri(project),
             Self::ProjectCamp { project, slug } => build_project_camp_uri(project, slug),
-            Self::ProjectCampParticipants { project, slug } => {
-                build_project_camp_participants_uri(project, slug)
+            Self::ProjectCampMembers { project, slug } => {
+                build_project_camp_members_uri(project, slug)
             }
             Self::ProjectCampPosts { project, slug } => build_project_camp_posts_uri(project, slug),
             Self::ProjectPages { project } => build_project_pages_uri(project),

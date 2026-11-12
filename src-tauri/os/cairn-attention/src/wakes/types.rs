@@ -18,14 +18,14 @@ pub const SOURCE_KIND_FACT: &str = "fact";
 /// full ref is `addressed:{source}.{field}`. No row is stored for it: with no
 /// persisted subscription of the same ref, routing synthesizes an active one
 /// ([`addressed_fact_subscription`]), so a persisted row on the ref is how a
-/// node mutes or refuses one addressee field.
+/// node mutes or refuses one addressee field. A camp's members are addressed
+/// under this namespace like any direct addressee.
 pub const ADDRESSED_FACT_REF_PREFIX: &str = "addressed:";
-/// A fact a camp delivered to a participant at `watch`: addressed, but
-/// passively. Its synthesized subscription is muted, so a source that rides
-/// along lands with the recipient's next run instead of waking it. A camp
-/// participant at `wake` or above is addressed under
-/// [`ADDRESSED_FACT_REF_PREFIX`] like any direct addressee.
-pub const CAMP_WATCH_FACT_REF_PREFIX: &str = cairn_db::storage::PASSIVE_FACT_REF_PREFIX;
+/// The namespace of a fact base camp delivered: `camp-passive:{source}.{field}`.
+/// Identity only, like [`ADDRESSED_FACT_REF_PREFIX`], and kept apart from it so
+/// a node can mute base camp separately from direct addressing. The delivered
+/// level, never this prefix, decides how loudly it lands.
+pub const PASSIVE_CAMP_FACT_REF_PREFIX: &str = cairn_db::storage::PASSIVE_CAMP_FACT_REF_PREFIX;
 pub const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 /// A `run` batch that outlived its call reported to its job. The row's
@@ -114,11 +114,15 @@ pub fn derived_child_subscription(job_id: &str, issue_uri: &str) -> WakeSubscrip
 
 /// The derived subscription a fact wake carries when the row addresses its
 /// recipient directly (see [`ADDRESSED_FACT_REF_PREFIX`]). Like
-/// [`derived_child_subscription`], it never reaches the database.
+/// [`derived_child_subscription`], it never reaches the database. Its state is
+/// the delivered level's: a passive delivery is muted, so a source that rides
+/// along lands with the recipient's next run instead of waking it, and a
+/// waking one is active. The ref's prefix plays no part.
 pub fn addressed_fact_subscription(
     job_id: &str,
     clause_ref: &str,
     fact_kind: &str,
+    urgency: DeliveryUrgency,
 ) -> WakeSubscription {
     WakeSubscription {
         id: format!("derived:addressed:{job_id}:{clause_ref}"),
@@ -126,7 +130,7 @@ pub fn addressed_fact_subscription(
         source_kind: SOURCE_KIND_FACT.to_string(),
         source_ref: Some(clause_ref.to_string()),
         fact_kinds: Some(vec![fact_kind.to_string()]),
-        state: if clause_ref.starts_with(CAMP_WATCH_FACT_REF_PREFIX) {
+        state: if urgency == DeliveryUrgency::Passive {
             WakeSubscriptionState::Muted
         } else {
             WakeSubscriptionState::Active
@@ -536,4 +540,36 @@ pub fn suppressed_from_row(row: &cairn_db::turso::Row) -> DbResult<SuppressedWak
         updated_at: row.i64(10)?,
         delivered_at: row.opt_i64(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_synthesized_addressee_follows_the_delivered_level_not_the_ref() {
+        let state = |clause_ref: &str, urgency| {
+            addressed_fact_subscription("job", clause_ref, "post_created", urgency).state
+        };
+        let base = format!("{PASSIVE_CAMP_FACT_REF_PREFIX}post_created.camp");
+        let direct = format!("{ADDRESSED_FACT_REF_PREFIX}post_created.camp");
+        assert_eq!(
+            state(&base, DeliveryUrgency::Queue),
+            WakeSubscriptionState::Active,
+            "a base camp ref delivered at wake wakes"
+        );
+        assert_eq!(
+            state(&direct, DeliveryUrgency::Passive),
+            WakeSubscriptionState::Muted,
+            "a direct ref delivered passively does not wake"
+        );
+        assert_eq!(
+            state(&base, DeliveryUrgency::Passive),
+            WakeSubscriptionState::Muted
+        );
+        assert_eq!(
+            state(&direct, DeliveryUrgency::Queue),
+            WakeSubscriptionState::Active
+        );
+    }
 }

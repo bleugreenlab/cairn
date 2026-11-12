@@ -81,7 +81,6 @@ fn quotation(entry: &ReferenceEntry) -> (&str, &str, Option<i64>, &str, bool) {
 fn a_camp_line_in_a_transcript_is_the_camp_s_not_the_operator_s() {
     let line = cairn_attention::message_render::render_camp_line(
         "base",
-        "wake",
         "Cairn was rebuilt.",
         "cairn://p/cairn/events/7",
     );

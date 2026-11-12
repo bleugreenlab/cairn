@@ -60,19 +60,6 @@ pub(super) async fn dispatch(
             } else {
                 None
             };
-            let camp = match payload.get("camp") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(value) => Some(
-                    value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
-                            build_failure(index, item, "payload.camp must be a camp URI string")
-                        })?
-                        .to_string(),
-                ),
-            };
             let mut execution = parse_create_execution_spec(index, item, payload)?;
             // `place:"head"` is checked before the issue exists, against the
             // thread the new issue will be a child of: the one `parent` names,
@@ -135,16 +122,6 @@ pub(super) async fn dispatch(
                     None => format!("Would create issue in project {project}: {title}"),
                 }
             } else {
-                // The camp is checked before the issue exists, so a refused
-                // join never leaves an issue behind.
-                let camp = match camp.as_deref() {
-                    Some(uri) => Some(
-                        crate::camps::camp_for_issue_join(orch, request, project, uri)
-                            .await
-                            .map_err(|error| build_failure(index, item, error))?,
-                    ),
-                    None => None,
-                };
                 let agent =
                     crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
                         .await
@@ -185,14 +162,7 @@ pub(super) async fn dispatch(
                     "number": outcome.number,
                     "uri": outcome.uri,
                 }));
-                match camp {
-                    Some((acting, camp)) => {
-                        let joined =
-                            join_created_issue(orch, &acting, camp, project, outcome.number).await;
-                        format!("{} {joined}", outcome.summary)
-                    }
-                    None => outcome.summary,
-                }
+                outcome.summary
             }
         }
         (
@@ -331,38 +301,10 @@ pub(super) async fn dispatch(
                     }
                 }
             };
-            // Joining a camp: absent leaves it untouched, null takes the issue
-            // out of its camp, a string joins the camp that URI names.
-            let camp = match payload.get("camp") {
-                None => None,
-                Some(serde_json::Value::Null) => Some(None),
-                Some(value) => Some(Some(
-                    value
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
-                            build_failure(
-                                index,
-                                item,
-                                "payload.camp must be a camp URI string, or null",
-                            )
-                        })?
-                        .to_string(),
-                )),
-            };
-            let fields_patched = payload
-                .as_object()
-                .is_some_and(|map| map.keys().any(|key| key != "camp"));
             if dry_run {
                 let mut details = Vec::new();
                 if let Some(status) = status.as_deref() {
                     details.push(format!("status={status}"));
-                }
-                match &camp {
-                    None => {}
-                    Some(None) => details.push("camp=cleared".to_string()),
-                    Some(Some(uri)) => details.push(format!("camp={uri}")),
                 }
                 match &parent {
                     None => {}
@@ -387,52 +329,22 @@ pub(super) async fn dispatch(
                     ),
                     None => None,
                 };
-                // The whole camp transition is validated before any field
-                // changes, so a refused camp change leaves the issue as it was.
-                let camp_plan = match &camp {
-                    Some(target) => Some(
-                        crate::camps::plan_issue_camp(
-                            orch,
-                            request,
-                            project,
-                            *number,
-                            target.as_deref(),
-                        )
-                        .await
-                        .map_err(|error| build_failure(index, item, error))?,
-                    ),
-                    None => None,
-                };
-                let mut summary = if fields_patched {
-                    issues::update_issue_by_project_number(
-                        orch,
-                        request,
-                        project,
-                        *number,
-                        issues::IssuePatchFields {
-                            title,
-                            description,
-                            labels,
-                            status,
-                            confirm,
-                            parent,
-                        },
-                    )
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?
-                } else {
-                    String::new()
-                };
-                if let Some(plan) = camp_plan {
-                    let line = apply_issue_camp(orch, project, plan)
-                        .await
-                        .map_err(|error| build_failure(index, item, error))?;
-                    if !summary.is_empty() {
-                        summary.push(' ');
-                    }
-                    summary.push_str(&line);
-                }
-                summary
+                issues::update_issue_by_project_number(
+                    orch,
+                    request,
+                    project,
+                    *number,
+                    issues::IssuePatchFields {
+                        title,
+                        description,
+                        labels,
+                        status,
+                        confirm,
+                        parent,
+                    },
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
             }
         }
         (CairnResource::Issue { project, number }, ChangeMode::Delete) => {
@@ -474,79 +386,6 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
-}
-
-/// Join a just-created issue to the camp its filing named. The issue already
-/// exists, so a failure here is reported beside its creation, never undone.
-async fn join_created_issue(
-    orch: &Orchestrator,
-    acting: &crate::camps::ActingThread,
-    camp: crate::models::Camp,
-    project: &str,
-    number: i32,
-) -> String {
-    let uri = cairn_uri::build_project_camp_uri(project, &camp.slug);
-    let issue_id =
-        match crate::issues::relations::issue_id_for_project_number(&acting.db, project, number)
-            .await
-        {
-            Ok(Some(id)) => id,
-            Ok(None) => return format!("It was not joined to {uri}: the new issue was not found."),
-            Err(error) => return format!("It was not joined to {uri}: {error}"),
-        };
-    match crate::camps::set_issue_camp(acting, &issue_id, Some(camp), orch.services.clock.now())
-        .await
-    {
-        Ok(_) => {
-            emit_camp_change(orch, &issue_id, &acting.project_id);
-            format!("Joined camp {uri}.")
-        }
-        Err(error) => format!("It was not joined to {uri}: {error}"),
-    }
-}
-
-/// Apply an issue camp change [`crate::camps::plan_issue_camp`] validated.
-async fn apply_issue_camp(
-    orch: &Orchestrator,
-    project: &str,
-    plan: crate::camps::IssueCampPlan,
-) -> Result<String, String> {
-    use cairn_db::storage::camps::IssueCampChange;
-    let crate::camps::IssueCampPlan {
-        acting,
-        issue_id,
-        camp,
-    } = plan;
-    let change =
-        crate::camps::set_issue_camp(&acting, &issue_id, camp, orch.services.clock.now()).await?;
-    Ok(match change {
-        IssueCampChange::Joined { camp_slug } => {
-            emit_camp_change(orch, &issue_id, &acting.project_id);
-            format!(
-                "Joined camp {}.",
-                cairn_uri::build_project_camp_uri(project, &camp_slug)
-            )
-        }
-        IssueCampChange::Left { camp_slug } => {
-            emit_camp_change(orch, &issue_id, &acting.project_id);
-            format!(
-                "Took the issue out of camp {}.",
-                cairn_uri::build_project_camp_uri(project, &camp_slug)
-            )
-        }
-        IssueCampChange::Unchanged => "Its camp is unchanged.".to_string(),
-    })
-}
-
-fn emit_camp_change(orch: &Orchestrator, issue_id: &str, project_id: &str) {
-    for payload in [
-        serde_json::json!({ "table": "camps", "action": "update" }),
-        crate::notify::issue_db_change_ids("update", issue_id, Some(project_id)),
-    ] {
-        if let Err(error) = orch.services.emitter.emit("db-change", payload) {
-            tracing::warn!(%error, "failed to emit camp db-change notification");
-        }
-    }
 }
 
 fn parse_string_array_field(

@@ -10,14 +10,14 @@
 //! A camp post is an ordinary project post that also names one camp of that
 //! project. Which camp is checked here, because the reference crosses
 //! databases (posts are workspace-private, camps live with their project) and
-//! no foreign key can hold it: the camp must exist in that project and be live,
-//! and an agent may address only a camp its thread takes part in. The operator
-//! is an implicit participant of every camp. Base camp is a room: every thread
-//! of the project may post to it.
+//! no foreign key can hold it: the camp must exist in that project and be
+//! active, and an agent may address only a camp its thread is a member of.
+//! The operator may post to any camp. Base camp is every open thread's
+//! channel: every thread of the project may post to it.
 //!
 //! An operator's camp post is minted like any other post fact, with no actor
-//! job: it reaches the camp's participants by role through the fact log, never
-//! as a direct operator message to any of them.
+//! job: it reaches the camp's members through the fact log, never as a direct
+//! operator message to any of them.
 
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 
@@ -88,7 +88,7 @@ fn internal(error: impl std::fmt::Display) -> PublishError {
     PublishError::Internal(error.to_string())
 }
 
-/// The camp a post addresses, checked: it exists in `project_id`, is live,
+/// The camp a post addresses, checked: it exists in `project_id`, is active,
 /// and the author may post to it.
 async fn check_camp_target(
     orch: &Orchestrator,
@@ -114,14 +114,14 @@ async fn check_camp_target(
                 .to_string(),
         ));
     };
-    if camp.is_struck() {
+    if camp.is_archived() {
         return Err(PublishError::Refused(format!(
-            "camp `{}` is struck; it is read-only and takes no new posts",
+            "camp `{}` is archived; it is read-only and takes no new posts",
             camp.slug
         )));
     }
     let Some(job_id) = actor_job_id else {
-        // The operator takes part in every camp of their workspace.
+        // The operator may post to every camp of their workspace.
         return Ok(camp);
     };
     let thread = db
@@ -142,19 +142,25 @@ async fn check_camp_target(
         ));
     }
     if camp.is_base() {
-        // Base camp is a room: every thread of the project is seated in it.
+        // Every open thread of the project is in base camp.
         return Ok(camp);
     }
-    let takes_part = db
-        .camp_participants(&camp)
-        .await
-        .map_err(internal)?
-        .iter()
-        .any(|participant| participant.subject.thread_id() == Some(thread_id.as_str()));
-    if !takes_part {
+    let member = crate::models::CampSubject::Thread {
+        thread_id: thread_id.clone(),
+    };
+    if !db.is_camp_member(&camp, &member).await.map_err(internal)? {
+        let key = db
+            .query_opt_text(
+                "SELECT key FROM projects WHERE id = ?1",
+                (project_id.to_string(),),
+            )
+            .await
+            .map_err(internal)?
+            .unwrap_or_else(|| project_id.to_string());
         return Err(PublishError::Refused(format!(
-            "your thread does not take part in camp `{}`; join it first by appending to its participants",
-            camp.slug
+            "your thread is not a member of camp `{}`; a member adds you, or add yourself by appending {{member: \"<your thread URI>\"}} to {}",
+            camp.slug,
+            cairn_uri::build_project_camp_members_uri(&key, &camp.slug)
         )));
     }
     Ok(camp)
@@ -214,7 +220,7 @@ pub async fn publish_post(
 }
 
 /// Write a comment on an existing post, announce it, and mint its fact. A
-/// comment on a struck camp's post is refused: the camp is read-only.
+/// comment on an archived camp's post is refused: the camp is read-only.
 pub async fn publish_comment(
     orch: &Orchestrator,
     input: PublishComment,
@@ -240,9 +246,9 @@ pub async fn publish_comment(
             })
             .await
             .map_err(internal)?;
-        if let Some(camp) = camp.filter(Camp::is_struck) {
+        if let Some(camp) = camp.filter(Camp::is_archived) {
             return Err(PublishError::Refused(format!(
-                "camp `{}` is struck; its posts are read-only",
+                "camp `{}` is archived; its posts are read-only",
                 camp.slug
             )));
         }

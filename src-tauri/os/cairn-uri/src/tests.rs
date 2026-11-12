@@ -2021,19 +2021,16 @@ fn camp_uris_parse_build_route_by_project_and_reserve_their_segment() {
         Some("cairn"),
         "a camp routes to the database that owns its project"
     );
-    let participants = parse_uri("cairn://p/cairn/camps/rebuild/participants").unwrap();
+    let members = parse_uri("cairn://p/cairn/camps/rebuild/members").unwrap();
     assert_eq!(
-        participants,
-        CairnResource::ProjectCampParticipants {
+        members,
+        CairnResource::ProjectCampMembers {
             project: "cairn".into(),
             slug: "rebuild".into()
         }
     );
-    assert_eq!(
-        participants.to_uri(),
-        "cairn://p/cairn/camps/rebuild/participants"
-    );
-    assert_eq!(participants.issue_number(), None);
+    assert_eq!(members.to_uri(), "cairn://p/cairn/camps/rebuild/members");
+    assert_eq!(members.issue_number(), None);
     assert_eq!(parse_uri("cairn://p/cairn/camps/Not_A_Slug"), None);
     assert!(
         crate::thread_name::validate_thread_name("camps").is_err(),

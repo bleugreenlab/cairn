@@ -20,7 +20,7 @@ pub(crate) enum Addressed {
     /// An issue: its parent edge, subscriptions and camp, in its owning
     /// database.
     Issue { db: Arc<LocalDb>, uri: String },
-    /// A camp: its participants, in the camp's own project database, so a
+    /// A camp: its members, in the camp's own project database, so a
     /// team camp is judged against its team project.
     Camp { db: Arc<LocalDb>, camp_id: String },
     /// A node, a sub-agent task or a thread: the recipient that home is.

@@ -904,15 +904,15 @@ async fn thread_store_census(thread_id: Option<String>, now: i64) -> String {
     render_thread_store_census(&census, now)
 }
 
-/// The thread a session job belongs to. Statements only.
 /// The most camps a seed names one by one; the rest are counted.
 const SEED_CAMPS: usize = 8;
+/// The most other members a camp line names; the rest are counted.
+const SEED_CAMP_MEMBERS: usize = 4;
 
-/// One generated line per camp this thread takes part in: its role and the
-/// camp's live size and state line ([`crate::camps::view::state_line`]), read
-/// from the camp's rows as the seed is composed. A camp's authored description
-/// is never copied here; its URI reads it.
-async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) -> String {
+/// One generated line per active camp this thread is a member of: who else is
+/// in it and when it was last posted to, read from the camp's rows as the
+/// seed is composed. Base camp has no line: every open thread is in it.
+pub(crate) async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) -> String {
     let Some(thread_id) = thread_id else {
         return String::new();
     };
@@ -922,18 +922,25 @@ async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) ->
             let thread_id = thread_id.clone();
             Box::pin(async move {
                 let camps =
-                    cairn_db::storage::camps::camps_for_thread_conn(conn, &thread_id).await?;
+                    cairn_db::storage::camps::camps_for_member_conn(conn, &thread_id).await?;
                 let mut rows = Vec::with_capacity(camps.len());
-                for (camp, role) in camps.into_iter().filter(|(camp, _)| !camp.is_struck()) {
-                    let participants =
-                        cairn_db::storage::camps::camp_participants_conn(conn, &camp)
-                            .await?
-                            .len();
-                    let issues = cairn_db::storage::camps::camp_issues_conn(conn, &camp.id).await?;
-                    let counts = crate::camps::view::IssueCounts::from_statuses(
-                        issues.iter().map(|issue| issue.status.as_str()),
-                    );
-                    rows.push((camp, role, participants, counts));
+                for camp in camps {
+                    let mut others = Vec::new();
+                    for member in cairn_db::storage::camps::camp_members_conn(conn, &camp).await? {
+                        match member.subject.thread_id() {
+                            Some(id) if id == thread_id => {}
+                            Some(id) => {
+                                let mut names = conn
+                                    .query("SELECT name FROM threads WHERE id = ?1", params![id])
+                                    .await?;
+                                if let Some(row) = names.next().await? {
+                                    others.push(row.text(0)?);
+                                }
+                            }
+                            None => others.push("operator".to_string()),
+                        }
+                    }
+                    rows.push((camp, others));
                 }
                 Ok(rows)
             })
@@ -957,20 +964,29 @@ async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) ->
     }
     let mut out = String::from("## Camps\n\n");
     let now = chrono::Utc::now().timestamp();
-    for (camp, role, participants, counts) in rows.iter().take(SEED_CAMPS) {
-        let state =
-            crate::camps::view::state_line(counts, posts.get(&camp.id).map(|(_, at)| *at), now);
+    for (camp, others) in rows.iter().take(SEED_CAMPS) {
+        let with = if others.is_empty() {
+            " · no other members".to_string()
+        } else {
+            let mut named = others
+                .iter()
+                .take(SEED_CAMP_MEMBERS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if others.len() > SEED_CAMP_MEMBERS {
+                named.push_str(&format!(" +{}", others.len() - SEED_CAMP_MEMBERS));
+            }
+            format!(" · with {named}")
+        };
+        let last_post = posts
+            .get(&camp.id)
+            .map(|(_, at)| format!(" · last post {}", crate::camps::view::coarse_ago(*at, now)))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- `{}` {} — your role: {} · {participants} participant{}{} → {}\n",
+            "- `{}` {}{with}{last_post} → {}\n",
             camp.slug,
             one_line(&camp.title),
-            role.as_str(),
-            if *participants == 1 { "" } else { "s" },
-            if state.is_empty() {
-                String::new()
-            } else {
-                format!(" · {state}")
-            },
             cairn_uri::build_project_camp_uri(project_key, &camp.slug),
         ));
     }
@@ -985,6 +1001,7 @@ async fn camp_lines(db: &LocalDb, thread_id: Option<&str>, project_key: &str) ->
     out
 }
 
+/// The thread a session job belongs to. Statements only.
 async fn job_thread_id(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
@@ -4786,33 +4803,63 @@ mod tests {
         assert!(seed.content.contains("[prior context compacted]"));
     }
 
-    /// A seed's camp line is the camp's generated state, post activity
-    /// included: a camp with a recent post says when it was.
+    /// A seed's camp line names who else is in the camp and when it was last
+    /// posted to. Base camp, which every open thread is in, has no line.
     #[tokio::test]
-    async fn a_camp_line_carries_the_camps_state_and_its_last_post() {
+    async fn a_camp_line_names_the_other_members_and_the_last_post() {
         let db = migrated_test_db("thread-seed-camp-line.db").await;
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES ('p', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO threads(id, project_id, name, status, created_at, updated_at)
-               VALUES ('t', 'p', 'general', 'active', 1, 1);",
+               VALUES ('t', 'p', 'general', 'active', 1, 1), ('d', 'p', 'devops', 'active', 2, 2);",
         )
         .await
         .unwrap();
-        let (base, _) = db.ensure_base_camp("p", "t", 1).await.unwrap();
+        db.ensure_base_camp("p", 1).await.unwrap();
+        assert_eq!(camp_lines(&db, Some("t"), "cairn").await, "");
+        let camp = db
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_db::storage::camps::create_camp_conn(
+                        conn,
+                        &cairn_db::storage::camps::NewCamp {
+                            project_id: "p".into(),
+                            slug: "rebuild".into(),
+                            title: "Rebuild".into(),
+                        },
+                        &crate::models::CampSubject::Thread {
+                            thread_id: "t".into(),
+                        },
+                        &[
+                            crate::models::CampSubject::Thread {
+                                thread_id: "d".into(),
+                            },
+                            crate::models::CampSubject::Operator,
+                        ],
+                        1,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
         db.execute_script(format!(
             "INSERT INTO posts(project_id, camp_id, content, author_principal_json, appearance_snapshot_json, created_at)
                VALUES ('p', '{}', 'hello', '{{}}', '{{}}', unixepoch() - 7200);",
-            base.id
+            camp.id
         ))
         .await
         .unwrap();
 
         let lines = camp_lines(&db, Some("t"), "cairn").await;
         assert!(
-            lines.contains("`base` Base camp — your role: lead · 1 participant · last post 2h ago"),
+            lines.contains(
+                "- `rebuild` Rebuild · with devops, operator · last post 2h ago → cairn://p/cairn/camps/rebuild"
+            ),
             "{lines}"
         );
+        assert!(!lines.contains("`base`"), "{lines}");
     }
 
     #[tokio::test]

@@ -282,6 +282,87 @@ impl LocalDb {
             .collect())
     }
 
+    /// The newest post of each camp of one project, keyed by camp id. A camp
+    /// with no posts is absent.
+    pub async fn last_camp_posts(
+        &self,
+        project_id: &str,
+    ) -> DbResult<std::collections::HashMap<String, Post>> {
+        Ok(self
+            .query_all(
+                format!(
+                    "SELECT {POST_COLUMNS} FROM posts
+                     WHERE id IN (
+                         SELECT MAX(id) FROM posts
+                          WHERE project_id = ?1 AND camp_id IS NOT NULL
+                          GROUP BY camp_id
+                     )"
+                ),
+                (project_id.to_string(),),
+                map_post,
+            )
+            .await?
+            .into_iter()
+            .filter_map(|post| post.camp_id.clone().map(|camp_id| (camp_id, post)))
+            .collect())
+    }
+
+    /// Per camp of one project, how many posts by agents are newer than
+    /// `reader`'s cursor. The operator's own posts carry a human or machine
+    /// principal and so are never unread to the operator. A camp with nothing
+    /// unread is absent.
+    pub async fn camp_unread_counts(
+        &self,
+        reader: &str,
+        project_id: &str,
+    ) -> DbResult<std::collections::HashMap<String, i64>> {
+        Ok(self
+            .query_all(
+                "SELECT p.camp_id, COUNT(*) FROM posts p
+                 LEFT JOIN camp_read_cursors c ON c.camp_id = p.camp_id AND c.reader = ?1
+                 WHERE p.project_id = ?2 AND p.camp_id IS NOT NULL
+                   AND p.id > COALESCE(c.seen_through_post_id, 0)
+                   AND p.author_principal_json LIKE '{\"kind\":\"agent\"%'
+                 GROUP BY p.camp_id",
+                (reader.to_string(), project_id.to_string()),
+                |row| Ok((row.text(0)?, row.i64(1)?)),
+            )
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    /// Move `reader`'s cursor on a camp forward to `through_post_id`, clamped
+    /// to the camp's newest post so a cursor never claims a post not yet
+    /// written. A cursor only moves forward.
+    pub async fn advance_camp_read_cursor(
+        &self,
+        reader: &str,
+        camp_id: &str,
+        through_post_id: i64,
+        now: i64,
+    ) -> DbResult<()> {
+        let (reader, camp_id) = (reader.to_string(), camp_id.to_string());
+        self.write(move |conn| {
+            let (reader, camp_id) = (reader.clone(), camp_id.clone());
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO camp_read_cursors (reader, camp_id, seen_through_post_id, seen_at)
+                     SELECT ?1, ?2, MIN(?3, newest), ?4
+                       FROM (SELECT MAX(id) AS newest FROM posts WHERE camp_id = ?2)
+                      WHERE newest IS NOT NULL
+                     ON CONFLICT (camp_id, reader) DO UPDATE SET
+                       seen_through_post_id = MAX(seen_through_post_id, excluded.seen_through_post_id),
+                       seen_at = excluded.seen_at",
+                    params![reader, camp_id, through_post_id, now],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// The newest posts a reader standing in one project can see, and exactly
     /// those posts' comments.
     ///

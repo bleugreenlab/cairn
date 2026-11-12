@@ -2705,8 +2705,8 @@ async fn render_resource_body(
         CairnResource::ProjectCamp { project, slug } => {
             super::camps::read_camp(orch, db, &project, &slug, &params).await
         }
-        CairnResource::ProjectCampParticipants { project, slug } => {
-            super::camps::read_participants(orch, db, &project, &slug, &params).await
+        CairnResource::ProjectCampMembers { project, slug } => {
+            super::camps::read_members(orch, db, &project, &slug, &params).await
         }
         CairnResource::ProjectCodemap { project } => {
             super::codemap::read_codemap(orch, db, &project, &params).await

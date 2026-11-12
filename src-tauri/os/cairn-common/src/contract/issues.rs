@@ -39,7 +39,6 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
                         KeyType::Str,
                         "canonical issue URI or thread URI to adopt under: an issue parent also confers branch ancestry (future executions branch from / merge to its branch), a thread parent routes attention only and leaves the child on the base branch; null to orphan back to project-level routing and the base branch",
                     ),
-                    ISSUE_CAMP,
                 ],
                 label: "patch issue",
                 example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER\",mode:\"patch\",payload:{status:\"closed\"}}]})",

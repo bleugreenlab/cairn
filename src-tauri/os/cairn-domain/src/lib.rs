@@ -77,8 +77,8 @@ pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};
 
 // Camp types
 pub use camp::{
-    validate_camp_slug, Camp, CampEventKind, CampKind, CampLevel, CampParticipant, CampRole,
-    CampStatus, CampSubject, BASE_CAMP_SLUG, CAMP_SLUG_MAX_LEN,
+    validate_camp_slug, Camp, CampKind, CampMember, CampStatus, CampSubject, BASE_CAMP_SLUG,
+    CAMP_SLUG_MAX_LEN, OPERATOR_MEMBER_KEY,
 };
 
 // Job types (replaces timeline_nodes)

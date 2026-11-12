@@ -21,12 +21,12 @@
 //! §3). The key is unique because the subscription is one-shot, so a later
 //! boot finds nothing pending and a retry is refused by the receipt itself.
 //! The firing cannot simply join the boot's base-camp rebuild fact: that fact
-//! exists only for a boot that changed builds, and a `watch` participant may
+//! exists only for a boot that changed builds, and a base camp member may
 //! already have read it passively. So the firing's receipt *references* the
 //! camp fact's row when the boot has one for the subscriber's project, and
 //! the drain carries a recipient's receipts for one row in one message at
-//! their loudest level, framed `From camp base (your role: wake — rebuild
-//! subscription): …`. With no camp fact it renders the firing's own words
+//! their loudest level, framed `From camp base: …`. With no camp fact it
+//! renders the firing's own words
 //! from the facts its receipt keeps (`fact_json`).
 //!
 //! A recipient that cannot take the wake now (a closed thread, a resolved
@@ -84,9 +84,6 @@ pub const REBUILD_WAKE_SOURCE: &str = "rebuild_wake";
 /// wake from its receipt alone and never reads it as a row (pinned in the
 /// rebuild tests).
 pub const NO_FACT_ROW: i64 = 0;
-
-/// The camp role a firing beside its boot's camp fact reads as.
-pub const REBUILD_WAKE_ROLE: &str = "wake \u{2014} rebuild subscription";
 
 /// The receipt key of one subscription's firing.
 pub fn rebuild_wake_key(subscription_id: &str) -> String {

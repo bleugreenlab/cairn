@@ -1,23 +1,26 @@
-//! `cairn://p/{project}/camps`, `/camps/{slug}`, `/camps/{slug}/participants`
-//! and `/camps/{slug}/posts`.
+//! `cairn://p/{project}/camps`, `/camps/{slug}`, `/camps/{slug}/members` and
+//! `/camps/{slug}/posts`.
 //!
 //! Every rendering here is a view of [`crate::camps::view`], the one camp
-//! projection the desktop page and the thread seed also read, so a count or a
-//! history line reads the same wherever it appears.
+//! projection the desktop page and the thread seed also read, so a member
+//! count or a last post reads the same wherever it appears.
 
 use cairn_common::query::QueryParam;
 use cairn_uri::{
-    build_project_camp_participants_uri, build_project_camp_posts_uri, build_project_camp_uri,
+    build_project_camp_members_uri, build_project_camp_posts_uri, build_project_camp_uri,
     build_project_camps_uri,
 };
 use serde_json::json;
 
-use crate::camps::view::{self, CampSummary, CensusEntry};
+use crate::camps::view::{self, CampSummary, MemberEntry};
+use crate::models::{CampKind, CampStatus};
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 
-/// How many participants a camp read lists before pointing at the census.
-const CENSUS_INLINE: usize = 12;
+/// How many members a camp read lists before pointing at the member list.
+const MEMBERS_INLINE: usize = 12;
+/// How many lines of conversation a camp read shows.
+const CONVERSATION_INLINE: usize = 20;
 
 fn wants_json(params: &[QueryParam]) -> Result<bool, String> {
     for param in params {
@@ -36,10 +39,6 @@ fn wants_json(params: &[QueryParam]) -> Result<bool, String> {
 async fn project(db: &LocalDb, project_key: &str) -> Result<(String, String), String> {
     let project_id = crate::mcp::handlers::run_context::project_id_by_key(db, project_key).await?;
     Ok((project_id, cairn_uri::canonical_project(project_key)))
-}
-
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
 }
 
 fn missing_camp(project_key: &str, slug: &str) -> String {
@@ -61,19 +60,17 @@ fn plural(count: usize, word: &str) -> String {
 
 fn summary_line(camp: &CampSummary) -> String {
     format!(
-        "- [{}]({}) — {} · lead {} · {}{}{}\n",
+        "- [{}]({}) — {} · {}{}{}\n",
         camp.slug,
         camp.uri,
         camp.title,
-        camp.lead.label,
-        plural(camp.participants, "participant"),
-        if camp.state.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", camp.state)
-        },
-        if camp.status == crate::models::CampStatus::Struck {
-            " · struck"
+        plural(camp.members, "member"),
+        camp.last_post
+            .as_ref()
+            .map(|post| format!(" · last post {}", crate::clock::age(post.at)))
+            .unwrap_or_default(),
+        if camp.status == CampStatus::Archived {
+            " · archived"
         } else {
             ""
         },
@@ -100,16 +97,12 @@ async fn camps(
 ) -> Result<String, String> {
     let json = wants_json(params)?;
     let (project_id, project_key) = project(db, project_key).await?;
-    let listed =
-        view::list_summaries(db, Some(&orch.db.local), &project_id, &project_key, now()).await?;
+    let listed = view::list_summaries(db, Some(&orch.db.local), &project_id, &project_key).await?;
     if json {
         return Ok(serde_json::to_string_pretty(&json!({ "camps": listed })).unwrap_or_default());
     }
     let mut out = format!("# Camps — {project_key}\n\n");
-    if !listed
-        .iter()
-        .any(|camp| camp.kind == crate::models::CampKind::Base)
-    {
+    if !listed.iter().any(|camp| camp.kind == CampKind::Base) {
         out.push_str(&format!(
             "{}\n\n",
             missing_camp(&project_key, crate::models::BASE_CAMP_SLUG)
@@ -119,30 +112,17 @@ async fn camps(
         out.push_str(&summary_line(camp));
     }
     if listed.is_empty() {
-        out.push_str("No camps.\n");
+        out.push_str("No camps yet.\n");
     }
     Ok(out)
 }
 
-fn census_line(entry: &CensusEntry) -> String {
+fn member_line(entry: &MemberEntry) -> String {
     let who = match &entry.thread {
         Some(uri) => format!("[{}]({uri})", entry.display.label),
-        None => entry.display.inline(),
+        None => entry.display.label.clone(),
     };
-    let mut line = format!("- {who} — {}", entry.role.as_str());
-    if entry.lead {
-        if let Some(level) = entry.level {
-            line.push_str(&format!(" (also a {} member)", level.as_str()));
-        }
-    }
-    if let Some(reason) = &entry.reason {
-        line.push_str(&format!(": {reason}"));
-    }
-    if let Some(by) = &entry.assigned_by {
-        line.push_str(&format!(" · set by {}", by.label));
-    }
-    line.push_str(&format!(" · since {}", crate::clock::age(entry.since)));
-    line
+    format!("- {who} · since {}", crate::clock::age(entry.since))
 }
 
 /// `cairn://p/{project}/camps/{slug}`.
@@ -167,15 +147,8 @@ async fn camp(
 ) -> Result<String, String> {
     let json = wants_json(params)?;
     let (project_id, project_key) = project(db, project_key).await?;
-    let Some(camp) = view::camp_view(
-        db,
-        Some(&orch.db.local),
-        &project_id,
-        &project_key,
-        slug,
-        now(),
-    )
-    .await?
+    let local = &orch.db.local;
+    let Some(camp) = view::camp_view(db, Some(local), &project_id, &project_key, slug).await?
     else {
         return Err(missing_camp(&project_key, slug));
     };
@@ -183,98 +156,106 @@ async fn camp(
         return Ok(serde_json::to_string_pretty(&camp).unwrap_or_default());
     }
     let summary = &camp.summary;
-    let lead = match &summary.lead_thread {
-        Some(uri) => format!("[{}]({uri})", summary.lead.label),
-        None => summary.lead.label.clone(),
-    };
+    let base = summary.kind == CampKind::Base;
     let mut out = format!("# Camp: {} (`{}`)\n\n", summary.title, summary.slug);
     out.push_str(&format!(
-        "- Kind: {}\n- Status: {}{}\n- Lead: {lead}\n- Pitched: {}\n{}\n",
-        summary.kind.as_str(),
+        "- Kind: {}\n- Status: {}\n- Created: {}\n\n",
+        if base { "base camp" } else { "camp" },
         summary.status.as_str(),
-        summary
-            .struck_reason
-            .as_deref()
-            .map(|reason| format!(" ({reason})"))
-            .unwrap_or_default(),
         crate::clock::age(summary.created_at),
-        if summary.state.is_empty() {
-            String::new()
-        } else {
-            format!("- State: {}\n", summary.state)
-        },
     ));
-    if summary.kind == crate::models::CampKind::Base {
-        out.push_str(&format!("## Roadmap ({})\n\n", camp.roadmap.len()));
-        for other in &camp.roadmap {
-            out.push_str(&summary_line(other));
-        }
-        if camp.roadmap.is_empty() {
-            out.push_str("No camps pitched.\n");
-        }
-        out.push('\n');
-    }
-    out.push_str(&format!("## Participants ({})\n\n", camp.census.len()));
-    for entry in camp.census.iter().take(CENSUS_INLINE) {
-        out.push_str(&census_line(entry));
-        out.push('\n');
-    }
-    if camp.census.len() > CENSUS_INLINE {
+    out.push_str(&format!("## Members ({})\n\n", summary.members));
+    if base {
         out.push_str(&format!(
-            "- … {} more at {}\n",
-            camp.census.len() - CENSUS_INLINE,
-            build_project_camp_participants_uri(&project_key, &summary.slug)
+            "Every open thread of the project ({}).\n",
+            summary.members
         ));
-    }
-    out.push_str(&format!("\n## Issues ({})\n\n", camp.issues.len()));
-    for issue in &camp.issues {
-        out.push_str(&format!(
-            "- [#{}]({}) {} · {}\n",
-            issue.number, issue.uri, issue.title, issue.status
-        ));
-    }
-    if camp.issues.is_empty() {
-        out.push_str("No issues joined.\n");
-    }
-    out.push_str(&format!(
-        "\n## Posts ({})\n\nRead and write them at {}.\n",
-        summary.posts,
-        build_project_camp_posts_uri(&project_key, &summary.slug)
-    ));
-    if !camp.tenets.is_empty() {
-        out.push_str(&format!("\n## Linked tenets ({})\n\n", camp.tenets.len()));
-        for tenet in &camp.tenets {
+    } else {
+        for entry in camp.members.iter().take(MEMBERS_INLINE) {
+            out.push_str(&member_line(entry));
+            out.push('\n');
+        }
+        if camp.members.len() > MEMBERS_INLINE {
             out.push_str(&format!(
-                "- [{}]({}) {} · {}\n",
-                tenet.number, tenet.uri, tenet.statement, tenet.status
+                "- … {} more at {}\n",
+                camp.members.len() - MEMBERS_INLINE,
+                build_project_camp_members_uri(&project_key, &summary.slug)
             ));
         }
     }
-    out.push_str("\n## History\n\n");
-    for entry in &camp.history {
-        out.push_str(&format!(
-            "- {}: {}\n",
-            crate::clock::age(entry.at),
-            entry.text
-        ));
+
+    // The conversation: the newest posts and notices, interleaved by time.
+    let camp_row = db
+        .camp_by_slug(&project_id, slug)
+        .await
+        .map_err(|error| format!("Failed to load camp `{slug}`: {error}"))?;
+    let mut posts = match &camp_row {
+        Some(row) => local
+            .list_posts(
+                crate::storage::PostScope::Camp(&row.id),
+                None,
+                CONVERSATION_INLINE,
+            )
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    crate::identity::display::resolve_author_displays(local, &mut posts).await;
+    let mut lines: Vec<(i64, String)> = posts
+        .iter()
+        .map(|post| {
+            let author = post
+                .author_display
+                .as_ref()
+                .map(|display| display.label.clone())
+                .unwrap_or_else(|| "someone".to_string());
+            (
+                post.created_at,
+                format!(
+                    "- {} · {author}: {} — cairn://posts/{}",
+                    crate::clock::age(post.created_at),
+                    view::excerpt(post),
+                    post.id
+                ),
+            )
+        })
+        .collect();
+    lines.extend(camp.notices.iter().map(|notice| {
+        (
+            notice.at,
+            format!("- {} · {}", crate::clock::age(notice.at), notice.text),
+        )
+    }));
+    lines.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    out.push_str(&format!("\n## Conversation ({} posts)\n\n", summary.posts));
+    for (_, line) in lines.iter().take(CONVERSATION_INLINE) {
+        out.push_str(line);
+        out.push('\n');
     }
+    if lines.is_empty() {
+        out.push_str("Nothing posted yet.\n");
+    }
+    out.push_str(&format!(
+        "\nRead and write the posts at {}.\n",
+        build_project_camp_posts_uri(&project_key, &summary.slug)
+    ));
     Ok(out)
 }
 
-/// `cairn://p/{project}/camps/{slug}/participants`.
-pub(crate) async fn read_participants(
+/// `cairn://p/{project}/camps/{slug}/members`.
+pub(crate) async fn read_members(
     orch: &Orchestrator,
     db: &LocalDb,
     project_key: &str,
     slug: &str,
     params: &[QueryParam],
 ) -> String {
-    match participants(orch, db, project_key, slug, params).await {
+    match members(orch, db, project_key, slug, params).await {
         Ok(text) | Err(text) => text,
     }
 }
 
-async fn participants(
+async fn members(
     orch: &Orchestrator,
     db: &LocalDb,
     project_key: &str,
@@ -283,32 +264,28 @@ async fn participants(
 ) -> Result<String, String> {
     let json = wants_json(params)?;
     let (project_id, project_key) = project(db, project_key).await?;
-    let Some(camp) = view::camp_view(
-        db,
-        Some(&orch.db.local),
-        &project_id,
-        &project_key,
-        slug,
-        now(),
-    )
-    .await?
+    let Some(camp) =
+        view::camp_view(db, Some(&orch.db.local), &project_id, &project_key, slug).await?
     else {
         return Err(missing_camp(&project_key, slug));
     };
     if json {
         let value = json!({
             "camp": build_project_camp_uri(&project_key, slug),
-            "participants": camp.census,
+            "members": camp.members,
         });
         return Ok(serde_json::to_string_pretty(&value).unwrap_or_default());
     }
     let mut out = format!(
-        "# Participants — camp `{}` ({})\n\n",
+        "# Members — camp `{}` ({})\n\n",
         camp.summary.slug,
-        camp.census.len()
+        camp.members.len()
     );
-    for entry in &camp.census {
-        out.push_str(&census_line(entry));
+    if camp.summary.kind == CampKind::Base {
+        out.push_str("Every open thread of the project is in base camp.\n\n");
+    }
+    for entry in &camp.members {
+        out.push_str(&member_line(entry));
         out.push('\n');
     }
     Ok(out)

@@ -25,7 +25,7 @@ impl CairnResource {
             | ProjectTenet { project, .. }
             | ProjectCamps { project, .. }
             | ProjectCamp { project, .. }
-            | ProjectCampParticipants { project, .. }
+            | ProjectCampMembers { project, .. }
             | ProjectCampPosts { project, .. }
             | ProjectPages { project, .. }
             | ProjectCodemap { project, .. }
@@ -150,7 +150,7 @@ impl CairnResource {
             | Self::ProjectTenet { project, .. }
             | Self::ProjectCamps { project }
             | Self::ProjectCamp { project, .. }
-            | Self::ProjectCampParticipants { project, .. }
+            | Self::ProjectCampMembers { project, .. }
             | Self::ProjectCampPosts { project, .. }
             | Self::ProjectPages { project }
             | Self::ProjectCodemap { project }
@@ -437,7 +437,7 @@ impl CairnResource {
             | Self::ProjectTenet { .. }
             | Self::ProjectCamps { .. }
             | Self::ProjectCamp { .. }
-            | Self::ProjectCampParticipants { .. }
+            | Self::ProjectCampMembers { .. }
             | Self::ProjectCampPosts { .. }
             | Self::ProjectPages { .. }
             | Self::ProjectCodemap { .. }

@@ -293,8 +293,8 @@ impl CairnResource {
                 in_project(project, "base camp")
             }
             Self::ProjectCamp { project, slug } => in_project(project, format!("camp {slug}")),
-            Self::ProjectCampParticipants { project, slug } => {
-                in_project(project, format!("camp {slug} / participants"))
+            Self::ProjectCampMembers { project, slug } => {
+                in_project(project, format!("camp {slug} / members"))
             }
             Self::ProjectCampPosts { project, slug } if slug == "base" => {
                 in_project(project, "base camp posts")
