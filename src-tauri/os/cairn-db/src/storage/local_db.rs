@@ -339,6 +339,29 @@ impl std::fmt::Display for HolderKind {
     }
 }
 
+/// A long read maintenance declares when it opens its connection, so the rest
+/// of the process sees it for what it is instead of inferring a leak.
+///
+/// `PRAGMA integrity_check` is one statement over the whole file: it holds a
+/// snapshot for minutes and cannot yield, so no checkpoint drain can outwait
+/// it, and a drain that tries stalls every database call before failing. The
+/// label rides on the connection's gate record, so [`LocalDb::maintenance_read_open`]
+/// reads it from the gate's live registry and it ends exactly when the
+/// connection drops; there is no flag to clear or to drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceRead {
+    /// The weekly whole-database integrity sweep.
+    IntegritySweep,
+}
+
+impl std::fmt::Display for MaintenanceRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IntegritySweep => "integrity sweep",
+        })
+    }
+}
+
 /// `file:line`, without the column `Location`'s own `Display` adds.
 pub(crate) struct Site(pub(crate) Caller);
 
@@ -423,6 +446,8 @@ struct HolderShared {
     /// Set for a read opened through [`LocalDb::read_ad_hoc`]: its own bound,
     /// and who it runs for.
     ad_hoc: Option<AdHocRead>,
+    /// Set for a connection opened through [`LocalDb::connect_maintenance`].
+    maintenance: Option<MaintenanceRead>,
 }
 
 struct HolderState {
@@ -452,14 +477,23 @@ pub struct HolderActivity {
 
 impl Holder {
     pub(super) fn new(caller: Caller, sql: Option<&str>) -> Self {
-        Self::build(caller, sql, None)
+        Self::build(caller, sql, None, None)
     }
 
     fn ad_hoc(caller: Caller, read: AdHocRead) -> Self {
-        Self::build(caller, None, Some(read))
+        Self::build(caller, None, Some(read), None)
     }
 
-    fn build(caller: Caller, sql: Option<&str>, ad_hoc: Option<AdHocRead>) -> Self {
+    fn maintenance(caller: Caller, read: MaintenanceRead) -> Self {
+        Self::build(caller, None, None, Some(read))
+    }
+
+    fn build(
+        caller: Caller,
+        sql: Option<&str>,
+        ad_hoc: Option<AdHocRead>,
+        maintenance: Option<MaintenanceRead>,
+    ) -> Self {
         Self(Arc::new(HolderShared {
             state: Mutex::new(HolderState {
                 statement: statement_label(caller, sql),
@@ -469,12 +503,17 @@ impl Holder {
             in_flight: AtomicUsize::new(0),
             plan_audit_exempt: AtomicBool::new(false),
             ad_hoc,
+            maintenance,
         }))
     }
 
     /// Who an ad hoc read runs for, when it said.
     fn on_behalf_of(&self) -> Option<Arc<str>> {
         self.0.ad_hoc.as_ref()?.on_behalf_of.clone()
+    }
+
+    fn maintenance_read(&self) -> Option<MaintenanceRead> {
+        self.0.maintenance
     }
 
     fn lock(&self) -> MutexGuard<'_, HolderState> {
@@ -636,6 +675,8 @@ pub struct OverdueHolder {
     pub activity: HolderActivity,
     /// Who an ad hoc read runs for (see [`AdHocRead::on_behalf_of`]).
     pub on_behalf_of: Option<Arc<str>>,
+    /// The declared maintenance read this connection is, if it is one.
+    pub maintenance: Option<MaintenanceRead>,
 }
 
 /// A pooled read of SQL the codebase did not write, such as an agent's
@@ -1134,6 +1175,17 @@ impl LocalDb {
         self.gate.checkpoint_in_engine.load(Ordering::SeqCst)
     }
 
+    /// The declared maintenance read holding a connection right now, if any
+    /// (see [`MaintenanceRead`]). Read from the gate's live registry, so it is
+    /// gone the moment the read's connection drops.
+    pub fn maintenance_read_open(&self) -> Option<MaintenanceRead> {
+        self.gate
+            .lock()
+            .live
+            .values()
+            .find_map(|live| live.holder.maintenance_read())
+    }
+
     /// The private database that owns machine-local route metadata for this team
     /// replica, when available.
     pub fn private_route_db(&self) -> Option<&Arc<LocalDb>> {
@@ -1295,6 +1347,7 @@ impl LocalDb {
                     statement: live.holder.statement(),
                     activity: live.holder.activity(),
                     on_behalf_of: live.holder.on_behalf_of(),
+                    maintenance: live.holder.maintenance_read(),
                 });
             }
         }
@@ -1421,7 +1474,20 @@ impl LocalDb {
     #[track_caller]
     pub fn connect(&self) -> DbCall<'_, TrackedConnection> {
         let caller = Location::caller();
-        let holder = Holder::new(caller, None);
+        self.connect_as(caller, Holder::new(caller, None))
+    }
+
+    /// [`Self::connect`] for a declared maintenance read: the same out-of-pool
+    /// connection, registered under `read`'s label for as long as it lives.
+    /// While it does, every [`Self::checkpoint`] returns without closing the
+    /// gate, and the gate watch names the read instead of reporting a holder.
+    #[track_caller]
+    pub fn connect_maintenance(&self, read: MaintenanceRead) -> DbCall<'_, TrackedConnection> {
+        let caller = Location::caller();
+        self.connect_as(caller, Holder::maintenance(caller, read))
+    }
+
+    fn connect_as(&self, caller: Caller, holder: Holder) -> DbCall<'_, TrackedConnection> {
         DbCall::new(holder.clone(), move || async move {
             let slot = self
                 .gate
@@ -2222,6 +2288,13 @@ impl LocalDb {
     /// completed call reopen admissions while the second still depended on a
     /// quiet database. Serialization also prevents concurrent TRUNCATE operations.
     ///
+    /// A declared maintenance read (see [`MaintenanceRead`]) short-circuits the
+    /// pass the way an attempt still in the engine does: it is one statement
+    /// that cannot yield, so a drain against it can only stall every call and
+    /// then lose. The pass neither closes the gate nor attempts, and reports
+    /// the read in `maintenance_read`. A read admitted between that check and
+    /// the gate closing fails the drain instead, and is reported the same way.
+    ///
     /// Returns `Err` only when no connection could be obtained; a checkpoint that
     /// ran and lost is a successful call reporting an unsuccessful pass.
     pub async fn checkpoint(
@@ -2268,6 +2341,20 @@ impl LocalDb {
                 drain: DrainReport::not_closed(),
                 slow: false,
                 in_engine: true,
+                maintenance_read: None,
+            });
+        }
+        if let Some(read) = self.maintenance_read_open() {
+            return Ok(CheckpointReport {
+                attempts: 0,
+                error: Some(format!("{read} open")),
+                log_bytes_before,
+                log_bytes_after: self.logical_log_bytes(),
+                duration: started.elapsed(),
+                drain: DrainReport::not_closed(),
+                slow: false,
+                in_engine: false,
+                maintenance_read: Some(read),
             });
         }
 
@@ -2341,6 +2428,13 @@ impl LocalDb {
         }
         drop(hold);
 
+        // A maintenance read admitted between the check above and the gate
+        // closing is what this drain lost to.
+        let maintenance_read = if error.is_some() && !drain.drained {
+            self.maintenance_read_open()
+        } else {
+            None
+        };
         let report = CheckpointReport {
             attempts,
             error,
@@ -2350,6 +2444,7 @@ impl LocalDb {
             drain,
             slow,
             in_engine: false,
+            maintenance_read,
         };
         if abandoned {
             log::warn!(
@@ -3356,6 +3451,9 @@ pub struct CheckpointReport {
     /// The pass neither closed the gate nor attempted, because an earlier
     /// attempt is still running in the engine.
     pub in_engine: bool,
+    /// The declared maintenance read the pass did not drain against: it
+    /// returned without closing the gate, or its drain lost to that read.
+    pub maintenance_read: Option<MaintenanceRead>,
 }
 
 impl CheckpointReport {
@@ -3389,6 +3487,9 @@ impl std::fmt::Display for CheckpointReport {
         }
         if self.slow {
             write!(f, " slow=true")?;
+        }
+        if let Some(read) = self.maintenance_read {
+            write!(f, " maintenance_read={read}")?;
         }
         match &self.error {
             Some(error) => write!(f, " outcome=failed error={error}"),
@@ -5840,7 +5941,101 @@ mod tests {
             .find(|holder| holder.kind == HolderKind::Connect)
             .unwrap();
         assert_eq!(connect.on_behalf_of, None);
+        assert_eq!(connect.maintenance, None);
         drop(conn);
+    }
+
+    /// A declared maintenance read is visible for exactly as long as its
+    /// connection lives, and the gate watch carries its label.
+    #[tokio::test]
+    async fn a_maintenance_read_is_open_while_its_connection_lives() {
+        let db = test_db().await.unwrap();
+        assert_eq!(db.maintenance_read_open(), None);
+        let plain = db.connect().await.unwrap();
+        assert_eq!(
+            db.maintenance_read_open(),
+            None,
+            "a plain connect is not one"
+        );
+
+        let sweep = db
+            .connect_maintenance(MaintenanceRead::IntegritySweep)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.maintenance_read_open(),
+            Some(MaintenanceRead::IntegritySweep)
+        );
+        let held = db.overdue_holders(Duration::ZERO, Duration::ZERO);
+        let labelled: Vec<_> = held
+            .iter()
+            .filter_map(|holder| holder.maintenance)
+            .collect();
+        assert_eq!(labelled, vec![MaintenanceRead::IntegritySweep], "{held:?}");
+        assert!(held.iter().all(|holder| holder.kind == HolderKind::Connect));
+
+        drop(sweep);
+        assert_eq!(db.maintenance_read_open(), None);
+        drop(plain);
+    }
+
+    /// With a maintenance read open, a checkpoint returns without closing the
+    /// gate: no attempt, no drain, and a pooled read beside it is not held at
+    /// a shut gate.
+    #[tokio::test]
+    async fn a_checkpoint_does_not_drain_against_a_maintenance_read() {
+        let db = test_db().await.unwrap();
+        let sweep = db
+            .connect_maintenance(MaintenanceRead::IntegritySweep)
+            .await
+            .unwrap();
+        sweep.execute(db.concurrent_begin(), ()).await.unwrap();
+
+        let report = db
+            .checkpoint(
+                3,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.maintenance_read,
+            Some(MaintenanceRead::IntegritySweep)
+        );
+        assert_eq!(report.attempts, 0, "{report}");
+        assert_eq!(report.drain.waited, Duration::ZERO, "{report}");
+        assert_eq!(report.drain.open_at_close, 0, "the gate never closed");
+        assert!(!report.succeeded());
+        assert!(!report.in_engine);
+        let rendered = report.to_string();
+        assert!(
+            rendered.contains("maintenance_read=integrity sweep")
+                && rendered.ends_with("outcome=failed error=integrity sweep open"),
+            "{rendered}"
+        );
+
+        let read = timeout(
+            Duration::from_secs(2),
+            db.query_one("SELECT 1", (), |row| row.i64(0)),
+        )
+        .await
+        .expect("a pooled read must not wait on a gate the checkpoint never closed")
+        .unwrap();
+        assert_eq!(read, 1);
+
+        sweep.execute("ROLLBACK", ()).await.unwrap();
+        drop(sweep);
+        let report = db
+            .checkpoint(
+                3,
+                Duration::ZERO,
+                DrainBudget::fixed(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.maintenance_read, None, "{report}");
+        assert!(report.succeeded(), "{report}");
     }
 
     /// The gate watch's source: each overdue holder once, then only again

@@ -28,14 +28,14 @@ pub(crate) fn read_host_resources() -> HostResourceReading {
 }
 
 #[cfg(unix)]
-fn host_load_average() -> Option<[f64; 3]> {
+pub(crate) fn host_load_average() -> Option<[f64; 3]> {
     let mut load = [0.0_f64; 3];
     // SAFETY: `getloadavg` writes at most the requested three doubles.
     (unsafe { libc::getloadavg(load.as_mut_ptr(), 3) } == 3).then_some(load)
 }
 
 #[cfg(not(unix))]
-fn host_load_average() -> Option<[f64; 3]> {
+pub(crate) fn host_load_average() -> Option<[f64; 3]> {
     // Windows has no native equivalent of Unix's 1, 5, and 15 minute load
     // averages. CPU utilization requires samples over time and is a distinct
     // metric, so do not manufacture load-average values from a single read.

@@ -2463,7 +2463,6 @@ mod tests {
                 machine_services: Vec::new(),
             },
             current_load: 0,
-            warm_roots: Vec::new(),
             observed_at_unix_ms: 0,
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
@@ -2472,7 +2471,14 @@ mod tests {
         };
         let (sender, _link) = tokio::sync::mpsc::unbounded_channel();
         orch.fleet
-            .attach_advertised_executor(advertisement, sender, false, None, None)
+            .attach_advertised_executor(
+                advertisement,
+                Default::default(),
+                sender,
+                false,
+                None,
+                None,
+            )
             .unwrap();
 
         let stored_for = |typed: &str| {

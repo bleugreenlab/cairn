@@ -113,6 +113,7 @@ pub mod transcripts;
 // ── Internal implementation modules ────────────────────
 mod agent_process;
 mod backends;
+mod build_center;
 mod clock;
 mod db;
 mod dev_instances;

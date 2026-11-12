@@ -50,7 +50,8 @@ use std::time::{Duration, Instant};
 
 use super::local_db::Site;
 use crate::storage::{
-    Caller, CheckpointReport, DbResult, DrainBudget, LocalDb, RowExt, TrackedConnection,
+    Caller, CheckpointReport, DbResult, DrainBudget, LocalDb, MaintenanceRead, RowExt,
+    TrackedConnection,
 };
 use crate::turso::Value;
 
@@ -1726,6 +1727,11 @@ pub enum PassEnd {
     /// [`EvictorBudget::fold_at_log_bytes`], so deleting more would only grow
     /// it, or an earlier checkpoint attempt is still running in the engine.
     FoldFailed,
+    /// A fold the pass needed was skipped because a declared maintenance read
+    /// is open (see [`MaintenanceRead`]): the log was at or past
+    /// [`EvictorBudget::fold_at_log_bytes`], and nothing can fold it until the
+    /// read ends, so deleting more would only grow it.
+    MaintenanceRead,
 }
 
 /// Why a fold did not fold.
@@ -1812,6 +1818,9 @@ pub struct PassReport {
     pub log_peak_bytes: u64,
     pub duration: Duration,
     pub end: PassEnd,
+    /// The maintenance read the pass skipped folds for. A skip records no
+    /// [`FoldRecord`] and spends none of [`EvictorBudget::folds_per_pass`].
+    pub folds_skipped_for: Option<MaintenanceRead>,
 }
 
 impl PassReport {
@@ -1860,6 +1869,9 @@ impl std::fmt::Display for PassReport {
             .collect();
         if let Some(last) = failures.last() {
             write!(f, " folds_failed={} fold_failed={last}", failures.len())?;
+        }
+        if let Some(read) = self.folds_skipped_for {
+            write!(f, " folds skipped: {read} open")?;
         }
         for rule in &self.rules {
             write!(
@@ -1921,6 +1933,7 @@ pub async fn run_rules(
         log_peak_bytes: db.logical_log_bytes(),
         duration: Duration::ZERO,
         end: PassEnd::Complete,
+        folds_skipped_for: None,
     };
     let mut rows_total = 0usize;
     let mut slow_write = false;
@@ -1947,7 +1960,7 @@ pub async fn run_rules(
                 let fold =
                     fold_if_due(db, budget, state, &mut folding, eviction, &mut report).await;
                 report.end = match fold {
-                    Some(PassEnd::FoldFailed) => PassEnd::FoldFailed,
+                    Some(end @ (PassEnd::FoldFailed | PassEnd::MaintenanceRead)) => end,
                     _ => PassEnd::SlowWrite,
                 };
             } else if started.elapsed() >= budget.pass_time {
@@ -1996,10 +2009,13 @@ pub async fn run_rules(
     // A fold that failed under the ceiling left its pages, and any deleted
     // since, for a later fold. Try once more before the pass leaves them to the
     // next one, unless nothing was deleted since the failure.
-    if report.end != PassEnd::FoldFailed && folding.since_failure.is_some_and(|pages| pages > 0) {
-        if let Some(PassEnd::FoldFailed) = fold(db, budget, state, &mut folding, &mut report).await
+    if !matches!(report.end, PassEnd::FoldFailed | PassEnd::MaintenanceRead)
+        && folding.since_failure.is_some_and(|pages| pages > 0)
+    {
+        if let Some(end @ (PassEnd::FoldFailed | PassEnd::MaintenanceRead)) =
+            fold(db, budget, state, &mut folding, &mut report).await
         {
-            report.end = PassEnd::FoldFailed;
+            report.end = end;
         }
     }
     report.duration = started.elapsed();
@@ -2057,6 +2073,12 @@ async fn fold_if_due(
 /// will cost to fold, and one connection held past the drain budget is enough
 /// to fail it: on 11-06 that ended 22 of 64 passes having deleted nothing, with
 /// the log at 3 to 37 MiB (cairn/6324).
+///
+/// While a declared maintenance read is open the fold is skipped, not failed:
+/// nothing can fold behind a statement that cannot yield, so asking would only
+/// stall every call for a drain that loses. A skip ends the pass only when the
+/// fold was required; under the threshold the pass keeps deleting, which can
+/// grow the log only as far as the threshold before the skip ends it.
 async fn fold(
     db: &LocalDb,
     budget: EvictorBudget,
@@ -2069,9 +2091,23 @@ async fn fold(
     }
     let log_bytes = db.logical_log_bytes();
     let required = log_bytes >= budget.fold_at_log_bytes;
+    let skip = |read, report: &mut PassReport| {
+        report.folds_skipped_for = Some(read);
+        required.then_some(PassEnd::MaintenanceRead)
+    };
+    if let Some(read) = db.maintenance_read_open() {
+        return skip(read, report);
+    }
     let outcome = db
         .checkpoint(3, Duration::from_millis(50), DrainBudget::PRODUCTION)
         .await;
+    if let Some(read) = outcome
+        .as_ref()
+        .ok()
+        .and_then(|checkpoint| checkpoint.maintenance_read)
+    {
+        return skip(read, report);
+    }
     let record = match outcome {
         Ok(checkpoint) => FoldRecord {
             log_bytes_before: checkpoint.log_bytes_before,

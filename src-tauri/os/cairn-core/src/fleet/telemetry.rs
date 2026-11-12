@@ -289,7 +289,6 @@ mod tests {
                         machine_services: Vec::new(),
                     },
                     current_load: 0,
-                    warm_roots: Vec::new(),
                     observed_at_unix_ms: 0,
                     liveness_observed_at_unix_ms: None,
                     facts_stale_refresh_blocked: None,

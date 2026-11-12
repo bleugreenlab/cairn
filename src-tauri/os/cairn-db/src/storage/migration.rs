@@ -82,9 +82,9 @@ async fn rebuild_indexes(conn: &TrackedConnection, names: &[String]) -> DbResult
     Ok(())
 }
 
-/// Cadence for the whole-database integrity sweep. Verifying every index of a
-/// multi-gigabyte database costs on the order of a minute of CPU, far too much to
-/// pay on every boot for drift that accumulates over weeks.
+/// Cadence for the whole-database integrity sweep. Verifying every index reads
+/// the whole file, about eight minutes for a 31 GB database, far too much to pay
+/// on every boot for drift that accumulates over weeks.
 const INTEGRITY_SWEEP_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// What a whole-database integrity sweep found.
@@ -114,7 +114,11 @@ pub async fn run_integrity_sweep(db: &LocalDb) -> DbResult<IntegritySweepOutcome
         return Ok(IntegritySweepOutcome::Skipped);
     }
 
-    let conn = db.connect().await?;
+    // Declared, so every checkpoint skips its fold rather than draining against
+    // a statement that cannot yield, and the gate watch names it.
+    let conn = db
+        .connect_maintenance(super::local_db::MaintenanceRead::IntegritySweep)
+        .await?;
     let outcome = match read_integrity_check(&conn).await? {
         IntegrityStatus::Ok => {
             log::info!("integrity sweep: database verified clean");
@@ -156,12 +160,28 @@ pub async fn run_integrity_sweep(db: &LocalDb) -> DbResult<IntegritySweepOutcome
     Ok(outcome)
 }
 
-async fn integrity_sweep_due(db: &LocalDb) -> DbResult<bool> {
+/// Whether the cadence calls for a sweep: none recorded, or the last one at
+/// least [`INTEGRITY_SWEEP_INTERVAL_SECS`] ago. One row read.
+pub async fn integrity_sweep_due(db: &LocalDb) -> DbResult<bool> {
     db.query_one(
         "SELECT last_swept_at IS NULL OR last_swept_at <= unixepoch() - ?1
          FROM integrity_sweep_state WHERE id = 1",
         (INTEGRITY_SWEEP_INTERVAL_SECS,),
         |row| Ok(row.i64(0)? != 0),
+    )
+    .await
+}
+
+/// How long ago the last sweep was recorded, or `None` when none ever was.
+pub async fn integrity_sweep_since_last(db: &LocalDb) -> DbResult<Option<std::time::Duration>> {
+    db.query_one(
+        "SELECT unixepoch() - last_swept_at FROM integrity_sweep_state WHERE id = 1",
+        (),
+        |row| {
+            Ok(row
+                .opt_i64(0)?
+                .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)))
+        },
     )
     .await
 }
@@ -791,6 +811,45 @@ mod tests {
             Some(row) => row.opt_text(0),
             None => Ok(None),
         }
+    }
+
+    /// The weekly cadence on `integrity_sweep_state`: due when never swept, not
+    /// due right after a sweep, due again a full interval later.
+    #[tokio::test]
+    async fn the_integrity_sweep_is_due_weekly() {
+        let db = LocalDb::open_migrated_for_test(tempdir().unwrap().keep().join("cadence.db"))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE integrity_sweep_state SET last_swept_at = NULL WHERE id = 1",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(integrity_sweep_due(&db).await.unwrap());
+        assert_eq!(integrity_sweep_since_last(&db).await.unwrap(), None);
+
+        assert_eq!(
+            run_integrity_sweep(&db).await.unwrap(),
+            IntegritySweepOutcome::Clean
+        );
+        assert!(!integrity_sweep_due(&db).await.unwrap());
+        assert!(integrity_sweep_since_last(&db)
+            .await
+            .unwrap()
+            .is_some_and(|since| since < std::time::Duration::from_secs(60)));
+        assert_eq!(
+            run_integrity_sweep(&db).await.unwrap(),
+            IntegritySweepOutcome::Skipped
+        );
+
+        db.execute(
+            "UPDATE integrity_sweep_state SET last_swept_at = unixepoch() - ?1 WHERE id = 1",
+            (INTEGRITY_SWEEP_INTERVAL_SECS,),
+        )
+        .await
+        .unwrap();
+        assert!(integrity_sweep_due(&db).await.unwrap());
     }
 
     #[test]

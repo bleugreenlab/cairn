@@ -198,6 +198,13 @@ fn each_address_opens_the_view_the_app_has_for_it() {
                 request: Some("request_1-abc".into()),
             },
         ),
+        ("cairn://rebuilds", Surface::Builds { rebuild: None }),
+        (
+            "cairn://rebuilds/req-1",
+            Surface::Builds {
+                rebuild: Some("req-1".into()),
+            },
+        ),
         ("cairn://executors", Surface::Fleet { machine: None }),
         (
             "cairn://executors/bbs",

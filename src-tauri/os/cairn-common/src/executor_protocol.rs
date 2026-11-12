@@ -7672,7 +7672,23 @@ pub struct LearnedResourceEstimate {
 /// no frame, variant or field changes. What a runner gets wrong talking to an
 /// older executor: nothing; that executor's commands carry no record, which the
 /// test process reports as no record handed down.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 168;
+///
+/// Version 169 (cairn/6950) moves a machine's warm roots off the beat. The
+/// advertisement no longer carries `warmRoots`: [`ExecutorMessage::Hello`]
+/// carries the whole [`WarmRootInventory`] once per link, and the new
+/// [`ExecutorMessage::WarmRootsChanged`] carries each later change as a
+/// [`WarmRootChange`] delta against the revision before it, or whole when that
+/// is smaller. The runner answers a delta whose base it does not hold with the
+/// new [`ExecutorMessage::WarmRootsRequest`]. A runner older than its executor
+/// would refuse the Hello for the missing roots it does not know moved, fail
+/// to decode both new frames (neither enum carries `#[serde(other)]`), and,
+/// reading beats with no `warmRoots`, would price every sync onto the machine
+/// with no haves and read every commit as cold, which changes which machine
+/// placement chooses (tenet 541). A runner newer than its executor would
+/// refuse that executor's Hello, which carries no inventory. The handshake
+/// refuses mixed versions and the self-repair path updates the executor, so
+/// neither pairing attaches.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 169;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -9158,13 +9174,13 @@ pub const fn admission_concurrency_budget(logical_cores: usize) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum GitObjectFormat {
     Sha1,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryIdentity {
     pub project_id: String,
@@ -9270,11 +9286,58 @@ impl RepositoryLocator {
     }
 }
 
+/// One repository's verified warm roots: the commits whose complete object
+/// closure this machine holds, so materializing any of them fetches nothing.
+/// The sender lists `commits` sorted and deduplicated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct VerifiedWarmRoot {
+pub struct WarmRepositoryRoots {
     pub repository: RepositoryIdentity,
-    pub commit: String,
+    pub commits: Vec<String>,
+}
+
+/// Every warm root a machine holds, as of `revision`.
+///
+/// Carried whole in [`ExecutorMessage::Hello`] and moved afterwards only by
+/// [`ExecutorMessage::WarmRootsChanged`]. It used to ride every beat, and a
+/// machine that had fetched for months sent over a megabyte every thirty
+/// seconds of a set that changes only when a fetch lands or a cache
+/// consolidates.
+///
+/// `revision` is the executor's own counter. It rises across every link the
+/// process holds rather than restarting per link, so a change left queued from
+/// an earlier link reads as older than the inventory the next Hello carries and
+/// is discarded rather than mistaken for a gap.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmRootInventory {
+    pub revision: u64,
+    pub repositories: Vec<WarmRepositoryRoots>,
+}
+
+/// How one [`ExecutorMessage::WarmRootsChanged`] moves the runner's copy of a
+/// machine's [`WarmRootInventory`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WarmRootChange {
+    /// The whole inventory, replacing whatever the runner holds. The answer to
+    /// [`ExecutorMessage::WarmRootsRequest`], and what the executor sends
+    /// instead of a delta that would be the larger frame.
+    Whole {
+        repositories: Vec<WarmRepositoryRoots>,
+    },
+    /// The roots added and removed since `base_revision`. Applies to the
+    /// inventory at exactly that revision and to no other; a runner holding
+    /// any other keeps what it has and asks for the whole inventory.
+    Delta {
+        base_revision: u64,
+        added: Vec<WarmRepositoryRoots>,
+        removed: Vec<WarmRepositoryRoots>,
+    },
 }
 
 /// The phases of one liveness refresh pass, in the order the pass runs them.
@@ -9431,8 +9494,6 @@ pub struct ExecutorAdvertisement {
     pub identity: ExecutorIdentity,
     pub capabilities: ExecutorCapabilities,
     pub current_load: usize,
-    #[serde(default)]
-    pub warm_roots: Vec<VerifiedWarmRoot>,
     /// The node scratch replicas this machine holds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_scratches: Vec<NodeScratchReplica>,
@@ -9445,7 +9506,7 @@ pub struct ExecutorAdvertisement {
     /// cannot silence it; the cost of that split is that a wedged producer
     /// keeps advertising, with facts that quietly age. This is the field that
     /// makes the ageing visible, so a fresh beat carrying hour-old load, disk,
-    /// and warm-root facts cannot pass for a healthy executor.
+    /// and scratch facts cannot pass for a healthy executor.
     ///
     /// `None` from an executor that does not report it, which is read as "no
     /// claim" rather than as infinitely stale.
@@ -21330,6 +21391,9 @@ pub enum ExecutorMessage {
     Hello {
         protocol_version: u32,
         advertisement: ExecutorAdvertisement,
+        /// Every warm root this machine holds, so placement reads a machine
+        /// that has just attached as exactly as warm as it is.
+        warm_roots: WarmRootInventory,
         enrollment: ExecutorEnrollmentIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         executor_build_id: Option<String>,
@@ -21432,6 +21496,21 @@ pub enum ExecutorMessage {
     AdvertisementUpdated {
         advertisement: ExecutorAdvertisement,
     },
+    /// Executor → runner: the warm-root inventory moved to `revision`. Sent
+    /// from the beat, at most once per beat and only when the inventory
+    /// changed since the last inventory this process sent.
+    ///
+    /// A delta, unlike every other restatement this link carries, so it is
+    /// never coalesced: the runner applies each one in arrival order, and one
+    /// dropped would leave the next one's base unmatched.
+    WarmRootsChanged {
+        revision: u64,
+        change: WarmRootChange,
+    },
+    /// Runner → executor: the runner's copy of the warm-root inventory no
+    /// longer matches what the executor is sending deltas against. Answered
+    /// with a [`Self::WarmRootsChanged`] carrying [`WarmRootChange::Whole`].
+    WarmRootsRequest {},
     ListenerUpdated {
         listener: ExecutorListenerAdvertisement,
     },
@@ -22097,6 +22176,7 @@ mod tests {
         let hello = ExecutorMessage::Hello {
             protocol_version: 91,
             advertisement: sample_advertisement(),
+            warm_roots: WarmRootInventory::default(),
             enrollment: ExecutorEnrollmentIdentity::Colocated {
                 supervision_nonce: String::new(),
             },
@@ -22415,12 +22495,31 @@ mod tests {
             ExecutorMessage::Hello {
                 protocol_version: EXECUTOR_PROTOCOL_VERSION,
                 advertisement: advertisement.clone(),
+                warm_roots: WarmRootInventory {
+                    revision: 1,
+                    repositories: vec![sample_warm_roots(&["a", "b"])],
+                },
                 enrollment: ExecutorEnrollmentIdentity::Colocated {
                     supervision_nonce: "nonce".into(),
                 },
                 executor_build_id: Some("executor-build".into()),
                 last_update: Some(sample_update_report()),
             },
+            ExecutorMessage::WarmRootsChanged {
+                revision: 2,
+                change: WarmRootChange::Delta {
+                    base_revision: 1,
+                    added: vec![sample_warm_roots(&["c"])],
+                    removed: vec![sample_warm_roots(&["a"])],
+                },
+            },
+            ExecutorMessage::WarmRootsChanged {
+                revision: 3,
+                change: WarmRootChange::Whole {
+                    repositories: vec![sample_warm_roots(&["b", "c"])],
+                },
+            },
+            ExecutorMessage::WarmRootsRequest {},
             ExecutorMessage::Ready {
                 protocol_version: EXECUTOR_PROTOCOL_VERSION,
                 identity: advertisement.identity.clone(),
@@ -23613,20 +23712,39 @@ mod tests {
                 machine_services: Vec::new(),
             },
             current_load: 1,
-            warm_roots: vec![VerifiedWarmRoot {
-                repository: RepositoryIdentity {
-                    project_id: "p".into(),
-                    repository_id: "repo".into(),
-                    object_format: GitObjectFormat::Sha1,
-                },
-                commit: "b".into(),
-            }],
             observed_at_unix_ms: 4,
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
             last_refresh: None,
             node_scratches: Vec::new(),
         }
+    }
+
+    fn sample_warm_roots(commits: &[&str]) -> WarmRepositoryRoots {
+        WarmRepositoryRoots {
+            repository: RepositoryIdentity {
+                project_id: "p".into(),
+                repository_id: "repo".into(),
+                object_format: GitObjectFormat::Sha1,
+            },
+            commits: commits.iter().map(|commit| commit.to_string()).collect(),
+        }
+    }
+
+    /// The beat stays free of warm roots: they ride the Hello and the change
+    /// frames, and a beat that carried them again would be megabytes.
+    #[test]
+    fn an_advertisement_carries_no_warm_roots() {
+        let json = serde_json::to_value(sample_advertisement()).unwrap();
+        assert!(json.get("warmRoots").is_none(), "{json}");
+        let change = serde_json::to_value(WarmRootChange::Delta {
+            base_revision: 1,
+            added: vec![sample_warm_roots(&["c"])],
+            removed: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(change["kind"], "delta");
+        assert_eq!(change["baseRevision"], 1);
     }
 
     #[test]

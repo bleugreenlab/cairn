@@ -69,7 +69,6 @@ async fn upsert_executor(
         serde_json::to_string(&capabilities.toolchains).unwrap_or_else(|_| "[]".into());
     let projects =
         serde_json::to_string(&capabilities.projects_served).unwrap_or_else(|_| "[]".into());
-    let warm = serde_json::to_string(&advertisement.warm_roots).unwrap_or_else(|_| "[]".into());
     let status = status.to_string();
     let current_load = advertisement.current_load as i64;
     let result = db.write(|conn| {
@@ -77,12 +76,11 @@ async fn upsert_executor(
         let capabilities = capabilities.clone();
         let toolchains = toolchains.clone();
         let projects = projects.clone();
-        let warm = warm.clone();
         let status = status.clone();
         Box::pin(async move {
             conn.execute(
-                "INSERT INTO executor_registry (device_id, executor_id, display_name, os, arch, logical_cores, toolchains, projects_served, current_load, warm_commits, connection_generation, status, last_seen, expires_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14) ON CONFLICT(device_id,executor_id) DO UPDATE SET display_name=excluded.display_name, os=excluded.os, arch=excluded.arch, logical_cores=excluded.logical_cores, toolchains=excluded.toolchains, projects_served=excluded.projects_served, current_load=excluded.current_load, warm_commits=excluded.warm_commits, connection_generation=excluded.connection_generation, status=excluded.status, last_seen=excluded.last_seen, expires_at=excluded.expires_at, updated_at=excluded.updated_at",
-                params![identity.device_id, identity.executor_id, identity.display_name, capabilities.os, capabilities.arch, capabilities.logical_cores as i64, toolchains, projects, current_load, warm, generation as i64, status, now, expires_at]
+                "INSERT INTO executor_registry (device_id, executor_id, display_name, os, arch, logical_cores, toolchains, projects_served, current_load, connection_generation, status, last_seen, expires_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13) ON CONFLICT(device_id,executor_id) DO UPDATE SET display_name=excluded.display_name, os=excluded.os, arch=excluded.arch, logical_cores=excluded.logical_cores, toolchains=excluded.toolchains, projects_served=excluded.projects_served, current_load=excluded.current_load, connection_generation=excluded.connection_generation, status=excluded.status, last_seen=excluded.last_seen, expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+                params![identity.device_id, identity.executor_id, identity.display_name, capabilities.os, capabilities.arch, capabilities.logical_cores as i64, toolchains, projects, current_load, generation as i64, status, now, expires_at]
             ).await?;
             Ok(())
         })
@@ -148,6 +146,19 @@ mod tests {
     async fn advertisement_upsert_and_disconnect_are_non_secret() {
         let dir = tempfile::tempdir().unwrap().keep();
         let db = LocalDb::open(dir.join("team.db")).await.unwrap();
+        // A row an older runner wrote, with every warm root in it, before the
+        // migration that empties them.
+        let (earlier, clearing): (Vec<_>, Vec<_>) = TEAM_MIGRATIONS
+            .iter()
+            .copied()
+            .partition(|migration| migration.name() != "clear_executor_registry_warm_commits");
+        assert_eq!(clearing.len(), 1);
+        MigrationRunner::new(earlier).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO executor_registry (device_id, executor_id, display_name, os, arch, logical_cores, current_load, warm_commits, connection_generation, status, last_seen, expires_at, updated_at) VALUES ('d', 'e', 'E', 'linux', 'arm64', 4, 1, '[{\"commit\":\"abc\"}]', 2, 'online', 1, 1, 1);",
+        )
+        .await
+        .unwrap();
         MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
             .run(&db)
             .await
@@ -176,14 +187,6 @@ mod tests {
                 machine_services: Vec::new(),
             },
             current_load: 1,
-            warm_roots: vec![cairn_common::executor_protocol::VerifiedWarmRoot {
-                repository: cairn_common::executor_protocol::RepositoryIdentity {
-                    project_id: "p".into(),
-                    repository_id: "repo".into(),
-                    object_format: cairn_common::executor_protocol::GitObjectFormat::Sha1,
-                },
-                commit: "abc".into(),
-            }],
             observed_at_unix_ms: 1,
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
@@ -192,23 +195,24 @@ mod tests {
         };
         upsert_executor(&db, &advertisement, 3, "online").await;
         upsert_executor(&db, &advertisement, 3, "offline").await;
-        let (status, count): (String, i64) = db
+        let (status, count, warm): (String, i64, String) = db
             .read(|conn| {
                 Box::pin(async move {
                     let mut rows = conn
                         .query(
-                            "SELECT status, COUNT(*) FROM executor_registry WHERE executor_id='e'",
+                            "SELECT status, COUNT(*), MAX(warm_commits) FROM executor_registry WHERE executor_id='e'",
                             (),
                         )
                         .await?;
                     let row = rows.next().await?.unwrap();
-                    Ok((row.text(0)?, row.i64(1)?))
+                    Ok((row.text(0)?, row.i64(1)?, row.text(2)?))
                 })
             })
             .await
             .unwrap();
         assert_eq!(status, "offline");
         assert_eq!(count, 1);
+        assert_eq!(warm, "[]", "the registry row carries no warm roots");
         let columns: Vec<String> = db
             .query_all("PRAGMA table_info(executor_registry)", (), |row| {
                 row.text(1)

@@ -87,6 +87,10 @@ pub mod operator_requests {
     pub use crate::operator_requests::*;
 }
 
+pub mod build_center {
+    pub use crate::build_center::*;
+}
+
 pub mod agent_process {
     pub use crate::agent_process::*;
 }

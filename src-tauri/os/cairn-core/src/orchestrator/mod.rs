@@ -44,6 +44,7 @@ pub mod inference_models;
 pub mod inference_overview;
 pub mod inference_route;
 pub mod inference_verify;
+mod integrity_sweep;
 pub(crate) mod landing;
 pub mod lifecycle;
 pub mod model_defaults;
@@ -3284,20 +3285,20 @@ impl Orchestrator {
     /// migration and panic the runner's boot (CAIRN-3103). Migrations now verify
     /// their own rebuilt tables; whole-database verification belongs here, off
     /// the boot path, where every finding is a report rather than a gate. Gated
-    /// by `integrity_sweep_state` to a weekly cadence, so most boots pay nothing.
-    pub async fn run_integrity_sweep(&self) {
-        if let Err(e) = crate::storage::run_integrity_sweep(&self.db.local).await {
-            log::warn!("integrity sweep failed: {e}");
-        }
+    /// by `integrity_sweep_state` to a weekly cadence, so most boots pay nothing,
+    /// and postponed while the host is loaded (see `orchestrator::integrity_sweep`)
+    /// until `shutdown`.
+    pub async fn run_integrity_sweep_when_host_allows(
+        &self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        integrity_sweep::run(&self.db.local, shutdown).await;
     }
 
-    pub fn spawn_integrity_sweep(&self) {
+    /// [`Self::run_integrity_sweep_when_host_allows`] on its own task.
+    pub fn spawn_integrity_sweep(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
         let db = self.db.local.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::storage::run_integrity_sweep(&db).await {
-                log::warn!("integrity sweep failed: {e}");
-            }
-        });
+        tokio::spawn(async move { integrity_sweep::run(&db, shutdown).await });
     }
 
     /// Retire the attention queue's historical backlog once, in the background.
@@ -4921,7 +4922,6 @@ mod tests {
                     machine_services: Vec::new(),
                 },
                 current_load: 0,
-                warm_roots: Vec::new(),
                 observed_at_unix_ms: 0,
                 liveness_observed_at_unix_ms: Some(0),
                 facts_stale_refresh_blocked: None,

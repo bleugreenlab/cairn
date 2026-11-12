@@ -411,6 +411,7 @@ fn the_next_pass_starts_where_this_one_was_cut_short() {
         log_peak_bytes: 0,
         duration: Duration::ZERO,
         end,
+        folds_skipped_for: None,
     };
     let mut rules = Eviction::ALL;
     rules.rotate_left(2);
@@ -1140,6 +1141,88 @@ async fn a_held_connection_ends_the_pass_when_the_log_needs_the_fold() {
         )),
         "{rendered}"
     );
+}
+
+/// Under the threshold, an open integrity sweep skips the pass's folds rather
+/// than failing them: no fold is recorded or spent, the pass keeps deleting,
+/// and the line says why nothing folded.
+#[tokio::test]
+async fn a_maintenance_read_skips_folds_and_the_pass_keeps_deleting() {
+    let (_temp, db) = private_db().await;
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    let budget = EvictorBudget {
+        fold_work_target: Some(Duration::ZERO),
+        folds_per_pass: 8,
+        ..UNBOUNDED
+    };
+
+    let sweep = db
+        .connect_maintenance(MaintenanceRead::IntegritySweep)
+        .await
+        .unwrap();
+    // Moving to the second rule with the first rule's page unfolded makes the
+    // fold cost-due (fold windows hold one rule), with the log under the
+    // threshold.
+    let report = run(
+        &db,
+        budget,
+        &[Eviction::DoneOutbox, Eviction::TerminalStreams],
+    )
+    .await;
+    drop(sweep);
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert_eq!(report.folds.len(), 0, "{report}");
+    assert_eq!(
+        report.folds_skipped_for,
+        Some(MaintenanceRead::IntegritySweep)
+    );
+    assert_eq!(report.rows(), 1, "{report}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM effect_outbox").await, 0);
+    let rendered = report.to_string();
+    assert!(
+        rendered.contains("folds=0 ") && rendered.contains(" folds skipped: integrity sweep open"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("fold_failed"), "{rendered}");
+}
+
+/// At the threshold the skip ends the pass, as a failed required fold does,
+/// and once the read is gone the next pass folds.
+#[tokio::test]
+async fn a_maintenance_read_ends_the_pass_when_the_log_needs_the_fold() {
+    let (_temp, db) = private_db().await;
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    let budget = EvictorBudget {
+        fold_at_log_bytes: 0,
+        folds_per_pass: 8,
+        ..UNBOUNDED
+    };
+
+    let sweep = db
+        .connect_maintenance(MaintenanceRead::IntegritySweep)
+        .await
+        .unwrap();
+    let report = run(&db, budget, &[Eviction::DoneOutbox]).await;
+    drop(sweep);
+
+    assert_eq!(report.end, PassEnd::MaintenanceRead, "{report}");
+    assert_eq!(report.rows(), 0, "{report}");
+    assert_eq!(report.folds.len(), 0, "{report}");
+    let rendered = report.to_string();
+    assert!(
+        rendered.starts_with("end=MaintenanceRead rows=0 ")
+            && rendered.contains(" folds skipped: integrity sweep open"),
+        "{rendered}"
+    );
+
+    let report = run(&db, budget, &[Eviction::DoneOutbox]).await;
+    assert_eq!(report.folds_skipped_for, None, "{report}");
+    assert!(!report.folds.is_empty(), "{report}");
+    assert!(report.folds.iter().all(FoldRecord::succeeded), "{report}");
+    assert_eq!(report.rows(), 1, "{report}");
 }
 
 /// Delete `pages` of `rule` and fold them for `work_ms`.

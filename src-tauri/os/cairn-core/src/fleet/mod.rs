@@ -40,6 +40,7 @@ pub mod self_update;
 pub(crate) mod service_placement;
 pub mod telemetry;
 pub mod unreturned;
+mod warm_roots;
 
 pub use cairn_config::fleet::*;
 
@@ -3771,8 +3772,15 @@ struct ExecutorConnectionState {
     identity: ExecutorIdentity,
     /// Shared for the reason `snapshot` is: every placement pass copies the
     /// connection table, and each copy would otherwise clone every machine's
-    /// capabilities, warm roots, and scratch replicas.
+    /// capabilities and scratch replicas.
     advertisement: Arc<ExecutorAdvertisement>,
+    /// The warm roots this link's Hello carried, moved by each change frame
+    /// since. Shared for the reason `advertisement` is.
+    warm_roots: Arc<warm_roots::WarmRootSet>,
+    /// Whether this runner has asked the executor for its whole warm-root
+    /// inventory and not yet had it, so a run of deltas against a base it
+    /// does not hold asks once rather than once per delta.
+    warm_roots_resync_requested: bool,
     generation: u64,
     sender: mpsc::UnboundedSender<ExecutorMessage>,
     /// Shared rather than owned so a placement pass can copy the connection
@@ -4479,7 +4487,6 @@ impl Fleet {
                 machine_services: Vec::new(),
             },
             current_load: 0,
-            warm_roots: Vec::new(),
             observed_at_unix_ms: unix_time_ms(),
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
@@ -4489,13 +4496,17 @@ impl Fleet {
         // The colocated machine pins no listener certificate and places no
         // rotation hold, so the one failure a remote attach can report cannot
         // arise here.
-        self.attach_advertised_executor(advertisement, sender, true, None, None)
+        self.attach_advertised_executor(advertisement, Default::default(), sender, true, None, None)
             .expect("a colocated attach places no listener rotation hold and cannot fail")
     }
 
+    /// Attach a machine with what its Hello said: its advertisement and every
+    /// warm root it holds, inserted together so placement never reads a
+    /// machine that has just attached as colder than it is.
     pub fn attach_advertised_executor(
         &self,
         advertisement: ExecutorAdvertisement,
+        warm_roots: cairn_common::executor_protocol::WarmRootInventory,
         sender: mpsc::UnboundedSender<ExecutorMessage>,
         colocated: bool,
         executor_build_id: Option<String>,
@@ -4561,6 +4572,8 @@ impl Fleet {
         let mut connection = ExecutorConnectionState {
             identity,
             advertisement: Arc::new(advertisement),
+            warm_roots: Arc::new(warm_roots::WarmRootSet::from_inventory(warm_roots)),
+            warm_roots_resync_requested: false,
             generation,
             sender,
             snapshot: Arc::default(),
@@ -6388,6 +6401,62 @@ impl Fleet {
         true
     }
 
+    /// Move a connection's warm roots by one change its executor sent.
+    ///
+    /// A delta against a base this runner does not hold leaves the set as it
+    /// was. That costs placement precision and nothing else: the roots are
+    /// hints, the executor re-verifies a commit before it trusts it, and a
+    /// fetch negotiates its own haves. The runner asks for the whole
+    /// inventory once, and not again until the answer arrives.
+    fn apply_warm_roots(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        revision: u64,
+        change: cairn_common::executor_protocol::WarmRootChange,
+    ) {
+        let mut connections = self.lock_connections();
+        let Some(entry) = connections.get_mut(executor_id) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        let whole = matches!(
+            change,
+            cairn_common::executor_protocol::WarmRootChange::Whole { .. }
+        );
+        let mut moved = (*entry.warm_roots).clone();
+        match moved.apply(revision, change) {
+            warm_roots::WarmRootApply::Applied => {
+                entry.warm_roots = Arc::new(moved);
+                if whole {
+                    entry.warm_roots_resync_requested = false;
+                }
+                drop(connections);
+                self.connection_ready.notify_waiters();
+            }
+            warm_roots::WarmRootApply::Stale => {
+                log::debug!(
+                    "executor_id={executor_id} generation={generation} sent warm-root revision {revision}, no newer than the {} this runner holds; discarded",
+                    entry.warm_roots.revision()
+                );
+            }
+            warm_roots::WarmRootApply::BaseMismatch { held, base } => {
+                if entry.warm_roots_resync_requested {
+                    return;
+                }
+                log::warn!(
+                    "executor_id={executor_id} generation={generation} sent a warm-root delta against revision {base}, but this runner holds revision {held}; keeping revision {held} and asking for the whole inventory"
+                );
+                entry.warm_roots_resync_requested = entry
+                    .sender
+                    .send(ExecutorMessage::WarmRootsRequest {})
+                    .is_ok();
+            }
+        }
+    }
+
     pub fn handle_executor_message(
         &self,
         executor_id: &str,
@@ -6778,6 +6847,11 @@ impl Fleet {
             }
             ExecutorMessage::AdvertisementUpdated { advertisement } => {
                 self.update_advertisement(executor_id, generation, advertisement)
+            }
+            // Placement reads the roots; the public fleet reading does not.
+            ExecutorMessage::WarmRootsChanged { revision, change } => {
+                self.apply_warm_roots(executor_id, generation, revision, change);
+                false
             }
             // Health only: the public fleet reading did not change shape, as
             // the CPU snapshot this frame replaced almost never did either.
@@ -20191,12 +20265,9 @@ fn unpredicted_candidate(
 
 /// Whether this machine has already verified the exact commit the request names.
 fn warm_root_holds_commit(entry: &ExecutorConnectionState, request: &CellRequest) -> bool {
-    let repository = request.repository.identity();
     entry
-        .advertisement
         .warm_roots
-        .iter()
-        .any(|root| root.repository == repository && root.commit == request.base_commit)
+        .holds(&request.repository.identity(), &request.base_commit)
 }
 
 /// The three readings placement decides on, as this machine last reported them.
@@ -20361,24 +20432,18 @@ fn repository_sync_cost(
     }
 
     let repository = request.repository.identity();
-    let warm_root_commits: Vec<_> = entry
-        .advertisement
-        .warm_roots
-        .iter()
-        .filter(|root| root.repository == repository)
-        .map(|root| root.commit.clone())
-        .collect();
-    if warm_root_commits
-        .iter()
-        .any(|commit| commit == &request.base_commit)
-    {
+    if entry.warm_roots.holds(&repository, &request.base_commit) {
         return SyncCost::Known(0);
     }
 
     let Some(repository_path) = request.repository.colocated_path() else {
         return SyncCost::Unknown;
     };
-    price(repository_path, &warm_root_commits, &request.base_commit)
+    price(
+        repository_path,
+        entry.warm_roots.commits(&repository),
+        &request.base_commit,
+    )
 }
 
 fn aggregate_batch_learned_estimates(
@@ -22957,6 +23022,7 @@ mod tests {
         assert!(fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(entry.advertisement),
+                Default::default(),
                 entry.sender,
                 false,
                 None,
@@ -23769,8 +23835,8 @@ mod tests {
     use cairn_codec::testutil::{commit_all, init_repo, write_file};
     use cairn_common::executor_protocol::{
         CellAdmissionKind, CellOccupancy, GitObjectFormat, MachineMemory, Measurement,
-        ResidencyFence, ResidentOccupancyEvidence, VerifiedWarmRoot,
-        EXECUTOR_LINK_STALL_REMEDIATION_MS,
+        ResidencyFence, ResidentOccupancyEvidence, WarmRepositoryRoots, WarmRootChange,
+        WarmRootInventory, EXECUTOR_LINK_STALL_REMEDIATION_MS,
     };
 
     fn relay_request(run_id: Option<&str>) -> cairn_common::protocol::CallbackRequest {
@@ -24115,6 +24181,7 @@ mod tests {
         let (_, connection) = fleet_entry(executor_id, "linux", 0, &[]);
         pool.attach_advertised_executor(
             Arc::unwrap_or_clone(connection.advertisement),
+            Default::default(),
             connection.sender,
             false,
             None,
@@ -28386,24 +28453,17 @@ mod tests {
                         machine_services: Vec::new(),
                     },
                     current_load: load,
-                    warm_roots: warm
-                        .iter()
-                        .map(|value| VerifiedWarmRoot {
-                            repository: RepositoryLocator::ManagedObjects {
-                                project_id: "p".into(),
-                                repository_id: "repo".into(),
-                                object_format: GitObjectFormat::Sha1,
-                            }
-                            .identity(),
-                            commit: (*value).into(),
-                        })
-                        .collect(),
                     observed_at_unix_ms,
                     liveness_observed_at_unix_ms: None,
                     facts_stale_refresh_blocked: None,
                     last_refresh: None,
                     node_scratches: Vec::new(),
                 }),
+                warm_roots: Arc::new(warm_roots::WarmRootSet::from_inventory(WarmRootInventory {
+                    revision: 1,
+                    repositories: vec![test_warm_roots("repo", warm)],
+                })),
+                warm_roots_resync_requested: false,
                 generation: 1,
                 sender,
                 snapshot: Arc::default(),
@@ -28499,6 +28559,7 @@ mod tests {
         fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(entry.advertisement),
+                Default::default(),
                 entry.sender,
                 false,
                 None,
@@ -28554,6 +28615,7 @@ mod tests {
         fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(stray.advertisement),
+                Default::default(),
                 stray.sender,
                 false,
                 None,
@@ -34239,6 +34301,7 @@ mod tests {
         let generation = fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(entry.advertisement),
+                Default::default(),
                 entry.sender,
                 false,
                 None,
@@ -34343,6 +34406,7 @@ mod tests {
         let generation = fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(first.advertisement),
+                Default::default(),
                 first.sender,
                 false,
                 None,
@@ -34372,6 +34436,7 @@ mod tests {
         let later = fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(second.advertisement),
+                Default::default(),
                 second.sender,
                 false,
                 None,
@@ -35828,6 +35893,7 @@ mod tests {
         let (_, managed) = fleet_entry("managed", "linux", 0, &[]);
         pool.attach_advertised_executor(
             Arc::unwrap_or_clone(managed.advertisement),
+            Default::default(),
             managed.sender,
             false,
             None,
@@ -36857,6 +36923,7 @@ mod tests {
         let generation = pool
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(connection.advertisement),
+                Default::default(),
                 connection.sender,
                 false,
                 None,
@@ -37918,6 +37985,7 @@ mod tests {
             .fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(advertised.advertisement),
+                Default::default(),
                 sender,
                 false,
                 None,
@@ -39905,16 +39973,223 @@ mod tests {
         .is_err());
     }
 
+    /// The managed-object repository every `fleet_entry` serves, under
+    /// `repository_id`, holding `commits` as warm roots.
+    fn test_warm_roots(repository_id: &str, commits: &[&str]) -> WarmRepositoryRoots {
+        WarmRepositoryRoots {
+            repository: RepositoryLocator::ManagedObjects {
+                project_id: "p".into(),
+                repository_id: repository_id.into(),
+                object_format: GitObjectFormat::Sha1,
+            }
+            .identity(),
+            commits: commits.iter().map(|commit| commit.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn warm_root_is_zero_only_for_the_requested_repository() {
         let (_, mut entry) = fleet_entry("warm", "linux", 0, &["base"]);
         let request = targeted_request("linux");
         assert_eq!(measured_sync_cost(&request, &entry), SyncCost::Known(0));
 
-        Arc::make_mut(&mut entry.advertisement).warm_roots[0]
-            .repository
-            .repository_id = "other-repo".into();
+        entry.warm_roots = Arc::new(warm_roots::WarmRootSet::from_inventory(WarmRootInventory {
+            revision: 1,
+            repositories: vec![test_warm_roots("other-repo", &["base"])],
+        }));
         assert_eq!(measured_sync_cost(&request, &entry), SyncCost::Unknown);
+    }
+
+    /// A machine whose roots arrived as a Hello and two deltas answers both
+    /// placement lookups exactly as one built whole from the final set: the
+    /// exact-commit hit and miss per repository, and the haves a sync walk is
+    /// priced with.
+    #[test]
+    fn warm_roots_moved_by_deltas_answer_as_the_whole_final_set() {
+        let fleet = Fleet::default();
+        let (sender, _frames) = mpsc::unbounded_channel();
+        let (_, entry) = fleet_entry("moved", "linux", 0, &[]);
+        let generation = fleet
+            .attach_advertised_executor(
+                (*entry.advertisement).clone(),
+                WarmRootInventory {
+                    revision: 4,
+                    repositories: vec![
+                        test_warm_roots("repo", &["a1", "a2"]),
+                        test_warm_roots("other-repo", &["b1"]),
+                    ],
+                },
+                sender,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        // A fetch added a root to the first repository; then a consolidation
+        // dropped one there and the other repository fetched.
+        let deltas = [
+            (
+                5,
+                WarmRootChange::Delta {
+                    base_revision: 4,
+                    added: vec![test_warm_roots("repo", &["a3"])],
+                    removed: Vec::new(),
+                },
+            ),
+            (
+                6,
+                WarmRootChange::Delta {
+                    base_revision: 5,
+                    added: vec![test_warm_roots("other-repo", &["b2"])],
+                    removed: vec![test_warm_roots("repo", &["a1"])],
+                },
+            ),
+        ];
+        for (revision, change) in deltas {
+            fleet.handle_executor_message(
+                "moved",
+                generation,
+                ExecutorMessage::WarmRootsChanged { revision, change },
+            );
+        }
+        let moved = fleet.lock_connections().get("moved").unwrap().clone();
+        let (_, mut whole) = fleet_entry("whole", "linux", 0, &[]);
+        whole.warm_roots = Arc::new(warm_roots::WarmRootSet::from_inventory(WarmRootInventory {
+            revision: 1,
+            repositories: vec![
+                test_warm_roots("other-repo", &["b2", "b1"]),
+                test_warm_roots("repo", &["a3", "a2"]),
+            ],
+        }));
+        assert_eq!(moved.warm_roots.revision(), 6);
+
+        let haves = |entry: &ExecutorConnectionState, request: &CellRequest| {
+            let mut given = None;
+            let cost = repository_sync_cost(request, entry, |_, roots, _| {
+                given = Some(roots.to_vec());
+                SyncCost::Known(7)
+            });
+            (cost, given)
+        };
+        let mut request = targeted_request("linux");
+        for (repository_id, commit) in [
+            ("repo", "a1"),
+            ("repo", "a2"),
+            ("repo", "a3"),
+            ("repo", "b2"),
+            ("other-repo", "b1"),
+            ("other-repo", "b2"),
+            ("other-repo", "a2"),
+        ] {
+            request.repository = RepositoryLocator::ColocatedPath {
+                project_id: "p".into(),
+                repository_id: repository_id.into(),
+                absolute_path: "/repo".into(),
+            };
+            request.base_commit = commit.into();
+            assert_eq!(
+                warm_root_holds_commit(&moved, &request),
+                warm_root_holds_commit(&whole, &request),
+                "{repository_id}@{commit}"
+            );
+            assert_eq!(
+                haves(&moved, &request),
+                haves(&whole, &request),
+                "{repository_id}@{commit}"
+            );
+        }
+        request.repository = targeted_request("linux").repository;
+        request.base_commit = "a3".into();
+        assert_eq!(haves(&moved, &request), (SyncCost::Known(0), None));
+        request.base_commit = "a1".into();
+        assert_eq!(
+            haves(&moved, &request),
+            (
+                SyncCost::Known(7),
+                Some(vec!["a2".to_string(), "a3".to_string()])
+            ),
+            "the walk is given the surviving roots, sorted"
+        );
+    }
+
+    /// A delta against a revision the runner does not hold changes nothing and
+    /// asks for the whole inventory once; the whole answer replaces the set;
+    /// a change from a retired link is refused.
+    #[test]
+    fn an_unmatched_warm_root_delta_asks_once_for_the_whole_inventory() {
+        let fleet = Fleet::default();
+        let (sender, mut frames) = mpsc::unbounded_channel();
+        let (_, entry) = fleet_entry("gap", "linux", 0, &[]);
+        let generation = fleet
+            .attach_advertised_executor(
+                (*entry.advertisement).clone(),
+                WarmRootInventory {
+                    revision: 2,
+                    repositories: vec![test_warm_roots("repo", &["a1"])],
+                },
+                sender,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        while frames.try_recv().is_ok() {}
+        let held = |fleet: &Fleet| {
+            fleet
+                .lock_connections()
+                .get("gap")
+                .unwrap()
+                .warm_roots
+                .clone()
+        };
+        let before = held(&fleet);
+        for revision in [5, 6] {
+            fleet.handle_executor_message(
+                "gap",
+                generation,
+                ExecutorMessage::WarmRootsChanged {
+                    revision,
+                    change: WarmRootChange::Delta {
+                        base_revision: revision - 1,
+                        added: vec![test_warm_roots("repo", &["a9"])],
+                        removed: Vec::new(),
+                    },
+                },
+            );
+        }
+        assert_eq!(*held(&fleet), *before, "an unmatched delta changes nothing");
+        let mut requests = 0;
+        while let Ok(frame) = frames.try_recv() {
+            if matches!(frame, ExecutorMessage::WarmRootsRequest {}) {
+                requests += 1;
+            }
+        }
+        assert_eq!(requests, 1, "asked once, not once per delta");
+
+        let answer = |revision| ExecutorMessage::WarmRootsChanged {
+            revision,
+            change: WarmRootChange::Whole {
+                repositories: vec![test_warm_roots("repo", &["a1", "a9"])],
+            },
+        };
+        fleet.handle_executor_message("gap", generation + 1, answer(9));
+        assert_eq!(*held(&fleet), *before, "a retired link's change is refused");
+        fleet.handle_executor_message("gap", generation, answer(7));
+        let after = held(&fleet);
+        assert_eq!(after.revision(), 7);
+        assert!(after.holds(&test_warm_roots("repo", &[]).repository, "a9"));
+        // A change older than the answer, left queued behind it, is stale.
+        fleet.handle_executor_message(
+            "gap",
+            generation,
+            ExecutorMessage::WarmRootsChanged {
+                revision: 6,
+                change: WarmRootChange::Whole {
+                    repositories: Vec::new(),
+                },
+            },
+        );
+        assert_eq!(*held(&fleet), *after);
     }
 
     /// Each sync walk a counted runner was asked for: (target, warm roots).
@@ -42072,6 +42347,7 @@ mod tests {
         let generation = pool
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(advertised.advertisement),
+                Default::default(),
                 sender,
                 id == COLOCATED_EXECUTOR_ID,
                 None,
@@ -46065,6 +46341,7 @@ mod tests {
             .fleet
             .attach_advertised_executor(
                 Arc::unwrap_or_clone(advertised.advertisement),
+                Default::default(),
                 sender,
                 false,
                 None,

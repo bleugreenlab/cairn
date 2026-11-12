@@ -2112,7 +2112,11 @@ fn rebuild_ledger_uris_are_portable_and_replace_legacy() {
         assert_eq!(resource.kind(), kind);
         assert_eq!(resource.to_uri(), uri);
         assert_eq!(resource.project(), None);
-        assert_eq!(resource.surface(), crate::Surface::Read { uri: uri.into() });
+        let rebuild = match &resource {
+            CairnResource::Rebuild { id } => Some(id.clone()),
+            _ => None,
+        };
+        assert_eq!(resource.surface(), crate::Surface::Builds { rebuild });
         let label = match kind {
             ResourceKind::Rebuilds => "Rebuild ledger",
             ResourceKind::Rebuild => "Rebuild rebuild-1",

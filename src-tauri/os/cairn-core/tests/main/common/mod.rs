@@ -385,13 +385,24 @@ fn test_executor_advertisement(
             machine_services: Vec::new(),
         },
         current_load: 0,
-        warm_roots: pool.map(ExecutorPool::warm_roots).unwrap_or_default(),
         node_scratches: pool.map(ExecutorPool::node_scratches).unwrap_or_default(),
         observed_at_unix_ms: if pool.is_some() { unix_time_ms() } else { 0 },
         liveness_observed_at_unix_ms: None,
         facts_stale_refresh_blocked: None,
         last_refresh: None,
     }
+}
+
+/// Carry the machine's warm roots to the runner as a real link does: a change
+/// frame whenever they moved since the inventory last sent.
+fn publish_warm_roots(
+    tracker: &cairn_exec::warm_roots::WarmRootTracker,
+    pool: &ExecutorPool,
+    deliver: impl FnOnce(ExecutorMessage),
+) {
+    tracker.publish_change(&Arc::new(pool.warm_roots()), |revision, change| {
+        deliver(ExecutorMessage::WarmRootsChanged { revision, change })
+    });
 }
 
 /// Answer an offer in the production link handler's order: claim first, then
@@ -961,8 +972,16 @@ fn attach_executor(
     // machine that was offline when a node closed is cleaned on attach.
     let mut hello = test_executor_advertisement(executor_id, colocated, &projects_served, None);
     hello.node_scratches = executor_pool.node_scratches();
+    let warm_roots = Arc::new(cairn_exec::warm_roots::WarmRootTracker::default());
     let attached_generation = core_pool
-        .attach_advertised_executor(hello, tx, colocated, None, None)
+        .attach_advertised_executor(
+            hello,
+            warm_roots.whole(&Arc::new(executor_pool.warm_roots())),
+            tx,
+            colocated,
+            None,
+            None,
+        )
         .expect("attach the test executor");
     generation.store(attached_generation, Ordering::Release);
     // Beat as a real machine does, on the production interval and whatever it
@@ -982,6 +1001,7 @@ fn attach_executor(
         let core_pool = core_pool.clone();
         let pool = executor_pool.clone();
         let projects_served = projects_served.clone();
+        let warm_roots = warm_roots.clone();
         tokio::spawn(async move {
             let interval = std::time::Duration::from_millis(EXECUTOR_HEARTBEAT_INTERVAL_MS);
             let mut beat =
@@ -993,6 +1013,9 @@ fn attach_executor(
                     pool.refresh_liveness().await;
                 }
                 pool.record_protocol_heartbeat();
+                publish_warm_roots(&warm_roots, &pool, |message| {
+                    core_pool.handle_executor_message(executor_id, attached_generation, message);
+                });
                 core_pool.handle_executor_message(
                     executor_id,
                     attached_generation,
@@ -1102,6 +1125,7 @@ fn attach_executor(
                     let core_pool = core_pool.clone();
                     let projects_served = projects_served.clone();
                     let relay = relay.clone();
+                    let warm_roots = warm_roots.clone();
                     tokio::spawn(async move {
                         let request_id = request.request_id.clone();
                         let attempt_id = request.attempt_id.clone();
@@ -1120,6 +1144,13 @@ fn attach_executor(
                                 outcome,
                             },
                         );
+                        publish_warm_roots(&warm_roots, &executor_pool, |message| {
+                            core_pool.handle_executor_message(
+                                executor_id,
+                                attached_generation,
+                                message,
+                            );
+                        });
                         core_pool.handle_executor_message(
                             executor_id,
                             attached_generation,

@@ -552,7 +552,6 @@ fn advertisement(scratch_id: &str) -> ExecutorAdvertisement {
             machine_services: Vec::new(),
         },
         current_load: 0,
-        warm_roots: Vec::new(),
         observed_at_unix_ms: 0,
         liveness_observed_at_unix_ms: Some(0),
         facts_stale_refresh_blocked: None,
@@ -576,7 +575,7 @@ async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
     let generation = world
         .orch
         .fleet
-        .attach_advertised_executor(advertisement, sender, true, None, None)
+        .attach_advertised_executor(advertisement, Default::default(), sender, true, None, None)
         .unwrap();
     // Checked before this task yields once: the caller sends `Ready` as soon
     // as attach returns, and the executor retries what it owes the moment
@@ -612,7 +611,7 @@ async fn advertised_unknown_scratch_is_retained_but_known_closed_scratch_is_dele
     world
         .orch
         .fleet
-        .attach_advertised_executor(advertisement, sender, true, None, None)
+        .attach_advertised_executor(advertisement, Default::default(), sender, true, None, None)
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {

@@ -133,6 +133,11 @@ pub enum Surface {
     Requests {
         request: Option<String>,
     },
+    /// The build center beside the notification bell: builds of Cairn itself,
+    /// opened onto `rebuild` when one is named.
+    Builds {
+        rebuild: Option<String>,
+    },
     /// Settings > Library, focused on `pack` when one is named.
     Packs {
         pack: Option<String>,
@@ -184,6 +189,10 @@ impl CairnResource {
             Self::Requests => Surface::Requests { request: None },
             Self::Request { id } => Surface::Requests {
                 request: Some(id.clone()),
+            },
+            Self::Rebuilds => Surface::Builds { rebuild: None },
+            Self::Rebuild { id } => Surface::Builds {
+                rebuild: Some(id.clone()),
             },
             Self::Executors => Surface::Fleet { machine: None },
             Self::Executor { name } => Surface::Fleet {
@@ -261,8 +270,6 @@ impl CairnResource {
             | Self::InferenceGenerations
             | Self::InferenceGeneration { .. }
             | Self::Bug
-            | Self::Rebuilds
-            | Self::Rebuild { .. }
             | Self::Help
             | Self::WebSearch
             | Self::Mcp { .. } => self.read(),

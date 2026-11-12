@@ -62,12 +62,13 @@ pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEE
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, AdHocRead, Caller,
     CheckpointReport, DbCall, DrainBudget, DrainReport, HolderActivity, HolderKind, LocalDb,
-    OverdueHolder, OverdueWriteWaiter, RetryConfig, TrackedConnection, TrackedRows,
-    CHECKPOINT_SLOW_AFTER, CHECKPOINT_WEDGE_BACKSTOP, FOLD_AT_LOG_BYTES, READ_STATEMENT_BOUND,
+    MaintenanceRead, OverdueHolder, OverdueWriteWaiter, RetryConfig, TrackedConnection,
+    TrackedRows, CHECKPOINT_SLOW_AFTER, CHECKPOINT_WEDGE_BACKSTOP, FOLD_AT_LOG_BYTES,
+    READ_STATEMENT_BOUND,
 };
 pub use migration::{
-    repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,
-    MigrationRunner, MigrationStep,
+    integrity_sweep_due, integrity_sweep_since_last, repair_index_entry_drift, run_integrity_sweep,
+    IntegritySweepOutcome, Migration, MigrationRunner, MigrationStep,
 };
 pub use migrations::{
     Lineage, PrivateReason, RekeyTableManifest, ScopeTarget, TableScope, PROJECT_REKEY_MANIFEST,
