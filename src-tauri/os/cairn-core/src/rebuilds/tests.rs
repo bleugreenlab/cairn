@@ -31,13 +31,13 @@ async fn two_boots_and_live_append_are_idempotent() {
     let db = db().await;
     write_events(dir.path(), "r1", &[phase("r1", "phase")]);
     assert_eq!(
-        ingest_once(&db, dir.path(), ActorState::Loaded)
+        ingest_once(&db, dir.path(), ActorState::Running)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        ingest_once(&db, dir.path(), ActorState::Loaded)
+        ingest_once(&db, dir.path(), ActorState::Running)
             .await
             .unwrap(),
         0
@@ -87,7 +87,7 @@ async fn a_finished_rebuild_releases_its_bun_copy_and_keeps_its_evidence() {
     write_events(dir.path(), "in-flight", &[phase("in-flight", "e1")]);
 
     for _ in 0..2 {
-        ingest_once(&db, dir.path(), ActorState::Loaded)
+        ingest_once(&db, dir.path(), ActorState::Running)
             .await
             .unwrap();
         assert!(!dir.path().join("finished").join(ACTOR_RUNTIME).exists());
@@ -129,7 +129,7 @@ async fn conflicting_bytes_unknown_types_and_malformed_lines_are_faults() {
     let db = db().await;
     let first = phase("r1", "e1");
     write_events(dir.path(), "r1", std::slice::from_ref(&first));
-    ingest_once(&db, dir.path(), ActorState::Loaded)
+    ingest_once(&db, dir.path(), ActorState::Running)
         .await
         .unwrap();
     let conflict = json!({"event":"e1","rebuild":"r1","at":"2026-11-07T13:00:00Z","type":"outcome","outcome":"done","summary":"forged"});
@@ -184,17 +184,95 @@ async fn absent_actor_fails_last_phase_but_unknown_liveness_stays_acting() {
     assert_eq!(row.summary.as_deref(), Some("actor died during build"));
 }
 
+/// Captured verbatim from `launchctl print` on bgsrv-mac (macOS 26.6): a
+/// keepalive agent running, and a `RunAtLoad` one-shot that ran and exited,
+/// the shape an unbooted rebuild actor leaves. Agent batches there are
+/// Seatbelt-confined and launchd refuses their `bootstrap`, so these are live
+/// jobs of other labels; the parser never reads the label. The killed print is
+/// a jetsam-killed agent on macOS 26.4: it carries no `last exit code` at all.
+const PRINT_RUNNING: &str = include_str!("fixtures/launchctl-print-running.txt");
+const PRINT_EXITED: &str = include_str!("fixtures/launchctl-print-exited.txt");
+const PRINT_KILLED: &str = include_str!("fixtures/launchctl-print-killed.txt");
+
+#[test]
+fn launchctl_print_tells_running_from_exited() {
+    let running = job_state(Some(0), PRINT_RUNNING, "");
+    assert_eq!(running.state, ActorState::Running);
+    assert_eq!(running.pid, Some(556));
+    assert_eq!(running.program.as_deref(), Some("/usr/bin/caffeinate"));
+    assert_eq!(
+        running.last_exit.as_deref(),
+        Some("last exit code = (never exited)")
+    );
+
+    let exited = job_state(Some(0), PRINT_EXITED, "");
+    assert_eq!(exited.state, ActorState::Exited);
+    assert_eq!(exited.pid, None);
+    assert_eq!(exited.program.as_deref(), Some("/opt/homebrew/bin/imsg"));
+    assert_eq!(exited.last_exit.as_deref(), Some("last exit code = 0"));
+    assert!(exited.state.actor_gone() && !running.state.actor_gone());
+
+    // A killed process prints no exit code; its exit reason or terminating
+    // signal is the record. Nested coalitions print `state = active`.
+    const JETSAM: &str = "\tlast exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT\n";
+    assert!(!PRINT_KILLED.contains("last exit code"));
+    let killed = job_state(Some(0), PRINT_KILLED, "");
+    assert_eq!(killed.state, ActorState::Exited);
+    assert_eq!(
+        killed.last_exit.as_deref(),
+        Some("last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT")
+    );
+    let signalled = PRINT_KILLED.replacen(JETSAM, "\tlast terminating signal = Killed: 9\n", 1);
+    assert_ne!(signalled, PRINT_KILLED);
+    let signalled = job_state(Some(0), &signalled, "");
+    assert_eq!(signalled.state, ActorState::Exited);
+    assert_eq!(
+        signalled.last_exit.as_deref(),
+        Some("last terminating signal = Killed: 9")
+    );
+    let unrecorded = PRINT_KILLED.replacen(JETSAM, "", 1);
+    assert_ne!(unrecorded, PRINT_KILLED);
+    assert_eq!(
+        job_state(Some(0), &unrecorded, "").state,
+        ActorState::Unknown
+    );
+
+    // Exited needs every sign; anything less is unknown, never death. Nested
+    // blocks print their own `state` and `active count`, which never count.
+    for (from, to) in [
+        ("\tstate = not running\n", ""),
+        ("\tstate = not running\n", "\tstate = spawn scheduled\n"),
+        (
+            "\tlast exit code = 0\n",
+            "\tlast exit code = (never exited)\n",
+        ),
+        ("\tlast exit code = 0\n", ""),
+        ("\truns = 1\n", "\truns = 0\n"),
+        ("\tactive count = 0\n", ""),
+        ("\tactive count = 0\n", "\tactive count = 1\n"),
+        ("\truns = 1\n", "\truns = 1\n\tpid = 77\n"),
+    ] {
+        let text = PRINT_EXITED.replacen(from, to, 1);
+        assert_ne!(text, PRINT_EXITED, "{from:?}");
+        assert_eq!(
+            job_state(Some(0), &text, "").state,
+            ActorState::Unknown,
+            "{from:?} -> {to:?}"
+        );
+    }
+}
+
 #[test]
 fn unreadable_launchctl_is_not_death_evidence() {
-    assert_eq!(job_state(Some(0), ""), ActorState::Loaded);
-    assert_eq!(job_state(Some(113), "Bad request. Could not find service \"computer.cairn.rebuild\" in domain for user gui: 501"), ActorState::Absent);
+    assert_eq!(job_state(Some(0), "", "").state, ActorState::Unknown);
+    assert_eq!(job_state(Some(113), "", "Bad request. Could not find service \"computer.cairn.rebuild\" in domain for user gui: 501").state, ActorState::Absent);
     for (code, stderr) in [
         (None, ""),
         (Some(1), "Operation not permitted"),
         (Some(113), "Could not find domain"),
         (Some(113), "permission denied"),
     ] {
-        assert_eq!(job_state(code, stderr), ActorState::Unknown);
+        assert_eq!(job_state(code, "", stderr).state, ActorState::Unknown);
     }
 }
 
@@ -312,7 +390,7 @@ async fn changed_directory_mode_is_refused_on_existing_rows() {
     let dir = root();
     let db = db().await;
     write_events(dir.path(), "r1", &[phase("r1", "e1")]);
-    ingest_once(&db, dir.path(), ActorState::Loaded)
+    ingest_once(&db, dir.path(), ActorState::Running)
         .await
         .unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
@@ -388,7 +466,7 @@ async fn observes_actor_after_snapshot_so_launch_cannot_fail_a_new_journal() {
     .await
     .unwrap();
     assert!(ledger::get(&db, "r1").await.unwrap().is_none());
-    ingest_with_observation(&db, dir.path(), || async { ActorState::Loaded })
+    ingest_with_observation(&db, dir.path(), || async { ActorState::Running })
         .await
         .unwrap();
     assert_eq!(

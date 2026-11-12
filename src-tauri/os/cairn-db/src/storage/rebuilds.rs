@@ -63,6 +63,29 @@ pub struct RebuildRecord {
     /// The report the consumer froze before handing it to the request primitive.
     #[serde(default)]
     pub consumer_report: Option<FrozenReport>,
+    /// Exited definitions of the actor label the runner booted out under this row.
+    #[serde(default)]
+    pub actor_unloads: Vec<ActorUnload>,
+}
+
+/// The runner's `launchctl bootout` of an exited actor label: what launchd
+/// printed for the definition, and whether the domain then showed it gone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActorUnload {
+    pub label: String,
+    /// `settled`: this row's own actor, after its report froze. `fence`: a
+    /// definition still holding the label when this row's actor was to launch.
+    pub reason: String,
+    pub program: Option<String>,
+    /// launchd's last-exit lines for the definition, verbatim.
+    pub last_exit: Option<String>,
+    /// The rebuild whose staged runtime the definition ran, when it names one
+    /// Cairn launched; `None` for a definition no request launched.
+    pub owner: Option<String>,
+    pub removed: bool,
+    /// launchctl's answer when the bootout failed or left the label loaded.
+    pub detail: Option<String>,
+    pub at: i64,
 }
 
 /// What the runner commits to before it stages an actor: the checked attempt it
@@ -135,6 +158,7 @@ impl RebuildRecord {
             faults: vec![],
             launch: None,
             consumer_report: None,
+            actor_unloads: vec![],
         }
     }
 
@@ -327,7 +351,14 @@ pub async fn ingest(
                 report.applied += 1;
             }
             let terminal = ledger.row.events.iter().any(|e| e["type"] == "outcome");
-            if !terminal && actor_absent {
+            // An attempt never bootstrapped had no actor to die; its outcome is
+            // the runner's refusal or the consumer's "stopped before launching".
+            let unlaunched = ledger
+                .row
+                .launch
+                .as_ref()
+                .is_some_and(|launch| launch.bootstrap_requested_at.is_none());
+            if !terminal && actor_absent && !unlaunched {
                 let phase = ledger.row.phases.last().map(|p| p.name.as_str()).unwrap_or("unknown phase");
                 ledger.row.status = "failed".into();
                 ledger.row.outcome = Some("failed".into());
@@ -481,6 +512,22 @@ pub async fn freeze_report(db: &LocalDb, id: &str, report: FrozenReport) -> DbRe
             ledger.row.consumer_report = Some(report.clone());
             save(conn, &id, &ledger).await?;
             Ok(report)
+        })
+    })
+    .await
+}
+
+pub async fn record_actor_unload(db: &LocalDb, id: &str, unload: ActorUnload) -> DbResult<()> {
+    let id = id.to_string();
+    db.write(move |conn| {
+        let id = id.clone();
+        let unload = unload.clone();
+        Box::pin(async move {
+            let mut ledger = load(conn, &id)
+                .await?
+                .ok_or_else(|| DbError::Row(format!("rebuild {id} has no ledger row")))?;
+            ledger.row.actor_unloads.push(unload);
+            save(conn, &id, &ledger).await
         })
     })
     .await

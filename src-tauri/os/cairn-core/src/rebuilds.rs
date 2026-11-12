@@ -32,9 +32,45 @@ pub(crate) const ACTOR_RUNTIME: &str = "bun";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorState {
-    Loaded,
+    /// launchd reports the label's process running.
+    Running,
+    /// The label is still loaded, and launchd reports a process that ran and
+    /// is gone. A one-shot's definition stays like this until someone boots it
+    /// out, so this is death evidence, never a reason to wait.
+    Exited,
+    /// launchd reports no such label in the domain.
     Absent,
     Unknown,
+}
+
+impl ActorState {
+    /// launchd positively shows that no actor process is alive.
+    pub fn actor_gone(self) -> bool {
+        matches!(self, Self::Absent | Self::Exited)
+    }
+}
+
+/// One `launchctl print` of the actor label: the state, and what the print
+/// says about the definition holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorJob {
+    pub state: ActorState,
+    pub pid: Option<u32>,
+    pub program: Option<String>,
+    /// launchd's own record of how the last process ended, verbatim: its exit
+    /// code, terminating signal or exit reason lines, joined.
+    pub last_exit: Option<String>,
+}
+
+impl From<ActorState> for ActorJob {
+    fn from(state: ActorState) -> Self {
+        Self {
+            state,
+            pid: None,
+            program: None,
+            last_exit: None,
+        }
+    }
 }
 
 fn fault(name: &str, detail: impl Into<String>) -> IngestionFault {
@@ -476,7 +512,7 @@ where
         seen.insert(journal.id.clone());
         // Refused/unreadable bytes cannot establish that a terminal record is
         // absent. Keep the fault without inventing an actor-death outcome.
-        let can_infer_death = journal.faults.is_empty() && actor == ActorState::Absent;
+        let can_infer_death = journal.faults.is_empty() && actor.actor_gone();
         let report = ledger::ingest(
             db,
             &journal.id,
@@ -497,7 +533,13 @@ where
             .map_err(|e| e.to_string())?;
         let count = rows.len();
         for row in rows {
-            if seen.contains(&row.id) {
+            // A launch intent not yet staged has no journal by design.
+            let unstaged = row.events.is_empty()
+                && row
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.bootstrap_requested_at.is_none());
+            if seen.contains(&row.id) || unstaged {
                 continue;
             }
             let error = directory_fault
@@ -525,32 +567,91 @@ fn log_faults(id: &str, faults: &[IngestionFault]) {
 /// Only a successful print or the specific service-not-found diagnostic is
 /// evidence. Permission errors, missing domains, failed spawns and timeouts are
 /// UNKNOWN, never an absent actor.
-fn job_state(code: Option<i32>, stderr: &str) -> ActorState {
+fn job_state(code: Option<i32>, stdout: &str, stderr: &str) -> ActorJob {
     if code == Some(0) {
-        return ActorState::Loaded;
+        return parse_print(stdout);
     }
     if code == Some(113)
         && stderr.contains("Could not find service \"computer.cairn.rebuild\"")
         && stderr.contains("in domain for user gui:")
     {
-        ActorState::Absent
+        ActorState::Absent.into()
     } else {
-        ActorState::Unknown
+        ActorState::Unknown.into()
+    }
+}
+
+/// Reads only the service's own top-level keys: nested blocks (coalitions,
+/// endpoints) carry their own `state` and `active count`. `Exited` needs the
+/// whole picture — not running, nothing active, no pid, and a recorded exit
+/// (a code, a terminating signal or an exit reason) of a process that ran; a job never spawned, or any state launchd may add, is
+/// unknown.
+fn parse_print(stdout: &str) -> ActorJob {
+    let mut depth = 0usize;
+    let mut fields = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == "}" {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 1 {
+            if let Some((key, value)) = line.split_once(" = ") {
+                fields.entry(key).or_insert(value);
+            }
+        }
+        if line.ends_with('{') {
+            depth += 1;
+        }
+    }
+    let number = |key: &str| fields.get(key).and_then(|value| value.parse::<u32>().ok());
+    let pid = number("pid");
+    // A clean exit prints its code. A killed process prints no code: a signal
+    // death prints its terminating signal, a jetsam kill only an exit reason.
+    let exits: Vec<String> = [
+        "last exit code",
+        "last terminating signal",
+        "last exit reason",
+    ]
+    .into_iter()
+    .filter_map(|key| fields.get(key).map(|value| format!("{key} = {value}")))
+    .collect();
+    let exit_recorded = fields.contains_key("last terminating signal")
+        || fields.contains_key("last exit reason")
+        || fields
+            .get("last exit code")
+            .is_some_and(|code| *code != "(never exited)");
+    let ran_and_exited = number("runs").is_some_and(|runs| runs > 0) && exit_recorded;
+    let state = match fields.get("state").copied() {
+        Some("running") => ActorState::Running,
+        Some("not running")
+            if pid.is_none() && number("active count") == Some(0) && ran_and_exited =>
+        {
+            ActorState::Exited
+        }
+        _ => ActorState::Unknown,
+    };
+    ActorJob {
+        state,
+        pid,
+        program: fields.get("program").map(|program| program.to_string()),
+        last_exit: (!exits.is_empty()).then(|| exits.join("; ")),
     }
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) async fn actor_state() -> ActorState {
-    // SAFETY: geteuid has no preconditions.
-    let target = format!("gui/{}/computer.cairn.rebuild", unsafe { libc::geteuid() });
+pub(crate) async fn actor_state() -> ActorJob {
+    // SAFETY: getuid has no preconditions.
+    let target = format!("gui/{}/computer.cairn.rebuild", unsafe { libc::getuid() });
     let mut command = tokio::process::Command::new("/bin/launchctl");
     command.args(["print", &target]).kill_on_drop(true);
     match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
         Ok(Ok(output)) => job_state(
             output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         ),
-        _ => ActorState::Unknown,
+        _ => ActorState::Unknown.into(),
     }
 }
 
@@ -559,7 +660,8 @@ pub(crate) async fn actor_state() -> ActorState {
 /// without any final filesystem event. Every pass reopens and rechecks inodes.
 #[cfg(target_os = "macos")]
 pub async fn start(db: std::sync::Arc<LocalDb>, root: PathBuf) {
-    if let Err(error) = ingest_with_observation(&db, &root, actor_state).await {
+    let observe = || async { actor_state().await.state };
+    if let Err(error) = ingest_with_observation(&db, &root, observe).await {
         tracing::warn!(%error, "rebuild boot ingestion failed");
     }
     tokio::spawn(async move {
@@ -567,7 +669,7 @@ pub async fn start(db: std::sync::Arc<LocalDb>, root: PathBuf) {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
-            if let Err(error) = ingest_with_observation(&db, &root, actor_state).await {
+            if let Err(error) = ingest_with_observation(&db, &root, observe).await {
                 tracing::warn!(%error, "rebuild live ingestion failed");
             }
         }

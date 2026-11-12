@@ -1,0 +1,62 @@
+gui/501/green.bleu.imsg-launch = {
+	active count = 0
+	path = /Users/dev/Library/LaunchAgents/green.bleu.imsg-launch.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /opt/homebrew/bin/imsg
+	arguments = {
+		/opt/homebrew/bin/imsg
+		launch
+		--dylib
+		/opt/homebrew/opt/imsg/libexec/imsg-bridge-helper.dylib
+	}
+
+	stdout path = /tmp/imsg-launch.log
+	stderr path = /tmp/imsg-launch.err
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.ZP82CuEwjM/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => green.bleu.imsg-launch
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 0
+
+	resource coalition = {
+		ID = 699
+		type = resource
+		state = active
+		active count = 1
+		name = green.bleu.imsg-launch
+	}
+
+	jetsam coalition = {
+		ID = 700
+		type = jetsam
+		state = active
+		active count = 1
+		name = green.bleu.imsg-launch
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = runatload | inferred program | system service | managed LWCR | tle system
+}

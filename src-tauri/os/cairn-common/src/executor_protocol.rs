@@ -7688,6 +7688,13 @@ pub struct LearnedResourceEstimate {
 /// refuse that executor's Hello, which carries no inventory. The handshake
 /// refuses mixed versions and the self-repair path updates the executor, so
 /// neither pairing attaches.
+///
+/// cairn/6967 does not move the number. A scratch replica's snapshot now
+/// forces the index-only removal of a recorded directory that became a
+/// repository, which Git refused when a file in it had been edited since the
+/// last snapshot. That is local to the executor's replica: no frame, variant or
+/// field changes, and an older executor simply keeps failing that write-back as
+/// it did. What a runner gets wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 169;
 
 /// The version `build.rs` derived from the paragraphs above

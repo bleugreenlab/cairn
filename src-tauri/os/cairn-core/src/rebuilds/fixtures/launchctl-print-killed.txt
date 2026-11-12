@@ -1,0 +1,168 @@
+gui/501/com.apple.knowledgeconstructiond = {
+	active count = 0
+	path = /System/Library/LaunchAgents/com.apple.knowledgeconstructiond.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /System/Library/PrivateFrameworks/IntelligencePlatformCore.framework/Versions/A/knowledgeconstructiond
+	arguments = {
+		/System/Library/PrivateFrameworks/IntelligencePlatformCore.framework/Versions/A/knowledgeconstructiond
+	}
+
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.WX6Ilbm11Q/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		MallocSpaceEfficient => 1
+		XPC_SERVICE_NAME => com.apple.knowledgeconstructiond
+	}
+
+	domain = gui/501 [100028]
+	asid = 100028
+	minimum runtime = 10
+	base minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT
+	last jetsam exit details = JETSAM_REASON_MEMORY_PERPROCESSLIMIT
+
+	event triggers = {
+		com.apple.intelligenceplatform.IntelligencePlatformCore.FullPipeline => {
+			keepalive = 0
+			service = com.apple.knowledgeconstructiond
+			stream = com.apple.bg.system.task
+			monitor = com.apple.dasd
+			descriptor = {
+				"PowerNap" => true
+				"GroupConcurrencyLimit" => 1
+				"RepeatingTask" => {
+					"Interval" => 86400
+				}
+				"RequiresExternalPower" => true
+				"ResourceIntensive" => true
+				"GroupName" => "com.apple.intelligenceplatform.IntelligencePlatformCore"
+				"Priority" => "Maintenance"
+			}
+		}
+		com.apple.intelligenceplatform.IntelligencePlatformCore.AutonamingMessagesPipeline => {
+			keepalive = 0
+			service = com.apple.knowledgeconstructiond
+			stream = com.apple.xpc.activity
+			monitor = com.apple.UserEventAgent-Aqua
+			descriptor = {
+				"MaxConcurrencyLimit" => 1
+				"Repeating" => true
+				"CPUIntensive" => true
+				"Interval" => 86400
+				"PowerNap" => true
+				"AllowBattery" => false
+				"ActivityGroupName" => "com.apple.intelligenceplatform.IntelligencePlatformCore"
+				"Priority" => "Maintenance"
+			}
+		}
+		com.apple.intelligenceplatform.IntelligencePlatformCore.AutonamingMessagesAggregationAccuracy => {
+			keepalive = 0
+			service = com.apple.knowledgeconstructiond
+			stream = com.apple.xpc.activity
+			monitor = com.apple.UserEventAgent-Aqua
+			descriptor = {
+				"MaxConcurrencyLimit" => 1
+				"Repeating" => true
+				"CPUIntensive" => true
+				"Interval" => 604800
+				"PowerNap" => true
+				"AllowBattery" => false
+				"ActivityGroupName" => "com.apple.intelligenceplatform.IntelligencePlatformCore"
+				"Priority" => "Maintenance"
+			}
+		}
+	}
+
+	endpoints = {
+		"com.apple.intelligenceplatform.KnowledgeConstruction" = {
+			port = 0x125337
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+	}
+
+	event channels = {
+		"com.apple.locationd-events" = {
+			port = 0x124c6f
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+		"com.apple.distnoted.matching" = {
+			port = 0xe2ecb
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+		"com.apple.notifyd.matching" = {
+			port = 0xeba1f
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+		"com.apple.bg.system.task" = {
+			port = 0xfb563
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+		"com.apple.xpc.activity" = {
+			port = 0xc5e03
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+	}
+
+	resource coalition = {
+		ID = 1820
+		type = resource
+		state = active
+		active count = 1
+		name = com.apple.knowledgeconstructiond
+	}
+
+	jetsam coalition = {
+		ID = 1821
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.apple.knowledgeconstructiond
+	}
+
+	spawn type = adaptive (6)
+	jetsam priority = 40
+	jetsam memory limit (active, soft) = 50 MB
+	jetsam memory limit (inactive, hard) = 15 MB
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	exponential throttling grace limit = 10
+	job state = exited
+
+	properties = supports transactions | supports pressured exit | inferred program | system service | exponential throttling | tle system
+}

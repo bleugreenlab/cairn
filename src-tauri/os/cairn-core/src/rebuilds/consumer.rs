@@ -9,9 +9,11 @@
 //! the journal into the ledger row, and one reconciler maps that row onto the
 //! primitive's report, both while the runner is live and after it restarts.
 //!
-//! Liveness is launchd's answer, never an assumption. A loaded label, whoever
-//! loaded it, refuses a launch; a loaded or unreadable label holds a launched
-//! attempt open; nothing in this module ever relaunches an attempt.
+//! Liveness is launchd's answer, never an assumption. A running or unreadable
+//! label, whoever loaded it, refuses a launch and holds a launched attempt
+//! open. The actor is a one-shot whose definition outlives its process, so
+//! the runner owns unloading it: an exited actor's attempt is settled first,
+//! then its label booted out. Nothing in this module ever relaunches an attempt.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -25,11 +27,13 @@ use cairn_common::identity::PrincipalRef;
 use cairn_common::requests::{
     RequestAcceptance, RequestAttemptOutcome, RequestFilter, RequestKind, RequestState,
 };
-use cairn_db::storage::rebuilds::{self as ledger, FrozenReport, LaunchIntent, RebuildRecord};
+use cairn_db::storage::rebuilds::{
+    self as ledger, ActorUnload, FrozenReport, LaunchIntent, RebuildRecord,
+};
 use cairn_db::storage::requests as request_store;
 use serde_json::{json, Value};
 
-use super::ActorState;
+use super::{ActorJob, ActorState};
 use crate::operator_requests::registry::{
     ActorFacts, ConsumerReport, ExecutorTarget, RequestConsumer,
 };
@@ -78,8 +82,11 @@ fn full_commit(value: &str) -> bool {
 /// launchd, injected so tests never touch the real domain.
 #[async_trait]
 pub(crate) trait Launchd: Send + Sync {
-    async fn state(&self) -> ActorState;
+    async fn state(&self) -> ActorJob;
     async fn bootstrap(&self, plist: &Path) -> Result<(), String>;
+    /// Remove the label's definition. Called only for an exited actor: booting
+    /// out a running one would kill it mid-install.
+    async fn bootout(&self) -> Result<(), String>;
 }
 
 /// The operator's `gui/<uid>` domain.
@@ -87,31 +94,44 @@ pub(crate) trait Launchd: Send + Sync {
 struct GuiDomain;
 
 #[cfg(target_os = "macos")]
+fn gui_domain() -> String {
+    // SAFETY: getuid has no preconditions.
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "macos")]
+async fn launchctl(verb: &str, args: &[std::ffi::OsString]) -> Result<(), String> {
+    let mut command = tokio::process::Command::new("/bin/launchctl");
+    command.arg(verb).args(args).kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(30), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(format!(
+            "launchctl {verb} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Ok(Err(error)) => Err(format!("launchctl {verb} could not run: {error}")),
+        Err(_) => Err(format!("launchctl {verb} did not answer within 30 seconds")),
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[async_trait]
 impl Launchd for GuiDomain {
-    async fn state(&self) -> ActorState {
+    async fn state(&self) -> ActorJob {
         super::actor_state().await
     }
 
     async fn bootstrap(&self, plist: &Path) -> Result<(), String> {
-        // SAFETY: getuid has no preconditions.
-        let domain = format!("gui/{}", unsafe { libc::getuid() });
-        let mut command = tokio::process::Command::new("/bin/launchctl");
-        command
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(plist)
-            .kill_on_drop(true);
-        match tokio::time::timeout(Duration::from_secs(30), command.output()).await {
-            Ok(Ok(output)) if output.status.success() => Ok(()),
-            Ok(Ok(output)) => Err(format!(
-                "launchctl bootstrap exited {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
-            Ok(Err(error)) => Err(format!("launchctl bootstrap could not run: {error}")),
-            Err(_) => Err("launchctl bootstrap did not answer within 30 seconds".into()),
-        }
+        launchctl("bootstrap", &[gui_domain().into(), plist.into()]).await
+    }
+
+    async fn bootout(&self) -> Result<(), String> {
+        launchctl(
+            "bootout",
+            &[format!("{}/{ACTOR_LABEL}", gui_domain()).into()],
+        )
+        .await
     }
 }
 
@@ -490,7 +510,8 @@ pub(crate) fn assemble_facts(inputs: FactsInputs, now: i64) -> ActorFacts {
 }
 
 /// Map a settled ledger row onto the primitive's report. `None` while the
-/// actor may still be running: launched and not positively absent.
+/// actor may still be running: launched, and launchd shows it neither absent
+/// nor exited.
 pub(crate) fn decide_report(
     row: &RebuildRecord,
     launch: &LaunchIntent,
@@ -498,7 +519,7 @@ pub(crate) fn decide_report(
     at: i64,
 ) -> Option<FrozenReport> {
     let launched = launch.bootstrap_requested_at.is_some();
-    if launched && actor != ActorState::Absent {
+    if launched && !actor.actor_gone() {
         return None;
     }
     let last_phase = row.phases.last().map(|phase| phase.name.clone());
@@ -535,13 +556,22 @@ pub(crate) fn decide_report(
         ),
     };
     let built_commit = (outcome == RequestAttemptOutcome::Done).then(|| launch.commit.clone());
+    let mut document = json!({
+        "rebuild": format!("cairn://rebuilds/{}", row.id),
+        "outcome": row.outcome, "summary": row.summary, "detail": detail,
+        "lastPhase": last_phase, "launched": launched,
+    });
+    // What the fence removed before this attempt's own actor could launch.
+    if !row.actor_unloads.is_empty() {
+        document["removedDefinitions"] = json!(row
+            .actor_unloads
+            .iter()
+            .map(describe_unload)
+            .collect::<Vec<_>>());
+    }
     Some(FrozenReport {
         receipt_id: receipt_id(&launch.attempt_id),
-        document: json!({
-            "rebuild": format!("cairn://rebuilds/{}", row.id),
-            "outcome": row.outcome, "summary": row.summary, "detail": detail,
-            "lastPhase": last_phase, "launched": launched,
-        }),
+        document,
         outcome,
         // Either nothing was ever launched, or launchd positively shows the
         // label gone: the attempt's actor is fenced in both cases.
@@ -550,6 +580,30 @@ pub(crate) fn decide_report(
         frozen_at: at,
         acknowledged_at: None,
     })
+}
+
+fn describe_unload(unload: &ActorUnload) -> String {
+    let owner = match &unload.owner {
+        Some(owner) => format!("the actor of cairn://rebuilds/{owner}"),
+        None => "a definition no request launched".into(),
+    };
+    let done = if unload.removed {
+        "booted out".to_string()
+    } else {
+        format!(
+            "could not be booted out: {}",
+            unload.detail.as_deref().unwrap_or("no answer")
+        )
+    };
+    format!(
+        "the exited launchd job {} ({owner}; program {}; {}) {done}",
+        unload.label,
+        unload.program.as_deref().unwrap_or("not printed"),
+        unload
+            .last_exit
+            .as_deref()
+            .unwrap_or("no last exit printed"),
+    )
 }
 
 fn escape_xml(value: &str) -> String {
@@ -748,7 +802,7 @@ impl RebuildConsumer {
     ) -> Result<(), String> {
         let acceptance = context.acceptance().clone();
         self.gate()?;
-        self.fence().await?;
+        self.fence(orch, id).await?;
         let (app, bun, script) = self.host.bundled_actor()?;
         let source = self.source.resolve(orch).await?;
         if acceptance.policy_project_id.as_deref() != Some(source.project_id.as_str()) {
@@ -778,7 +832,7 @@ impl RebuildConsumer {
             .recheck_for(orch, &acceptance)
             .await
             .map_err(|error| format!("refused at launch: {error}"))?;
-        self.fence().await?;
+        self.fence(orch, id).await?;
         ledger::mark_bootstrap_requested(&orch.db.local, id, now())
             .await
             .map_err(|error| error.to_string())?;
@@ -790,12 +844,136 @@ impl RebuildConsumer {
         Ok(())
     }
 
-    /// The physical fence is the label itself, whoever loaded it.
-    async fn fence(&self) -> Result<(), String> {
-        match self.launchd.state().await {
+    /// The physical fence is the label itself, whoever loaded it. An exited
+    /// definition holds the label without an actor: its attempt is settled
+    /// first, then it is booted out and named on `id`'s row.
+    async fn fence(&self, orch: &Orchestrator, id: &str) -> Result<(), String> {
+        let job = self.launchd.state().await;
+        match job.state {
             ActorState::Absent => Ok(()),
-            ActorState::Loaded => Err(format!("refused: the launchd job {ACTOR_LABEL} is already loaded, whoever loaded it; a second rebuild actor is never started")),
+            ActorState::Running => Err(format!("refused: the launchd job {ACTOR_LABEL} is already loaded, whoever loaded it; a second rebuild actor is never started")),
             ActorState::Unknown => Err(format!("refused: launchctl could not say whether {ACTOR_LABEL} is loaded; an unknown actor is never duplicated")),
+            ActorState::Exited => {
+                let owner = self.launched_owner(orch, &job).await?;
+                if let Some(owner) = owner.as_ref().filter(|row| row.consumer_report.is_none()) {
+                    super::ingest_once(&orch.db.local, &self.host.rebuilds, job.state).await?;
+                    let row = ledger::get(&orch.db.local, &owner.id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or("the exited actor's ledger row vanished")?;
+                    if let Err(error) = self.settle(orch, &row, job.state).await {
+                        tracing::warn!(rebuild = %row.id, %error, "rebuild request report deferred");
+                    }
+                    let frozen = ledger::get(&orch.db.local, &owner.id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .is_some_and(|row| row.consumer_report.is_some());
+                    if !frozen {
+                        return Err(format!("refused: the exited actor of cairn://rebuilds/{} still holds {ACTOR_LABEL} and its report could not be frozen; its outcome is never lost to a new launch", owner.id));
+                    }
+                }
+                let unload = self
+                    .unload(orch, &job, "fence", owner.as_ref().map(|row| row.id.clone()), id)
+                    .await?;
+                if unload.removed {
+                    tracing::info!(rebuild = id, removed = %describe_unload(&unload), "rebuild fence cleared an exited actor definition");
+                    Ok(())
+                } else {
+                    Err(format!("refused: {}; a second rebuild actor is never started beside it", describe_unload(&unload)))
+                }
+            }
+        }
+    }
+
+    /// The ledger row of the launched attempt whose staged runtime the
+    /// definition runs. A definition naming no such row (a hand-run rebuild,
+    /// a stale staging directory) is never adopted as any attempt's outcome.
+    async fn launched_owner(
+        &self,
+        orch: &Orchestrator,
+        job: &ActorJob,
+    ) -> Result<Option<RebuildRecord>, String> {
+        let Some(program) = job.program.as_deref().map(Path::new) else {
+            return Ok(None);
+        };
+        let Some(dir) = program
+            .parent()
+            .filter(|_| program.file_name() == Some(std::ffi::OsStr::new(super::ACTOR_RUNTIME)))
+            .filter(|dir| dir.parent() == Some(self.host.rebuilds.as_path()))
+        else {
+            return Ok(None);
+        };
+        let Some(id) = dir.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        Ok(ledger::get(&orch.db.local, id)
+            .await
+            .map_err(|error| error.to_string())?
+            .filter(|row| {
+                row.launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.bootstrap_requested_at.is_some())
+            }))
+    }
+
+    /// Boot an exited definition out, confirm the label is gone, and record
+    /// both on `record_on`'s row.
+    async fn unload(
+        &self,
+        orch: &Orchestrator,
+        job: &ActorJob,
+        reason: &str,
+        owner: Option<String>,
+        record_on: &str,
+    ) -> Result<ActorUnload, String> {
+        let detail = match self.launchd.bootout().await {
+            Err(error) => Some(error),
+            Ok(()) => match self.launchd.state().await.state {
+                ActorState::Absent => None,
+                other => Some(format!(
+                    "launchctl bootout returned, but launchd still shows {ACTOR_LABEL} {other:?}"
+                )),
+            },
+        };
+        let unload = ActorUnload {
+            label: ACTOR_LABEL.into(),
+            reason: reason.into(),
+            program: job.program.clone(),
+            last_exit: job.last_exit.clone(),
+            owner,
+            removed: detail.is_none(),
+            detail,
+            at: now(),
+        };
+        ledger::record_actor_unload(&orch.db.local, record_on, unload.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(unload)
+    }
+
+    /// After a pass's reports: an exited actor whose own attempt has frozen
+    /// its report is booted out, so the domain returns to absent. A definition
+    /// no launched attempt owns is left to the next launch's fence, which
+    /// names it on that attempt's report. One try per attempt: a bootout that
+    /// failed is retried by that fence, not every pass.
+    async fn unload_settled(&self, orch: &Orchestrator, job: &ActorJob) -> Result<(), String> {
+        let Some(owner) = self.launched_owner(orch, job).await? else {
+            return Ok(());
+        };
+        let tried = owner
+            .actor_unloads
+            .iter()
+            .any(|unload| unload.reason == "settled");
+        if owner.consumer_report.is_none() || tried {
+            return Ok(());
+        }
+        let unload = self
+            .unload(orch, job, "settled", Some(owner.id.clone()), &owner.id)
+            .await?;
+        if unload.removed {
+            Ok(())
+        } else {
+            Err(describe_unload(&unload))
         }
     }
 
@@ -927,9 +1105,11 @@ impl RebuildConsumer {
 
     /// Observe launchd, then ingest, then decide: an actor that wrote its
     /// outcome and exited is read from a final journal, never declared dead.
+    /// Only then is an exited actor's definition unloaded.
     async fn reconcile_locked(&self, orch: &Orchestrator) -> Result<usize, String> {
         self.adopt_abandoned_claims(orch).await?;
-        let actor = self.launchd.state().await;
+        let job = self.launchd.state().await;
+        let actor = job.state;
         super::ingest_once(&orch.db.local, &self.host.rebuilds, actor).await?;
         let rows = ledger::unacknowledged_launches(&orch.db.local)
             .await
@@ -942,6 +1122,11 @@ impl RebuildConsumer {
                 Err(error) => {
                     tracing::warn!(rebuild = %row.id, %error, "rebuild request report deferred")
                 }
+            }
+        }
+        if actor == ActorState::Exited {
+            if let Err(error) = self.unload_settled(orch, &job).await {
+                tracing::warn!(%error, "rebuild actor definition left loaded");
             }
         }
         Ok(reported)
@@ -1224,7 +1409,7 @@ impl RequestConsumer for RebuildConsumer {
         super::ingest_once(
             &orch.db.local,
             &self.host.rebuilds,
-            self.launchd.state().await,
+            self.launchd.state().await.state,
         )
         .await?;
         let row = ledger::get(&orch.db.local, &id)

@@ -16,35 +16,86 @@ fn commit(letter: char) -> String {
     letter.to_string().repeat(40)
 }
 
+#[derive(Clone)]
+enum Bootout {
+    Removes,
+    Fails(String),
+    LeavesLoaded,
+}
+
 struct FakeLaunchd {
-    state: Mutex<ActorState>,
+    job: Mutex<ActorJob>,
     bootstraps: Mutex<Vec<PathBuf>>,
+    bootouts: Mutex<usize>,
+    bootout: Mutex<Bootout>,
 }
 
 impl FakeLaunchd {
     fn new(state: ActorState) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(state),
+            job: Mutex::new(state.into()),
             bootstraps: Mutex::new(vec![]),
+            bootouts: Mutex::new(0),
+            bootout: Mutex::new(Bootout::Removes),
         })
     }
     fn set(&self, state: ActorState) {
-        *self.state.lock().unwrap() = state;
+        *self.job.lock().unwrap() = state.into();
+    }
+    /// An exited definition whose program is `program`, as launchctl prints it.
+    fn exited(&self, program: &Path) {
+        self.ended(program, "last exit code = 0");
+    }
+    /// A definition whose process the kernel killed: no exit code is printed.
+    fn killed(&self, program: &Path) {
+        self.ended(
+            program,
+            "last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT",
+        );
+    }
+    fn ended(&self, program: &Path, last_exit: &str) {
+        *self.job.lock().unwrap() = ActorJob {
+            state: ActorState::Exited,
+            pid: None,
+            program: Some(program.display().to_string()),
+            last_exit: Some(last_exit.into()),
+        };
+    }
+    fn answer_bootout(&self, answer: Bootout) {
+        *self.bootout.lock().unwrap() = answer;
     }
     fn bootstraps(&self) -> usize {
         self.bootstraps.lock().unwrap().len()
+    }
+    fn bootouts(&self) -> usize {
+        *self.bootouts.lock().unwrap()
+    }
+    fn state_now(&self) -> ActorState {
+        self.job.lock().unwrap().state
     }
 }
 
 #[async_trait]
 impl Launchd for FakeLaunchd {
-    async fn state(&self) -> ActorState {
-        *self.state.lock().unwrap()
+    async fn state(&self) -> ActorJob {
+        self.job.lock().unwrap().clone()
     }
     async fn bootstrap(&self, plist: &Path) -> Result<(), String> {
         self.bootstraps.lock().unwrap().push(plist.to_path_buf());
-        self.set(ActorState::Loaded);
+        self.set(ActorState::Running);
         Ok(())
+    }
+    async fn bootout(&self) -> Result<(), String> {
+        *self.bootouts.lock().unwrap() += 1;
+        let answer = self.bootout.lock().unwrap().clone();
+        match answer {
+            Bootout::Removes => {
+                self.set(ActorState::Absent);
+                Ok(())
+            }
+            Bootout::Fails(text) => Err(text),
+            Bootout::LeavesLoaded => Ok(()),
+        }
     }
 }
 
@@ -435,10 +486,12 @@ async fn an_accepted_request_launches_the_actor_once_from_its_claimed_attempt() 
 
 #[tokio::test]
 async fn the_launch_refuses_while_the_label_is_loaded_by_anyone() {
-    for state in [ActorState::Loaded, ActorState::Unknown] {
+    for state in [ActorState::Running, ActorState::Unknown] {
         let f = fixture_with(state, true).await;
         let (request, id) = launched(&f).await;
         assert_eq!(f.launchd.bootstraps(), 0, "{state:?}");
+        // A running or unreadable label is never booted out.
+        assert_eq!(f.launchd.bootouts(), 0, "{state:?}");
         // Nothing was launched, so the refusal settles and the request reopens.
         assert_eq!(request.state, RequestState::Open, "{state:?}");
         let attempt = request.attempts.last().unwrap();
@@ -451,9 +504,197 @@ async fn the_launch_refuses_while_the_label_is_loaded_by_anyone() {
     }
 }
 
+/// The staged runtime a launched attempt's definition runs.
+fn staged_runtime(f: &Fixture, id: &str) -> PathBuf {
+    f.host()
+        .rebuilds
+        .join(id)
+        .join(crate::rebuilds::ACTOR_RUNTIME)
+}
+
+#[tokio::test]
+async fn an_exited_actor_settles_its_attempt_and_is_booted_out() {
+    let f = fixture().await;
+    let (request, id) = launched(&f).await;
+    f.append(&id, json!({"type":"fact","facts":{"commit": commit('b')}}));
+    f.append(
+        &id,
+        json!({"type":"outcome","outcome":"done","summary":"installed"}),
+    );
+    // launchd keeps a finished one-shot loaded and not running.
+    f.launchd.exited(&staged_runtime(&f, &id));
+    assert_eq!(f.consumer.reconcile(&f.orch).await.unwrap(), 1);
+    assert_eq!(get(&f.orch, &request.id).await.state, RequestState::Done);
+    assert_eq!(f.launchd.bootouts(), 1);
+    assert_eq!(f.launchd.state_now(), ActorState::Absent);
+    let row = ledger::get(&f.orch.db.local, &id).await.unwrap().unwrap();
+    let unload = &row.actor_unloads[..];
+    assert_eq!(unload.len(), 1);
+    assert_eq!(unload[0].reason, "settled");
+    assert_eq!(unload[0].owner.as_deref(), Some(id.as_str()));
+    assert!(unload[0].removed);
+    assert_eq!(unload[0].last_exit.as_deref(), Some("last exit code = 0"));
+    // The report froze from the ledger outcome before the bootout.
+    let frozen = row.consumer_report.unwrap();
+    assert_eq!(frozen.outcome, RequestAttemptOutcome::Done);
+    assert!(frozen.document.get("removedDefinitions").is_none());
+    assert_eq!(f.consumer.reconcile(&f.orch).await.unwrap(), 0);
+    assert_eq!(f.launchd.bootouts(), 1);
+}
+
+#[tokio::test]
+async fn a_bootout_the_reconciler_could_not_finish_is_tried_once() {
+    let f = fixture().await;
+    let (_, id) = launched(&f).await;
+    f.append(
+        &id,
+        json!({"type":"outcome","outcome":"failed","summary":"build failed"}),
+    );
+    f.launchd.exited(&staged_runtime(&f, &id));
+    f.launchd.answer_bootout(Bootout::Fails(
+        "Boot-out failed: 5: Input/output error".into(),
+    ));
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(f.launchd.bootouts(), 1);
+    let row = ledger::get(&f.orch.db.local, &id).await.unwrap().unwrap();
+    assert!(!row.actor_unloads[0].removed);
+    assert!(row.actor_unloads[0]
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("Input/output error"));
+    assert_eq!(
+        row.consumer_report.unwrap().outcome,
+        RequestAttemptOutcome::Failed
+    );
+}
+
+#[tokio::test]
+async fn the_fence_boots_out_a_definition_no_request_launched_and_launches() {
+    let f = fixture().await;
+    // A hand-run rebuild's leftover: a journalled row with no launch intent.
+    let stale = "20261108T193554-1890af";
+    create_private_dir(&f.host().rebuilds).unwrap();
+    write_private(&f.journal(stale), b"", 0o600).unwrap();
+    f.append(
+        stale,
+        json!({"type":"outcome","outcome":"done","summary":"installed"}),
+    );
+    f.launchd.exited(&staged_runtime(&f, stale));
+    // The reconciler never adopts or unloads a definition it did not launch.
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(f.launchd.bootouts(), 0);
+
+    let (request, id) = launched(&f).await;
+    assert_eq!(f.launchd.bootouts(), 1);
+    assert_eq!(f.launchd.bootstraps(), 1);
+    assert_eq!(request.state, RequestState::Acting);
+    let row = ledger::get(&f.orch.db.local, &id).await.unwrap().unwrap();
+    assert_eq!(row.actor_unloads.len(), 1);
+    let unload = &row.actor_unloads[0];
+    assert_eq!(unload.reason, "fence");
+    assert_eq!(unload.owner, None);
+    assert!(unload.removed);
+    assert_eq!(
+        unload.program.as_deref(),
+        Some(staged_runtime(&f, stale).display().to_string().as_str())
+    );
+
+    // The new actor's own outcome is its report, naming what was removed.
+    f.append(&id, json!({"type":"fact","facts":{"commit": commit('b')}}));
+    f.append(
+        &id,
+        json!({"type":"outcome","outcome":"done","summary":"installed"}),
+    );
+    f.launchd.set(ActorState::Absent);
+    assert_eq!(f.consumer.reconcile(&f.orch).await.unwrap(), 1);
+    let after = get(&f.orch, &request.id).await;
+    assert_eq!(after.state, RequestState::Done);
+    let report = after
+        .attempts
+        .last()
+        .unwrap()
+        .report
+        .as_ref()
+        .unwrap()
+        .to_string();
+    assert!(report.contains("removedDefinitions"), "{report}");
+    assert!(report.contains("no request launched"), "{report}");
+    assert!(report.contains(stale), "{report}");
+}
+
+#[tokio::test]
+async fn the_fence_settles_an_exited_launched_actor_before_booting_it_out() {
+    let f = fixture().await;
+    let (earlier, earlier_id) = launched(&f).await;
+    f.append(
+        &earlier_id,
+        json!({"type":"outcome","outcome":"failed","summary":"build failed"}),
+    );
+    f.launchd.exited(&staged_runtime(&f, &earlier_id));
+    // A later attempt's fence reaches the label before any reconciler pass.
+    let attempt = earlier.attempts.last().unwrap();
+    let next = "req-next";
+    ledger::record_launch_intent(
+        &f.orch.db.local,
+        next,
+        LaunchIntent {
+            attempt_id: "next".into(),
+            ..intent(&attempt.acceptance, &attempt.authorization_event_id)
+        },
+    )
+    .await
+    .unwrap();
+    f.consumer.fence(&f.orch, next).await.unwrap();
+    assert_eq!(f.launchd.bootouts(), 1);
+    let settled = get(&f.orch, &earlier.id).await;
+    assert_eq!(settled.state, RequestState::Open);
+    assert_eq!(
+        settled.attempts.last().unwrap().outcome,
+        Some(RequestAttemptOutcome::Failed)
+    );
+    let row = ledger::get(&f.orch.db.local, next).await.unwrap().unwrap();
+    assert_eq!(
+        row.actor_unloads[0].owner.as_deref(),
+        Some(earlier_id.as_str())
+    );
+    assert!(row.actor_unloads[0].removed);
+}
+
+#[tokio::test]
+async fn a_bootout_that_fails_or_leaves_the_job_refuses_the_launch() {
+    for (answer, expected) in [
+        (
+            Bootout::Fails(
+                "launchctl bootout exited Some(5): Boot-out failed: 5: Input/output error".into(),
+            ),
+            "Input/output error",
+        ),
+        (Bootout::LeavesLoaded, "still shows"),
+    ] {
+        let f = fixture().await;
+        f.launchd.exited(Path::new("/elsewhere/bun"));
+        f.launchd.answer_bootout(answer);
+        let (request, _) = launched(&f).await;
+        assert_eq!(f.launchd.bootstraps(), 0, "{expected}");
+        assert_eq!(request.state, RequestState::Open, "{expected}");
+        let report = request
+            .attempts
+            .last()
+            .unwrap()
+            .report
+            .as_ref()
+            .unwrap()
+            .to_string();
+        assert!(report.contains(expected), "{report}");
+        assert!(report.contains("/elsewhere/bun"), "{report}");
+    }
+}
+
 #[tokio::test]
 async fn the_launch_refuses_without_an_acting_claimed_attempt() {
-    let f = fixture_with(ActorState::Loaded, true).await;
+    let f = fixture_with(ActorState::Running, true).await;
     let (request, _) = launched(&f).await;
     assert_eq!(request.state, RequestState::Open);
     // A context recovered for the settled attempt cannot launch anything.
@@ -552,7 +793,8 @@ async fn an_actor_that_exits_without_an_outcome_fails_naming_its_phase() {
     f.launchd.set(ActorState::Unknown);
     f.consumer.reconcile(&f.orch).await.unwrap();
     assert_eq!(get(&f.orch, &request.id).await.state, RequestState::Acting);
-    f.launchd.set(ActorState::Absent);
+    // Not running is death evidence, exactly as absent is.
+    f.launchd.exited(&staged_runtime(&f, &id));
     f.consumer.reconcile(&f.orch).await.unwrap();
     let after = get(&f.orch, &request.id).await;
     assert_eq!(after.state, RequestState::Open);
@@ -565,6 +807,33 @@ async fn an_actor_that_exits_without_an_outcome_fails_naming_its_phase() {
         .unwrap()
         .to_string();
     assert!(report.contains("install"), "{report}");
+    assert_eq!(f.launchd.bootouts(), 1);
+}
+
+#[tokio::test]
+async fn a_killed_actor_settles_as_failed_and_is_booted_out() {
+    let f = fixture().await;
+    let (request, id) = launched(&f).await;
+    f.append(
+        &id,
+        json!({"type":"phase","name":"build","state":"started"}),
+    );
+    // Jetsam or SIGKILL leaves no exit code, only launchd's reason for the end.
+    f.launchd.killed(&staged_runtime(&f, &id));
+    f.consumer.reconcile(&f.orch).await.unwrap();
+    assert_eq!(get(&f.orch, &request.id).await.state, RequestState::Open);
+    let row = ledger::get(&f.orch.db.local, &id).await.unwrap().unwrap();
+    assert_eq!(row.outcome.as_deref(), Some("failed"));
+    assert_eq!(row.summary.as_deref(), Some("actor died during build"));
+    assert_eq!(
+        row.consumer_report.unwrap().outcome,
+        RequestAttemptOutcome::Failed
+    );
+    assert_eq!(f.launchd.bootouts(), 1);
+    assert_eq!(
+        row.actor_unloads[0].last_exit.as_deref(),
+        Some("last exit reason = JETSAM_REASON_MEMORY_PERPROCESSLIMIT")
+    );
 }
 
 #[tokio::test]
@@ -575,7 +844,7 @@ async fn restart_recovery_neither_duplicates_nor_relaunches() {
 
     // A new runner process over the same database and home.
     let restarted = orchestrator_over(&f.root, f.orch.db.local.clone()).await;
-    let launchd = FakeLaunchd::new(ActorState::Loaded);
+    let launchd = FakeLaunchd::new(ActorState::Running);
     let consumer = Arc::new(RebuildConsumer::new(
         f.consumer.host.clone(),
         launchd.clone(),
