@@ -17,11 +17,12 @@
 //!
 //! For each execution, the pass:
 //!
-//! 1. Checks the archive volume against the free-space floor (at least
-//!    [`PackBudget::floor_free_pct`] of the volume and
-//!    [`PackBudget::floor_free_bytes`]) and stops the pass below it, and checks
-//!    the store answers. Reconstruction degrades to a stub when the store
-//!    fails, so packing against an offline archive would preserve stubs.
+//! 1. Checks the store answers, then checks the archive volume against the
+//!    free-space floor (at least [`PackBudget::floor_free_pct`] of the volume
+//!    and [`PackBudget::floor_free_bytes`]) and stops the pass below it.
+//!    Reconstruction degrades to a stub when the store fails, so packing
+//!    against an offline archive would preserve stubs; and an archive whose
+//!    volume is not mounted has no free space of its own to measure.
 //! 2. Takes the archival permit and holds it for this execution only, so a
 //!    teardown waits behind at most one execution.
 //! 3. Skips the execution if any of its runs is still live.
@@ -102,12 +103,21 @@ pub struct PackBudget {
 }
 
 impl PackBudget {
+    /// The floor follows from the pass's own bounds. Between two floor checks
+    /// the pass writes at most one pack (at most [`PACK_MAX_BYTES`], staged
+    /// under the store's `tmp/` and renamed into place) and folds a log of
+    /// [`FOLD_AT_LOG_BYTES`], on a volume the database may share. Four packs'
+    /// worth covers that with room to spare for whatever else writes to the
+    /// volume between checks; 1% keeps the pass proportionally clear of a
+    /// large volume's last few percent, where filesystems slow down. On a
+    /// 1.86 TB disk that is 18.6 GiB, the scale of the executor's own critical
+    /// line (16 GiB), not a share sized to exceed what a busy host has free.
     pub const PRODUCTION: Self = Self {
         pass_time: Duration::from_secs(30 * 60),
         max_pack_bytes: PACK_MAX_BYTES,
         fold_at_log_bytes: FOLD_AT_LOG_BYTES,
-        floor_free_bytes: 100 * 1024 * 1024 * 1024,
-        floor_free_pct: 10,
+        floor_free_bytes: 4 * PACK_MAX_BYTES,
+        floor_free_pct: 1,
         max_executions: usize::MAX,
     };
 
@@ -462,9 +472,7 @@ async fn walk(
     started: Instant,
     report: &mut PackReport,
 ) -> Result<(), Stop> {
-    if let Some(root) = store.local_root() {
-        check_floor(root, budget).await?;
-    }
+    check_archive(store, budget).await?;
     let phase = Instant::now();
     let result = walk_executions(
         db,
@@ -543,9 +551,7 @@ async fn walk_executions(
             if Instant::now() >= deadline {
                 return Ok(false);
             }
-            if let Some(root) = store.local_root() {
-                check_floor(root, budget).await?;
-            }
+            check_archive(store, budget).await?;
             let before = (report.packed, report.skipped.len(), report.failed.len());
             pack_candidate(db, store, now, budget, &candidate, report).await?;
             report.executions.packed += report.packed - before.0;
@@ -884,18 +890,45 @@ async fn ensure_online(store: &dyn ContentStore) -> Result<(), ExecutionError> {
         .map_err(|error| ExecutionError::Halt(error.to_string()))
 }
 
-/// Stop the pass if the archive's volume is under the floor. Never writes
-/// toward a full disk: on a volume this full the pass stops at once, and the
-/// reason says where the archive is so an operator can move it.
-async fn check_floor(root: &Path, budget: PackBudget) -> Result<(), Stop> {
+/// Halt the pass if the archive is offline, and stop it if the archive's
+/// volume is under the floor. Liveness comes first: `volume::space` answers
+/// for the nearest existing ancestor, so a root on an unmounted volume would
+/// otherwise be measured against whichever disk holds its mount point.
+async fn check_archive(store: &dyn ContentStore, budget: PackBudget) -> Result<(), Stop> {
+    store
+        .get(PROBE_KEY)
+        .await
+        .map_err(|error| Stop::halt(error.to_string()))?;
+    let Some(root) = store.local_root() else {
+        return Ok(());
+    };
     let root: PathBuf = root.to_path_buf();
     let probed = root.clone();
-    let space = tokio::task::spawn_blocking(move || cairn_common::volume::space(&probed))
-        .await
-        .map_err(|error| Stop::halt(format!("the free-space probe failed: {error}")))?
-        .map_err(|error| {
-            Stop::halt(format!("reading free space at {}: {error}", root.display()))
-        })?;
+    let space = tokio::task::spawn_blocking(move || {
+        // The store answered, but the root can still go between the probe
+        // and here; never let the ancestor rule measure another disk.
+        if !probed.is_dir() {
+            return Ok(None);
+        }
+        cairn_common::volume::space(&probed).map(Some)
+    })
+    .await
+    .map_err(|error| Stop::halt(format!("the free-space probe failed: {error}")))?
+    .map_err(|error| Stop::halt(format!("reading free space at {}: {error}", root.display())))?;
+    match space {
+        Some(space) => floor_verdict(&root, space, budget),
+        None => Err(Stop::halt(format!("archive offline: {}", root.display()))),
+    }
+}
+
+/// Stop the pass if `space` is under the floor. Never writes toward a full
+/// disk: on a volume this full the pass stops at once, and the reason says
+/// where the archive is so an operator can move it.
+fn floor_verdict(
+    root: &Path,
+    space: cairn_common::volume::VolumeSpace,
+    budget: PackBudget,
+) -> Result<(), Stop> {
     let floor = budget.floor_for(space.total_bytes);
     if space.free_bytes < floor {
         return Err(Stop::budget(format!(

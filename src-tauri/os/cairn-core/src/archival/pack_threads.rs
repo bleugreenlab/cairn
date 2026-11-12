@@ -56,9 +56,7 @@ pub(super) async fn walk(
                     // excluded when the next pass builds the remainder.
                     return Ok(false);
                 }
-                if let Some(root) = store.local_root() {
-                    check_floor(root, budget).await?;
-                }
+                check_archive(store, budget).await?;
                 let label = format!(
                     "thread {} sessions {}-{} ({})",
                     candidate.thread_name,

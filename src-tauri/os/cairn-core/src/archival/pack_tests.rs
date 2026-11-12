@@ -360,13 +360,73 @@ async fn a_volume_under_the_floor_stops_the_pass_and_says_where() {
     assert!(catalogued(&db).await.is_empty());
 }
 
+#[tokio::test]
+async fn an_unmounted_archive_is_offline_not_under_its_floor() {
+    let db = migrated_test_db("pack-pass-unmounted.db").await;
+    seed_project(&db).await;
+    seed_execution(&db, 1, "merged", Some(OLD), "exited").await;
+    let root = db
+        .content_store()
+        .unwrap()
+        .local_root()
+        .unwrap()
+        .to_path_buf();
+    // The volume goes away: the root no longer exists, but its parent does,
+    // and the parent's volume is the one the ancestor rule would measure.
+    std::fs::rename(&root, root.with_extension("unmounted")).unwrap();
+    let floor = PackBudget {
+        floor_free_bytes: u64::MAX,
+        ..budget()
+    };
+
+    let report = run_pack_pass_at(&db, NOW, policy(), floor).await;
+    let stopped = report.stopped.clone().unwrap_or_default();
+    assert!(stopped.contains("archive offline"), "{report}");
+    assert!(!stopped.contains("under its floor"), "{report}");
+    assert!(report.halted);
+    assert!(catalogued(&db).await.is_empty());
+}
+
 #[test]
 fn the_floor_is_the_larger_of_its_share_and_its_minimum() {
     let budget = PackBudget::PRODUCTION;
     let gib = 1024 * 1024 * 1024;
-    // A 500 GiB volume keeps the 100 GiB minimum; a 2 TiB one keeps 10%.
-    assert_eq!(budget.floor_for(500 * gib), 100 * gib);
-    assert_eq!(budget.floor_for(2048 * gib), 2048 * gib / 100 * 10);
+    // Four packs' worth on a small volume; 1% once that is larger.
+    assert_eq!(budget.floor_for(100 * gib), 4 * PACK_MAX_BYTES);
+    assert_eq!(budget.floor_for(2048 * gib), 2048 * gib / 100);
+    // The production host's 1.86 TB disk keeps about 18.6 GiB.
+    let host = 1_995_000_000_000u64;
+    assert_eq!(budget.floor_for(host), host / 100);
+    assert!(budget.floor_for(host) < 20 * gib);
+}
+
+#[test]
+fn a_volume_at_the_floor_passes_and_one_byte_under_stops() {
+    let budget = PackBudget::PRODUCTION;
+    let root = Path::new("/archive");
+    let total = 1_995_000_000_000u64;
+    let floor = budget.floor_for(total);
+    let at = cairn_common::volume::VolumeSpace {
+        total_bytes: total,
+        free_bytes: floor,
+    };
+    assert!(floor_verdict(root, at, budget).is_ok());
+
+    let under = cairn_common::volume::VolumeSpace {
+        free_bytes: floor - 1,
+        ..at
+    };
+    let stop = floor_verdict(root, under, budget).err().unwrap();
+    assert!(!stop.halted);
+    assert!(
+        stop.reason.contains("archive volume under its floor"),
+        "{}",
+        stop.reason
+    );
+    // The line names the measured free space and the floor it was held to.
+    assert!(stop.reason.contains(&gib(floor - 1)), "{}", stop.reason);
+    assert!(stop.reason.contains(&gib(floor)), "{}", stop.reason);
+    assert!(stop.reason.contains("/archive"), "{}", stop.reason);
 }
 
 #[tokio::test]
