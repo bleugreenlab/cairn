@@ -711,7 +711,7 @@ pub(crate) async fn release_terminal_by_session(
     orch: &Orchestrator,
     session_id: &str,
 ) -> Result<(), String> {
-    let binding = terminal_binding_by_session(orch, session_id).await?;
+    let binding = terminal_binding_by_session(orch, session_id, BindingPurpose::Release).await?;
     release_terminal_process(orch, &binding).await?;
     if let Ok(mut sessions) = orch.pty_state.sessions.lock() {
         sessions.remove(session_id);
@@ -814,7 +814,7 @@ pub(crate) async fn resize_terminal_by_session(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let binding = terminal_binding_by_session(orch, session_id).await?;
+    let binding = terminal_binding_by_session(orch, session_id, BindingPurpose::Operate).await?;
     let result = orch
         .fleet
         .operate_residency(
@@ -900,48 +900,140 @@ fn terminal_binding_from_cells(
     })
 }
 
+/// Why a terminal session has no executor process to act on. Each variant's
+/// text tells the caller what to do next; none of them is a storage failure.
+#[derive(Debug)]
+pub(crate) enum TerminalBindingError {
+    /// The terminal has ended: its row has exited, is being removed, or is gone.
+    /// The agent's move is to create it again, not to reason about what it lost.
+    Ended {
+        session_id: String,
+        exited_at: Option<i64>,
+    },
+    /// The terminal still owes a process, but no advertised environment holds
+    /// it right now (its executor is away, or recovery has not reclaimed it).
+    Unreachable {
+        session_id: String,
+    },
+    /// The terminal is being removed. Its slug stays taken until the removal
+    /// completes, so creating it again would be refused until then.
+    Closing {
+        session_id: String,
+    },
+    Other(String),
+}
+
+impl std::fmt::Display for TerminalBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ended {
+                session_id,
+                exited_at,
+            } => {
+                let when = exited_at
+                    .and_then(crate::clock::stamp)
+                    .map(|stamp| format!(" (it exited at {stamp})"))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "Terminal session {session_id} is no longer running{when}; create it again."
+                )
+            }
+            Self::Unreachable { session_id } => write!(
+                f,
+                "Terminal session {session_id} is not reachable right now; retry, or create it again."
+            ),
+            Self::Closing { session_id } => write!(
+                f,
+                "Terminal session {session_id} is being removed; its slug frees once the removal completes."
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<TerminalBindingError> for String {
+    fn from(error: TerminalBindingError) -> Self {
+        error.to_string()
+    }
+}
+
+/// What a binding lookup is for, which decides the durable states that still
+/// count as owning a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingPurpose {
+    /// Acting on the process (input, resize, stop): only a `running` terminal.
+    Operate,
+    /// Releasing it: a `closing` row keeps its process and fence until the
+    /// release succeeds, and the release is exactly what it is waiting for.
+    Release,
+}
+
 async fn persisted_terminal_binding_by_session(
     orch: &Orchestrator,
     session_id: &str,
-) -> Result<crate::services::LeaseTerminalBinding, String> {
-    let session_id = session_id.to_string();
-    let (slug, residency_holder, incarnation_id, cell_epoch, process_generation) = orch
+    purpose: BindingPurpose,
+) -> Result<crate::services::LeaseTerminalBinding, TerminalBindingError> {
+    let row = orch
         .db
         .local
-        .read(|conn| {
-            let session_id = session_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT slug, residency_holder, residency_incarnation_id, cell_epoch, process_generation
-                         FROM job_terminals
-                         WHERE session_id = ?1 AND status = 'running'
-                         LIMIT 1",
-                        (session_id.as_str(),),
-                    )
-                    .await?;
-                let row = rows.next().await?.ok_or_else(|| {
-                    crate::storage::DbError::Row(format!(
-                        "Terminal session not running: {session_id}"
-                    ))
-                })?;
+        .query_opt(
+            "SELECT slug, residency_holder, residency_incarnation_id, cell_epoch,
+                    process_generation, status, exited_at
+             FROM job_terminals
+             WHERE session_id = ?1
+             LIMIT 1",
+            params![session_id.to_string()],
+            |row| {
                 Ok((
                     row.opt_text(0)?,
                     row.opt_text(1)?,
                     row.opt_text(2)?,
                     row.opt_i64(3)?.map(|value| value as u64),
                     row.opt_i64(4)?.map(|value| value as u64),
+                    row.text(5)?,
+                    row.opt_i64(6)?,
                 ))
-            })
-        })
+            },
+        )
         .await
-        .map_err(|error| error.to_string())?;
-    // A terminal whose binding is gone reads as an ordinary ended session: the
-    // agent's move is to create it again, not to reason about what it lost.
-    let ended = || format!("Terminal session {session_id} is no longer running; create it again.");
-    let residency_holder = residency_holder.ok_or_else(ended)?;
-    let incarnation_id = incarnation_id.ok_or_else(ended)?;
-    let cell_epoch = cell_epoch.ok_or_else(ended)?;
+        .map_err(|error| TerminalBindingError::Other(error.to_string()))?;
+    let ended = |exited_at| TerminalBindingError::Ended {
+        session_id: session_id.to_string(),
+        exited_at,
+    };
+    let Some((
+        slug,
+        residency_holder,
+        incarnation_id,
+        cell_epoch,
+        process_generation,
+        status,
+        exited_at,
+    )) = row
+    else {
+        return Err(ended(None));
+    };
+    match (status.as_str(), purpose) {
+        ("running", _) | ("closing", BindingPurpose::Release) => {}
+        ("closing", BindingPurpose::Operate) => {
+            return Err(TerminalBindingError::Closing {
+                session_id: session_id.to_string(),
+            })
+        }
+        ("recovering", _) => {
+            return Err(TerminalBindingError::Unreachable {
+                session_id: session_id.to_string(),
+            })
+        }
+        _ => return Err(ended(exited_at)),
+    }
+    // A terminal whose binding is gone reads as an ordinary ended session.
+    let (Some(residency_holder), Some(incarnation_id), Some(cell_epoch)) =
+        (residency_holder, incarnation_id, cell_epoch)
+    else {
+        return Err(ended(exited_at));
+    };
     terminal_binding_from_cells(
         &orch.fleet.snapshot().cells,
         &residency_holder,
@@ -950,40 +1042,60 @@ async fn persisted_terminal_binding_by_session(
         slug.as_deref(),
         process_generation,
     )
-    .ok_or_else(|| {
-        format!(
-            "Terminal session {session_id} is not reachable right now; retry, or create it again."
-        )
+    .ok_or_else(|| TerminalBindingError::Unreachable {
+        session_id: session_id.to_string(),
     })
 }
 
 async fn terminal_binding_by_session(
     orch: &Orchestrator,
     session_id: &str,
-) -> Result<crate::services::LeaseTerminalBinding, String> {
+    purpose: BindingPurpose,
+) -> Result<crate::services::LeaseTerminalBinding, TerminalBindingError> {
     let session = orch
         .pty_state
         .sessions
         .lock()
-        .map_err(|error| error.to_string())?
+        .map_err(|error| TerminalBindingError::Other(error.to_string()))?
         .get(session_id)
         .cloned();
     if let Some(session) = session {
         return session
             .lock()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| TerminalBindingError::Other(error.to_string()))?
             .lease
             .clone()
-            .ok_or_else(|| "This terminal has no executor process binding".to_string());
+            .ok_or_else(|| {
+                TerminalBindingError::Other(
+                    "This terminal has no executor process binding".to_string(),
+                )
+            });
     }
-    persisted_terminal_binding_by_session(orch, session_id).await
+    persisted_terminal_binding_by_session(orch, session_id, purpose).await
 }
 
+/// What a stop request found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopOutcome {
+    /// The process was asked to stop. Its exit arrives as the executor's own
+    /// exit event, which finalizes the row like any other end.
+    Stopped,
+    /// The terminal had already ended; there was nothing to stop.
+    AlreadyEnded,
+}
+
+/// Stop a terminal's process. Stopping one that has already ended is not an
+/// error: the caller wanted it not running, and it is not.
 pub(crate) async fn stop_terminal_by_session(
     orch: &Orchestrator,
     session_id: &str,
-) -> Result<(), String> {
-    let binding = terminal_binding_by_session(orch, session_id).await?;
+) -> Result<StopOutcome, String> {
+    let binding = match terminal_binding_by_session(orch, session_id, BindingPurpose::Operate).await
+    {
+        Ok(binding) => binding,
+        Err(TerminalBindingError::Ended { .. }) => return Ok(StopOutcome::AlreadyEnded),
+        Err(error) => return Err(error.to_string()),
+    };
     let result = orch
         .fleet
         .operate_residency(
@@ -995,7 +1107,7 @@ pub(crate) async fn stop_terminal_by_session(
         )
         .await;
     if matches!(result, ResidencyResult::State { .. }) {
-        Ok(())
+        Ok(StopOutcome::Stopped)
     } else {
         Err(format!("Failed to stop terminal: {result:?}"))
     }
@@ -2344,10 +2456,19 @@ pub(crate) fn register_terminal_output_watcher(
     outcome
 }
 
-async fn lookup_terminal_session_id_for_target(
+/// The durable row a terminal resource names within its own scope.
+struct TerminalTargetRow {
+    id: String,
+    session_id: String,
+    status: String,
+    exit_code: Option<i32>,
+    exited_at: Option<i64>,
+}
+
+async fn lookup_terminal_row_for_target(
     db: &LocalDb,
     target: &TerminalResourceTarget,
-) -> DbResult<Option<String>> {
+) -> DbResult<Option<TerminalTargetRow>> {
     let job_id = target.job_id.clone();
     let project_id = target.project_id.clone();
     let slug = target.slug.clone();
@@ -2356,7 +2477,7 @@ async fn lookup_terminal_session_id_for_target(
             let mut rows = if let Some(job_id) = job_id {
                 conn.query(
                     "
-                    SELECT session_id
+                    SELECT id, session_id, status, exit_code, exited_at
                     FROM job_terminals
                     WHERE job_id = ?1 AND slug = ?2
                     LIMIT 1
@@ -2367,7 +2488,7 @@ async fn lookup_terminal_session_id_for_target(
             } else {
                 conn.query(
                     "
-                    SELECT session_id
+                    SELECT id, session_id, status, exit_code, exited_at
                     FROM job_terminals
                     WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2
                     LIMIT 1
@@ -2376,10 +2497,63 @@ async fn lookup_terminal_session_id_for_target(
                 )
                 .await?
             };
-            crate::storage::next_text(&mut rows, 0).await
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(TerminalTargetRow {
+                        id: row.text(0)?,
+                        session_id: row.text(1)?,
+                        status: row.text(2)?,
+                        exit_code: row.opt_i64(3)?.map(|code| code as i32),
+                        exited_at: row.opt_i64(4)?,
+                    })
+                })
+                .transpose()
         })
     })
     .await
+}
+
+/// Remove an exited terminal's row, freeing its slug.
+///
+/// An exited terminal holds nothing live: when its process ended, the lifetime
+/// handler dropped the session and released the environment if nothing else ran
+/// in it, and the fence columns the row keeps are cleared by the owner-recovery
+/// sweep. Removal is therefore only the row. The slug-keyed transcript log in the
+/// owner's scratch stays, because a re-created terminal of the same slug appends
+/// to it. A waiter still subscribed to this terminal's exit is settled first,
+/// while the row still records how the terminal ended: after the delete, the
+/// only answer left for it would be that the terminal was lost.
+///
+/// The delete is conditional on `exited` so it cannot remove a row that a
+/// concurrent create has already replaced. Returns whether a row was removed.
+pub(crate) async fn remove_exited_terminal(
+    orch: &Orchestrator,
+    terminal_id: &str,
+) -> Result<bool, String> {
+    reconcile_exited_terminal_wakes(orch).await?;
+    let terminal_id = terminal_id.to_string();
+    let removed = orch
+        .db
+        .local
+        .write(|conn| {
+            let terminal_id = terminal_id.clone();
+            Box::pin(async move {
+                Ok(conn
+                    .execute(
+                        "DELETE FROM job_terminals WHERE id = ?1 AND status = 'exited'",
+                        params![terminal_id.as_str()],
+                    )
+                    .await?
+                    > 0)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if removed {
+        crate::terminal_host::emit_terminal_change(orch, "delete");
+    }
+    Ok(removed)
 }
 
 /// Remove a dead terminal session from the live PTY map without killing (the
@@ -2491,7 +2665,7 @@ pub fn finalize_terminal_by_session_id(
     orch: &Orchestrator,
     session_id: &str,
 ) -> Result<(), String> {
-    crate::storage::run_db_blocking(|| stop_terminal_by_session(orch, session_id))
+    crate::storage::run_db_blocking(|| stop_terminal_by_session(orch, session_id)).map(|_| ())
 }
 
 /// Settle a running terminal whose process Cairn has proven gone although its
@@ -3569,9 +3743,10 @@ pub async fn append_terminal_input(
     let target = resolve_terminal_resource_target(&orch.db.local, resource)
         .await
         .map_err(|e| e.to_string())?;
-    let session_id = lookup_terminal_session_id_for_target(&orch.db.local, &target)
+    let session_id = lookup_terminal_row_for_target(&orch.db.local, &target)
         .await
         .map_err(|e| e.to_string())?
+        .map(|row| row.session_id)
         .ok_or_else(|| format!("Terminal not found: {}", target.slug))?;
 
     let written = deliver_terminal_input(orch, &session_id, content, submit).await?;
@@ -3582,6 +3757,14 @@ pub async fn append_terminal_input(
     ))
 }
 
+/// A terminal resource's `delete`, which is two-stage like a REPL's.
+///
+/// On a running terminal it stops the process and keeps the row: the executor's
+/// exit event finalizes it as `exited`, so the final output and exit status stay
+/// readable and an exit wake fires as for any other end. On an exited terminal it
+/// removes the row. Removal is not what makes a slug reusable (creating a slug
+/// again already replaces its exited row); it is for clearing a terminal away,
+/// such as one that shadows a same-slug terminal in another scope.
 pub async fn delete_terminal_by_resource(
     orch: &Orchestrator,
     resource: &CairnResource,
@@ -3589,17 +3772,62 @@ pub async fn delete_terminal_by_resource(
     let target = resolve_terminal_resource_target(&orch.db.local, resource)
         .await
         .map_err(|e| e.to_string())?;
-    let session_id = lookup_terminal_session_id_for_target(&orch.db.local, &target)
+    let slug = target.slug.as_str();
+    let row = lookup_terminal_row_for_target(&orch.db.local, &target)
         .await
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Terminal not found: {}", target.slug))?;
+        .ok_or_else(|| format!("Terminal not found: {slug}"))?;
 
-    // Stop the fenced executor process but retain the residency and
-    // materialization. The executor's ProcessExited event converges on the
-    // canonical conditional finalizer and makes the same slug restartable.
-    stop_terminal_by_session(orch, &session_id).await?;
+    match row.status.as_str() {
+        "running" => match stop_terminal_by_session(orch, &row.session_id).await? {
+            StopOutcome::Stopped => Ok(format!(
+                "Stopped terminal {slug}; its output stays readable. Delete again to remove it."
+            )),
+            // The process ended on its own between the lookup and the stop.
+            StopOutcome::AlreadyEnded => Ok(format!(
+                "Terminal {slug} had already exited; delete again to remove it."
+            )),
+        },
+        "exited" => {
+            if remove_exited_terminal(orch, &row.id).await? {
+                Ok(format!(
+                    "Removed terminal {slug}{}.",
+                    exit_summary(row.exit_code, row.exited_at)
+                ))
+            } else {
+                Err(format!(
+                    "Terminal {slug} changed while it was being removed; read it to see its state."
+                ))
+            }
+        }
+        "closing" => Ok(format!("Terminal {slug} is already being removed.")),
+        // No process is bound yet, so there is nothing to stop and keep: the
+        // close path fences the row as `closing`, and its stop, release and
+        // delete finish now if the environment is advertised, or once it is.
+        "recovering" => {
+            crate::terminal_host::close_job_terminal(orch, row.id).await?;
+            let remaining = lookup_terminal_row_for_target(&orch.db.local, &target)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(match remaining {
+                None => format!("Removed terminal {slug}."),
+                Some(_) => {
+                    format!("Removing terminal {slug}; it completes once its executor reconnects.")
+                }
+            })
+        }
+        other => Err(format!("Terminal {slug} is in an unknown state: {other}")),
+    }
+}
 
-    Ok(format!("Stopped terminal {}", target.slug))
+/// ` (exited 3 at 2026-11-12 14:03 PST)` for a removal reply.
+fn exit_summary(exit_code: Option<i32>, exited_at: Option<i64>) -> String {
+    let code = exit_code.map(|code| format!(" {code}")).unwrap_or_default();
+    let at = exited_at
+        .and_then(crate::clock::stamp)
+        .map(|stamp| format!(" at {stamp}"))
+        .unwrap_or_default();
+    format!(" (exited{code}{at})")
 }
 
 /// Get exit code from PTY session using non-blocking try_wait.
@@ -7550,5 +7778,343 @@ mod terminal_finalize_tests {
         assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 13)])));
         // No connected executor can ever vouch for an absence.
         assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[])));
+    }
+
+    async fn terminal_status(db: &LocalDb, terminal_id: &str) -> Option<String> {
+        db.query_opt(
+            "SELECT status FROM job_terminals WHERE id = ?1",
+            params![terminal_id.to_string()],
+            |row| row.text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn exit_seeded_node_terminal(db: &LocalDb) {
+        db.execute(
+            "UPDATE job_terminals SET status='exited', exit_code=3, exited_at=50 WHERE session_id='s1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// cairn/4537. Delete used to only stop, so an exited terminal could not be
+    /// deleted at all: the stop's binding lookup raised a storage row-conversion
+    /// error, and a same-slug collision could never be cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_an_exited_node_terminal_removes_it() {
+        let db = crate::storage::migrated_test_db("term_delete_exited_node.db").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        exit_seeded_node_terminal(&orch.db.local).await;
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("run-1"))
+            .await
+            .unwrap();
+        assert!(
+            reply.starts_with("Removed terminal run-1 (exited 3 at "),
+            "{reply}"
+        );
+        assert_eq!(terminal_status(&orch.db.local, "t").await, None);
+        // The task's terminal of the same slug belongs to another owner.
+        assert_eq!(
+            terminal_status(&orch.db.local, "task-t").await.as_deref(),
+            Some("running")
+        );
+        assert!(emitter
+            .events_named("db-change")
+            .iter()
+            .any(|event| event["table"] == "job_terminals" && event["action"] == "delete"));
+
+        let again = delete_terminal_by_resource(&orch, &node_terminal_resource("run-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(again, "Terminal not found: run-1");
+    }
+
+    /// A waiter still armed on a terminal's exit when the terminal is removed
+    /// hears how it actually ended, not that Cairn lost it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_an_exited_terminal_settles_its_exit_waiter_with_the_real_exit() {
+        let db = crate::storage::migrated_test_db("term_remove_settles_waiter.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_live_turn(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE job_terminals SET status='exited', exit_code=3, exited_at=50, output_tail='boom'
+                 WHERE session_id='s1'",
+                (),
+            )
+            .await
+            .unwrap();
+        let uri = node_uri();
+        let facts = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
+        crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j",
+            "process",
+            Some(&uri),
+            Some(&facts),
+            "agent",
+        )
+        .await
+        .unwrap();
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("run-1"))
+            .await
+            .unwrap();
+        assert!(reply.starts_with("Removed terminal run-1"), "{reply}");
+
+        let exits = orch
+            .db
+            .local
+            .query_all(
+                "SELECT content FROM messages WHERE channel_type='direct'
+                   AND content LIKE '[Terminal exit]%'
+                   AND id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'run-live')",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exits.len(), 1, "{exits:?}");
+        assert!(exits[0].contains("exit code 3"), "{}", exits[0]);
+        assert!(exits[0].contains("boom"), "{}", exits[0]);
+        assert!(!exits[0].contains("did not recover"), "{}", exits[0]);
+        let subs = crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "j")
+            .await
+            .unwrap();
+        assert!(
+            !subs
+                .iter()
+                .any(|sub| sub.source_ref.as_deref() == Some(uri.as_str())),
+            "the removal must consume the one-shot exit subscription"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_an_exited_project_terminal_removes_it() {
+        let db = crate::storage::migrated_test_db("term_delete_exited_project.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO job_terminals(id, project_id, session_id, command, status, exit_code, created_at, exited_at, slug)
+                 VALUES('proj-t', 'p', 'proj-s', 'true', 'exited', 0, 1, 60, 'proj')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let reply = delete_terminal_by_resource(
+            &orch,
+            &CairnResource::ProjectTerminal {
+                project: "p".into(),
+                slug: "proj".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            reply.starts_with("Removed terminal proj (exited 0 at "),
+            "{reply}"
+        );
+        assert_eq!(terminal_status(&orch.db.local, "proj-t").await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ended_terminal_stops_idempotently_and_reports_why_it_cannot_act() {
+        let db = crate::storage::migrated_test_db("term_stop_ended.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        exit_seeded_node_terminal(&orch.db.local).await;
+
+        assert_eq!(
+            stop_terminal_by_session(&orch, "s1").await,
+            Ok(StopOutcome::AlreadyEnded)
+        );
+        assert_eq!(
+            stop_terminal_by_session(&orch, "no-such-session").await,
+            Ok(StopOutcome::AlreadyEnded)
+        );
+        let error = resize_terminal_by_session(&orch, "s1", 80, 24)
+            .await
+            .unwrap_err();
+        assert!(error.contains("s1 is no longer running"), "{error}");
+        assert!(error.contains("create it again"), "{error}");
+        assert!(!error.contains("row conversion"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_closing_terminal_succeeds_and_a_missing_one_is_not_found() {
+        let db = crate::storage::migrated_test_db("term_delete_closing.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE job_terminals SET status='closing' WHERE session_id='s1'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("run-1"))
+            .await
+            .unwrap();
+        assert_eq!(reply, "Terminal run-1 is already being removed.");
+        assert_eq!(
+            terminal_status(&orch.db.local, "t").await.as_deref(),
+            Some("closing")
+        );
+        // Create refuses the slug until the removal completes, so acting on a
+        // closing terminal must not advise creating it again.
+        let error = resize_terminal_by_session(&orch, "s1", 80, 24)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Terminal session s1 is being removed; its slug frees once the removal completes."
+        );
+
+        let missing = delete_terminal_by_resource(&orch, &node_terminal_resource("nope"))
+            .await
+            .unwrap_err();
+        assert_eq!(missing, "Terminal not found: nope");
+    }
+
+    /// The first delete keeps the stop-then-read workflow: the process is
+    /// stopped, the row is finalized by the exit like any other end, and only a
+    /// second delete removes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_running_terminal_stops_it_and_a_second_delete_removes_it() {
+        let db = crate::storage::migrated_test_db("term_delete_two_stage.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("dev");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, target, "sleep 600").await;
+        executor.post();
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("dev"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            "Stopped terminal dev; its output stays readable. Delete again to remove it."
+        );
+        // Stopping is not ending: the row waits for the process's exit.
+        assert_eq!(
+            read_terminal(&orch.db.local, &session_id).await.0,
+            "running"
+        );
+
+        assert!(
+            settle_lost_terminal(&orch, &session_id, Some(143), "stopped")
+                .await
+                .unwrap()
+        );
+        let (status, code, _) = read_terminal(&orch.db.local, &session_id).await;
+        assert_eq!((status.as_str(), code), ("exited", Some(143)));
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("dev"))
+            .await
+            .unwrap();
+        assert!(
+            reply.starts_with("Removed terminal dev (exited 143"),
+            "{reply}"
+        );
+        let remaining = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT id FROM job_terminals WHERE session_id = ?1",
+                params![session_id.clone()],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remaining, None);
+    }
+
+    /// The UI's close dropped an exited tab from its cache but left the row, so
+    /// the tab came back on the next refetch: the release it attempted could
+    /// never find a running terminal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_an_exited_terminal_tab_removes_its_row() {
+        let db = crate::storage::migrated_test_db("term_close_exited_tab.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        exit_seeded_node_terminal(&orch.db.local).await;
+
+        crate::terminal_host::close_job_terminal(&orch, "t".into())
+            .await
+            .unwrap();
+        assert_eq!(terminal_status(&orch.db.local, "t").await, None);
+    }
+
+    /// After a host restart a terminal is `recovering` with no live session.
+    /// Deleting it closes it through its persisted fence, which the release
+    /// lookup must accept for the `closing` row the close leaves behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_recovering_terminal_closes_it_through_its_persisted_fence() {
+        let db = crate::storage::migrated_test_db("term_delete_recovering.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("dev");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, target, "sleep 600").await;
+        executor.post();
+        orch.pty_state.sessions.lock().unwrap().clear();
+        orch.db
+            .local
+            .execute(
+                &format!(
+                    "UPDATE job_terminals SET status='recovering' WHERE session_id='{session_id}'"
+                ),
+                (),
+            )
+            .await
+            .unwrap();
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("dev"))
+            .await
+            .unwrap();
+        assert_eq!(reply, "Removed terminal dev.");
+    }
+
+    /// With its executor away, a recovering terminal's delete fences it as
+    /// `closing` and says the removal finishes when the executor returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_recovering_terminal_whose_executor_is_away_leaves_it_closing() {
+        let db = crate::storage::migrated_test_db("term_delete_recovering_away.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE job_terminals SET status='recovering', residency_holder='terminal:j',
+                     residency_incarnation_id='inc', cell_epoch=1
+                 WHERE session_id='s1'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let reply = delete_terminal_by_resource(&orch, &node_terminal_resource("run-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            "Removing terminal run-1; it completes once its executor reconnects."
+        );
+        assert_eq!(
+            terminal_status(&orch.db.local, "t").await.as_deref(),
+            Some("closing")
+        );
     }
 }

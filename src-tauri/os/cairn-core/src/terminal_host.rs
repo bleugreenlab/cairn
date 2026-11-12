@@ -28,7 +28,7 @@ pub struct PtyCommandSnapshot {
     duration_ms: Option<u64>,
 }
 
-fn emit_terminal_change(orch: &Orchestrator, action: &str) {
+pub(crate) fn emit_terminal_change(orch: &Orchestrator, action: &str) {
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "job_terminals", "action": action}),
@@ -1138,7 +1138,9 @@ pub async fn resize_pty(
 }
 
 pub async fn close_pty(orch: &Orchestrator, session_id: String) -> Result<(), String> {
-    crate::mcp::handlers::terminal::stop_terminal_by_session(orch, &session_id).await
+    crate::mcp::handlers::terminal::stop_terminal_by_session(orch, &session_id)
+        .await
+        .map(|_| ())
 }
 
 pub fn check_pty_session_exists(orch: &Orchestrator, session_id: String) -> Result<bool, String> {
@@ -1352,33 +1354,37 @@ pub async fn get_job_terminals(db: &DbState, job_id: String) -> Result<Vec<JobTe
         .collect())
 }
 
-async fn terminal_close_session(db: Arc<LocalDb>, terminal_id: String) -> Result<String, String> {
-    db.read(|conn| {
-        let terminal_id = terminal_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT session_id FROM job_terminals WHERE id = ?1 LIMIT 1",
-                    params![terminal_id.as_str()],
-                )
-                .await?;
-            let Some(row) = rows.next().await? else {
-                return Err(DbError::Row(format!("Terminal not found: {terminal_id}")));
-            };
-            row.text(0)
-        })
-    })
+/// The session and status of the terminal a close names, or `None` when it is
+/// already gone.
+async fn terminal_close_session(
+    db: Arc<LocalDb>,
+    terminal_id: String,
+) -> Result<Option<(String, String)>, String> {
+    db.query_opt(
+        "SELECT session_id, status FROM job_terminals WHERE id = ?1 LIMIT 1",
+        params![terminal_id],
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
     .await
     .map_err(|error| error.to_string())
 }
 
+/// Close a terminal tab: take the terminal off every live surface and remove it.
+///
+/// An exited terminal has nothing left to stop or release, so it is removed
+/// directly. A live one is fenced as `closing` first, then stopped, released and
+/// deleted; when its environment cannot be reached now, the lifecycle reconcile
+/// loop finishes that ordering later.
 pub async fn close_job_terminal(orch: &Orchestrator, terminal_id: String) -> Result<(), String> {
-    let session_id = match terminal_close_session(orch.db.local.clone(), terminal_id.clone()).await
-    {
-        Ok(session_id) => session_id,
-        Err(error) if error.contains("Terminal not found") => return Ok(()),
-        Err(error) => return Err(error),
+    let Some((session_id, status)) =
+        terminal_close_session(orch.db.local.clone(), terminal_id.clone()).await?
+    else {
+        return Ok(());
     };
+    if status == "exited" {
+        crate::mcp::handlers::terminal::remove_exited_terminal(orch, &terminal_id).await?;
+        return Ok(());
+    }
     let transitioned = orch
         .db
         .local

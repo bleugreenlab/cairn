@@ -183,7 +183,9 @@ pub(super) async fn dispatch(
             ChangeMode::Delete,
         ) => {
             if dry_run {
-                format!("Would stop terminal {slug}")
+                format!(
+                    "Would stop terminal {slug} if it is running, or remove it if it has exited"
+                )
             } else {
                 terminal::delete_terminal_by_resource(orch, resource)
                     .await
