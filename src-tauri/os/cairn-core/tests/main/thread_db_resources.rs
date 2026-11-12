@@ -85,6 +85,63 @@ async fn parameterized_batches_are_atomic_and_single_statement_params_still_work
     assert!(!rows.contains("rolled back"), "{rows}");
 }
 
+/// Placeholders in SET and WHERE bind in order, and a numeric string matches an
+/// INTEGER PRIMARY KEY. Too few values is refused by name: Turso would bind the
+/// missing one as NULL, `post = NULL` would match nothing, and the write would
+/// report success with no rows changed.
+#[tokio::test]
+async fn placeholder_and_value_counts_must_match() {
+    let _fixture_guard = fixture_lock().lock().await;
+    let (_temp, _db, orch) = fixture().await;
+    let uri = format!("cairn://p/{PROJECT}/{THREAD}/db");
+
+    let created = common::change_resource_as_run(
+        &orch,
+        patch_with_params(
+            "CREATE TABLE posts(post INTEGER PRIMARY KEY, why TEXT); INSERT INTO posts(post, why) VALUES (206, 'start')",
+            json!([[], []]),
+        ),
+        Some(RUN),
+    )
+    .await;
+    assert!(created.contains("Applied 2 statements"), "{created}");
+
+    let update = "UPDATE posts SET why = ? WHERE post = ?";
+    for (params, why) in [
+        (json!(["int", 206]), "int"),
+        (json!(["text", "206"]), "text"),
+    ] {
+        let applied =
+            common::change_resource_as_run(&orch, patch_with_params(update, params), Some(RUN))
+                .await;
+        assert!(applied.contains("(1 rows changed)"), "{applied}");
+        let rows = common::read_resource(
+            &orch,
+            format!("{uri}?sql=SELECT why FROM posts WHERE post = 206"),
+        )
+        .await;
+        assert!(rows.contains(why), "{rows}");
+    }
+
+    let short = common::change_resource_as_run(
+        &orch,
+        patch_with_params(update, json!(["lost"])),
+        Some(RUN),
+    )
+    .await;
+    assert!(
+        short.contains("statement 1 has 2 parameter placeholders but 1 value was given in params"),
+        "{short}"
+    );
+    let rows = common::read_resource(
+        &orch,
+        format!("{uri}?sql=SELECT why FROM posts WHERE post = 206"),
+    )
+    .await;
+    assert!(rows.contains("text"), "{rows}");
+    assert!(!rows.contains("lost"), "{rows}");
+}
+
 #[tokio::test]
 async fn parameterized_batches_refuse_mismatched_flat_and_mixed_shapes() {
     let _fixture_guard = fixture_lock().lock().await;

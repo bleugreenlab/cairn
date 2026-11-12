@@ -239,6 +239,77 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
+/// How many values a statement binds, numbered the way SQLite numbers its
+/// parameters: a bare `?` takes one more than the highest index assigned so far,
+/// `?NNN` takes index NNN, and `:name`, `@name` and `$name` take the next index
+/// unless the same name was already seen. The count is the highest index.
+/// Placeholders inside quoted values, identifiers and comments are not
+/// parameters.
+///
+/// Turso binds a parameter that was not given a value as NULL, so a statement
+/// sent with too few values runs rather than failing: `WHERE post = ?` then
+/// matches nothing and the write reports success with no rows changed.
+pub(crate) fn parameter_count(sql: &str) -> usize {
+    fn is_word(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_' || ch == '$' || !ch.is_ascii()
+    }
+    let mut chars = sql.char_indices().peekable();
+    let mut highest = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '\'' | '"' | '`' => skip_quoted(ch, &mut chars),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next)| *next == '-') => {
+                chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '*') => {
+                chars.next();
+                skip_block_comment(&mut chars);
+            }
+            '?' => {
+                let mut digits = String::new();
+                while let Some((_, next)) = chars.peek().copied() {
+                    if next.is_ascii_digit() {
+                        digits.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                highest = match digits.parse::<usize>() {
+                    Ok(index) => highest.max(index),
+                    Err(_) => highest + 1,
+                };
+            }
+            ':' | '@' | '$' if chars.peek().is_some_and(|(_, next)| is_word(*next)) => {
+                let mut name = String::from(ch);
+                while let Some((_, next)) = chars.peek().copied() {
+                    if is_word(next) {
+                        name.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !names.contains(&name) {
+                    names.push(name);
+                    highest += 1;
+                }
+            }
+            // A whole word, so a `$` inside an identifier is not a parameter.
+            c if is_word(c) => {
+                while chars.peek().is_some_and(|(_, next)| is_word(*next)) {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    highest
+}
+
 /// The parts of a `CREATE [UNIQUE] INDEX` statement, as SQLite's catalog keeps
 /// its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +612,25 @@ mod tests {
             "CREATE INDEX i ON t(a) WHERE",
         ] {
             assert_eq!(parse_create_index(unparseable), None, "{unparseable}");
+        }
+    }
+
+    #[test]
+    fn parameter_count_follows_sqlite_numbering() {
+        for (sql, expected) in [
+            ("UPDATE posts SET why = ? WHERE post = ?", 2),
+            ("SELECT 1", 0),
+            ("INSERT INTO t VALUES ('?', \"?\", [?], ?) -- ?", 1),
+            ("SELECT ? /* ? ? */ + ?", 2),
+            ("SELECT ?3", 3),
+            ("SELECT ?2, ?", 3),
+            ("SELECT ?1, ?1", 1),
+            ("UPDATE t SET a = :v, b = :v WHERE id = :id", 2),
+            ("SELECT @a, $b, :c", 3),
+            ("SELECT price$ FROM t WHERE x = ?", 1),
+            ("SELECT '2020-01-01 10:30'", 0),
+        ] {
+            assert_eq!(parameter_count(sql), expected, "{sql}");
         }
     }
 

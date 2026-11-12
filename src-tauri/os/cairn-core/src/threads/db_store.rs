@@ -293,7 +293,40 @@ pub fn police(statements: &[WriteStatement]) -> Result<(), String> {
     }
     statements
         .iter()
-        .try_for_each(|statement| validate_write_statement(&statement.sql))
+        .enumerate()
+        .try_for_each(|(index, statement)| {
+            validate_write_statement(&statement.sql)?;
+            check_parameter_count(index, statements.len(), statement)
+        })
+}
+
+/// Refuse a statement whose values do not match its placeholders. Turso binds
+/// a missing value as NULL, so `UPDATE t SET why = ? WHERE id = ?` sent with one
+/// value would compare `id = NULL`, change nothing, and report success.
+fn check_parameter_count(
+    index: usize,
+    statement_count: usize,
+    statement: &WriteStatement,
+) -> Result<(), String> {
+    let placeholders = sql_policy::parameter_count(&statement.sql);
+    let given = statement.params.len();
+    if placeholders == given {
+        return Ok(());
+    }
+    let plural = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    let example = if statement_count == 1 {
+        "params:[\"x\", 206]"
+    } else {
+        "one array per statement, params:[[\"x\", 206], [...]]"
+    };
+    Err(format!(
+        "statement {} has {} but {} given in params; pass one value per placeholder, in order ({example})",
+        index + 1,
+        plural(placeholders, "parameter placeholder", "parameter placeholders"),
+        plural(given, "value was", "values were"),
+    ))
 }
 
 /// Mint the database that belongs to a newly-created thread and install every

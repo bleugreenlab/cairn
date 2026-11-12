@@ -2689,11 +2689,10 @@ async fn resolve_permission_request_impl(
         }
     }
 
+    // The record recomputed the issue's and thread's attention in its own
+    // transaction. Attention bookkeeping is host-local (CAIRN-2186), so the
+    // wake stays on orch.
     if let Some(issue_id) = resume.issue_id.as_deref() {
-        if let Err(e) = recompute_issue_status_for_issue(&owning_db, issue_id).await {
-            log::warn!("Failed to recompute issue status {}: {}", issue_id, e);
-        }
-        // Attention bookkeeping is host-local (CAIRN-2186), so wake stays on orch.
         orch.wake_for_issue(issue_id).await;
     }
 
@@ -3561,6 +3560,12 @@ async fn record_permission_response_with(
                         )
                         .await?;
                     }
+                    crate::transitions::outcome::recompute_run_attention_conn(
+                        conn,
+                        job_id.as_deref(),
+                        issue_id.as_deref(),
+                    )
+                    .await?;
                 }
 
                 // The answer and its successor commit together: a reader never

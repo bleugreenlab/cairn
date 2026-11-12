@@ -132,12 +132,33 @@ pub(crate) async fn latest_run_id_for_job(db: &LocalDb, job_id: &str) -> Option<
     .flatten()
 }
 
-pub(crate) fn pending_dispatch_description(parent_segment: Option<&str>) -> String {
-    match parent_segment {
-        Some(parent) => format!("pending, not started; dispatches when `{parent}` settles"),
-        None => "pending, not started; dispatches when its recipe dependencies settle".to_string(),
+/// What a job that has not started yet is waiting on.
+pub(crate) enum PendingDispatch<'a> {
+    /// A task its parent spawned (`jobs.parent_tool_use_id` is set). It
+    /// launches on its own once prepared; nothing has to settle first.
+    Delegated,
+    /// A recipe child that dispatches when its parent node settles.
+    AfterParent(&'a str),
+    /// A recipe node that dispatches when its recipe dependencies settle.
+    AfterRecipe,
+}
+
+pub(crate) fn pending_dispatch_description(pending: PendingDispatch<'_>) -> String {
+    match pending {
+        PendingDispatch::Delegated => "starting: spawned by its parent and preparing to launch; it starts on its own, nothing to wait for".to_string(),
+        PendingDispatch::AfterParent(parent) => {
+            format!("pending, not started; dispatches when `{parent}` settles")
+        }
+        PendingDispatch::AfterRecipe => {
+            "pending, not started; dispatches when its recipe dependencies settle".to_string()
+        }
     }
 }
+
+/// A job claimed `running` before its first run exists is setting itself up;
+/// without this line its read shows a bare running icon and looks hung.
+pub(crate) const PREPARING_DESCRIPTION: &str =
+    "preparing: claimed and setting up its branch and worktree; no run yet.";
 
 fn address_root_predicate(alias: &str) -> String {
     format!("({alias}.parent_job_id IS NULL OR {alias}.agent_config_id = 'workflow')")

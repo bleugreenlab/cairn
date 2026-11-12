@@ -172,6 +172,43 @@ async fn a_thread_answering_its_question_records_the_canonical_thread_actor() {
     );
 }
 
+/// Answering a thread's only open question clears the thread's persisted
+/// attention in the same write: nothing else will recompute it, and a thread
+/// left reading `needs_input` asks the operator for an answer already given.
+#[tokio::test]
+async fn answering_a_threads_question_clears_its_attention() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_thread_question_fixture(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/tqt/design/questions/q-1",
+                "mode": "patch",
+                "payload": {"answer": "Yes"}
+            }]
+        })),
+    )
+    .await;
+    assert!(result.contains("Answered question q-1"), "{result}");
+
+    let attention = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT attention FROM threads WHERE id = 'thread-1'", ())
+                    .await?;
+                rows.next().await?.map(|row| row.text(0)).transpose()
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(attention.as_deref(), Some("none"));
+}
+
 /// An answer body that carries every structure an answer must survive:
 /// paragraphs, a numbered list at line starts, a bulleted list, and a fenced
 /// code block (cairn/4560).

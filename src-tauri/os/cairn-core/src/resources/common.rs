@@ -25,6 +25,8 @@ pub(crate) struct ResourceJob {
     pub(super) completed_at: Option<i32>,
     pub(super) started_at: Option<i32>,
     pub(super) uri_segment: Option<String>,
+    /// Spawned by its parent's tool call rather than dispatched by a recipe.
+    pub(super) delegated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +68,8 @@ pub(super) struct ResourceActionRun {
 }
 
 pub(super) const JOB_COLUMNS: &str = "
-    id, parent_job_id, status, completed_at, started_at, uri_segment
+    id, parent_job_id, status, completed_at, started_at, uri_segment,
+    parent_tool_use_id IS NOT NULL
 ";
 
 const ARTIFACT_COLUMNS: &str = "data, output_name, artifact_type";
@@ -261,6 +264,7 @@ pub(super) fn resource_job_from_row(row: &cairn_db::turso::Row) -> DbResult<Reso
         completed_at: row.opt_i64(3)?.map(|value| value as i32),
         started_at: row.opt_i64(4)?.map(|value| value as i32),
         uri_segment: row.opt_text(5)?,
+        delegated: row.i64(6)? != 0,
     })
 }
 

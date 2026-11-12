@@ -178,16 +178,7 @@ pub async fn recompute_job_owner_attention_conn(
     job_id: &str,
     issue_id: Option<&str>,
 ) -> DbResult<()> {
-    let mut rows = conn
-        .query("SELECT thread_id FROM jobs WHERE id = ?1", (job_id,))
-        .await?;
-    if let Some(thread_id) = rows
-        .next()
-        .await?
-        .map(|row| row.opt_text(0))
-        .transpose()?
-        .flatten()
-    {
+    if let Some(thread_id) = job_thread_id_conn(conn, job_id).await? {
         recompute_thread_attention_conn(conn, &thread_id).await
     } else if let Some(issue_id) = issue_id {
         recompute_issue_status_conn(conn, issue_id).await?;
@@ -197,8 +188,60 @@ pub async fn recompute_job_owner_attention_conn(
     }
 }
 
+/// Recompute every attention projection a run's question or permission request
+/// feeds: its issue's, and its job's thread's when the job belongs to a thread.
+///
+/// Every path that answers or withdraws one of those rows calls this in the
+/// same transaction. `threads.attention` is a persisted projection, so a path
+/// that recomputed only the issue left a thread reading `needs_input` or
+/// `needs_authorization` long after its last prompt was answered.
+pub async fn recompute_run_attention_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: Option<&str>,
+    issue_id: Option<&str>,
+) -> DbResult<()> {
+    if let Some(issue_id) = issue_id {
+        recompute_issue_status_conn(conn, issue_id).await?;
+    }
+    if let Some(job_id) = job_id {
+        recompute_job_thread_attention_conn(conn, job_id).await?;
+    }
+    Ok(())
+}
+
+/// Recompute the attention of the thread that owns `job_id`, if one does.
+pub async fn recompute_job_thread_attention_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<()> {
+    match job_thread_id_conn(conn, job_id).await? {
+        Some(thread_id) => recompute_thread_attention_conn(conn, &thread_id).await,
+        None => Ok(()),
+    }
+}
+
+async fn job_thread_id_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query("SELECT thread_id FROM jobs WHERE id = ?1", (job_id,))
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.opt_text(0))
+        .transpose()?
+        .flatten())
+}
+
 /// Project human attention for a first-class thread. Rest is silent; only a
 /// pending question, permission request, or approval asks for attention.
+///
+/// Idempotent like [`recompute_issue_status_conn`]: when the column already
+/// holds the derived value nothing is written, so `threads.updated_at` (the
+/// thread's "moved" ordering) reports a real change rather than when the
+/// projection last ran.
 pub async fn recompute_thread_attention_conn(
     conn: &cairn_db::storage::TrackedConnection,
     thread_id: &str,
@@ -231,7 +274,7 @@ pub async fn recompute_thread_attention_conn(
         IssueAttention::None
     };
     conn.execute(
-        "UPDATE threads SET attention = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE threads SET attention = ?1, updated_at = ?2 WHERE id = ?3 AND attention != ?1",
         params![
             attention.to_string(),
             chrono::Utc::now().timestamp(),
@@ -928,6 +971,63 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("needs_input")
+        );
+    }
+
+    async fn thread_attention_and_updated_at(db: &LocalDb) -> (String, i64) {
+        db.query_one(
+            "SELECT attention, updated_at FROM threads WHERE id='th'",
+            (),
+            |row| Ok((row.text(0)?, row.i64(1)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn recompute_thread(db: &LocalDb) {
+        db.write(|conn| Box::pin(async move { recompute_thread_attention_conn(conn, "th").await }))
+            .await
+            .unwrap();
+    }
+
+    /// A pending permission asks for authorization; answering it clears the
+    /// thread back to `none`. A recompute that derives what the column already
+    /// holds writes nothing, so the thread's `updated_at` does not move.
+    #[tokio::test]
+    async fn thread_authorization_follows_its_permission_and_settles_without_churn() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','proj','/tmp/p',1,1);
+             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('th','p','topic','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES('j','th','p','running','thread','thread',1,1);
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r','j','p','live',1,1);
+             INSERT INTO permission_requests(id,run_id,tool_use_id,tool_name,tool_input,status,created_at) VALUES('pr','r','t','read','{}','pending',1);"
+        ).await.unwrap();
+
+        recompute_thread(&db).await;
+        assert_eq!(
+            thread_attention_and_updated_at(&db).await.0,
+            "needs_authorization"
+        );
+
+        db.execute(
+            "UPDATE permission_requests SET status='allowed' WHERE id='pr'",
+            (),
+        )
+        .await
+        .unwrap();
+        recompute_thread(&db).await;
+        assert_eq!(thread_attention_and_updated_at(&db).await.0, "none");
+
+        db.execute("UPDATE threads SET updated_at = 4242 WHERE id='th'", ())
+            .await
+            .unwrap();
+        recompute_thread(&db).await;
+        assert_eq!(
+            thread_attention_and_updated_at(&db).await,
+            ("none".to_string(), 4242),
+            "a no-op recompute must not write, so updated_at must not move"
         );
     }
 

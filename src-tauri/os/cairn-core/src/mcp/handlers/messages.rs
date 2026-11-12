@@ -186,8 +186,14 @@ async fn resolve_channel_id(
 }
 
 enum RecipientJob {
-    Started { job_id: String, run_id: String },
-    Pending { parent_segment: Option<String> },
+    Started {
+        job_id: String,
+        run_id: String,
+    },
+    Pending {
+        parent_segment: Option<String>,
+        delegated: bool,
+    },
 }
 
 /// Resolve the recipient job and its latest run for a direct message.
@@ -252,7 +258,8 @@ async fn find_recipient_job(
                 Some(task) => {
                     conn.query(
                         "
-                        SELECT j.id, r.id, j.status, p.uri_segment
+                        SELECT j.id, r.id, j.status, p.uri_segment,
+                               j.parent_tool_use_id IS NOT NULL
                         FROM jobs j
                         JOIN jobs p ON j.parent_job_id = p.id
                         LEFT JOIN runs r ON r.job_id = j.id
@@ -273,7 +280,8 @@ async fn find_recipient_job(
                 None => {
                     conn.query(
                         "
-                        SELECT j.id, r.id, j.status, NULL
+                        SELECT j.id, r.id, j.status, NULL,
+                               j.parent_tool_use_id IS NOT NULL
                         FROM jobs j
                         LEFT JOIN runs r ON r.job_id = j.id
                         WHERE j.issue_id = ?1 AND j.execution_id = ?2
@@ -296,6 +304,7 @@ async fn find_recipient_job(
                         Some(run_id) => Ok(RecipientJob::Started { job_id, run_id }),
                         None if row.text(2)? == "pending" => Ok(RecipientJob::Pending {
                             parent_segment: row.opt_text(3)?,
+                            delegated: row.i64(4)? != 0,
                         }),
                         None => Err(DbError::Internal(format!(
                             "recipient job {job_id} has no run but is not pending"
@@ -575,9 +584,17 @@ pub async fn append_direct_message_with_urgency(
         .ok_or_else(|| format!("{} not found ({}).", addressed_uri, scope_hint))?
         {
             RecipientJob::Started { job_id, run_id } => (job_id, run_id),
-            RecipientJob::Pending { parent_segment } => {
-                let condition =
-                    crate::jobs::queries::pending_dispatch_description(parent_segment.as_deref());
+            RecipientJob::Pending {
+                parent_segment,
+                delegated,
+            } => {
+                use crate::jobs::queries::PendingDispatch;
+                let pending = match (delegated, parent_segment.as_deref()) {
+                    (true, _) => PendingDispatch::Delegated,
+                    (false, Some(parent)) => PendingDispatch::AfterParent(parent),
+                    (false, None) => PendingDispatch::AfterRecipe,
+                };
+                let condition = crate::jobs::queries::pending_dispatch_description(pending);
                 return Err(format!("{addressed_uri}: {condition}."));
             }
         }

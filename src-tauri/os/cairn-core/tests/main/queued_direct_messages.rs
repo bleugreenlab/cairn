@@ -535,6 +535,69 @@ async fn pending_task_and_recipe_node_reads_name_their_dispatch_conditions() {
     }
 }
 
+/// A task its parent spawned (`parent_tool_use_id` set) and a node claimed
+/// `running` before its first run exists, beside the recipe shapes above.
+async fn insert_starting_targets(db: &LocalDb) {
+    insert_pending_targets(db).await;
+    db.execute_script(
+        "INSERT INTO jobs (id, execution_id, parent_job_id, parent_tool_use_id, issue_id, project_id, node_name, uri_segment, status, task_description, created_at, updated_at)
+           VALUES ('pending-probe', 'pending-exec', 'pending-builder', 'tool-1', 'pending-issue', 'pending-project', 'probe', 'probe', 'pending', 'probe it', 1, 1);
+         INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+           VALUES ('claimed-fresh', 'pending-exec', 'fresh', 'pending-issue', 'pending-project', 'fresh', 'fresh', 'running', 1, 1);",
+    )
+    .await
+    .unwrap();
+}
+
+const STARTING: &str = "starting: spawned by its parent and preparing to launch; it starts on its own, nothing to wait for";
+
+/// A delegated task launches on its own, so its read must not tell the reader
+/// to wait for its parent; a claimed node with no run says it is preparing
+/// rather than showing a bare running icon.
+#[tokio::test(flavor = "current_thread")]
+async fn delegated_task_reads_as_starting_and_claimed_node_as_preparing() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_starting_targets(&orch.db.local).await;
+
+    for (uri, expected) in [
+        ("cairn://p/pending/42/1/builder/task/probe", STARTING),
+        (
+            "cairn://p/pending/42/1/fresh",
+            "preparing: claimed and setting up its branch and worktree; no run yet.",
+        ),
+    ] {
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp".to_string(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({ "uri": uri }),
+            tool_use_id: None,
+            origin: None,
+        };
+        let result = handle_read_issue_resource(&orch, &request).await;
+        assert!(result.contains(expected), "{uri}: {result}");
+        assert!(!result.contains("dispatches when"), "{uri}: {result}");
+    }
+
+    let error = append_direct_message(
+        &orch,
+        &callback_request("write", None),
+        "pending",
+        42,
+        1,
+        "builder",
+        Some("probe"),
+        "hello",
+        false,
+    )
+    .await
+    .expect_err("a task without a first run cannot receive a run-addressed direct message");
+    assert!(error.contains(STARTING), "{error}");
+    assert!(!error.contains("dispatches when"), "{error}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn message_to_pending_task_refuses_with_the_same_dispatch_condition() {
     let (_temp, orch) = common::test_orchestrator().await;

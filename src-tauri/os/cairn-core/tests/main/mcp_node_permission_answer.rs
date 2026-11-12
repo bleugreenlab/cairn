@@ -233,8 +233,8 @@ async fn insert_thread_task_permission_fixture(db: &LocalDb) {
             )
             .await?;
             conn.execute(
-                "INSERT INTO jobs(id, execution_id, project_id, parent_job_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
-                 VALUES ('thread-task-job', 'host-exec-1', ?1, 'thread-job-1', 'Explore', 'running', 'thread-task-session', 'probe', 2, 2)",
+                "INSERT INTO jobs(id, execution_id, thread_id, project_id, parent_job_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+                 VALUES ('thread-task-job', 'host-exec-1', 'thread-1', ?1, 'thread-job-1', 'Explore', 'running', 'thread-task-session', 'probe', 2, 2)",
                 params![project_id.as_str()],
             )
             .await?;
@@ -505,7 +505,25 @@ async fn thread_task_permission_patch_resolves_the_tasks_request() {
             Some(expected),
             "{decision}"
         );
+        assert_eq!(
+            thread_attention(&db).await.as_deref(),
+            Some("none"),
+            "{decision}: answering the thread's last pending request must clear its attention"
+        );
     }
+}
+
+async fn thread_attention(db: &LocalDb) -> Option<String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query("SELECT attention FROM threads WHERE id = 'thread-1'", ())
+                .await?;
+            rows.next().await?.map(|row| row.text(0)).transpose()
+        })
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]

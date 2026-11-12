@@ -2109,23 +2109,41 @@ pub(super) async fn read_node(
     }
     push_placement_default(&mut output, db, &job.id).await;
     if job.status == "pending" && job.started_at.is_none() {
-        output.push_str(&crate::jobs::queries::pending_dispatch_description(None));
+        use crate::jobs::queries::PendingDispatch;
+        let pending = if job.delegated {
+            PendingDispatch::Delegated
+        } else {
+            PendingDispatch::AfterRecipe
+        };
+        output.push_str(&crate::jobs::queries::pending_dispatch_description(pending));
         output.push_str(".\n\n");
     }
     // A launch waiting for a session slot has a run and no process, which reads
     // like a hang unless the summary says where it is in line and why.
-    if let Some(launch) = crate::execution::jobs::describe_job_launch(orch, &job.id).await {
-        output.push_str(&launch);
+    let launch = crate::execution::jobs::describe_job_launch(orch, &job.id).await;
+    if let Some(launch) = launch.as_deref() {
+        output.push_str(launch);
         output.push('\n');
     }
     // Branch preparation queues for the project store before any run exists,
     // so without this line a new job reads as stalled for as long as it waits.
-    if let Some((status, position, since_ms)) = orch.branch_preparation_wait(&job.id) {
+    let preparation = orch.branch_preparation_wait(&job.id);
+    if let Some((status, position, since_ms)) = preparation.as_ref() {
         output.push_str(&crate::orchestrator::describe_preparation_wait(
-            &status,
-            position,
+            status,
+            *position,
             &format_node_timestamp(since_ms / 1_000),
         ));
+        output.push_str("\n\n");
+    }
+    if job.status == "running"
+        && launch.is_none()
+        && preparation.is_none()
+        && crate::jobs::queries::latest_run_id_for_job(db, &job.id)
+            .await
+            .is_none()
+    {
+        output.push_str(crate::jobs::queries::PREPARING_DESCRIPTION);
         output.push_str("\n\n");
     }
     // A call that settled but whose result never made it back reads like a
@@ -3246,10 +3264,21 @@ pub(super) async fn read_task(
     );
     push_placement_default(&mut output, db, &task_job.id).await;
     if let Some(parent_segment) = parent_segment {
-        output.push_str(&crate::jobs::queries::pending_dispatch_description(Some(
-            &parent_segment,
-        )));
+        use crate::jobs::queries::PendingDispatch;
+        let pending = if task_job.delegated {
+            PendingDispatch::Delegated
+        } else {
+            PendingDispatch::AfterParent(&parent_segment)
+        };
+        output.push_str(&crate::jobs::queries::pending_dispatch_description(pending));
         output.push_str(".\n\n");
+    } else if task_job.status == "running"
+        && crate::jobs::queries::latest_run_id_for_job(db, &task_job.id)
+            .await
+            .is_none()
+    {
+        output.push_str(crate::jobs::queries::PREPARING_DESCRIPTION);
+        output.push_str("\n\n");
     }
 
     let chat_uri = build_task_chat_uri(project_key, number, exec_seq, node_name, task_name);

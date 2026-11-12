@@ -667,6 +667,22 @@ pub(crate) async fn withdraw_prompt_conn(
             params![prompt_id, now, cause],
         )
         .await?;
+    if changed > 0 {
+        let mut rows = conn
+            .query(
+                "SELECT r.job_id FROM prompts p JOIN runs r ON p.run_id = r.id WHERE p.id = ?1",
+                params![prompt_id],
+            )
+            .await?;
+        let job_id = match rows.next().await? {
+            Some(row) => row.opt_text(0)?,
+            None => None,
+        };
+        drop(rows);
+        if let Some(job_id) = job_id {
+            crate::transitions::outcome::recompute_job_thread_attention_conn(conn, &job_id).await?;
+        }
+    }
     Ok(changed > 0)
 }
 
@@ -679,14 +695,18 @@ pub(crate) async fn withdraw_job_prompts_conn(
     now: i64,
 ) -> DbResult<u64> {
     let cause = withdrawal_cause_text(cause)?;
-    Ok(conn
+    let withdrawn = conn
         .execute(
             "UPDATE prompts SET withdrawn_at = ?2, withdrawn_cause = ?3
               WHERE response IS NULL AND withdrawn_at IS NULL
                 AND turn_id IN (SELECT id FROM turns WHERE job_id = ?1)",
             params![job_id, now, cause],
         )
-        .await?)
+        .await?;
+    if withdrawn > 0 {
+        crate::transitions::outcome::recompute_job_thread_attention_conn(conn, job_id).await?;
+    }
+    Ok(withdrawn)
 }
 
 fn withdrawal_cause_text(cause: WithdrawalCause) -> DbResult<String> {
@@ -1763,9 +1783,12 @@ async fn record_prompt_response_conn(
         .await?;
     }
 
-    if let Some(issue_id) = issue_id.as_deref() {
-        crate::transitions::outcome::recompute_issue_status_conn(conn, issue_id).await?;
-    }
+    crate::transitions::outcome::recompute_run_attention_conn(
+        conn,
+        job_id.as_deref(),
+        issue_id.as_deref(),
+    )
+    .await?;
 
     Ok(PromptRecord::Recorded(Box::new(PromptResume {
         run_id,
