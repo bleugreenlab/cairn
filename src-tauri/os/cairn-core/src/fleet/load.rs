@@ -219,6 +219,7 @@ pub(super) mod tests {
                     user: utilization,
                     system: 0.0,
                     logical_cores: 8,
+                    clusters: None,
                 },
             ),
             memory: Measurement::measured(
@@ -276,6 +277,7 @@ pub(super) mod tests {
             measured_at_unix_ms: 9,
             quality: MeasurementQuality::Sampled,
             quiet_window: None,
+            scheduling: None,
         };
         let mut index = LiveUsageIndex::default();
         assert!(index.adopt(&Measurement::measured(

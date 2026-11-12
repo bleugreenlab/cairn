@@ -152,6 +152,9 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
             HostPressureCondition::MemoryAvailable { .. }
             | HostPressureCondition::ResidentOccupancy { .. }
             | HostPressureCondition::CpuUtilization { .. }
+            // Lowered work starved of cores is relieved as the lanes beside it
+            // finish, as saturated cores are.
+            | HostPressureCondition::CpuLoweredWait { .. }
             // A memory stall ends as the work thrashing the host finishes or
             // is killed, which is the machine being busy, not broken.
             | HostPressureCondition::MemoryStall { .. }

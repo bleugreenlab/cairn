@@ -167,6 +167,7 @@ mod tests {
             cpu_ms: Some(0),
             storage_io_bytes: None,
             uninterruptible: false,
+            scheduling: None,
         }
     }
     fn census(rows: Vec<CensusRow>) -> Census {
@@ -263,6 +264,7 @@ mod scope_tests {
             cpu_ms: Some(1),
             storage_io_bytes: None,
             uninterruptible: false,
+            scheduling: None,
         }
     }
     fn identity(pid: u32, start: u64) -> ProcessIdentity {

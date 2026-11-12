@@ -4078,7 +4078,9 @@ pub const MACHINE_READING_STALE_AFTER_MS: u64 = MACHINE_SAMPLE_BLIND_AFTER_MS;
 /// still only priced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StallInstrument {
-    /// Non-idle share of processor time.
+    /// Processor saturation, read by two arms ([`CpuArm`]): the whole host's
+    /// non-idle share, and on a colocated macOS executor the share of lowered
+    /// work's demand left waiting for a core.
     Cpu,
     /// Share of wall time every non-idle task was stalled on memory at once
     /// (PSI `full` avg10).
@@ -4123,7 +4125,7 @@ impl StallInstrument {
 
 /// The two readings [`StallInstrument::DiskWrite`] is drawn from. Each is a
 /// tracker of its own with its own bars; the instrument is pressured when
-/// either arm is ([`combine_disk_write_arms`]).
+/// either arm is ([`combine_arms`]).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum DiskWriteArm {
@@ -4149,19 +4151,50 @@ impl DiskWriteArm {
     }
 }
 
+/// The two readings [`StallInstrument::Cpu`] is drawn from. Each is a tracker
+/// of its own with its own bars; the instrument is pressured when either arm
+/// is ([`CpuArms::combined`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum CpuArm {
+    /// The whole host's non-idle share of processor time, on every platform.
+    Utilization,
+    /// The share of lowered work's demand that waited for a core
+    /// ([`LoweredCpu::wait_share`]), on a colocated macOS executor that lowers
+    /// its bulk work. Lowered work can be held to a fraction of the host (the
+    /// efficiency cluster plus a trickle of the performance cores) while the
+    /// host as a whole reads half idle, so the utilisation arm cannot see the
+    /// saturation it governs (cairn/6980). Never measured anywhere else, where
+    /// it gates nothing.
+    LoweredWait,
+}
+
+impl CpuArm {
+    pub const ALL: [Self; 2] = [Self::Utilization, Self::LoweredWait];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utilization => "utilisation",
+            Self::LoweredWait => "lowered-wait",
+        }
+    }
+}
+
 /// One tracker of the host-stall brake: the single reading of a one-arm
-/// instrument, or one arm of [`StallInstrument::DiskWrite`]. Each gauge has
-/// its own [`StallInstrumentPolicy`] and its own hysteresis.
+/// instrument, or one arm of [`StallInstrument::Cpu`] or
+/// [`StallInstrument::DiskWrite`]. Each gauge has its own
+/// [`StallInstrumentPolicy`] and its own hysteresis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StallGauge {
-    Cpu,
+    Cpu(CpuArm),
     Memory,
     DiskWrite(DiskWriteArm),
 }
 
 impl StallGauge {
-    pub const ALL: [Self; 4] = [
-        Self::Cpu,
+    pub const ALL: [Self; 5] = [
+        Self::Cpu(CpuArm::Utilization),
+        Self::Cpu(CpuArm::LoweredWait),
         Self::Memory,
         Self::DiskWrite(DiskWriteArm::Stall),
         Self::DiskWrite(DiskWriteArm::Latency),
@@ -4169,7 +4202,7 @@ impl StallGauge {
 
     pub fn instrument(self) -> StallInstrument {
         match self {
-            Self::Cpu => StallInstrument::Cpu,
+            Self::Cpu(_) => StallInstrument::Cpu,
             Self::Memory => StallInstrument::Memory,
             Self::DiskWrite(_) => StallInstrument::DiskWrite,
         }
@@ -4177,7 +4210,8 @@ impl StallGauge {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Cpu => "CPU",
+            Self::Cpu(CpuArm::Utilization) => "CPU",
+            Self::Cpu(CpuArm::LoweredWait) => "CPU lowered-work wait",
             Self::Memory => "Memory",
             Self::DiskWrite(DiskWriteArm::Stall) => "Build volume write stall",
             Self::DiskWrite(DiskWriteArm::Latency) => "Build volume write latency",
@@ -4191,12 +4225,15 @@ impl StallGauge {
     }
 }
 
-/// The [`StallInstrument::DiskWrite`] verdict from its two arms: pressured if
-/// either arm is, accepting only when every arm that has measured accepts, and
-/// unknown when neither has measured, which fails open (tenets 1309, 302).
+/// A two-arm instrument's verdict from its arms: pressured if either arm is,
+/// accepting only when every arm that has measured accepts, and unknown when
+/// neither has measured, which fails open (tenets 1309, 302). The one
+/// combination both [`CpuArms`] and [`DiskWriteArms`] use.
 ///
-/// The combined reading is the stall arm's, the one fraction the instrument
-/// has; which arm tripped and both readings are on the arms themselves.
+/// The combined reading is the primary arm's (the first): the one figure the
+/// instrument has always reported, whole-host utilisation for CPU and the
+/// stall fraction for build-volume writes. Which arm tripped and both readings
+/// are on the arms themselves.
 ///
 /// A verdict is only as fresh as the evidence that establishes it. A
 /// pressured instrument takes `measured_at_unix_ms` from its pressured arms
@@ -4204,11 +4241,11 @@ impl StallGauge {
 /// blind on its own time, and a healthy reading from the other arm can never
 /// renew it into current saturation. An instrument that is not pressured
 /// takes the newer arm's time, so it goes blind only when both have stopped.
-pub fn combine_disk_write_arms(
-    stall: &StallInstrumentHealth,
-    latency: &StallInstrumentHealth,
+pub fn combine_arms(
+    primary: &StallInstrumentHealth,
+    secondary: &StallInstrumentHealth,
 ) -> StallInstrumentHealth {
-    let arms = [stall, latency];
+    let arms = [primary, secondary];
     let pressured: Vec<&StallInstrumentHealth> = arms
         .iter()
         .copied()
@@ -4246,12 +4283,123 @@ pub fn combine_disk_write_arms(
     };
     StallInstrumentHealth {
         state,
-        reading: stall.reading,
+        reading: primary.reading,
         state_since_unix_ms,
         measured_at_unix_ms: evidence
             .iter()
             .filter_map(|arm| arm.measured_at_unix_ms)
             .max(),
+    }
+}
+
+/// The arm a pressured instrument is pressured by: the pressured arm with the
+/// newest reading, since a stale one beside it is history, and the earlier arm
+/// of `arms` when both are equally fresh.
+fn freshest_pressured_arm<A: Copy>(arms: [(A, &StallInstrumentHealth); 2]) -> Option<A> {
+    arms.into_iter()
+        .filter(|(_, health)| health.state == StallInstrumentState::Pressured)
+        .fold(
+            None,
+            |best: Option<(A, &StallInstrumentHealth)>, (arm, health)| match best {
+                Some(best) if best.1.measured_at_unix_ms >= health.measured_at_unix_ms => {
+                    Some(best)
+                }
+                _ => Some((arm, health)),
+            },
+        )
+        .map(|(arm, _)| arm)
+}
+
+/// Both arms of the CPU instrument, as their trackers hold them. On the wire
+/// they are [`HostHealth::cpu_admission`] (the utilisation arm, under the name
+/// it has always had) and [`HostHealth::cpu_lowered_wait`]; the instrument's
+/// verdict is always derived from them ([`Self::combined`]), never transported
+/// beside them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CpuArms {
+    pub utilization: StallInstrumentHealth,
+    pub lowered_wait: StallInstrumentHealth,
+}
+
+impl CpuArms {
+    /// The instrument's verdict, drawn from both arms. Its reading is the
+    /// utilisation arm's.
+    pub fn combined(&self) -> StallInstrumentHealth {
+        combine_arms(&self.utilization, &self.lowered_wait)
+    }
+
+    pub fn arm(&self, arm: CpuArm) -> &StallInstrumentHealth {
+        match arm {
+            CpuArm::Utilization => &self.utilization,
+            CpuArm::LoweredWait => &self.lowered_wait,
+        }
+    }
+
+    /// The arm a pressured instrument is pressured by: the freshest pressured
+    /// arm, utilisation on a tie. The one answer the executor's refusal, the
+    /// runner's hold, and the page each name.
+    pub fn pressured_arm(&self) -> Option<CpuArm> {
+        freshest_pressured_arm([
+            (CpuArm::Utilization, &self.utilization),
+            (CpuArm::LoweredWait, &self.lowered_wait),
+        ])
+    }
+
+    /// The arm that holds admission now: pressured on a fresh reading, the
+    /// freshest such arm, utilisation on a tie. A stale arm drops out on its
+    /// own and never takes a fresh one with it, so a lowered-wait arm that
+    /// faulted cannot release a utilisation arm that is pressured now. The one
+    /// rule the executor's admission, the runner's hold and the page apply.
+    pub fn holding_arm(&self, now_unix_ms: u64) -> Option<CpuArm> {
+        let fresh = |health: &StallInstrumentHealth| {
+            if health.fresh(now_unix_ms) {
+                health.clone()
+            } else {
+                StallInstrumentHealth::default()
+            }
+        };
+        freshest_pressured_arm([
+            (CpuArm::Utilization, &fresh(&self.utilization)),
+            (CpuArm::LoweredWait, &fresh(&self.lowered_wait)),
+        ])
+    }
+
+    /// Whether the instrument has gone blind, and what that means.
+    ///
+    /// The utilisation arm is the machine sampler's own reading, so it blind
+    /// is the sampler blind, which holds (CAIRN-4359), exactly as before this
+    /// arm existed. The lowered-wait arm blind while utilisation is fresh is a
+    /// broken instrument: the tick ran and the process census did not deliver,
+    /// which fails open (tenets 1441, 302). The census rolling its windows on
+    /// the sampler's cadence is what keeps this arm inside the blindness bound
+    /// on a machine whose census is healthy.
+    pub fn blindness(&self, now_unix_ms: u64) -> Option<StallBlindness> {
+        if let Some(blind) = StallBlindness::classify(
+            StallInstrument::Cpu,
+            &self.utilization,
+            &self.utilization,
+            now_unix_ms,
+        ) {
+            return Some(blind);
+        }
+        let age_ms = self.lowered_wait.blind_age_ms(now_unix_ms)?;
+        Some(
+            match self
+                .utilization
+                .measured_at_unix_ms
+                .filter(|_| self.utilization.fresh(now_unix_ms))
+            {
+                Some(measured_at) => StallBlindness::InstrumentFault {
+                    instrument: StallInstrument::Cpu,
+                    age_ms,
+                    sampler_age_ms: now_unix_ms.saturating_sub(measured_at),
+                },
+                None => StallBlindness::SamplerBlind {
+                    instrument: StallInstrument::Cpu,
+                    age_ms,
+                },
+            },
+        )
     }
 }
 
@@ -4277,7 +4425,7 @@ pub struct DiskWriteArms {
 impl DiskWriteArms {
     /// The instrument's verdict, drawn from both arms.
     pub fn combined(&self) -> StallInstrumentHealth {
-        combine_disk_write_arms(&self.stall, &self.latency)
+        combine_arms(&self.stall, &self.latency)
     }
 
     pub fn arm(&self, arm: DiskWriteArm) -> &StallInstrumentHealth {
@@ -4292,17 +4440,10 @@ impl DiskWriteArms {
     /// stall arm when both are equally fresh. The one answer the executor's
     /// refusal, the runner's hold, and the page each name.
     pub fn pressured_arm(&self) -> Option<DiskWriteArm> {
-        DiskWriteArm::ALL
-            .into_iter()
-            .filter(|arm| self.arm(*arm).state == StallInstrumentState::Pressured)
-            .fold(None, |best: Option<DiskWriteArm>, arm| match best {
-                Some(best)
-                    if self.arm(best).measured_at_unix_ms >= self.arm(arm).measured_at_unix_ms =>
-                {
-                    Some(best)
-                }
-                _ => Some(arm),
-            })
+        freshest_pressured_arm([
+            (DiskWriteArm::Stall, &self.stall),
+            (DiskWriteArm::Latency, &self.latency),
+        ])
     }
 
     /// Take each arm from `candidate` that was measured after the one held
@@ -4497,6 +4638,22 @@ pub enum StallBlindness {
 }
 
 impl StallBlindness {
+    /// Classify `instrument`'s verdict `health` against the CPU instrument's
+    /// arms: the CPU instrument by its own arm rule ([`CpuArms::blindness`]),
+    /// every other instrument against the utilisation arm, which is the
+    /// sampler's age.
+    pub fn of(
+        instrument: StallInstrument,
+        health: &StallInstrumentHealth,
+        cpu: &CpuArms,
+        now_unix_ms: u64,
+    ) -> Option<Self> {
+        match instrument {
+            StallInstrument::Cpu => cpu.blindness(now_unix_ms),
+            _ => Self::classify(instrument, health, &cpu.utilization, now_unix_ms),
+        }
+    }
+
     /// Classify `reading`, a gauge of `instrument`, against the CPU gauge
     /// `cpu`, or `None` when the reading is not blind. A CPU gauge that never
     /// measured cannot vouch for the sampler, so blindness then stays
@@ -7956,7 +8113,27 @@ pub struct LearnedResourceEstimate {
 /// unaccounted, exactly as before this change, so admission there concludes
 /// what it did. An older runner never sends the request, so a newer executor
 /// never reports the class or the field to it.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 170;
+///
+/// Version 171 (cairn/6980) gives the CPU instrument a second arm. On a
+/// colocated macOS executor that lowers its bulk work, the executor reads the
+/// share of lowered work's demand left waiting for a core and holds
+/// non-interactive admission on it ([`CpuArm::LoweredWait`]). [`HostHealth`]
+/// and [`MachineSample`] carry the arm as `cpuLoweredWait` beside
+/// `cpuAdmission`, which is now the utilisation arm, with its reading
+/// `loweredCpu`; the runner derives the CPU verdict from both arms
+/// ([`CpuArms`]); and a hold on the new arm crosses as
+/// [`HostPressureCondition::CpuLoweredWait`]. `CpuPressure.clusters`,
+/// `LiveUsageSample.scheduling` and the policy's `cpuLoweredWait` bars are
+/// additive and defaulted. What a runner gets wrong talking to an older
+/// executor: nothing, since that executor sends no arm and the derived
+/// verdict is its utilisation arm alone, as before. An older runner talking to
+/// a newer executor would read only `cpuAdmission`, rank a machine holding on
+/// its lowered-wait arm as accepting and keep offering it work, and fail to
+/// decode a decline whose evidence names `cpuLoweredWait` (the condition enum
+/// carries no `#[serde(other)]`). That changes what a runner concludes about
+/// admission (tenet 541), so the number moves and the handshake refuses the
+/// pairing until the executor self-updates.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -11364,6 +11541,14 @@ pub enum HostPressureCondition {
         state_since_unix_ms: u64,
         measured_at_unix_ms: u64,
     },
+    /// The CPU instrument's lowered-wait arm holds: lowered work has left at
+    /// least the entry share of its demand waiting for a core for the entry
+    /// window ([`LoweredWaitHold::describe`] says it in words).
+    CpuLoweredWait {
+        wait: LoweredWaitHold,
+        state_since_unix_ms: u64,
+        measured_at_unix_ms: u64,
+    },
     /// The host-stall brake's memory instrument holds: every non-idle task has
     /// been stalled on memory (PSI `full` avg10) at or above the entry bar for
     /// the entry window, and has not yet stayed under the clear bar long
@@ -13865,6 +14050,212 @@ pub struct CpuPressure {
     /// than work getting done, which is why it is worth separating.
     pub system: f64,
     pub logical_cores: usize,
+    /// The same window split by core kind, on a machine whose kernel says
+    /// which logical CPU is which (macOS on Apple silicon). Context only:
+    /// nothing gates or prices on it, and the whole-host `utilization` above
+    /// stays the reading placement and the utilisation arm use. Absent where
+    /// the map could not be read or did not agree with the kernel's own counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clusters: Option<CpuClusters>,
+}
+
+/// [`CpuPressure`] by core kind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuClusters {
+    pub efficiency: CpuCluster,
+    pub performance: CpuCluster,
+}
+
+/// One core kind's share of the window.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuCluster {
+    pub logical_cpus: usize,
+    /// Non-idle share of these CPUs' time in `[0, 1]`.
+    pub utilization: f64,
+}
+
+/// What every lowered process tree on the machine did over the process
+/// sampler's last live window, summed: the reading [`CpuArm::LoweredWait`] is
+/// drawn from.
+///
+/// Lowered trees are the ones the executor spawned under its bulk-priority
+/// clamp, marked at spawn rather than inferred from a nice value, so no
+/// resident and no process outside Cairn is counted. All times come from one
+/// kernel struct per process (`proc_pid_rusage`), so their ratios never mix
+/// sources. Darwin's runnable time includes running time; runnable less CPU
+/// is the time threads waited for a core.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct LoweredCpu {
+    pub window_ms: u64,
+    pub cpu_ms: u64,
+    pub runnable_ms: u64,
+    /// CPU on performance cores, where the kernel reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_cpu_ms: Option<u64>,
+    /// How many lowered trees the window covers.
+    pub trees: u32,
+}
+
+/// Lowered demand under this many thread-equivalents over a window reads as
+/// a wait share of zero rather than as whatever ratio a few milliseconds make:
+/// a lone idle lane is not evidence of starvation, and an idle machine must
+/// still measure this arm (fresh, at zero) rather than go blind on it.
+pub const LOWERED_DEMAND_FLOOR_THREADS: f64 = 0.25;
+
+impl LoweredCpu {
+    /// Cores lowered work kept busy.
+    pub fn running_cores(&self) -> Option<f64> {
+        (self.window_ms > 0).then(|| self.cpu_ms as f64 / self.window_ms as f64)
+    }
+
+    /// Threads, on average, runnable but not on a core.
+    pub fn waiting_threads(&self) -> Option<f64> {
+        (self.window_ms > 0)
+            .then(|| self.runnable_ms.saturating_sub(self.cpu_ms) as f64 / self.window_ms as f64)
+    }
+
+    /// Threads, on average, that wanted a core: running plus waiting.
+    pub fn demand_threads(&self) -> Option<f64> {
+        (self.window_ms > 0).then(|| self.runnable_ms as f64 / self.window_ms as f64)
+    }
+
+    /// The share of lowered demand left waiting for a core, in `[0, 1]`: zero
+    /// for work that got every core it wanted, near one for work that waits
+    /// almost always. Zero under [`LOWERED_DEMAND_FLOOR_THREADS`].
+    pub fn wait_share(&self) -> Option<f64> {
+        // No lowered tree at all is a measured zero: an idle machine must keep
+        // this arm fresh rather than leave it to go blind.
+        if self.trees == 0 {
+            return Some(0.0);
+        }
+        let demand = self.demand_threads()?;
+        if demand < LOWERED_DEMAND_FLOOR_THREADS || self.runnable_ms == 0 {
+            return Some(0.0);
+        }
+        Some(self.runnable_ms.saturating_sub(self.cpu_ms) as f64 / self.runnable_ms as f64)
+    }
+
+    /// The share of lowered CPU spent on performance cores. Context: a lowered
+    /// loop that waits 87% of its time still spends 38-52% of its little CPU
+    /// there, so this cannot tell confinement from healthy spreading.
+    pub fn performance_share(&self) -> Option<f64> {
+        let performance = self.performance_cpu_ms?;
+        (self.cpu_ms > 0).then(|| performance as f64 / self.cpu_ms as f64)
+    }
+}
+
+/// The lowered-wait arm's hold, in integers so hold evidence compares for
+/// equality: thousandths for shares, hundredths for cores and threads. One
+/// renderer ([`Self::describe`]) serves the executor's refusal, the runner's
+/// hold evidence, and the page.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LoweredWaitHold {
+    /// The arm's sustained reading, from its tracker: what the hold is on.
+    pub wait_permille: u32,
+    /// The last window's figures, absent when no lowered work is running now
+    /// (the hold then stands on hysteresis until the clear window passes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_centicores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_centithreads: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_share_permille: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_permille: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_idle_permille: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efficiency_permille: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efficiency_cpus: Option<u32>,
+    pub entry_permille: u32,
+    pub clear_permille: u32,
+}
+
+fn permille(fraction: f64) -> u32 {
+    (fraction.clamp(0.0, 1.0) * 1_000.0).round() as u32
+}
+
+fn centi(value: f64) -> u32 {
+    (value.max(0.0) * 100.0).round().min(f64::from(u32::MAX)) as u32
+}
+
+impl LoweredWaitHold {
+    /// The hold on the arm's sustained `wait_share` against `policy`, with
+    /// the last lowered window's figures where lowered work is running and the
+    /// host's whole and per-cluster utilisation as context. Infallible: the
+    /// hold is the tracker's, and describing it never decides it.
+    pub fn of(
+        wait_share: f64,
+        lowered: Option<&LoweredCpu>,
+        cpu: Option<&CpuPressure>,
+        policy: StallInstrumentPolicy,
+    ) -> Self {
+        let clusters = cpu.and_then(|cpu| cpu.clusters);
+        let running = lowered.filter(|lowered| lowered.trees > 0);
+        Self {
+            wait_permille: permille(wait_share),
+            running_centicores: running.and_then(LoweredCpu::running_cores).map(centi),
+            waiting_centithreads: running.and_then(LoweredCpu::waiting_threads).map(centi),
+            performance_share_permille: running
+                .and_then(LoweredCpu::performance_share)
+                .map(permille),
+            host_permille: cpu.map(|cpu| permille(cpu.utilization)),
+            performance_idle_permille: clusters
+                .map(|clusters| permille(1.0 - clusters.performance.utilization)),
+            efficiency_permille: clusters.map(|clusters| permille(clusters.efficiency.utilization)),
+            efficiency_cpus: clusters.map(|clusters| {
+                u32::try_from(clusters.efficiency.logical_cpus).unwrap_or(u32::MAX)
+            }),
+            entry_permille: permille(policy.entry),
+            clear_permille: permille(policy.clear),
+        }
+    }
+
+    /// `lowered work waits runnable for 86% of its demand (3.0 cores running,
+    /// 18 threads waiting; entry 50%, clear 30%); host 45%, performance cores
+    /// 73% idle, efficiency cluster 100% of 4`. Attribution of CPU used
+    /// outside Cairn (cairn/6513) appends to this line, not into it.
+    pub fn describe(&self) -> String {
+        let percent = |permille: u32| format!("{:.0}%", f64::from(permille) / 10.0);
+        let now = match (self.running_centicores, self.waiting_centithreads) {
+            (Some(running), Some(waiting)) => format!(
+                "{:.1} cores running, {:.0} threads waiting",
+                f64::from(running) / 100.0,
+                f64::from(waiting) / 100.0
+            ),
+            _ => "no lowered work running now".to_string(),
+        };
+        let mut out = format!(
+            "lowered work waits runnable for {} of its demand ({now}; entry {}, clear {})",
+            percent(self.wait_permille),
+            percent(self.entry_permille),
+            percent(self.clear_permille),
+        );
+        let context: Vec<String> = [
+            self.host_permille
+                .map(|host| format!("host {}", percent(host))),
+            self.performance_idle_permille
+                .map(|idle| format!("performance cores {} idle", percent(idle))),
+            self.efficiency_permille
+                .map(|busy| match self.efficiency_cpus {
+                    Some(cpus) => format!("efficiency cluster {} of {cpus}", percent(busy)),
+                    None => format!("efficiency cluster {}", percent(busy)),
+                }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !context.is_empty() {
+            out.push_str("; ");
+            out.push_str(&context.join(", "));
+        }
+        out
+    }
 }
 
 /// Physical memory on the machine, which is the memory question placement asks.
@@ -14585,11 +14976,24 @@ impl MachineTelemetry {
 #[serde(rename_all = "camelCase")]
 pub struct HostHealth {
     pub pressure: Option<HostPressureEvidence>,
-    /// The host-stall brake's sustained CPU verdict. This is separate from the
-    /// latest machine reading because admission acts on hysteresis, not a
-    /// single sample.
+    /// The host-stall brake's CPU utilisation arm ([`CpuArm::Utilization`]),
+    /// under the name it carried while it was the whole CPU instrument. The
+    /// instrument's verdict is derived from both arms ([`Self::cpu_arms`]).
+    /// Separate from the latest machine reading because admission acts on
+    /// hysteresis, not a single sample.
     #[serde(default)]
     pub cpu_admission: StallInstrumentHealth,
+    /// The CPU instrument's lowered-wait arm ([`CpuArm::LoweredWait`]).
+    /// Defaulted, so an executor that predates it, and every executor that
+    /// does not lower its work, reads as never having measured it, which
+    /// gates nothing.
+    #[serde(default)]
+    pub cpu_lowered_wait: StallInstrumentHealth,
+    /// The lowered-wait arm's reading, with its parts. `UnsupportedPlatform`
+    /// where per-process runnable time cannot be read, and on an executor that
+    /// does not lower its work.
+    #[serde(default)]
+    pub lowered_cpu: Measurement<LoweredCpu>,
     /// The host-stall brake's sustained memory-stall verdict. Defaulted, so an
     /// executor that predates it reads as never having measured memory stall,
     /// which fails open.
@@ -14725,6 +15129,10 @@ pub struct MachineSample {
     #[serde(default)]
     pub cpu_admission: StallInstrumentHealth,
     #[serde(default)]
+    pub cpu_lowered_wait: StallInstrumentHealth,
+    #[serde(default)]
+    pub lowered_cpu: Measurement<LoweredCpu>,
+    #[serde(default)]
     pub memory_admission: StallInstrumentHealth,
     #[serde(default)]
     pub disk_write_arms: DiskWriteArms,
@@ -14755,6 +15163,8 @@ impl MachineSample {
             memory_pressure: report.host.memory_pressure.clone(),
             gpus: report.host.gpus.clone(),
             cpu_admission: report.host.cpu_admission.clone(),
+            cpu_lowered_wait: report.host.cpu_lowered_wait.clone(),
+            lowered_cpu: report.host.lowered_cpu.clone(),
             memory_admission: report.host.memory_admission.clone(),
             disk_write_arms: report.host.disk_write_arms.clone(),
             live_usage: Measurement::default(),
@@ -14764,11 +15174,19 @@ impl MachineSample {
 }
 
 impl HostHealth {
-    /// One instrument of the host-stall brake. The build-volume write
-    /// instrument's verdict is derived from its arms on every read.
+    /// The CPU instrument's two arms.
+    pub fn cpu_arms(&self) -> CpuArms {
+        CpuArms {
+            utilization: self.cpu_admission.clone(),
+            lowered_wait: self.cpu_lowered_wait.clone(),
+        }
+    }
+
+    /// One instrument of the host-stall brake. The CPU and build-volume write
+    /// instruments' verdicts are derived from their arms on every read.
     pub fn stall(&self, instrument: StallInstrument) -> StallInstrumentHealth {
         match instrument {
-            StallInstrument::Cpu => self.cpu_admission.clone(),
+            StallInstrument::Cpu => self.cpu_arms().combined(),
             StallInstrument::Memory => self.memory_admission.clone(),
             StallInstrument::DiskWrite => self.disk_write_arms.combined(),
         }
@@ -14777,15 +15195,11 @@ impl HostHealth {
     /// Every instrument that measured and has gone blind, classified against
     /// the sampler ([`StallBlindness`]).
     pub fn stall_blindness(&self, now_unix_ms: u64) -> Vec<StallBlindness> {
+        let cpu = self.cpu_arms();
         StallInstrument::ALL
             .into_iter()
             .filter_map(|instrument| {
-                StallBlindness::classify(
-                    instrument,
-                    &self.stall(instrument),
-                    &self.cpu_admission,
-                    now_unix_ms,
-                )
+                StallBlindness::of(instrument, &self.stall(instrument), &cpu, now_unix_ms)
             })
             .collect()
     }
@@ -14851,6 +15265,29 @@ pub struct LiveUsageSample {
     /// reading. An absent window is never evidence of a stall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_window: Option<QuietWindow>,
+    /// What the scheduler accounted to the tree across the window, where the
+    /// platform reads it (macOS). Absent elsewhere, and for a window in which
+    /// some member's accounting could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<SchedulingWindow>,
+}
+
+/// One tree's scheduler accounting across a live window, every figure from
+/// the same kernel struct so they divide without mixing sources. Runnable time
+/// includes running time ([`LoweredCpu`] has the arithmetic).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulingWindow {
+    /// The window this accounting covers, which can be longer than the CPU
+    /// window beside it: a census that could not read some member's
+    /// accounting leaves this window open rather than undercount it.
+    pub window_ms: u64,
+    pub runnable_ms: u64,
+    pub cpu_ms: u64,
+    /// The part of `cpu_ms` spent on performance cores, where the kernel
+    /// reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_cpu_ms: Option<u64>,
 }
 
 impl LiveUsageSample {
@@ -14938,8 +15375,10 @@ impl ExecutorSubstrateReport {
         // every sample for the same reason CPU does: carried only on the
         // report, they aged with the liveness beat and read blind half the
         // time on a machine whose sampler never missed a tick.
+        adopted |= newer(&mut host.lowered_cpu, &sample.lowered_cpu);
         for (current, candidate) in [
             (&mut host.cpu_admission, &sample.cpu_admission),
+            (&mut host.cpu_lowered_wait, &sample.cpu_lowered_wait),
             (&mut host.memory_admission, &sample.memory_admission),
         ] {
             if candidate.measured_at_unix_ms > current.measured_at_unix_ms {
@@ -16005,9 +16444,14 @@ pub struct ExecutorRuntimePolicy {
     /// that budget above this floor, across the materialized pool.
     #[serde(default = "default_slot_target_max_bytes")]
     pub slot_target_max_bytes: u64,
-    /// The host-stall brake's CPU instrument bars.
+    /// The host-stall brake's CPU utilisation-arm bars.
     #[serde(default = "default_cpu_admission")]
     pub cpu_admission: StallInstrumentPolicy,
+    /// The CPU instrument's lowered-wait-arm bars, a fraction of lowered
+    /// demand left waiting. Defaulted, so a policy written before the arm
+    /// loads with its defaults.
+    #[serde(default = "default_cpu_lowered_wait")]
+    pub cpu_lowered_wait: StallInstrumentPolicy,
     /// The host-stall brake's memory instrument bars. Defaulted, so a policy
     /// written before the memory instrument loads with its defaults.
     #[serde(default = "default_memory_admission")]
@@ -16033,6 +16477,10 @@ pub struct ExecutorRuntimePolicy {
 
 pub fn default_cpu_admission() -> StallInstrumentPolicy {
     StallInstrumentPolicy::CPU_DEFAULT
+}
+
+pub fn default_cpu_lowered_wait() -> StallInstrumentPolicy {
+    StallInstrumentPolicy::CPU_LOWERED_WAIT_DEFAULT
 }
 
 pub fn default_memory_admission() -> StallInstrumentPolicy {
@@ -16065,7 +16513,8 @@ impl ExecutorRuntimePolicy {
     /// The bars `gauge` is held to.
     pub fn stall_policy(&self, gauge: StallGauge) -> StallInstrumentPolicy {
         match gauge {
-            StallGauge::Cpu => self.cpu_admission,
+            StallGauge::Cpu(CpuArm::Utilization) => self.cpu_admission,
+            StallGauge::Cpu(CpuArm::LoweredWait) => self.cpu_lowered_wait,
             StallGauge::Memory => self.memory_admission,
             StallGauge::DiskWrite(DiskWriteArm::Stall) => self.disk_write_stall,
             StallGauge::DiskWrite(DiskWriteArm::Latency) => self.disk_write_latency,
@@ -16115,6 +16564,46 @@ impl StallInstrumentPolicy {
     pub const CPU_DEFAULT: Self = Self {
         entry: 0.90,
         clear: 0.75,
+        entry_window_ms: 15_000,
+        clear_window_ms: 10_000,
+    };
+
+    /// CPU lowered-wait arm: hold once lowered work has left at least half its
+    /// demand waiting for a core for 15 s; release after 10 s at 30% or less.
+    /// The windows are the utilisation arm's, since both read the same
+    /// sampler's 5 s windows.
+    ///
+    /// Tenet 1438 sets a bar measured before it is set. The wait share is
+    /// (runnable − CPU) / runnable over the lowered trees' window, Darwin's
+    /// runnable time including running time (cairn/6980):
+    ///
+    /// Measured 11-11 with the census's own arithmetic (V6 rusage deltas over
+    /// every nice-10 process of the executor's user, 5 s windows):
+    ///
+    /// | Specimen                                              | Wait share | Held? |
+    /// |-------------------------------------------------------|------------|-------|
+    /// | local, lanes starved (6980 comment 2, b0-b3)          | 0.82-0.84  | yes   |
+    /// | local, one lowered busy loop beside them              | 0.84       | yes   |
+    /// | local, 21:5x lanes, load1 23, 1.8-2.2 cores served    | 0.68-0.78  | yes   |
+    /// | bgsrv-mac idle                                        | 0.00       | no    |
+    /// | bgsrv-mac, 1 and 4 clamped loops (P-share 1.00)       | 0.00       | no    |
+    /// | bgsrv-mac, 24 clamped loops on 12 CPUs                | 0.58       | yes   |
+    ///
+    /// A tree that gets every core it asks for reads zero whatever its size,
+    /// and the floor ([`LOWERED_DEMAND_FLOOR_THREADS`]) keeps a few idle lanes
+    /// at zero. Twenty-four CPU-bound threads on twelve CPUs is oversubscribed
+    /// by construction (at least 0.5 even with every core given), so holding
+    /// it is the brake doing its job; it sits 8 points over entry, so a
+    /// machine moderately oversubscribed but not confined (16 threads on 12
+    /// CPUs is 0.25) is not held. Not taken: local with no lanes or one lone
+    /// lane (local had no quiet window), and bgsrv-mac with a rust-tests lane
+    /// (bgsrv-mac does not lower its work, so the arm never measures there).
+    /// The entry window absorbs a compile's brief link-step fan-out; the clear
+    /// bar sits well under entry so a machine that has just drained does not
+    /// flap.
+    pub const CPU_LOWERED_WAIT_DEFAULT: Self = Self {
+        entry: 0.50,
+        clear: 0.30,
         entry_window_ms: 15_000,
         clear_window_ms: 10_000,
     };
@@ -16374,6 +16863,7 @@ impl Default for ExecutorRuntimePolicy {
             quarantine_forensic_window_ms: default_quarantine_forensic_window_ms(),
             slot_target_max_bytes: default_slot_target_max_bytes(),
             cpu_admission: StallInstrumentPolicy::CPU_DEFAULT,
+            cpu_lowered_wait: StallInstrumentPolicy::CPU_LOWERED_WAIT_DEFAULT,
             memory_admission: StallInstrumentPolicy::MEMORY_DEFAULT,
             disk_write_stall: StallInstrumentPolicy::DISK_WRITE_STALL_DEFAULT,
             disk_write_latency: StallInstrumentPolicy::DISK_WRITE_LATENCY_DEFAULT,
@@ -18408,6 +18898,10 @@ pub enum AdmissionHoldEvidence {
     /// reading.
     Pressure {
         cpu_pressured: bool,
+        /// The CPU instrument holds on its lowered-wait arm, with that arm's
+        /// figures. Absent when it holds on utilisation, or not at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_lowered_wait: Option<LoweredWaitHold>,
         #[serde(default)]
         memory_stalled: bool,
         /// The build-volume write instrument holds, and this request is
@@ -18475,6 +18969,7 @@ impl AdmissionHoldEvidence {
             ),
             Self::Pressure {
                 cpu_pressured,
+                cpu_lowered_wait,
                 memory_stalled,
                 disk_write_stalled,
                 disk_write_device,
@@ -18504,7 +18999,10 @@ impl AdmissionHoldEvidence {
                         }
                     });
                 let parts: Vec<String> = cpu_pressured
-                    .then(|| "sustained CPU pressure".to_string())
+                    .then(|| match cpu_lowered_wait {
+                        Some(hold) => hold.describe(),
+                        None => "sustained CPU pressure".to_string(),
+                    })
                     .into_iter()
                     .chain(memory_stalled.then(|| "memory stall".to_string()))
                     .chain(
@@ -23148,6 +23646,7 @@ mod tests {
                             user: 0.25,
                             system: 0.25,
                             logical_cores: 8,
+                            clusters: None,
                         },
                     ),
                     ..MachineSample::default()
@@ -24096,6 +24595,7 @@ mod tests {
                             user: 0.02,
                             system: 0.01,
                             logical_cores: 16,
+                            clusters: None,
                         },
                     ),
                     memory: Measurement::measured(
@@ -25055,6 +25555,22 @@ mod tests {
                 state_since_unix_ms: Some(3),
                 measured_at_unix_ms: Some(4),
             },
+            cpu_lowered_wait: StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                reading: Some(0.12),
+                state_since_unix_ms: Some(3),
+                measured_at_unix_ms: Some(4),
+            },
+            lowered_cpu: Measurement::measured(
+                4,
+                LoweredCpu {
+                    window_ms: 5_000,
+                    cpu_ms: 10_000,
+                    runnable_ms: 11_400,
+                    performance_cpu_ms: Some(6_000),
+                    trees: 2,
+                },
+            ),
             memory_admission: StallInstrumentHealth {
                 state: StallInstrumentState::Pressured,
                 reading: Some(0.23),
@@ -25221,6 +25737,7 @@ mod tests {
                     user: 1.125,
                     system: 0.375,
                     logical_cores: 10,
+                    clusters: None,
                 },
             ),
             memory: Measurement::measured(
@@ -26666,6 +27183,7 @@ mod tests {
                     user: 0.3,
                     system: 0.1,
                     logical_cores: 16,
+                    clusters: None,
                 },
             ),
             memory: Measurement::measured(
@@ -26758,6 +27276,7 @@ mod tests {
                     user: 0.1875,
                     system: 0.0625,
                     logical_cores: 8,
+                    clusters: None,
                 },
             ),
             memory: Measurement::measured(
@@ -27136,12 +27655,12 @@ mod tests {
         };
         let unknown = StallInstrumentHealth::default();
         assert_eq!(
-            combine_disk_write_arms(&unknown, &unknown).state,
+            combine_arms(&unknown, &unknown).state,
             StallInstrumentState::Unknown
         );
         let accepting = at(StallInstrumentState::Accepting, 10, 50);
         let pressured = at(StallInstrumentState::Pressured, 20, 40);
-        let combined = combine_disk_write_arms(&accepting, &pressured);
+        let combined = combine_arms(&accepting, &pressured);
         assert_eq!(combined.state, StallInstrumentState::Pressured);
         assert_eq!(combined.state_since_unix_ms, Some(20));
         assert_eq!(
@@ -27149,7 +27668,7 @@ mod tests {
             Some(40),
             "a pressured verdict is as fresh as its pressured arm, never the healthy one"
         );
-        let combined = combine_disk_write_arms(&accepting, &unknown);
+        let combined = combine_arms(&accepting, &unknown);
         assert_eq!(combined.state, StallInstrumentState::Accepting);
         assert_eq!(combined.measured_at_unix_ms, Some(50));
 
@@ -27170,6 +27689,262 @@ mod tests {
         assert!(StallInstrument::DiskWrite.holds_class(CellCommandClass::CargoTest));
         assert!(!StallInstrument::DiskWrite.holds_class(CellCommandClass::Vitest));
         assert!(StallInstrument::Memory.holds_class(CellCommandClass::Vitest));
+    }
+
+    fn arm_at(state: StallInstrumentState, reading: f64, measured: u64) -> StallInstrumentHealth {
+        StallInstrumentHealth {
+            state,
+            reading: Some(reading),
+            state_since_unix_ms: Some(measured.saturating_sub(20_000)),
+            measured_at_unix_ms: Some(measured),
+        }
+    }
+
+    /// The CPU instrument is pressured when either arm is, its reading stays
+    /// the utilisation arm's, and the arm a hold names is the freshest
+    /// pressured one, utilisation on a tie.
+    #[test]
+    fn the_cpu_verdict_combines_its_arms() {
+        let now = 1_000_000;
+        let mut host = HostHealth {
+            cpu_admission: arm_at(StallInstrumentState::Accepting, 0.45, now - 2_000),
+            cpu_lowered_wait: arm_at(StallInstrumentState::Pressured, 0.86, now - 2_000),
+            ..HostHealth::default()
+        };
+        let verdict = host.stall(StallInstrument::Cpu);
+        assert_eq!(verdict.state, StallInstrumentState::Pressured);
+        assert_eq!(verdict.reading, Some(0.45), "the utilisation arm's figure");
+        assert!(verdict.holds(now));
+        assert_eq!(host.cpu_arms().pressured_arm(), Some(CpuArm::LoweredWait));
+        host.cpu_admission.state = StallInstrumentState::Pressured;
+        assert_eq!(
+            host.cpu_arms().pressured_arm(),
+            Some(CpuArm::Utilization),
+            "utilisation wins a tie"
+        );
+        host.cpu_lowered_wait.measured_at_unix_ms = Some(now - 1_000);
+        assert_eq!(host.cpu_arms().pressured_arm(), Some(CpuArm::LoweredWait));
+
+        // A machine that never measured the arm (no lowering, Linux) reads
+        // exactly as the utilisation arm alone.
+        let unlowered = HostHealth {
+            cpu_admission: arm_at(StallInstrumentState::Accepting, 0.45, now - 2_000),
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            unlowered.stall(StallInstrument::Cpu),
+            unlowered.cpu_admission
+        );
+        assert!(unlowered.stall_blindness(now).is_empty());
+    }
+
+    /// Utilisation blind is the sampler blind and holds; the lowered-wait arm
+    /// blind under a fresh utilisation reading is a broken instrument, which
+    /// holds nothing, even when it last read pressured.
+    #[test]
+    fn the_cpu_arms_go_blind_by_their_own_rule() {
+        let now = 1_000_000;
+        let stale = now - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
+        let host = HostHealth {
+            cpu_admission: arm_at(StallInstrumentState::Accepting, 0.45, now - 2_000),
+            cpu_lowered_wait: arm_at(StallInstrumentState::Pressured, 0.86, stale),
+            ..HostHealth::default()
+        };
+        assert!(matches!(
+            host.cpu_arms().blindness(now),
+            Some(StallBlindness::InstrumentFault {
+                instrument: StallInstrument::Cpu,
+                sampler_age_ms: 2_000,
+                ..
+            })
+        ));
+        assert!(!host.stall(StallInstrument::Cpu).holds(now));
+        assert_eq!(host.sampler_blind_instrument(now), None);
+        assert_eq!(host.cpu_arms().holding_arm(now), None);
+
+        // A fault in the lowered-wait arm, whatever it last read, never
+        // releases a utilisation arm pressured now.
+        for stale_state in [
+            StallInstrumentState::Accepting,
+            StallInstrumentState::Pressured,
+        ] {
+            let saturated = HostHealth {
+                cpu_admission: arm_at(StallInstrumentState::Pressured, 0.95, now - 2_000),
+                cpu_lowered_wait: arm_at(stale_state, 0.86, stale),
+                ..HostHealth::default()
+            };
+            assert!(matches!(
+                saturated.cpu_arms().blindness(now),
+                Some(StallBlindness::InstrumentFault { .. })
+            ));
+            assert_eq!(
+                saturated.cpu_arms().holding_arm(now),
+                Some(CpuArm::Utilization),
+                "{stale_state:?}"
+            );
+            assert!(saturated.stall(StallInstrument::Cpu).holds(now));
+        }
+
+        let sampler_blind = HostHealth {
+            cpu_admission: arm_at(StallInstrumentState::Accepting, 0.45, stale),
+            cpu_lowered_wait: arm_at(StallInstrumentState::Accepting, 0.1, now - 2_000),
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            sampler_blind.sampler_blind_instrument(now),
+            Some((StallInstrument::Cpu, MACHINE_SAMPLE_BLIND_AFTER_MS + 1))
+        );
+    }
+
+    /// Runnable time includes running time, so an unstarved tree reads zero,
+    /// and the planner's local specimen reads as starved.
+    #[test]
+    fn lowered_cpu_reads_waiting_as_runnable_less_cpu() {
+        let unstarved = LoweredCpu {
+            window_ms: 5_000,
+            cpu_ms: 5_000,
+            runnable_ms: 5_000,
+            performance_cpu_ms: Some(5_000),
+            trees: 1,
+        };
+        assert_eq!(unstarved.wait_share(), Some(0.0));
+        assert_eq!(unstarved.waiting_threads(), Some(0.0));
+        // 6980 comment 2, b1: ~3.0 cores running of ~17.9 threads runnable.
+        let starved = LoweredCpu {
+            window_ms: 5_000,
+            cpu_ms: 15_100,
+            runnable_ms: 89_300,
+            performance_cpu_ms: Some(5_285),
+            trees: 4,
+        };
+        let share = starved.wait_share().unwrap();
+        assert!((share - 0.831).abs() < 0.001, "{share}");
+        assert!((starved.running_cores().unwrap() - 3.02).abs() < 1e-9);
+        assert!((starved.performance_share().unwrap() - 0.35).abs() < 1e-9);
+        // Under the floor is a measured zero, not a ratio of a few ticks.
+        let trickle = LoweredCpu {
+            window_ms: 5_000,
+            cpu_ms: 100,
+            runnable_ms: 1_000,
+            performance_cpu_ms: None,
+            trees: 1,
+        };
+        assert_eq!(trickle.wait_share(), Some(0.0));
+        assert_eq!(
+            LoweredCpu::default().wait_share(),
+            Some(0.0),
+            "no lowered tree is a measured zero"
+        );
+        assert_eq!(
+            LoweredCpu {
+                trees: 1,
+                ..LoweredCpu::default()
+            }
+            .wait_share(),
+            None,
+            "a tree's empty window is no reading"
+        );
+    }
+
+    #[test]
+    fn the_lowered_wait_hold_says_what_waits_and_what_is_idle() {
+        let lowered = LoweredCpu {
+            window_ms: 5_000,
+            cpu_ms: 15_000,
+            runnable_ms: 107_000,
+            performance_cpu_ms: Some(5_400),
+            trees: 4,
+        };
+        let cpu = CpuPressure {
+            utilization: 0.45,
+            user: 0.4,
+            system: 0.05,
+            logical_cores: 16,
+            clusters: Some(CpuClusters {
+                efficiency: CpuCluster {
+                    logical_cpus: 4,
+                    utilization: 1.0,
+                },
+                performance: CpuCluster {
+                    logical_cpus: 12,
+                    utilization: 0.27,
+                },
+            }),
+        };
+        let hold = LoweredWaitHold::of(
+            lowered.wait_share().unwrap(),
+            Some(&lowered),
+            Some(&cpu),
+            StallInstrumentPolicy::CPU_LOWERED_WAIT_DEFAULT,
+        );
+        assert_eq!(
+            hold.describe(),
+            "lowered work waits runnable for 86% of its demand (3.0 cores running, 18 threads waiting; entry 50%, clear 30%); host 45%, performance cores 73% idle, efficiency cluster 100% of 4"
+        );
+        let bare = LoweredWaitHold::of(
+            lowered.wait_share().unwrap(),
+            Some(&lowered),
+            None,
+            StallInstrumentPolicy::CPU_LOWERED_WAIT_DEFAULT,
+        );
+        assert_eq!(
+            bare.describe(),
+            "lowered work waits runnable for 86% of its demand (3.0 cores running, 18 threads waiting; entry 50%, clear 30%)"
+        );
+        // The last lowered tree has exited and the hold is riding its clear
+        // window: the hold is still described, never dropped for want of a
+        // window to describe.
+        let draining = LoweredWaitHold::of(
+            0.0,
+            Some(&LoweredCpu::default()),
+            None,
+            StallInstrumentPolicy::CPU_LOWERED_WAIT_DEFAULT,
+        );
+        assert_eq!(
+            draining.describe(),
+            "lowered work waits runnable for 0% of its demand (no lowered work running now; entry 50%, clear 30%)"
+        );
+        let evidence = AdmissionHoldEvidence::Pressure {
+            cpu_pressured: true,
+            cpu_lowered_wait: Some(hold),
+            memory_stalled: false,
+            disk_write_stalled: false,
+            disk_write_device: None,
+            disk_write_arm: None,
+            available_memory_bytes: None,
+            owed_memory_bytes: 0,
+            memory_floor_bytes: 0,
+        };
+        assert_eq!(
+            evidence.describe_at(0),
+            format!("held: {}", hold.describe()),
+            "the runner's hold reads in the executor's words"
+        );
+        let round_trip: AdmissionHoldEvidence =
+            serde_json::from_value(serde_json::to_value(&evidence).unwrap()).unwrap();
+        assert_eq!(round_trip, evidence);
+    }
+
+    /// Each CPU arm is adopted from a sample by its own stamp: a stale copy of
+    /// one never displaces a fresh copy held for it.
+    #[test]
+    fn the_cpu_arms_and_lowered_reading_are_adopted_by_their_own_stamps() {
+        let mut report = ExecutorSubstrateReport::default();
+        report.host.cpu_admission = arm_at(StallInstrumentState::Accepting, 0.4, 10_000);
+        report.host.cpu_lowered_wait = arm_at(StallInstrumentState::Pressured, 0.8, 30_000);
+        let mut sample = MachineSample::of_report(&report);
+        sample.cpu_admission = arm_at(StallInstrumentState::Accepting, 0.5, 20_000);
+        sample.cpu_lowered_wait = arm_at(StallInstrumentState::Accepting, 0.1, 25_000);
+        sample.lowered_cpu = Measurement::measured(20_000, LoweredCpu::default());
+        assert!(report.adopt_newer_readings(&sample));
+        assert_eq!(report.host.cpu_admission, sample.cpu_admission);
+        assert_eq!(
+            report.host.cpu_lowered_wait.measured_at_unix_ms,
+            Some(30_000),
+            "an older arm never displaces a newer one"
+        );
+        assert_eq!(report.host.lowered_cpu, sample.lowered_cpu);
+        assert!(!report.adopt_newer_readings(&sample), "nothing newer twice");
     }
 
     /// The CPU bars keep the serialized names they had while CPU was the only
@@ -27195,7 +27970,14 @@ mod tests {
     #[test]
     fn stall_instrument_policy_rejects_invalid_bars_and_windows() {
         for (instrument, valid) in [
-            (StallGauge::Cpu, StallInstrumentPolicy::CPU_DEFAULT),
+            (
+                StallGauge::Cpu(CpuArm::Utilization),
+                StallInstrumentPolicy::CPU_DEFAULT,
+            ),
+            (
+                StallGauge::Cpu(CpuArm::LoweredWait),
+                StallInstrumentPolicy::CPU_LOWERED_WAIT_DEFAULT,
+            ),
             (StallGauge::Memory, StallInstrumentPolicy::MEMORY_DEFAULT),
             (
                 StallGauge::DiskWrite(DiskWriteArm::Stall),
@@ -27243,7 +28025,12 @@ mod tests {
             }
             let mut policy = ExecutorRuntimePolicy::default();
             match instrument {
-                StallGauge::Cpu => policy.cpu_admission.clear = policy.cpu_admission.entry,
+                StallGauge::Cpu(CpuArm::Utilization) => {
+                    policy.cpu_admission.clear = policy.cpu_admission.entry
+                }
+                StallGauge::Cpu(CpuArm::LoweredWait) => {
+                    policy.cpu_lowered_wait.clear = policy.cpu_lowered_wait.entry
+                }
                 StallGauge::Memory => policy.memory_admission.clear = policy.memory_admission.entry,
                 StallGauge::DiskWrite(DiskWriteArm::Stall) => {
                     policy.disk_write_stall.clear = policy.disk_write_stall.entry
@@ -27393,7 +28180,7 @@ mod tests {
         assert_eq!(arms.last_pressured_unix_ms, Some(25_000));
         assert_eq!(
             report.host.stall(StallInstrument::DiskWrite),
-            combine_disk_write_arms(&arms.stall, &arms.latency)
+            combine_arms(&arms.stall, &arms.latency)
         );
         assert_eq!(
             report.host.stall(StallInstrument::DiskWrite).state,

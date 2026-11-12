@@ -289,6 +289,7 @@ mod tests {
             cpu_ms: Some(1),
             uninterruptible: false,
             storage_io_bytes: Some(1),
+            scheduling: None,
         }
     }
     fn register(state: &AgentProcessState, run: &str, pid: u32, start: u64) {

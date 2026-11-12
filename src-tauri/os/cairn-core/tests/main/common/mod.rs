@@ -869,6 +869,7 @@ impl cairn_exec::machine::MachineProbe for MeasuredTestMachine {
                 user: 0.04,
                 system: 0.01,
                 logical_cores: 8,
+                clusters: None,
             },
         )
     }

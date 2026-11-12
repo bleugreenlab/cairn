@@ -830,6 +830,7 @@ mod tests {
             cpu_ms: Some(10),
             storage_io_bytes: Some(20),
             uninterruptible: false,
+            scheduling: None,
         }
     }
     type Script = Arc<Mutex<Option<(Vec<CensusRow>, Vec<u32>, bool)>>>;
@@ -1278,6 +1279,7 @@ mod delivery_tests {
             cpu_ms: Some(1),
             storage_io_bytes: None,
             uninterruptible: false,
+            scheduling: None,
         });
         true
     }
@@ -1632,6 +1634,7 @@ mod watch_settle_tests {
                         cpu_ms: Some(1),
                         storage_io_bytes: None,
                         uninterruptible: false,
+                        scheduling: None,
                     });
                 }
                 true

@@ -28,9 +28,10 @@ use std::borrow::Cow;
 
 use cairn_common::executor_protocol::{
     admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence,
-    CellPriority, CellRequest, DeclineReason, DiskHealthStatus, DiskWriteArmHold,
-    ExecutorSubstrateReport, FleetSnapshot, ProvisioningHold, RepositoryLocator, ResidencyFence,
-    StallInstrument, StallInstrumentState, StoragePressureOutcome, StorageSweepStatus,
+    CellPriority, CellRequest, CpuArm, DeclineReason, DiskHealthStatus, DiskWriteArmHold,
+    ExecutorSubstrateReport, FleetSnapshot, LoweredWaitHold, ProvisioningHold, RepositoryLocator,
+    ResidencyFence, StallGauge, StallInstrument, StallInstrumentState, StoragePressureOutcome,
+    StorageSweepStatus,
 };
 
 /// How the executor will judge one piece of work: the facts the offer carries
@@ -152,6 +153,7 @@ pub(crate) fn posted_hold(
         if let Some(mut reading) = read_pressure(request, machine) {
             let AdmissionHoldEvidence::Pressure {
                 cpu_pressured,
+                cpu_lowered_wait,
                 memory_stalled,
                 disk_write_stalled,
                 disk_write_device,
@@ -163,7 +165,13 @@ pub(crate) fn posted_hold(
             else {
                 unreachable!("the pressure reader reads pressure");
             };
-            *cpu_pressured &= health.host.cpu_admission.fresh(now_unix_ms);
+            // The arm pressured on a fresh reading, by the executor's rule: a
+            // faulted arm drops out without releasing a fresh one.
+            let holding = health.host.cpu_arms().holding_arm(now_unix_ms);
+            *cpu_pressured &= holding.is_some();
+            if holding != Some(CpuArm::LoweredWait) {
+                *cpu_lowered_wait = None;
+            }
             *memory_stalled &= health.host.memory_admission.fresh(now_unix_ms);
             *disk_write_stalled &= health
                 .host
@@ -340,7 +348,22 @@ fn read_provisioning(
 
 fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Reading> {
     let health = machine.health;
-    let cpu_pressured = health.host.cpu_admission.state == StallInstrumentState::Pressured;
+    // Either CPU arm, by the one combination the executor's admission uses;
+    // the lowered-wait arm holds exactly the classes the utilisation arm does.
+    let cpu_pressured =
+        health.host.stall(StallInstrument::Cpu).state == StallInstrumentState::Pressured;
+    let arms = health.host.cpu_arms();
+    let cpu_lowered_wait = (cpu_pressured && arms.pressured_arm() == Some(CpuArm::LoweredWait))
+        .then(|| {
+            LoweredWaitHold::of(
+                arms.lowered_wait.reading.unwrap_or(0.0),
+                health.host.lowered_cpu.value(),
+                health.machine.cpu.value(),
+                health
+                    .applied_policy
+                    .stall_policy(StallGauge::Cpu(CpuArm::LoweredWait)),
+            )
+        });
     let memory_stalled = health.host.memory_admission.state == StallInstrumentState::Pressured;
     // The executor holds compile-class work only on its build volume's write
     // instrument, by the class the queue gave the request, which is the class
@@ -364,6 +387,7 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
         },
         evidence: AdmissionHoldEvidence::Pressure {
             cpu_pressured,
+            cpu_lowered_wait,
             memory_stalled,
             disk_write_stalled,
             disk_write_device: disk_write_stalled
@@ -704,6 +728,137 @@ mod tests {
             absolute_path: "/repo".into(),
         };
         request
+    }
+
+    /// The lowered-wait arm holds exactly the work the utilisation arm holds,
+    /// every non-interactive class, and never an agent's interactive command;
+    /// its hold reads in admission's own words (cairn/6980).
+    #[test]
+    fn the_lowered_wait_arm_holds_what_cpu_holds_and_never_an_interactive_command() {
+        use cairn_common::executor_protocol::{CellCommandClass, LoweredCpu};
+        let snapshot = FleetSnapshot::default();
+        let fresh = |state, reading| StallInstrumentHealth {
+            state,
+            reading: Some(reading),
+            state_since_unix_ms: Some(NOW - 60_000),
+            measured_at_unix_ms: Some(NOW - 1_000),
+        };
+        let mut starved = health();
+        starved.host.cpu_admission = fresh(StallInstrumentState::Accepting, 0.45);
+        starved.host.cpu_lowered_wait = fresh(StallInstrumentState::Pressured, 0.86);
+        starved.host.lowered_cpu = Measurement::measured(
+            NOW - 1_000,
+            LoweredCpu {
+                window_ms: 5_000,
+                cpu_ms: 15_000,
+                runnable_ms: 107_000,
+                performance_cpu_ms: Some(5_400),
+                trees: 4,
+            },
+        );
+        let mut saturated = health();
+        saturated.host.cpu_admission = fresh(StallInstrumentState::Pressured, 0.95);
+        for class in [
+            CellCommandClass::CargoTest,
+            CellCommandClass::CargoCheck,
+            CellCommandClass::Build,
+            CellCommandClass::Vitest,
+            CellCommandClass::Typecheck,
+            CellCommandClass::Other,
+        ] {
+            let mut request = request();
+            request.command_class = class;
+            let view = AdmissionView::of_request(&request);
+            let held = hold(&view, &request, &snapshot, &starved)
+                .unwrap_or_else(|| panic!("{class:?} is held on the lowered-wait arm"));
+            assert_eq!(held.reason, DeclineReason::Pressure);
+            let AdmissionHoldEvidence::Pressure {
+                cpu_pressured: true,
+                cpu_lowered_wait: Some(wait),
+                ..
+            } = &held.evidence
+            else {
+                panic!("{:?}", held.evidence);
+            };
+            assert_eq!(wait.wait_permille, 860);
+            assert!(
+                held.evidence
+                    .describe_at(NOW)
+                    .starts_with("held: lowered work waits runnable for 86% of its demand"),
+                "{}",
+                held.evidence.describe_at(NOW)
+            );
+            assert!(
+                hold(&view, &request, &snapshot, &saturated).is_some(),
+                "{class:?}: the utilisation arm holds the same classes"
+            );
+            let interactive = AdmissionView {
+                interactive: true,
+                ..view
+            };
+            assert_eq!(
+                hold(&interactive, &request, &snapshot, &starved),
+                None,
+                "{class:?}: an agent's interactive command is never held by it"
+            );
+        }
+    }
+
+    /// The runner holds on the executor's rule (cairn/6980): a stale
+    /// lowered-wait arm never releases a fresh utilisation hold, and a drained
+    /// lowered-wait hold stands until its tracker clears.
+    #[test]
+    fn the_runner_holds_on_the_freshly_pressured_cpu_arm_through_its_clear_window() {
+        use cairn_common::executor_protocol::LoweredCpu;
+        let snapshot = FleetSnapshot::default();
+        let request = request();
+        let view = AdmissionView::of_request(&request);
+        let health_at = |state, reading, at| StallInstrumentHealth {
+            state,
+            reading: Some(reading),
+            state_since_unix_ms: Some(at),
+            measured_at_unix_ms: Some(at),
+        };
+        let stale = NOW - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
+        for stale_state in [
+            StallInstrumentState::Accepting,
+            StallInstrumentState::Pressured,
+        ] {
+            let mut machine = health();
+            machine.host.cpu_admission =
+                health_at(StallInstrumentState::Pressured, 0.95, NOW - 1_000);
+            machine.host.cpu_lowered_wait = health_at(stale_state, 0.86, stale);
+            let held = hold(&view, &request, &snapshot, &machine)
+                .unwrap_or_else(|| panic!("{stale_state:?}: the utilisation hold stands"));
+            assert!(
+                matches!(
+                    held.evidence,
+                    AdmissionHoldEvidence::Pressure {
+                        cpu_pressured: true,
+                        cpu_lowered_wait: None,
+                        ..
+                    }
+                ),
+                "{:?}",
+                held.evidence
+            );
+        }
+
+        let mut drained = health();
+        drained.host.cpu_admission = health_at(StallInstrumentState::Accepting, 0.3, NOW - 1_000);
+        drained.host.cpu_lowered_wait =
+            health_at(StallInstrumentState::Pressured, 0.0, NOW - 1_000);
+        drained.host.lowered_cpu = Measurement::measured(NOW - 1_000, LoweredCpu::default());
+        let held = hold(&view, &request, &snapshot, &drained).expect("a drained hold still holds");
+        assert!(
+            held.evidence
+                .describe_at(NOW)
+                .contains("no lowered work running now"),
+            "{}",
+            held.evidence.describe_at(NOW)
+        );
+        drained.host.cpu_lowered_wait.state = StallInstrumentState::Accepting;
+        assert_eq!(hold(&view, &request, &snapshot, &drained), None);
     }
 
     /// The 10-16 loop: a machine pressured on CPU posts a new utilization
@@ -1284,6 +1439,7 @@ mod tests {
             measured_at_unix_ms: NOW,
             quality: MeasurementQuality::Sampled,
             quiet_window: None,
+            scheduling: None,
         });
         executing
     }
@@ -1331,6 +1487,7 @@ mod tests {
                 disk_write_arm: None,
                 disk_write_stalled: false,
                 cpu_pressured: false,
+                cpu_lowered_wait: None,
                 memory_stalled: false,
                 available_memory_bytes: Some(10 * GIB),
                 owed_memory_bytes: 16 * GIB,

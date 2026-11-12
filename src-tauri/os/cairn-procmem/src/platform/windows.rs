@@ -159,6 +159,7 @@ fn row(handle: &OwnedHandle, pid: u32, parent: u32, observed: &Times) -> CensusR
         uninterruptible: false,
         // GetProcessIoCounters includes logical/cache/pipe I/O, not physical storage.
         storage_io_bytes: None,
+        scheduling: None,
     }
 }
 

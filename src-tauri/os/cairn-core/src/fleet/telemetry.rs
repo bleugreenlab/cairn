@@ -362,6 +362,7 @@ mod tests {
                     user: 0.3,
                     system: 0.1567,
                     logical_cores: 8,
+                    clusters: None,
                 },
             ),
             memory: Measurement::measured(

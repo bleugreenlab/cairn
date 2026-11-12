@@ -236,6 +236,7 @@ pub fn census(out: &mut Census) -> bool {
                 .map(|ticks| ticks_to_ms(ticks, ticks_per_second)),
             uninterruptible,
             storage_io_bytes,
+            scheduling: None,
         });
     }
     true

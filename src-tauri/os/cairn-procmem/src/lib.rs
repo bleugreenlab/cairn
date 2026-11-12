@@ -9,7 +9,7 @@ mod membership;
 pub mod platform;
 mod sampler;
 
-pub use census::{Census, CensusFn, CensusRow};
+pub use census::{Census, CensusFn, CensusRow, SchedulingTimes};
 pub use fd_census::{fd_census, FdCensus, FdCensusRow};
 pub use identity::{KernelProcess, KernelRead, ProcessIdentity, StartKey};
 pub use sampler::{

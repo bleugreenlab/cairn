@@ -28965,6 +28965,7 @@ mod tests {
                         user: cpu_utilization,
                         system: 0.0,
                         logical_cores: 8,
+                        clusters: None,
                     },
                 ),
                 memory: Measurement::measured(
@@ -39465,6 +39466,7 @@ mod tests {
                     quiet_ms: 120_000,
                     silence_bound_ms: Fleet::REVIEW_CHECK_SILENCE_BOUND_MS,
                 }),
+                scheduling: None,
             },
         };
         assert!(entry.live_usage.adopt(&Measurement::measured(

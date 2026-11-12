@@ -203,6 +203,8 @@ use cairn_common::executor_protocol::{
     UpdateReport, UpdateState, MACHINE_READING_STALE_AFTER_MS, MACHINE_SAMPLE_BLIND_AFTER_MS,
 };
 
+use cairn_common::executor_protocol::{CpuArm, LoweredCpu, LoweredWaitHold};
+
 use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
 use cairn_common::executor_protocol::{
     ColocatedGenerationHold, ColocatedSupervision, ExecutorRetirementSummary,
@@ -1510,12 +1512,25 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str(&format!(
         "- CPU utilisation: {}\n",
         reading(&machine.cpu, executor.captured_at_unix_ms, |cpu| format!(
-            "{:.0}% of {} cores ({:.0}% user, {:.0}% system)",
+            "{:.0}% of {} cores ({:.0}% user, {:.0}% system){}",
             cpu.utilization * 100.0,
             cpu.logical_cores,
             cpu.user * 100.0,
-            cpu.system * 100.0
+            cpu.system * 100.0,
+            cpu.clusters
+                .map(|clusters| format!(
+                    "; efficiency cluster {:.0}% of {}, performance cluster {:.0}% of {}",
+                    clusters.efficiency.utilization * 100.0,
+                    clusters.efficiency.logical_cpus,
+                    clusters.performance.utilization * 100.0,
+                    clusters.performance.logical_cpus
+                ))
+                .unwrap_or_default()
         ))
+    ));
+    out.push_str(&format!(
+        "- Lowered work: {}\n",
+        render_lowered_work(&health.host.lowered_cpu, executor.captured_at_unix_ms)
     ));
     out.push_str(&format!(
         "- Memory: {}\n",
@@ -1756,23 +1771,24 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
                 &health.applied_policy,
                 executor.captured_at_unix_ms,
             ),
-            StallInstrument::Cpu | StallInstrument::Memory => {
-                let gauge = if instrument == StallInstrument::Cpu {
-                    StallGauge::Cpu
-                } else {
-                    StallGauge::Memory
-                };
+            StallInstrument::Cpu => cpu_brake_summary(
+                &health.host,
+                health.machine.cpu.value(),
+                &health.applied_policy,
+                executor.captured_at_unix_ms,
+            ),
+            StallInstrument::Memory => {
                 let reading = health.host.stall(instrument);
                 stall_brake_summary(
-                    gauge,
+                    StallGauge::Memory,
                     &reading,
-                    StallBlindness::classify(
+                    StallBlindness::of(
                         instrument,
                         &reading,
-                        &health.host.cpu_admission,
+                        &health.host.cpu_arms(),
                         executor.captured_at_unix_ms,
                     ),
-                    health.applied_policy.stall_policy(gauge),
+                    health.applied_policy.stall_policy(StallGauge::Memory),
                     executor.captured_at_unix_ms,
                 )
             }
@@ -4015,6 +4031,9 @@ fn stall_brake_summary(
             StallGauge::DiskWrite(DiskWriteArm::Latency) => {
                 "unmeasured — this arm reads a non-rotational build device only".to_string()
             }
+            StallGauge::Cpu(CpuArm::LoweredWait) => {
+                "not measured on this executor — it reads lowered work on a colocated macOS executor only".to_string()
+            }
             _ => "never measured on this machine — the brake cannot engage".to_string(),
         };
     };
@@ -4046,11 +4065,14 @@ fn stall_brake_summary(
         StallGauge::Memory | StallGauge::DiskWrite(DiskWriteArm::Stall) => {
             format!("{:.1}%", value * 100.0)
         }
-        StallGauge::Cpu => format!("{:.0}%", value * 100.0),
+        StallGauge::Cpu(_) => format!("{:.0}%", value * 100.0),
         StallGauge::DiskWrite(DiskWriteArm::Latency) => format!("{value:.0} ms"),
     };
     let reading = match (health.reading, gauge) {
-        (Some(value), StallGauge::Cpu) => percent(value),
+        (Some(value), StallGauge::Cpu(CpuArm::Utilization)) => percent(value),
+        (Some(value), StallGauge::Cpu(CpuArm::LoweredWait)) => {
+            format!("{} of lowered demand waiting", percent(value))
+        }
         (Some(value), StallGauge::Memory) => format!("{} full (avg10)", percent(value)),
         (Some(value), StallGauge::DiskWrite(DiskWriteArm::Stall)) => {
             format!("{} full (avg60)", percent(value))
@@ -4074,7 +4096,7 @@ fn stall_brake_summary(
     match health.state {
         StallInstrumentState::Pressured => {
             let verb = match gauge {
-                StallGauge::Cpu => "pressured",
+                StallGauge::Cpu(_) => "pressured",
                 StallGauge::Memory | StallGauge::DiskWrite(DiskWriteArm::Stall) => "stalled",
                 StallGauge::DiskWrite(DiskWriteArm::Latency) => "slow",
             };
@@ -4089,6 +4111,112 @@ fn stall_brake_summary(
         }
         _ => format!("accepting at {reading} (measured {}; {entry})", age(age_ms)),
     }
+}
+
+/// What lowered work did over the last window, or why this executor has no
+/// such reading.
+fn render_lowered_work(lowered: &Measurement<LoweredCpu>, captured_at_unix_ms: u64) -> String {
+    if let MeasurementReading::Unavailable {
+        reason: cairn_common::executor_protocol::MeasurementGap::UnsupportedPlatform,
+        detail: Some(detail),
+    } = &lowered.reading
+    {
+        return format!("not measured ({detail})");
+    }
+    reading(lowered, captured_at_unix_ms, |lowered| {
+        let (Some(running), Some(waiting), Some(share)) = (
+            lowered.running_cores(),
+            lowered.waiting_threads(),
+            lowered.wait_share(),
+        ) else {
+            return "none running".to_string();
+        };
+        if lowered.trees == 0 {
+            return "none running".to_string();
+        }
+        format!(
+            "{running:.1} cores running, {waiting:.1} threads waiting runnable across {} {} ({:.0}% of its demand waits){}",
+            lowered.trees,
+            if lowered.trees == 1 { "tree" } else { "trees" },
+            share * 100.0,
+            lowered
+                .performance_share()
+                .map(|share| format!("; {:.0}% of its CPU on performance cores", share * 100.0))
+                .unwrap_or_default()
+        )
+    })
+}
+
+/// The CPU instrument. On a machine whose lowered-wait arm never measured
+/// (Linux, Windows, a remote executor) it is the utilisation arm's one line,
+/// exactly as before that arm existed. Where the arm has measured it renders
+/// as the build-volume write brake does: the verdict, naming the arm a hold is
+/// on and, for the lowered-wait arm, the hold reason admission gives, then
+/// each arm against its own bars.
+fn cpu_brake_summary(
+    host: &HostHealth,
+    cpu: Option<&cairn_common::executor_protocol::CpuPressure>,
+    policy: &ExecutorRuntimePolicy,
+    captured_at_unix_ms: u64,
+) -> String {
+    let arms = host.cpu_arms();
+    let combined = arms.combined();
+    let blindness = arms.blindness(captured_at_unix_ms);
+    let utilization = StallGauge::Cpu(CpuArm::Utilization);
+    let utilization_line = stall_brake_summary(
+        utilization,
+        &arms.utilization,
+        blindness.filter(|blind| blind.holds()),
+        policy.stall_policy(utilization),
+        captured_at_unix_ms,
+    );
+    if arms.lowered_wait.state == StallInstrumentState::Unknown {
+        return stall_brake_summary(
+            utilization,
+            &combined,
+            blindness,
+            policy.stall_policy(utilization),
+            captured_at_unix_ms,
+        );
+    }
+    let lowered_wait = StallGauge::Cpu(CpuArm::LoweredWait);
+    let wait_line = stall_brake_summary(
+        lowered_wait,
+        &arms.lowered_wait,
+        blindness.filter(|blind| !blind.holds()),
+        policy.stall_policy(lowered_wait),
+        captured_at_unix_ms,
+    );
+    let holding = arms.holding_arm(captured_at_unix_ms);
+    let head = match blindness {
+        Some(StallBlindness::SamplerBlind { .. }) => {
+            "BLIND — the machine sampler has stopped; non-interactive admission is held".to_string()
+        }
+        _ if holding.is_some() => {
+            let reason = (holding == Some(CpuArm::LoweredWait))
+                .then(|| {
+                    LoweredWaitHold::of(
+                        arms.lowered_wait.reading.unwrap_or(0.0),
+                        host.lowered_cpu.value(),
+                        cpu,
+                        policy.stall_policy(lowered_wait),
+                    )
+                })
+                .map(|hold| format!(": {}", hold.describe()))
+                .unwrap_or_default();
+            format!(
+                "pressured{} — holding new non-interactive work{reason}",
+                holding
+                    .map(|arm| format!(" ({} arm)", arm.label()))
+                    .unwrap_or_default()
+            )
+        }
+        Some(StallBlindness::InstrumentFault { .. }) => {
+            "accepting (lowered-wait arm stopped reading — not holding)".to_string()
+        }
+        _ => "accepting".to_string(),
+    };
+    format!("{head}\n  - Utilisation arm: {utilization_line}\n  - Lowered-wait arm: {wait_line}")
 }
 
 /// The build-volume write instrument: its verdict, then each arm against its
@@ -8960,6 +9088,7 @@ mod tests {
                 user: 0.30,
                 system: 0.12,
                 logical_cores: 16,
+                clusters: None,
             },
         );
         executor.health.machine.memory = Measurement::measured(
@@ -9224,6 +9353,66 @@ mod tests {
         assert!(
             rendered.contains("enters ≥90% for 15 s, clears ≤75% for 10 s"),
             "the CPU line carries the bars it is judged against: {rendered}"
+        );
+
+        // Where the lowered-wait arm measures, the brake names the arm it
+        // holds on, gives admission's own reason, and renders both arms.
+        let now = executor.captured_at_unix_ms;
+        executor.health.host.cpu_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Accepting,
+            reading: Some(0.45),
+            state_since_unix_ms: Some(now - 60_000),
+            measured_at_unix_ms: Some(now - 2_000),
+        };
+        executor.health.host.cpu_lowered_wait = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.86),
+            state_since_unix_ms: Some(now - 60_000),
+            measured_at_unix_ms: Some(now - 2_000),
+        };
+        executor.health.host.lowered_cpu = Measurement::measured(
+            now - 2_000,
+            LoweredCpu {
+                window_ms: 5_000,
+                cpu_ms: 15_000,
+                runnable_ms: 107_000,
+                performance_cpu_ms: Some(5_400),
+                trees: 4,
+            },
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("CPU brake: pressured (lowered-wait arm) — holding new non-interactive work: lowered work waits runnable for 86% of its demand (3.0 cores running, 18 threads waiting; entry 50%, clear 30%)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - Utilisation arm: accepting at 45%"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  - Lowered-wait arm: pressured at 86% of lowered demand waiting for 1m"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Lowered work: 3.0 cores running, 18.4 threads waiting runnable across 4 trees (86% of its demand waits); 36% of its CPU on performance cores (measured 2s ago)"),
+            "{rendered}"
+        );
+
+        // The arm stopped under a current sampler is a fault that holds
+        // nothing, even though it last read pressured.
+        executor.health.host.cpu_lowered_wait.measured_at_unix_ms =
+            Some(now - MACHINE_SAMPLE_BLIND_AFTER_MS - 1);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered
+                .contains("CPU brake: accepting (lowered-wait arm stopped reading — not holding)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - Lowered-wait arm: FAULT"),
+            "{rendered}"
         );
     }
 
@@ -11783,6 +11972,7 @@ mod tests {
                             user: 0.02,
                             system: 0.01,
                             logical_cores: 16,
+                            clusters: None,
                         },
                     ),
                     memory: Measurement::measured(

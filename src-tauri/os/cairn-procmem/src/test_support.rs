@@ -49,6 +49,7 @@ fn row(
         cpu_ms: Some(cpu),
         storage_io_bytes: Some(storage),
         uninterruptible: false,
+        scheduling: None,
     }
 }
 

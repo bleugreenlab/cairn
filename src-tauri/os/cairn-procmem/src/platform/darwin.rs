@@ -1,4 +1,4 @@
-use crate::census::{Census, CensusRow};
+use crate::census::{Census, CensusRow, SchedulingTimes};
 use crate::identity::{KernelProcess, KernelRead, StartKey};
 /// `PROC_PIDTBSDINFO` for one pid. A nonzero `arg` asks the kernel to
 /// look among zombies too; with zero it answers `ESRCH` for one.
@@ -151,12 +151,15 @@ pub fn census(out: &mut Census) -> bool {
             out.rows.push(CensusRow {
                 process,
                 resident_bytes: task.map(|task| task.pti_resident_size),
-                physical_footprint_bytes: usage.map(|usage| usage.ri_phys_footprint),
+                physical_footprint_bytes: usage.as_ref().map(|usage| usage.info.ri_phys_footprint),
                 cpu_ms: task.map(|task| macos_task_cpu_ms(&task, timebase)),
                 // Darwin keeps no per-process uninterruptible state to read, so
                 // on macOS only storage bytes speak for a disk-bound tree.
                 uninterruptible: false,
                 storage_io_bytes,
+                scheduling: usage
+                    .as_ref()
+                    .map(|usage| rusage_scheduling(usage, timebase)),
             });
         }
         true
@@ -204,6 +207,7 @@ pub fn census_process_group(process_group_id: u32, out: &mut Census) -> bool {
                 cpu_ms: None,
                 uninterruptible: false,
                 storage_io_bytes: None,
+                scheduling: None,
             }),
             KernelRead::Gone => {}
             KernelRead::Unreadable => out.unreadable.push(pid as u32),
@@ -361,26 +365,114 @@ pub fn macos_task_cpu_ms(task: &libc::proc_taskinfo, timebase: (u32, u32)) -> u6
     )
 }
 
-/// The kernel's resource accounting for one process: the one reader of
-/// `proc_pid_rusage` in Cairn. Fails for another user's process.
-#[cfg(target_os = "macos")]
-fn macos_rusage(pid: i32) -> Option<libc::rusage_info_v2> {
-    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-    // SAFETY: the kernel fills a caller-owned struct of the flavor named.
-    let status = unsafe {
-        libc::proc_pid_rusage(
-            pid,
-            libc::RUSAGE_INFO_V2,
-            (&mut info as *mut libc::rusage_info_v2).cast(),
-        )
-    };
-    (status == 0).then_some(info)
+/// `RUSAGE_INFO_V6` from the macOS SDK's sys/resource.h, which libc does not
+/// define.
+const RUSAGE_INFO_V6: libc::c_int = 6;
+
+/// `struct rusage_info_v6` from the macOS SDK's sys/resource.h. Its prefix is
+/// `rusage_info_v4` field for field, so a V4 answer fills the same struct and
+/// leaves the V6 tail zero. Fields this crate does not read are kept as
+/// arrays, named in the comment beside each, so the layout stays exact.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RusageInfo {
+    _ri_uuid: [u8; 16],
+    ri_user_time: u64,
+    ri_system_time: u64,
+    /// `ri_pkg_idle_wkups`, `ri_interrupt_wkups`, `ri_pageins`,
+    /// `ri_wired_size`, `ri_resident_size`.
+    _wakeups_to_resident: [u64; 5],
+    ri_phys_footprint: u64,
+    /// `ri_proc_start_abstime`, `ri_proc_exit_abstime`, the five `ri_child_*`
+    /// counters, `ri_child_elapsed_abstime`.
+    _lifetimes: [u64; 8],
+    ri_diskio_bytesread: u64,
+    ri_diskio_byteswritten: u64,
+    /// The seven `ri_cpu_time_qos_*` counters, `ri_billed_system_time`,
+    /// `ri_serviced_system_time`, `ri_logical_writes`,
+    /// `ri_lifetime_max_phys_footprint`, `ri_instructions`, `ri_cycles`,
+    /// `ri_billed_energy`, `ri_serviced_energy`,
+    /// `ri_interval_max_phys_footprint`.
+    _qos_to_interval_footprint: [u64; 16],
+    /// The last V4 field.
+    ri_runnable_time: u64,
+    _ri_flags: u64,
+    ri_user_ptime: u64,
+    ri_system_ptime: u64,
+    /// `ri_pinstructions`, `ri_pcycles`, `ri_energy_nj`, `ri_penergy_nj`,
+    /// `ri_secure_time_in_system`, `ri_secure_ptime_in_system`, the three
+    /// neural footprints, then `ri_reserved[9]`.
+    _performance_to_reserved: [u64; 18],
 }
 
-#[cfg(target_os = "macos")]
-fn rusage_storage_bytes(info: &libc::rusage_info_v2) -> u64 {
-    info.ri_diskio_bytesread
-        .saturating_add(info.ri_diskio_byteswritten)
+/// One `proc_pid_rusage` answer, and whether it came from the V6 flavor, the
+/// only one carrying performance-core time.
+struct Rusage {
+    info: RusageInfo,
+    performance_cores: bool,
+}
+
+/// Whether this kernel refused the V6 flavor, after which every read asks for
+/// V4. Learned once, so a process the census may not read (another user's)
+/// costs one failed syscall, not two.
+static RUSAGE_V6_UNSUPPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The kernel's resource accounting for one process: the one reader of
+/// `proc_pid_rusage` in Cairn. Fails for another user's process.
+fn macos_rusage(pid: i32) -> Option<Rusage> {
+    use std::sync::atomic::Ordering;
+    let mut info: RusageInfo = unsafe { std::mem::zeroed() };
+    loop {
+        let v6 = !RUSAGE_V6_UNSUPPORTED.load(Ordering::Relaxed);
+        let flavor = if v6 {
+            RUSAGE_INFO_V6
+        } else {
+            libc::RUSAGE_INFO_V4
+        };
+        // SAFETY: the kernel fills a caller-owned struct at least as large as
+        // the flavor named.
+        let status =
+            unsafe { libc::proc_pid_rusage(pid, flavor, (&mut info as *mut RusageInfo).cast()) };
+        if status == 0 {
+            return Some(Rusage {
+                info,
+                performance_cores: v6,
+            });
+        }
+        // An unknown flavor is EINVAL; anything else is this process's.
+        if !(v6 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)) {
+            return None;
+        }
+        RUSAGE_V6_UNSUPPORTED.store(true, Ordering::Relaxed);
+        tracing::info!(
+            "proc_pid_rusage refused RUSAGE_INFO_V6; reading V4, without performance-core time"
+        );
+    }
+}
+
+fn rusage_scheduling(usage: &Rusage, timebase: (u32, u32)) -> SchedulingTimes {
+    let info = &usage.info;
+    SchedulingTimes {
+        runnable_ms: mach_ticks_to_ms(info.ri_runnable_time, timebase),
+        cpu_ms: mach_ticks_to_ms(
+            info.ri_user_time.saturating_add(info.ri_system_time),
+            timebase,
+        ),
+        performance_cpu_ms: usage.performance_cores.then(|| {
+            mach_ticks_to_ms(
+                info.ri_user_ptime.saturating_add(info.ri_system_ptime),
+                timebase,
+            )
+        }),
+    }
+}
+
+fn rusage_storage_bytes(usage: &Rusage) -> u64 {
+    usage
+        .info
+        .ri_diskio_bytesread
+        .saturating_add(usage.info.ri_diskio_byteswritten)
 }
 
 /// Bytes the process has read from and written to storage, from the kernel's
@@ -394,7 +486,7 @@ pub fn macos_storage_io_bytes(pid: i32) -> Option<u64> {
 /// and `vmmap -summary` report and what memory-pressure kills count, with
 /// compressed pages included and shared pages excluded.
 pub fn process_footprint_bytes(pid: u32) -> Option<u64> {
-    macos_rusage(pid as i32).map(|info| info.ri_phys_footprint)
+    macos_rusage(pid as i32).map(|usage| usage.info.ri_phys_footprint)
 }
 
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
@@ -408,6 +500,42 @@ mod tests {
         assert_eq!(mach_ticks_to_ms(24_000_000, (125, 3)), 1000);
         assert_eq!(mach_ticks_to_ms(1_000_000_000, (1, 1)), 1000);
         assert_eq!(mach_ticks_to_ms(u64::MAX, (u32::MAX, 1)), u64::MAX);
+    }
+
+    /// The SDK's `sizeof(struct rusage_info_v6)` and field offsets (Xcode 26
+    /// SDK, read with clang): the kernel fills as many bytes as its flavor
+    /// says, so a layout drift would read the wrong counters silently.
+    #[test]
+    fn the_v6_struct_matches_the_sdk_layout() {
+        assert_eq!(std::mem::size_of::<RusageInfo>(), 464);
+        assert_eq!(std::mem::offset_of!(RusageInfo, ri_runnable_time), 288);
+        assert_eq!(std::mem::offset_of!(RusageInfo, ri_user_ptime), 304);
+        assert_eq!(std::mem::offset_of!(RusageInfo, ri_phys_footprint), 72);
+        // Everything through the runnable time is exactly libc's V4.
+        assert_eq!(
+            std::mem::offset_of!(RusageInfo, _ri_flags),
+            std::mem::size_of::<libc::rusage_info_v4>()
+        );
+    }
+
+    /// A busy loop's runnable time covers its CPU time: on Darwin runnable
+    /// includes running, which is what the lowered-wait arm's arithmetic
+    /// (waiting = runnable less CPU) depends on.
+    #[test]
+    fn own_scheduling_reads_runnable_covering_cpu() {
+        let started = std::time::Instant::now();
+        let mut spin = 0_u64;
+        while started.elapsed() < std::time::Duration::from_millis(200) {
+            spin = std::hint::black_box(spin.wrapping_add(1));
+        }
+        let usage = macos_rusage(std::process::id() as i32).expect("own rusage");
+        let times = rusage_scheduling(&usage, mach_timebase());
+        assert!(times.cpu_ms >= 150, "{times:?}");
+        // Allow for accounting granularity between the two counters.
+        assert!(times.runnable_ms + 50 >= times.cpu_ms, "{times:?}");
+        if let Some(performance) = times.performance_cpu_ms {
+            assert!(performance <= times.cpu_ms, "{times:?}");
+        }
     }
 
     #[test]

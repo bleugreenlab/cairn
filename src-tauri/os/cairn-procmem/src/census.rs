@@ -14,6 +14,25 @@ pub struct CensusRow {
     pub uninterruptible: bool,
     /// Physical storage bytes, not pipe or page-cache traffic.
     pub storage_io_bytes: Option<u64>,
+    /// What the scheduler accounted to the process: macOS only, from the same
+    /// `proc_pid_rusage` read as footprint. `None` off macOS or when the read
+    /// failed.
+    pub scheduling: Option<SchedulingTimes>,
+}
+
+/// One process's cumulative scheduler accounting, all from one kernel struct so
+/// a ratio between them never mixes sources.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedulingTimes {
+    /// Thread time spent runnable, which on Darwin includes the time spent
+    /// running: one uncontended busy thread accrues runnable time equal to its
+    /// CPU time. Runnable less CPU is the time its threads waited for a core.
+    pub runnable_ms: u64,
+    /// User plus system time from the same accounting as `runnable_ms`.
+    pub cpu_ms: u64,
+    /// The part of `cpu_ms` spent on performance cores. `None` on a kernel
+    /// that predates the accounting (`RUSAGE_INFO_V6`).
+    pub performance_cpu_ms: Option<u64>,
 }
 
 /// Reused machine-sized buffers; rows and unreadable PIDs are sorted before folding.

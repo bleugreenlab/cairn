@@ -638,6 +638,7 @@ mod tests {
             cpu_ms: None,
             uninterruptible: false,
             storage_io_bytes: None,
+            scheduling: None,
         });
         assert!(group_may_be_live_in_census(42, true, &census));
         assert!(!group_may_be_live_in_census(43, true, &census));

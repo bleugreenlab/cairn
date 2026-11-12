@@ -15,6 +15,9 @@ pub use windows::*;
 pub const MEMORY_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos", windows));
 pub const CPU_SUPPORTED: bool = MEMORY_SUPPORTED;
 pub const STORAGE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+/// Whether census rows carry [`crate::SchedulingTimes`]: only Darwin's
+/// `proc_pid_rusage` reports runnable time per process.
+pub const SCHEDULING_SUPPORTED: bool = cfg!(target_os = "macos");
 
 pub fn read_kernel_process(pid: u32) -> Option<KernelProcess> {
     match read_kernel_state(pid) {
