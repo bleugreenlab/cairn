@@ -1856,6 +1856,10 @@ pub struct Fleet {
     /// This runner process's identity in every journal it writes, set once
     /// when the journals attach.
     runner_incarnation: Arc<std::sync::OnceLock<String>>,
+    /// The restart bound a long main-cadence lane is weighed against
+    /// ([`runner_events::restart_bound_ms`]), read once from the journal when
+    /// it attaches: the restart history cannot change until the next boot.
+    restart_bound_ms: Arc<std::sync::OnceLock<u64>>,
     /// Results that arrived for no binding this process holds, for the
     /// orchestrator's adoption to decide (`run::adopted`).
     unbound_results: Arc<Mutex<UnboundResults>>,
@@ -3267,10 +3271,57 @@ impl Fleet {
         db: Arc<crate::storage::LocalDb>,
         runner_incarnation: String,
     ) {
-        if let Err(error) = self.runner_events.attach_journal(db, &runner_incarnation) {
+        if let Err(error) = self
+            .runner_events
+            .attach_journal(db.clone(), &runner_incarnation)
+        {
             log::error!("runner event journal did not attach: {error}");
         }
         let _ = self.runner_incarnation.set(runner_incarnation);
+        let bound = self.restart_bound_ms.clone();
+        let started_at_ms = self.runner_events.started_at_ms();
+        crate::orchestrator::spawn_onto(
+            tokio::runtime::Handle::try_current().ok().as_ref(),
+            async move {
+                match runner_events::load_restart_bound(&db, unix_time_ms(), started_at_ms).await
+                {
+                    Ok(bound_ms) => {
+                        log::info!(
+                            "placement restart bound: {} ms from the last week's runner starts",
+                            bound_ms
+                        );
+                        let _ = bound.set(bound_ms);
+                    }
+                    Err(error) => log::warn!(
+                        "runner starts could not be read, so the restart bound stays at its ceiling: {error}"
+                    ),
+                }
+            },
+            || log::warn!("the restart bound could not be read; it stays at its ceiling"),
+        );
+    }
+
+    /// The restart bound placement weighs a long main-cadence lane against:
+    /// [`runner_events::RESTART_BOUND_CEILING_MS`] until the journal has been
+    /// read.
+    fn restart_bound_ms(&self) -> u64 {
+        self.restart_bound_ms
+            .get()
+            .copied()
+            .unwrap_or(runner_events::RESTART_BOUND_CEILING_MS)
+    }
+
+    /// The main-cadence lane `request` is the live answer to, with the restart
+    /// bound it is weighed against; `None` for every other request.
+    fn cadence_lane_restart(&self, request: &CellRequest) -> Option<CadenceLaneRestart> {
+        let identity = (request.request_id.clone(), request.attempt_id.clone());
+        let precedence = self.cadence_precedence();
+        let (check, platform) = precedence.get(&identity)?.main_cadence_lane()?;
+        Some(CadenceLaneRestart {
+            check: check.to_string(),
+            platform: platform.to_string(),
+            bound_ms: self.restart_bound_ms(),
+        })
     }
 
     /// The sink every runner lifecycle fact is recorded through.
@@ -15547,6 +15598,7 @@ impl Fleet {
         // inspection and consumption share one short critical section, after all
         // asynchronous prediction work, so concurrent waves cannot spend the
         // same exploration slot.
+        let cadence_lane = self.cadence_lane_restart(request);
         let mut exploration_by_work_class = self.exploration_by_work_class.lock().unwrap();
         let exploration = exploration_by_work_class
             .entry(request.placement_work_class)
@@ -15563,6 +15615,7 @@ impl Fleet {
                     policy,
                     now_unix_ms: now,
                     exploration,
+                    cadence_lane: cadence_lane.as_ref(),
                 },
             )
             .ok()
@@ -15618,6 +15671,7 @@ impl Fleet {
                 policy,
                 now_unix_ms: now,
                 exploration,
+                cadence_lane: cadence_lane.as_ref(),
             },
         ) {
             Ok(draft) => draft,
@@ -16747,6 +16801,7 @@ fn choose_executor_with_policy(
             policy,
             now_unix_ms,
             exploration: &ExplorationState::default(),
+            cadence_lane: None,
         },
     )
 }
@@ -18544,6 +18599,73 @@ struct SurveyRankingContext<'a> {
     policy: &'a ActivePlacementPolicy,
     now_unix_ms: u64,
     exploration: &'a ExplorationState,
+    /// Set when the request is the live answer to a main-cadence question.
+    cadence_lane: Option<&'a CadenceLaneRestart>,
+}
+
+/// The main-cadence lane a request answers, and the restart bound it is
+/// weighed against: the request-level half of [`LaneRestartExposure`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CadenceLaneRestart {
+    check: String,
+    platform: String,
+    bound_ms: u64,
+}
+
+/// A main-cadence lane expected to run longer than the runner stays up.
+///
+/// A runner restart ends every lane on the colocated executor (tenet 316) and
+/// a remote lane is adopted across it (cairn/6581), so for such a lane the
+/// colocated executor ranks behind every adoptable host that fits the work
+/// ([`rank_candidates`]). Computed once per survey from the request and the
+/// candidates' learned durations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaneRestartExposure {
+    check: String,
+    platform: String,
+    expected_run_ms: u64,
+    bound_ms: u64,
+}
+
+/// The lane's exposure, when its learned run exceeds the restart bound. The
+/// run is the colocated executor's when it has learned one, since that is the
+/// run a restart would end; otherwise the longest any candidate learned. With
+/// nothing learned there is no evidence the lane is long, and nothing changes.
+fn lane_restart_exposure(
+    scored: &[ScoredCandidate<'_>],
+    lane: &CadenceLaneRestart,
+) -> Option<LaneRestartExposure> {
+    let learned = |candidate: &ScoredCandidate<'_>| {
+        candidate
+            .prediction
+            .run
+            .is_learned()
+            .then_some(candidate.prediction.run.predicted_ms)
+    };
+    let expected_run_ms = scored
+        .iter()
+        .filter(|candidate| candidate.entry.colocated)
+        .find_map(learned)
+        .or_else(|| scored.iter().filter_map(learned).max())?;
+    (expected_run_ms > lane.bound_ms).then(|| LaneRestartExposure {
+        check: lane.check.clone(),
+        platform: lane.platform.clone(),
+        expected_run_ms,
+        bound_ms: lane.bound_ms,
+    })
+}
+
+/// Whether a rejection says something about this machine taking this lane.
+/// A machine of another platform, outside the pin, or not serving the project
+/// was never a host for it, and naming it would only bury the ones that were.
+fn bears_on_the_lane(reason: &PlacementRejectionReason) -> bool {
+    !matches!(
+        reason,
+        PlacementRejectionReason::SelectorMismatch { .. }
+            | PlacementRejectionReason::PinMismatch { .. }
+            | PlacementRejectionReason::ProjectUnavailable { .. }
+            | PlacementRejectionReason::UntrustedVerdictPlatform { .. }
+    )
 }
 
 /// Rank what survived the survey, on the estimates and readings each machine
@@ -18561,6 +18683,7 @@ fn rank_survey(
         policy,
         now_unix_ms,
         exploration,
+        cadence_lane,
     } = context;
     let CandidateSurvey {
         usable,
@@ -18689,6 +18812,7 @@ fn rank_survey(
         })
         .collect();
 
+    let restart_exposure = cadence_lane.and_then(|lane| lane_restart_exposure(&scored, lane));
     let (winner, ranked, changed_earliest_winner, bootstrap_exploration, tie_break) =
         rank_candidates(
             &scored,
@@ -18697,6 +18821,7 @@ fn rank_survey(
             request,
             policy,
             exploration,
+            restart_exposure.as_ref(),
         );
     let Some(winner) = winner else {
         // Every machine placement could score is too small for one process of
@@ -18857,6 +18982,9 @@ fn rank_survey(
         PlacementReason::PredictedEarliestVerdict
     };
     let winner_name = executor_public_name(winner.entry);
+    let restart_exposure = restart_exposure.and_then(|exposure| {
+        restart_exposure_record(exposure, winner, &winner_name, &ranked, &rejected)
+    });
     rejected.extend(
         ranked
             .into_iter()
@@ -18915,6 +19043,7 @@ fn rank_survey(
         // The survey kept a waivable Mac only when nothing that satisfies the
         // requirement could take the work, so its winning is the fallback.
         nested_sandbox_waived: nested_sandbox_waiver(request, winner.entry),
+        restart_exposure,
         cache_distance: winner.cache_distance.map(|distance| {
             cairn_common::cache_distance::MeasuredDistance {
                 target_commit: request.base_commit.clone(),
@@ -18927,6 +19056,64 @@ fn rank_survey(
         selected: Some((selected_executor(winner.entry), selection)),
         rejected,
         policy: policy_evidence(request, policy, changed_earliest_winner),
+    })
+}
+
+/// What the selection records about a restart-exposed lane: that an adoptable
+/// host won while the colocated executor was a candidate, or that the
+/// colocated executor won and why each remote that could have served the lane
+/// did not. Nothing when the colocated executor was never a candidate.
+fn restart_exposure_record(
+    exposure: LaneRestartExposure,
+    winner: &ScoredCandidate<'_>,
+    winner_name: &str,
+    ranked: &[&ScoredCandidate<'_>],
+    rejected: &[PlacementRejection],
+) -> Option<cairn_common::executor_protocol::RestartExposure> {
+    use cairn_common::executor_protocol::{RestartExposure, RestartExposureOutcome};
+    let outcome = if winner.entry.colocated {
+        let mut remotes: Vec<String> = ranked
+            .iter()
+            .filter(|candidate| !candidate.entry.colocated)
+            .map(|candidate| {
+                let why = match candidate.prediction.queue.predicted_ms() {
+                    Some(wait) if wait > exposure.expected_run_ms => format!(
+                        "its queue is forecast at {} s, longer than the lane's run",
+                        wait / 1_000
+                    ),
+                    _ => candidate.outranked_rejection(winner_name).reason.describe(),
+                };
+                format!("{}: {why}", executor_public_name(candidate.entry))
+            })
+            .collect();
+        remotes.extend(
+            rejected
+                .iter()
+                .filter(|rejection| {
+                    rejection.executor_id != COLOCATED_EXECUTOR_ID
+                        && bears_on_the_lane(&rejection.reason)
+                })
+                .map(|rejection| {
+                    format!(
+                        "{}: {}",
+                        rejection.executor_name,
+                        rejection.reason.describe()
+                    )
+                }),
+        );
+        RestartExposureOutcome::NoAdoptableHost { remotes }
+    } else {
+        let colocated = ranked.iter().find(|candidate| candidate.entry.colocated)?;
+        RestartExposureOutcome::ColocatedPassedOver {
+            colocated: executor_public_name(colocated.entry),
+        }
+    };
+    Some(RestartExposure {
+        check: exposure.check,
+        platform: exposure.platform,
+        expected_run_ms: exposure.expected_run_ms,
+        restart_bound_ms: exposure.bound_ms,
+        outcome,
     })
 }
 
@@ -19292,6 +19479,18 @@ impl<'a> ScoredCandidate<'a> {
 /// confidently predicted to be slow is still slow, and preferring it because the
 /// prediction was well-evidenced would rank on the measurement rather than on
 /// what was measured.
+///
+/// A main-cadence lane expected to outlast the runner
+/// ([`LaneRestartExposure`]) ranks the colocated executor behind every
+/// adoptable host, right after fit: a remote that is busy still outranks an
+/// idle colocated executor, because a hold costs the lane minutes while a
+/// restart costs it the whole pass (cairn/6969). Only a remote whose own queue
+/// is forecast to outlast the lane's run earns no such preference, since the
+/// colocated run would likely finish first. The key orders the colocated
+/// executor against remotes and nothing else: warmth still orders the remotes
+/// among themselves (tenet 1395), and the colocated executor stays selectable,
+/// so it takes the lane whenever no remote can.
+#[allow(clippy::too_many_arguments)]
 fn rank_candidates<'a, 'b>(
     scored: &'b [ScoredCandidate<'a>],
     settled_by_caller: bool,
@@ -19299,6 +19498,7 @@ fn rank_candidates<'a, 'b>(
     request: &CellRequest,
     policy: &ActivePlacementPolicy,
     exploration: &ExplorationState,
+    restart_exposure: Option<&LaneRestartExposure>,
 ) -> (
     Option<&'b ScoredCandidate<'a>>,
     Vec<&'b ScoredCandidate<'a>>,
@@ -19306,6 +19506,22 @@ fn rank_candidates<'a, 'b>(
     bool,
     Option<PlacementTieBreak>,
 ) {
+    // The key applies only where it has something to choose between: a
+    // colocated candidate and at least one adoptable one.
+    let restart_exposure = restart_exposure.filter(|_| {
+        scored.iter().any(|candidate| candidate.entry.colocated)
+            && scored.iter().any(|candidate| !candidate.entry.colocated)
+    });
+    let restart_demoted = |candidate: &&ScoredCandidate<'a>| {
+        restart_exposure.is_some_and(|exposure| {
+            candidate.entry.colocated
+                || candidate
+                    .prediction
+                    .queue
+                    .predicted_ms()
+                    .is_some_and(|wait| wait > exposure.expected_run_ms)
+        })
+    };
     let hard_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
         a.excluded
             .is_some()
@@ -19319,6 +19535,7 @@ fn rank_candidates<'a, 'b>(
             .then_with(|| b.unmeasured_capacity.cmp(&a.unmeasured_capacity))
             .then_with(|| a.over_ceiling.is_some().cmp(&b.over_ceiling.is_some()))
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
+            .then_with(|| restart_demoted(a).cmp(&restart_demoted(b)))
             .then_with(|| a.held.is_some().cmp(&b.held.is_some()))
             .then_with(|| b.admission_accepts.cmp(&a.admission_accepts))
             .then_with(|| a.declined_here.is_some().cmp(&b.declined_here.is_some()))
@@ -19479,6 +19696,8 @@ fn rank_candidates<'a, 'b>(
             // explored onto whatever machine is due: its order is by size.
             && candidate.deferred.is_none()
             && candidate.unmeasured_capacity.is_none()
+            // Nor is a lane a restart would end sent where it would end.
+            && !restart_demoted(candidate)
             && candidate.admission_accepts
             && candidate.prediction.queue.predicted_ms() == Some(0)
             && resource_profiles::teaches_baseline(&forecast_start(&candidate.prediction))
@@ -28032,6 +28251,7 @@ mod tests {
                     policy: &ActivePlacementPolicy::default_profile(),
                     now_unix_ms: NOW,
                     exploration: &ExplorationState::default(),
+                    cadence_lane: None,
                 },
             )
             .unwrap()
@@ -30849,6 +31069,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(
             winner
@@ -30949,6 +31170,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, idle_id);
     }
@@ -31130,6 +31352,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
 
@@ -31263,6 +31486,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
 
@@ -31419,6 +31643,7 @@ mod tests {
             &spillable_request(),
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
         (
             winner.unwrap().entry.identity.executor_id.clone(),
@@ -31618,6 +31843,7 @@ mod tests {
             &request,
             &local_first(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(
             winner.unwrap().entry.identity.executor_id,
@@ -31657,6 +31883,7 @@ mod tests {
             &request,
             &local_first(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, "fedora");
     }
@@ -31737,7 +31964,7 @@ mod tests {
         };
         let scored = vec![cold_candidate, warm_candidate];
         let (winner, _, _, _, _) =
-            rank_candidates(&scored, false, true, &request, &policy, &history);
+            rank_candidates(&scored, false, true, &request, &policy, &history, None);
         assert_eq!(winner.unwrap().entry.identity.executor_id, "warm");
 
         let mut only_cold = ScoredCandidate::new(
@@ -31753,7 +31980,7 @@ mod tests {
         only_cold.scratch_sync_ms = 6_100;
         let scored = vec![only_cold];
         let (winner, _, _, _, _) =
-            rank_candidates(&scored, false, true, &request, &policy, &history);
+            rank_candidates(&scored, false, true, &request, &policy, &history, None);
         assert_eq!(
             winner
                 .expect("a cold machine is priced, never excluded")
@@ -31787,6 +32014,7 @@ mod tests {
             &request,
             &local_first(),
             &ExplorationState::default(),
+            None,
         );
         assert_eq!(
             winner.unwrap().entry.identity.executor_id,
@@ -31872,6 +32100,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
 
         assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
@@ -31888,6 +32117,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &history,
+            None,
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, favorite_id);
         assert!(!exploring, "the next three waves preserve exploitation");
@@ -31902,6 +32132,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &history,
+            None,
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
         assert!(exploring, "the fourth wave restores the exploration budget");
@@ -31969,7 +32200,7 @@ mod tests {
         };
 
         let (winner, _, _, _, tie_break) =
-            rank_candidates(&scored, false, true, &request, &policy, &history);
+            rank_candidates(&scored, false, true, &request, &policy, &history, None);
         let first_winner = winner.unwrap().entry.identity.executor_id.clone();
         assert_eq!(
             tie_break.unwrap().deciding_reason,
@@ -31978,7 +32209,7 @@ mod tests {
         history.record_selection(&first_winner);
 
         let (winner, _, _, _, tie_break) =
-            rank_candidates(&scored, false, true, &request, &policy, &history);
+            rank_candidates(&scored, false, true, &request, &policy, &history, None);
         let second_winner = winner.unwrap().entry.identity.executor_id.clone();
         assert_ne!(first_winner, second_winner);
         assert_eq!(
@@ -32013,8 +32244,15 @@ mod tests {
             ),
         ];
         history.record_selection(&second_id);
-        let (winner, _, _, _, tie_break) =
-            rank_candidates(&faster_scored, false, true, &request, &policy, &history);
+        let (winner, _, _, _, tie_break) = rank_candidates(
+            &faster_scored,
+            false,
+            true,
+            &request,
+            &policy,
+            &history,
+            None,
+        );
         assert_eq!(winner.unwrap().entry.identity.executor_id, second_id);
         assert!(tie_break.is_none());
 
@@ -32059,6 +32297,7 @@ mod tests {
             &request,
             &policy,
             &bootstrap_history,
+            None,
         );
         assert_eq!(
             winner.unwrap().entry.identity.executor_id,
@@ -32171,6 +32410,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &ExplorationState::default(),
+            None,
         );
 
         assert_eq!(winner.unwrap().entry.identity.executor_id, favorite_id);
@@ -32432,6 +32672,7 @@ mod tests {
                 policy: &ActivePlacementPolicy::default_profile(),
                 now_unix_ms: NOW,
                 exploration: &ExplorationState::default(),
+                cadence_lane: None,
             },
         )
     }
@@ -34934,6 +35175,7 @@ mod tests {
                 decisions_since_exploration: EXPLORATION_INTERVAL,
                 ..Default::default()
             },
+            None,
         );
         (
             winner.unwrap().entry.identity.executor_id.clone(),
@@ -36472,6 +36714,299 @@ mod tests {
             ..ExecutorSelector::default()
         });
         request
+    }
+
+    const MINUTE_MS: u64 = 60 * 1_000;
+
+    /// The 11-11 macOS fleet: the colocated executor and bgsrv-mac, both
+    /// floor-confined and so both eligible for the nested-Seatbelt lane under
+    /// cairn/6341's fallback.
+    fn floor_confined_macs() -> HashMap<String, ExecutorConnectionState> {
+        let (_, floored) = capable_and_floored_evidence();
+        let mut connections = HashMap::from([
+            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
+            fleet_entry("bgsrv-mac", "macos", 0, &[]),
+        ]);
+        for entry in connections.values_mut() {
+            measured(entry, 0.1, 16_000_000_000, 500_000_000_000);
+        }
+        set_sandbox(
+            &mut connections,
+            COLOCATED_EXECUTOR_ID,
+            Some(floored.clone()),
+        );
+        set_sandbox(&mut connections, "bgsrv-mac", Some(floored));
+        connections
+    }
+
+    fn macos_rust_tests() -> CellRequest {
+        let mut request = spillable_request();
+        request.executor = Some(ExecutorSelector {
+            os: Some("macos".into()),
+            required_toolchains: vec!["rust".into()],
+            requires_macos_nested_sandbox_write: true,
+            ..ExecutorSelector::default()
+        });
+        request
+    }
+
+    fn macos_main_lane() -> CadenceLaneRestart {
+        CadenceLaneRestart {
+            check: "rust-tests".into(),
+            platform: "macos".into(),
+            bound_ms: runner_events::RESTART_BOUND_CEILING_MS,
+        }
+    }
+
+    /// Survey and rank as production does, every machine having learned a
+    /// `run_ms` run with nothing queued ahead, and the colocated executor,
+    /// warm, predicted to answer a quarter-hour sooner; `adjust` then shapes
+    /// one machine's prediction.
+    fn place_lane(
+        connections: &HashMap<String, ExecutorConnectionState>,
+        request: &CellRequest,
+        lane: Option<&CadenceLaneRestart>,
+        run_ms: u64,
+        adjust: impl Fn(&str, &mut PlacementPrediction),
+    ) -> PlacementDraft {
+        let survey = survey_candidates(
+            connections,
+            &[],
+            request,
+            NOW,
+            &HashMap::new(),
+            &AdmissionView::of_request(request),
+        )
+        .unwrap();
+        let (mut predictions, sync_costs) =
+            prior_predictions(&survey.usable, request, |_, _| SyncCost::Known(0), NOW);
+        for (executor_id, prediction) in predictions.iter_mut() {
+            prediction.run.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+            prediction.run.predicted_ms = run_ms;
+            prediction.queue = QueueForecast::Forecast {
+                predicted_ms: 0,
+                requests_ahead: 0,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
+            };
+            prediction.predicted_verdict_ms = run_ms
+                + if executor_id == COLOCATED_EXECUTOR_ID {
+                    0
+                } else {
+                    15 * MINUTE_MS
+                };
+            adjust(executor_id, prediction);
+        }
+        rank_survey(
+            request,
+            survey,
+            SurveyRankingContext {
+                reservations: &HashMap::new(),
+                predictions: &predictions,
+                sync_costs: &sync_costs,
+                cache_distances: &HashMap::new(),
+                policy: &ActivePlacementPolicy::default_profile(),
+                now_unix_ms: NOW,
+                exploration: &ExplorationState::default(),
+                cadence_lane: lane,
+            },
+        )
+        .unwrap()
+    }
+
+    fn queued_for(prediction: &mut PlacementPrediction, wait_ms: u64) {
+        prediction.queue = QueueForecast::Forecast {
+            predicted_ms: wait_ms,
+            requests_ahead: 1,
+            running_ahead: 1,
+            fully_measured: true,
+            observed_at_unix_ms: NOW,
+            stalled_head_ms: None,
+        };
+        prediction.predicted_verdict_ms += wait_ms;
+    }
+
+    /// cairn/6969, specimen 11-11: macOS main rust-tests ran 96-155 min on
+    /// the colocated executor while the runner restarted every 2 h 34 min,
+    /// and both restarts ended the pass. With a learned 96-minute run over
+    /// the hour bound, the adoptable Mac takes the lane though the colocated
+    /// executor is warm and forecast to answer first, and the record says
+    /// the colocated executor was passed over and why.
+    #[test]
+    fn a_main_cadence_lane_longer_than_the_restart_bound_prefers_an_adoptable_host() {
+        let connections = floor_confined_macs();
+        let request = macos_rust_tests();
+        let lane = macos_main_lane();
+
+        let draft = place_lane(
+            &connections,
+            &request,
+            Some(&lane),
+            96 * MINUTE_MS,
+            |_, _| {},
+        );
+        let selection = chosen(&draft);
+        assert_eq!(selection.executor_id, "bgsrv-mac");
+        let exposure = selection
+            .restart_exposure
+            .as_ref()
+            .expect("the passed-over note is recorded");
+        assert_eq!(
+            exposure.describe(),
+            "colocated local passed over: main cadence rust-tests on macos expected 1 h 36 m (learned) exceeds the restart bound 60 m; an adoptable host is eligible"
+        );
+        assert!(
+            draft.rejected.iter().any(|rejection| {
+                rejection.executor_id == COLOCATED_EXECUTOR_ID
+                    && matches!(
+                        rejection.reason,
+                        PlacementRejectionReason::OutrankedBy { .. }
+                    )
+            }),
+            "the colocated executor stays a candidate that lost, not a refused one: {:?}",
+            draft.rejected
+        );
+
+        // Under the bound nothing changes: the colocated executor wins on its
+        // forecast and the record says nothing about restarts.
+        let draft = place_lane(
+            &connections,
+            &request,
+            Some(&lane),
+            20 * MINUTE_MS,
+            |_, _| {},
+        );
+        assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
+        assert_eq!(chosen(&draft).restart_exposure, None);
+
+        // A review lane of the same suite is no main-cadence lane.
+        let draft = place_lane(&connections, &request, None, 96 * MINUTE_MS, |_, _| {});
+        assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
+        assert_eq!(chosen(&draft).restart_exposure, None);
+    }
+
+    /// The lane is a main-cadence lane exactly when the purpose registry holds
+    /// the request as the live answer to a main-cadence question.
+    #[test]
+    fn only_a_live_main_cadence_holder_is_weighed_against_restarts() {
+        let pool = Fleet::default();
+        let request = macos_rust_tests();
+        assert_eq!(pool.cadence_lane_restart(&request), None);
+        pool.purposes.lock().unwrap().admit(
+            purpose::PurposeKey::main_cadence("p", "rust-tests", "macos"),
+            (request.request_id.clone(), request.attempt_id.clone()),
+            1,
+        );
+        assert_eq!(pool.cadence_lane_restart(&request), Some(macos_main_lane()));
+        let mut other = request.clone();
+        other.request_id = "review".into();
+        assert_eq!(pool.cadence_lane_restart(&other), None);
+    }
+
+    /// With no adoptable host able to take the lane, the colocated executor
+    /// takes it, never refused by name, and the record says why each remote
+    /// that could have served it did not.
+    #[test]
+    fn the_colocated_executor_takes_a_restart_exposed_lane_when_no_adoptable_host_can() {
+        let request = macos_rust_tests();
+        let lane = macos_main_lane();
+
+        let mut connections = floor_confined_macs();
+        connections.get_mut("bgsrv-mac").unwrap().drained = true;
+        connections.extend([fleet_entry("fedora", "linux", 0, &[])]);
+        let draft = place_lane(
+            &connections,
+            &request,
+            Some(&lane),
+            96 * MINUTE_MS,
+            |_, _| {},
+        );
+        let selection = chosen(&draft);
+        assert_eq!(selection.executor_id, COLOCATED_EXECUTOR_ID);
+        let exposure = selection
+            .restart_exposure
+            .as_ref()
+            .expect("last resort recorded");
+        let cairn_common::executor_protocol::RestartExposureOutcome::NoAdoptableHost { remotes } =
+            &exposure.outcome
+        else {
+            panic!("{exposure:?}");
+        };
+        assert_eq!(
+            remotes.len(),
+            1,
+            "the Linux machine was never a host: {remotes:?}"
+        );
+        assert!(remotes[0].starts_with("bgsrv-mac: "), "{remotes:?}");
+        assert!(
+            exposure
+                .describe()
+                .starts_with("restart-exposed: no adoptable host eligible (bgsrv-mac: "),
+            "{}",
+            exposure.describe()
+        );
+
+        connections.remove("bgsrv-mac");
+        let draft = place_lane(
+            &connections,
+            &request,
+            Some(&lane),
+            96 * MINUTE_MS,
+            |_, _| {},
+        );
+        assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
+        assert_eq!(
+            chosen(&draft).restart_exposure.as_ref().unwrap().describe(),
+            "restart-exposed: no adoptable host eligible (no remote machine serves this lane); main cadence rust-tests on macos expected 1 h 36 m (learned) exceeds the restart bound 60 m"
+        );
+    }
+
+    /// A busy adoptable host still outranks an idle colocated executor, since
+    /// a wait costs the lane minutes and a restart the whole pass, unless its
+    /// own queue is forecast to outlast the lane's run.
+    #[test]
+    fn a_busy_adoptable_host_is_preferred_unless_its_queue_outlasts_the_run() {
+        let request = macos_rust_tests();
+        let lane = macos_main_lane();
+        let mut connections = floor_confined_macs();
+        Arc::make_mut(&mut connections.get_mut("bgsrv-mac").unwrap().health)
+            .applied_policy
+            .maximum_queue_depth = 0;
+        let busy_for = |wait_ms: u64| {
+            move |executor_id: &str, prediction: &mut PlacementPrediction| {
+                if executor_id == "bgsrv-mac" {
+                    queued_for(prediction, wait_ms);
+                }
+            }
+        };
+
+        let draft = place_lane(
+            &connections,
+            &request,
+            Some(&lane),
+            96 * MINUTE_MS,
+            busy_for(10 * MINUTE_MS),
+        );
+        assert_eq!(chosen(&draft).executor_id, "bgsrv-mac");
+
+        let draft = place_lane(
+            &connections,
+            &request,
+            Some(&lane),
+            96 * MINUTE_MS,
+            busy_for(3 * 60 * MINUTE_MS),
+        );
+        assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
+        let exposure = chosen(&draft).restart_exposure.as_ref().unwrap();
+        assert!(
+            exposure.describe().contains(
+                "bgsrv-mac: its queue is forecast at 10800 s, longer than the lane's run"
+            ),
+            "{}",
+            exposure.describe()
+        );
     }
 
     /// cairn/6341. A Mac whose check lanes the credential floor refuses a
@@ -44075,7 +44610,7 @@ mod tests {
         };
         let winner_of = |scored: Vec<ScoredCandidate<'_>>| {
             let (winner, _, _, _, _) =
-                rank_candidates(&scored, false, true, &request, &policy, &history);
+                rank_candidates(&scored, false, true, &request, &policy, &history, None);
             winner
                 .expect("a priced machine is never excluded")
                 .entry

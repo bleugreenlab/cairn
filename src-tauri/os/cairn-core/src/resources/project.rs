@@ -1550,6 +1550,9 @@ fn render_held_executions(
 /// difference: while a lane is listed, the absence of its rows for the current
 /// head is a run still working, not a gap.
 ///
+/// Beside the running work, each lane whose passes runner restarts keep
+/// cancelling, as one incident line that holds until its next complete row.
+///
 /// Below the running work, every lane's last report since this runner started:
 /// a short lane (a typecheck) runs for a minute or two after each merge, and
 /// would otherwise appear here only in that window. Silent when no lane is
@@ -1557,13 +1560,23 @@ fn render_held_executions(
 fn render_main_attestation(orch: &Orchestrator, project_id: &str) -> String {
     let in_flight = crate::execution::checks_main::in_flight(orch, project_id);
     let outcomes = crate::execution::checks_main::last_outcomes(orch, project_id);
-    if in_flight.is_none() && outcomes.is_empty() {
+    let streaks = crate::execution::checks_main::restart_streak_lines(orch, project_id);
+    if in_flight.is_none() && outcomes.is_empty() && streaks.is_empty() {
         return String::new();
     }
     let now = chrono::Utc::now().timestamp_millis();
     let mut out = String::from("## Main cadence\n\n");
     if let Some(in_flight) = in_flight {
         render_main_in_flight(&mut out, &in_flight, now);
+    }
+    if !streaks.is_empty() {
+        out.push_str(
+            "Lanes runner restarts keep cancelling, each until its next complete row:\n\n",
+        );
+        for line in &streaks {
+            out.push_str(&format!("- {line}\n"));
+        }
+        out.push('\n');
     }
     if !outcomes.is_empty() {
         out.push_str("Each lane's last report since this runner started:\n\n");

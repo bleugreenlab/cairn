@@ -409,6 +409,12 @@ impl RunnerEvents {
         }
     }
 
+    /// When this runner incarnation began: the instant its `runner_started`
+    /// row carries.
+    pub(crate) fn started_at_ms(&self) -> u64 {
+        self.inner.created_at_ms
+    }
+
     fn runner_started(&self, runner_incarnation: &str) -> RunnerEvent {
         RunnerEvent::new(RunnerEventKind::RunnerStarted)
             .at(self.inner.created_at_ms)
@@ -875,6 +881,57 @@ pub(crate) async fn load_window(db: &LocalDb, since_ms: u64) -> DbResult<RunnerE
     })
 }
 
+/// The longest a main-cadence lane may be expected to run before placement
+/// treats the runner's next restart as likely to end it on the colocated
+/// executor, whatever the restart history says.
+pub(crate) const RESTART_BOUND_CEILING_MS: u64 = 60 * 60 * 1_000;
+/// How far back the restart interval is measured.
+pub(crate) const RESTART_INTERVAL_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// The restart bound placement weighs a long main-cadence lane against: the
+/// shorter of [`RESTART_BOUND_CEILING_MS`] and the median interval between
+/// successive runner starts. Fewer than two starts have no interval, and the
+/// ceiling stands.
+pub(crate) fn restart_bound_ms(starts_ms: &[u64]) -> u64 {
+    let mut starts = starts_ms.to_vec();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut intervals: Vec<u64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    if intervals.is_empty() {
+        return RESTART_BOUND_CEILING_MS;
+    }
+    intervals.sort_unstable();
+    let middle = intervals.len() / 2;
+    let median = if intervals.len().is_multiple_of(2) {
+        (intervals[middle - 1] + intervals[middle]) / 2
+    } else {
+        intervals[middle]
+    };
+    median.min(RESTART_BOUND_CEILING_MS)
+}
+
+/// [`restart_bound_ms`] over every `runner_started` row in the last
+/// [`RESTART_INTERVAL_WINDOW_MS`], with this incarnation's own start, which
+/// its writer may not have stored yet.
+pub(crate) async fn load_restart_bound(
+    db: &LocalDb,
+    now_ms: u64,
+    started_at_ms: u64,
+) -> DbResult<u64> {
+    let since = now_ms.saturating_sub(RESTART_INTERVAL_WINDOW_MS) as i64;
+    let mut starts = db
+        .query_all(
+            "SELECT occurred_at_ms FROM runner_events
+             WHERE kind = 'runner_started' AND occurred_at_ms >= ?1
+             ORDER BY occurred_at_ms",
+            (since,),
+            |row| Ok(row.i64(0)?.max(0) as u64),
+        )
+        .await?;
+    starts.push(started_at_ms);
+    Ok(restart_bound_ms(&starts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1373,63 @@ mod tests {
             2
         );
         assert_eq!(events.journal_state().dropped, 0);
+    }
+
+    /// cairn/6969: the bound is the median interval between runner starts,
+    /// capped at an hour. The 11-11 restarts 2 h 34 min apart leave the cap;
+    /// a day of restarts every 40-45 minutes brings it to their median.
+    #[test]
+    fn the_restart_bound_is_the_median_start_interval_capped_at_an_hour() {
+        const MINUTE: u64 = 60 * 1_000;
+        assert_eq!(
+            restart_bound_ms(&[0, 154 * MINUTE, 314 * MINUTE]),
+            RESTART_BOUND_CEILING_MS
+        );
+        assert_eq!(
+            restart_bound_ms(&[85 * MINUTE, 0, 40 * MINUTE]),
+            42 * MINUTE + 30 * 1_000,
+            "order does not matter, and an even count averages its middle pair"
+        );
+        assert_eq!(
+            restart_bound_ms(&[0, 30 * MINUTE, 70 * MINUTE, 120 * MINUTE]),
+            40 * MINUTE
+        );
+        assert_eq!(restart_bound_ms(&[5 * MINUTE]), RESTART_BOUND_CEILING_MS);
+        assert_eq!(restart_bound_ms(&[]), RESTART_BOUND_CEILING_MS);
+        assert_eq!(
+            restart_bound_ms(&[7 * MINUTE, 7 * MINUTE]),
+            RESTART_BOUND_CEILING_MS,
+            "the incarnation's own start, already stored, is one start"
+        );
+    }
+
+    #[test]
+    fn the_restart_bound_reads_the_last_weeks_starts_and_this_one() {
+        const MINUTE: u64 = 60 * 1_000;
+        let runtime = runtime();
+        let db = test_db(&runtime, "restart-bound");
+        let now = 30 * 24 * 60 * MINUTE;
+        runtime.block_on(async {
+            for (id, at) in [
+                ("ancient", now - 8 * 24 * 60 * MINUTE),
+                ("first", now - 80 * MINUTE),
+                ("second", now - 40 * MINUTE),
+            ] {
+                db.execute(
+                    "INSERT INTO runner_events
+                       (id, runner_incarnation, kind, occurred_at_ms, detail_json)
+                     VALUES (?1, 'r', 'runner_started', ?2, '{}')",
+                    (id, at as i64),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                load_restart_bound(&db, now, now).await.unwrap(),
+                40 * MINUTE,
+                "two 40-minute intervals; the start eight days ago is outside the window"
+            );
+        });
     }
 
     fn kinds(rows: &[(String, Option<String>, Option<i64>, Value)]) -> Vec<&str> {

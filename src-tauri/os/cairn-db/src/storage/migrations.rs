@@ -2866,6 +2866,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "main_cadence_interruptions",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // How many times running this runner's restarts have cancelled one
+    // main-cadence lane, until its next complete row. About this install's
+    // restarts and machines, so never synced.
+    (
+        "main_cadence_restart_streaks",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // This runner's claims on remote check attempts it was granted, and the
     // consumers waiting on each. A claim names this install's executor and
     // request ids and is only adoptable by the runner that granted it, so it

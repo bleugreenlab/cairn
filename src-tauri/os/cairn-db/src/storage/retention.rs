@@ -333,6 +333,11 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "cleared when the cadence resumes",
     ),
     owned_by(
+        "main_cadence_restart_streaks",
+        "cairn-core execution::checks_main::restart_streaks",
+        "cleared by the lane's next complete row",
+    ),
+    owned_by(
         "check_lane_adoptions",
         "cairn-core storage::check_lane_adoptions::prune",
         "settled claims (recorded, lost, cancelled) 7 days after their last update once every waiter has settled; open claims are kept until adopted, never by age",

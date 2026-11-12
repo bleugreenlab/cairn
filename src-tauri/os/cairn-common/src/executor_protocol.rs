@@ -7836,6 +7836,15 @@ pub struct LearnedResourceEstimate {
 /// the runner alone makes from evidence every executor already sends. What a
 /// runner gets wrong talking to an older executor: nothing.
 ///
+/// cairn/6969 does not move the number. It adds
+/// [`PlacementSelection::restart_exposure`] with its new [`RestartExposure`]
+/// and [`RestartExposureOutcome`]: runner placement vocabulary recording why
+/// a long main-cadence lane was kept off the colocated executor, or why it
+/// landed there anyway, omitted when absent and carried to no executor. The
+/// ranking key behind it is a choice the runner alone makes from predictions
+/// and readings every executor already sends. What a runner gets wrong
+/// talking to an older executor: nothing.
+///
 /// cairn/6544 does not move the number. A cache checkpoint callback the runner
 /// does not acknowledge no longer fails the item that finished before it: the
 /// executor returns the item's outcome with a new optional
@@ -17682,6 +17691,12 @@ pub struct PlacementSelection {
     /// attached machine that can could take it. See [`NestedSandboxWaiver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested_sandbox_waived: Option<NestedSandboxWaiver>,
+    /// Present when this is a main-cadence lane expected to outlast the
+    /// runner's restart interval and a colocated executor was among the
+    /// candidates: whether it was ranked behind an adoptable host, or took the
+    /// lane because no adoptable host could. See [`RestartExposure`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_exposure: Option<RestartExposure>,
     /// The single process this machine was judged on, or that heavy work
     /// was placed with none known. Absent for work whose class compiles
     /// nothing and that measured no process, and on a record from before it
@@ -19257,6 +19272,82 @@ impl NestedSandboxWaiver {
             self.credential_floor_sha256.chars().take(12).collect::<String>(),
             self.detail
         )
+    }
+}
+
+/// A main-cadence lane whose learned run is longer than the runner is
+/// expected to stay up, as placement weighed it against the colocated
+/// executor.
+///
+/// A runner restart ends every lane on the colocated executor (tenet 316),
+/// while a remote lane is adopted across it (cairn/6581). So for such a lane
+/// the colocated executor ranks behind every adoptable host that fits the
+/// work, and is chosen only when none can take it: ranking, never a refusal
+/// by name (cairn/6969).
+///
+/// Runner placement vocabulary like [`NestedSandboxWaiver`]: nothing the
+/// runner sends an executor carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestartExposure {
+    pub check: String,
+    pub platform: String,
+    /// The lane's learned run: the colocated executor's when it has one, else
+    /// the longest any candidate learned.
+    pub expected_run_ms: u64,
+    /// The shorter of an hour and the median interval between this runner's
+    /// starts over the last week.
+    pub restart_bound_ms: u64,
+    pub outcome: RestartExposureOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RestartExposureOutcome {
+    /// An adoptable host was chosen, and the colocated executor named here
+    /// was ranked behind it.
+    #[serde(rename_all = "camelCase")]
+    ColocatedPassedOver { colocated: String },
+    /// The colocated executor took the lane because no adoptable host could:
+    /// each remote as `name: why`, empty when none serves the platform.
+    #[serde(rename_all = "camelCase")]
+    NoAdoptableHost { remotes: Vec<String> },
+}
+
+impl RestartExposure {
+    pub fn describe(&self) -> String {
+        let lane = format!(
+            "main cadence {} on {} expected {} (learned) exceeds the restart bound {}",
+            self.check,
+            self.platform,
+            hours_and_minutes(self.expected_run_ms),
+            hours_and_minutes(self.restart_bound_ms)
+        );
+        match &self.outcome {
+            RestartExposureOutcome::ColocatedPassedOver { colocated } => format!(
+                "colocated {colocated} passed over: {lane}; an adoptable host is eligible"
+            ),
+            RestartExposureOutcome::NoAdoptableHost { remotes } if remotes.is_empty() => format!(
+                "restart-exposed: no adoptable host eligible (no remote machine serves this lane); {lane}"
+            ),
+            RestartExposureOutcome::NoAdoptableHost { remotes } => format!(
+                "restart-exposed: no adoptable host eligible ({}); {lane}",
+                remotes.join("; ")
+            ),
+        }
+    }
+}
+
+/// `42 m`, `60 m`, `1 h 36 m`, `2 h`: a duration at minute resolution, in
+/// minutes up to the hour the restart bound is capped at.
+fn hours_and_minutes(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    if minutes <= 60 {
+        return format!("{minutes} m");
+    }
+    match (minutes / 60, minutes % 60) {
+        (hours, 0) => format!("{hours} h"),
+        (hours, minutes) => format!("{hours} h {minutes} m"),
     }
 }
 
@@ -23749,6 +23840,7 @@ mod tests {
                 memory_ceiling: None,
                 process_fit_waived: None,
                 nested_sandbox_waived: None,
+                restart_exposure: None,
                 process_demand: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),

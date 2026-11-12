@@ -2515,6 +2515,10 @@ async fn render_resource_body(
                                 captured_at,
                             ));
                             rendered.push_str(&crate::execution::checks_main::render_machine_adoptions(orch, &executor.name));
+                            rendered.push_str(&crate::execution::checks_main::render_machine_restart_streaks(
+                                orch,
+                                &executor.health.identity.executor_id,
+                            ));
                             rendered.push_str(&crate::resources::executors::render_blocked_questions(
                                 &orch.fleet.blocked_questions(
                                     Some(&executor.health.identity.executor_id),

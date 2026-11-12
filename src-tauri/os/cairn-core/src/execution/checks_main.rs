@@ -65,6 +65,7 @@
 mod corroboration;
 mod incident_sources;
 mod incidents;
+mod restart_streaks;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -241,6 +242,12 @@ pub(crate) struct Interruption {
     /// The tip the cancelled pass was attesting.
     pub(crate) commit: String,
     pub(crate) stopped_at_unix_ms: i64,
+    /// The machine the pass ran on, when it is known.
+    pub(crate) executor_id: Option<String>,
+    /// The restart that cancelled the pass, when a boot recorded it. A stop
+    /// cannot know the build it stops for, so it leaves this to the boot that
+    /// reads the interruption back ([`restart_streaks::record`]).
+    pub(crate) cancelled_by: Option<restart_streaks::RestartStamp>,
 }
 
 impl Interruption {
@@ -407,6 +414,10 @@ pub(crate) struct CadenceSlots {
     interrupted: HashMap<String, Vec<Interruption>>,
     /// Each lane's last report, for the project overview.
     outcomes: HashMap<(String, LaneKey), LaneOutcome>,
+    /// Each lane's restart streak, mirrored from its durable row so the
+    /// project and executor pages render it without a read; see
+    /// [`restart_streaks`].
+    restart_streaks: HashMap<(String, LaneKey), restart_streaks::RestartStreak>,
     /// Each lane's standing non-verdict: the last it announced, until a
     /// complete row ends it. In memory like `outcomes`, so after a restart a
     /// lane's first non-verdict announces again.
@@ -530,6 +541,31 @@ impl CadenceSlots {
         if lanes.is_empty() {
             self.interrupted.remove(project_id);
         }
+    }
+
+    fn set_restart_streak(&mut self, streak: restart_streaks::RestartStreak) {
+        self.restart_streaks.insert(streak.key(), streak);
+    }
+
+    fn restart_streak(
+        &self,
+        project_id: &str,
+        lane: &CadenceLane,
+    ) -> Option<&restart_streaks::RestartStreak> {
+        self.restart_streaks
+            .get(&(project_id.to_string(), lane.key()))
+    }
+
+    /// `project_id`'s restart streaks, in lane order.
+    fn restart_streaks(&self, project_id: &str) -> Vec<restart_streaks::RestartStreak> {
+        let mut streaks: Vec<_> = self
+            .restart_streaks
+            .iter()
+            .filter(|((project, _), _)| project == project_id)
+            .map(|(_, streak)| streak.clone())
+            .collect();
+        streaks.sort_by(|a, b| (&a.check, &a.platform).cmp(&(&b.check, &b.platform)));
+        streaks
     }
 
     /// Record what a lane last reported, replacing its earlier report.
@@ -789,6 +825,53 @@ pub(crate) fn render_adopted_lane(lane: &LaneInFlight) -> Option<String> {
     ))
 }
 
+/// Each restart streak `project_id` holds, as its incident line, in lane
+/// order: what the project overview's Main cadence section lists.
+pub(crate) fn restart_streak_lines(orch: &Orchestrator, project_id: &str) -> Vec<String> {
+    let streaks = orch
+        .main_cadence
+        .lock()
+        .unwrap()
+        .restart_streaks(project_id);
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
+    let now = now_ms();
+    streaks
+        .iter()
+        .map(|streak| restart_streaks::render(streak, now, &names))
+        .collect()
+}
+
+/// The restart streaks whose cancelled passes ran on `executor_id`, for that
+/// machine's page: the same lines the project overview lists.
+pub(crate) fn render_machine_restart_streaks(orch: &Orchestrator, executor_id: &str) -> String {
+    let mut streaks: Vec<_> = orch
+        .main_cadence
+        .lock()
+        .unwrap()
+        .restart_streaks
+        .values()
+        .filter(|streak| streak.ran_on(executor_id))
+        .cloned()
+        .collect();
+    if streaks.is_empty() {
+        return String::new();
+    }
+    streaks.sort_by_key(restart_streaks::RestartStreak::key);
+    let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
+    let now = now_ms();
+    let mut out = String::from(
+        "## Main cadence restart-cancel streaks\n\nLanes whose passes on this machine runner restarts keep cancelling; each clears with the lane's next complete row.\n\n",
+    );
+    for streak in &streaks {
+        out.push_str(&format!(
+            "- {}\n",
+            restart_streaks::render(streak, now, &names)
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 pub(crate) fn render_machine_adoptions(orch: &Orchestrator, machine: &str) -> String {
     let projects: BTreeSet<_> = orch
         .main_cadence
@@ -1035,6 +1118,10 @@ fn adoption_interruptions(claim: &Claim, checks: &[String]) -> Vec<Interruption>
             commit: claim.commit_sha.clone(),
             // The durable timestamp is stable across abrupt-stop resends.
             stopped_at_unix_ms: claim.stopped_at_ms.unwrap_or(claim.updated_ms),
+            executor_id: Some(claim.executor_id.clone()),
+            // An adoption is lost in the boot after the restart that left it
+            // to be adopted, so that boot is the restart that cost the pass.
+            cancelled_by: restart_streaks::RestartStamp::current(),
         })
         .collect()
 }
@@ -1048,6 +1135,11 @@ pub(crate) async fn record_adoption_interruptions(
 ) -> Result<(), String> {
     for interruption in adoption_interruptions(claim, checks) {
         record_interruption(db, &claim.project_id, &interruption).await?;
+        // Counted here, at the loss's own settlement edge, since a loss after
+        // the boot's scan reaches no boot transfer; the citation that follows
+        // may be consumed by a report before any boot reads it. Idempotent,
+        // so the boot that does read it back counts it once.
+        restart_streaks::record(db, None, &claim.project_id, &interruption, None, now_ms()).await?;
     }
     Ok(())
 }
@@ -1086,6 +1178,13 @@ pub(crate) async fn try_lose_adoption(
         .map_err(|error| error.to_string())?;
     }
     for interruption in adoption_interruptions(claim, checks) {
+        restart_streaks::refresh(
+            orch,
+            &claim.project_id,
+            &interruption.check,
+            &interruption.platform,
+        )
+        .await;
         orch.main_cadence
             .lock()
             .unwrap()
@@ -1513,20 +1612,30 @@ async fn adopt_at_boot(orch: &Orchestrator) {
 /// on the same inputs is joined by the fleet's coalescing, not run twice.
 pub(crate) async fn arm_at_boot(orch: &Orchestrator) {
     adopt_at_boot(orch).await;
-    match take_interruptions(&orch.db.local).await {
-        Ok(interrupted) => {
-            let mut slots = orch.main_cadence.lock().unwrap();
-            for (project_id, interruption) in interrupted {
-                log::info!(
-                    "main cadence for project {project_id}: re-arming {}",
-                    interruption.describe()
-                );
-                slots.interrupted(&project_id, interruption);
-            }
+    let interrupted = match read_interruptions(&orch.db.local).await {
+        Ok(interrupted) => interrupted,
+        Err(error) => {
+            log::warn!(
+                "main cadence: could not read back the passes the last restart cancelled, so the boot pass will not cite them: {error}"
+            );
+            Vec::new()
         }
-        Err(error) => log::warn!(
-            "main cadence: could not read back the passes the last restart cancelled, so the boot pass will not cite them: {error}"
-        ),
+    };
+    // Counted before any lane re-arms, so a lane's first report sees the
+    // streak this boot added to.
+    let streaks = restart_streaks::at_boot(orch, &interrupted).await;
+    {
+        let mut slots = orch.main_cadence.lock().unwrap();
+        for streak in streaks {
+            slots.set_restart_streak(streak);
+        }
+        for (project_id, interruption) in interrupted {
+            log::info!(
+                "main cadence for project {project_id}: re-arming {}",
+                interruption.describe()
+            );
+            slots.interrupted(&project_id, interruption);
+        }
     }
     spawn_all_current(orch, Trigger::Startup).await;
     spawn_heartbeat(orch);
@@ -1786,6 +1895,7 @@ async fn run_pass(
         slots.forget_undeclared_interruptions(project_id, &declared);
         slots.forget_undeclared_outcomes(project_id, &declared);
     }
+    restart_streaks::forget_undeclared(orch, project_id, &declared).await;
     let lanes: Vec<CadenceLane> = declared
         .into_iter()
         .filter(|lane| scope.includes(lane))
@@ -1971,6 +2081,9 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
         }
     };
     let context = &tip.context(trigger);
+    // Before the run, so a streak a boot raised is announced whatever the run
+    // then does and however long it takes.
+    restart_streaks::announce_rise(orch, &db, &tip.project_id, lane).await;
     match attempt_lane(orch, db.clone(), context, lane).await {
         LaneAttempt::Covered(row) => {
             // The observation may have committed immediately before a crash or
@@ -1992,15 +2105,16 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
                 slots.answered(context.project_id, lane);
                 slots.take_interruption(context.project_id, lane)
             };
-            if let Some(interruption) = rearmed {
-                forget_interruption(&orch.db.local, context.project_id, &interruption).await;
-                log::info!(
-                    "main cadence: {} is answered by {}, which already covers `{}`",
-                    interruption.describe(),
-                    row.reference,
-                    short_commit(context.commit)
-                );
-            }
+            answer_by_covering_row(
+                orch,
+                &db,
+                context.project_id,
+                lane,
+                rearmed,
+                &row,
+                context.commit,
+            )
+            .await;
             if context.trigger == Trigger::Heartbeat {
                 announce_quiet_lane(orch, &db, context, lane, &row).await;
             }
@@ -2012,6 +2126,42 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
             }
             report_live_lane(orch, &db, context, lane, verdict, &attempted).await;
             drop(attempted.consumer_guard);
+        }
+    }
+}
+
+/// A complete row already covering the tip answers the lane: it retires the
+/// cancel the lane's re-arm cites and ends the lane's restart streak, as
+/// surely as a row the lane just recorded. The cancel is counted first when
+/// it can be, so the clearing names every cancel; when it cannot, it is
+/// retired all the same, since a queued cancel the next boot transferred
+/// would start the streak this row just ended over again.
+async fn answer_by_covering_row(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    lane: &CadenceLane,
+    rearmed: Option<Interruption>,
+    row: &CadenceRow,
+    tip: &str,
+) {
+    if let Some(interruption) = rearmed {
+        if acknowledge_interruption(&orch.db.local, project_id, &interruption, true).await {
+            restart_streaks::refresh(orch, project_id, &lane.check, &lane.platform).await;
+        } else {
+            acknowledge_interruption(&orch.db.local, project_id, &interruption, false).await;
+        }
+        log::info!(
+            "main cadence: {} is answered by {}, which already covers `{}`",
+            interruption.describe(),
+            row.reference,
+            short_commit(tip)
+        );
+    }
+    if let Some(cleared) = restart_streaks::clear_lane(orch, project_id, lane).await {
+        let line = restart_streaks::render_cleared(&cleared, row);
+        if let Err(error) = try_deliver(orch, db, project_id, &lane.notify, &line).await {
+            log::warn!("main cadence: {line} Not posted: {error}");
         }
     }
 }
@@ -2512,6 +2662,12 @@ async fn try_report_lane(
             platform: lane.platform.clone(),
             commit: commit.to_string(),
             stopped_at_unix_ms: *stopped_at_unix_ms,
+            // A remote lane the stop reached is held for adoption and reports
+            // `AwaitingAdoption` instead (cairn/6581), so a cancelled pass was
+            // the colocated executor's, which ends with the runner (tenet
+            // 316), or had not been placed at all.
+            executor_id: Some(crate::fleet::COLOCATED_EXECUTOR_ID.to_string()),
+            cancelled_by: None,
         };
         if let Err(error) = record_interruption(&orch.db.local, project_id, &interruption).await {
             log::warn!(
@@ -2521,6 +2677,21 @@ async fn try_report_lane(
             );
         }
     }
+    // A complete row is the one thing that ends a restart streak: a death or
+    // a non-verdict leaves the lane as unobserved as a cancel does.
+    let cleared = match &verdict {
+        CadenceVerdict::Complete(_) => restart_streaks::clear_lane(orch, project_id, lane).await,
+        _ => None,
+    };
+    // Only a boot re-arm's report speaks for the streak: it is the report
+    // that succeeds the restart which last added to it.
+    let streak = rearmed.as_ref().and_then(|_| {
+        orch.main_cadence
+            .lock()
+            .unwrap()
+            .restart_streak(project_id, lane)
+            .cloned()
+    });
     let now = now_ms();
     let report = CadenceReport {
         check: &lane.check,
@@ -2548,7 +2719,26 @@ async fn try_report_lane(
     // earlier row on the lane holds for corroboration.
     filing_note
         .push_str(&incident_sources::revisit_held(orch, db, project_id, lane, event_key).await);
-    let content = format!("{}{filing_note}", render_report(&report));
+    let mut content = format!("{}{filing_note}", render_report(&report));
+    // A re-armed lane's report carries its streak. Past one cancel the
+    // streak's rise was already announced as the lane started
+    // (`restart_streaks::announce_rise`), so the report no longer forces itself.
+    let escalated = streak
+        .as_ref()
+        .is_some_and(|streak| streak.cancels.len() >= 2);
+    if let Some(streak) = &streak {
+        content.push_str(&format!(
+            "\n\n{}",
+            restart_streaks::render(streak, now, &names)
+        ));
+    }
+    let cleared_line = cleared
+        .as_ref()
+        .zip(verdict.row())
+        .map(|(streak, row)| restart_streaks::render_cleared(streak, row));
+    if let Some(line) = &cleared_line {
+        content.push_str(&format!("\n\n{line}"));
+    }
     orch.main_cadence.lock().unwrap().settled(
         project_id,
         LaneOutcome {
@@ -2592,20 +2782,30 @@ async fn try_report_lane(
         .unwrap()
         .wake(project_id, lane, observed, now);
     // A boot re-arm cites the pass the restart cancelled, which only its own
-    // report names.
+    // report names. Once the lane's streak has run past one cancel, the
+    // escalation posted as the lane started is that citation: the report then
+    // posts only when it is news of its own, and a pass cancelled yet again
+    // posts nothing, since the next boot counts it and announces the rise.
     let filing_news = filing_notice_due(orch, project_id, &filing_note, now);
-    let wake = if rearmed.is_some() || filing_news {
-        Wake::Announce
-    } else {
-        wake
+    let message = match (escalated, filing_news) {
+        (_, true) => Some(content.clone()),
+        (true, false) => match (&verdict, wake) {
+            (CadenceVerdict::Cancelled { .. }, _) => None,
+            (_, Wake::Announce) => Some(content.clone()),
+            (_, Wake::StillHeld { since_ms }) => Some(render_still_held(&report, since_ms)),
+            (_, Wake::Quiet) => None,
+        },
+        (false, false) if rearmed.is_some() => Some(content.clone()),
+        (false, false) => match wake {
+            Wake::Announce => Some(content.clone()),
+            Wake::StillHeld { since_ms } => Some(render_still_held(&report, since_ms)),
+            // A streak's end is news even on a row that is otherwise not.
+            Wake::Quiet => cleared_line.clone(),
+        },
     };
-    let delivered = match wake {
-        Wake::Announce => try_deliver(orch, db, project_id, &lane.notify, &content).await,
-        Wake::StillHeld { since_ms } => {
-            let still = render_still_held(&report, since_ms);
-            try_deliver(orch, db, project_id, &lane.notify, &still).await
-        }
-        Wake::Quiet => {
+    let delivered = match &message {
+        Some(message) => try_deliver(orch, db, project_id, &lane.notify, message).await,
+        None => {
             log::info!(
                 "main cadence {} on {}: identical to its predecessor, so recorded and not posted",
                 lane.check,
@@ -2617,30 +2817,39 @@ async fn try_report_lane(
     if let Err(error) = delivered {
         // An attempted send is not an announcement. A retry must not turn a
         // failed Announce into Quiet, or discard the interruption it should cite.
-        let mut slots = orch.main_cadence.lock().unwrap();
-        match previous_standing {
-            Some(standing) => {
-                slots.standing.insert(lane_key, standing);
+        {
+            let mut slots = orch.main_cadence.lock().unwrap();
+            match previous_standing {
+                Some(standing) => {
+                    slots.standing.insert(lane_key, standing);
+                }
+                None => {
+                    slots.standing.remove(&lane_key);
+                }
             }
-            None => {
-                slots.standing.remove(&lane_key);
+            match previous_filing_notice {
+                Some(at) => {
+                    slots.filing_notices.insert(project_id.to_string(), at);
+                }
+                None => {
+                    slots.filing_notices.remove(project_id);
+                }
+            }
+            if let Some(interruption) = rearmed {
+                slots.interrupted(project_id, interruption);
             }
         }
-        match previous_filing_notice {
-            Some(at) => {
-                slots.filing_notices.insert(project_id.to_string(), at);
-            }
-            None => {
-                slots.filing_notices.remove(project_id);
-            }
-        }
-        if let Some(interruption) = rearmed {
-            slots.interrupted(project_id, interruption);
+        // Nor may it lose the streak's clearing, which the retry posts.
+        if let Some(cleared) = cleared {
+            restart_streaks::restore(orch, cleared).await;
         }
         return Err(error);
     }
     if let Some(interruption) = &rearmed {
-        forget_interruption(&orch.db.local, project_id, interruption).await;
+        let count = !verdict.is_complete();
+        if acknowledge_interruption(&orch.db.local, project_id, interruption, count).await {
+            restart_streaks::refresh(orch, project_id, &lane.check, &lane.platform).await;
+        }
     }
     Ok(())
 }
@@ -3491,16 +3700,21 @@ async fn record_interruption(
     project_id: &str,
     interruption: &Interruption,
 ) -> Result<(), String> {
+    let cancelled_by = interruption.cancelled_by.as_ref();
     db.execute(
         "INSERT OR REPLACE INTO main_cadence_interruptions
-           (project_id, check_name, platform, commit_sha, stopped_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+           (project_id, check_name, platform, commit_sha, stopped_at, executor_id,
+            build_id, source_commit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             project_id,
             interruption.check.as_str(),
             interruption.platform.as_str(),
             interruption.commit.as_str(),
             interruption.stopped_at_unix_ms,
+            interruption.executor_id.as_deref(),
+            cancelled_by.map(|stamp| stamp.build_id.as_str()),
+            cancelled_by.and_then(|stamp| stamp.source_commit.as_deref()),
         ),
     )
     .await
@@ -3508,40 +3722,109 @@ async fn record_interruption(
     .map_err(|error| error.to_string())
 }
 
-async fn forget_interruption(db: &LocalDb, project_id: &str, interruption: &Interruption) {
+/// Retire a cited interruption from the queue. Every deletion outside the
+/// boot's transfer comes here, and it holds the queue's one invariant: a
+/// cancel leaves the queue only once its lane's streak has counted it. So the
+/// queued row is re-read, for the restart its boot stamped on it, and moved
+/// through [`restart_streaks::transfer`]; one that cannot be counted stays
+/// queued for the next boot. With `count` false (a complete row answered the
+/// lane, which ends the streak the cancel would have joined) it is only
+/// deleted. Returns whether the lane's streak may have changed.
+async fn acknowledge_interruption(
+    db: &LocalDb,
+    project_id: &str,
+    interruption: &Interruption,
+    count: bool,
+) -> bool {
+    let queued = match read_interruptions(db).await {
+        Ok(queued) => queued.into_iter().find(|(project, held)| {
+            project == project_id
+                && held.check == interruption.check
+                && held.platform == interruption.platform
+                && held.commit == interruption.commit
+                && held.stopped_at_unix_ms == interruption.stopped_at_unix_ms
+        }),
+        Err(error) => {
+            log::warn!(
+                "could not read the cited cadence interruption back, so it stays queued: {error}"
+            );
+            return false;
+        }
+    };
+    let Some((_, queued)) = queued else {
+        return false;
+    };
+    if count {
+        let boot = restart_streaks::RestartStamp::current();
+        return match restart_streaks::transfer(
+            db,
+            None,
+            project_id,
+            &queued,
+            boot.as_ref(),
+            now_ms(),
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!(
+                    "main cadence: {} could not be counted, so it stays queued for the next boot: {error}",
+                    queued.describe()
+                );
+                false
+            }
+        };
+    }
     if let Err(error) = db.execute(
         "DELETE FROM main_cadence_interruptions WHERE project_id=?1 AND check_name=?2 AND platform=?3 AND commit_sha=?4 AND stopped_at=?5",
-        (project_id, interruption.check.as_str(), interruption.platform.as_str(), interruption.commit.as_str(), interruption.stopped_at_unix_ms),
+        (project_id.to_string(), queued.check.clone(), queued.platform.clone(), queued.commit.clone(), queued.stopped_at_unix_ms),
     ).await {
         log::warn!("could not retire cited cadence interruption: {error}");
     }
+    false
 }
 
-/// Every recorded restart cancel, removed as it is read: one boot cites each.
-async fn take_interruptions(db: &LocalDb) -> Result<Vec<(String, Interruption)>, String> {
-    let interrupted = db
-        .query_all(
-            "SELECT project_id, check_name, platform, commit_sha, stopped_at
+/// Every recorded restart cancel, for the boot to cite. Each is removed only
+/// once the boot has counted it into its lane's streak
+/// ([`restart_streaks::transfer`]), so a failed count is retried by the next
+/// boot.
+async fn read_interruptions(db: &LocalDb) -> Result<Vec<(String, Interruption)>, String> {
+    db.query_all(
+        "SELECT project_id, check_name, platform, commit_sha, stopped_at, executor_id,
+                    build_id, source_commit
                FROM main_cadence_interruptions",
-            (),
-            |row| {
-                Ok((
-                    row.text(0)?,
-                    Interruption {
-                        check: row.text(1)?,
-                        platform: row.text(2)?,
-                        commit: row.text(3)?,
-                        stopped_at_unix_ms: row.i64(4)?,
-                    },
-                ))
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if !interrupted.is_empty() {
-        db.execute("DELETE FROM main_cadence_interruptions", ())
-            .await
-            .map_err(|error| error.to_string())?;
+        (),
+        |row| {
+            Ok((
+                row.text(0)?,
+                Interruption {
+                    check: row.text(1)?,
+                    platform: row.text(2)?,
+                    commit: row.text(3)?,
+                    stopped_at_unix_ms: row.i64(4)?,
+                    executor_id: row.opt_text(5)?,
+                    cancelled_by: row
+                        .opt_text(6)?
+                        .map(|build_id| restart_streaks::RestartStamp {
+                            build_id,
+                            source_commit: row.opt_text(7).ok().flatten(),
+                        }),
+                },
+            ))
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// What a boot does with the queue, without an orchestrator: read every
+/// interruption and move each into its streak.
+#[cfg(test)]
+async fn take_interruptions(db: &LocalDb) -> Result<Vec<(String, Interruption)>, String> {
+    let interrupted = read_interruptions(db).await?;
+    for (project_id, interruption) in &interrupted {
+        restart_streaks::transfer(db, None, project_id, interruption, None, now_ms()).await?;
     }
     Ok(interrupted)
 }
@@ -7071,6 +7354,8 @@ mod tests {
             platform: lane.platform.clone(),
             commit: "5027f5473a57a1b2".into(),
             stopped_at_unix_ms: stopped_at,
+            executor_id: Some(crate::fleet::COLOCATED_EXECUTOR_ID.into()),
+            cancelled_by: None,
         };
         record_interruption(&db, "p", &cancelled).await.unwrap();
         // The process ends, and its slots, queued successor included, with it.
@@ -7963,7 +8248,7 @@ mod tests {
             rearmed: Some(&citation),
         });
         assert!(rendered.contains(&citation.describe()), "{rendered}");
-        forget_interruption(&db, "p", &citation).await;
+        acknowledge_interruption(&db, "p", &citation, true).await;
         assert!(
             take_interruptions(&db).await.unwrap().is_empty(),
             "a subsequent boot must not discover a stale repair and phantom rearm"
@@ -8068,7 +8353,7 @@ mod tests {
             .unwrap()
             .take_interruption("p", &lane)
             .is_none());
-        forget_interruption(&db, "p", &interrupted).await;
+        acknowledge_interruption(&db, "p", &interrupted, true).await;
         assert!(take_interruptions(&db).await.unwrap().is_empty());
     }
 
@@ -8124,6 +8409,8 @@ mod tests {
             platform: "linux".into(),
             commit: "c".into(),
             stopped_at_unix_ms: 1,
+            executor_id: None,
+            cancelled_by: None,
         };
         let mut slots = CadenceSlots::default();
         slots.interrupted("p", interruption("retired-check"));
@@ -11374,6 +11661,583 @@ mod tests {
             "typecheck is no longer declared"
         );
         assert_eq!(slots.outcomes("q").len(), 1, "projects are independent");
+    }
+
+    /// cairn/6969 item 2, pinned rather than changed. A pass binds no tip, so
+    /// the boot pass after a restart attests wherever the store's default head
+    /// is now, whatever commit the cancelled pass had: testing read 747e49da
+    /// as a stale re-arm, and it was main's tip when that boot armed. A pass
+    /// over an older tip still in flight when main moves keeps its slot, and
+    /// the newer tip waits as its one queued successor (cairn/6497 comment #1,
+    /// case 1).
+    #[tokio::test]
+    async fn the_boot_re_arm_attests_the_current_tip_and_an_older_pass_keeps_its_slot() {
+        const CANCELLED: &str = "747e49da00000000";
+        const CURRENT: &str = "5734fd2c00000000";
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_migrated_for_test(temp.path().join("cadence.db"))
+            .await
+            .unwrap();
+        let lane = macos_lane();
+        record_interruption(&db, "p", &restart_cancel(CANCELLED, 3 * HOUR))
+            .await
+            .unwrap();
+
+        let slots = std::sync::Mutex::new(CadenceSlots::default());
+        for (project_id, interruption) in take_interruptions(&db).await.unwrap() {
+            slots.lock().unwrap().interrupted(&project_id, interruption);
+        }
+        let resolves = || async { Ok::<_, String>(CURRENT.to_string()) };
+        assert_eq!(
+            pass_head(&slots, "p", "main", true, resolves).await,
+            Ok(Some(CURRENT.to_string())),
+            "the boot pass resolves the default head; the citation plays no part"
+        );
+        let mut slots = slots.into_inner().unwrap();
+        assert!(slots.offer(&lane, &tip("p", CURRENT), Trigger::Startup, 4 * HOUR));
+        let armed = slots.in_flight("p").unwrap();
+        assert_eq!(armed.lanes[0].commit, CURRENT, "the re-arm attests the tip");
+        assert_eq!(armed.rearming[0].commit, CANCELLED, "and cites the cancel");
+        let cited = slots.take_interruption("p", &lane).unwrap();
+        let mut answered = row("r", CURRENT, 5 * HOUR, &[("t", TestOutcome::Passed)]);
+        answered.platform = "macos".into();
+        let message = render_report(&CadenceReport {
+            check: "rust-tests",
+            platform: "macos",
+            kind: LaneVerdict::PerTest,
+            commit: Some(CURRENT),
+            verdict: &CadenceVerdict::Complete(answered),
+            comparison: &Comparison::Baseline,
+            bracket: &Bracket::default(),
+            now_ms: 6 * HOUR,
+            rearmed: Some(&cited),
+        });
+        assert!(
+            message.contains("Re-armed at boot") && message.contains("`747e49da0000`"),
+            "{message}"
+        );
+        assert_eq!(slots.lane_finished("p", &lane, 6 * HOUR), None);
+
+        // An older pass in flight when main moves keeps its slot.
+        assert!(slots.offer(&lane, &tip("p", CANCELLED), Trigger::Merge, 7 * HOUR));
+        assert!(!slots.offer(&lane, &tip("p", CURRENT), Trigger::Merge, 8 * HOUR));
+        let running = slots.in_flight("p").unwrap();
+        assert_eq!(running.lanes[0].commit, CANCELLED);
+        assert!(running.lanes[0].queued);
+        assert_eq!(
+            slots.lane_finished("p", &lane, 9 * HOUR),
+            Some((Trigger::Merge, tip("p", CURRENT)))
+        );
+    }
+
+    /// A macOS rust-tests pass on the colocated executor that a stop cancelled.
+    fn restart_cancel(commit: &str, stopped_at_unix_ms: i64) -> Interruption {
+        Interruption {
+            check: "rust-tests".into(),
+            platform: "macos".into(),
+            commit: commit.into(),
+            stopped_at_unix_ms,
+            executor_id: Some(crate::fleet::COLOCATED_EXECUTOR_ID.into()),
+            cancelled_by: None,
+        }
+    }
+
+    /// An orchestrator over a cadence database whose `testing` thread takes
+    /// the lanes' messages.
+    async fn notifying_orchestrator(root: &tempfile::TempDir) -> (Orchestrator, Arc<LocalDb>) {
+        let db = Arc::new(cadence_db(root).await);
+        db.execute_script(
+            "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at)
+               VALUES('testing','p','testing','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,node_name,uri_segment,status,created_at,updated_at)
+               VALUES('thread-job','testing','p','thread','thread','idle',1,1);",
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(db.clone(), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root.path().to_path_buf(),
+        )
+        .build();
+        (orch, db)
+    }
+
+    async fn cadence_messages(db: &LocalDb) -> Vec<String> {
+        db.query_all(
+            "SELECT content FROM messages
+              WHERE channel_id='testing' AND sender_name='main cadence' ORDER BY rowid",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// cairn/6969, specimen 11-11: macOS main rust-tests' last complete row
+    /// ran at 19:27Z on 81656f2a; the 21:34Z rebuild a5f3bc58 cancelled the
+    /// pass on 31a23e03 and the 00:08Z rebuild a051cd41 (from b70efa60) the
+    /// pass on 747e49da. Two boots make one streak naming both restarts. The
+    /// rise to two is announced once, as the re-armed lane starts, whatever
+    /// that pass then does; a death leaves the streak standing, a pass
+    /// cancelled yet again posts nothing (the next boot counts and announces
+    /// it), and a complete row clears it.
+    #[tokio::test]
+    async fn restart_cancels_across_boots_are_one_streak_until_a_complete_row() {
+        use restart_streaks::RestartStamp;
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = notifying_orchestrator(&root).await;
+        let lane = macos_lane();
+        let complete_at = 100 * HOUR;
+        let first_stop = complete_at + 2 * HOUR + 7 * MINUTE;
+        let second_stop = first_stop + 2 * HOUR + 34 * MINUTE;
+        // The lane's rows live in the project's database. Kept apart from the
+        // orchestrator's here, where a cadence row would also queue as an
+        // incident source the report would then owe a filing notice for.
+        let project_root = tempfile::tempdir().unwrap();
+        let project_db = cadence_db(&project_root).await;
+        project_db
+            .execute_script(format!(
+                "INSERT INTO check_result_observations
+               (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+                environment_fingerprint, exit_code, verdict, complete, reusable,
+                parser_version, result_schema_version, ran_at, duration_ms, job_id,
+                cadence, output_tail, executor_id, verdict_platform, public_handle,
+                selection, failure_kind)
+             VALUES('last','p','81656f2a00000000','t','rust-tests','i-last','env',0,'passed',1,0,
+                    1,1,{complete_at},5757000,'main:p','main','','colocated','macos','h-last',
+                    'full',NULL);"
+            ))
+            .await
+            .unwrap();
+
+        let first_boot = RestartStamp {
+            build_id: "a5f3bc5800000000".into(),
+            source_commit: None,
+        };
+        let streak = restart_streaks::record(
+            &db,
+            Some(&project_db),
+            "p",
+            &restart_cancel("31a23e0300000000", first_stop),
+            Some(&first_boot),
+            first_stop + MINUTE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(streak.cancels.len(), 1);
+        assert_eq!(
+            streak.last_complete,
+            Some(("81656f2a00000000".to_string(), complete_at))
+        );
+
+        let second_boot = RestartStamp {
+            build_id: "a051cd4100000000".into(),
+            source_commit: Some("b70efa6000000000".into()),
+        };
+        let second = restart_cancel("747e49da00000000", second_stop);
+        let record_second = || {
+            restart_streaks::record(
+                &db,
+                Some(&project_db),
+                "p",
+                &second,
+                Some(&second_boot),
+                second_stop + MINUTE,
+            )
+        };
+        let streak = record_second().await.unwrap();
+        assert_eq!(
+            record_second().await.unwrap(),
+            streak,
+            "a pass is counted once however often a boot reads it back"
+        );
+        assert_eq!(
+            restart_streaks::load_all(&db).await.unwrap(),
+            vec![streak.clone()]
+        );
+        let names = |executor: &str| {
+            if executor == crate::fleet::COLOCATED_EXECUTOR_ID {
+                "local".to_string()
+            } else {
+                executor.to_string()
+            }
+        };
+        assert_eq!(
+            restart_streaks::render(&streak, complete_at + 4 * HOUR + 40 * MINUTE + 30_000, &names),
+            format!(
+                "macOS rust-tests cancelled by restart 2x running; unobserved 4h 40m since `81656f2a0000` (last complete row {}). Cancelled by: {} rebuild a5f3bc580000 from source unknown (pass on `31a23e030000` on local); {} rebuild a051cd410000 from `b70efa600000` (pass on `747e49da0000` on local).",
+                stamp(complete_at),
+                stamp(first_stop),
+                stamp(second_stop)
+            )
+        );
+
+        // The second boot holds the risen streak and re-arms the lane. As the
+        // lane starts, before any verdict, the rise is announced, once.
+        {
+            let mut slots = orch.main_cadence.lock().unwrap();
+            slots.set_restart_streak(streak.clone());
+            slots.interrupted("p", second.clone());
+        }
+        restart_streaks::announce_rise(&orch, &db, "p", &lane).await;
+        restart_streaks::announce_rise(&orch, &db, "p", &lane).await;
+        let posted = cadence_messages(&db).await;
+        assert_eq!(posted.len(), 1, "{posted:#?}");
+        assert!(
+            posted[0].starts_with(
+                "**MAIN CADENCE RESTART STREAK** — macOS rust-tests cancelled by restart 2x running; unobserved "
+            ) && posted[0].ends_with("the next complete row clears this."),
+            "{}",
+            posted[0]
+        );
+        assert_eq!(
+            restart_streaks::load_all(&db).await.unwrap()[0].announced,
+            2,
+            "the rise is marked durably, so a later boot does not repeat it"
+        );
+
+        // A death with no row observed nothing: the streak stands.
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("5734fd2c00000000"),
+            CadenceVerdict::Death {
+                row: None,
+                cause: "infrastructure: the lane's machine went away".into(),
+            },
+            &Attempted::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restart_streaks::load_all(&db).await.unwrap().len(), 1);
+        assert!(orch
+            .main_cadence
+            .lock()
+            .unwrap()
+            .restart_streak("p", &lane)
+            .is_some());
+        assert!(
+            !cadence_messages(&db)
+                .await
+                .iter()
+                .any(|message| message.contains("CANCELLED BY RESTART")),
+            "no full cancelled report once the streak has risen"
+        );
+
+        // Re-armed again and cancelled again: nothing posts now; the next boot
+        // counts the pass and announces the rise to three.
+        let before = cadence_messages(&db).await.len();
+        orch.main_cadence
+            .lock()
+            .unwrap()
+            .interrupted("p", second.clone());
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("5734fd2c00000000"),
+            CadenceVerdict::Cancelled {
+                cause: "infrastructure: Cairn's runner is stopping.".into(),
+                stopped_at_unix_ms: second_stop + 2 * HOUR,
+            },
+            &Attempted::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cadence_messages(&db).await.len(), before);
+
+        let mut answered = row(
+            "r",
+            "5734fd2c00000000",
+            now_ms(),
+            &[("t", TestOutcome::Passed)],
+        );
+        answered.platform = "macos".into();
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("5734fd2c00000000"),
+            CadenceVerdict::Complete(answered),
+            &Attempted::default(),
+        )
+        .await
+        .unwrap();
+        assert!(restart_streaks::load_all(&db).await.unwrap().is_empty());
+        assert!(orch
+            .main_cadence
+            .lock()
+            .unwrap()
+            .restart_streak("p", &lane)
+            .is_none());
+        let posted = cadence_messages(&db).await;
+        assert!(
+            posted.last().unwrap().contains(
+                "macOS rust-tests streak cleared: complete row cairn://p/cairn/check-observations/r on `5734fd2c0000` after 2 restart cancels."
+            ),
+            "{posted:#?}"
+        );
+    }
+
+    /// A boot that cannot count an interruption keeps it queued: the next boot
+    /// counts it, still naming the restart that cancelled it, and only then is
+    /// it acknowledged.
+    #[tokio::test]
+    async fn a_cancel_the_boot_could_not_count_is_counted_by_the_next_boot() {
+        use restart_streaks::RestartStamp;
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = notifying_orchestrator(&temp).await;
+        let cancel = restart_cancel("747e49da00000000", 3 * HOUR);
+        record_interruption(&db, "p", &cancel).await.unwrap();
+        db.execute_script(
+            "CREATE TRIGGER reject_streak BEFORE INSERT ON main_cadence_restart_streaks
+             BEGIN SELECT RAISE(ABORT,'injected streak write failure'); END;",
+        )
+        .await
+        .unwrap();
+        let first_boot = RestartStamp {
+            build_id: "a051cd4100000000".into(),
+            source_commit: Some("b70efa6000000000".into()),
+        };
+        let error = restart_streaks::transfer(&db, None, "p", &cancel, Some(&first_boot), 4 * HOUR)
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected streak write failure"), "{error}");
+        let queued = read_interruptions(&db).await.unwrap();
+        assert_eq!(queued.len(), 1, "the uncounted cancel stays queued");
+        assert_eq!(queued[0].1.cancelled_by, Some(first_boot.clone()));
+
+        // The boot cites it all the same (its in-memory copy, unstamped), and
+        // the re-armed successor reports a non-verdict while the streak still
+        // cannot be written: the report must not retire the uncounted cancel.
+        orch.main_cadence
+            .lock()
+            .unwrap()
+            .interrupted("p", cancel.clone());
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &macos_lane(),
+            Some("5734fd2c00000000"),
+            CadenceVerdict::NoVerdict {
+                row: None,
+                cause: "no test produced a result".into(),
+            },
+            &Attempted::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_interruptions(&db).await.unwrap(),
+            queued,
+            "the report leaves the uncounted cancel queued, stamp and all"
+        );
+        assert!(restart_streaks::load_all(&db).await.unwrap().is_empty());
+
+        db.execute_script("DROP TRIGGER reject_streak;")
+            .await
+            .unwrap();
+        let next_boot = RestartStamp {
+            build_id: "ffffffff00000000".into(),
+            source_commit: None,
+        };
+        let (project_id, interruption) = &queued[0];
+        restart_streaks::transfer(
+            &db,
+            None,
+            project_id,
+            interruption,
+            Some(&next_boot),
+            5 * HOUR,
+        )
+        .await
+        .unwrap();
+        assert!(read_interruptions(&db).await.unwrap().is_empty());
+        let streaks = restart_streaks::load_all(&db).await.unwrap();
+        assert_eq!(streaks.len(), 1);
+        assert_eq!(streaks[0].cancels.len(), 1);
+        assert_eq!(
+            streaks[0].cancels[0].build_id.as_deref(),
+            Some("a051cd4100000000"),
+            "the cancel names the restart that cancelled it, not the boot that counted it"
+        );
+    }
+
+    /// A covering row ends the streak even when the cancel its re-arm cites
+    /// cannot be counted: the cancel is retired with the streak, so once the
+    /// store recovers the next boot finds nothing to start the streak again.
+    #[tokio::test]
+    async fn a_covering_row_retires_a_cancel_it_could_not_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = notifying_orchestrator(&temp).await;
+        let lane = macos_lane();
+        let earlier = restart_cancel("31a23e0300000000", 2 * HOUR);
+        let streak = restart_streaks::record(&db, None, "p", &earlier, None, 2 * HOUR)
+            .await
+            .unwrap();
+        orch.main_cadence.lock().unwrap().set_restart_streak(streak);
+        let cancel = restart_cancel("747e49da00000000", 3 * HOUR);
+        record_interruption(&db, "p", &cancel).await.unwrap();
+        db.execute_script(
+            "CREATE TRIGGER reject_streak BEFORE INSERT ON main_cadence_restart_streaks
+             BEGIN SELECT RAISE(ABORT,'injected streak write failure'); END;",
+        )
+        .await
+        .unwrap();
+        // The boot could not count it, and cites it anyway.
+        assert!(
+            restart_streaks::transfer(&db, None, "p", &cancel, None, 4 * HOUR)
+                .await
+                .is_err()
+        );
+        let mut covering = row(
+            "r",
+            "5734fd2c00000000",
+            5 * HOUR,
+            &[("t", TestOutcome::Passed)],
+        );
+        covering.platform = "macos".into();
+        answer_by_covering_row(
+            &orch,
+            &db,
+            "p",
+            &lane,
+            Some(cancel.clone()),
+            &covering,
+            "5734fd2c00000000",
+        )
+        .await;
+        assert!(read_interruptions(&db).await.unwrap().is_empty());
+        assert!(restart_streaks::load_all(&db).await.unwrap().is_empty());
+        assert!(cadence_messages(&db)
+            .await
+            .last()
+            .unwrap()
+            .contains("streak cleared: complete row cairn://p/cairn/check-observations/r"));
+
+        // The store recovers and the runner boots again: nothing to recount.
+        db.execute_script("DROP TRIGGER reject_streak;")
+            .await
+            .unwrap();
+        assert!(take_interruptions(&db).await.unwrap().is_empty());
+        assert!(restart_streaks::load_all(&db).await.unwrap().is_empty());
+    }
+
+    /// An adoption lost after the boot's scan is counted at the loss itself:
+    /// its citation may be consumed by the successor's report (here a
+    /// non-verdict) before any boot reads the queue again.
+    #[tokio::test]
+    async fn an_adoption_lost_after_the_boot_scan_is_counted_in_its_streak() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = notifying_orchestrator(&root).await;
+        let lane = linux_lane();
+        let claim = adoption_claim("running");
+        check_lane_adoptions::insert(&db, &claim).await.unwrap();
+        try_lose_adoption(
+            &orch,
+            &claim,
+            std::slice::from_ref(&lane.check),
+            "machine omitted the request",
+        )
+        .await
+        .unwrap();
+        let counted = |streaks: Vec<restart_streaks::RestartStreak>| {
+            assert_eq!(streaks.len(), 1, "{streaks:?}");
+            assert_eq!(streaks[0].cancels.len(), 1);
+            assert_eq!(streaks[0].cancels[0].executor_id.as_deref(), Some("remote"));
+        };
+        counted(restart_streaks::load_all(&db).await.unwrap());
+        assert!(orch
+            .main_cadence
+            .lock()
+            .unwrap()
+            .restart_streak("p", &lane)
+            .is_some());
+
+        try_report_lane(
+            &orch,
+            &db,
+            "p",
+            "cairn",
+            None,
+            &lane,
+            Some("successor"),
+            CadenceVerdict::NoVerdict {
+                row: None,
+                cause: "no test produced a result".into(),
+            },
+            &Attempted::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read_interruptions(&db).await.unwrap().is_empty(),
+            "the report consumed the citation"
+        );
+        counted(restart_streaks::load_all(&db).await.unwrap());
+        let line = &restart_streak_lines(&orch, "p")[0];
+        assert!(
+            render_machine_restart_streaks(&orch, "remote").contains(line.as_str()),
+            "the loss shows on the page of the machine that lost the pass"
+        );
+        assert_eq!(
+            render_machine_restart_streaks(&orch, crate::fleet::COLOCATED_EXECUTOR_ID),
+            ""
+        );
+    }
+
+    /// The incident is one line wherever it shows: the project's Main cadence
+    /// section, and the page of the machine its cancelled passes ran on only.
+    #[tokio::test]
+    async fn a_restart_streak_renders_on_main_cadence_and_on_its_machines_page() {
+        let root = tempfile::tempdir().unwrap();
+        let (orch, db) = notifying_orchestrator(&root).await;
+        let streak = restart_streaks::record(
+            &db,
+            None,
+            "p",
+            &restart_cancel("31a23e0300000000", 3 * HOUR),
+            None,
+            4 * HOUR,
+        )
+        .await
+        .unwrap();
+        orch.main_cadence.lock().unwrap().set_restart_streak(streak);
+
+        let lines = restart_streak_lines(&orch, "p");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(
+                "macOS rust-tests cancelled by restart 1x running; no complete row on record. Cancelled by: "
+            ) && lines[0].contains("a restart into an unrecorded build (pass on `31a23e030000` on "),
+            "{}",
+            lines[0]
+        );
+        let machine = render_machine_restart_streaks(&orch, crate::fleet::COLOCATED_EXECUTOR_ID);
+        assert!(
+            machine.starts_with("## Main cadence restart-cancel streaks")
+                && machine.contains(&format!("- {}\n", lines[0])),
+            "{machine}"
+        );
+        assert_eq!(render_machine_restart_streaks(&orch, "bgsrv-mac"), "");
+        assert!(restart_streak_lines(&orch, "q").is_empty());
     }
 }
 

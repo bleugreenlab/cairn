@@ -11738,6 +11738,7 @@ mod tests {
                 memory_ceiling: None,
                 process_fit_waived: None,
                 nested_sandbox_waived: None,
+                restart_exposure: None,
                 process_demand: None,
                 executor_name: executor_name.into(),
                 executor_id: "executor-7b21ce".into(),
