@@ -1708,6 +1708,24 @@ async fn release_reconcile_quarantine(
 pub(super) struct SiblingJob {
     pub(super) id: String,
     base_commit: Option<String>,
+    /// Whether the job owns the branch rather than sharing it with the job
+    /// that delegated it ([`OWNS_BRANCH`]).
+    pub(super) owns_branch: bool,
+}
+
+/// The jobs on a branch that are told about it: its owners. A task working on
+/// its delegating parent's branch shares the branch but is not the one to
+/// resolve, carry or decide anything about it. When none of the live jobs owns
+/// the branch (its owner ended while a task it delegated still runs), the
+/// jobs sharing it stand in, as they do for
+/// [`preparation::live_branch_owner`].
+pub(super) fn branch_owners(jobs: &[SiblingJob]) -> Vec<&SiblingJob> {
+    let owners: Vec<&SiblingJob> = jobs.iter().filter(|job| job.owns_branch).collect();
+    if owners.is_empty() {
+        jobs.iter().collect()
+    } else {
+        owners
+    }
 }
 
 #[derive(Debug)]
@@ -2525,8 +2543,9 @@ pub(crate) async fn reconcile_base_branch_advance(
     }
 }
 
-/// Tell every live job whose own branch is `branch` something about it, once
-/// per `key`.
+/// Tell the owners of `branch` ([`branch_owners`]) something about it, once
+/// per `key`. A task sharing the branch neither publishes it nor decides how
+/// a divergence from origin is combined.
 async fn notify_on_branch_jobs(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -2543,7 +2562,7 @@ async fn notify_on_branch_jobs(
             return;
         }
     };
-    for job in jobs {
+    for job in branch_owners(&jobs) {
         let Some(run_id) = latest_run_for_job(db, &job.id) else {
             continue;
         };
@@ -3315,6 +3334,23 @@ const LIVE_JOB_PREDICATE: &str = "NOT EXISTS (
                        AND mr.status NOT IN ('merged', 'closed')
                   ) )";
 
+/// Joins `delegator` to job `j` when `j` works on the branch of the job that
+/// delegated it: a sub-agent task (or a workflow agent) on its parent's
+/// branch. Read through [`OWNS_BRANCH`].
+const DELEGATOR_ON_BRANCH_JOIN: &str = "LEFT JOIN jobs delegator
+             ON delegator.id = j.parent_job_id
+            AND delegator.project_id = j.project_id
+            AND delegator.branch = j.branch";
+
+/// Whether job `j` owns its branch, over [`DELEGATOR_ON_BRANCH_JOIN`]: it did
+/// not inherit the branch from the job that delegated it. A task sharing its
+/// parent's branch holds it at the mutation boundary like its owner does
+/// ([`shares_live_branch`]), but the branch's declaration, its conflicts and
+/// the notices about it belong to the owner. The one owner predicate: owner
+/// resolution ([`preparation::live_branch_owner`]) and every notice about a
+/// branch ([`branch_owners`]) read it, so the two cannot name different owners.
+const OWNS_BRANCH: &str = "(delegator.id IS NULL)";
+
 /// Re-point everything cut from a branch that has just merged.
 ///
 /// A child issue's execution records its parent's integration branch in
@@ -3439,7 +3475,8 @@ pub(crate) async fn load_tracked_base_branches(
     .map_err(|error| error.to_string())
 }
 
-/// Active jobs whose durable branch is the branch that just advanced.
+/// Active jobs whose durable branch is the branch that just advanced. Every
+/// one of them records the advanced base; only its [`branch_owners`] are told.
 pub(super) async fn load_on_branch_jobs(
     db: &LocalDb,
     project_id: &str,
@@ -3447,35 +3484,27 @@ pub(super) async fn load_on_branch_jobs(
 ) -> Result<Vec<SiblingJob>, String> {
     let project_id = project_id.to_string();
     let branch = branch.to_string();
+    let sql = format!(
+        "SELECT j.id, j.base_commit, {OWNS_BRANCH}
+           FROM jobs j {DELEGATOR_ON_BRANCH_JOIN}
+          WHERE j.project_id = ?1
+            AND j.branch = ?2
+            AND {LIVE_JOB_PREDICATE}"
+    );
     db.read(|conn| {
         let project_id = project_id.clone();
         let branch = branch.clone();
+        let sql = sql.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query(
-                    "SELECT j.id, j.branch, j.base_commit
-                         FROM jobs j
-                         WHERE j.project_id = ?1
-                           AND j.branch = ?2
-                           AND NOT EXISTS (
-                             SELECT 1 FROM issues i
-                             WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
-                           )
-                           AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
-                                 OR EXISTS (
-                                   SELECT 1 FROM merge_requests mr
-                                   WHERE mr.source_branch = j.branch
-                                     AND mr.project_id = j.project_id
-                                     AND mr.status NOT IN ('merged', 'closed')
-                                 ) )",
-                    params![project_id.as_str(), branch.as_str()],
-                )
+                .query(&sql, params![project_id.as_str(), branch.as_str()])
                 .await?;
             let mut jobs = Vec::new();
             while let Some(row) = rows.next().await? {
                 jobs.push(SiblingJob {
                     id: row.text(0)?,
-                    base_commit: row.opt_text(2)?,
+                    base_commit: row.opt_text(1)?,
+                    owns_branch: row.i64(2)? != 0,
                 });
             }
             Ok(jobs)
@@ -4630,6 +4659,7 @@ mod tests {
         let sibling = SiblingJob {
             id: "job-overlap".to_string(),
             base_commit: Some("stale-snapshot".to_string()),
+            owns_branch: true,
         };
 
         advance_sibling_durable_base(&db, &sibling, "new-tip")
@@ -4662,6 +4692,7 @@ mod tests {
         let sibling = SiblingJob {
             id: "job-overlap".to_string(),
             base_commit: Some("stale-snapshot".to_string()),
+            owns_branch: true,
         };
 
         advance_sibling_durable_base(&db, &sibling, "new-tip")
@@ -4693,6 +4724,7 @@ mod tests {
         let sibling = SiblingJob {
             id: "job-overlap".to_string(),
             base_commit: None,
+            owns_branch: true,
         };
 
         advance_sibling_durable_base(&db, &sibling, "new-tip")
@@ -4714,6 +4746,7 @@ mod tests {
         let sibling = SiblingJob {
             id: "job-that-was-deleted".to_string(),
             base_commit: Some("stale-snapshot".to_string()),
+            owns_branch: true,
         };
 
         advance_sibling_durable_base(&db, &sibling, "new-tip")

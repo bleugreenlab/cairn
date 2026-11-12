@@ -79,11 +79,12 @@ use std::time::Duration;
 use cairn_db::turso::params;
 
 use super::{
-    advance_sibling_durable_base, append_conflict_diagnostic, load_on_branch_jobs,
+    advance_sibling_durable_base, append_conflict_diagnostic, branch_owners, load_on_branch_jobs,
     load_project_default_branch, load_project_repo_path, load_reconcile_quarantine,
     mark_publication_unconfirmed, materialize_markers_for_branch, persist_reconcile_item,
     quarantine_blocks_automatic_replay, record_reconcile_timeout, refresh_residencies_for_branch,
-    release_reconcile_quarantine, replay_kept_patch, ReconcileItemUpdate, LIVE_JOB_PREDICATE,
+    release_reconcile_quarantine, replay_kept_patch, ReconcileItemUpdate, DELEGATOR_ON_BRANCH_JOIN,
+    LIVE_JOB_PREDICATE, OWNS_BRANCH,
 };
 use crate::messages::delivery::{latest_run_for_job, queue_system_direct_once};
 use crate::messages::queued::DeliveryUrgency;
@@ -153,8 +154,11 @@ impl PreparationPurpose {
 pub(crate) struct PreparationRequest {
     pub(crate) project_id: String,
     pub(crate) branch: String,
-    /// The job whose declaration governs the relationship. `None` resolves the
-    /// branch's live owner; a terminal job's stale declaration never decides.
+    /// The job whose commit, merge or capture asks for this preparation; its
+    /// declaration governs the relationship. It may be a task sharing its
+    /// parent's branch, which a conflict tells that the owner resolves. `None`
+    /// resolves the branch's live owner; a terminal job's stale declaration
+    /// never decides.
     pub(crate) owner_job_id: Option<String>,
     /// Prepare against this branch instead of the declared base: the actual
     /// landing target. The declaration is still captured and revalidated.
@@ -4224,7 +4228,8 @@ impl Context<'_> {
         let jobs = load_on_branch_jobs(self.db, &request.project_id, branch)
             .await
             .map_err(PreparationRefusal::Repository)?;
-        for job in jobs {
+        let owners = branch_owners(&jobs);
+        for job in &owners {
             let Some(run_id) = latest_run_for_job(self.db, &job.id) else {
                 continue;
             };
@@ -4234,6 +4239,43 @@ impl Context<'_> {
             {
                 log::warn!("steer job {} about `{branch}`'s conflict: {error}", job.id);
             }
+        }
+        // A task sharing the branch whose own commit met the conflict learns
+        // that it did not land and who resolves it. Its tool result already
+        // carries the refusal, so this rides along rather than waking it.
+        let Some(requester) = request.owner_job_id.as_deref() else {
+            return Ok(());
+        };
+        let shares = jobs.iter().any(|job| job.id == requester)
+            && !owners.iter().any(|job| job.id == requester);
+        if !shares {
+            return Ok(());
+        }
+        let Some(run_id) = latest_run_for_job(self.db, requester) else {
+            return Ok(());
+        };
+        let mut named = Vec::with_capacity(owners.len());
+        for owner in &owners {
+            named.push(
+                crate::jobs::queries::home_uri_for_job(self.db, &owner.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| format!("job `{}`", owner.id)),
+            );
+        }
+        let note = build_preparation_conflict_sharer_note(
+            branch,
+            &coordinate.base_branch,
+            &coordinate.base,
+            request.purpose,
+            &named.join(", "),
+        );
+        let key = conflict_delivery_key(&request.project_id, branch, requester, &fingerprint);
+        if let Err(error) =
+            queue_system_direct_once(self.orch, &run_id, &note, DeliveryUrgency::Passive, &key)
+        {
+            log::warn!("tell job {requester} its commit to `{branch}` conflicted: {error}");
         }
         Ok(())
     }
@@ -4253,7 +4295,7 @@ impl Context<'_> {
             &installed.head,
             request.purpose,
         );
-        for job in jobs {
+        for job in branch_owners(jobs) {
             let Some(run_id) = latest_run_for_job(self.db, &job.id) else {
                 continue;
             };
@@ -4470,16 +4512,17 @@ struct Owner {
     branchless: bool,
 }
 
-/// The live jobs on branch `?2` in project `?1`, newest first: who a
-/// preparation that names no owner acts for. Its plan is pinned by
-/// `live_job_lookups_by_branch_seek_project_and_branch` (migration
+/// The live jobs on branch `?2` in project `?1`, owners first ([`OWNS_BRANCH`]:
+/// a task on its parent's branch never displaces the parent), then newest
+/// first: who a preparation that names no owner acts for. Its plan is pinned
+/// by `live_job_lookups_by_branch_seek_project_and_branch` (migration
 /// `0403_index_jobs_project_branch`).
 pub(super) fn live_owners_on_branch_sql() -> String {
     format!(
-        "SELECT j.id, j.base_branch, 0 FROM jobs j
+        "SELECT j.id, j.base_branch, 0 FROM jobs j {DELEGATOR_ON_BRANCH_JOIN}
           WHERE j.project_id = ?1 AND j.branch = ?2
             AND {LIVE_JOB_PREDICATE}
-          ORDER BY j.created_at DESC, j.id"
+          ORDER BY {OWNS_BRANCH} DESC, j.created_at DESC, j.id"
     )
 }
 
@@ -4815,7 +4858,7 @@ fn short(commit: &str) -> &str {
 }
 
 // The key becomes a globally unique message id, so it names the recipient job:
-// every live job on the branch hears each note once, not just the first.
+// each recipient hears each note once, not just the first.
 fn clean_delivery_key(project_id: &str, branch: &str, job_id: &str, base_commit: &str) -> String {
     format!("prepare:{project_id}:{branch}:{job_id}:clean:{base_commit}")
 }
@@ -4860,6 +4903,26 @@ fn build_preparation_conflict_note(
          `{base_branch}` at {}, and carrying it there conflicts. Nothing was installed: your \
          branch is unchanged. Resolve the conflict through `cairn:~/rebase`; your work cannot \
          land until it carries the base.",
+        purpose.label(),
+        short(base_commit),
+    )
+}
+
+/// The conflict as told to a task whose own commit met it on the branch it
+/// shares with `owners`: never a request to resolve what the owner resolves.
+fn build_preparation_conflict_sharer_note(
+    branch: &str,
+    base_branch: &str,
+    base_commit: &str,
+    purpose: PreparationPurpose,
+    owners: &str,
+) -> String {
+    format!(
+        "[Base branch update] Your {} to `{branch}` did not land: the branch needed its current \
+         base `{base_branch}` at {}, carrying it there conflicts, and nothing was installed. \
+         `{branch}` belongs to {owners}, which has been told and resolves the conflict; it is not \
+         yours to resolve. Another commit to `{branch}` meets the same conflict until it is \
+         resolved, so report what you were committing to the owner rather than retrying.",
         purpose.label(),
         short(base_commit),
     )

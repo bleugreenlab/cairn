@@ -496,3 +496,139 @@ fn the_preparer_reads_resolution_bases_only_through_the_bounded_offload() {
         );
     }
 }
+
+/// Two sub-agent tasks of the harness's owner, delegated onto the owner's own
+/// branch, newer than the owner, each with a live run of its own: one that
+/// commits and one that never does.
+const TASK: &str = "job-prep-task";
+const TASK_RUN: &str = "run-prep-task";
+const IDLE_TASK_RUN: &str = "run-prep-idle";
+
+async fn add_tasks(h: &Harness) {
+    h.db.execute_script(format!(
+        "UPDATE jobs SET uri_segment = 'builder' WHERE id = '{JOB}';
+         INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, parent_job_id, status, branch, base_branch, uri_segment, created_at, updated_at)
+           VALUES ('{TASK}', 'exec-1', 'node', 'issue-1', 'proj-1', '{JOB}', 'running', '{BRANCH}', NULL, 'scout', 2, 2),
+                  ('job-prep-idle', 'exec-1', 'node', 'issue-1', 'proj-1', '{JOB}', 'running', '{BRANCH}', NULL, 'idle', 3, 3);
+         INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+           VALUES ('{TASK_RUN}', 'issue-1', 'proj-1', '{TASK}', 'live', 2, 2),
+                  ('{IDLE_TASK_RUN}', 'issue-1', 'proj-1', 'job-prep-idle', 'live', 3, 3);"
+    ))
+    .await
+    .unwrap();
+}
+
+/// Every queued direct message, as `(recipient run, urgency, content)`.
+async fn directs(h: &Harness) -> Vec<(String, String, String)> {
+    h.db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT recipient_run_id, urgency, content FROM messages
+                      WHERE channel_type = 'direct' ORDER BY created_at, rowid",
+                    (),
+                )
+                .await?;
+            let mut all = Vec::new();
+            while let Some(row) = rows.next().await? {
+                all.push((row.text(0)?, row.text(1)?, row.text(2)?));
+            }
+            Ok::<_, DbError>(all)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+fn to(directs: &[(String, String, String)], run: &str) -> Vec<(String, String)> {
+    directs
+        .iter()
+        .filter(|(recipient, ..)| recipient == run)
+        .map(|(_, urgency, content)| (urgency.clone(), content.clone()))
+        .collect()
+}
+
+/// A conflict is the owner's to resolve. A task sharing the branch hears
+/// nothing unless its own commit tripped it, and then only that its commit
+/// did not land and who resolves it: never a blocking "yours to merge".
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_conflict_steers_only_the_branch_owner_not_a_task_sharing_its_branch() {
+    let h = harness_or_skip!("prep_conflict_owner_only");
+    add_tasks(&h).await;
+    assert_eq!(
+        live_branch_owner(&h.db, "proj-1", BRANCH)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(JOB),
+        "a newer task on its parent's branch does not displace the owner"
+    );
+    h.commit(&h.branch_ws, BRANCH, "shared.txt", "original\nX\n");
+    h.advance_main("shared.txt", "original\nA\n");
+
+    // The task's own commit is the one that meets the conflict.
+    match prepare_branch(
+        &h.orch,
+        PreparationRequest::new(
+            "proj-1",
+            BRANCH,
+            Some(TASK.to_string()),
+            PreparationPurpose::OwnerCommit,
+        ),
+    )
+    .await
+    {
+        Err(PreparationRefusal::Conflict(_)) => {}
+        Ok(_) => panic!("the commit records the conflict, not an advance"),
+        Err(refusal) => panic!("the commit records the conflict: {refusal}"),
+    }
+    let all = directs(&h).await;
+    let owner = to(&all, RUN);
+    assert_eq!(owner.len(), 1, "the owner is steered once: {all:?}");
+    assert_eq!(owner[0].0, "steer");
+    assert!(owner[0].1.contains("cairn:~/rebase"), "{}", owner[0].1);
+    assert!(
+        to(&all, IDLE_TASK_RUN).is_empty(),
+        "a task that committed nothing hears nothing: {all:?}"
+    );
+    let task = to(&all, TASK_RUN);
+    assert_eq!(task.len(), 1, "the committing task is told: {all:?}");
+    let (urgency, note) = &task[0];
+    assert_eq!(
+        urgency, "passive",
+        "its tool result already refused: {note}"
+    );
+    assert!(note.contains("did not land"), "{note}");
+    assert!(
+        note.contains("cairn://p/proj/1/1/builder"),
+        "names the owner: {note}"
+    );
+    assert!(
+        !note.contains("BLOCKING") && !note.contains("Resolve the conflict through"),
+        "the task is not asked to resolve: {note}"
+    );
+}
+
+/// A clean carry is noted to the owner; the task that shares its branch is
+/// not told its branch was carried.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_clean_carry_notes_only_the_branch_owner() {
+    let h = harness_or_skip!("prep_clean_owner_only");
+    add_tasks(&h).await;
+    h.commit(&h.branch_ws, BRANCH, "own.txt", "mine\n");
+    h.advance_main("incoming.txt", "theirs\n");
+
+    let prepared = h
+        .prepare(PreparationPurpose::OwnerCommit)
+        .await
+        .unwrap_or_else(|refusal| panic!("a disjoint base carries cleanly: {refusal}"));
+    assert!(prepared.advanced);
+    let all = directs(&h).await;
+    let owner = to(&all, RUN);
+    assert_eq!(owner.len(), 1, "{all:?}");
+    assert_eq!(owner[0].0, "passive");
+    assert!(to(&all, TASK_RUN).is_empty(), "{all:?}");
+    assert!(to(&all, IDLE_TASK_RUN).is_empty(), "{all:?}");
+}

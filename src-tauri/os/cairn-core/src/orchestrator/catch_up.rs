@@ -867,7 +867,7 @@ pub(crate) async fn announce_reconcile_outcome(
             // review-path hits gate landing, but never wake an idle builder.
             let urgency = crate::messages::queued::DeliveryUrgency::Passive;
             let jobs = super::base_advance::load_on_branch_jobs(db, project_id, branch).await?;
-            for job in jobs {
+            for job in super::base_advance::branch_owners(&jobs) {
                 match crate::messages::delivery::latest_run_for_job(db, &job.id) {
                     Some(run_id) => crate::messages::delivery::queue_system_direct_once(
                         orch,
