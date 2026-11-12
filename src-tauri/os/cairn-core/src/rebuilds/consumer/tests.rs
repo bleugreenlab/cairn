@@ -1243,12 +1243,15 @@ async fn a_runner_outside_an_installed_bundle_cannot_offer_rebuilds() {
 }
 
 /// A colocated executor that answers every adoption and release, and records
-/// what it was told and what the release taught.
+/// what it was told and what the release taught. It reports a key adopted
+/// only on the link that adopted it: a new generation is an executor that
+/// holds nothing yet.
 #[derive(Default)]
 struct FakeAdopter {
     generation: Mutex<Option<u64>>,
     changes: Mutex<Vec<(u64, ProcessTreeAdoptionChange)>>,
     observed: Mutex<Vec<(String, bool)>>,
+    adopted: Mutex<Vec<(u64, String)>>,
 }
 
 impl FakeAdopter {
@@ -1279,6 +1282,16 @@ impl TreeAdopter for FakeAdopter {
     fn generation(&self, _: &Orchestrator) -> Option<u64> {
         *self.generation.lock().unwrap()
     }
+    fn adopted_keys(&self, _: &Orchestrator) -> Vec<String> {
+        let generation = *self.generation.lock().unwrap();
+        self.adopted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(on, _)| Some(*on) == generation)
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
     async fn reservation(
         &self,
         _: &Orchestrator,
@@ -1296,6 +1309,17 @@ impl TreeAdopter for FakeAdopter {
         generation: u64,
         change: ProcessTreeAdoptionChange,
     ) -> Result<ProcessTreeAdoptionOutcome, String> {
+        {
+            let mut adopted = self.adopted.lock().unwrap();
+            match &change {
+                ProcessTreeAdoptionChange::Adopt { adoption } => {
+                    adopted.push((generation, adoption.key.clone()))
+                }
+                ProcessTreeAdoptionChange::Release { key } => {
+                    adopted.retain(|(_, held)| held != key)
+                }
+            }
+        }
         let outcome = match &change {
             ProcessTreeAdoptionChange::Adopt { .. } => ProcessTreeAdoptionOutcome::Adopted {
                 leader_start: "1:0".into(),
@@ -1428,7 +1452,7 @@ async fn adopting_fixture(adopter: Arc<FakeAdopter>) -> Fixture {
     let launchd = FakeLaunchd::new(ActorState::Absent);
     let consumer = Arc::new(
         RebuildConsumer::new(host(&root), launchd.clone(), Arc::new(FixedSource))
-            .with_adopter(adopter),
+            .with_adopter(adopter, ADOPT_RETRY_MS),
     );
     orch.operator_requests.register(consumer.clone()).unwrap();
     Fixture {
