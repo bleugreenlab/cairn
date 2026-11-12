@@ -274,7 +274,9 @@ Cairn started it, so it has been left stopped.\r\n";
 /// handler — into the screen an attached reader sees and the log a post-exit
 /// read replays, which is what makes a restart legible to whoever left the
 /// terminal running.
-fn announce_in_terminal(orch: &Orchestrator, session_id: &str, message: &str) {
+///
+/// Returns whether a live transcript took the message.
+pub(crate) fn announce_in_terminal(orch: &Orchestrator, session_id: &str, message: &str) -> bool {
     let transcript = orch
         .pty_state
         .sessions
@@ -286,9 +288,10 @@ fn announce_in_terminal(orch: &Orchestrator, session_id: &str, message: &str) {
             Some((session.output_buffer.clone()?, session.output_log.clone()?))
         });
     let Some((buffer, log)) = transcript else {
-        return;
+        return false;
     };
     emit_terminal_data(&*orch.services.emitter, session_id, message, &buffer, &log);
+    true
 }
 
 /// Whether an exited terminal is one to start again rather than finalize.
@@ -7291,6 +7294,39 @@ mod terminal_finalize_tests {
         assert_eq!(
             exit_reason(&orch.db.local, &session_id).await.as_deref(),
             Some("process lost: no executor holds this terminal's environment any more")
+        );
+    }
+
+    /// What a self-update restart leaves of a running terminal, which the
+    /// rollout's notice to its owner states (cairn/6630). The directive ends
+    /// the executor's link before the executor stops its residents, so no exit
+    /// reaches the terminal's own handler; the returning executor's adoption
+    /// reports the process lost under the cell's next epoch. That is a loss
+    /// the liveness pass settles, never a death recovery starts again: the
+    /// owner is told the terminal is not started again because it is not.
+    #[test]
+    fn a_terminal_across_a_self_update_restart_is_settled_lost_not_restarted() {
+        let (_, fence) = test_terminal_target("tests");
+        let terminal = binding(&fence);
+        let adopted = vec![cell_holding(
+            &fence,
+            "sess",
+            fence.cell_epoch + 1,
+            terminal.process_generation,
+            ResidentProcessStatus::Exited {
+                finished_at_unix_ms: 1,
+                exit_code: None,
+                restartable: true,
+                executor_lost: true,
+            },
+        )];
+        assert_eq!(
+            judge_terminal_process(&terminal, &adopted, true),
+            TerminalLiveness::Lost(ProcessLoss::EpochAdvanced {
+                executor: "bgsrv-ub".into(),
+                from: fence.cell_epoch,
+                to: fence.cell_epoch + 1,
+            })
         );
     }
 

@@ -1209,6 +1209,26 @@ fn render_self_update(
             in_flight: 0,
             since_unix_ms,
             cycles,
+            residents,
+            restart_expected_unix_ms,
+            waits_for_turn,
+            updating,
+            ..
+        } if !residents.is_empty() => format!(
+            "draining for update: only residents remain ({}){}{} (new work refused since {}){}",
+            resident_clauses(residents),
+            match (waits_for_turn, updating) {
+                (true, Some(name)) => format!("; it updates once {name} has finished updating"),
+                _ => String::new(),
+            },
+            restart_at(*restart_expected_unix_ms),
+            age(captured_at_unix_ms.saturating_sub(*since_unix_ms)),
+            restart_cycles(cycles)
+        ),
+        SelfUpdatePhase::Draining {
+            in_flight: 0,
+            since_unix_ms,
+            cycles,
             waits_for_turn: true,
             updating,
             ..
@@ -1237,6 +1257,8 @@ fn render_self_update(
             holds,
             cycles,
             waits_for_turn,
+            residents,
+            restart_expected_unix_ms,
             ..
         } => {
             let waiting_on = match holds.first() {
@@ -1248,8 +1270,17 @@ fn render_self_update(
                 ),
                 None => String::new(),
             };
+            let residents = match residents.as_slice() {
+                [] => String::new(),
+                residents => format!("; {}", resident_clauses(residents)),
+            };
+            let restart = if restart_expected_unix_ms.is_some() && !residents.is_empty() {
+                restart_at(*restart_expected_unix_ms)
+            } else {
+                String::new()
+            };
             format!(
-                "draining for update: {in_flight} in flight{waiting_on}; new work goes elsewhere{} (since {}){}",
+                "draining for update: {in_flight} in flight{waiting_on}; new work goes elsewhere{} (since {}){}{residents}{restart}",
                 if *waits_for_turn {
                     ", and it holds no other machine's update"
                 } else {
@@ -1259,16 +1290,49 @@ fn render_self_update(
                 restart_cycles(cycles)
             )
         }
-        SelfUpdatePhase::Directed { at_unix_ms, cycled } => format!(
-            "updating: directed to install {served} {}; waiting for it to return on that build{}",
+        SelfUpdatePhase::Directed {
+            at_unix_ms,
+            cycled,
+            ended,
+        } => format!(
+            "updating: directed to install {served} {}; waiting for it to return on that build{}{}",
             age(captured_at_unix_ms.saturating_sub(*at_unix_ms)),
             match cycled.as_slice() {
                 [] => String::new(),
                 cycled => format!("; {} down until it does", cycled.join(", ")),
+            },
+            match ended.as_slice() {
+                [] => String::new(),
+                ended => format!(
+                    "; the restart ended {}",
+                    ended
+                        .iter()
+                        .map(|resident| format!(
+                            "{} ({})",
+                            resident.label,
+                            owner_told(&resident.notice)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             }
         ),
-        SelfUpdatePhase::Deferred { until_unix_ms } => format!(
-            "update deferred: work there outran its own expected duration and was read as wedged, so it takes work again and is asked again in {}",
+        SelfUpdatePhase::Deferred {
+            until_unix_ms,
+            cause,
+            deferrals,
+        } => format!(
+            "update deferred{}: {}, so it takes work again and is asked again at {} (in {})",
+            match deferrals {
+                0 | 1 => String::new(),
+                count => format!(" ({} time for this build)", ordinal(*count)),
+            },
+            match cause {
+                Some(cause) => format!("{cause}, and was read as wedged"),
+                None => "work there outran its own expected duration and was read as wedged"
+                    .to_string(),
+            },
+            cairn_common::executor_protocol::describe_clock(*until_unix_ms),
             duration_ms(until_unix_ms.saturating_sub(captured_at_unix_ms))
         ),
         SelfUpdatePhase::Halted { cause } => {
@@ -1319,6 +1383,58 @@ pub(crate) fn hold_remaining(
         Some(_) => format!("past its expected finish, waited on up to {bound} more{longer}"),
         None => format!("no expected finish, waited on up to {bound} more{longer}"),
     }
+}
+
+/// `terminal `lab` of cairn/6613 ends with the restart, no earlier than
+/// 18:38 UTC (owner told at 18:33 UTC)`, for each resident.
+fn resident_clauses(residents: &[cairn_common::executor_protocol::ResidentHold]) -> String {
+    residents
+        .iter()
+        .map(|resident| {
+            format!(
+                "{} ends with the restart, no earlier than {} ({})",
+                resident.label,
+                cairn_common::executor_protocol::describe_clock(resident.ends_at_unix_ms),
+                owner_told(&resident.notice)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What a resident's owner has been told, for the page.
+fn owner_told(notice: &cairn_common::executor_protocol::ResidentNotice) -> String {
+    use cairn_common::executor_protocol::{describe_clock, ResidentNotice};
+    match notice {
+        ResidentNotice::Told { at_unix_ms } => {
+            format!("owner told at {}", describe_clock(*at_unix_ms))
+        }
+        ResidentNotice::OwnerNotFound => "owner not found; noted in its own transcript".into(),
+        ResidentNotice::Pending => "owner not yet told".into(),
+    }
+}
+
+/// `; restarts by 18:38 UTC`, or nothing while no bound stands.
+fn restart_at(restart_expected_unix_ms: Option<u64>) -> String {
+    match restart_expected_unix_ms {
+        Some(at) => format!(
+            "; restarts by {}",
+            cairn_common::executor_protocol::describe_clock(at)
+        ),
+        None => String::new(),
+    }
+}
+
+/// `2nd`, `3rd`, `11th`.
+fn ordinal(count: u32) -> String {
+    let suffix = match (count % 10, count % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{count}{suffix}")
 }
 
 /// The service instances a self-update restart ends, which their owners place
@@ -12227,6 +12343,8 @@ mod tests {
             cycles: vec!["service `iMessage channel`".into()],
             waits_for_turn: false,
             updating: None,
+            residents: Vec::new(),
+            restart_expected_unix_ms: None,
         });
         pending.health.build_skew = Some(cairn_common::executor_protocol::BuildSkew {
             runner_build_id: "build-1329".into(),
@@ -12257,6 +12375,8 @@ mod tests {
             cycles: Vec::new(),
             waits_for_turn: false,
             updating: None,
+            residents: Vec::new(),
+            restart_expected_unix_ms: None,
         }));
         assert!(
             slow.contains(
@@ -12307,6 +12427,8 @@ mod tests {
             cycles: Vec::new(),
             waits_for_turn: true,
             updating: Some("bbs".into()),
+            residents: Vec::new(),
+            restart_expected_unix_ms: None,
         }));
         assert!(
             draining.contains(
@@ -12321,6 +12443,8 @@ mod tests {
             cycles: Vec::new(),
             waits_for_turn: true,
             updating: Some("bbs".into()),
+            residents: Vec::new(),
+            restart_expected_unix_ms: None,
         }));
         assert!(
             drained.contains(
@@ -12341,6 +12465,120 @@ mod tests {
         // rollout line.
         let rendered = render_executor(&inspection("local", true));
         assert!(!rendered.contains("Self-update"), "{rendered}");
+    }
+
+    /// The cairn/6630 specimen on the page: a terminal holds the drain only
+    /// to its notice bound, named with whose it is, when it ends, and whether
+    /// its owner was told; a deferral says what was wedged and how many times.
+    #[test]
+    fn the_page_names_residents_their_bound_and_a_deferrals_cause() {
+        use cairn_common::executor_protocol::{
+            describe_clock, DrainHold, ResidentHold, ResidentNotice, SelfUpdatePhase,
+        };
+        let ends = CAPTURED_AT + 5 * 60_000;
+        let lab = |notice| ResidentHold {
+            label: "terminal `lab` of cairn/6613".into(),
+            ends_at_unix_ms: ends,
+            notice,
+        };
+        let told = ResidentNotice::Told {
+            at_unix_ms: CAPTURED_AT - 60_000,
+        };
+
+        let alone = render_executor(&self_updating(SelfUpdatePhase::Draining {
+            in_flight: 0,
+            since_unix_ms: CAPTURED_AT - 60_000,
+            holds: Vec::new(),
+            cycles: Vec::new(),
+            waits_for_turn: true,
+            updating: None,
+            residents: vec![lab(told)],
+            restart_expected_unix_ms: Some(ends),
+        }));
+        assert!(
+            alone.contains(&format!(
+                "- Self-update: draining for update: only residents remain (terminal `lab` of cairn/6613 ends with the restart, no earlier than {} (owner told at {})); restarts by {} (new work refused since 1m ago)\n",
+                describe_clock(ends),
+                describe_clock(CAPTURED_AT - 60_000),
+                describe_clock(ends),
+            )),
+            "{alone}"
+        );
+
+        // Its notice has passed but another machine holds the turn: the page
+        // says what it waits for, and the bound is the head's return.
+        let head_back = CAPTURED_AT + 20 * 60_000;
+        let behind = render_executor(&self_updating(SelfUpdatePhase::Draining {
+            in_flight: 0,
+            since_unix_ms: CAPTURED_AT - 60_000,
+            holds: Vec::new(),
+            cycles: Vec::new(),
+            waits_for_turn: true,
+            updating: Some("fedora".into()),
+            residents: vec![lab(told)],
+            restart_expected_unix_ms: Some(head_back),
+        }));
+        assert!(
+            behind.contains(&format!(
+                "; it updates once fedora has finished updating; restarts by {} (new work refused since 1m ago)",
+                describe_clock(head_back)
+            )),
+            "{behind}"
+        );
+
+        let lane_deadline = CAPTURED_AT + 19 * 60_000;
+        let busy = render_executor(&self_updating(SelfUpdatePhase::Draining {
+            in_flight: 2,
+            since_unix_ms: CAPTURED_AT - 60_000,
+            holds: vec![DrainHold {
+                label: "`rust-tests` for cairn/6093".into(),
+                expected_done_unix_ms: Some(CAPTURED_AT + 4 * 60_000),
+                deadline_unix_ms: lane_deadline,
+                progressing: None,
+            }],
+            cycles: Vec::new(),
+            waits_for_turn: true,
+            updating: None,
+            residents: vec![lab(ResidentNotice::OwnerNotFound)],
+            restart_expected_unix_ms: Some(lane_deadline),
+        }));
+        assert!(
+            busy.contains(&format!(
+                "draining for update: 2 in flight, the longest `rust-tests` for cairn/6093, ~4.0m left; new work goes elsewhere, and it holds no other machine's update (since 1m ago); terminal `lab` of cairn/6613 ends with the restart, no earlier than {} (owner not found; noted in its own transcript); restarts by {}\n",
+                describe_clock(ends),
+                describe_clock(lane_deadline),
+            )),
+            "{busy}"
+        );
+
+        let directed = render_executor(&self_updating(SelfUpdatePhase::Directed {
+            at_unix_ms: CAPTURED_AT - 60_000,
+            cycled: vec!["service `iMessage channel`".into()],
+            ended: vec![lab(told)],
+        }));
+        assert!(
+            directed.contains(&format!(
+                "; service `iMessage channel` down until it does; the restart ended terminal `lab` of cairn/6613 (owner told at {})\n",
+                describe_clock(CAPTURED_AT - 60_000)
+            )),
+            "{directed}"
+        );
+
+        let asked_at = CAPTURED_AT + 29 * 60_000;
+        let deferred = render_executor(&self_updating(SelfUpdatePhase::Deferred {
+            until_unix_ms: asked_at,
+            cause: Some(
+                "fedora's `cargo test` for cairn/6093 was expected to finish 12 minutes ago, from its own learned duration of 20 minutes".into(),
+            ),
+            deferrals: 2,
+        }));
+        assert!(
+            deferred.contains(&format!(
+                "- Self-update: update deferred (2nd time for this build): fedora's `cargo test` for cairn/6093 was expected to finish 12 minutes ago, from its own learned duration of 20 minutes, and was read as wedged, so it takes work again and is asked again at {} (in 29.0m)\n",
+                describe_clock(asked_at)
+            )),
+            "{deferred}"
+        );
     }
 }
 

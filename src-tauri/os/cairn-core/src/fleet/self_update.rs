@@ -8,8 +8,15 @@ use cairn_config::drain::{
     AdmissionEffect, DrainOwner, RuntimeDrainContext, RuntimeDrainKind, RuntimeDrainToken,
 };
 
+use cairn_common::executor_protocol::{
+    describe_clock, ResidencyHolder, ResidentNotice, ResidentProcessKind,
+};
+
+use super::rollout::{NoticeKind, OwnerNotice, Resident};
 use super::{management, rollout::SelfUpdateDrain, FleetConfig};
+use crate::messages::queued::DeliveryUrgency;
 use crate::orchestrator::Orchestrator;
+use crate::storage::RowExt;
 
 pub(super) struct SelfUpdateRuntime {
     pub(super) pass: Mutex<()>,
@@ -37,10 +44,326 @@ pub fn advance(orch: &Orchestrator, now_unix_ms: u64) -> Result<(), String> {
             None => "fleet authoritative settings have not been initialized".into(),
         });
     }
-    orch.fleet
+    let notices = orch
+        .fleet
         .advance_self_update_rollout(now_unix_ms, |required| {
             persist_required(orch, required, now_unix_ms)
+        })?;
+    if notices.is_empty() {
+        return Ok(());
+    }
+    // Telling an owner reads the database and queues a message, so it runs
+    // beside the pass rather than inside it. The update does not wait on it:
+    // the restart ends the resident whether or not its owner was reached.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let orch = orch.clone();
+            handle.spawn(async move {
+                for notice in notices {
+                    let outcome = deliver_owner_notice(&orch, &notice, unix_now_ms()).await;
+                    orch.fleet.note_resident_notice(&notice, outcome);
+                }
+            });
+        }
+        Err(error) => log::warn!(
+            "self-update: {} resident notice(s) not delivered, no runtime to deliver them on: {error}",
+            notices.len()
+        ),
+    }
+    Ok(())
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Who a resident belongs to, as far as the runner can reach them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ResidentOwner {
+    /// The job the message goes to.
+    job_id: Option<String>,
+    /// The live terminal session the notice is also written into.
+    session_id: Option<String>,
+    /// The resident's own resource, for the message to link.
+    uri: Option<String>,
+}
+
+/// The job whose branch a dev instance was built from, as the dev-instance
+/// path itself finds a branch's owner.
+async fn branch_owner_job(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let (project_id, branch) = (project_id.to_string(), branch.to_string());
+    orch.db
+        .local
+        .read(|conn| {
+            let project_id = project_id.clone();
+            let branch = branch.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM jobs WHERE project_id = ?1 AND branch = ?2 ORDER BY created_at DESC LIMIT 1",
+                        cairn_db::turso::params![project_id.as_str(), branch.as_str()],
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.text(0)).transpose()
+            })
         })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The owner of a resident: for a terminal, the row its process key names
+/// (the executor's key for a terminal is its session id); for a dev instance,
+/// the job whose branch it was built from; for anything else, the job
+/// holding the environment it runs in.
+///
+/// `Ok` with no job is a resident nobody owns. `Err` is a lookup that failed,
+/// which the caller reports as not yet delivered so the notice is retried.
+async fn resolve_owner(orch: &Orchestrator, resident: &Resident) -> Result<ResidentOwner, String> {
+    let address = &resident.address;
+    let holder_job = match &address.holder {
+        Some(ResidencyHolder::Job { job_id }) => Some(job_id.clone()),
+        _ => None,
+    }
+    .or_else(|| {
+        address
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.job_id.clone())
+    });
+    let (job_id, session_id, path) = match &address.kind {
+        Some(ResidentProcessKind::Terminal { slug }) => {
+            let session = address.process_key.clone();
+            let holder = address
+                .holder
+                .as_ref()
+                .map(ResidencyHolder::storage_key)
+                .unwrap_or_default();
+            let slug_for_row = slug.clone();
+            let row = orch
+                .db
+                .local
+                .read(|conn| {
+                    let session = session.clone();
+                    let holder = holder.clone();
+                    let slug = slug_for_row.clone();
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT job_id, session_id FROM job_terminals
+                                 WHERE status IN ('running', 'recovering')
+                                   AND (session_id = ?1 OR (residency_holder = ?2 AND slug = ?3))
+                                 ORDER BY session_id = ?1 DESC, created_at DESC
+                                 LIMIT 1",
+                                cairn_db::turso::params![
+                                    session.as_str(),
+                                    holder.as_str(),
+                                    slug.as_str()
+                                ],
+                            )
+                            .await?;
+                        match rows.next().await? {
+                            Some(row) => Ok(Some((row.opt_text(0)?, row.text(1)?))),
+                            None => Ok(None),
+                        }
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            match row {
+                Some((job, session)) => (
+                    job.or(holder_job),
+                    Some(session),
+                    Some(format!("terminal/{slug}")),
+                ),
+                None => (holder_job, None, Some(format!("terminal/{slug}"))),
+            }
+        }
+        Some(ResidentProcessKind::Repl { slug }) => {
+            (holder_job, None, Some(format!("repl/{slug}")))
+        }
+        Some(ResidentProcessKind::DevInstance { .. }) => {
+            let job = match (holder_job, &address.project_id, &address.selector) {
+                (Some(job), ..) => Some(job),
+                (None, Some(project), Some(branch)) => {
+                    branch_owner_job(orch, project, branch).await?
+                }
+                _ => None,
+            };
+            (job, None, None)
+        }
+        _ => (holder_job, None, None),
+    };
+    let uri = match (&job_id, path) {
+        (Some(job), Some(path)) => crate::jobs::queries::home_uri_for_job(&orch.db.local, job)
+            .await
+            .ok()
+            .flatten()
+            .map(|home| format!("{home}/{path}")),
+        _ => None,
+    };
+    Ok(ResidentOwner {
+        job_id,
+        session_id,
+        uri,
+    })
+}
+
+/// `terminal `lab``, `REPL `py``, `dev instance`: the resident as its owner
+/// knows it.
+fn resident_noun(kind: Option<&ResidentProcessKind>) -> String {
+    match kind {
+        Some(ResidentProcessKind::Terminal { slug }) => format!("terminal `{slug}`"),
+        Some(ResidentProcessKind::Repl { slug }) => format!("REPL `{slug}`"),
+        Some(ResidentProcessKind::DevInstance { .. }) => "dev instance".into(),
+        _ => "resident process".into(),
+    }
+}
+
+/// The message for the owner and, for a terminal, the line for its own
+/// transcript.
+///
+/// What happens to a terminal after the restart is measured, not assumed:
+/// the directive ends the executor's link before it stops its residents, so
+/// no exit reaches the runner, and the returning executor reports the process
+/// under a new cell epoch, which the runner settles as lost. Cairn does not
+/// start such a terminal again, and the text says so. Whether a REPL or a dev
+/// instance is started again belongs to its own lifecycle, so their text
+/// claims neither.
+fn notice_text(notice: &OwnerNotice, uri: Option<&str>) -> (String, Option<String>) {
+    let kind = notice.resident.address.kind.as_ref();
+    let noun = resident_noun(kind);
+    let terminal = matches!(kind, Some(ResidentProcessKind::Terminal { .. }));
+    let machine = &notice.name;
+    let after = if terminal {
+        format!(
+            "Cairn does not start it again: restart it once {machine} is back if you still need it"
+        )
+    } else {
+        format!("start it again once {machine} is back if you still need it")
+    };
+    let link = uri.map(|uri| format!(" ({uri})")).unwrap_or_default();
+    match notice.kind {
+        NoticeKind::Announced {
+            restart_no_earlier_than_unix_ms,
+            commands_in_flight,
+        } => {
+            let commands = match commands_in_flight {
+                0 => String::new(),
+                1 => ", once the command running there finishes".to_string(),
+                count => format!(", once the {count} commands running there finish"),
+            };
+            let at = describe_clock(restart_no_earlier_than_unix_ms);
+            (
+                format!(
+                    "{machine}, where your {noun}{link} runs, restarts to install executor build {} no earlier than {at}{commands}. The restart ends your {noun}; {after}.",
+                    notice.build_id
+                ),
+                terminal.then(|| {
+                    format!(
+                        "\r\n[Cairn] {machine} restarts for an executor update no earlier than {at}{commands}. This terminal ends then and is not started again.\r\n"
+                    )
+                }),
+            )
+        }
+        NoticeKind::Ending => (
+            format!(
+                "{machine} is restarting now to install executor build {}, and your {noun}{link} ends with it; {after}.",
+                notice.build_id
+            ),
+            terminal.then(|| {
+                format!(
+                    "\r\n[Cairn] {machine} is restarting now for an executor update. This terminal ends with it and is not started again.\r\n"
+                )
+            }),
+        ),
+    }
+}
+
+/// Tell one resident's owner what the update means for it: into the
+/// terminal's own transcript when it is live, and as one message to the
+/// owner's latest run, idempotent per turn, resident and notice, so a pass
+/// that repeats a notice never tells the owner twice. Never steering: the
+/// owner reads it at its next boundary.
+pub(crate) async fn deliver_owner_notice(
+    orch: &Orchestrator,
+    notice: &OwnerNotice,
+    now_unix_ms: u64,
+) -> ResidentNotice {
+    let not_yet = |error: String| {
+        log::warn!(
+            "self-update: could not look up the owner of {} on {}; retried next pass: {error}",
+            notice.resident.label,
+            notice.name
+        );
+        ResidentNotice::Pending
+    };
+    let owner = match resolve_owner(orch, &notice.resident).await {
+        Ok(owner) => owner,
+        Err(error) => return not_yet(error),
+    };
+    let (message, transcript) = notice_text(notice, owner.uri.as_deref());
+    if let (Some(session), Some(line)) = (&owner.session_id, &transcript) {
+        crate::mcp::handlers::terminal::announce_in_terminal(orch, session, line);
+    }
+    let run = match &owner.job_id {
+        Some(job) => {
+            match crate::messages::delivery::latest_run_for_job_async(&orch.db.local, job).await {
+                Ok(run) => run,
+                Err(error) => return not_yet(error),
+            }
+        }
+        None => None,
+    };
+    let Some(run) = run else {
+        log::info!(
+            "self-update: no owner found for {} on {}; noted only in its own transcript where it has one",
+            notice.resident.label,
+            notice.name
+        );
+        return ResidentNotice::OwnerNotFound;
+    };
+    let key = format!(
+        "self-update:{}:{}:{}",
+        notice.operation_id,
+        notice.resident.key,
+        match notice.kind {
+            NoticeKind::Announced { .. } => "announced",
+            NoticeKind::Ending => "ending",
+        }
+    );
+    let queue_orch = orch.clone();
+    let queued = tokio::task::spawn_blocking(move || {
+        crate::messages::delivery::queue_system_direct_once(
+            &queue_orch,
+            &run,
+            &message,
+            DeliveryUrgency::Queue,
+            &key,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|queued| queued);
+    match queued {
+        Ok(()) => ResidentNotice::Told {
+            at_unix_ms: now_unix_ms,
+        },
+        Err(error) => {
+            log::warn!(
+                "self-update: could not tell the owner of {} on {}: {error}",
+                notice.resident.label,
+                notice.name
+            );
+            ResidentNotice::Pending
+        }
+    }
 }
 
 /// Commit the holds one pass requires. Runs under the pass gate, before the
@@ -222,6 +545,203 @@ fn apply_required_drains(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn notice_for(kind: NoticeKind, resident_kind: ResidentProcessKind) -> OwnerNotice {
+        OwnerNotice {
+            executor_id: "id-fedora".into(),
+            name: "fedora".into(),
+            build_id: "build-new".into(),
+            operation_id: "turn-1".into(),
+            resident: Resident {
+                key: "process:cell-1/terminal:lab/1".into(),
+                label: "terminal `lab` of proj/1".into(),
+                address: super::super::rollout::ResidentAddress {
+                    process_key: "terminal:lab".into(),
+                    kind: Some(resident_kind),
+                    holder: Some(ResidencyHolder::Job {
+                        job_id: "job-thread".into(),
+                    }),
+                    owner: None,
+                    project_id: None,
+                    selector: None,
+                },
+            },
+            kind,
+        }
+    }
+
+    /// The owner is told the restart's time and that the terminal ends and is
+    /// not started again, which is what a self-update restart measurably does
+    /// to it; a REPL's text claims nothing about its restart.
+    #[test]
+    fn the_notice_names_the_machine_the_time_and_the_outcome() {
+        let at = 1_800_000_000_000 + 5 * 60_000;
+        let terminal = ResidentProcessKind::Terminal { slug: "lab".into() };
+        let (message, transcript) = notice_text(
+            &notice_for(
+                NoticeKind::Announced {
+                    restart_no_earlier_than_unix_ms: at,
+                    commands_in_flight: 2,
+                },
+                terminal.clone(),
+            ),
+            Some("cairn://p/proj/1/1/builder/terminal/lab"),
+        );
+        assert_eq!(
+            message,
+            format!(
+                "fedora, where your terminal `lab` (cairn://p/proj/1/1/builder/terminal/lab) runs, restarts to install executor build build-new no earlier than {}, once the 2 commands running there finish. The restart ends your terminal `lab`; Cairn does not start it again: restart it once fedora is back if you still need it.",
+                describe_clock(at)
+            )
+        );
+        assert!(transcript
+            .unwrap()
+            .contains("This terminal ends then and is not started again."));
+
+        let (message, transcript) = notice_text(&notice_for(NoticeKind::Ending, terminal), None);
+        assert_eq!(
+            message,
+            "fedora is restarting now to install executor build build-new, and your terminal `lab` ends with it; Cairn does not start it again: restart it once fedora is back if you still need it."
+        );
+        assert!(transcript.is_some());
+
+        let (message, transcript) = notice_text(
+            &notice_for(
+                NoticeKind::Ending,
+                ResidentProcessKind::Repl { slug: "py".into() },
+            ),
+            None,
+        );
+        assert!(
+            message.ends_with("start it again once fedora is back if you still need it."),
+            "{message}"
+        );
+        assert!(!message.contains("does not start"), "{message}");
+        assert!(transcript.is_none(), "a REPL has no terminal transcript");
+    }
+
+    /// One notice reaches the owner's run once however many passes repeat it,
+    /// the two notices of a turn are two messages, and a resident nobody
+    /// owns is reported as such without failing the pass.
+    #[tokio::test]
+    async fn an_owner_is_told_each_notice_once() {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::migrated_test_db("self-update-notices").await);
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-1','default','Test Project','proj','/tmp/test-repo',1,1);
+             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('thread-1','proj-1','general','active','none',1,1);
+             INSERT INTO jobs (id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+               VALUES ('job-thread','thread-1','proj-1','thread','thread','idle',1,1);
+             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('run-1','proj-1','job-thread','live',1,1);
+             INSERT INTO job_terminals (id, job_id, session_id, command, title, status, created_at, slug, residency_holder)
+               VALUES ('t-1','job-thread','terminal:lab','','Shell','running',1,'lab','job:job-thread');",
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            temp.path().to_path_buf(),
+        )
+        .build();
+        let terminal = ResidentProcessKind::Terminal { slug: "lab".into() };
+        let announced = notice_for(
+            NoticeKind::Announced {
+                restart_no_earlier_than_unix_ms: 1,
+                commands_in_flight: 0,
+            },
+            terminal.clone(),
+        );
+        let ending = notice_for(NoticeKind::Ending, terminal.clone());
+
+        for _ in 0..2 {
+            assert_eq!(
+                deliver_owner_notice(&orch, &announced, 7).await,
+                ResidentNotice::Told { at_unix_ms: 7 }
+            );
+        }
+        assert_eq!(
+            deliver_owner_notice(&orch, &ending, 8).await,
+            ResidentNotice::Told { at_unix_ms: 8 }
+        );
+        let delivered = |key: &str| {
+            let id = crate::messages::delivery::system_direct_once_message_id(key);
+            let db = db.clone();
+            async move {
+                db.query_one(
+                    "SELECT COUNT(*) FROM messages WHERE id = ?1 AND recipient_run_id = 'run-1'",
+                    cairn_db::turso::params![id.as_str()],
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            delivered("self-update:turn-1:process:cell-1/terminal:lab/1:announced").await,
+            1
+        );
+        assert_eq!(
+            delivered("self-update:turn-1:process:cell-1/terminal:lab/1:ending").await,
+            1
+        );
+
+        // A dev instance as production records it: its own holder, and an
+        // owner reference that never names a job. Its owner is the job whose
+        // branch it was built from.
+        db.execute_script(
+            "UPDATE jobs SET branch = 'agent/proj-1-builder-0' WHERE id = 'job-thread';",
+        )
+        .await
+        .unwrap();
+        let mut dev = notice_for(
+            NoticeKind::Ending,
+            ResidentProcessKind::DevInstance {
+                source_terminal_session_id: None,
+            },
+        );
+        dev.resident.key = "process:cell-2/dev/1".into();
+        dev.resident.address.process_key = "dev".into();
+        dev.resident.address.holder = Some(ResidencyHolder::DevInstance {
+            instance_id: "inst-1".into(),
+        });
+        dev.resident.address.owner = Some(cairn_common::executor_protocol::CellOwnerRef {
+            project_id: "proj-1".into(),
+            project_key: Some("proj".into()),
+            issue_number: Some(1),
+            job_id: None,
+            execution_seq: None,
+            node_kind: Some("builder".into()),
+        });
+        dev.resident.address.project_id = Some("proj-1".into());
+        dev.resident.address.selector = Some("agent/proj-1-builder-0".into());
+        assert_eq!(
+            deliver_owner_notice(&orch, &dev, 10).await,
+            ResidentNotice::Told { at_unix_ms: 10 }
+        );
+        assert_eq!(
+            delivered("self-update:turn-1:process:cell-2/dev/1:ending").await,
+            1
+        );
+
+        let mut orphan = notice_for(NoticeKind::Ending, terminal);
+        orphan.resident.address.holder = Some(ResidencyHolder::ProjectTerminals {
+            project_id: "proj-1".into(),
+        });
+        orphan.resident.address.process_key = "terminal:nobody".into();
+        assert_eq!(
+            deliver_owner_notice(&orch, &orphan, 9).await,
+            ResidentNotice::OwnerNotFound
+        );
+    }
 
     #[tokio::test]
     async fn rollout_cannot_open_an_uninitialized_fleet_projection() {

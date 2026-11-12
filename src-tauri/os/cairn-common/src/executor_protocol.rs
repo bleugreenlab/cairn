@@ -8133,6 +8133,20 @@ pub struct LearnedResourceEstimate {
 /// carries no `#[serde(other)]`). That changes what a runner concludes about
 /// admission (tenet 541), so the number moves and the handshake refuses the
 /// pairing until the executor self-updates.
+///
+/// cairn/6630 does not move the number. It adds defaulted, optional fields to
+/// runner-authored types no executor decodes into a decision: `residents` and
+/// `restartExpectedUnixMs` on [`SelfUpdatePhase::Draining`], `ended` on
+/// [`SelfUpdatePhase::Directed`], `cause` and `deferrals` on
+/// [`SelfUpdatePhase::Deferred`], and `returnsByUnixMs` on
+/// [`PlacementRejectionReason::UpdatePending`], which becomes a struct variant.
+/// The enum is internally tagged, so `{"kind":"updatePending"}` written by an
+/// older peer or stored in an older placement record decodes as the struct
+/// variant with no bound, and a unit variant on an older peer ignores the
+/// added field. What a runner gets wrong talking to an older executor:
+/// nothing, since the executor neither sends nor reads these. The change is
+/// in the runner's rollout policy (residents hold a drain for a notice period
+/// rather than the unmeasured hold), which an executor never observes.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -17027,6 +17041,17 @@ pub enum SelfUpdatePhase {
         /// The machine updating now, when this one waits for the turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         updating: Option<String>,
+        /// Terminals, REPLs and dev instances the restart will end. They
+        /// never finish on their own, so they hold the drain only for the
+        /// turn's one notice period, which their owners are told of.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        residents: Vec<ResidentHold>,
+        /// When the restart is expected: the later of the residents' notice
+        /// period and the latest bound among the work in flight. `None` while
+        /// work past its bound is still progressing, which holds the drain for
+        /// as long as it moves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restart_expected_unix_ms: Option<u64>,
     },
     /// Directed to update; the runner is waiting for it to return on the new
     /// build.
@@ -17035,16 +17060,71 @@ pub enum SelfUpdatePhase {
         /// Service instances the restart ended, down until it returns.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cycled: Vec<String>,
+        /// Residents the restart ended, each told to its owner.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<ResidentHold>,
     },
     /// Work on it outran its own bound and was read as wedged, so it takes
     /// work again and its turn comes back after `until_unix_ms`.
-    Deferred { until_unix_ms: u64 },
+    Deferred {
+        until_unix_ms: u64,
+        /// The work read as wedged and why, as the deferral stated it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
+        /// How many times this machine has been deferred for this build.
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        deferrals: u32,
+    },
     /// An update to this build failed in the fleet, so the runner directs no
     /// machine to it. A different artifact resumes the rollout.
     Halted { cause: String },
     /// This machine did not act on a directive to this build. Other machines
     /// still update; this one is retried when the artifact changes.
     Excluded { cause: String },
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// A resident (terminal, REPL or dev instance) a self-update restart ends,
+/// and what its owner has been told.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentHold {
+    /// The resident and whose it is, named the way an operator reads it.
+    pub label: String,
+    /// When its notice period ends; the restart that ends it comes no
+    /// earlier.
+    pub ends_at_unix_ms: u64,
+    #[serde(default)]
+    pub notice: ResidentNotice,
+}
+
+/// Whether a resident's owner has been told that a restart will end it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ResidentNotice {
+    /// The notice has not been delivered yet.
+    #[default]
+    Pending,
+    /// The owner was told at this instant.
+    Told { at_unix_ms: u64 },
+    /// No owner could be resolved; the notice went only into the resident's
+    /// own transcript, where there is one.
+    OwnerNotFound,
+}
+
+/// A runner-clock instant as a UTC wall-clock time to the minute, `18:38 UTC`,
+/// for a bound an operator lines up against a clock rather than an age that
+/// goes stale as the page is read.
+pub fn describe_clock(unix_ms: u64) -> String {
+    let minutes = (unix_ms / 60_000) % 1_440;
+    format!("{:02}:{:02} UTC", minutes / 60, minutes % 60)
 }
 
 /// One piece of work a draining machine's update waits on.
@@ -20262,7 +20342,14 @@ pub enum PlacementRejectionReason {
     /// the build the runner serves for it. Clears on its own once the update
     /// lands, fails, or is deferred. Work already resident here is exempt, as
     /// for a drain.
-    UpdatePending,
+    UpdatePending {
+        /// When the machine is expected back on the runner's build: its
+        /// expected restart plus the install, or, once directed, the end of
+        /// the runner's return budget. Absent while work past its bound is
+        /// still progressing, which holds the drain for as long as it moves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        returns_by_unix_ms: Option<u64>,
+    },
     /// A model placement holds resident here keeps the room this work needs:
     /// a loading model's footprint it has not yet taken, or a model's memory
     /// that evicting it would return. Filtered rather than offered, and waited
@@ -20518,9 +20605,13 @@ impl PlacementRejectionReason {
                 trusted.join(", ")
             ),
             Self::Drained => "drained, refusing new work".into(),
-            Self::UpdatePending => {
-                "being emptied for an executor update, refusing new work".into()
-            }
+            Self::UpdatePending { returns_by_unix_ms } => match returns_by_unix_ms {
+                Some(at) => format!(
+                    "being emptied for an executor update, refusing new work; expected back by {}",
+                    describe_clock(*at)
+                ),
+                None => "being emptied for an executor update, refusing new work".into(),
+            },
             Self::ModelResident {
                 model,
                 phase,

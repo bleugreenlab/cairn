@@ -32,13 +32,20 @@
 //!   for its own learned duration plus margin, and work with no expected end
 //!   for a fixed hold. A command past that bound keeps the drain for as long
 //!   as its own stall stop still sees its tree progressing, because a slow
-//!   command on a stalled disk is busy, not wedged. Since new placement is
-//!   refused, including new batches for resident jobs, a draining machine's
-//!   work only shrinks. Already-running commands and resident processes keep
-//!   running. A terminal or REPL that never ends
-//!   is work with no expected end: it holds the drain for the fixed hold and
-//!   then defers the machine like any wedged work, so that machine does not
-//!   update past it, and it holds no other machine's update meanwhile.
+//!   command on a stalled disk is busy, not wedged. New environments are
+//!   refused, but a job already resident there may still send it batches;
+//!   those are commands and are bounded like any other. Already-running
+//!   commands and resident processes keep running.
+//! - **Residents are cycled after a short notice, never waited on.** A
+//!   terminal, REPL or dev instance ends when its owner ends it, which may be
+//!   days, and every executor exit ends it whether the rollout waits or not:
+//!   no process survives an executor restart. Waiting buys it nothing, so a
+//!   resident holds the drain only for one notice period
+//!   ([`RESIDENT_NOTICE_MS`]) fixed when the turn begins and never extended by
+//!   residents that appear later. Its owner is told when the drain first sees
+//!   it and again when the restart that ends it is directed. A resident never
+//!   defers a machine, so the hold-then-defer loop a long-lived terminal used
+//!   to cause cannot recur.
 //! - **Long-lived services are cycled, not waited on.** A service instance
 //!   never finishes, and any executor restart ends it whether the rollout waits
 //!   or not; its owner already re-places it whenever its executor is lost. So
@@ -56,19 +63,25 @@
 //! This module is the decision alone, over plain facts the fleet copies out of
 //! its connection table, so every transition is testable without a link.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cairn_common::executor_protocol::{
-    DrainHold, SelfUpdatePhase, SelfUpdateStatus, UpdateReport, UpdateState,
+    describe_clock, CellOwnerRef, DrainHold, ResidencyHolder, ResidentHold, ResidentNotice,
+    ResidentProcessKind, SelfUpdatePhase, SelfUpdateStatus, UpdateReport, UpdateState,
 };
 
 /// The least slack a command gets past its own expected finish before the
 /// rollout reads it as wedged rather than busy.
 pub(crate) const COMMAND_MARGIN_MS: u64 = 10 * 60 * 1000;
 /// How long work with no expected end may hold a turn: a command never
-/// measured, an environment being acquired, or a terminal or REPL left
-/// running, none of which says when it will finish.
+/// measured, or an environment being acquired, neither of which says when it
+/// will finish.
 pub(crate) const UNMEASURED_HOLD_MS: u64 = 60 * 60 * 1000;
+/// How long residents (terminals, REPLs, dev instances) may hold a turn,
+/// from when it begins: long enough for their owners to read the notice and
+/// save what they need, short enough that a resident costs the fleet minutes
+/// rather than the machine.
+pub(crate) const RESIDENT_NOTICE_MS: u64 = 5 * 60 * 1000;
 /// How long a machine whose work outran its bound keeps that work before it
 /// is asked again.
 pub(crate) const DEFER_MS: u64 = 30 * 60 * 1000;
@@ -223,9 +236,67 @@ pub(crate) struct Candidate {
     /// Long-lived service instances on this machine. A restart ends them too,
     /// but they never finish, so they are cycled rather than waited on.
     pub services: Vec<String>,
+    /// Terminals, REPLs and dev instances on this machine. A restart ends
+    /// them and they never finish on their own, so they hold a turn only for
+    /// its notice period.
+    pub residents: Vec<Resident>,
     pub snapshots_received: u64,
     /// Whether the link is open and fresh enough to carry a directive.
     pub reachable: bool,
+}
+
+/// One resident a restart of the machine would end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Resident {
+    /// Stable across passes, `process:{cell}/{process key}/{generation}`, so a
+    /// turn tells each resident's owner once.
+    pub key: String,
+    /// The resident and whose it is, named the way an operator reads it.
+    pub label: String,
+    /// How the runner reaches its owner. The rollout carries it untouched.
+    pub address: ResidentAddress,
+}
+
+/// Where a resident lives and who holds it, as its machine reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ResidentAddress {
+    pub process_key: String,
+    pub kind: Option<ResidentProcessKind>,
+    pub holder: Option<ResidencyHolder>,
+    /// Descriptive attribution only; a dev instance's never names a job,
+    /// because that id keys lease adoption.
+    pub owner: Option<CellOwnerRef>,
+    /// The project the cell belongs to and the residency's selector (a dev
+    /// instance's branch), which is how a dev instance's owning job is found.
+    pub project_id: Option<String>,
+    pub selector: Option<String>,
+}
+
+/// What a resident's owner is to be told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeKind {
+    /// The drain first saw it: the restart comes no earlier than
+    /// `restart_no_earlier_than_unix_ms`, and not before the machine's
+    /// `commands_in_flight` finish.
+    Announced {
+        restart_no_earlier_than_unix_ms: u64,
+        commands_in_flight: usize,
+    },
+    /// The restart that ends it was just directed.
+    Ending,
+}
+
+/// A notice for one resident's owner. The rollout only decides that it is
+/// due; the runner delivers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnerNotice {
+    pub executor_id: String,
+    pub name: String,
+    pub build_id: String,
+    /// The turn's operation, so one turn tells an owner each thing once.
+    pub operation_id: String,
+    pub resident: Resident,
+    pub kind: NoticeKind,
 }
 
 /// A directive to send now, on exactly this generation's link.
@@ -277,6 +348,9 @@ pub(crate) struct Transition {
     pub kind: TransitionKind,
     pub build_id: String,
     pub cause: String,
+    /// For a deferral, how many times this machine has now been deferred for
+    /// this build.
+    pub deferrals: Option<u32>,
 }
 
 /// A directed machine that stayed away past [`RETURN_BUDGET_MS`]: the update
@@ -299,16 +373,26 @@ pub(crate) struct Step {
     pub transitions: Vec<Transition>,
     /// Machines this pass concluded did not return from their directive.
     pub unreturned: Vec<Unreturned>,
+    /// Residents' owners to tell what the update means for them.
+    pub notices: Vec<OwnerNotice>,
 }
 
 /// Where a held machine's update stands, in the terms work waiting on it is
 /// told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UpdateWait {
-    /// Emptying: what it still waits on, latest bound first.
-    Draining { holds: Vec<DrainHold> },
+    /// Emptying: what it still waits on, latest bound first, the residents
+    /// the restart will end, and when it is expected back.
+    Draining {
+        holds: Vec<DrainHold>,
+        residents: Vec<String>,
+        returns_by_unix_ms: Option<u64>,
+    },
     /// Directed to install the build and awaited on its return.
-    Directed { at_unix_ms: u64 },
+    Directed {
+        at_unix_ms: u64,
+        returns_by_unix_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -319,7 +403,73 @@ struct Turn {
     target: &'static str,
     operation_id: String,
     unexplained_returns: u8,
+    /// When residents stop holding this turn: one bound for the turn, set
+    /// when it begins and never extended by residents that appear later.
+    residents_release_at_unix_ms: u64,
+    /// Residents whose owners this turn has told it is coming, or is telling
+    /// now. A delivery that fails takes its resident back out, so the next
+    /// pass tells the owner again, against the same deadline.
+    announced: HashSet<String>,
+    /// Residents whose owners this turn has told the restart is directed, or
+    /// is telling now, retried the same way while the turn awaits the return.
+    ending_sent: HashSet<String>,
+    /// What delivering each resident's notice came to, as the runner
+    /// reported it back.
+    told: HashMap<String, ResidentNotice>,
     phase: TurnPhase,
+}
+
+impl Turn {
+    /// Tell the owner of each resident this turn has not yet seen.
+    fn announce(&mut self, candidate: &Candidate, step: &mut Step) {
+        for resident in &candidate.residents {
+            if self.announced.insert(resident.key.clone()) {
+                step.notices.push(self.notice(
+                    resident,
+                    NoticeKind::Announced {
+                        restart_no_earlier_than_unix_ms: self.residents_release_at_unix_ms,
+                        commands_in_flight: candidate.work.len(),
+                    },
+                ));
+            }
+        }
+    }
+
+    /// Tell every resident's owner that the restart ending it is directed.
+    fn end_residents(&mut self, residents: &[Resident], step: &mut Step) {
+        for resident in residents {
+            self.announced.insert(resident.key.clone());
+            if self.ending_sent.insert(resident.key.clone()) {
+                step.notices.push(self.notice(resident, NoticeKind::Ending));
+            }
+        }
+    }
+
+    fn notice(&self, resident: &Resident, kind: NoticeKind) -> OwnerNotice {
+        OwnerNotice {
+            executor_id: self.executor_id.clone(),
+            name: self.name.clone(),
+            build_id: self.build_id.clone(),
+            operation_id: self.operation_id.clone(),
+            resident: resident.clone(),
+            kind,
+        }
+    }
+
+    /// The residents named, for a surface, with their notice period and what
+    /// their owners were told.
+    fn resident_holds<'a>(
+        &self,
+        residents: impl Iterator<Item = (&'a String, &'a String)>,
+    ) -> Vec<ResidentHold> {
+        residents
+            .map(|(key, label)| ResidentHold {
+                label: label.clone(),
+                ends_at_unix_ms: self.residents_release_at_unix_ms,
+                notice: self.told.get(key).copied().unwrap_or_default(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -334,25 +484,42 @@ enum TurnPhase {
         holds: Vec<DrainHold>,
         /// Service instances the restart will cycle.
         cycles: Vec<String>,
+        /// Residents the restart will end, as `(key, label)`.
+        residents: Vec<(String, String)>,
+        /// When the last pass expected the restart, or `None` while work past
+        /// its bound is still progressing.
+        restart_expected_unix_ms: Option<u64>,
     },
     Directed {
         at_unix_ms: u64,
         generation: u64,
         cycled: Vec<String>,
+        /// Residents the restart ended, kept whole so a failed Ending notice
+        /// can be sent again while the machine is away.
+        ended: Vec<Resident>,
     },
 }
 
 impl TurnPhase {
     /// A drain's account of the work it found on one pass.
+    #[allow(clippy::too_many_arguments)]
     fn draining(
         candidate: &Candidate,
         since_unix_ms: u64,
         generation: u64,
         snapshots_at_hold: u64,
         first_seen: HashMap<String, u64>,
+        residents_release_at_unix_ms: u64,
         now_unix_ms: u64,
     ) -> Self {
         let (first_seen, holds) = account(&candidate.work, first_seen, now_unix_ms);
+        let restart_expected_unix_ms = restart_expected(
+            &holds,
+            !candidate.residents.is_empty(),
+            residents_release_at_unix_ms,
+            since_unix_ms,
+            now_unix_ms,
+        );
         Self::Draining {
             since_unix_ms,
             generation,
@@ -360,8 +527,42 @@ impl TurnPhase {
             first_seen,
             holds,
             cycles: candidate.services.clone(),
+            residents: candidate
+                .residents
+                .iter()
+                .map(|resident| (resident.key.clone(), resident.label.clone()))
+                .collect(),
+            restart_expected_unix_ms,
         }
     }
+}
+
+/// When a draining machine's restart is expected: the later of its
+/// residents' notice period and the latest bound among its work, or the
+/// moment the drain began when nothing holds it. `None` while work past its
+/// bound is still progressing, since nothing bounds that but its progress.
+fn restart_expected(
+    holds: &[DrainHold],
+    has_residents: bool,
+    residents_release_at_unix_ms: u64,
+    since_unix_ms: u64,
+    now_unix_ms: u64,
+) -> Option<u64> {
+    if holds
+        .iter()
+        .any(|hold| HeldWork::held_past(hold, now_unix_ms))
+    {
+        return None;
+    }
+    let notice = has_residents.then_some(residents_release_at_unix_ms);
+    Some(
+        holds
+            .iter()
+            .map(|hold| hold.deadline_unix_ms)
+            .chain(notice)
+            .max()
+            .unwrap_or(since_unix_ms),
+    )
 }
 
 /// When each piece of work was first seen (work that finished is forgotten,
@@ -391,7 +592,7 @@ fn account(
 }
 
 /// `a`, `a and b`, `a, b and c`.
-fn listed(items: &[String]) -> String {
+pub(crate) fn listed(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),
@@ -426,10 +627,23 @@ pub(crate) struct Rollout {
     line: Vec<String>,
     /// Builds no machine is directed to, with why.
     halted: HashMap<String, String>,
-    /// Machines whose work outran its bound, until when.
-    deferred: HashMap<String, u64>,
+    /// Machines whose work outran its bound, until when and why.
+    deferred: HashMap<String, Deferral>,
+    /// How many times each machine has been deferred, for the build it was
+    /// last deferred for. Kept past the deferral itself, so a machine deferred
+    /// again for the same build is counted rather than starting over.
+    deferral_counts: HashMap<String, (String, u32)>,
     /// Machines that did not act on a directive, with the build and why.
     excluded: HashMap<String, (String, String)>,
+}
+
+/// One machine's deferral: when it is asked again, the work read as wedged,
+/// and how many times it has been deferred for this build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Deferral {
+    until_unix_ms: u64,
+    cause: String,
+    count: u32,
 }
 
 /// The durable admission hold a proposed rollout needs before it can act.
@@ -463,13 +677,102 @@ impl Rollout {
         self.turns()
             .find(|(_, turn)| turn.executor_id == executor_id)
             .map(|(_, turn)| match &turn.phase {
-                TurnPhase::Draining { holds, .. } => UpdateWait::Draining {
+                TurnPhase::Draining {
+                    holds,
+                    residents,
+                    restart_expected_unix_ms,
+                    ..
+                } => UpdateWait::Draining {
                     holds: holds.clone(),
+                    residents: residents.iter().map(|(_, label)| label.clone()).collect(),
+                    returns_by_unix_ms: restart_expected_unix_ms
+                        .map(|at| at.saturating_add(RETURN_BUDGET_MS)),
                 },
                 TurnPhase::Directed { at_unix_ms, .. } => UpdateWait::Directed {
                     at_unix_ms: *at_unix_ms,
+                    returns_by_unix_ms: at_unix_ms.saturating_add(RETURN_BUDGET_MS),
                 },
             })
+    }
+
+    /// When this machine is expected back on the runner's build, for work
+    /// waiting on it: its expected restart plus the return budget while it
+    /// drains, the end of the return budget once directed. `None` when no
+    /// turn holds it, or while work past its bound still progresses.
+    pub(crate) fn returns_by(&self, executor_id: &str) -> Option<u64> {
+        let (_, turn) = self
+            .turns()
+            .find(|(_, turn)| turn.executor_id == executor_id)?;
+        match &turn.phase {
+            TurnPhase::Draining {
+                restart_expected_unix_ms,
+                ..
+            } => restart_expected_unix_ms.map(|at| at.saturating_add(RETURN_BUDGET_MS)),
+            TurnPhase::Directed { at_unix_ms, .. } => {
+                Some(at_unix_ms.saturating_add(RETURN_BUDGET_MS))
+            }
+        }
+    }
+
+    /// A draining machine takes the head only once the head is free, so its
+    /// restart comes no earlier than the head machine's return: the bound it
+    /// publishes is the later of its own and the head's latest return, and
+    /// open while the head's is.
+    fn bound_drain_by_head(&mut self) {
+        let Some(head) = self.head.as_ref() else {
+            return;
+        };
+        let head_back = match &head.phase {
+            TurnPhase::Directed { at_unix_ms, .. } => {
+                Some(at_unix_ms.saturating_add(RETURN_BUDGET_MS))
+            }
+            TurnPhase::Draining {
+                restart_expected_unix_ms,
+                ..
+            } => restart_expected_unix_ms.map(|at| at.saturating_add(RETURN_BUDGET_MS)),
+        };
+        if let Some(TurnPhase::Draining {
+            restart_expected_unix_ms,
+            ..
+        }) = self.drain.as_mut().map(|turn| &mut turn.phase)
+        {
+            *restart_expected_unix_ms = match (*restart_expected_unix_ms, head_back) {
+                (Some(own), Some(head)) => Some(own.max(head)),
+                _ => None,
+            };
+        }
+    }
+
+    /// Record what delivering a resident's notice came to, for the page.
+    /// A delivery that could not be made (`Pending`) makes that notice due
+    /// again, so the next pass retries it under the same idempotency key and
+    /// against the same deadline. Ignored when the turn it was for has ended.
+    pub(crate) fn note_resident_notice(
+        &mut self,
+        executor_id: &str,
+        operation_id: &str,
+        resident_key: &str,
+        kind: NoticeKind,
+        notice: ResidentNotice,
+    ) {
+        for turn in [self.head.as_mut(), self.drain.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if turn.executor_id == executor_id && turn.operation_id == operation_id {
+                if notice == ResidentNotice::Pending {
+                    match kind {
+                        NoticeKind::Announced { .. } => turn.announced.remove(resident_key),
+                        NoticeKind::Ending => turn.ending_sent.remove(resident_key),
+                    };
+                }
+                // A told owner stays told; a later notice never unsays it.
+                let entry = turn.told.entry(resident_key.to_string()).or_insert(notice);
+                if !matches!(entry, ResidentNotice::Told { .. }) {
+                    *entry = notice;
+                }
+            }
+        }
     }
 
     /// The machines directed to install the build and awaited on their
@@ -496,7 +799,8 @@ impl Rollout {
     ) -> Step {
         let mut step = Step::default();
         self.absorb_reported_failures(candidates);
-        self.deferred.retain(|_, until| *until > now_unix_ms);
+        self.deferred
+            .retain(|_, deferral| deferral.until_unix_ms > now_unix_ms);
         if let Some(turn) = self.drain.take() {
             self.drain = self.continue_turn(
                 turn,
@@ -523,7 +827,7 @@ impl Rollout {
             && self
                 .drain
                 .as_ref()
-                .is_some_and(|turn| ready(turn, candidates))
+                .is_some_and(|turn| ready(turn, candidates, now_unix_ms))
         {
             let turn = self.drain.take().expect("checked above");
             self.head = self.continue_turn(
@@ -563,6 +867,7 @@ impl Rollout {
                 ));
             }
         }
+        self.bound_drain_by_head();
         self.line = self.line_up(candidates, artifacts);
         step.holds = self
             .turns()
@@ -578,6 +883,9 @@ impl Rollout {
     pub(crate) fn directive_undelivered(&mut self, executor_id: &str, now_unix_ms: u64) {
         if let Some(turn) = self.head.as_mut() {
             if turn.executor_id == executor_id {
+                // The residents' notice period stands as it was: their
+                // owners were told the restart was coming, and a link that
+                // dropped under the directive does not extend it.
                 turn.phase = TurnPhase::Draining {
                     since_unix_ms: now_unix_ms,
                     generation: 0,
@@ -585,6 +893,8 @@ impl Rollout {
                     first_seen: HashMap::new(),
                     holds: Vec::new(),
                     cycles: Vec::new(),
+                    residents: Vec::new(),
+                    restart_expected_unix_ms: Some(now_unix_ms),
                 };
             }
         }
@@ -633,6 +943,8 @@ impl Rollout {
                     since_unix_ms,
                     holds,
                     cycles,
+                    residents,
+                    restart_expected_unix_ms,
                     ..
                 } => SelfUpdatePhase::Draining {
                     in_flight: u32::try_from(holds.len()).unwrap_or(u32::MAX),
@@ -641,12 +953,23 @@ impl Rollout {
                     cycles: cycles.clone(),
                     waits_for_turn: slot == Slot::Drain,
                     updating: updating.filter(|_| slot == Slot::Drain),
+                    residents: turn
+                        .resident_holds(residents.iter().map(|(key, label)| (key, label))),
+                    restart_expected_unix_ms: *restart_expected_unix_ms,
                 },
                 TurnPhase::Directed {
-                    at_unix_ms, cycled, ..
+                    at_unix_ms,
+                    cycled,
+                    ended,
+                    ..
                 } => SelfUpdatePhase::Directed {
                     at_unix_ms: *at_unix_ms,
                     cycled: cycled.clone(),
+                    ended: turn.resident_holds(
+                        ended
+                            .iter()
+                            .map(|resident| (&resident.key, &resident.label)),
+                    ),
                 },
             };
         }
@@ -664,9 +987,11 @@ impl Rollout {
                 cause: cause.clone(),
             };
         }
-        if let Some(until_unix_ms) = self.deferred.get(&candidate.executor_id) {
+        if let Some(deferral) = self.deferred.get(&candidate.executor_id) {
             return SelfUpdatePhase::Deferred {
-                until_unix_ms: *until_unix_ms,
+                until_unix_ms: deferral.until_unix_ms,
+                cause: Some(deferral.cause.clone()),
+                deferrals: deferral.count,
             };
         }
         // The machine updating now goes before everything in line.
@@ -748,6 +1073,7 @@ impl Rollout {
                                 "the runner now serves {served} for {} in place of {}; {} keeps draining and will be directed to the new build",
                                 turn.target, turn.build_id, turn.name
                             ),
+                            deferrals: None,
                         });
                     }
                     turn.build_id = served.clone();
@@ -762,16 +1088,19 @@ impl Rollout {
                             "the runner no longer serves an executor for {}",
                             turn.target
                         ),
+                        deferrals: None,
                     });
                     return None;
                 }
             }
         }
-        let transition = |kind, cause: String| Transition {
-            executor_id: turn.executor_id.clone(),
+        let (turn_executor, turn_build) = (turn.executor_id.clone(), turn.build_id.clone());
+        let transition = move |kind, cause: String| Transition {
+            executor_id: turn_executor.clone(),
             kind,
-            build_id: turn.build_id.clone(),
+            build_id: turn_build.clone(),
             cause,
+            deferrals: None,
         };
         if let Some(cause) = self.halted.get(&turn.build_id) {
             step.transitions
@@ -787,6 +1116,7 @@ impl Rollout {
                 at_unix_ms: 0,
                 generation: 0,
                 cycled: Vec::new(),
+                ended: Vec::new(),
             },
         ) {
             TurnPhase::Draining {
@@ -832,6 +1162,7 @@ impl Rollout {
                         generation,
                         snapshots_at_hold,
                         first_seen,
+                        turn.residents_release_at_unix_ms,
                         now_unix_ms,
                     );
                     if let Some(drain) = &self.drain {
@@ -851,10 +1182,17 @@ impl Rollout {
                             turn.name
                         ),
                     ));
+                    turn.announce(candidate, step);
                     self.drain = Some(turn);
                     return None;
                 }
+                // Residents hold the head too, but only to the turn's one
+                // notice bound: a resident that appeared after the turn began
+                // gets what is left of it, never a period of its own.
+                let notice_served = candidate.residents.is_empty()
+                    || now_unix_ms >= turn.residents_release_at_unix_ms;
                 if slot == Slot::Head
+                    && notice_served
                     && candidate.reachable
                     && candidate.snapshots_received >= snapshots_at_hold + FRESH_SNAPSHOTS
                 {
@@ -874,17 +1212,50 @@ impl Rollout {
                             listed(&candidate.services)
                         ),
                     };
+                    let ending = if candidate.residents.is_empty() {
+                        String::new()
+                    } else {
+                        let ended: Vec<String> = candidate
+                            .residents
+                            .iter()
+                            .map(|resident| {
+                                let told = match turn.told.get(&resident.key) {
+                                    Some(ResidentNotice::Told { at_unix_ms }) => format!(
+                                        " (its owner was told at {})",
+                                        describe_clock(*at_unix_ms)
+                                    ),
+                                    Some(ResidentNotice::OwnerNotFound) => {
+                                        " (no owner was found to tell)".to_string()
+                                    }
+                                    _ => String::new(),
+                                };
+                                format!("{}{told}", resident.label)
+                            })
+                            .collect();
+                        format!(
+                            "; the restart ends {}, whose notice period ended at {}",
+                            listed(&ended),
+                            describe_clock(turn.residents_release_at_unix_ms)
+                        )
+                    };
+                    let state = if candidate.residents.is_empty() {
+                        "is empty"
+                    } else {
+                        "has no work in flight"
+                    };
                     step.transitions.push(transition(
                         TransitionKind::Directed,
                         format!(
-                            "{} is empty; directed to install {}{cycling}",
+                            "{} {state}; directed to install {}{cycling}{ending}",
                             turn.name, turn.build_id
                         ),
                     ));
+                    turn.end_residents(&candidate.residents, step);
                     turn.phase = TurnPhase::Directed {
                         at_unix_ms: now_unix_ms,
                         generation,
                         cycled: candidate.services.clone(),
+                        ended: candidate.residents.clone(),
                     };
                     return Some(turn);
                 }
@@ -894,10 +1265,13 @@ impl Rollout {
                     generation,
                     snapshots_at_hold,
                     first_seen,
+                    turn.residents_release_at_unix_ms,
                     now_unix_ms,
                 );
+                turn.announce(candidate, step);
                 // An empty head not yet confirmed empty, or not reachable to
-                // direct: nothing it holds can be wedged.
+                // direct: nothing it holds can be wedged. Residents are never
+                // read as wedged: they hold the turn only to its notice bound.
                 if slot == Slot::Head {
                     return Some(turn);
                 }
@@ -940,18 +1314,33 @@ impl Rollout {
                             now_unix_ms.saturating_sub(seen) / 60_000
                         ),
                     };
-                    self.deferred
-                        .insert(turn.executor_id.clone(), now_unix_ms + DEFER_MS);
-                    step.transitions.push(transition(
+                    let count = match self.deferral_counts.get(&turn.executor_id) {
+                        Some((build, count)) if *build == turn.build_id => count + 1,
+                        _ => 1,
+                    };
+                    self.deferral_counts
+                        .insert(turn.executor_id.clone(), (turn.build_id.clone(), count));
+                    let cause = format!("{}'s {} {why}{silent}", turn.name, item.label);
+                    self.deferred.insert(
+                        turn.executor_id.clone(),
+                        Deferral {
+                            until_unix_ms: now_unix_ms + DEFER_MS,
+                            cause: cause.clone(),
+                            count,
+                        },
+                    );
+                    let mut deferred = transition(
                         TransitionKind::Deferred,
                         format!(
-                            "{}'s {} {why}{silent}, so it is read as wedged; {} takes work again and is asked after {} minutes",
-                            turn.name,
-                            item.label,
+                            "{cause}, so it is read as wedged; {} takes work again and is asked after {} minutes ({} for {})",
                             turn.name,
                             DEFER_MS / 60_000,
+                            nth_deferral(count),
+                            turn.build_id,
                         ),
-                    ));
+                    );
+                    deferred.deferrals = Some(count);
+                    step.transitions.push(deferred);
                     return None;
                 }
                 Some(turn)
@@ -960,6 +1349,7 @@ impl Rollout {
                 at_unix_ms,
                 generation,
                 cycled,
+                ended,
             } => {
                 let elapsed = now_unix_ms.saturating_sub(at_unix_ms);
                 match candidate {
@@ -975,15 +1365,21 @@ impl Rollout {
                         // and has already halted this build. A return with no
                         // explanation is retried once before it is read as one.
                         if turn.unexplained_returns < UNEXPLAINED_RETURNS {
+                            // A retry is a drain of its own: residents
+                            // started since are new processes, owed a notice
+                            // period of their own.
                             turn.unexplained_returns += 1;
+                            turn.residents_release_at_unix_ms = now_unix_ms + RESIDENT_NOTICE_MS;
                             turn.phase = TurnPhase::draining(
                                 candidate,
                                 now_unix_ms,
                                 candidate.generation,
                                 candidate.snapshots_received,
                                 HashMap::new(),
+                                turn.residents_release_at_unix_ms,
                                 now_unix_ms,
                             );
+                            turn.announce(candidate, step);
                             return Some(turn);
                         }
                         let cause = format!(
@@ -1032,10 +1428,14 @@ impl Rollout {
                         None
                     }
                     _ => {
+                        // An Ending notice that could not be delivered is
+                        // sent again while the machine is away.
+                        turn.end_residents(&ended, step);
                         turn.phase = TurnPhase::Directed {
                             at_unix_ms,
                             generation,
                             cycled,
+                            ended,
                         };
                         Some(turn)
                     }
@@ -1069,8 +1469,10 @@ impl Rollout {
     }
 
     /// The machine to take a free slot: for the head, a due machine with
-    /// nothing in flight; for the drain, the least busy due machine with work
-    /// in flight. Neither takes a machine already in the other slot.
+    /// nothing in flight and no resident; for the drain, the least busy due
+    /// machine with work in flight or a resident to give notice to, so a
+    /// notice period never holds the fleet's head. Neither takes a machine
+    /// already in the other slot.
     fn next<'a>(
         &self,
         slot: Slot,
@@ -1080,13 +1482,17 @@ impl Rollout {
         candidates
             .iter()
             .filter(|candidate| !self.holds(&candidate.executor_id))
-            .filter(|candidate| candidate.work.is_empty() == (slot == Slot::Head))
+            .filter(|candidate| candidate.is_empty() == (slot == Slot::Head))
             .filter_map(|candidate| {
                 self.due(candidate, artifacts)
                     .map(|(target, build_id)| (candidate, target, build_id))
             })
             .min_by(|(left, ..), (right, ..)| {
-                (left.work.len(), &left.name).cmp(&(right.work.len(), &right.name))
+                (left.work.len(), left.residents.len(), &left.name).cmp(&(
+                    right.work.len(),
+                    right.residents.len(),
+                    &right.name,
+                ))
             })
     }
 
@@ -1108,7 +1514,7 @@ impl Rollout {
                 if !draining && self.due(candidate, artifacts).is_none() {
                     return None;
                 }
-                let idle = candidate.reachable && candidate.work.is_empty();
+                let idle = candidate.reachable && candidate.is_empty();
                 let rank = match (draining, idle) {
                     (true, true) => 0,
                     (false, true) => 1,
@@ -1131,14 +1537,34 @@ impl Rollout {
     }
 }
 
-/// Whether a draining machine can take the head: reachable, and nothing in
-/// flight.
-fn ready(turn: &Turn, candidates: &[Candidate]) -> bool {
+/// Whether a draining machine can take the head: reachable, nothing in
+/// flight, and either no resident or the turn's notice period served.
+fn ready(turn: &Turn, candidates: &[Candidate], now_unix_ms: u64) -> bool {
     candidates.iter().any(|candidate| {
         candidate.executor_id == turn.executor_id
             && candidate.reachable
             && candidate.work.is_empty()
+            && (candidate.residents.is_empty() || now_unix_ms >= turn.residents_release_at_unix_ms)
     })
+}
+
+/// `1st deferral`, `2nd deferral`, `3rd deferral`, `11th deferral`.
+fn nth_deferral(count: u32) -> String {
+    let suffix = match (count % 10, count % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{count}{suffix} deferral")
+}
+
+impl Candidate {
+    /// Nothing a restart would end: no work in flight and no resident.
+    fn is_empty(&self) -> bool {
+        self.work.is_empty() && self.residents.is_empty()
+    }
 }
 
 /// A machine's turn begins in `slot`: it is refused new work from now.
@@ -1150,15 +1576,35 @@ fn begin(
     now_unix_ms: u64,
     step: &mut Step,
 ) -> Turn {
+    let residents_release_at_unix_ms = now_unix_ms + RESIDENT_NOTICE_MS;
     let waiting_on = match slot {
         Slot::Head => {
             "; it has nothing in flight, so it takes the turn and takes no new work until it is directed"
                 .to_string()
         }
-        Slot::Drain => format!(
-            "; it takes no new work until its {} in flight have finished, and holds no other machine's update meanwhile",
-            candidate.work.len()
-        ),
+        Slot::Drain => {
+            let work = match candidate.work.len() {
+                0 => String::new(),
+                count => format!(" until its {count} in flight have finished"),
+            };
+            let residents = if candidate.residents.is_empty() {
+                String::new()
+            } else {
+                let labels: Vec<String> = candidate
+                    .residents
+                    .iter()
+                    .map(|resident| resident.label.clone())
+                    .collect();
+                format!(
+                    "; the restart ends {}, whose owners are told now and which hold it no later than {}",
+                    listed(&labels),
+                    describe_clock(residents_release_at_unix_ms)
+                )
+            };
+            format!(
+                "; it takes no new work{work}, and holds no other machine's update meanwhile{residents}"
+            )
+        }
     };
     step.transitions.push(Transition {
         executor_id: candidate.executor_id.clone(),
@@ -1172,23 +1618,31 @@ fn begin(
                 .as_deref()
                 .unwrap_or("an unreported build"),
         ),
+        deferrals: None,
     });
-    Turn {
+    let mut turn = Turn {
         executor_id: candidate.executor_id.clone(),
         name: candidate.name.clone(),
         build_id,
         target,
         operation_id: uuid::Uuid::new_v4().to_string(),
         unexplained_returns: 0,
+        residents_release_at_unix_ms,
+        announced: HashSet::new(),
+        ending_sent: HashSet::new(),
+        told: HashMap::new(),
         phase: TurnPhase::draining(
             candidate,
             now_unix_ms,
             candidate.generation,
             candidate.snapshots_received,
             HashMap::new(),
+            residents_release_at_unix_ms,
             now_unix_ms,
         ),
-    }
+    };
+    turn.announce(candidate, step);
+    turn
 }
 
 #[cfg(test)]
@@ -1208,9 +1662,23 @@ mod tests {
             last_update: None,
             work: Vec::new(),
             services: Vec::new(),
+            residents: Vec::new(),
             snapshots_received: 10,
             reachable: true,
         }
+    }
+
+    /// A terminal of cairn/6613's, as the fleet labels one.
+    fn terminal(slug: &str) -> Resident {
+        Resident {
+            key: format!("process:cell-1/{slug}/1"),
+            label: format!("terminal `{slug}` of cairn/6613"),
+            address: ResidentAddress::default(),
+        }
+    }
+
+    fn notice_kinds(step: &Step) -> Vec<NoticeKind> {
+        step.notices.iter().map(|notice| notice.kind).collect()
     }
 
     const LANE_MS: u64 = 20 * 60_000;
@@ -1338,6 +1806,7 @@ mod tests {
             SelfUpdatePhase::Directed {
                 at_unix_ms: NOW + 2_000,
                 cycled: Vec::new(),
+                ended: Vec::new(),
             }
         );
 
@@ -1646,6 +2115,10 @@ mod tests {
                 cycles: Vec::new(),
                 waits_for_turn: true,
                 updating: Some("bbs".into()),
+                residents: Vec::new(),
+                // Nothing of its own holds it, but bbs holds the turn: it
+                // restarts no earlier than bbs's latest return.
+                restart_expected_unix_ms: Some(NOW + 1_000 + RETURN_BUDGET_MS),
             }
         );
         assert_eq!(
@@ -1768,12 +2241,15 @@ mod tests {
             step.transitions[0].cause
         );
         assert_eq!(held(&step), ["id-idle"], "the next machine takes the turn");
-        assert_eq!(
+        assert!(matches!(
             phase(&rollout, &fleet[0], &artifacts),
             SelfUpdatePhase::Deferred {
-                until_unix_ms: deadline + DEFER_MS
-            }
-        );
+                until_unix_ms,
+                cause: Some(ref cause),
+                deferrals: 1,
+            } if until_unix_ms == deadline + DEFER_MS
+                && cause.contains("`rust-tests` was expected to finish 10 minutes ago")
+        ));
     }
 
     /// The fedora specimen (cairn/5672): a whole-suite pass with a learned
@@ -1947,15 +2423,19 @@ mod tests {
         );
     }
 
-    /// Work with no expected end (a command never measured, a terminal left
-    /// running) holds the turn for the fixed hold from when the drain first
-    /// saw it, however long before the drain it started.
+    /// Work with no expected end (a command never measured, a request still
+    /// preparing its cell) holds the turn for the fixed hold from when the
+    /// drain first saw it, however long before the drain it started.
     #[test]
     fn unmeasured_work_holds_the_turn_for_the_fixed_hold() {
         let artifacts = serving("new");
         let mut rollout = Rollout::default();
         let mut machine = remote("a", "old");
-        machine.work = vec![command("terminal `dev`", NOW - 6 * 3_600_000, None)];
+        machine.work = vec![command(
+            "request r-1 (preparing its cell)",
+            NOW - 6 * 3_600_000,
+            None,
+        )];
         rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
         let step = rollout.advance(
             std::slice::from_ref(&machine),
@@ -2011,6 +2491,400 @@ mod tests {
             phase(&rollout, &machine, &artifacts),
             SelfUpdatePhase::Directed { ref cycled, .. } if cycled.len() == 2
         ));
+    }
+
+    /// The fedora specimen (cairn/6630): one check lane and one terminal in
+    /// flight. The terminal's owner is told when the drain begins, the lane
+    /// finishes, the terminal does not, and once the notice period has passed
+    /// the machine is directed and the restart ends the terminal, its owner
+    /// told again. Nothing is ever deferred.
+    #[test]
+    fn a_lane_and_a_terminal_drain_then_the_terminal_is_cycled() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("fedora", "old");
+        with_work(&mut machine, 1);
+        machine.residents = vec![terminal("lab")];
+        let mut transitions = Vec::new();
+
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        assert_eq!(held(&step), ["id-fedora"]);
+        assert_eq!(
+            notice_kinds(&step),
+            [NoticeKind::Announced {
+                restart_no_earlier_than_unix_ms: NOW + RESIDENT_NOTICE_MS,
+                commands_in_flight: 1,
+            }]
+        );
+        let notice = step.notices[0].clone();
+        assert_eq!(notice.resident.label, "terminal `lab` of cairn/6613");
+        assert_eq!(notice.build_id, "new");
+        transitions.extend(step.transitions);
+        let lane_deadline = NOW + LANE_MS + COMMAND_MARGIN_MS;
+        let SelfUpdatePhase::Draining {
+            in_flight,
+            residents,
+            restart_expected_unix_ms,
+            waits_for_turn,
+            ..
+        } = phase(&rollout, &machine, &artifacts)
+        else {
+            panic!("draining");
+        };
+        assert_eq!(in_flight, 1, "the terminal is not counted as work");
+        assert!(waits_for_turn, "a resident never takes the head");
+        assert_eq!(
+            residents,
+            [ResidentHold {
+                label: "terminal `lab` of cairn/6613".into(),
+                ends_at_unix_ms: NOW + RESIDENT_NOTICE_MS,
+                notice: ResidentNotice::Pending,
+            }]
+        );
+        assert_eq!(restart_expected_unix_ms, Some(lane_deadline));
+        assert_eq!(
+            rollout.returns_by("id-fedora"),
+            Some(lane_deadline + RETURN_BUDGET_MS)
+        );
+
+        // The runner tells the owner; the page says so, and the owner is
+        // never told the same thing twice.
+        rollout.note_resident_notice(
+            "id-fedora",
+            &notice.operation_id,
+            &notice.resident.key,
+            notice.kind,
+            ResidentNotice::Told { at_unix_ms: NOW },
+        );
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 60_000);
+        assert!(step.notices.is_empty(), "{:?}", step.notices);
+        transitions.extend(step.transitions);
+
+        // The lane finishes; the terminal stays.
+        machine.work.clear();
+        let now = NOW + LANE_MS;
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
+        assert_eq!(step.direct, None, "not yet confirmed empty");
+        transitions.extend(step.transitions);
+        settle(&mut machine);
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now + 1_000);
+        assert_eq!(
+            step.direct
+                .as_ref()
+                .map(|direct| direct.executor_id.as_str()),
+            Some("id-fedora")
+        );
+        assert_eq!(notice_kinds(&step), [NoticeKind::Ending]);
+        let directed = step
+            .transitions
+            .iter()
+            .find(|transition| transition.kind == TransitionKind::Directed)
+            .expect("directed");
+        assert!(
+            directed
+                .cause
+                .contains("the restart ends terminal `lab` of cairn/6613 (its owner was told at"),
+            "{}",
+            directed.cause
+        );
+        transitions.extend(step.transitions);
+        assert!(matches!(
+            phase(&rollout, &machine, &artifacts),
+            SelfUpdatePhase::Directed { ref ended, .. }
+                if ended.len() == 1 && matches!(ended[0].notice, ResidentNotice::Told { .. })
+        ));
+        assert_eq!(
+            rollout.returns_by("id-fedora"),
+            Some(now + 1_000 + RETURN_BUDGET_MS)
+        );
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.kind != TransitionKind::Deferred),
+            "{transitions:?}"
+        );
+    }
+
+    /// A machine whose only resident is a terminal drains beside the turn
+    /// rather than taking it, and is held for the notice period, not the
+    /// hour work with no expected end gets.
+    #[test]
+    fn a_terminal_alone_holds_only_the_notice_period() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = vec![remote("fedora", "old"), remote("idle", "old")];
+        fleet[0].residents = vec![terminal("lab")];
+        let step = rollout.advance(&fleet, &artifacts, NOW);
+        assert_eq!(held(&step), ["id-idle", "id-fedora"]);
+        assert!(matches!(
+            phase(&rollout, &fleet[0], &artifacts),
+            SelfUpdatePhase::Draining {
+                in_flight: 0,
+                waits_for_turn: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            phase(&rollout, &fleet[1], &artifacts),
+            SelfUpdatePhase::Draining {
+                waits_for_turn: false,
+                ..
+            }
+        ));
+
+        let mut rollout = Rollout::default();
+        let mut machine = fleet.remove(0);
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        settle(&mut machine);
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + RESIDENT_NOTICE_MS - 1,
+        );
+        assert_eq!(held(&step), ["id-fedora"]);
+        assert_eq!(step.direct, None, "held through the notice period");
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + RESIDENT_NOTICE_MS,
+        );
+        assert!(step.direct.is_some(), "directed once it has passed");
+        assert_eq!(notice_kinds(&step), [NoticeKind::Ending]);
+    }
+
+    /// A terminal that outlives everything never reads as wedged: the
+    /// machine's lanes keep it busy for two hours, and it is never deferred
+    /// on the terminal's account.
+    #[test]
+    fn residents_never_defer_a_machine() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("fedora", "old");
+        machine.residents = vec![terminal("lab")];
+        machine.work = vec![command("lane-0", NOW, Some(LANE_MS))];
+        let mut now = NOW;
+        for arrival in 0..=24 {
+            now = NOW + arrival * 5 * 60_000;
+            machine.work = vec![command(&format!("lane-{arrival}"), now, Some(LANE_MS))];
+            let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
+            assert_eq!(held(&step), ["id-fedora"], "at {arrival}");
+            assert!(
+                step.transitions
+                    .iter()
+                    .all(|transition| transition.kind != TransitionKind::Deferred),
+                "{:?}",
+                step.transitions
+            );
+        }
+        assert!(now - NOW >= 2 * HOUR);
+        machine.work.clear();
+        settle(&mut machine);
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now + 1_000);
+        assert!(step.direct.is_some());
+    }
+
+    /// The notice period is one bound for the turn: a resident that appears
+    /// later is told, but gets what is left of it, not a period of its own.
+    #[test]
+    fn the_notice_bound_is_not_extended_by_a_later_resident() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("fedora", "old");
+        with_work(&mut machine, 1);
+        machine.residents = vec![terminal("lab")];
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        machine.residents.push(terminal("watch"));
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 4 * 60_000);
+        assert_eq!(step.notices.len(), 1, "only the new one is told");
+        assert_eq!(
+            step.notices[0].resident.label,
+            "terminal `watch` of cairn/6613"
+        );
+        assert_eq!(
+            step.notices[0].kind,
+            NoticeKind::Announced {
+                restart_no_earlier_than_unix_ms: NOW + RESIDENT_NOTICE_MS,
+                commands_in_flight: 1,
+            }
+        );
+        let SelfUpdatePhase::Draining { residents, .. } = phase(&rollout, &machine, &artifacts)
+        else {
+            panic!("draining");
+        };
+        assert!(residents
+            .iter()
+            .all(|resident| resident.ends_at_unix_ms == NOW + RESIDENT_NOTICE_MS));
+    }
+
+    /// A notice whose delivery failed (the owner lookup or the queue write
+    /// errored) is due again on the next pass, against the same deadline, and
+    /// stops once delivered. The same holds for the Ending notice while the
+    /// machine is away.
+    #[test]
+    fn a_notice_whose_delivery_failed_is_retried_on_the_next_pass() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("fedora", "old");
+        with_work(&mut machine, 1);
+        machine.residents = vec![terminal("lab")];
+        let announced = NoticeKind::Announced {
+            restart_no_earlier_than_unix_ms: NOW + RESIDENT_NOTICE_MS,
+            commands_in_flight: 1,
+        };
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        assert_eq!(notice_kinds(&step), [announced]);
+        let first = step.notices[0].clone();
+        let report = |rollout: &mut Rollout, kind, outcome| {
+            rollout.note_resident_notice(
+                "id-fedora",
+                &first.operation_id,
+                &first.resident.key,
+                kind,
+                outcome,
+            )
+        };
+
+        report(&mut rollout, announced, ResidentNotice::Pending);
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 30_000);
+        assert_eq!(
+            notice_kinds(&step),
+            [announced],
+            "same deadline, told again"
+        );
+        assert_eq!(step.notices[0].operation_id, first.operation_id);
+        report(
+            &mut rollout,
+            announced,
+            ResidentNotice::Told {
+                at_unix_ms: NOW + 30_000,
+            },
+        );
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 60_000);
+        assert!(step.notices.is_empty(), "{:?}", step.notices);
+
+        machine.work.clear();
+        settle(&mut machine);
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + RESIDENT_NOTICE_MS,
+        );
+        assert!(step.direct.is_some());
+        assert_eq!(notice_kinds(&step), [NoticeKind::Ending]);
+        report(&mut rollout, NoticeKind::Ending, ResidentNotice::Pending);
+        // The machine is away installing; the owner is still told.
+        let step = rollout.advance(&[], &artifacts, NOW + RESIDENT_NOTICE_MS + 31_000);
+        assert_eq!(notice_kinds(&step), [NoticeKind::Ending]);
+        report(
+            &mut rollout,
+            NoticeKind::Ending,
+            ResidentNotice::Told {
+                at_unix_ms: NOW + RESIDENT_NOTICE_MS + 31_000,
+            },
+        );
+        let step = rollout.advance(&[], &artifacts, NOW + RESIDENT_NOTICE_MS + 61_000);
+        assert!(step.notices.is_empty(), "{:?}", step.notices);
+    }
+
+    /// A resident-only machine whose notice has passed still cannot restart
+    /// while another machine holds the turn, so the bound it publishes is that
+    /// machine's return, and its phase says which machine it waits for.
+    #[test]
+    fn a_drain_behind_a_directed_head_publishes_the_heads_return() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = vec![remote("a", "old"), remote("fedora", "old")];
+        fleet[1].residents = vec![terminal("lab")];
+        assert_eq!(
+            held(&rollout.advance(&fleet, &artifacts, NOW)),
+            ["id-a", "id-fedora"]
+        );
+        settle(&mut fleet[0]);
+        settle(&mut fleet[1]);
+        let step = rollout.advance(&fleet, &artifacts, NOW + 1_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-a".to_string())
+        );
+        let head_back = NOW + 1_000 + RETURN_BUDGET_MS;
+
+        // Six minutes on, a is still installing; fedora's notice has passed.
+        let away = [fleet[1].clone()];
+        let step = rollout.advance(&away, &artifacts, NOW + 6 * 60_000);
+        assert_eq!(step.direct, None, "the turn is a's");
+        let SelfUpdatePhase::Draining {
+            restart_expected_unix_ms,
+            waits_for_turn,
+            updating,
+            ..
+        } = phase(&rollout, &fleet[1], &artifacts)
+        else {
+            panic!("draining");
+        };
+        assert_eq!(restart_expected_unix_ms, Some(head_back));
+        assert!(waits_for_turn);
+        assert_eq!(updating.as_deref(), Some("a"));
+        assert_eq!(
+            rollout.returns_by("id-fedora"),
+            Some(head_back + RETURN_BUDGET_MS)
+        );
+    }
+
+    /// A machine deferred again for the same build says how many times, and
+    /// what was read as wedged.
+    #[test]
+    fn a_deferral_is_counted_per_build() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("fedora", "old");
+        machine.work = vec![command("wedged", NOW, Some(LANE_MS))];
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        let first = NOW + LANE_MS + COMMAND_MARGIN_MS;
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, first);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert_eq!(step.transitions[0].deferrals, Some(1));
+
+        // Asked again, it drains anew; the same work is still there.
+        let again = first + DEFER_MS;
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, again);
+        let second = again + COMMAND_MARGIN_MS;
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, second);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert_eq!(step.transitions[0].deferrals, Some(2));
+        assert!(
+            step.transitions[0].cause.contains("(2nd deferral for new)"),
+            "{}",
+            step.transitions[0].cause
+        );
+        assert!(matches!(
+            phase(&rollout, &machine, &artifacts),
+            SelfUpdatePhase::Deferred {
+                deferrals: 2,
+                cause: Some(ref cause),
+                ..
+            } if cause.starts_with("fedora's `wedged` was expected to finish")
+        ));
+
+        // A different build starts the count over.
+        let newer = serving("newer");
+        let resumed = second + DEFER_MS;
+        rollout.advance(std::slice::from_ref(&machine), &newer, resumed);
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &newer,
+            resumed + COMMAND_MARGIN_MS,
+        );
+        assert_eq!(step.transitions[0].deferrals, Some(1));
+    }
+
+    #[test]
+    fn ordinal_deferrals_read_as_english() {
+        assert_eq!(nth_deferral(1), "1st deferral");
+        assert_eq!(nth_deferral(2), "2nd deferral");
+        assert_eq!(nth_deferral(3), "3rd deferral");
+        assert_eq!(nth_deferral(4), "4th deferral");
+        assert_eq!(nth_deferral(11), "11th deferral");
+        assert_eq!(nth_deferral(22), "22nd deferral");
     }
 
     #[test]

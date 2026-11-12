@@ -8381,11 +8381,15 @@ impl Fleet {
     /// read between two acquisitions of the connection table rather than
     /// under it, and the rollout decides between them, so no lock here is ever
     /// held across another.
+    ///
+    /// Returns the notices residents' owners are owed, which the caller
+    /// delivers: telling an owner reaches the database and the messaging
+    /// path, neither of which this pass may hold a lock across.
     pub(crate) fn advance_self_update_rollout(
         &self,
         now_unix_ms: u64,
         persist: impl FnOnce(&[rollout::SelfUpdateDrain]) -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<rollout::OwnerNotice>, String> {
         let _pass = self.self_update_runtime.pass.lock().unwrap();
         let artifacts = self.executor_artifact_builds.lock().unwrap().clone();
         let mut candidates: Vec<rollout::Candidate> = self
@@ -8394,7 +8398,7 @@ impl Fleet {
             .filter(|entry| !entry.colocated)
             .map(|entry| {
                 let mut candidate = rollout_candidate(entry, now_unix_ms);
-                (candidate.work, candidate.services) = snapshot_work(entry);
+                (candidate.work, candidate.services, candidate.residents) = snapshot_work(entry);
                 candidate
             })
             .collect();
@@ -8471,18 +8475,59 @@ impl Fleet {
                 transition.build_id,
                 transition.cause
             );
+            let mut detail = serde_json::json!({
+                "phase": transition.kind.as_str(),
+                "build": transition.build_id,
+            });
+            if let Some(deferrals) = transition.deferrals {
+                detail["deferrals"] = serde_json::json!(deferrals);
+            }
             self.runner_events.record(
                 runner_events::RunnerEvent::new(runner_events::RunnerEventKind::ExecutorSelfUpdate)
                     .executor(transition.executor_id)
                     .cause(transition.cause)
-                    .detail(serde_json::json!({
-                        "phase": transition.kind.as_str(),
-                        "build": transition.build_id,
-                    })),
+                    .detail(detail),
             );
         }
         self.note_unreturned(step.unreturned, now_unix_ms);
-        Ok(())
+        Ok(step.notices)
+    }
+
+    /// Record what delivering one resident's notice came to, so the machine's
+    /// page says whether its owner was told.
+    pub(crate) fn note_resident_notice(
+        &self,
+        notice: &rollout::OwnerNotice,
+        outcome: cairn_common::executor_protocol::ResidentNotice,
+    ) {
+        self.self_update.lock().unwrap().note_resident_notice(
+            &notice.executor_id,
+            &notice.operation_id,
+            &notice.resident.key,
+            notice.kind,
+            outcome,
+        );
+    }
+
+    /// Fill each self-update refusal with when its machine is expected back,
+    /// so a parked request can say when its candidate returns.
+    fn stamp_update_bounds(&self, rejected: &mut [PlacementRejection]) {
+        if !rejected.iter().any(|rejection| {
+            matches!(
+                rejection.reason,
+                PlacementRejectionReason::UpdatePending { .. }
+            )
+        }) {
+            return;
+        }
+        let rollout = self.self_update.lock().unwrap();
+        for rejection in rejected {
+            if let PlacementRejectionReason::UpdatePending { returns_by_unix_ms } =
+                &mut rejection.reason
+            {
+                *returns_by_unix_ms = rollout.returns_by(&rejection.executor_id);
+            }
+        }
     }
 
     fn note_unreturned(&self, unreturned: Vec<rollout::Unreturned>, now_unix_ms: u64) {
@@ -8762,21 +8807,50 @@ impl Fleet {
     /// What work waiting on `executor_id`'s self-update is told: the machine,
     /// that it is being updated, and how much of that is left.
     fn update_wait_sentence(&self, executor_id: &str, name: &str, now_unix_ms: u64) -> String {
+        use cairn_common::executor_protocol::describe_clock;
         let wait = self.self_update.lock().unwrap().update_wait(executor_id);
         let progress = match wait {
-            Some(rollout::UpdateWait::Draining { holds }) => match holds.first() {
-                Some(hold) => format!(
-                    " ({} in flight, {}{}, {})",
-                    holds.len(),
-                    if holds.len() > 1 { "the longest " } else { "" },
-                    hold.label,
-                    crate::resources::executors::hold_remaining(hold, now_unix_ms)
-                ),
-                None => " (empty, about to install it)".to_string(),
-            },
-            Some(rollout::UpdateWait::Directed { at_unix_ms }) => format!(
-                " (installing it, directed {} ago)",
-                describe_quiet_ms(now_unix_ms.saturating_sub(at_unix_ms))
+            Some(rollout::UpdateWait::Draining {
+                holds,
+                residents,
+                returns_by_unix_ms,
+            }) => {
+                let state = match (holds.first(), residents.as_slice()) {
+                    (Some(hold), residents) => format!(
+                        "{} in flight, {}{}, {}{}",
+                        holds.len(),
+                        if holds.len() > 1 { "the longest " } else { "" },
+                        hold.label,
+                        crate::resources::executors::hold_remaining(hold, now_unix_ms),
+                        match residents {
+                            [] => String::new(),
+                            residents =>
+                                format!("; the restart ends {}", rollout::listed(residents)),
+                        }
+                    ),
+                    (None, []) => "empty, about to install it".to_string(),
+                    (None, [one]) => format!("only {one} remains, which the restart ends"),
+                    (None, residents) => format!(
+                        "only {} remain, which the restart ends",
+                        rollout::listed(residents)
+                    ),
+                };
+                let back = match returns_by_unix_ms {
+                    Some(at) => format!(", expected back by {}", describe_clock(at)),
+                    None => {
+                ", with no return time yet (work past its bound is still progressing, or the machine updating ahead of it has no bound)"
+                    .to_string()
+            }
+                };
+                format!(" ({state}){back}")
+            }
+            Some(rollout::UpdateWait::Directed {
+                at_unix_ms,
+                returns_by_unix_ms,
+            }) => format!(
+                " (installing it, directed {} ago), expected back by {}",
+                describe_quiet_ms(now_unix_ms.saturating_sub(at_unix_ms)),
+                describe_clock(returns_by_unix_ms)
             ),
             None => String::new(),
         };
@@ -15481,14 +15555,18 @@ impl Fleet {
                             prediction: None,
                             executor_name,
                             executor_id,
-                            reason: PlacementRejectionReason::UpdatePending,
+                            reason: PlacementRejectionReason::UpdatePending {
+                                returns_by_unix_ms: None,
+                            },
                         });
                         rejected
                     }
                     None => {
                         // A refusal is a decision with the same evidence attached
                         // as a success, and it is recorded as one.
-                        self.record_placement_decision(refused.decision);
+                        let mut decision = refused.decision;
+                        self.stamp_update_bounds(&mut decision.rejected);
+                        self.record_placement_decision(decision);
                         return Err(CellOutcome::Unavailable {
                             reason: refused.reason,
                             diagnostic: refused.diagnostic,
@@ -15497,6 +15575,8 @@ impl Fleet {
                 },
                 Ok(Selection::Waiting { rejected }) => rejected,
             };
+            let mut rejected = rejected;
+            self.stamp_update_bounds(&mut rejected);
             // The work went nowhere. A machine that refused it only for room
             // a model resident holds was otherwise able to take it (the room
             // is checked after every eligibility check), so placement's model
@@ -15533,7 +15613,10 @@ impl Fleet {
             let updates: Vec<String> = rejected
                 .iter()
                 .filter(|rejection| {
-                    matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
+                    matches!(
+                        rejection.reason,
+                        PlacementRejectionReason::UpdatePending { .. }
+                    )
                 })
                 .map(|rejection| {
                     self.update_wait_sentence(&rejection.executor_id, &rejection.executor_name, now)
@@ -17601,7 +17684,7 @@ fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
         reason,
         PlacementRejectionReason::Declined { .. }
             | PlacementRejectionReason::Held { .. }
-            | PlacementRejectionReason::UpdatePending
+            | PlacementRejectionReason::UpdatePending { .. }
             | PlacementRejectionReason::ModelResident { .. }
             | PlacementRejectionReason::ProvisioningTurn { .. }
             | PlacementRejectionReason::CadenceTurn { .. }
@@ -17992,7 +18075,10 @@ fn wait_decision(
     // update sentence already does, so a row it covers is told once.
     let told_by_update = |rejection: &&PlacementRejection| {
         waiting_on_update.is_some()
-            && matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
+            && matches!(
+                rejection.reason,
+                PlacementRejectionReason::UpdatePending { .. }
+            )
     };
     let others: Vec<PlacementRejection> = rejected
         .iter()
@@ -18633,7 +18719,14 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         }
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
-        PlacementRejectionReason::UpdatePending => "updatePending",
+        // The bound's minute is part of the verdict: a bound that moves is
+        // news to a parked request, so its wait is recorded afresh.
+        PlacementRejectionReason::UpdatePending { returns_by_unix_ms } => {
+            return match returns_by_unix_ms {
+                Some(at) => format!("updatePending:{}", at / 60_000),
+                None => "updatePending".to_string(),
+            }
+        }
         PlacementRejectionReason::ModelResident { .. } => "modelResident",
         PlacementRejectionReason::BuildVolumeAbsent { .. } => "buildVolumeAbsent",
         PlacementRejectionReason::PipeDegraded { .. } => "pipeDegraded",
@@ -21388,6 +21481,7 @@ fn rollout_candidate(entry: &ExecutorConnectionState, now_unix_ms: u64) -> rollo
         last_update: entry.last_update.clone(),
         work: Vec::new(),
         services: Vec::new(),
+        residents: Vec::new(),
         snapshots_received: entry.snapshots_received,
         reachable: !entry.sender.is_closed()
             && matches!(
@@ -21437,10 +21531,32 @@ fn held_command_label(
     }
 }
 
-/// What a restart of this machine would end, one item per piece of work, as
-/// its own snapshot reports it; and, apart, the long-lived service instances
-/// the restart would cycle, which never finish and so are not waited on.
-fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Vec<String>) {
+/// ` of cairn/6613`, ` of job j-1`, or nothing: whose a resident is, the way
+/// [`held_command_label`] names a command's owner.
+fn resident_owner_suffix(owner: Option<&cairn_common::executor_protocol::CellOwnerRef>) -> String {
+    match owner {
+        Some(cairn_common::executor_protocol::CellOwnerRef {
+            project_key: Some(project),
+            issue_number: Some(issue),
+            ..
+        }) => format!(" of {project}/{issue}"),
+        Some(cairn_common::executor_protocol::CellOwnerRef {
+            job_id: Some(job_id),
+            ..
+        }) => format!(" of job {job_id}"),
+        _ => String::new(),
+    }
+}
+
+/// What a restart of this machine would end, as its own snapshot reports it,
+/// in three kinds: work that will finish on its own, one item per piece; the
+/// long-lived service instances the restart cycles, which never finish and
+/// are placed again by their owners; and the terminals, REPLs and dev
+/// instances it ends, which never finish on their own and hold a turn only
+/// for its notice period. A service's one-shot command is work.
+fn snapshot_work(
+    entry: &ExecutorConnectionState,
+) -> (Vec<rollout::HeldWork>, Vec<String>, Vec<rollout::Resident>) {
     use cairn_common::executor_protocol::{ResidentProcessKind, ResidentProcessStatus};
 
     let snapshot = &entry.snapshot;
@@ -21518,7 +21634,10 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
         });
     }
     let mut services = Vec::new();
+    let mut residents = Vec::new();
     for cell in &snapshot.cells {
+        let residency = cell.residency.as_ref();
+        let owner = residency.and_then(|residency| residency.owner_ref.as_ref());
         for (process_key, process) in &cell.occupancy.processes {
             let started_at_unix_ms = match &process.status {
                 ResidentProcessStatus::Starting => None,
@@ -21527,17 +21646,39 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
                 } => Some(*started_at_unix_ms),
                 _ => continue,
             };
+            let key = format!(
+                "process:{}/{process_key}/{}",
+                cell.cell_id, process.generation
+            );
             match &process.kind {
                 ResidentProcessKind::Service { role, .. }
                     if role != service_placement::ONE_SHOT_ROLE =>
                 {
                     services.push(resident_process_label(&process.kind));
                 }
+                kind @ (ResidentProcessKind::Terminal { .. }
+                | ResidentProcessKind::Repl { .. }
+                | ResidentProcessKind::DevInstance { .. }) => {
+                    residents.push(rollout::Resident {
+                        key,
+                        label: format!(
+                            "{}{}",
+                            resident_process_label(kind),
+                            resident_owner_suffix(owner)
+                        ),
+                        address: rollout::ResidentAddress {
+                            process_key: process_key.clone(),
+                            kind: Some(kind.clone()),
+                            holder: residency.map(|residency| residency.holder.clone()),
+                            owner: owner.cloned(),
+                            project_id: Some(cell.project_id.clone())
+                                .filter(|project| !project.is_empty()),
+                            selector: residency.and_then(|residency| residency.selector.clone()),
+                        },
+                    });
+                }
                 kind => work.push(rollout::HeldWork {
-                    key: format!(
-                        "process:{}/{process_key}/{}",
-                        cell.cell_id, process.generation
-                    ),
+                    key,
                     label: resident_process_label(kind),
                     started_at_unix_ms,
                     expected_ms: None,
@@ -21550,7 +21691,8 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
     work.retain(|item| keys.insert(item.key.clone()));
     services.sort();
     services.dedup();
-    (work, services)
+    residents.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.key.cmp(&b.key)));
+    (work, services, residents)
 }
 
 /// The runner's own account joined to the machine's: work its queue binds to
@@ -22731,12 +22873,23 @@ fn no_matching_executor_diagnostic(
         );
     }
     let updating_target = rejected.iter().find(|rejection| {
-        matches!(rejection.reason, PlacementRejectionReason::UpdatePending)
-            && would_serve(rejection)
+        matches!(
+            rejection.reason,
+            PlacementRejectionReason::UpdatePending { .. }
+        ) && would_serve(rejection)
     });
     if let Some(rejection) = updating_target {
+        let back = match &rejection.reason {
+            PlacementRejectionReason::UpdatePending {
+                returns_by_unix_ms: Some(at),
+            } => format!(
+                ", expected by {}",
+                cairn_common::executor_protocol::describe_clock(*at)
+            ),
+            _ => String::new(),
+        };
         return format!(
-            "{name} is being emptied for an executor update, so the runner is refusing new work there until it returns on the runner's build. This clears on its own; cairn://executors/{name} shows how far along it is.{account}",
+            "{name} is being emptied for an executor update, so the runner is refusing new work there until it returns on the runner's build{back}. This clears on its own; cairn://executors/{name} shows how far along it is.{account}",
             name = rejection.executor_name
         );
     }
@@ -36669,7 +36822,10 @@ mod tests {
                 .rejected
                 .iter()
                 .any(|rejection| rejection.executor_name == "bbs"
-                    && rejection.reason == PlacementRejectionReason::UpdatePending),
+                    && matches!(
+                        rejection.reason,
+                        PlacementRejectionReason::UpdatePending { .. }
+                    )),
             "{:?}",
             draft.rejected
         );
@@ -36737,7 +36893,9 @@ mod tests {
         check.placement_work_class = PlacementWorkClass::WriteChecks;
         assert_eq!(
             candidate_rejection(&resident_home, PlacementScope::of(&check), NOW),
-            Some(PlacementRejectionReason::UpdatePending),
+            Some(PlacementRejectionReason::UpdatePending {
+                returns_by_unix_ms: None
+            }),
             "a pinned check lane is a new environment"
         );
 
@@ -36797,7 +36955,10 @@ mod tests {
             !rejected
                 .iter()
                 .any(|rejection| rejection.executor_id == "bbs"
-                    && rejection.reason == PlacementRejectionReason::UpdatePending),
+                    && matches!(
+                        rejection.reason,
+                        PlacementRejectionReason::UpdatePending { .. }
+                    )),
             "{rejected:?}"
         );
         let survey = HashMap::from([connections
@@ -36862,6 +37023,53 @@ mod tests {
             waits[0]
         );
         assert!(waits[0].contains("cairn://executors/bbs"), "{}", waits[0]);
+
+        // The refusal carries when bbs is expected back, the rollout's own
+        // bound, and the wait states it as a clock time.
+        let returns_by = pool
+            .self_update
+            .lock()
+            .unwrap()
+            .returns_by(&executor_id)
+            .expect("a bounded drain");
+        assert_eq!(
+            returns_by,
+            now + rollout::UNMEASURED_HOLD_MS + rollout::RETURN_BUDGET_MS,
+            "an unmeasured grant's hold, then the return budget"
+        );
+        let refusals: Vec<Option<u64>> = pool
+            .placements_naming("bbs")
+            .into_iter()
+            .flat_map(|decision| decision.rejected)
+            .filter_map(|rejection| match rejection.reason {
+                PlacementRejectionReason::UpdatePending { returns_by_unix_ms } => {
+                    Some(returns_by_unix_ms)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!refusals.is_empty());
+        assert!(
+            refusals.iter().all(|bound| *bound == Some(returns_by)),
+            "{refusals:?}"
+        );
+        assert!(
+            waits[0].contains(&format!(
+                "expected back by {}",
+                cairn_common::executor_protocol::describe_clock(returns_by)
+            )),
+            "{}",
+            waits[0]
+        );
+        // A bound that moves is a different verdict, so the wait is recorded
+        // again rather than left standing with a stale clock time.
+        let moved = |at: u64| {
+            placement_rejection_signature(&PlacementRejectionReason::UpdatePending {
+                returns_by_unix_ms: Some(at),
+            })
+        };
+        assert_eq!(moved(returns_by), moved(returns_by - returns_by % 60_000));
+        assert_ne!(moved(returns_by), moved(returns_by + 60_000));
     }
 
     /// A machine that closes its link to install the runner's build is about
@@ -37492,7 +37700,10 @@ mod tests {
                 .rejected
                 .iter()
                 .any(|rejection| rejection.executor_name == "bgsrv-mac"
-                    && rejection.reason == PlacementRejectionReason::UpdatePending),
+                    && matches!(
+                        rejection.reason,
+                        PlacementRejectionReason::UpdatePending { .. }
+                    )),
             "{:?}",
             draft.rejected
         );
@@ -39474,7 +39685,7 @@ mod tests {
             vec![usage("r1", "a1"), usage("r2", "a1")],
         )));
 
-        let (work, _) = snapshot_work(&entry);
+        let (work, _, _) = snapshot_work(&entry);
         let progress: Vec<_> = work
             .iter()
             .map(|item| (item.key.as_str(), item.progress))
@@ -39492,6 +39703,91 @@ mod tests {
                 ),
                 ("request:r2", None),
             ]
+        );
+    }
+
+    /// A terminal, a REPL and a dev instance are residents the restart ends,
+    /// named with whose they are and addressed for their owner's notice; a
+    /// long-lived service is cycled; a service's one-shot command is work.
+    #[test]
+    fn snapshot_work_names_residents_apart_from_work_and_services() {
+        use cairn_common::executor_protocol::{
+            ResidentProcess, ResidentProcessKind, ResidentProcessStatus,
+        };
+        let (_, mut entry) = fleet_entry("fedora", "linux", 0, &[]);
+        let mut cell = materialization_read_cell("fedora-home", "builder");
+        let holder = cell.residency.as_ref().unwrap().holder.clone();
+        let running = |kind| ResidentProcess {
+            generation: 1,
+            kind,
+            spec: None,
+            status: ResidentProcessStatus::Running {
+                started_at_unix_ms: 1,
+                process_group_id: None,
+                ownership: None,
+            },
+            reservation: None,
+            live_usage: None,
+            charge: None,
+        };
+        cell.occupancy.processes = std::collections::BTreeMap::from([
+            (
+                "terminal:lab".to_string(),
+                running(ResidentProcessKind::Terminal { slug: "lab".into() }),
+            ),
+            (
+                "repl:py".to_string(),
+                running(ResidentProcessKind::Repl { slug: "py".into() }),
+            ),
+            (
+                "dev".to_string(),
+                running(ResidentProcessKind::DevInstance {
+                    source_terminal_session_id: None,
+                }),
+            ),
+            (
+                "watch".to_string(),
+                running(ResidentProcessKind::Service {
+                    name: "iMessage channel".into(),
+                    role: "watch".into(),
+                }),
+            ),
+            (
+                "once".to_string(),
+                running(ResidentProcessKind::Service {
+                    name: "setup".into(),
+                    role: service_placement::ONE_SHOT_ROLE.into(),
+                }),
+            ),
+        ]);
+        Arc::make_mut(&mut entry.snapshot).cells = vec![cell];
+
+        let (work, services, residents) = snapshot_work(&entry);
+        assert_eq!(
+            work.iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["service `setup`"]
+        );
+        assert_eq!(services, ["service `iMessage channel`"]);
+        assert_eq!(
+            residents
+                .iter()
+                .map(|resident| resident.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "REPL `py` of cairn/1",
+                "a dev instance of cairn/1",
+                "terminal `lab` of cairn/1"
+            ]
+        );
+        let lab = &residents[2];
+        assert_eq!(lab.key, "process:fedora-home/terminal:lab/1");
+        assert_eq!(lab.address.process_key, "terminal:lab");
+        assert_eq!(lab.address.holder, Some(holder));
+        assert_eq!(
+            lab.address.kind,
+            Some(ResidentProcessKind::Terminal { slug: "lab".into() })
         );
     }
 

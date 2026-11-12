@@ -163,7 +163,10 @@ pub(super) fn rejection(entry: &ExecutorConnectionState) -> PlacementRejectionRe
         && records.iter().all(|record| matches!(&record.owner,
             ExecutorDrainOwner::Runtime { context } if context.kind == ExecutorRuntimeDrainKind::SelfUpdate))
     {
-        PlacementRejectionReason::UpdatePending
+        // The bound is the rollout's fact, filled where placement can read it.
+        PlacementRejectionReason::UpdatePending {
+            returns_by_unix_ms: None,
+        }
     } else {
         PlacementRejectionReason::Drained
     }
@@ -351,7 +354,9 @@ impl Fleet {
             let reason = if refusing.iter().all(|row| {
                 row.admission_effect == ExecutorDrainAdmissionEffect::RefuseNewEnvironments
             }) {
-                PlacementRejectionReason::UpdatePending
+                PlacementRejectionReason::UpdatePending {
+                    returns_by_unix_ms: None,
+                }
             } else {
                 PlacementRejectionReason::Drained
             };
@@ -968,7 +973,10 @@ mod tests {
             let error = fleet
                 .send_new_admission(&selected, request, false, frame(id))
                 .expect_err("new environments are refused");
-            assert_eq!(error.reason, PlacementRejectionReason::UpdatePending);
+            assert!(matches!(
+                error.reason,
+                PlacementRejectionReason::UpdatePending { .. }
+            ));
         }
         let sent: Vec<String> = std::iter::from_fn(|| inbox.try_recv().ok())
             .filter_map(|message| match message {
