@@ -1,16 +1,16 @@
 {
   "integration": 1,
-  "version": "2.1.311",
-  "reason": "First managed pin: the stable channel on 2026-11-05, claude-contract green on macOS and Linux.",
+  "version": "2.1.322",
+  "reason": "Operator-requested bump ahead of the stable channel (which names 2.1.311), to get Fable 5.2 as the CLI default model (introduced in 2.1.321). Integration 1 unchanged; lands only through the pinBump precondition with claude-pin and claude-contract passed on macOS and Linux.",
   "skip": [],
   "packages": {
-    "darwin-arm64": { "sha256": "85d8c08707fcfd1e78ffa0204eefbc6ec9e4fe22f375fb2767ef85d957ed3161", "size": 276185504 },
-    "darwin-x64": { "sha256": "d34e1cb82015b050471a97574aa6ea6f698ecf3a97a61c980961f43ad9f838f5", "size": 287420928 },
-    "linux-x64": { "sha256": "86dc1fcc69498159eaf15f446613e847010f9036bfbbdffd4c49350be8489ada", "size": 293776752 },
-    "linux-arm64": { "sha256": "2e2496c9a8065df93acb0fca2d341f59a6b8777649b2e025ab8c9bcd5eef61f3", "size": 293658808 },
-    "linux-x64-musl": { "sha256": "cd40dd327145ee47aa0deacd571801c1d782388f709d71242eee6b91de8ed11f", "size": 287442392 },
-    "linux-arm64-musl": { "sha256": "172150e3f9ea07e8e2e2e29862d7d9a25f5c234d8e909e4063df237665bf09b9", "size": 285822152 },
-    "win32-x64": { "sha256": "966f4b2ce962298f5dee6a942e8c47c8f97392e69e728e622319a98b259c0680", "size": 298870432 },
-    "win32-arm64": { "sha256": "951b5d94bf2a5296db2c442784e68d18fa04dec2d7d2e805aa50e75d618aad5e", "size": 282933920 }
+    "darwin-arm64": { "sha256": "a9d237949db816a0b7afd88a9a8e1df36b3a597a30f5a41d1c0539eb180a3450", "size": 323702464 },
+    "darwin-x64": { "sha256": "b513d15117cbf1bb05095dab41963fd394ff40de1fa99dcc6d7d1033bf292e9b", "size": 338400544 },
+    "linux-x64": { "sha256": "bfb3703ad5380242328459bc62ada4bde8ae7ba57c6e1eeadb9c00e08874c478", "size": 341914128 },
+    "linux-arm64": { "sha256": "f220ca50ea4f3222043ff83cc224a1262e0196e9897acc0871efa94235b0c1fd", "size": 341501368 },
+    "linux-x64-musl": { "sha256": "9bed6cfc5d2420b673a0b9fe41c71533a02904935cbc3b4cd110302d475fee6f", "size": 328374856 },
+    "linux-arm64-musl": { "sha256": "b8a07ebb71cd612bd1ed80eabd2084ded98cadbae298d068a4a1307f0448c40c", "size": 325808392 },
+    "win32-x64": { "sha256": "345996b4bdbae21d817f750fae2f34cbf8d81224a5444c78136091d121beb298", "size": 346496160 },
+    "win32-arm64": { "sha256": "8e32c3f2fee1e5c17f0ae9a544fedf0951c4d0482268bb47c06c229fc62894c4", "size": 329660576 }
   }
 }
