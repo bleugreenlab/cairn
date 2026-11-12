@@ -159,10 +159,12 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
             // as the compiles issuing them finish, and the brake holds only
             // compile-class work meanwhile.
             | HostPressureCondition::DiskWriteStall { .. }
-            // Telemetry goes blind when the machine is too loaded to sample
-            // itself, so the work already running is what clears it: the
-            // sampler gets its turn back as that work drains. Waiting is the
-            // right response, and it is the same wait measured pressure gets.
+            // The executor reports telemetry blind only when its sampler is,
+            // which is the machine too loaded to sample itself, so the work
+            // already running is what clears it: the sampler gets its turn
+            // back as that work drains. Waiting is the right response, and it
+            // is the same wait measured pressure gets. A single instrument
+            // broken under a running sampler is not reported as blind at all.
             | HostPressureCondition::TelemetryBlind { .. } => true,
             HostPressureCondition::DiskFree { .. } => false,
         })

@@ -4003,17 +4003,28 @@ impl MachineRole {
     }
 }
 
-/// Cadence and freshness bound for measured CPU admission decisions.
-pub const CPU_ADMISSION_SAMPLE_INTERVAL_MS: u64 = 5_000;
-
-/// How long an executor that has measured its own CPU may go without a new
-/// reading before admission treats it as blind.
+/// The executor's machine sampler cadence: how often it takes the cheap
+/// machine readings and folds them into every host-stall gauge.
 ///
-/// Three sample intervals, the same allowance the runner gives a link before
-/// calling it stale. The bound has to tolerate ordinary jitter — a sampler that
-/// misses one tick on a busy machine is busy, not broken — while still being
-/// far shorter than the minutes a genuinely starved sampler goes quiet for.
-pub const CPU_ADMISSION_BLIND_AFTER_MS: u64 = 3 * CPU_ADMISSION_SAMPLE_INTERVAL_MS;
+/// Every stall gauge — CPU, memory stall, and both build-volume write arms —
+/// is fed on this one tick from one cached sample, which is why one bound
+/// ([`MACHINE_SAMPLE_BLIND_AFTER_MS`]) serves all of them. A gauge given a
+/// cadence of its own must get a bound of its own. Between ticks a reading is
+/// reused with its own collection time, so a heartbeat published inside the
+/// interval carries a fact that is honestly a few seconds old rather than one
+/// re-stamped with the beat's clock.
+pub const MACHINE_SAMPLE_INTERVAL_MS: u64 = 5_000;
+
+/// How long a stall gauge that has measured may go without a new reading
+/// before it is blind.
+///
+/// Three sample intervals. The real gap between new readings is one tick, or
+/// two when another caller refreshed the cache just before the tick; the third
+/// is margin for delivery. The bound has to tolerate that jitter — a sampler
+/// that misses one tick on a busy machine is busy, not broken — while still
+/// being far shorter than the minutes a genuinely starved sampler goes quiet
+/// for.
+pub const MACHINE_SAMPLE_BLIND_AFTER_MS: u64 = 3 * MACHINE_SAMPLE_INTERVAL_MS;
 
 /// The least available memory a non-interactive admission must leave the
 /// machine, once what admitted work still owes is subtracted, when the
@@ -4050,7 +4061,7 @@ pub fn memory_short(available_bytes: u64, owed_bytes: u64, floor_bytes: u64) -> 
 /// most at the end of a generation: a sampler starves under exactly the
 /// pressure that kills the process, so the last size it recorded is the one
 /// most likely to be far below the truth (CAIRN-4627).
-pub const MACHINE_READING_STALE_AFTER_MS: u64 = CPU_ADMISSION_BLIND_AFTER_MS;
+pub const MACHINE_READING_STALE_AFTER_MS: u64 = MACHINE_SAMPLE_BLIND_AFTER_MS;
 
 /// One instrument of the host-stall brake: a reading of how stalled the host
 /// is, held to its own entry and clear bars with hysteresis.
@@ -4245,8 +4256,9 @@ pub fn combine_disk_write_arms(
 }
 
 /// Both arms of the build-volume write instrument, as their trackers hold
-/// them, and the device they read. [`HostHealth::disk_write_admission`] is the
-/// verdict drawn from these.
+/// them. They are the instrument's only transported state: its verdict is
+/// always derived from them ([`DiskWriteArms::combined`]), so a combined
+/// verdict and the arms it came from can never travel separately and drift.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskWriteArms {
@@ -4260,6 +4272,128 @@ pub struct DiskWriteArms {
     /// only for one saturated now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pressured_unix_ms: Option<u64>,
+}
+
+impl DiskWriteArms {
+    /// The instrument's verdict, drawn from both arms.
+    pub fn combined(&self) -> StallInstrumentHealth {
+        combine_disk_write_arms(&self.stall, &self.latency)
+    }
+
+    pub fn arm(&self, arm: DiskWriteArm) -> &StallInstrumentHealth {
+        match arm {
+            DiskWriteArm::Stall => &self.stall,
+            DiskWriteArm::Latency => &self.latency,
+        }
+    }
+
+    /// The arm a pressured instrument is pressured by: the pressured arm with
+    /// the newest reading, since a stale one beside it is history, and the
+    /// stall arm when both are equally fresh. The one answer the executor's
+    /// refusal, the runner's hold, and the page each name.
+    pub fn pressured_arm(&self) -> Option<DiskWriteArm> {
+        DiskWriteArm::ALL
+            .into_iter()
+            .filter(|arm| self.arm(*arm).state == StallInstrumentState::Pressured)
+            .fold(None, |best: Option<DiskWriteArm>, arm| match best {
+                Some(best)
+                    if self.arm(best).measured_at_unix_ms >= self.arm(arm).measured_at_unix_ms =>
+                {
+                    Some(best)
+                }
+                _ => Some(arm),
+            })
+    }
+
+    /// Take each arm from `candidate` that was measured after the one held
+    /// here, and say whether any was. Arm by arm, because each is a tracker of
+    /// its own and a stale copy of one must never displace a fresh copy of
+    /// the other.
+    fn adopt_newer(&mut self, candidate: &DiskWriteArms) -> bool {
+        let mut adopted = false;
+        for (current, candidate) in [
+            (&mut self.stall, &candidate.stall),
+            (&mut self.latency, &candidate.latency),
+        ] {
+            if candidate.measured_at_unix_ms > current.measured_at_unix_ms {
+                *current = candidate.clone();
+                adopted = true;
+            }
+        }
+        let last = self
+            .last_pressured_unix_ms
+            .max(candidate.last_pressured_unix_ms);
+        adopted |= last != self.last_pressured_unix_ms;
+        self.last_pressured_unix_ms = last;
+        adopted
+    }
+}
+
+/// The arm of the build-volume write instrument a hold is on, with that arm's
+/// own reading and bars, so a hold explains itself in the units of the arm
+/// that tripped rather than in the other arm's.
+///
+/// Integers in the arm's display unit, because hold evidence is compared for
+/// equality: thousandths for the stall arm (228 is 22.8% full avg60), whole
+/// milliseconds of mean write for the latency arm.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiskWriteArmHold {
+    pub arm: DiskWriteArm,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<u32>,
+    pub entry: u32,
+    pub clear: u32,
+}
+
+impl DiskWriteArmHold {
+    /// The pressured arm of `arms` ([`DiskWriteArms::pressured_arm`]) against
+    /// the bars `policy` holds it to.
+    pub fn of(arms: &DiskWriteArms, policy: &ExecutorRuntimePolicy) -> Option<Self> {
+        let arm = arms.pressured_arm()?;
+        let gauge = StallGauge::DiskWrite(arm);
+        let bars = policy.stall_policy(gauge);
+        let unit = |value: f64| {
+            if gauge.reads_milliseconds() {
+                value.max(0.0).round() as u32
+            } else {
+                (value.clamp(0.0, 1.0) * 1_000.0).round() as u32
+            }
+        };
+        Some(Self {
+            arm,
+            reading: arms.arm(arm).reading.map(unit),
+            entry: unit(bars.entry),
+            clear: unit(bars.clear),
+        })
+    }
+
+    /// `build volume write stall 22.8% full avg60 on nvme0n1 (write stall
+    /// arm: entry 8.0%, clear 3.0%)`, or the latency arm's equivalent.
+    pub fn describe(&self, device: Option<&str>) -> String {
+        let on = device
+            .map(|device| format!(" on {device}"))
+            .unwrap_or_default();
+        let tenths = |value: u32| format!("{:.1}%", f64::from(value) / 10.0);
+        match self.arm {
+            DiskWriteArm::Stall => format!(
+                "build volume write stall{}{on} (write stall arm: entry {}, clear {})",
+                self.reading
+                    .map(|reading| format!(" {} full avg60", tenths(reading)))
+                    .unwrap_or_default(),
+                tenths(self.entry),
+                tenths(self.clear)
+            ),
+            DiskWriteArm::Latency => format!(
+                "build volume write latency{}{on} (write latency arm: entry {} ms, clear {} ms)",
+                self.reading
+                    .map(|reading| format!(" {reading} ms mean"))
+                    .unwrap_or_default(),
+                self.entry,
+                self.clear
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -4284,9 +4418,10 @@ pub enum StallInstrumentState {
 // therefore be set by a party that cannot observe the condition and trusted by
 // parties that can: every consumer already holds `measured_at_unix_ms` and a
 // clock, which is the whole answer. `measured_at_unix_ms.is_none()` means never
-// measured; an age past `CPU_ADMISSION_BLIND_AFTER_MS` means blind; otherwise
+// measured; an age past `MACHINE_SAMPLE_BLIND_AFTER_MS` means blind; otherwise
 // the state below is the verdict. One definition, derived wherever it is read:
-// [`StallInstrumentHealth::blind_age_ms`] and [`StallInstrumentHealth::fresh`].
+// [`StallInstrumentHealth::blind_age_ms`] and [`StallInstrumentHealth::fresh`],
+// and, for what a blind reading means, [`StallBlindness::classify`].
 
 /// One instrument's sustained verdict, with the reading it was last drawn from.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -4311,17 +4446,17 @@ pub struct StallInstrumentHealth {
 
 impl StallInstrumentHealth {
     /// How old the last reading is, when that age makes this instrument blind:
-    /// it measured, and has not for longer than [`CPU_ADMISSION_BLIND_AFTER_MS`].
+    /// it measured, and has not for longer than [`MACHINE_SAMPLE_BLIND_AFTER_MS`].
     /// `None` for an instrument that never measured, which is not blind.
     pub fn blind_age_ms(&self, now_unix_ms: u64) -> Option<u64> {
         let age = now_unix_ms.saturating_sub(self.measured_at_unix_ms?);
-        (age > CPU_ADMISSION_BLIND_AFTER_MS).then_some(age)
+        (age > MACHINE_SAMPLE_BLIND_AFTER_MS).then_some(age)
     }
 
     /// Whether the verdict speaks for the machine now: measured, and recently.
     pub fn fresh(&self, now_unix_ms: u64) -> bool {
         self.measured_at_unix_ms.is_some_and(|measured_at| {
-            now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_BLIND_AFTER_MS
+            now_unix_ms.saturating_sub(measured_at) <= MACHINE_SAMPLE_BLIND_AFTER_MS
         })
     }
 
@@ -4329,6 +4464,81 @@ impl StallInstrumentHealth {
     /// on a fresh reading.
     pub fn holds(&self, now_unix_ms: u64) -> bool {
         self.state == StallInstrumentState::Pressured && self.fresh(now_unix_ms)
+    }
+}
+
+/// What a blind stall reading means, judged against the machine sampler.
+///
+/// Every gauge is fed on the sampler's one tick, so the CPU gauge's age is the
+/// sampler's age. A machine too loaded to sample itself goes blind on CPU
+/// first, and every instrument blind with it is history about a host nobody
+/// can see into: that holds admission (CAIRN-4359). A gauge blind while CPU is
+/// fresh is a different fact: the tick ran and produced a gap for that gauge
+/// alone — the device left `/proc/diskstats`, PSI became unreadable, the
+/// volume was unplugged. That is a broken instrument, not a saturated machine,
+/// and a failed measurement is not a fact (tenet 1441), so it fails open like
+/// an instrument that never measured (tenet 302).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallBlindness {
+    /// The sampler itself stopped, or cannot be told apart from having
+    /// stopped. Holds admission.
+    SamplerBlind {
+        instrument: StallInstrument,
+        age_ms: u64,
+    },
+    /// This instrument stopped reading while the sampler kept running. Does
+    /// not hold admission.
+    InstrumentFault {
+        instrument: StallInstrument,
+        age_ms: u64,
+        /// How old the CPU reading is: the evidence the sampler is current.
+        sampler_age_ms: u64,
+    },
+}
+
+impl StallBlindness {
+    /// Classify `reading`, a gauge of `instrument`, against the CPU gauge
+    /// `cpu`, or `None` when the reading is not blind. A CPU gauge that never
+    /// measured cannot vouch for the sampler, so blindness then stays
+    /// sampler blindness, as it was before this distinction existed.
+    pub fn classify(
+        instrument: StallInstrument,
+        reading: &StallInstrumentHealth,
+        cpu: &StallInstrumentHealth,
+        now_unix_ms: u64,
+    ) -> Option<Self> {
+        let age_ms = reading.blind_age_ms(now_unix_ms)?;
+        let sampler_age_ms = cpu
+            .measured_at_unix_ms
+            .filter(|_| instrument != StallInstrument::Cpu && cpu.fresh(now_unix_ms))
+            .map(|measured_at| now_unix_ms.saturating_sub(measured_at));
+        Some(match sampler_age_ms {
+            Some(sampler_age_ms) => Self::InstrumentFault {
+                instrument,
+                age_ms,
+                sampler_age_ms,
+            },
+            None => Self::SamplerBlind { instrument, age_ms },
+        })
+    }
+
+    pub fn instrument(self) -> StallInstrument {
+        match self {
+            Self::SamplerBlind { instrument, .. } | Self::InstrumentFault { instrument, .. } => {
+                instrument
+            }
+        }
+    }
+
+    pub fn age_ms(self) -> u64 {
+        match self {
+            Self::SamplerBlind { age_ms, .. } | Self::InstrumentFault { age_ms, .. } => age_ms,
+        }
+    }
+
+    /// Whether this blindness holds admission: only the sampler's does.
+    pub fn holds(self) -> bool {
+        matches!(self, Self::SamplerBlind { .. })
     }
 }
 
@@ -7695,7 +7905,23 @@ pub struct LearnedResourceEstimate {
 /// last snapshot. That is local to the executor's replica: no frame, variant or
 /// field changes, and an older executor simply keeps failing that write-back as
 /// it did. What a runner gets wrong talking to an older executor: nothing.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 169;
+///
+/// Version 170 (cairn/6936) removes the transported build-volume write
+/// verdict (`diskWriteAdmission`) from [`HostHealth`] and [`MachineSample`]:
+/// the verdict is now derived from [`DiskWriteArms`] wherever it is read, and
+/// the runner adopts each arm from every machine sample by its own stamp.
+/// What a runner gets wrong talking to an older executor: nothing it decodes
+/// differently, since that executor already sends the arms on every sample and
+/// report and serde ignores its extra field; the one difference is that it
+/// still holds on a write instrument that faulted under a current sampler,
+/// which the runner now ranks as not blind, so that machine's refusal arrives
+/// as a decline rather than a ranking. An older runner talking to a newer
+/// executor would read the write verdict as never measured, which fails open,
+/// and would place compile-class work on a machine whose build volume is
+/// saturated. That changes what a runner concludes about admission (tenet
+/// 541), so the number moves and the handshake refuses the pairing until the
+/// executor self-updates.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 170;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -14250,11 +14476,10 @@ pub struct HostHealth {
     /// which fails open.
     #[serde(default)]
     pub memory_admission: StallInstrumentHealth,
-    /// The host-stall brake's build-volume write verdict, drawn from
-    /// [`Self::disk_write_arms`]. Defaulted, so an executor that predates it
-    /// reads as never having measured, which fails open.
-    #[serde(default)]
-    pub disk_write_admission: StallInstrumentHealth,
+    /// The host-stall brake's build-volume write arms. The instrument's
+    /// verdict is derived from them ([`Self::stall`]), never transported
+    /// beside them. Defaulted, so an executor that predates them reads as
+    /// never having measured, which fails open.
     #[serde(default)]
     pub disk_write_arms: DiskWriteArms,
     pub logical_cores: Option<usize>,
@@ -14383,8 +14608,6 @@ pub struct MachineSample {
     #[serde(default)]
     pub memory_admission: StallInstrumentHealth,
     #[serde(default)]
-    pub disk_write_admission: StallInstrumentHealth,
-    #[serde(default)]
     pub disk_write_arms: DiskWriteArms,
     /// What each executing command attempt and each resident process is using
     /// now, from the process-tree sampler's last window. A platform with no
@@ -14414,47 +14637,48 @@ impl MachineSample {
             gpus: report.host.gpus.clone(),
             cpu_admission: report.host.cpu_admission.clone(),
             memory_admission: report.host.memory_admission.clone(),
-            disk_write_admission: report.host.disk_write_admission.clone(),
             disk_write_arms: report.host.disk_write_arms.clone(),
             live_usage: Measurement::default(),
             pipe_health: report.host.pipe_health.clone(),
         }
     }
-
-    pub fn stall(&self, instrument: StallInstrument) -> &StallInstrumentHealth {
-        match instrument {
-            StallInstrument::Cpu => &self.cpu_admission,
-            StallInstrument::Memory => &self.memory_admission,
-            StallInstrument::DiskWrite => &self.disk_write_admission,
-        }
-    }
 }
 
 impl HostHealth {
-    /// One instrument of the host-stall brake.
-    pub fn stall(&self, instrument: StallInstrument) -> &StallInstrumentHealth {
+    /// One instrument of the host-stall brake. The build-volume write
+    /// instrument's verdict is derived from its arms on every read.
+    pub fn stall(&self, instrument: StallInstrument) -> StallInstrumentHealth {
         match instrument {
-            StallInstrument::Cpu => &self.cpu_admission,
-            StallInstrument::Memory => &self.memory_admission,
-            StallInstrument::DiskWrite => &self.disk_write_admission,
+            StallInstrument::Cpu => self.cpu_admission.clone(),
+            StallInstrument::Memory => self.memory_admission.clone(),
+            StallInstrument::DiskWrite => self.disk_write_arms.combined(),
         }
     }
 
-    pub fn stall_mut(&mut self, instrument: StallInstrument) -> &mut StallInstrumentHealth {
-        match instrument {
-            StallInstrument::Cpu => &mut self.cpu_admission,
-            StallInstrument::Memory => &mut self.memory_admission,
-            StallInstrument::DiskWrite => &mut self.disk_write_admission,
-        }
+    /// Every instrument that measured and has gone blind, classified against
+    /// the sampler ([`StallBlindness`]).
+    pub fn stall_blindness(&self, now_unix_ms: u64) -> Vec<StallBlindness> {
+        StallInstrument::ALL
+            .into_iter()
+            .filter_map(|instrument| {
+                StallBlindness::classify(
+                    instrument,
+                    &self.stall(instrument),
+                    &self.cpu_admission,
+                    now_unix_ms,
+                )
+            })
+            .collect()
     }
 
-    /// The first instrument that measured and has gone blind, with its age.
-    pub fn blind_stall_instrument(&self, now_unix_ms: u64) -> Option<(StallInstrument, u64)> {
-        StallInstrument::ALL.into_iter().find_map(|instrument| {
-            self.stall(instrument)
-                .blind_age_ms(now_unix_ms)
-                .map(|age| (instrument, age))
-        })
+    /// The first instrument blind because the sampler is, with its age. An
+    /// instrument that faulted under a current sampler is not here: it is not
+    /// a machine nobody can see into.
+    pub fn sampler_blind_instrument(&self, now_unix_ms: u64) -> Option<(StallInstrument, u64)> {
+        self.stall_blindness(now_unix_ms)
+            .into_iter()
+            .find(|blindness| blindness.holds())
+            .map(|blindness| (blindness.instrument(), blindness.age_ms()))
     }
 }
 
@@ -14589,17 +14813,22 @@ impl ExecutorSubstrateReport {
                 adopted = true;
             }
         }
-        // Instrument by instrument, each by its own stamp. `None` orders before
-        // every stamp, so an instrument that has never measured never displaces
-        // one that has.
-        for instrument in StallInstrument::ALL {
-            let candidate = sample.stall(instrument);
-            let current = host.stall_mut(instrument);
+        // Gauge by gauge, each by its own stamp: CPU, memory, and each
+        // build-volume write arm. `None` orders before every stamp, so a gauge
+        // that has never measured never displaces one that has. The arms ride
+        // every sample for the same reason CPU does: carried only on the
+        // report, they aged with the liveness beat and read blind half the
+        // time on a machine whose sampler never missed a tick.
+        for (current, candidate) in [
+            (&mut host.cpu_admission, &sample.cpu_admission),
+            (&mut host.memory_admission, &sample.memory_admission),
+        ] {
             if candidate.measured_at_unix_ms > current.measured_at_unix_ms {
                 *current = candidate.clone();
                 adopted = true;
             }
         }
+        adopted |= host.disk_write_arms.adopt_newer(&sample.disk_write_arms);
         adopted
     }
 }
@@ -18063,6 +18292,10 @@ pub enum AdmissionHoldEvidence {
         /// The device that instrument reads, when it holds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disk_write_device: Option<String>,
+        /// The arm that instrument holds on, with that arm's reading and
+        /// bars, when it holds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disk_write_arm: Option<DiskWriteArmHold>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         available_memory_bytes: Option<u64>,
         #[serde(default)]
@@ -18120,6 +18353,7 @@ impl AdmissionHoldEvidence {
                 memory_stalled,
                 disk_write_stalled,
                 disk_write_device,
+                disk_write_arm,
                 available_memory_bytes,
                 owed_memory_bytes,
                 memory_floor_bytes,
@@ -18148,10 +18382,13 @@ impl AdmissionHoldEvidence {
                     .then(|| "sustained CPU pressure".to_string())
                     .into_iter()
                     .chain(memory_stalled.then(|| "memory stall".to_string()))
-                    .chain(disk_write_stalled.then(|| match disk_write_device {
-                        Some(device) => format!("build volume write stall on {device}"),
-                        None => "build volume write stall".to_string(),
-                    }))
+                    .chain(
+                        disk_write_stalled.then(|| match (disk_write_arm, disk_write_device) {
+                            (Some(hold), device) => hold.describe(device.as_deref()),
+                            (None, Some(device)) => format!("build volume write stall on {device}"),
+                            (None, None) => "build volume write stall".to_string(),
+                        }),
+                    )
                     .chain(memory)
                     .collect();
                 format!("held: {}", parts.join(", "))
@@ -21480,7 +21717,7 @@ pub enum ExecutorMessage {
     /// sampler without a fleet snapshot.
     ///
     /// This is what keeps the runner's view of the CPU brake inside
-    /// [`CPU_ADMISSION_BLIND_AFTER_MS`]: the beat is thirty seconds apart and
+    /// [`MACHINE_SAMPLE_BLIND_AFTER_MS`]: the beat is thirty seconds apart and
     /// the brake goes blind at fifteen, so the brake's own cadence has to carry
     /// it. It used to ride a whole snapshot every sample, which took pool state
     /// first and so could wait as long as the slowest `fsync` beneath it.
@@ -24496,12 +24733,6 @@ mod tests {
                 state_since_unix_ms: Some(3),
                 measured_at_unix_ms: Some(4),
             },
-            disk_write_admission: StallInstrumentHealth {
-                state: StallInstrumentState::Pressured,
-                reading: Some(0.102),
-                state_since_unix_ms: Some(3),
-                measured_at_unix_ms: Some(4),
-            },
             disk_write_arms: DiskWriteArms {
                 stall: StallInstrumentHealth {
                     state: StallInstrumentState::Pressured,
@@ -26592,6 +26823,21 @@ mod tests {
         let combined = combine_disk_write_arms(&accepting, &unknown);
         assert_eq!(combined.state, StallInstrumentState::Accepting);
         assert_eq!(combined.measured_at_unix_ms, Some(50));
+
+        // The arm a hold is named for: the freshest pressured one, the stall
+        // arm on a tie.
+        let mut arms = DiskWriteArms {
+            stall: at(StallInstrumentState::Pressured, 20, 40),
+            latency: at(StallInstrumentState::Pressured, 20, 45),
+            last_pressured_unix_ms: None,
+        };
+        assert_eq!(arms.pressured_arm(), Some(DiskWriteArm::Latency));
+        arms.latency.measured_at_unix_ms = Some(40);
+        assert_eq!(arms.pressured_arm(), Some(DiskWriteArm::Stall));
+        arms.stall.state = StallInstrumentState::Accepting;
+        assert_eq!(arms.pressured_arm(), Some(DiskWriteArm::Latency));
+        arms.latency.state = StallInstrumentState::Accepting;
+        assert_eq!(arms.pressured_arm(), None);
         assert!(StallInstrument::DiskWrite.holds_class(CellCommandClass::CargoTest));
         assert!(!StallInstrument::DiskWrite.holds_class(CellCommandClass::Vitest));
         assert!(StallInstrument::Memory.holds_class(CellCommandClass::Vitest));
@@ -26692,22 +26938,139 @@ mod tests {
             state_since_unix_ms: Some(0),
             measured_at_unix_ms: Some(10_000),
         };
-        let at_bound = 10_000 + CPU_ADMISSION_BLIND_AFTER_MS;
+        let at_bound = 10_000 + MACHINE_SAMPLE_BLIND_AFTER_MS;
         assert!(pressured.holds(at_bound));
         assert_eq!(pressured.blind_age_ms(at_bound), None);
         assert!(!pressured.holds(at_bound + 1));
         assert_eq!(
             pressured.blind_age_ms(at_bound + 1),
-            Some(CPU_ADMISSION_BLIND_AFTER_MS + 1)
+            Some(MACHINE_SAMPLE_BLIND_AFTER_MS + 1)
         );
         let host = HostHealth {
             memory_admission: pressured,
             ..HostHealth::default()
         };
         assert_eq!(
-            host.blind_stall_instrument(at_bound + 1),
-            Some((StallInstrument::Memory, CPU_ADMISSION_BLIND_AFTER_MS + 1))
+            host.sampler_blind_instrument(at_bound + 1),
+            Some((StallInstrument::Memory, MACHINE_SAMPLE_BLIND_AFTER_MS + 1)),
+            "a CPU gauge that never measured cannot vouch for the sampler"
         );
+    }
+
+    /// Every gauge is fed on one sampler tick, so the bound is three of its
+    /// intervals for all of them.
+    #[test]
+    fn the_blindness_bound_is_three_machine_sampler_ticks() {
+        assert_eq!(
+            MACHINE_SAMPLE_BLIND_AFTER_MS,
+            3 * MACHINE_SAMPLE_INTERVAL_MS
+        );
+    }
+
+    /// A gauge blind while CPU is fresh is that instrument's fault and holds
+    /// nothing; CPU blind makes every blind gauge the sampler's; a CPU gauge
+    /// that never measured leaves blindness the sampler's, as before.
+    #[test]
+    fn stall_blindness_is_the_samplers_only_when_cpu_is_blind_too() {
+        let now = 100_000;
+        let at = |measured_at| StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.5),
+            state_since_unix_ms: Some(0),
+            measured_at_unix_ms: Some(measured_at),
+        };
+        let stale = now - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
+        let mut host = HostHealth {
+            cpu_admission: StallInstrumentHealth {
+                state: StallInstrumentState::Accepting,
+                ..at(now - 2_000)
+            },
+            disk_write_arms: DiskWriteArms {
+                stall: at(stale),
+                latency: at(stale),
+                last_pressured_unix_ms: None,
+            },
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            host.stall_blindness(now),
+            [StallBlindness::InstrumentFault {
+                instrument: StallInstrument::DiskWrite,
+                age_ms: MACHINE_SAMPLE_BLIND_AFTER_MS + 1,
+                sampler_age_ms: 2_000,
+            }]
+        );
+        assert_eq!(host.sampler_blind_instrument(now), None);
+        assert!(
+            !host.stall(StallInstrument::DiskWrite).holds(now),
+            "a faulted pressured verdict holds nothing"
+        );
+
+        host.cpu_admission.measured_at_unix_ms = Some(stale);
+        let blindness = host.stall_blindness(now);
+        assert_eq!(blindness.len(), 2);
+        assert!(blindness.iter().all(|blindness| blindness.holds()));
+        assert_eq!(
+            host.sampler_blind_instrument(now),
+            Some((StallInstrument::Cpu, MACHINE_SAMPLE_BLIND_AFTER_MS + 1))
+        );
+
+        host.cpu_admission = StallInstrumentHealth::default();
+        assert_eq!(
+            host.sampler_blind_instrument(now),
+            Some((
+                StallInstrument::DiskWrite,
+                MACHINE_SAMPLE_BLIND_AFTER_MS + 1
+            ))
+        );
+    }
+
+    /// The arms ride every sample and are adopted arm by arm, each by its own
+    /// stamp; the instrument's verdict is derived from whatever was adopted.
+    /// Carried only on the liveness report, the arms aged with the beat and
+    /// read blind half the time on machines whose sampler never missed a
+    /// tick (cairn/6936).
+    #[test]
+    fn a_sample_freshens_each_disk_write_arm_by_its_own_stamp() {
+        let arm = |state, measured_at| StallInstrumentHealth {
+            state,
+            reading: Some(0.01),
+            state_since_unix_ms: Some(1),
+            measured_at_unix_ms: Some(measured_at),
+        };
+        let mut report = ExecutorSubstrateReport::default();
+        report.host.disk_write_arms = DiskWriteArms {
+            stall: arm(StallInstrumentState::Accepting, 10_000),
+            latency: arm(StallInstrumentState::Accepting, 30_000),
+            last_pressured_unix_ms: Some(5),
+        };
+        let mut sample = MachineSample::of_report(&report);
+        sample.disk_write_arms = DiskWriteArms {
+            stall: arm(StallInstrumentState::Pressured, 25_000),
+            latency: arm(StallInstrumentState::Accepting, 20_000),
+            last_pressured_unix_ms: Some(25_000),
+        };
+        assert!(report.adopt_newer_readings(&sample));
+        let arms = &report.host.disk_write_arms;
+        assert_eq!(
+            arms.stall, sample.disk_write_arms.stall,
+            "the newer arm is taken"
+        );
+        assert_eq!(
+            arms.latency.measured_at_unix_ms,
+            Some(30_000),
+            "an older arm never displaces a newer one"
+        );
+        assert_eq!(arms.last_pressured_unix_ms, Some(25_000));
+        assert_eq!(
+            report.host.stall(StallInstrument::DiskWrite),
+            combine_disk_write_arms(&arms.stall, &arms.latency)
+        );
+        assert_eq!(
+            report.host.stall(StallInstrument::DiskWrite).state,
+            StallInstrumentState::Pressured
+        );
+        assert!(!report.adopt_newer_readings(&sample), "nothing newer twice");
     }
 
     #[test]
@@ -26819,7 +27182,7 @@ mod tests {
         let host: HostHealth = serde_json::from_value(older).unwrap();
         assert_eq!(host.cpu_admission.state, StallInstrumentState::Accepting);
         assert_eq!(host.memory_admission, StallInstrumentHealth::default());
-        assert_eq!(host.blind_stall_instrument(5), None);
+        assert_eq!(host.sampler_blind_instrument(5), None);
     }
 
     #[test]

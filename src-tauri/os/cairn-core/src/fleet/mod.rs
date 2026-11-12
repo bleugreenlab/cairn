@@ -52,7 +52,7 @@ use cairn_common::executor_protocol::MachineSample;
 use cairn_common::executor_protocol::SandboxCapabilityEvidence;
 use cairn_common::executor_protocol::StallInstrumentState;
 #[cfg(test)]
-use cairn_common::executor_protocol::CPU_ADMISSION_BLIND_AFTER_MS;
+use cairn_common::executor_protocol::MACHINE_SAMPLE_BLIND_AFTER_MS;
 use cairn_common::executor_protocol::{
     aged_priority, CacheWarmthEvidence, CellAdmissionKind, CellCheckoutKind, CellCommandClass,
     CellResidency, ContentionEstimate, DeclineReason, DurationEstimate, DurationFallback,
@@ -19094,17 +19094,19 @@ impl<'a> ScoredCandidate<'a> {
         // blind — left a ten-second gap where a machine ranked as neither
         // pressured nor blind, which is to say as idle.
         //
-        // A machine where any host-stall instrument measured and stopped is not
-        // a machine with headroom, and ranking it as one is how work keeps
-        // arriving at a host nobody can see into. Derived from each reading's
-        // age rather than from any state the executor sent, because the
-        // executor could only set such a state from the sampler whose silence
-        // is the condition itself. An instrument that never measured is not
-        // blind: that is a platform without the probe, and it fails open.
+        // A machine whose sampler measured and stopped is not a machine with
+        // headroom, and ranking it as one is how work keeps arriving at a
+        // host nobody can see into. Derived from each reading's age rather
+        // than from any state the executor sent, because the executor could
+        // only set such a state from the sampler whose silence is the
+        // condition itself. An instrument that never measured is not blind:
+        // that is a platform without the probe, and it fails open. Nor is one
+        // that stopped while the sampler's CPU reading stayed current: that is
+        // a broken probe on a visible machine, and it fails open the same way.
         let stall_blind = entry
             .health
             .host
-            .blind_stall_instrument(now_unix_ms)
+            .sampler_blind_instrument(now_unix_ms)
             .is_some();
         let cpu_headroom_risk = (cpu_admission.fresh(now_unix_ms)
             && cpu_admission.state == StallInstrumentState::Accepting)
@@ -33227,7 +33229,7 @@ mod tests {
             48 * 1024 * 1024 * 1024,
             900 * 1024 * 1024 * 1024,
         );
-        let went_quiet = NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1;
+        let went_quiet = NOW - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
         Arc::make_mut(&mut remote.health).host.cpu_admission =
             cairn_common::executor_protocol::StallInstrumentHealth {
                 state: StallInstrumentState::Accepting,
@@ -33247,6 +33249,21 @@ mod tests {
             .host
             .cpu_admission
             .state_since_unix_ms = Some(NOW);
+        // A broken write instrument on that sampling remote is not a blind
+        // machine: its CPU reading proves the sampler current, so it ranks on
+        // its numbers as the control does.
+        let mut faulted = seeing.clone();
+        Arc::make_mut(&mut faulted.health).host.disk_write_arms =
+            cairn_common::executor_protocol::DiskWriteArms {
+                stall: cairn_common::executor_protocol::StallInstrumentHealth {
+                    state: StallInstrumentState::Pressured,
+                    reading: Some(0.3),
+                    state_since_unix_ms: Some(went_quiet),
+                    measured_at_unix_ms: Some(went_quiet),
+                },
+                latency: cairn_common::executor_protocol::StallInstrumentHealth::default(),
+                last_pressured_unix_ms: Some(went_quiet),
+            };
         let control = HashMap::from([
             (local_id.clone(), local.clone()),
             (remote_id.clone(), seeing),
@@ -33255,6 +33272,15 @@ mod tests {
             chosen(&place(&control, &spillable_request()).unwrap()).executor_id,
             remote_id,
             "control: a sampling remote with better numbers should win"
+        );
+        let faulted = HashMap::from([
+            (local_id.clone(), local.clone()),
+            (remote_id.clone(), faulted),
+        ]);
+        assert_eq!(
+            chosen(&place(&faulted, &spillable_request()).unwrap()).executor_id,
+            remote_id,
+            "an instrument faulted under a current sampler must not rank its machine as blind"
         );
 
         let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
@@ -33289,6 +33315,14 @@ mod tests {
             let (executor_id, mut connection) = fleet_entry(id, "linux", 0, &[]);
             measured_at(&mut connection, 0.2, 48 * gib, 900 * gib, pass_measured_at);
             Arc::make_mut(&mut connection.health).host.cpu_admission = brake(pass_measured_at);
+            Arc::make_mut(&mut connection.health)
+                .host
+                .disk_write_arms
+                .stall = brake(pass_measured_at);
+            Arc::make_mut(&mut connection.health)
+                .host
+                .disk_write_arms
+                .latency = brake(pass_measured_at);
             stuck_pass.insert(id, (*connection.health).clone());
             pool.lock_connections().insert(executor_id, connection);
         }
@@ -33298,6 +33332,8 @@ mod tests {
             fresh.machine.memory.measured_at_unix_ms = measured_at_unix_ms;
             fresh.machine.volume.measured_at_unix_ms = measured_at_unix_ms;
             fresh.host.cpu_admission = brake(measured_at_unix_ms);
+            fresh.host.disk_write_arms.stall = brake(measured_at_unix_ms);
+            fresh.host.disk_write_arms.latency = brake(measured_at_unix_ms);
             MachineSample::of_report(&fresh)
         };
         let beat = |id: &str, machine: Option<MachineSample>| {
@@ -33356,6 +33392,16 @@ mod tests {
         assert_eq!(fedora.machine.memory.measured_at_unix_ms, NOW);
         assert_eq!(fedora.machine.volume.measured_at_unix_ms, NOW);
         assert_eq!(fedora.host.cpu_admission.measured_at_unix_ms, Some(NOW));
+        // The write arms ride the same sample as the CPU brake, so they are
+        // exactly as fresh; on the report alone they aged with the beat.
+        assert_eq!(
+            fedora.host.disk_write_arms.stall.measured_at_unix_ms,
+            Some(NOW)
+        );
+        assert_eq!(
+            fedora.host.disk_write_arms.latency.measured_at_unix_ms,
+            Some(NOW)
+        );
         assert_eq!(
             *connections["bbs"].health, stuck_pass["bbs"],
             "an executor that sends no sample is held to exactly what it posted"

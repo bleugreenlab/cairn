@@ -28,9 +28,9 @@ use std::borrow::Cow;
 
 use cairn_common::executor_protocol::{
     admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence,
-    CellPriority, CellRequest, DeclineReason, DiskHealthStatus, ExecutorSubstrateReport,
-    FleetSnapshot, ProvisioningHold, RepositoryLocator, ResidencyFence, StallInstrument,
-    StallInstrumentState, StoragePressureOutcome, StorageSweepStatus,
+    CellPriority, CellRequest, DeclineReason, DiskHealthStatus, DiskWriteArmHold,
+    ExecutorSubstrateReport, FleetSnapshot, ProvisioningHold, RepositoryLocator, ResidencyFence,
+    StallInstrument, StallInstrumentState, StoragePressureOutcome, StorageSweepStatus,
 };
 
 /// How the executor will judge one piece of work: the facts the offer carries
@@ -155,6 +155,7 @@ pub(crate) fn posted_hold(
                 memory_stalled,
                 disk_write_stalled,
                 disk_write_device,
+                disk_write_arm,
                 available_memory_bytes,
                 owed_memory_bytes,
                 memory_floor_bytes,
@@ -164,9 +165,13 @@ pub(crate) fn posted_hold(
             };
             *cpu_pressured &= health.host.cpu_admission.fresh(now_unix_ms);
             *memory_stalled &= health.host.memory_admission.fresh(now_unix_ms);
-            *disk_write_stalled &= health.host.disk_write_admission.fresh(now_unix_ms);
+            *disk_write_stalled &= health
+                .host
+                .stall(StallInstrument::DiskWrite)
+                .fresh(now_unix_ms);
             if !*disk_write_stalled {
                 *disk_write_device = None;
+                *disk_write_arm = None;
             }
             let short = available_memory_bytes.is_some_and(|available| {
                 memory_short(available, *owed_memory_bytes, *memory_floor_bytes)
@@ -341,7 +346,7 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
     // instrument, by the class the queue gave the request, which is the class
     // the offer carries to it.
     let disk_write_stalled = StallInstrument::DiskWrite.holds_class(request.command_class)
-        && health.host.disk_write_admission.state == StallInstrumentState::Pressured;
+        && health.host.stall(StallInstrument::DiskWrite).state == StallInstrumentState::Pressured;
     let floor = admission_memory_floor(request.resource_reservation.memory_bytes);
     let owed = owed_memory_bytes(machine);
     let available = health
@@ -369,6 +374,9 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
                         .as_ref()
                         .map(|device| device.name.clone())
                 })
+                .flatten(),
+            disk_write_arm: disk_write_stalled
+                .then(|| DiskWriteArmHold::of(&health.host.disk_write_arms, &health.applied_policy))
                 .flatten(),
             available_memory_bytes: available,
             owed_memory_bytes: owed,
@@ -517,7 +525,7 @@ mod tests {
     use cairn_common::executor_protocol::{
         ExecutingCellRequest, LiveUsageSample, MachineMemory, MachineVolume, Measurement,
         MeasurementQuality, ProvisioningHold, ResourceReservation, StallInstrumentHealth,
-        CPU_ADMISSION_BLIND_AFTER_MS,
+        MACHINE_SAMPLE_BLIND_AFTER_MS,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -972,7 +980,7 @@ mod tests {
         };
         assert_eq!(hold(&interactive, &request, &snapshot, &machine), None);
         machine.host.cpu_admission.measured_at_unix_ms =
-            Some(NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+            Some(NOW - MACHINE_SAMPLE_BLIND_AFTER_MS - 1);
         assert_eq!(hold(&batch, &request, &snapshot, &machine), None);
     }
 
@@ -1122,7 +1130,7 @@ mod tests {
         };
         assert_eq!(hold(&interactive, &request, &snapshot, &machine), None);
         machine.host.memory_admission.measured_at_unix_ms =
-            Some(NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+            Some(NOW - MACHINE_SAMPLE_BLIND_AFTER_MS - 1);
         assert_eq!(hold(&batch, &request, &snapshot, &machine), None);
     }
 
@@ -1130,7 +1138,7 @@ mod tests {
         mut health: ExecutorSubstrateReport,
         state: StallInstrumentState,
     ) -> ExecutorSubstrateReport {
-        health.host.disk_write_admission = StallInstrumentHealth {
+        health.host.disk_write_arms.stall = StallInstrumentHealth {
             state,
             measured_at_unix_ms: Some(NOW),
             ..StallInstrumentHealth::default()
@@ -1168,7 +1176,23 @@ mod tests {
         ));
         assert_eq!(
             held.evidence.describe_at(NOW),
-            "held: build volume write stall on nvme0n1"
+            "held: build volume write stall on nvme0n1 (write stall arm: entry 8.0%, clear 3.0%)"
+        );
+
+        // Held on the latency arm, the hold names that arm and quotes its
+        // reading and bars, not the stall arm's.
+        let mut latency = machine.clone();
+        latency.host.disk_write_arms.stall.state = StallInstrumentState::Accepting;
+        latency.host.disk_write_arms.latency = StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(48.4),
+            state_since_unix_ms: Some(NOW - 130_000),
+            measured_at_unix_ms: Some(NOW),
+        };
+        let held = hold(&batch, &compile, &snapshot, &latency).expect("the latency arm holds");
+        assert_eq!(
+            held.evidence.describe_at(NOW),
+            "held: build volume write latency 48 ms mean on nvme0n1 (write latency arm: entry 40 ms, clear 15 ms)"
         );
         assert_eq!(
             condition(DeclineReason::Pressure, &compile, &snapshot, &machine),
@@ -1208,8 +1232,8 @@ mod tests {
             ..batch.clone()
         };
         assert_eq!(hold(&interactive, &compile, &snapshot, &machine), None);
-        machine.host.disk_write_admission.measured_at_unix_ms =
-            Some(NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+        machine.host.disk_write_arms.stall.measured_at_unix_ms =
+            Some(NOW - MACHINE_SAMPLE_BLIND_AFTER_MS - 1);
         assert_eq!(hold(&batch, &compile, &snapshot, &machine), None);
     }
 
@@ -1304,6 +1328,7 @@ mod tests {
             held.evidence,
             AdmissionHoldEvidence::Pressure {
                 disk_write_device: None,
+                disk_write_arm: None,
                 disk_write_stalled: false,
                 cpu_pressured: false,
                 memory_stalled: false,

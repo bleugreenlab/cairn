@@ -198,9 +198,9 @@ pub(crate) fn render_listener_identity(listener: Option<&ExecutorListenerAdverti
 use cairn_common::executor_protocol::{
     AllocatorState, BuildPrerequisiteStatus, EnrolledRemote, ExecutorCapabilities,
     ExecutorListenerAdvertisement, GenerationEndMemory, RemoteArtifactFault, RemoteAttachAttempt,
-    RemoteConnectionPhase, RemoteConnectionTransition, RemoteLinkState, StallInstrument,
-    StallInstrumentHealth, StallInstrumentPolicy, StallInstrumentState, UpdateReport, UpdateState,
-    CPU_ADMISSION_BLIND_AFTER_MS, MACHINE_READING_STALE_AFTER_MS,
+    RemoteConnectionPhase, RemoteConnectionTransition, RemoteLinkState, StallBlindness,
+    StallInstrument, StallInstrumentHealth, StallInstrumentPolicy, StallInstrumentState,
+    UpdateReport, UpdateState, MACHINE_READING_STALE_AFTER_MS, MACHINE_SAMPLE_BLIND_AFTER_MS,
 };
 
 use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
@@ -1762,9 +1762,16 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
                 } else {
                     StallGauge::Memory
                 };
+                let reading = health.host.stall(instrument);
                 stall_brake_summary(
                     gauge,
-                    health.host.stall(instrument),
+                    &reading,
+                    StallBlindness::classify(
+                        instrument,
+                        &reading,
+                        &health.host.cpu_admission,
+                        executor.captured_at_unix_ms,
+                    ),
                     health.applied_policy.stall_policy(gauge),
                     executor.captured_at_unix_ms,
                 )
@@ -2569,7 +2576,11 @@ fn write_saturation_recommendation(
         text: format!(
             "the build volume {} {} write-saturated{fullness}{load}. Consumer drives with a shrinking SLC cache (QLC) collapse like this near full: keep this volume under about 80% full, or move the build root to a TLC or enterprise device.",
             device_name(device),
-            if health.host.disk_write_admission.holds(captured) {
+            if health
+                .host
+                .stall(StallInstrument::DiskWrite)
+                .holds(captured)
+            {
                 "is"
             } else {
                 "was recently"
@@ -3984,10 +3995,13 @@ fn allocator_split(state: &AllocatorState) -> String {
 /// Blindness is judged against the clock here, not read off the reported state,
 /// for the same reason the executor judges it that way: the state only advances
 /// when the sampler runs, and a sampler that has stopped cannot report that it
-/// stopped.
+/// stopped. `blindness` is that judgement, made by the caller with
+/// [`StallBlindness::classify`] so every line on the page uses the one rule
+/// admission does.
 fn stall_brake_summary(
     gauge: StallGauge,
     health: &StallInstrumentHealth,
+    blindness: Option<StallBlindness>,
     policy: StallInstrumentPolicy,
     captured_at_unix_ms: u64,
 ) -> String {
@@ -4005,12 +4019,27 @@ fn stall_brake_summary(
         };
     };
     let age_ms = captured_at_unix_ms.saturating_sub(measured_at);
-    if age_ms > CPU_ADMISSION_BLIND_AFTER_MS {
-        return format!(
-            "BLIND — last reading {}, past the {}s bound; {held} admission is held",
-            age(age_ms),
-            CPU_ADMISSION_BLIND_AFTER_MS / 1_000
-        );
+    match blindness {
+        Some(StallBlindness::SamplerBlind { age_ms, .. }) => {
+            return format!(
+                "BLIND — last reading {}, past the {}s bound; {held} admission is held",
+                age(age_ms),
+                MACHINE_SAMPLE_BLIND_AFTER_MS / 1_000
+            );
+        }
+        Some(StallBlindness::InstrumentFault {
+            age_ms,
+            sampler_age_ms,
+            ..
+        }) => {
+            return format!(
+                "FAULT — last reading {}, past the {}s bound, while the machine sampler is current (CPU measured {}); this instrument is broken, not the machine, and does not hold admission",
+                age(age_ms),
+                MACHINE_SAMPLE_BLIND_AFTER_MS / 1_000,
+                age(sampler_age_ms)
+            );
+        }
+        None => {}
     }
     let percent = |value: f64| match gauge {
         // A stall share is small where it matters, so it keeps a decimal.
@@ -4062,44 +4091,94 @@ fn stall_brake_summary(
     }
 }
 
-/// The build-volume write instrument: its combined verdict, then each arm
-/// against its own bars, so a reader sees which arm tripped and what the
-/// other one reads.
+/// The build-volume write instrument: its verdict, then each arm against its
+/// own bars, so a reader sees which arm tripped and what the other one reads.
+///
+/// The headline and the arm lines are one rendering of one state: the verdict
+/// is derived from the arms shown beneath it, and both are classified by the
+/// same blindness rule at the same instant, so no arm line can say admission
+/// is held under a headline that says it is accepting.
 fn disk_write_brake_summary(
     host: &HostHealth,
     policy: &ExecutorRuntimePolicy,
     captured_at_unix_ms: u64,
 ) -> String {
-    let arm = |arm: DiskWriteArm| {
-        let health = match arm {
-            DiskWriteArm::Stall => &host.disk_write_arms.stall,
-            DiskWriteArm::Latency => &host.disk_write_arms.latency,
-        };
+    let arms = &host.disk_write_arms;
+    let classify = |health: &StallInstrumentHealth| {
+        StallBlindness::classify(
+            StallInstrument::DiskWrite,
+            health,
+            &host.cpu_admission,
+            captured_at_unix_ms,
+        )
+    };
+    // Whether the instrument holds is decided once, by the classification
+    // admission and placement use, on the verdict derived from the arms. An
+    // arm's own staleness only describes that arm: while its sibling reads,
+    // the instrument still sees and the stopped arm holds nothing.
+    let instrument = host
+        .stall_blindness(captured_at_unix_ms)
+        .into_iter()
+        .find(|blindness| blindness.instrument() == StallInstrument::DiskWrite);
+    let instrument_sampler_blind = instrument.is_some_and(StallBlindness::holds);
+    let arm_line = |arm: DiskWriteArm| {
         let gauge = StallGauge::DiskWrite(arm);
+        let blindness = classify(arms.arm(arm));
+        if let Some(StallBlindness::SamplerBlind { age_ms, .. }) = blindness {
+            if !instrument_sampler_blind {
+                return format!(
+                    "BLIND — last reading {}, past the {}s bound; the other arm is current, so this arm holds nothing",
+                    age(age_ms),
+                    MACHINE_SAMPLE_BLIND_AFTER_MS / 1_000
+                );
+            }
+        }
         stall_brake_summary(
             gauge,
-            health,
+            arms.arm(arm),
+            blindness,
             policy.stall_policy(gauge),
             captured_at_unix_ms,
         )
     };
-    let combined = &host.disk_write_admission;
-    let head = match combined.state {
-        StallInstrumentState::Unknown => {
-            "never measured on this machine (no build device resolved, or no PSI) — the brake cannot engage"
-                .to_string()
-        }
-        StallInstrumentState::Pressured if combined.fresh(captured_at_unix_ms) => {
-            "pressured — holding new compile-class work; spill-eligible work places elsewhere"
-                .to_string()
-        }
-        StallInstrumentState::Pressured => "pressured on a stale reading".to_string(),
-        StallInstrumentState::Accepting => "accepting".to_string(),
+    let combined = arms.combined();
+    let measured_arms: Vec<DiskWriteArm> = DiskWriteArm::ALL
+        .into_iter()
+        .filter(|arm| arms.arm(*arm).state != StallInstrumentState::Unknown)
+        .collect();
+    let stopped_arms: Vec<&str> = measured_arms
+        .iter()
+        .filter(|arm| classify(arms.arm(**arm)).is_some())
+        .map(|arm| arm.label())
+        .collect();
+    let head = if combined.state == StallInstrumentState::Unknown {
+        "never measured on this machine (no build device resolved, or no PSI) — the brake cannot engage"
+            .to_string()
+    } else if instrument_sampler_blind {
+        "BLIND — the machine sampler has stopped; compile-class admission is held".to_string()
+    } else if instrument.is_some() && stopped_arms.len() == measured_arms.len() {
+        "instrument fault — not holding; it stopped reading while the machine sampler is current"
+            .to_string()
+    } else if combined.holds(captured_at_unix_ms) {
+        let tripped = arms
+            .pressured_arm()
+            .map(|arm| format!(" ({} arm)", arm.label()))
+            .unwrap_or_default();
+        format!(
+            "pressured{tripped} — holding new compile-class work; spill-eligible work places elsewhere"
+        )
+    } else if stopped_arms.is_empty() {
+        "accepting".to_string()
+    } else {
+        format!(
+            "accepting ({} arm stopped reading — not holding)",
+            stopped_arms.join(" and ")
+        )
     };
     format!(
         "{head}\n  - Write stall arm: {}\n  - Write latency arm: {}",
-        arm(DiskWriteArm::Stall),
-        arm(DiskWriteArm::Latency)
+        arm_line(DiskWriteArm::Stall),
+        arm_line(DiskWriteArm::Latency)
     )
 }
 
@@ -9078,7 +9157,7 @@ mod tests {
     #[test]
     fn the_admission_section_says_when_the_cpu_brake_has_gone_blind() {
         let mut executor = inspection("blind", false);
-        let went_quiet = executor.captured_at_unix_ms - CPU_ADMISSION_BLIND_AFTER_MS - 1;
+        let went_quiet = executor.captured_at_unix_ms - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
         executor.health.host.cpu_admission = StallInstrumentHealth {
             state: StallInstrumentState::Accepting,
             reading: Some(0.99),
@@ -9165,9 +9244,135 @@ mod tests {
         );
 
         executor.health.host.memory_admission.measured_at_unix_ms =
-            Some(now - CPU_ADMISSION_BLIND_AFTER_MS - 1);
+            Some(now - MACHINE_SAMPLE_BLIND_AFTER_MS - 1);
         let rendered = render_executor(&executor);
         assert!(rendered.contains("Memory brake: BLIND"), "{rendered}");
+
+        // The same silence beside a current CPU reading is a broken probe.
+        executor.health.host.cpu_admission = StallInstrumentHealth {
+            state: StallInstrumentState::Accepting,
+            reading: Some(0.2),
+            state_since_unix_ms: Some(now - 60_000),
+            measured_at_unix_ms: Some(now - 1_000),
+        };
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Memory brake: FAULT"), "{rendered}");
+        assert!(
+            rendered.contains("(CPU measured 1s ago); this instrument is broken, not the machine, and does not hold admission"),
+            "{rendered}"
+        );
+    }
+
+    /// The write brake's headline is derived from the arms beneath it and
+    /// classified by the same rule at the same instant, so the two can never
+    /// disagree; a pressured headline names the arm that holds it.
+    #[test]
+    fn the_write_brake_headline_and_arms_render_one_state() {
+        let mut executor = inspection("arms", false);
+        let now = executor.captured_at_unix_ms;
+        let stale = now - MACHINE_SAMPLE_BLIND_AFTER_MS - 1;
+        let reading = |state, value, measured_at| StallInstrumentHealth {
+            state,
+            reading: Some(value),
+            state_since_unix_ms: Some(now - 200_000),
+            measured_at_unix_ms: Some(measured_at),
+        };
+        let host = &mut executor.health.host;
+        host.cpu_admission = reading(StallInstrumentState::Accepting, 0.1, now - 1_000);
+        host.disk_write_arms.stall = reading(StallInstrumentState::Accepting, 0.0, now - 2_000);
+        host.disk_write_arms.latency = reading(StallInstrumentState::Accepting, 3.0, now - 2_000);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Build volume write brake: accepting\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("BLIND"), "{rendered}");
+        assert!(!rendered.contains("FAULT"), "{rendered}");
+
+        executor.health.host.disk_write_arms.latency =
+            reading(StallInstrumentState::Pressured, 60.0, now - 2_000);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Build volume write brake: pressured (write latency arm) — holding new compile-class work"),
+            "{rendered}"
+        );
+
+        // One arm stopped under a current sampler: still accepting, and it
+        // says which arm is broken.
+        executor.health.host.disk_write_arms.latency =
+            reading(StallInstrumentState::Pressured, 60.0, stale);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "Build volume write brake: accepting (write latency arm stopped reading — not holding)"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Write latency arm: FAULT"), "{rendered}");
+
+        // Both stopped: the instrument is faulted, and nothing says held.
+        executor.health.host.disk_write_arms.stall =
+            reading(StallInstrumentState::Accepting, 0.0, stale);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Build volume write brake: instrument fault — not holding"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Write stall arm: FAULT"), "{rendered}");
+        assert!(!rendered.contains("admission is held"), "{rendered}");
+
+        // The sampler itself stopped: blind on the headline and both arms.
+        executor.health.host.cpu_admission.measured_at_unix_ms = Some(stale);
+        let rendered = render_executor(&executor);
+        for expected in [
+            "CPU brake: BLIND",
+            "Build volume write brake: BLIND",
+            "Write stall arm: BLIND",
+            "Write latency arm: BLIND",
+        ] {
+            assert!(rendered.contains(expected), "{expected}: {rendered}");
+        }
+        assert!(!rendered.contains("FAULT"), "{rendered}");
+
+        // Mixed-age accepting arms: the instrument still reads through its
+        // fresh arm, so admission holds nothing on it, and the page must not
+        // say otherwise, whether CPU never measured or is itself blind.
+        executor.health.host.disk_write_arms.stall =
+            reading(StallInstrumentState::Accepting, 0.0, now - 20_000);
+        executor.health.host.disk_write_arms.latency =
+            reading(StallInstrumentState::Accepting, 3.0, now - 1_000);
+        for cpu in [StallInstrumentHealth::default(), {
+            let mut blind = executor.health.host.cpu_admission.clone();
+            blind.measured_at_unix_ms = Some(stale);
+            blind
+        }] {
+            executor.health.host.cpu_admission = cpu;
+            assert_eq!(
+                executor
+                    .health
+                    .host
+                    .sampler_blind_instrument(now)
+                    .map(|(instrument, _)| instrument)
+                    .filter(|instrument| *instrument == StallInstrument::DiskWrite),
+                None,
+                "placement holds nothing on the write instrument here"
+            );
+            let rendered = render_executor(&executor);
+            assert!(
+                rendered.contains(
+                    "Build volume write brake: accepting (write stall arm stopped reading — not holding)"
+                ),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("Write stall arm: BLIND — last reading 20s ago, past the 15s bound; the other arm is current, so this arm holds nothing"),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains("compile-class admission is held"),
+                "{rendered}"
+            );
+        }
     }
 
     /// What admitted work still owes is shown with who owes it, so a memory

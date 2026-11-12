@@ -5,9 +5,7 @@
 
 use crate::agent_process::process::{AgentProcessState, RunnerMemoryObserver};
 use crate::services::EventEmitter;
-use cairn_common::executor_protocol::{
-    Measurement, MeasurementGap, CPU_ADMISSION_SAMPLE_INTERVAL_MS,
-};
+use cairn_common::executor_protocol::{Measurement, MeasurementGap, MACHINE_SAMPLE_INTERVAL_MS};
 use cairn_common::process_identity::ProcessAnchor;
 use cairn_procmem::{
     BatchObserver, ProcessTreeSampler, SamplingStatus, TickBatch, TickClocks, WatchId,
@@ -18,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 pub const AGENT_MEMORY_SAMPLE_EVENT: &str = "agent-memory-sample";
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(CPU_ADMISSION_SAMPLE_INTERVAL_MS);
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(MACHINE_SAMPLE_INTERVAL_MS);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
