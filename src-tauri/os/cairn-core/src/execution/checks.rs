@@ -18081,6 +18081,7 @@ cairn-common = { path = "../cairn-common" }
                 | "uri-wasm"
                 | "rust-write-pins"
                 | "tls-sole-loader"
+                | "home-coverage"
                 | "plan-audit"
                 | "workspace-compile"
                 | "source-scans"

@@ -8230,6 +8230,20 @@ pub struct LearnedResourceEstimate {
 /// always had, and it reports no test phase, so the runner learns none from
 /// it. An older runner sends no `testPhase`, and a newer executor then keeps
 /// the whole-suite charge, fail-closed.
+///
+/// cairn/6761 does not move the number. The categorized walk now names what no
+/// retention rule reaches: [`DiskAccounting::unreclaimable`] (with
+/// `unreclaimableTruncated`) lists the home entries at or above the threshold
+/// that the home retention registry does not claim or leaves undecided, and
+/// [`DiskCategoryAccounting::former_build_root_bytes`] prices a former build
+/// root's cells and caches apart from the live ones. After a restart, before
+/// the first walk, [`MachineTelemetry::restored_holdings`] carries the last
+/// walk's names from the executor's storage state. All three are additive and
+/// defaulted, and nothing prices, places or admits on them: a peer that omits
+/// them reads as having named nothing, which gates nothing. What a runner gets
+/// wrong talking to an older executor: nothing it concludes about placement or
+/// admission; its page shows no unreclaimable block and the former root's
+/// bytes inside live cells, as before. An older runner ignores the fields.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -14884,6 +14898,74 @@ pub struct DiskAccounting {
     /// outside Cairn's accounting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_homes: Vec<RetiredHomeAccounting>,
+    /// Home entries holding bytes no retention rule reaches, largest first and
+    /// bounded: unclaimed by the home retention registry
+    /// (`home_retention::HOME_RETENTION`), or registered as undecided with the
+    /// issue that owes them a rule. A former build root is never one of these;
+    /// its bytes are [`DiskCategoryAccounting::former_build_root_bytes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreclaimable: Vec<UnreclaimableHolding>,
+    /// Holdings beyond the retained bound.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub unreclaimable_truncated: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+/// One home entry the categorized walk found holding bytes no rule reclaims.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreclaimableHolding {
+    /// Executor-home-relative: a top-level entry, or `entry/child` where the
+    /// registry's rule differs one level down.
+    pub path: String,
+    pub bytes: u64,
+    /// The newest modification time of any file under it, so a reader can
+    /// tell a live writer from an abandoned tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_modified_unix_ms: Option<u64>,
+    pub reason: UnreclaimableReason,
+    /// The registry's owning thread, as a label. Absent for an unclaimed entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The issue an undecided entry names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum UnreclaimableReason {
+    /// No registry entry claims it: nothing in Cairn says who writes it.
+    Unclaimed,
+    /// Registered, with no rule yet; the entry names the issue that owes one.
+    Undecided,
+}
+
+impl UnreclaimableReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unclaimed => "unclaimed",
+            Self::Undecided => "undecided",
+        }
+    }
+}
+
+/// The last completed walk's names, restored from the executor's storage
+/// state before this process's first walk has finished.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredHoldings {
+    /// When that walk finished.
+    pub measured_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_top: Vec<DiskPathUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreclaimable: Vec<UnreclaimableHolding>,
+    #[serde(default)]
+    pub former_build_root_bytes: u64,
 }
 
 /// One retired executor home as the storage ladder accounts it.
@@ -15350,6 +15432,10 @@ pub struct MachineTelemetry {
     /// volume. Present exactly when `build_volume` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_disk_accounting: Option<Measurement<DiskAccounting>>,
+    /// The last walk's named holdings, restored from storage state, while
+    /// `disk_accounting` has no walk of this process's yet. Display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_holdings: Option<RestoredHoldings>,
     /// The host's shared temp filesystem, when it is apart from the home's and
     /// the build root's volumes. `None` when it is one of them (macOS keeps it
     /// on the system volume), when the directory is not there, on a platform
@@ -16227,6 +16313,12 @@ pub struct DiskCategoryAccounting {
     /// Node scratch replicas: each node's `$TMPDIR` copy on this machine.
     #[serde(default)]
     pub node_scratch_bytes: u64,
+    /// A former build root's cells and caches: the home's own `build-slots/`,
+    /// `managed-objects/`, `dependency-catalog/` and `tool-cache/` while a
+    /// build root is configured apart from the home. No ladder rung reaches
+    /// them; retiring them is what reclaims them (cairn/6762).
+    #[serde(default)]
+    pub former_build_root_bytes: u64,
     /// Where `external_managed_caches_bytes` sits. All zeros from an executor
     /// that predates it.
     #[serde(default)]
@@ -26455,6 +26547,7 @@ mod tests {
             host_temp: None,
             build_volume: None,
             build_disk_accounting: None,
+            restored_holdings: None,
             cpu: Measurement::measured(
                 40,
                 CpuPressure {
@@ -26494,6 +26587,7 @@ mod tests {
                         quarantines_bytes: 4,
                         temporary_other_bytes: 5,
                         node_scratch_bytes: 0,
+                        former_build_root_bytes: 0,
                         external_caches: ExternalCacheBreakdown::default(),
                     },
                     skipped: vec![SkippedEntry {
@@ -26517,6 +26611,8 @@ mod tests {
                         path: "scratch".into(),
                         bytes: 5,
                     }],
+                    unreclaimable: Vec::new(),
+                    unreclaimable_truncated: 0,
                 },
             ),
             process: ProcessTelemetry {
@@ -27705,6 +27801,8 @@ mod tests {
             vanished_entries: 0,
             retired_homes: Vec::new(),
             other_top: Vec::new(),
+            unreclaimable: Vec::new(),
+            unreclaimable_truncated: 0,
         };
         assert!(partial.is_partial());
         assert_eq!(partial.skipped_count(), 5);
@@ -27731,6 +27829,46 @@ mod tests {
         assert_eq!(disk["status"], "unknown");
         assert!(disk.get("totalBytes").is_none());
         assert!(disk.get("categories").is_none());
+    }
+
+    /// cairn/6761's fields are additive: an executor that predates them names
+    /// nothing, and a holding round-trips under the names the page reads.
+    #[test]
+    fn an_older_peers_accounting_names_no_unreclaimable_holding() {
+        let older: DiskAccounting = serde_json::from_value(serde_json::json!({
+            "usedBytes": 3,
+            "categories": {
+                "managedObjectsBytes": 0,
+                "liveSlotsBytes": 3,
+                "warmCachesBytes": 0,
+                "quarantinesBytes": 0,
+                "temporaryOtherBytes": 0
+            }
+        }))
+        .unwrap();
+        assert!(older.unreclaimable.is_empty());
+        assert_eq!(older.unreclaimable_truncated, 0);
+        assert_eq!(older.categories.former_build_root_bytes, 0);
+        let telemetry = serde_json::to_value(MachineTelemetry::default()).unwrap();
+        assert!(telemetry.get("restoredHoldings").is_none());
+        let telemetry: MachineTelemetry = serde_json::from_value(telemetry).unwrap();
+        assert_eq!(telemetry.restored_holdings, None);
+
+        let holding = UnreclaimableHolding {
+            path: "claude-profiles/_transcripts".into(),
+            bytes: 14,
+            newest_modified_unix_ms: Some(9),
+            reason: UnreclaimableReason::Undecided,
+            owner: Some("harness".into()),
+            issue: Some("cairn://p/cairn/6759".into()),
+        };
+        let wire = serde_json::to_value(&holding).unwrap();
+        assert_eq!(wire["reason"], "undecided");
+        assert_eq!(wire["newestModifiedUnixMs"], 9);
+        assert_eq!(
+            serde_json::from_value::<UnreclaimableHolding>(wire).unwrap(),
+            holding
+        );
     }
 
     /// Custodial storage health crosses the wire exactly, and a peer that
@@ -27908,6 +28046,7 @@ mod tests {
             host_temp: None,
             build_volume: None,
             build_disk_accounting: None,
+            restored_holdings: None,
             cpu: Measurement::measured(
                 1,
                 CpuPressure {

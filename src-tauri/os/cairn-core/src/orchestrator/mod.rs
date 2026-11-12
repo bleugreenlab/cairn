@@ -4951,6 +4951,7 @@ mod tests {
                 host_temp: None,
                 build_volume: None,
                 build_disk_accounting: None,
+                restored_holdings: None,
                 cpu: Measurement::measured(
                     10,
                     CpuPressure {

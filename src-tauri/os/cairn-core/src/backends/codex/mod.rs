@@ -1291,10 +1291,10 @@ mod goal_status_tests {
     }
 }
 
-/// Cairn's own `CODEX_HOME`, `~/.cairn/codex`, shared by every Codex process
-/// Cairn spawns so the user's `~/.codex` is never read (see
-/// `cairn_models::session::codex::home`).
+/// Cairn's own `CODEX_HOME`, `<cairn home>/codex`, shared by every Codex
+/// process Cairn spawns so the user's `~/.codex` is never read (see
+/// `cairn_models::session::codex::home`). Under the resolved home, so a dev
+/// build keeps its Codex state out of the production home.
 pub(crate) fn cairn_codex_home() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".cairn").join("codex")
+    cairn_common::paths::cairn_home().join("codex")
 }

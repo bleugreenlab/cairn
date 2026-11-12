@@ -2521,6 +2521,7 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                 "on the build volume",
                 accounting,
                 volume,
+                None,
                 captured,
             );
         }
@@ -2554,6 +2555,7 @@ fn render_storage(executor: &ExecutorInspection) -> String {
         "",
         &machine.disk_accounting,
         &machine.volume,
+        machine.restored_holdings.as_ref(),
         captured,
     );
     out
@@ -2916,6 +2918,7 @@ fn render_holdings(
     on: &str,
     accounting_reading: &Measurement<cairn_common::executor_protocol::DiskAccounting>,
     volume_reading: &Measurement<cairn_common::executor_protocol::MachineVolume>,
+    restored: Option<&cairn_common::executor_protocol::RestoredHoldings>,
     captured: u64,
 ) {
     let on = if on.is_empty() {
@@ -2959,6 +2962,13 @@ fn render_holdings(
                 bytes(categories.warm_caches_bytes),
                 bytes(categories.temporary_other_bytes),
             ));
+            out.push_str(&former_build_root_line(categories.former_build_root_bytes));
+            render_unreclaimable(
+                out,
+                &accounting.unreclaimable,
+                accounting.unreclaimable_truncated,
+                captured,
+            );
             for home in &accounting.retired_homes {
                 out.push_str(&retired_home_line(home));
             }
@@ -3000,10 +3010,89 @@ fn render_holdings(
                 }
             }
         }
-        None => out.push_str(&format!(
-            "- Cairn holds{on}: {}\n",
-            reading(accounting_reading, captured, |_| String::new())
-        )),
+        None => {
+            out.push_str(&format!(
+                "- Cairn holds{on}: {}\n",
+                reading(accounting_reading, captured, |_| String::new())
+            ));
+            // A restarted executor has no walk of its own for hours, and a
+            // failed walk has none either; the last successful one's names
+            // are still the answer to whose the bytes are.
+            if let Some(restored) = restored {
+                let other_top = restored
+                    .other_top
+                    .iter()
+                    .map(|entry| format!("{} {}", entry.path, bytes(entry.bytes)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "- As of the last walk (restored), {}: largest other {}\n",
+                    age(captured.saturating_sub(restored.measured_at_unix_ms)),
+                    if other_top.is_empty() {
+                        "none".to_string()
+                    } else {
+                        other_top
+                    },
+                ));
+                out.push_str(&former_build_root_line(restored.former_build_root_bytes));
+                render_unreclaimable(out, &restored.unreclaimable, 0, captured);
+            }
+        }
+    }
+}
+
+/// A former build root, as what it is: bytes a retirement reclaims, never
+/// folded into live cells or into what no rule reaches.
+fn former_build_root_line(former_build_root_bytes: u64) -> String {
+    if former_build_root_bytes == 0 {
+        return String::new();
+    }
+    format!(
+        "- Former build root: {} under the home (its build-slots, managed-objects, dependency-catalog and tool-cache, left when the build root moved), reclaimed by retirement (cairn/6762), not by the storage ladder\n",
+        bytes(former_build_root_bytes)
+    )
+}
+
+/// The home entries holding bytes no retention rule reaches, by name.
+fn render_unreclaimable(
+    out: &mut String,
+    holdings: &[cairn_common::executor_protocol::UnreclaimableHolding],
+    truncated: usize,
+    captured: u64,
+) {
+    if holdings.is_empty() {
+        return;
+    }
+    let total = holdings
+        .iter()
+        .fold(0_u64, |sum, holding| sum.saturating_add(holding.bytes));
+    out.push_str(&format!(
+        "- Unreclaimable holdings: {} ({}; no retention rule reaches these bytes)\n",
+        holdings.len() + truncated,
+        bytes(total),
+    ));
+    for holding in holdings {
+        let written = holding.newest_modified_unix_ms.map_or_else(
+            || "last written unknown".to_string(),
+            |at| format!("last written {}", age(captured.saturating_sub(at))),
+        );
+        let owner = holding
+            .owner
+            .as_deref()
+            .map_or_else(String::new, |owner| format!(", owner {owner}"));
+        let issue = holding
+            .issue
+            .as_deref()
+            .map_or_else(String::new, |issue| format!(", rule owed by {issue}"));
+        out.push_str(&format!(
+            "  - `{}`: {}, {written}, {}{owner}{issue}\n",
+            holding.path,
+            bytes(holding.bytes),
+            holding.reason.label(),
+        ));
+    }
+    if truncated > 0 {
+        out.push_str(&format!("  - and {truncated} more not listed\n"));
     }
 }
 
@@ -6663,6 +6752,7 @@ mod storage_section_tests {
                     quarantines_bytes: 104 * GIB,
                     temporary_other_bytes: 125 * GIB,
                     node_scratch_bytes: 0,
+                    former_build_root_bytes: 0,
                     external_caches: ExternalCacheBreakdown::default(),
                 },
                 other_top: vec![DiskPathUsage {
@@ -6880,6 +6970,104 @@ mod storage_section_tests {
         );
         assert!(
             rendered.contains("Last pressure pass: none since this executor started"),
+            "{rendered}"
+        );
+    }
+
+    /// 11-09: the volume at 99% while the page said only "other" and a
+    /// remainder outside Cairn. What no rule reaches is named with its owner
+    /// and the issue that owes it a rule, and a former build root reads as
+    /// what retiring it reclaims, never among them.
+    #[test]
+    fn unreclaimable_holdings_and_a_former_build_root_are_named() {
+        use cairn_common::executor_protocol::{UnreclaimableHolding, UnreclaimableReason};
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        let mut accounting = executor
+            .health
+            .machine
+            .disk_accounting
+            .value()
+            .unwrap()
+            .clone();
+        accounting.categories.former_build_root_bytes = 252 * GIB;
+        accounting.unreclaimable = vec![
+            UnreclaimableHolding {
+                path: "jj-stores".into(),
+                bytes: 129 * GIB,
+                newest_modified_unix_ms: Some(at - 5 * 60_000),
+                reason: UnreclaimableReason::Undecided,
+                owner: Some("performance".into()),
+                issue: Some("cairn://p/cairn/6757".into()),
+            },
+            UnreclaimableHolding {
+                path: "mystery".into(),
+                bytes: 2 * GIB,
+                newest_modified_unix_ms: None,
+                reason: UnreclaimableReason::Unclaimed,
+                owner: None,
+                issue: None,
+            },
+        ];
+        accounting.unreclaimable_truncated = 1;
+        executor.health.machine.disk_accounting = Measurement::measured(at, accounting);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Former build root: 252.0 GiB under the home ("),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- Unreclaimable holdings: 3 (131.0 GiB; no retention rule reaches these bytes)\n\
+                 \x20 - `jj-stores`: 129.0 GiB, last written 5m ago, undecided, owner performance, rule owed by cairn://p/cairn/6757\n\
+                 \x20 - `mystery`: 2.0 GiB, last written unknown, unclaimed\n\
+                 \x20 - and 1 more not listed\n"
+            ),
+            "{rendered}"
+        );
+
+        // An executor that predates the fields renders as before.
+        let before = render_executor(&tight_local());
+        assert!(!before.contains("Unreclaimable holdings"), "{before}");
+        assert!(!before.contains("Former build root"), "{before}");
+    }
+
+    /// A restarted executor's first walk can be hours away. Until it lands,
+    /// the page keeps the last walk's names, marked as restored, rather than
+    /// reading "not sampled".
+    #[test]
+    fn a_restarted_executor_shows_the_last_walks_names_as_restored() {
+        use cairn_common::executor_protocol::{
+            RestoredHoldings, UnreclaimableHolding, UnreclaimableReason,
+        };
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        executor.health.machine.disk_accounting = Measurement::default();
+        executor.health.machine.restored_holdings = Some(RestoredHoldings {
+            measured_at_unix_ms: at - 10 * 60_000,
+            other_top: vec![DiskPathUsage {
+                path: "jj-stores".into(),
+                bytes: 129 * GIB,
+            }],
+            unreclaimable: vec![UnreclaimableHolding {
+                path: "jj-stores".into(),
+                bytes: 129 * GIB,
+                newest_modified_unix_ms: None,
+                reason: UnreclaimableReason::Undecided,
+                owner: Some("performance".into()),
+                issue: Some("cairn://p/cairn/6757".into()),
+            }],
+            former_build_root_bytes: 0,
+        });
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- As of the last walk (restored), 10m ago: largest other jj-stores 129.0 GiB\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - `jj-stores`: 129.0 GiB, last written unknown, undecided"),
             "{rendered}"
         );
     }

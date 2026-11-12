@@ -489,7 +489,11 @@ fn marker_block() -> Value {
 /// name from its process cwd, so the path is computed the same way and then
 /// confirmed on disk; a miss falls back to searching for the id, since the
 /// mangling is the CLI's convention rather than a contract.
-fn transcript_path(config_dir: &Path, working_dir: &Path, backend_id: &str) -> Option<PathBuf> {
+fn transcript_path(
+    claude_config_dir: &Path,
+    working_dir: &Path,
+    backend_id: &str,
+) -> Option<PathBuf> {
     // The id becomes a file name, so refuse anything that is not the uuid shape
     // the CLI issues rather than letting it walk the filesystem.
     if backend_id.is_empty()
@@ -499,7 +503,7 @@ fn transcript_path(config_dir: &Path, working_dir: &Path, backend_id: &str) -> O
     {
         return None;
     }
-    let projects = config_dir.join("projects");
+    let projects = claude_config_dir.join("projects");
     let file_name = format!("{backend_id}.jsonl");
 
     // The CLI records its cwd after the OS resolves it, so on macOS a `/var/…`
