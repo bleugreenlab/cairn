@@ -26,6 +26,8 @@ use crate::runtime::BUILD_SLOTS_DIR;
 pub const AUTHORITY_DIR: &str = ".authority";
 /// The managed object cache's directory under the build root.
 pub const MANAGED_OBJECTS_DIR: &str = "managed-objects";
+/// The managed object cache's pack scratch under the build root.
+pub const PACK_SCRATCH_DIR: &str = "pack-scratch";
 /// The dependency catalog's directory under the build root.
 pub const DEPENDENCY_CATALOG_DIR: &str = "dependency-catalog";
 /// The tool cache's directory under the build root.
@@ -304,6 +306,17 @@ impl ExecutorPaths {
 
     pub fn managed_objects(&self) -> PathBuf {
         self.build_root.join(MANAGED_OBJECTS_DIR)
+    }
+
+    /// Where the executor validates received packs and proves commit closures
+    /// in throwaway repositories. On the build volume beside
+    /// [`Self::managed_objects`], never in the host's shared temp directory,
+    /// which another tenant can fill. The executor is its only writer, and
+    /// nothing in it outlives the process that made it. A sibling of the cache
+    /// rather than inside it, since the cache root holds exactly one directory
+    /// per repository.
+    pub fn pack_scratch(&self) -> PathBuf {
+        self.build_root.join(PACK_SCRATCH_DIR)
     }
 
     pub fn dependency_catalog(&self) -> PathBuf {

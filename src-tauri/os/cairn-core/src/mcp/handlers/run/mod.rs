@@ -880,9 +880,12 @@ fn make_delta_objects_available(
         .ok_or_else(|| "managed delta receipt is expired or stale".to_string())?;
     let pack = std::fs::read(&staged.path)
         .map_err(|error| format!("read staged managed delta pack: {error}"))?;
-    let validated =
-        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
-            .map_err(|error| format!("validate staged managed delta pack: {error}"))?;
+    let validated = cairn_codec::transfer::validate_pack(
+        &pack,
+        cairn_codec::transfer::PackLimits::default(),
+        &std::env::temp_dir(),
+    )
+    .map_err(|error| format!("validate staged managed delta pack: {error}"))?;
     if validated.manifest.pack_checksum != receipt.pack_checksum {
         return Err("managed delta pack checksum changed after upload".into());
     }
@@ -905,8 +908,14 @@ fn make_delta_objects_available(
     // the walk's throwaway repository cannot see that file unless it is passed.
     let shallow = cairn_codec::transfer::shallow_commits(repository)
         .map_err(|error| format!("read canonical repository shallow boundary: {error}"))?;
-    cairn_codec::transfer::verify_commit_closure(&objects_dir, &[], &shallow, &delta.delta_commit)
-        .map_err(|error| format!("verify imported managed delta closure: {error}"))?;
+    cairn_codec::transfer::verify_commit_closure(
+        &objects_dir,
+        &[],
+        &shallow,
+        &delta.delta_commit,
+        &std::env::temp_dir(),
+    )
+    .map_err(|error| format!("verify imported managed delta closure: {error}"))?;
     verify_available_delta(repository, delta)?;
     Ok((true, Some(installed.pack_path)))
 }
@@ -3710,6 +3719,7 @@ pub(crate) mod slot_publication_tests {
         let validated = cairn_codec::transfer::validate_pack(
             &pack,
             cairn_codec::transfer::PackLimits::default(),
+            &std::env::temp_dir(),
         )
         .unwrap();
         assert_eq!(

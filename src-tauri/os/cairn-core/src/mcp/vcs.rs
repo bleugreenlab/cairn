@@ -817,13 +817,21 @@ mod tests {
                 let validated = cairn_codec::transfer::validate_pack(
                     &pack,
                     cairn_codec::transfer::PackLimits::default(),
+                    &std::env::temp_dir(),
                 )
                 .unwrap();
                 assert_eq!(validated.index, index);
                 assert_eq!(&validated.manifest.pack_checksum, checksum);
                 cairn_codec::transfer::install_pack(objects, &validated).unwrap();
             }
-            cairn_codec::transfer::verify_commit_closure(objects, &[], &[], tip).map(|_| ())
+            cairn_codec::transfer::verify_commit_closure(
+                objects,
+                &[],
+                &[],
+                tip,
+                &std::env::temp_dir(),
+            )
+            .map(|_| ())
         }
 
         /// The first cloud-visible seal is self-contained: nothing is cataloged
@@ -888,12 +896,19 @@ mod tests {
             let validated = cairn_codec::transfer::validate_pack(
                 &pack,
                 cairn_codec::transfer::PackLimits::default(),
+                &std::env::temp_dir(),
             )
             .unwrap();
             cairn_codec::transfer::install_pack(&partial_objects, &validated).unwrap();
             assert!(
-                cairn_codec::transfer::verify_commit_closure(&partial_objects, &[], &[], &child)
-                    .is_err(),
+                cairn_codec::transfer::verify_commit_closure(
+                    &partial_objects,
+                    &[],
+                    &[],
+                    &child,
+                    &std::env::temp_dir()
+                )
+                .is_err(),
                 "a range pack must not masquerade as a complete history"
             );
 

@@ -409,6 +409,8 @@ fn a_volume_at_the_floor_passes_and_one_byte_under_stops() {
     let at = cairn_common::volume::VolumeSpace {
         total_bytes: total,
         free_bytes: floor,
+        total_inodes: None,
+        free_inodes: None,
     };
     assert!(floor_verdict(root, at, budget).is_ok());
 

@@ -79,6 +79,7 @@ pub async fn backfill_execution_pack_catalog(db: &LocalDb, limit: usize) -> DbRe
         let validated = match cairn_codec::transfer::validate_pack(
             &pack,
             cairn_codec::transfer::PackLimits::default(),
+            &std::env::temp_dir(),
         ) {
             Ok(validated) => validated,
             Err(_) => {

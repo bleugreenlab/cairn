@@ -4937,6 +4937,7 @@ mod tests {
                 ..DiskHealth::default()
             },
             machine: MachineTelemetry {
+                host_temp: None,
                 build_volume: None,
                 build_disk_accounting: None,
                 cpu: Measurement::measured(
@@ -4959,6 +4960,8 @@ mod tests {
                 volume: Measurement::measured(
                     10,
                     MachineVolume {
+                        total_inodes: None,
+                        free_inodes: None,
                         total_bytes: 900_000,
                         free_bytes: 400_000,
                     },

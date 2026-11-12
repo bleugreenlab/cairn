@@ -29115,6 +29115,7 @@ mod tests {
     ) {
         Arc::make_mut(&mut entry.health).machine =
             cairn_common::executor_protocol::MachineTelemetry {
+                host_temp: None,
                 cpu: Measurement::measured(
                     measured_at_unix_ms,
                     cairn_common::executor_protocol::CpuPressure {
@@ -29135,6 +29136,8 @@ mod tests {
                 volume: Measurement::measured(
                     measured_at_unix_ms,
                     cairn_common::executor_protocol::MachineVolume {
+                        total_inodes: None,
+                        free_inodes: None,
                         total_bytes: 1024 * 1024 * 1024 * 1024,
                         free_bytes: free_volume_bytes,
                     },
@@ -31115,6 +31118,7 @@ mod tests {
             alone_on_machine_bytes: Some(TOTAL),
         };
         let machine = |total_bytes: u64| cairn_common::executor_protocol::MachineTelemetry {
+            host_temp: None,
             memory: Measurement::measured(
                 1,
                 cairn_common::executor_protocol::MachineMemory {
@@ -33168,6 +33172,7 @@ mod tests {
             rejection_for(&draft, "bglab-mac"),
             &PlacementRejectionReason::Held {
                 evidence: AdmissionHoldEvidence::Disk {
+                    inodes: None,
                     free_bytes: GIB * 14 / 10,
                     floor_bytes: 2 * GIB,
                     sweep_in_flight: false,
@@ -33519,6 +33524,7 @@ mod tests {
             rejection_for(&draft, "a-fast"),
             &PlacementRejectionReason::Held {
                 evidence: AdmissionHoldEvidence::Disk {
+                    inodes: None,
                     free_bytes: 8 * GIB,
                     floor_bytes: 10 * GIB,
                     sweep_in_flight: false,
@@ -34782,6 +34788,7 @@ mod tests {
             rejection_for(&draft, COLOCATED_EXECUTOR_ID),
             &PlacementRejectionReason::Held {
                 evidence: AdmissionHoldEvidence::Disk {
+                    inodes: None,
                     free_bytes: 3 * GIB,
                     floor_bytes: 4 * GIB,
                     sweep_in_flight: false,

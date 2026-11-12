@@ -33,9 +33,12 @@ pub struct ValidatedObjectPack {
 }
 
 pub fn validate_pack_bytes(pack: Vec<u8>) -> Result<ValidatedObjectPack, String> {
-    let validated =
-        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
-            .map_err(|error| format!("validate object pack: {error}"))?;
+    let validated = cairn_codec::transfer::validate_pack(
+        &pack,
+        cairn_codec::transfer::PackLimits::default(),
+        &std::env::temp_dir(),
+    )
+    .map_err(|error| format!("validate object pack: {error}"))?;
     let index = validated.index.clone();
     let framed = cairn_codec::transfer::frame_pack(&pack, &index);
     Ok(ValidatedObjectPack {

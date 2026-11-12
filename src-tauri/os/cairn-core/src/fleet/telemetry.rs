@@ -334,6 +334,7 @@ mod tests {
     #[test]
     fn unmeasured_readings_are_absent_rather_than_zero() {
         let machine = MachineTelemetry {
+            host_temp: None,
             cpu: Measurement::unavailable(0, MeasurementGap::UnsupportedPlatform),
             memory: Measurement::unavailable(0, MeasurementGap::NotSampled),
             ..Default::default()
@@ -356,6 +357,7 @@ mod tests {
     #[test]
     fn measured_readings_become_whole_tenth_percentages() {
         let machine = MachineTelemetry {
+            host_temp: None,
             cpu: Measurement::measured(
                 10,
                 CpuPressure {
@@ -387,6 +389,7 @@ mod tests {
     #[test]
     fn zero_total_memory_is_a_gap_rather_than_a_ratio() {
         let machine = MachineTelemetry {
+            host_temp: None,
             memory: Measurement::measured(
                 10,
                 MachineMemory {

@@ -29,9 +29,9 @@ use std::borrow::Cow;
 use cairn_common::executor_protocol::{
     admission_memory_floor, admission_provisions, memory_short, AdmissionHoldEvidence,
     CellPriority, CellRequest, CpuArm, DeclineReason, DiskHealthStatus, DiskWriteArmHold,
-    ExecutorSubstrateReport, FleetSnapshot, LoweredWaitHold, ProvisioningHold, RepositoryLocator,
-    ResidencyFence, StallGauge, StallInstrument, StallInstrumentState, StoragePressureOutcome,
-    StorageSweepStatus,
+    ExecutorSubstrateReport, FleetSnapshot, InodeShortfall, LoweredWaitHold, MachineVolume,
+    ProvisioningHold, RepositoryLocator, ResidencyFence, StallGauge, StallInstrument,
+    StallInstrumentState, StoragePressureOutcome, StorageSweepStatus,
 };
 
 /// How the executor will judge one piece of work: the facts the offer carries
@@ -277,16 +277,37 @@ fn read_disk(
     let floor = disk_floor_bytes(view, view.provisions(request, machine), request, health);
     // The executor judges disk on the volume cells grow on: the build root's
     // while it is here, the home's otherwise.
-    let free = health
+    let volume = health
         .machine
         .build_volume
         .as_ref()
         .and_then(|volume| volume.value())
-        .or_else(|| health.machine.volume.value())
-        .map(|volume| volume.free_bytes);
+        .or_else(|| health.machine.volume.value());
+    let free = volume.map(|volume| volume.free_bytes);
     let headroom = free.map(|free| i128::from(free) - i128::from(floor));
     let short = disk.watermark_bytes > 0 && headroom.is_some_and(|headroom| headroom < 0);
-    if !(disk.cleanup_blocked || short) {
+    // And on that volume's inodes, which can run out with bytes to spare, and
+    // with a build root apart from the home, on the home's inodes too: every
+    // admission needs the home's own floor. An executor that posts no inode
+    // reading reads as not inode-limited.
+    let build_reading = health
+        .machine
+        .build_volume
+        .as_ref()
+        .and_then(|volume| volume.value());
+    let cells_volume = match (&health.machine.build_volume, build_reading) {
+        (Some(_), Some(_)) => "build volume",
+        (Some(_), None) => "home volume",
+        (None, _) => "volume",
+    };
+    let home_inodes = build_reading
+        .and_then(|_| health.machine.volume.value())
+        .and_then(MachineVolume::inodes_short);
+    let inodes_short = volume
+        .and_then(MachineVolume::inodes_short)
+        .map(|short| (cells_volume, short))
+        .or_else(|| home_inodes.map(|short| ("home volume", short)));
+    if !(disk.cleanup_blocked || short || inodes_short.is_some()) {
         return None;
     }
     let sweep_in_flight = disk.sweep_status == StorageSweepStatus::InFlight;
@@ -298,16 +319,24 @@ fn read_disk(
             last_pass: disk.pressure.as_ref().map(|pass| pass.outcome),
             headroom_bytes: headroom.unwrap_or(i128::MIN),
         },
-        evidence: if disk.cleanup_blocked {
-            AdmissionHoldEvidence::CleanupLatched {
+        evidence: match inodes_short {
+            _ if disk.cleanup_blocked => AdmissionHoldEvidence::CleanupLatched {
                 error: disk.cleanup_last_error.clone(),
-            }
-        } else {
-            AdmissionHoldEvidence::Disk {
+            },
+            _ => AdmissionHoldEvidence::Disk {
                 free_bytes: free.unwrap_or(0),
                 floor_bytes: floor,
                 sweep_in_flight,
-            }
+                // Bytes short is the condition reclamation acts on, so it
+                // is the one named when both are.
+                inodes: inodes_short.filter(|_| !short).map(
+                    |(volume, (free_inodes, floor_inodes))| InodeShortfall {
+                        volume: Some(volume.into()),
+                        free_inodes,
+                        floor_inodes,
+                    },
+                ),
+            },
         },
     })
 }
@@ -648,6 +677,8 @@ mod tests {
         health.machine.volume = Measurement::measured(
             1,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 1024 * GIB,
                 free_bytes: free,
             },
@@ -1090,6 +1121,7 @@ mod tests {
                 free_bytes: 10 * GIB + GIB / 2,
                 floor_bytes: 11 * GIB,
                 sweep_in_flight: false,
+                inodes: None,
             }
         );
         assert!(
@@ -1107,6 +1139,8 @@ mod tests {
         machine.machine.volume = Measurement::measured(
             2,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 1024 * GIB,
                 free_bytes: 20 * GIB,
             },
@@ -1114,6 +1148,72 @@ mod tests {
         let pressure = hold(&view, &request, &FleetSnapshot::default(), &machine).unwrap();
         assert_eq!(pressure.reason, DeclineReason::Pressure);
         assert!(pressure.relieves_itself);
+    }
+
+    /// A volume with ample bytes and its inodes under the line holds, and the
+    /// hold names inodes and the volume; a volume that keeps no fixed inode
+    /// table, or an executor that posts no reading, never holds on them.
+    #[test]
+    fn a_volume_under_its_inode_line_holds_on_inodes() {
+        use cairn_common::executor_protocol::free_inode_line;
+        const TABLE: u64 = 1_048_576;
+        let line = free_inode_line(TABLE);
+        let volume = |inodes: Option<u64>| {
+            Measurement::measured(
+                1,
+                MachineVolume {
+                    total_bytes: 1024 * GIB,
+                    free_bytes: 500 * GIB,
+                    total_inodes: inodes.map(|_| TABLE),
+                    free_inodes: inodes,
+                },
+            )
+        };
+        let request = request();
+        let view = AdmissionView::of_request(&request);
+        let snapshot = FleetSnapshot::default();
+        let mut machine = disk_at(500 * GIB, 0);
+        machine.machine.volume = volume(Some(line - 1));
+
+        let held = hold(&view, &request, &snapshot, &machine).unwrap();
+        assert_eq!(held.reason, DeclineReason::Disk);
+        let inode_hold = |volume: &str, free_inodes| AdmissionHoldEvidence::Disk {
+            free_bytes: 500 * GIB,
+            floor_bytes: 10 * GIB,
+            sweep_in_flight: false,
+            inodes: Some(InodeShortfall {
+                volume: Some(volume.into()),
+                free_inodes,
+                floor_inodes: line,
+            }),
+        };
+        assert_eq!(held.evidence, inode_hold("volume", line - 1));
+        assert_eq!(
+            held.evidence.describe(),
+            "held: volume has 65,535 free inodes (floor 65,536)"
+        );
+
+        machine.machine.build_volume = Some(volume(Some(0)));
+        assert!(matches!(
+            hold(&view, &request, &snapshot, &machine).unwrap().evidence,
+            AdmissionHoldEvidence::Disk { inodes: Some(InodeShortfall { ref volume, free_inodes: 0, .. }), .. } if volume.as_deref() == Some("build volume")
+        ));
+
+        // The executor also needs the home's own floor when the build root is
+        // apart: a roomy build volume and a home under its inode line hold,
+        // named as the home's.
+        machine.machine.build_volume = Some(volume(None));
+        assert_eq!(
+            hold(&view, &request, &snapshot, &machine).unwrap().evidence,
+            inode_hold("home volume", line - 1)
+        );
+        machine.machine.volume = volume(Some(line));
+        assert_eq!(hold(&view, &request, &snapshot, &machine), None);
+        machine.machine.volume = volume(None);
+        assert_eq!(hold(&view, &request, &snapshot, &machine), None);
+        machine.machine.build_volume = None;
+        machine.machine.volume = volume(Some(line));
+        assert_eq!(hold(&view, &request, &snapshot, &machine), None);
     }
 
     /// The executor skips host pressure for interactive work, and a CPU

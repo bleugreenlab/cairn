@@ -352,8 +352,11 @@ impl ScratchRepo {
 
     /// Validate a pack and install it into this store.
     pub fn install_pack(&self, pack: &[u8]) -> Result<u64, String> {
-        let validated =
-            crate::transfer::validate_pack(pack, crate::transfer::PackLimits::default())?;
+        let validated = crate::transfer::validate_pack(
+            pack,
+            crate::transfer::PackLimits::default(),
+            &self.git_dir,
+        )?;
         crate::transfer::install_pack(&self.objects_dir(), &validated)?;
         Ok(validated.manifest.object_count)
     }

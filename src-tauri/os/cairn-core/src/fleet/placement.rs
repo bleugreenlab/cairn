@@ -169,6 +169,8 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
             // is the same wait measured pressure gets. A single instrument
             // broken under a running sampler is not reported as blind at all.
             | HostPressureCondition::TelemetryBlind { .. } => true,
+            // Inodes, like bytes, come back from reclamation or an operator,
+            // not from the queue draining.
             HostPressureCondition::DiskFree { .. } => false,
         })
 }
@@ -568,6 +570,7 @@ mod tests {
         }]))
         .is_capacity());
         assert!(!settled(&held(vec![HostPressureCondition::DiskFree {
+            inodes: None,
             free_bytes: 1,
             floor_bytes: 2
         }]))
@@ -584,6 +587,7 @@ mod tests {
                 owing: Vec::new(),
             },
             HostPressureCondition::DiskFree {
+                inodes: None,
                 free_bytes: 1,
                 floor_bytes: 2
             },

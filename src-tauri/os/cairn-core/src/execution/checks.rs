@@ -21279,6 +21279,7 @@ cairn-common = { path = "../cairn-common" }
                 deadline(
                     None,
                     Some(vec![HostPressureCondition::DiskFree {
+                        inodes: None,
                         free_bytes: 1,
                         floor_bytes: 2,
                     }]),
@@ -21435,6 +21436,7 @@ cairn-common = { path = "../cairn-common" }
             deadline(
                 None,
                 Some(vec![HostPressureCondition::DiskFree {
+                    inodes: None,
                     free_bytes: 1,
                     floor_bytes: 2,
                 }]),
@@ -21442,6 +21444,7 @@ cairn-common = { path = "../cairn-common" }
             deadline(
                 Some(ExecutorSubstrateState::ConnectedStalled),
                 Some(vec![HostPressureCondition::DiskFree {
+                    inodes: None,
                     free_bytes: 1,
                     floor_bytes: 2,
                 }]),

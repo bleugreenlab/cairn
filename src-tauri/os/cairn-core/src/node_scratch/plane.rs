@@ -536,6 +536,7 @@ async fn upload_pack(
                 cairn_codec::transfer::validate_pack(
                     &body,
                     cairn_codec::transfer::PackLimits::default(),
+                    &std::env::temp_dir(),
                 )?;
                 std::fs::create_dir_all(&staging)
                     .map_err(|error| format!("stage scratch upload: {error}"))?;

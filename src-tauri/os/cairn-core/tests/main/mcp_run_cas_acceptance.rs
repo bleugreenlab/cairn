@@ -138,6 +138,7 @@ async fn catalog(
     let index = cairn_codec::transfer::validate_pack(
         &built.pack,
         cairn_codec::transfer::PackLimits::default(),
+        &std::env::temp_dir(),
     )
     .unwrap()
     .index;
@@ -273,9 +274,12 @@ async fn delta_complete(
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     let (pack, index) = cairn_codec::transfer::unframe_pack(&framed).unwrap();
-    let validated =
-        cairn_codec::transfer::validate_pack(&pack, cairn_codec::transfer::PackLimits::default())
-            .unwrap();
+    let validated = cairn_codec::transfer::validate_pack(
+        &pack,
+        cairn_codec::transfer::PackLimits::default(),
+        &std::env::temp_dir(),
+    )
+    .unwrap();
     if validated.index != index
         || validated.manifest.pack_checksum != request.pack_checksum
         || !validated
@@ -543,9 +547,12 @@ async fn upload(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let validated =
-        cairn_codec::transfer::validate_pack(&body, cairn_codec::transfer::PackLimits::default())
-            .unwrap();
+    let validated = cairn_codec::transfer::validate_pack(
+        &body,
+        cairn_codec::transfer::PackLimits::default(),
+        &std::env::temp_dir(),
+    )
+    .unwrap();
     let content_hash = format!("{:x}", Sha256::digest(&body));
     let receipt = DeltaUploadReceipt {
         receipt_id: format!("receipt-{}", coordinate.request_id),

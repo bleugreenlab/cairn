@@ -1744,8 +1744,9 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         format!("{:?}", health.disk.sweep_status)
     };
     out.push_str(&format!(
-        "- Verdict: volume {:?}, custody {custodial}, sweep {sweep}{partial}\n",
-        health.disk.status
+        "- Verdict: volume {:?}{}, custody {custodial}, sweep {sweep}{partial}\n",
+        health.disk.status,
+        inode_verdict_reason(health.disk.status, &health.machine)
     ));
     if health.disk.cleanup_blocked {
         out.push_str(&format!(
@@ -2480,12 +2481,13 @@ fn render_storage(executor: &ExecutorInspection) -> String {
     };
     let free_of = |volume: &cairn_common::executor_protocol::MachineVolume| {
         format!(
-            "{} free of {}{}",
+            "{} free of {}{}, {}",
             bytes(volume.free_bytes),
             bytes(volume.total_bytes),
             percent_full(volume)
                 .map(|full| format!(", {full}% full"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            inode_text(volume)
         )
     };
     // While a build root apart from the home is here, the verdict and its
@@ -2529,6 +2531,9 @@ fn render_storage(executor: &ExecutorInspection) -> String {
             disk.status,
         ));
     }
+    if let Some(host_temp) = &machine.host_temp {
+        out.push_str(&host_temp_line(host_temp, captured));
+    }
     out.push_str(&device_line(
         disk.device.as_ref(),
         &health.host.io_pressure,
@@ -2545,6 +2550,111 @@ fn render_storage(executor: &ExecutorInspection) -> String {
         captured,
     );
     out
+}
+
+/// `inodes 1,048,000 free of 1,048,576 (floor 65,536)`, or `inodes not
+/// limited` for a volume with no fixed table (btrfs, ZFS) or a reading from an
+/// executor that predates inode readings.
+fn inode_text(volume: &cairn_common::executor_protocol::MachineVolume) -> String {
+    use cairn_common::executor_protocol::describe_count;
+    match (volume.free_inodes, volume.total_inodes, volume.inode_line()) {
+        (Some(free), Some(total), Some(line)) => format!(
+            "inodes {} free of {} (floor {}){}",
+            describe_count(free),
+            describe_count(total),
+            describe_count(line),
+            if free < line { ", UNDER ITS LINE" } else { "" }
+        ),
+        _ => "inodes not limited".to_string(),
+    }
+}
+
+/// Why the verdict is what it is, when a volume's inodes drove it: `` (build
+/// volume under its inode line: 0 free, floor 65,536)``. Empty otherwise.
+fn inode_verdict_reason(
+    status: cairn_common::executor_protocol::DiskHealthStatus,
+    machine: &cairn_common::executor_protocol::MachineTelemetry,
+) -> String {
+    use cairn_common::executor_protocol::{describe_count, DiskHealthStatus};
+    if !matches!(status, DiskHealthStatus::Pressured | DiskHealthStatus::Full) {
+        return String::new();
+    }
+    let volumes = match machine.build_volume.as_ref() {
+        Some(build) => vec![
+            ("build volume", build.value()),
+            ("home volume", machine.volume.value()),
+        ],
+        None => vec![("volume", machine.volume.value())],
+    };
+    volumes
+        .into_iter()
+        .find_map(|(name, volume)| {
+            let (free, line) = volume?.inodes_short()?;
+            Some(format!(
+                " ({name} under its inode line: {} free, floor {})",
+                describe_count(free),
+                describe_count(line)
+            ))
+        })
+        .unwrap_or_default()
+}
+
+/// The host's shared temp filesystem, named and measured. Said plainly when it
+/// is out of inodes or nearly out of room, with whose files those are, because
+/// a full `/tmp` on a machine whose build volume is roomy is exactly what a
+/// reader would otherwise blame Cairn's storage for.
+fn host_temp_line(
+    measurement: &Measurement<cairn_common::executor_protocol::HostTempVolume>,
+    captured: u64,
+) -> String {
+    use cairn_common::executor_protocol::{describe_count, FREE_DISK_WATERMARK_BYTES};
+    let Some(temp) = measurement.value() else {
+        return format!(
+            "- Host temp: {}\n",
+            reading(measurement, captured, |_| String::new())
+        );
+    };
+    let identity = match &temp.filesystem {
+        Some(filesystem) => format!("{} ({filesystem} {})", temp.path, bytes(temp.total_bytes)),
+        None => format!("{} ({})", temp.path, bytes(temp.total_bytes)),
+    };
+    const NOT_CAIRNS: &str =
+        "Cairn keeps no scratch here; the holders are other tenants. It does not hold admission.";
+    let volume = temp.volume();
+    match (
+        volume.free_inodes,
+        volume.total_inodes,
+        volume.inodes_short(),
+    ) {
+        (Some(0), Some(total), _) => {
+            return format!(
+                "- Host temp: {identity} is out of inodes: 0 free of {}. {NOT_CAIRNS}\n",
+                describe_count(total)
+            )
+        }
+        (Some(free), Some(total), Some(_)) => {
+            return format!(
+                "- Host temp: {identity} is nearly out of inodes: {} free of {}. {NOT_CAIRNS}\n",
+                describe_count(free),
+                describe_count(total)
+            )
+        }
+        _ => {}
+    }
+    if temp.free_bytes < FREE_DISK_WATERMARK_BYTES {
+        return format!(
+            "- Host temp: {identity} is nearly out of space: {} free. {NOT_CAIRNS}\n",
+            bytes(temp.free_bytes)
+        );
+    }
+    format!(
+        "- Host temp: {identity}: {} — the host's shared temp; Cairn keeps no scratch here and it does not hold admission\n",
+        reading(measurement, captured, |temp| format!(
+            "{} free, {}",
+            bytes(temp.free_bytes),
+            inode_text(&temp.volume())
+        ))
+    )
 }
 
 /// How full a volume is, in whole percent, or `None` for a volume of no size.
@@ -2737,9 +2847,10 @@ fn build_root_line(
                 |volume| {
                     reading(volume, captured, |volume| {
                         format!(
-                            "{} free of {}",
+                            "{} free of {}, {}",
                             bytes(volume.free_bytes),
-                            bytes(volume.total_bytes)
+                            bytes(volume.total_bytes),
+                            inode_text(volume)
                         )
                     })
                 },
@@ -4638,7 +4749,7 @@ pub(crate) fn render_runner_events(
     out.push_str(&format!(
         "\nRetained {} days or {} rows; {oldest}; {gap}.\n",
         RETENTION_MS / (24 * 60 * 60 * 1_000),
-        group_thousands(RETENTION_ROWS),
+        cairn_common::executor_protocol::describe_count(RETENTION_ROWS),
     ));
     if !journal.attached {
         out.push_str("The journal is not attached: events are held in memory only.\n");
@@ -4656,18 +4767,6 @@ pub(crate) fn render_runner_events(
         "Full history: `cairn://db?sql=SELECT occurred_at_ms, kind, executor_id, generation, cause, detail_json FROM runner_events WHERE occurred_at_ms >= {} ORDER BY occurred_at_ms DESC`\n",
         window.since_ms.min(captured_at_unix_ms)
     ));
-    out
-}
-
-fn group_thousands(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
     out
 }
 
@@ -6529,6 +6628,8 @@ mod storage_section_tests {
         executor.health.machine.volume = Measurement::measured(
             at,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 1_800 * GIB,
                 free_bytes: 54 * GIB,
             },
@@ -6651,6 +6752,62 @@ mod storage_section_tests {
         assert!(!general.contains("resident scratch only"), "{general}");
     }
 
+    /// fedora's failure, as the page now reads it: the volume's inodes and the
+    /// verdict's reason for them, and a full host temp named as other
+    /// tenants' rather than left for a reader to blame on Cairn's storage.
+    #[test]
+    fn storage_names_inodes_and_a_full_host_temp_filesystem() {
+        use cairn_common::executor_protocol::{DiskHealthStatus, HostTempVolume};
+        const TABLE: u64 = 1_048_576;
+        let mut executor = tight_local();
+        let captured = executor.captured_at_unix_ms;
+        let volume = |free_inodes: Option<u64>| {
+            Measurement::measured(
+                captured,
+                MachineVolume {
+                    total_bytes: 1_800 * GIB,
+                    free_bytes: 540 * GIB,
+                    total_inodes: free_inodes.map(|_| TABLE),
+                    free_inodes,
+                },
+            )
+        };
+        executor.health.machine.volume = volume(Some(0));
+        executor.health.disk.status = DiskHealthStatus::Full;
+        executor.health.machine.host_temp = Some(Measurement::measured(
+            captured,
+            HostTempVolume {
+                path: "/tmp".into(),
+                filesystem: Some("tmpfs".into()),
+                total_bytes: 63 * GIB,
+                free_bytes: 60 * GIB,
+                total_inodes: Some(TABLE),
+                free_inodes: Some(0),
+            },
+        ));
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("inodes 0 free of 1,048,576 (floor 65,536), UNDER ITS LINE"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(volume under its inode line: 0 free, floor 65,536)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Host temp: /tmp (tmpfs 63.0 GiB) is out of inodes: 0 free of 1,048,576. Cairn keeps no scratch here; the holders are other tenants."),
+            "{rendered}"
+        );
+
+        executor.health.machine.volume = volume(None);
+        executor.health.disk.status = DiskHealthStatus::Ok;
+        executor.health.machine.host_temp = None;
+        let unlimited = render_executor(&executor);
+        assert!(unlimited.contains("inodes not limited"), "{unlimited}");
+        assert!(!unlimited.contains("Host temp"), "{unlimited}");
+        assert!(!unlimited.contains("inode line"), "{unlimited}");
+    }
+
     /// bgsrv-mac on 10-31: the external caches were one figure, almost all of
     /// it an abandoned catalog staging tree, while the page's next action
     /// named only the owner-retained part. Split, the staging reads first.
@@ -6732,6 +6889,8 @@ mod storage_section_tests {
         executor.health.machine.build_volume = Some(Measurement::measured(
             at,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 36 * TIB / 10,
                 free_bytes: 32 * TIB / 10,
             },
@@ -7813,9 +7972,15 @@ mod tests {
 
     #[test]
     fn thousands_are_grouped() {
-        assert_eq!(group_thousands(200_000), "200,000");
-        assert_eq!(group_thousands(1_234_567), "1,234,567");
-        assert_eq!(group_thousands(999), "999");
+        assert_eq!(
+            cairn_common::executor_protocol::describe_count(200_000),
+            "200,000"
+        );
+        assert_eq!(
+            cairn_common::executor_protocol::describe_count(1_234_567),
+            "1,234,567"
+        );
+        assert_eq!(cairn_common::executor_protocol::describe_count(999), "999");
     }
 
     pub(super) fn cached_slot() -> cairn_common::executor_protocol::PersistentCellState {
@@ -8399,6 +8564,8 @@ mod tests {
         executor.health.machine.volume = Measurement::measured(
             at,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 3_686 * GIB,
                 free_bytes: 258 * GIB,
             },
@@ -9218,6 +9385,8 @@ mod tests {
         executor.health.machine.volume = Measurement::measured(
             CAPTURED_AT - 2_000,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 2 * 1024 * 1024 * 1024 * 1024,
                 free_bytes: 512 * 1024 * 1024 * 1024,
             },
@@ -12102,6 +12271,8 @@ mod tests {
                     volume: Measurement::measured(
                         CAPTURED_AT - 2_000,
                         MachineVolume {
+                            total_inodes: None,
+                            free_inodes: None,
                             total_bytes: 1024 * 1024 * 1024 * 1024,
                             free_bytes: 900 * 1024 * 1024 * 1024,
                         },
@@ -12213,6 +12384,7 @@ mod tests {
                 executor_id: "bglab-mac".into(),
                 reason: PlacementRejectionReason::Held {
                     evidence: cairn_common::executor_protocol::AdmissionHoldEvidence::Disk {
+                        inodes: None,
                         free_bytes: 1024 * 1024 * 1024 * 14 / 10,
                         floor_bytes: 2 * 1024 * 1024 * 1024,
                         sweep_in_flight: false,

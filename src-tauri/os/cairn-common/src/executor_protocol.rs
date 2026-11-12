@@ -8159,6 +8159,23 @@ pub struct LearnedResourceEstimate {
 /// nothing, since the executor neither sends nor reads these. The change is
 /// in the runner's rollout policy (residents hold a drain for a notice period
 /// rather than the unmeasured hold), which an executor never observes.
+///
+/// cairn/5480 does not move the number. It makes inode exhaustion a measured
+/// storage condition with defaulted, optional fields only: [`MachineVolume`]
+/// carries `totalInodes`/`freeInodes`, [`MachineTelemetry::host_temp`] names
+/// the host's shared temp filesystem, and an inode shortfall crosses as the
+/// existing [`HostPressureCondition::DiskFree`] (and the runner's
+/// [`AdmissionHoldEvidence::Disk`]) with an `inodes` field naming it, under a
+/// `DeclineReason::Disk` refusal whose detail names inodes. What a runner gets
+/// wrong talking to an older executor: nothing, since that executor sends no
+/// inode reading and a volume without one is read as not inode-limited, as
+/// before. An older runner talking to a newer executor decodes every frame,
+/// ignoring the fields it does not know: it reads an inode hold as a disk
+/// hold whose bytes are not short, holds the machine on the executor's
+/// `pressured` verdict and its disk refusals as it does for any disk decline,
+/// and only cannot say that inodes are the cause, nor predict the hold before
+/// an offer. That is a weaker explanation, not a different admission
+/// conclusion: the executor still refuses, and the runner still routes away.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -11562,9 +11579,15 @@ pub enum HostPressureCondition {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         owing: Vec<OwingWork>,
     },
+    /// Free bytes under the floor, or, when `inodes` is present, free inodes
+    /// under their line ([`free_inode_line`]) on a volume whose bytes are not
+    /// short: creates are about to fail with `ENOSPC` however many bytes are
+    /// free. `free_bytes`/`floor_bytes` are then the byte reading and floor.
     DiskFree {
         free_bytes: u64,
         floor_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inodes: Option<InodeShortfall>,
     },
     ResidentOccupancy {
         process_count: usize,
@@ -14316,6 +14339,68 @@ impl MachineMemory {
 pub struct MachineVolume {
     pub total_bytes: u64,
     pub free_bytes: u64,
+    /// The volume's inode table. `None` where the filesystem keeps no fixed
+    /// table (btrfs, ZFS, most network filesystems), on a platform with no
+    /// such reading, and from an executor that predates it: each of those
+    /// means the volume is not inode-limited, never that none are left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_inodes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_inodes: Option<u64>,
+}
+
+impl MachineVolume {
+    /// The free-inode line on this volume ([`free_inode_line`]), or `None`
+    /// when it keeps no fixed inode table.
+    pub fn inode_line(&self) -> Option<u64> {
+        self.total_inodes.map(free_inode_line)
+    }
+
+    /// `(free, line)` when the volume's free inodes are under its line: every
+    /// create on it is about to be refused, whatever its free bytes say.
+    pub fn inodes_short(&self) -> Option<(u64, u64)> {
+        let free = self.free_inodes?;
+        let line = self.inode_line()?;
+        (free < line).then_some((free, line))
+    }
+}
+
+/// The host's shared temp directory (the process's `TMPDIR`, else `/tmp`),
+/// measured when it is a filesystem apart from every volume the executor keeps
+/// state on.
+///
+/// Diagnosis only, never an admission input. The executor keeps nothing there
+/// that placing work needs, and the directory is shared with every other
+/// tenant of the host: gating on it would let another tenant's files refuse
+/// Cairn's work, which is the failure measuring it exists to explain. The path
+/// is the host's own, not the executor home's, so it crosses the boundary as
+/// read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HostTempVolume {
+    pub path: String,
+    /// `tmpfs`, `ext4`, `apfs`, ...; `None` when the platform does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<String>,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// As [`MachineVolume::total_inodes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_inodes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_inodes: Option<u64>,
+}
+
+impl HostTempVolume {
+    /// The volume as a [`MachineVolume`], for the lines every volume shares.
+    pub fn volume(&self) -> MachineVolume {
+        MachineVolume {
+            total_bytes: self.total_bytes,
+            free_bytes: self.free_bytes,
+            total_inodes: self.total_inodes,
+            free_inodes: self.free_inodes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -14870,6 +14955,13 @@ pub struct MachineTelemetry {
     /// volume. Present exactly when `build_volume` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_disk_accounting: Option<Measurement<DiskAccounting>>,
+    /// The host's shared temp filesystem, when it is apart from the home's and
+    /// the build root's volumes. `None` when it is one of them (macOS keeps it
+    /// on the system volume), when the directory is not there, on a platform
+    /// that does not measure it, and from an executor that predates it.
+    /// Diagnosis only: see [`HostTempVolume`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_temp: Option<Measurement<HostTempVolume>>,
 }
 
 /// The stable name of a machine reading, used wherever a gap has to be reported
@@ -16800,6 +16892,32 @@ pub const IDLE_RETENTION_PRESSURE_FREE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// cold rebuild. Sits between the watermark and the pressure line, and the
 /// runtime policy refuses any other order.
 pub const STORAGE_CRITICAL_FREE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// The inode line's floor: free inodes under which a volume cells grow on
+/// reads `pressured` and admission holds, whatever its free bytes.
+///
+/// A filesystem with a fixed inode table refuses every create once the table
+/// is spent, with bytes to spare: a build writes tens of thousands of small
+/// files, and git writes several per object it unpacks. 65,536 is a few
+/// builds' worth, so the line is met while there is still room to finish what
+/// is running.
+pub const STORAGE_CRITICAL_FREE_INODES: u64 = 65_536;
+
+/// The inode line's share of the volume's table, in thousandths. The line is
+/// the larger of this and [`STORAGE_CRITICAL_FREE_INODES`], the same shape as
+/// the byte lines.
+pub const STORAGE_CRITICAL_FREE_INODES_PERMILLE: u64 = 10;
+
+/// The free-inode line on a volume whose table holds `total_inodes`.
+///
+/// Never above a quarter of the table, so a small table (a test volume, a
+/// little tmpfs) is not read as short while it is mostly empty.
+pub fn free_inode_line(total_inodes: u64) -> u64 {
+    let fraction = total_inodes.saturating_mul(STORAGE_CRITICAL_FREE_INODES_PERMILLE) / 1000;
+    STORAGE_CRITICAL_FREE_INODES
+        .max(fraction)
+        .min(total_inodes / 4)
+}
 
 /// The admission floor: free bytes below which the executor refuses work, and
 /// the volume verdict reads `pressured`. One default for every reader, so the
@@ -19026,11 +19144,42 @@ pub enum AdmissionHoldEvidence {
     /// Free space under the floor admission would charge this request.
     /// `sweep_in_flight` is whether reclamation is running now, which is the
     /// only posted sign that waiting can help.
+    ///
+    /// With `inodes` present the hold is on inodes instead, with the bytes not
+    /// short. Reclamation of bytes frees inodes too, but nothing runs a pass
+    /// on that condition, so waiting helps only as much as the regular
+    /// housekeeping does.
     Disk {
         free_bytes: u64,
         floor_bytes: u64,
         sweep_in_flight: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inodes: Option<InodeShortfall>,
     },
+}
+
+/// A volume's free inodes under their line ([`free_inode_line`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InodeShortfall {
+    /// Which volume (`build volume`, `home volume`), where the reader needs
+    /// telling; absent when the condition already says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
+    pub free_inodes: u64,
+    pub floor_inodes: u64,
+}
+
+impl InodeShortfall {
+    /// `build volume has 65,535 free inodes (floor 65,536)`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} has {} free inodes (floor {})",
+            self.volume.as_deref().unwrap_or("disk"),
+            describe_count(self.free_inodes),
+            describe_count(self.floor_inodes)
+        )
+    }
 }
 
 impl AdmissionHoldEvidence {
@@ -19119,9 +19268,14 @@ impl AdmissionHoldEvidence {
                 format!("held: {}", parts.join(", "))
             }
             Self::Disk {
+                inodes: Some(shortfall),
+                ..
+            } => format!("held: {}", shortfall.describe()),
+            Self::Disk {
                 free_bytes,
                 floor_bytes,
                 sweep_in_flight,
+                inodes: None,
             } => format!(
                 "held: disk free {} (floor {}), {}",
                 describe_gib(*free_bytes),
@@ -19134,6 +19288,19 @@ impl AdmissionHoldEvidence {
             ),
         }
     }
+}
+
+/// `1048576` as `1,048,576`: inode counts are read by people, not parsed.
+pub fn describe_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// This machine already declined the entry being placed. History, not current
@@ -25657,6 +25824,7 @@ mod tests {
                         measured_at_unix_ms: 4,
                     },
                     HostPressureCondition::DiskFree {
+                        inodes: None,
                         free_bytes: 3,
                         floor_bytes: 4,
                     },
@@ -25845,6 +26013,7 @@ mod tests {
             ),
         };
         let machine = MachineTelemetry {
+            host_temp: None,
             build_volume: None,
             build_disk_accounting: None,
             cpu: Measurement::measured(
@@ -25867,6 +26036,8 @@ mod tests {
             volume: Measurement::measured(
                 42,
                 MachineVolume {
+                    total_inodes: None,
+                    free_inodes: None,
                     total_bytes: 100,
                     free_bytes: 50,
                 },
@@ -27047,6 +27218,8 @@ mod tests {
         let zero = Measurement::measured(
             700,
             MachineVolume {
+                total_inodes: None,
+                free_inodes: None,
                 total_bytes: 10,
                 free_bytes: 0,
             },
@@ -27291,6 +27464,7 @@ mod tests {
     #[test]
     fn diagnostic_gaps_are_visible_but_are_not_placement_gaps() {
         let windows_shaped = MachineTelemetry {
+            host_temp: None,
             build_volume: None,
             build_disk_accounting: None,
             cpu: Measurement::measured(
@@ -27313,6 +27487,8 @@ mod tests {
             volume: Measurement::measured(
                 1,
                 MachineVolume {
+                    total_inodes: None,
+                    free_inodes: None,
                     total_bytes: 900,
                     free_bytes: 400,
                 },
@@ -27372,6 +27548,7 @@ mod tests {
 
         // A placement input that goes missing is still a placement gap.
         let blind = MachineTelemetry {
+            host_temp: None,
             volume: Measurement::unavailable(2, MeasurementGap::SamplingFailed),
             ..windows_shaped
         };
@@ -27386,6 +27563,7 @@ mod tests {
     #[test]
     fn telemetry_age_reads_the_oldest_value_and_ignores_gaps() {
         let telemetry = MachineTelemetry {
+            host_temp: None,
             cpu: Measurement::measured(
                 9_000,
                 CpuPressure {

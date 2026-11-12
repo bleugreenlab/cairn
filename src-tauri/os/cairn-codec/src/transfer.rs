@@ -248,7 +248,17 @@ pub fn build_delta_pack(
 /// Validate a received non-thin pack, derive its v2 index and canonical object
 /// manifest, and enforce transfer limits. Indexing occurs against an empty ODB,
 /// so a thin pack with an external delta base is rejected.
-pub fn validate_pack(pack: &[u8], limits: PackLimits) -> Result<ValidatedPack, String> {
+///
+/// The throwaway repository the pack is indexed in is created under `scratch`
+/// and removed before returning, on success and failure alike. The caller
+/// names `scratch` because only it knows which filesystem it owns: a
+/// process-wide temp directory is shared with every other tenant of the host
+/// and can be full while the caller's own volume has ample room.
+pub fn validate_pack(
+    pack: &[u8],
+    limits: PackLimits,
+    scratch: &Path,
+) -> Result<ValidatedPack, String> {
     if pack.len() as u64 > limits.max_pack_bytes {
         return Err(format!(
             "pack exceeds byte limit: {} > {}",
@@ -256,8 +266,10 @@ pub fn validate_pack(pack: &[u8], limits: PackLimits) -> Result<ValidatedPack, S
             limits.max_pack_bytes
         ));
     }
-    let scratch = tempfile::tempdir().map_err(|e| format!("creating pack quarantine: {e}"))?;
-    let git_dir = scratch.path().join("repository.git");
+    let scratch_dir = scratch_tempdir(scratch, ".validate-")
+        .map_err(|e| format!("creating pack validation scratch under {e}"))?;
+    let scratch = scratch_dir.path();
+    let git_dir = scratch.join("repository.git");
     // host-default-branch: a throwaway quarantine that validates a pack's
     // objects; no ref in it is ever read.
     let init = Command::new("git")
@@ -272,8 +284,8 @@ pub fn validate_pack(pack: &[u8], limits: PackLimits) -> Result<ValidatedPack, S
         ));
     }
     let objects = git_dir.join("objects");
-    let pack_path = scratch.path().join("incoming.pack");
-    let index_path = scratch.path().join("incoming.idx");
+    let pack_path = scratch.join("incoming.pack");
+    let index_path = scratch.join("incoming.idx");
     fs::write(&pack_path, pack).map_err(|e| format!("writing quarantined pack: {e}"))?;
 
     let input = File::open(&pack_path).map_err(|e| format!("opening quarantined pack: {e}"))?;
@@ -398,15 +410,19 @@ pub fn install_pack(
 /// any repository's own `shallow` file, so the boundary must be passed in;
 /// without it a shallow source's never-fetched parent reads as a missing
 /// object. Anything missing on the near side of the boundary is still refused.
+///
+/// The throwaway repository is created under `scratch`, for the same reason
+/// [`validate_pack`] takes one.
 pub fn verify_commit_closure(
     primary_objects_dir: &Path,
     alternate_objects_dirs: &[PathBuf],
     shallow: &[String],
     commit: &str,
+    scratch: &Path,
 ) -> Result<ClosureManifest, String> {
     validate_oid(commit)?;
     validate_oids(shallow)?;
-    let plumbing_repo = plumbing_repository()?;
+    let plumbing_repo = plumbing_repository(scratch)?;
     if !shallow.is_empty() {
         write_shallow_list(&plumbing_repo.path().join("shallow"), shallow)?;
     }
@@ -434,7 +450,12 @@ pub fn verify_commit_closure(
         validate_oid(oid)?;
         oids.push(oid.to_owned());
     }
-    let objects = canonical_object_sizes(primary_objects_dir, alternate_objects_dirs, &oids)?;
+    let objects = canonical_object_sizes(
+        plumbing_repo.path(),
+        primary_objects_dir,
+        alternate_objects_dirs,
+        &oids,
+    )?;
     let canonical_bytes = objects.iter().map(|object| object.canonical_bytes).sum();
     Ok(ClosureManifest {
         commit: commit.to_owned(),
@@ -576,8 +597,10 @@ fn write_shallow_list(path: &Path, commits: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Return canonical sizes for object IDs resolved through primary plus alternates.
+/// Return canonical sizes for object IDs resolved through primary plus
+/// alternates, using the throwaway `plumbing_git_dir` as the repository.
 fn canonical_object_sizes(
+    plumbing_git_dir: &Path,
     primary_objects_dir: &Path,
     alternate_objects_dirs: &[PathBuf],
     object_ids: &[String],
@@ -587,7 +610,6 @@ fn canonical_object_sizes(
     if !input.is_empty() {
         input.push('\n');
     }
-    let plumbing_repo = plumbing_repository()?;
     let output = git(
         Path::new("."),
         &[
@@ -596,7 +618,7 @@ fn canonical_object_sizes(
         ],
         Some(input.as_bytes()),
         &odb_env(
-            plumbing_repo.path(),
+            plumbing_git_dir,
             primary_objects_dir,
             alternate_objects_dirs,
         ),
@@ -702,8 +724,18 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("syncing {}: {e}", path.display()))
 }
 
-fn plumbing_repository() -> Result<tempfile::TempDir, String> {
-    let repo = tempfile::tempdir().map_err(|e| format!("creating plumbing repository: {e}"))?;
+/// A uniquely named directory under `parent`, removed when dropped. The error
+/// names `parent`, so a refusal says which filesystem could not take it.
+fn scratch_tempdir(parent: &Path, prefix: &str) -> Result<tempfile::TempDir, String> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(parent)
+        .map_err(|e| format!("{}: {e}", parent.display()))
+}
+
+fn plumbing_repository(scratch: &Path) -> Result<tempfile::TempDir, String> {
+    let repo = scratch_tempdir(scratch, ".closure-")
+        .map_err(|e| format!("creating plumbing repository under {e}"))?;
     // host-default-branch: a throwaway repository for object plumbing; no ref
     // in it is ever read.
     let output = Command::new("git")
@@ -844,8 +876,16 @@ mod tests {
         let oid = commit_all(source.path(), "base");
         let count = 100_000;
         let object_ids = vec![oid.clone(); count];
+        let scratch = tempfile::tempdir().unwrap();
+        let plumbing = plumbing_repository(scratch.path()).unwrap();
 
-        let sizes = canonical_object_sizes(&objects_dir(source.path()), &[], &object_ids).unwrap();
+        let sizes = canonical_object_sizes(
+            plumbing.path(),
+            &objects_dir(source.path()),
+            &[],
+            &object_ids,
+        )
+        .unwrap();
 
         assert_eq!(sizes.len(), count);
         assert!(sizes.iter().all(|size| size.oid == oid));
@@ -853,6 +893,7 @@ mod tests {
 
     #[test]
     fn cold_closure_pack_validates_and_installs_idempotently() {
+        let scratch = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
         init_repo(source.path());
         write_file(source.path(), "base.txt", b"base");
@@ -863,7 +904,7 @@ mod tests {
         let (pack, _) = build_reachable_pack(source.path(), std::slice::from_ref(&tip), &[])
             .unwrap()
             .unwrap();
-        let validated = validate_pack(&pack, PackLimits::default()).unwrap();
+        let validated = validate_pack(&pack, PackLimits::default(), scratch.path()).unwrap();
         assert!(validated.manifest.object_count >= 6);
         assert!(validated.manifest.canonical_bytes > 0);
 
@@ -873,7 +914,8 @@ mod tests {
         assert!(!first.already_present);
         let second = install_pack(&target_objects, &validated).unwrap();
         assert!(second.already_present);
-        let closure = verify_commit_closure(&target_objects, &[], &[], &tip).unwrap();
+        let closure =
+            verify_commit_closure(&target_objects, &[], &[], &tip, scratch.path()).unwrap();
         assert_eq!(closure.commit, tip);
         assert!(closure.objects.iter().any(|object| object.kind == "blob"));
 
@@ -885,6 +927,7 @@ mod tests {
 
     #[test]
     fn corrupt_truncated_and_limited_packs_are_rejected_without_installation() {
+        let scratch = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
         init_repo(source.path());
         write_file(source.path(), "a", b"content");
@@ -895,14 +938,20 @@ mod tests {
 
         let mut corrupt = pack.clone();
         corrupt[20] ^= 0xff;
-        assert!(validate_pack(&corrupt, PackLimits::default()).is_err());
-        assert!(validate_pack(&pack[..pack.len() - 8], PackLimits::default()).is_err());
+        assert!(validate_pack(&corrupt, PackLimits::default(), scratch.path()).is_err());
+        assert!(validate_pack(
+            &pack[..pack.len() - 8],
+            PackLimits::default(),
+            scratch.path()
+        )
+        .is_err());
         assert!(validate_pack(
             &pack,
             PackLimits {
                 max_pack_bytes: 1,
                 ..PackLimits::default()
-            }
+            },
+            scratch.path()
         )
         .is_err());
         assert!(validate_pack(
@@ -910,13 +959,58 @@ mod tests {
             PackLimits {
                 max_object_count: 1,
                 ..PackLimits::default()
-            }
+            },
+            scratch.path()
         )
         .is_err());
     }
 
     #[test]
+    fn validation_and_closure_scratch_lives_under_the_named_parent_and_is_removed() {
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path());
+        write_file(source.path(), "a", b"content");
+        let tip = commit_all(source.path(), "tip");
+        let (pack, _) = build_reachable_pack(source.path(), std::slice::from_ref(&tip), &[])
+            .unwrap()
+            .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let entries = || fs::read_dir(scratch.path()).unwrap().count();
+
+        let validated = validate_pack(&pack, PackLimits::default(), scratch.path()).unwrap();
+        assert_eq!(entries(), 0, "a validated pack leaves no scratch behind");
+        let mut corrupt = pack.clone();
+        corrupt[20] ^= 0xff;
+        assert!(validate_pack(&corrupt, PackLimits::default(), scratch.path()).is_err());
+        assert_eq!(entries(), 0, "a refused pack leaves no scratch behind");
+
+        let target = tempfile::tempdir().unwrap();
+        let objects = target.path().join("objects");
+        install_pack(&objects, &validated).unwrap();
+        verify_commit_closure(&objects, &[], &[], &tip, scratch.path()).unwrap();
+        assert_eq!(entries(), 0, "a proven closure leaves no scratch behind");
+        assert!(
+            verify_commit_closure(&objects, &[], &[], &"0".repeat(40), scratch.path()).is_err()
+        );
+        assert_eq!(
+            entries(),
+            0,
+            "a failed closure proof leaves no scratch behind"
+        );
+
+        // A parent that cannot be written to is named in the refusal, so the
+        // condition is diagnosable from the error alone.
+        let missing = scratch.path().join("absent");
+        let refused = validate_pack(&pack, PackLimits::default(), &missing).unwrap_err();
+        assert!(
+            refused.contains(&missing.display().to_string()),
+            "{refused}"
+        );
+    }
+
+    #[test]
     fn closure_can_resolve_through_primary_and_alternate_storage() {
+        let scratch = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
         init_repo(source.path());
         write_file(source.path(), "base", b"base object");
@@ -929,16 +1023,29 @@ mod tests {
         let delta = build_delta_pack(source.path(), &tip, &base)
             .unwrap()
             .unwrap();
-        let validated = validate_pack(&delta.0, PackLimits::default()).unwrap();
+        let validated = validate_pack(&delta.0, PackLimits::default(), scratch.path()).unwrap();
         install_pack(&objects_dir(target.path()), &validated).unwrap();
         let alternate = objects_dir(source.path());
-        let closure =
-            verify_commit_closure(&objects_dir(target.path()), &[alternate], &[], &tip).unwrap();
+        let closure = verify_commit_closure(
+            &objects_dir(target.path()),
+            &[alternate],
+            &[],
+            &tip,
+            scratch.path(),
+        )
+        .unwrap();
         assert!(closure.object_count > validated.manifest.object_count);
 
         let empty = tempfile::tempdir().unwrap();
         fs::create_dir_all(empty.path().join("objects/pack")).unwrap();
-        assert!(verify_commit_closure(&empty.path().join("objects"), &[], &[], &tip).is_err());
+        assert!(verify_commit_closure(
+            &empty.path().join("objects"),
+            &[],
+            &[],
+            &tip,
+            scratch.path()
+        )
+        .is_err());
     }
 
     /// A three-commit upstream and a `--depth 1` clone of it: the clone holds
@@ -965,6 +1072,7 @@ mod tests {
 
     #[test]
     fn closure_stops_at_a_shallow_source_boundary_and_not_before_it() {
+        let scratch = tempfile::tempdir().unwrap();
         let (_temp, clone, tip, parent) = shallow_clone();
         let shallow = shallow_commits(&clone).unwrap();
         assert_eq!(shallow, vec![tip.clone()]);
@@ -972,10 +1080,13 @@ mod tests {
         // Blind to the boundary, the walk crosses it into the parent the clone
         // never fetched: the failure every resident batch of a shallow-cloned
         // project hit.
-        let blind = verify_commit_closure(&objects_dir(&clone), &[], &[], &tip).unwrap_err();
+        let blind = verify_commit_closure(&objects_dir(&clone), &[], &[], &tip, scratch.path())
+            .unwrap_err();
         assert_eq!(blind, format!("commit closure is missing object {parent}"));
 
-        let closure = verify_commit_closure(&objects_dir(&clone), &[], &shallow, &tip).unwrap();
+        let closure =
+            verify_commit_closure(&objects_dir(&clone), &[], &shallow, &tip, scratch.path())
+                .unwrap();
         assert!(closure.objects.iter().any(|object| object.oid == tip));
         assert!(closure.objects.iter().all(|object| object.oid != parent));
 
@@ -986,7 +1097,7 @@ mod tests {
         let (pack, _) = build_reachable_pack(&clone, std::slice::from_ref(&tip), &[])
             .unwrap()
             .unwrap();
-        let validated = validate_pack(&pack, PackLimits::default()).unwrap();
+        let validated = validate_pack(&pack, PackLimits::default(), scratch.path()).unwrap();
         let without_blob = packed.path().join("objects");
         let blob_free: Vec<_> = validated
             .manifest
@@ -999,17 +1110,18 @@ mod tests {
             build_pack_from_oids(&clone, &format!("{}\n", blob_free.join("\n"))).unwrap();
         install_pack(
             &without_blob,
-            &validate_pack(&partial, PackLimits::default()).unwrap(),
+            &validate_pack(&partial, PackLimits::default(), scratch.path()).unwrap(),
         )
         .unwrap();
         assert_eq!(
-            verify_commit_closure(&without_blob, &[], &shallow, &tip).unwrap_err(),
+            verify_commit_closure(&without_blob, &[], &shallow, &tip, scratch.path()).unwrap_err(),
             format!("commit closure is missing object {blob}")
         );
     }
 
     #[test]
     fn a_complete_source_missing_an_object_is_still_refused() {
+        let scratch = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
         init_repo(source.path());
         write_file(source.path(), "base", b"base");
@@ -1024,13 +1136,21 @@ mod tests {
         fs::remove_file(loose).unwrap();
         let shallow = shallow_commits(source.path()).unwrap();
         assert_eq!(
-            verify_commit_closure(&objects_dir(source.path()), &[], &shallow, &tip).unwrap_err(),
+            verify_commit_closure(
+                &objects_dir(source.path()),
+                &[],
+                &shallow,
+                &tip,
+                scratch.path()
+            )
+            .unwrap_err(),
             format!("commit closure is missing object {base}")
         );
     }
 
     #[test]
     fn the_boundary_a_commit_reaches_is_carried_and_recorded_by_a_receiver() {
+        let scratch = tempfile::tempdir().unwrap();
         let (_temp, clone, tip, _parent) = shallow_clone();
         write_file(&clone, "four", b"four");
         let child = commit_all(&clone, "four");
@@ -1045,7 +1165,7 @@ mod tests {
             .unwrap();
         install_pack(
             &receiver.path().join("objects"),
-            &validate_pack(&pack, PackLimits::default()).unwrap(),
+            &validate_pack(&pack, PackLimits::default(), scratch.path()).unwrap(),
         )
         .unwrap();
         let boundary = parse_shallow_boundary(
