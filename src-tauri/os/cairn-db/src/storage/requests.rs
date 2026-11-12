@@ -911,6 +911,11 @@ pub async fn report_request_with_fulfillment(
             conn.execute("UPDATE request_attempts SET state=?2,outcome=?3,report_json=?4,updated_at=?5,settled=?6 WHERE id=?1",params![attempt,state,encode(&outcome)?.trim_matches('"').to_string(),encode(&report)?,now,i64::from(settled)]).await?;
             for m in &a.acceptance.request_ids {
                 conn.execute("UPDATE requests SET state=?2,report_json=?3,updated_at=?4 WHERE id=?1",params![m.clone(),state,encode(&report)?,now]).await?;
+                if outcome==RequestAttemptOutcome::Done {
+                    let mut rows=conn.query("SELECT id FROM request_requesters WHERE request_id=?1 AND active=1 AND satisfied_by_attempt IS NULL ORDER BY id",params![m.clone()]).await?;
+                    let mut open=vec![];while let Some(r)=rows.next().await? {open.push(r.text(0)?);}drop(rows);
+                    record_fulfillment(conn,attempt,m,&open).await?;
+                }
             }
             if settled&&outcome!=RequestAttemptOutcome::Done {reopen(conn,&a,now).await?;}
             else {conn.execute("UPDATE request_cohorts SET state=?2,updated_at=?3 WHERE id=?1",params![a.acceptance.cohort_id.clone(),state,now]).await?;}
@@ -980,7 +985,8 @@ async fn fulfill_conn(
             "linked rebuild fulfillment requires successful checked bump",
         ));
     }
-    let mut requests = std::collections::BTreeSet::new();
+    let mut satisfied: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
     for c in covered {
         let mut rows=conn.query("SELECT x.request_id,r.kind,r.state,x.satisfied_by_attempt FROM request_requesters x JOIN requests r ON r.id=x.request_id WHERE x.id=?1 AND x.active=1",params![c.clone()]).await?;
         let r = rows
@@ -998,20 +1004,19 @@ async fn fulfill_conn(
             return Err(error("covered rebuild contribution is not open"));
         }
         drop(rows);
-        conn.execute(
-            "UPDATE request_requesters SET satisfied_by_attempt=?2 WHERE id=?1",
-            params![c.clone(), bump_attempt],
-        )
-        .await?;
-        requests.insert(request);
+        satisfied.entry(request).or_default().insert(c.clone());
     }
-    let requests: Vec<_> = requests.into_iter().collect();
+    for (request, contributions) in &satisfied {
+        let contributions: Vec<_> = contributions.iter().cloned().collect();
+        record_fulfillment(conn, bump_attempt, request, &contributions).await?;
+    }
+    let requests: Vec<_> = satisfied.into_keys().collect();
     for request in &requests {
         let r = get_conn(conn, request)
             .await?
             .ok_or_else(|| error("missing rebuild"))?;
         let remaining=text(conn,"SELECT id FROM request_requesters WHERE request_id=?1 AND active=1 AND satisfied_by_attempt IS NULL LIMIT 1",params![request.clone()]).await?;
-        conn.execute("UPDATE requests SET fulfilled_by_attempt=?2,report_json=?3,updated_at=?4,state=?5 WHERE id=?1",params![request.clone(),bump_attempt,encode(&json!({"fulfilled_by_attempt":bump_attempt,"authorization_event_id":event,"report":report}))?,now,if remaining.is_none(){"done"}else{"open"}]).await?;
+        conn.execute("UPDATE requests SET report_json=?2,updated_at=?3,state=?4 WHERE id=?1",params![request.clone(),encode(&json!({"fulfilled_by_attempt":bump_attempt,"authorization_event_id":event,"report":report}))?,now,if remaining.is_none(){"done"}else{"open"}]).await?;
         conn.execute(
             "UPDATE request_cohorts SET revision=revision+1,updated_at=?2 WHERE id=?1",
             params![r.cohort_id.clone(), now],
@@ -1032,6 +1037,31 @@ async fn fulfill_conn(
         }
     }
     Ok(requests)
+}
+/// Records `attempt` as what satisfied `contributions` of `request` and what
+/// fulfilled the request. Both finishing paths (a request's own accepted
+/// attempt, and a bump attempt's proven coverage) write through here, so
+/// `recompute` reads a finished request's contributions as satisfied rather
+/// than open.
+async fn record_fulfillment(
+    conn: &TrackedConnection,
+    attempt: &str,
+    request: &str,
+    contributions: &[String],
+) -> DbResult<()> {
+    for c in contributions {
+        conn.execute(
+            "UPDATE request_requesters SET satisfied_by_attempt=?3 WHERE id=?1 AND request_id=?2",
+            params![c.clone(), request, attempt],
+        )
+        .await?;
+    }
+    conn.execute(
+        "UPDATE requests SET fulfilled_by_attempt=?2 WHERE id=?1",
+        params![request, attempt],
+    )
+    .await?;
+    Ok(())
 }
 pub async fn request_gate_state(db: &LocalDb, request: &str) -> DbResult<Option<RequestGateState>> {
     let request_owned = request.to_string();
@@ -1664,6 +1694,12 @@ mod tests {
             .unwrap();
         }
         assert_eq!(count(&db, "request_report_receipts").await, 1);
+        let done = get_request(&db, &r.request.id).await.unwrap().unwrap();
+        assert_eq!(done.state, RequestState::Done);
+        assert_eq!(
+            done.fulfilled_by_attempt.as_deref(),
+            Some(a.attempt_id.as_str())
+        );
         assert!(report_request(
             &db,
             &a.attempt_id,
@@ -1676,6 +1712,43 @@ mod tests {
         )
         .await
         .is_err());
+    }
+    #[tokio::test]
+    async fn recompute_keeps_a_request_done_by_its_own_attempt_done() {
+        let db = db().await;
+        let r = file_request(&db, &input(RequestKind::Rebuild, "a", None), 1)
+            .await
+            .unwrap();
+        let a = envelope(&db, &r.request.id).await;
+        let attempt = accept_request(&db, &a).await.unwrap();
+        claim_request(&db, &attempt.authorization_event_id, &a, "claim", 4)
+            .await
+            .unwrap();
+        report_request(
+            &db,
+            &a.attempt_id,
+            "claim",
+            "done",
+            RequestAttemptOutcome::Done,
+            json!({"ok":true}),
+            true,
+            5,
+        )
+        .await
+        .unwrap();
+        let cohort = a.cohort_id.clone();
+        db.exclusive(move |conn| {
+            let cohort = cohort.clone();
+            Box::pin(async move { recompute(conn, &cohort, 6).await })
+        })
+        .await
+        .unwrap();
+        let done = get_request(&db, &r.request.id).await.unwrap().unwrap();
+        assert_eq!(done.state, RequestState::Done);
+        assert!(done
+            .requesters
+            .iter()
+            .all(|c| c.satisfied_by_attempt.as_deref() == Some(a.attempt_id.as_str())));
     }
     #[tokio::test]
     async fn bump_report_links_only_proven_contributions_atomically_without_acceptance() {

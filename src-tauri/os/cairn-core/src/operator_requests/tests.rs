@@ -505,6 +505,11 @@ async fn policy_enabled_after_claim_blocks_live_recheck_but_allows_failure_repor
         .unwrap();
     let failed = get(&orch, &card.id).await.unwrap().unwrap();
     assert_eq!(failed.state, RequestState::Open);
+    assert!(failed.fulfilled_by_attempt.is_none());
+    assert!(failed
+        .requesters
+        .iter()
+        .all(|c| c.satisfied_by_attempt.is_none()));
     assert_eq!(
         failed.attempts[0].outcome,
         Some(RequestAttemptOutcome::Failed)
@@ -931,6 +936,44 @@ async fn settled_failure_preserves_attempt_and_joins_late_successor_before_fresh
     assert_eq!(attempt.acceptance.request_ids.len(), 2);
     assert_gate(&orch, &late, "accepted", true).await;
     assert!(old.recheck(&orch).await.is_err());
+    assert!(reopened.fulfilled_by_attempt.is_none());
+    assert!(reopened
+        .requesters
+        .iter()
+        .all(|c| c.satisfied_by_attempt.is_none()));
+}
+
+#[tokio::test]
+async fn request_done_by_its_own_attempt_records_that_attempt_as_its_fulfillment() {
+    let orch = fixture().await;
+    let consumer = register(&orch, RequestKind::Rebuild);
+    let card = file_rebuild(&orch, "run", "first").await;
+    file_rebuild(&orch, "thread-run", "second").await;
+    let card = get(&orch, &card.id).await.unwrap().unwrap();
+    assert_eq!(card.requesters.len(), 2);
+    let accepted = accept_card(&orch, &card).await.unwrap();
+    dispatch_accepted(&orch, &accepted.attempts[0].authorization_event_id)
+        .await
+        .unwrap();
+    let context = consumer.context();
+    context
+        .report(
+            &orch,
+            "rebuild-done",
+            report(RequestAttemptOutcome::Done, true, true),
+        )
+        .await
+        .unwrap();
+    let attempt = context.acceptance().attempt_id.clone();
+    let done = get(&orch, &card.id).await.unwrap().unwrap();
+    assert_eq!(done.state, RequestState::Done);
+    assert_eq!(done.current_attempt.as_deref(), Some(attempt.as_str()));
+    assert_eq!(done.fulfilled_by_attempt.as_deref(), Some(attempt.as_str()));
+    assert!(done
+        .requesters
+        .iter()
+        .filter(|c| c.active)
+        .all(|c| c.satisfied_by_attempt.as_deref() == Some(attempt.as_str())));
 }
 
 async fn assert_gate(
