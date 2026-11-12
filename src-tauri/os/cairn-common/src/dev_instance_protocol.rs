@@ -553,6 +553,7 @@ mod tests {
                 containment: None,
                 stop: None,
                 cell_origin: None,
+                test_phase: None,
             },
             mutation_delta: None,
             sandbox_denials: vec![],

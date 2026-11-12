@@ -5,8 +5,8 @@ use cairn_common::executor_protocol::{
     ContentionEvidence, ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence,
     DurationFallback, ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities,
     MeasurementQuality, MemoryCeiling, MemoryKill, ProcessDemandBasis, ReservationFallback,
-    ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW,
-    MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    ReservationRationale, TestPhaseEvidence, TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS,
+    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
@@ -367,9 +367,14 @@ impl ResolvedResourceProfile {
     /// largest rustc, not a measurement of this work, so it does not count; nor
     /// does a borrowed tree peak, which scales with the width of the machine
     /// that measured it rather than with this one.
+    ///
+    /// The suite's test phase as measured on this machine rides beside it, so
+    /// the executor can step a running lane down to it once the lane's own
+    /// output shows that phase; without one the lane keeps this charge.
     pub(super) fn charge_measured_peak(&mut self) {
         self.reservation.measured_peak_bytes =
             measured_peak_bytes(self.reservation.measured_peak_bytes, &self.process_evidence);
+        self.reservation.test_phase = self.process_evidence.test_phase;
     }
 }
 
@@ -589,15 +594,30 @@ pub(super) struct ProcessEvidence {
     /// its suite, or of any of the project's Rust compiles was measured on
     /// any platform: placement offers it the largest machines first.
     pub unmeasured_compile: bool,
+    /// The suite's test phase as measured on this very machine context, and
+    /// nowhere else: a test phase measured elsewhere ran at another width on
+    /// another volume, and an unmeasured one keeps the whole-suite charge.
+    pub test_phase: Option<TestPhaseEvidence>,
 }
 
 impl ProcessEvidence {
-    /// A batch's evidence: the heaviest item on each side.
+    /// A batch's evidence: the heaviest item on each side. Its test phase
+    /// stands only where both sides measured one, because whichever item is
+    /// testing must be covered by the figure the lane steps down to.
     pub(super) fn max(left: Self, right: Self) -> Self {
         Self {
             demand: ProcessDemand::max(left.demand, right.demand),
             unattributed: ProcessDemand::max(left.unattributed, right.unattributed),
             unmeasured_compile: left.unmeasured_compile || right.unmeasured_compile,
+            test_phase: match (left.test_phase, right.test_phase) {
+                (Some(left), Some(right)) => Some(TestPhaseEvidence {
+                    peak_bytes: left.peak_bytes.max(right.peak_bytes),
+                    bytes_per_concurrent_test: left
+                        .bytes_per_concurrent_test
+                        .max(right.bytes_per_concurrent_test),
+                }),
+                _ => None,
+            },
         }
     }
 
@@ -753,6 +773,7 @@ pub(super) async fn resolve_process_demand(
         demand,
         unattributed,
         unmeasured_compile,
+        test_phase: suite.and_then(|suite| suite.test_phase),
     }
 }
 
@@ -779,6 +800,8 @@ struct SuiteEvidence {
     peak: Option<(u64, Option<String>, String)>,
     kills_here: Option<SuiteKills>,
     elsewhere: Option<(u64, String, String, String)>,
+    /// Its test phase in this machine context.
+    test_phase: Option<TestPhaseEvidence>,
 }
 
 /// The identity's evidence on this platform, and its largest single process
@@ -874,7 +897,8 @@ async fn load_suite_evidence(
                             oom_kill_count, oom_machine_total_bytes, os, arch,
                             oom_kill_memory_brake, oom_crowded_kill_count,
                             oom_crowded_most_co_resident, oom_crowded_memory_brake,
-                            oom_crowded_killed_at_unix_ms
+                            oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes,
+                            upper_test_phase_bytes_per_test
                      FROM suite_memory_evidence
                      WHERE suite_key=?1",
                     params![suite_key],
@@ -884,6 +908,7 @@ async fn load_suite_evidence(
                 peak: None,
                 kills_here: None,
                 elsewhere: None,
+                test_phase: None,
             };
             let mut any = false;
             while let Some(row) = rows.next().await? {
@@ -923,6 +948,14 @@ async fn load_suite_evidence(
                     let kills = suite_kills_from_row(&row, 3)?;
                     if kills.alone > 0 || kills.crowded.is_some() {
                         evidence.kills_here = Some(kills);
+                    }
+                    let peak = row.get::<Option<i64>>(12)?;
+                    let per_test = row.get::<Option<i64>>(13)?;
+                    if let (Some(peak), Some(per_test)) = (peak, per_test) {
+                        evidence.test_phase = Some(TestPhaseEvidence {
+                            peak_bytes: peak.max(0) as u64,
+                            bytes_per_concurrent_test: per_test.max(0) as u64,
+                        });
                     }
                 }
             }
@@ -1084,6 +1117,7 @@ pub(super) async fn observe_suite(
         peak,
         kills,
         None,
+        metadata.test_phase,
     )
     .await;
 }
@@ -1170,6 +1204,7 @@ pub(super) async fn observe_suite_kill(
             },
         }),
         Some(kill.pid),
+        None,
     )
     .await;
 }
@@ -1185,6 +1220,10 @@ pub(super) const RESIDENT_KILL_LEARNING_HORIZON_MS: u64 = 24 * 60 * 60 * 1_000;
 /// anything the runner would replay.
 const RESIDENT_KILL_IDENTITY_KEPT_MS: u64 = 2 * RESIDENT_KILL_LEARNING_HORIZON_MS;
 
+/// Fold one observation into the suite's row in this machine context. A
+/// test phase raises the row's test-phase peak and per-test figure, each
+/// independently and never lowering either.
+#[allow(clippy::too_many_arguments)]
 async fn record_suite_evidence(
     db: Arc<LocalDb>,
     suite_key: &str,
@@ -1193,8 +1232,9 @@ async fn record_suite_evidence(
     peak: Option<(u64, Option<String>)>,
     kills: KillsSeen,
     resident_kill: Option<u32>,
+    test_phase: Option<TestPhaseMeasurement>,
 ) -> Result<(), String> {
-    if peak.is_none() && kills == KillsSeen::Neither {
+    if peak.is_none() && kills == KillsSeen::Neither && test_phase.is_none() {
         return Ok(());
     }
     let suite_key = suite_key.to_string();
@@ -1237,7 +1277,7 @@ async fn record_suite_evidence(
                 context.os.clone(),
                 context.arch.clone()
             ];
-            if peak.is_none() && kills == KillsSeen::CleanRun {
+            if peak.is_none() && kills == KillsSeen::CleanRun && test_phase.is_none() {
                 // Nothing to learn but that the kills are over: a row that
                 // does not exist has none to forget.
                 conn.execute(
@@ -1278,8 +1318,8 @@ async fn record_suite_evidence(
                 None => (None, None),
             };
             conn.execute(
-                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                    ON CONFLICT(suite_key, executor_class, os, arch) DO UPDATE SET
                      upper_process_peak_bytes=CASE WHEN ?5 IS NULL THEN suite_memory_evidence.upper_process_peak_bytes WHEN suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes THEN ?5 ELSE suite_memory_evidence.upper_process_peak_bytes END,
                      process_peak_name=CASE WHEN ?5 IS NOT NULL AND (suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes) THEN COALESCE(?6, suite_memory_evidence.process_peak_name) ELSE suite_memory_evidence.process_peak_name END,
@@ -1290,7 +1330,9 @@ async fn record_suite_evidence(
                      oom_crowded_kill_count=?11,
                      oom_crowded_most_co_resident=?12,
                      oom_crowded_memory_brake=?13,
-                     oom_crowded_killed_at_unix_ms=?14"#,
+                     oom_crowded_killed_at_unix_ms=?14,
+                     upper_test_phase_peak_bytes=CASE WHEN ?15 IS NULL THEN suite_memory_evidence.upper_test_phase_peak_bytes WHEN suite_memory_evidence.upper_test_phase_peak_bytes IS NULL OR ?15 > suite_memory_evidence.upper_test_phase_peak_bytes THEN ?15 ELSE suite_memory_evidence.upper_test_phase_peak_bytes END,
+                     upper_test_phase_bytes_per_test=CASE WHEN ?16 IS NULL THEN suite_memory_evidence.upper_test_phase_bytes_per_test WHEN suite_memory_evidence.upper_test_phase_bytes_per_test IS NULL OR ?16 > suite_memory_evidence.upper_test_phase_bytes_per_test THEN ?16 ELSE suite_memory_evidence.upper_test_phase_bytes_per_test END"#,
                 params![
                     suite_key.clone(),
                     context.executor_class.clone(),
@@ -1305,7 +1347,9 @@ async fn record_suite_evidence(
                     crowded.map_or(0, |crowded| crowded.count as i64),
                     crowded.and_then(|crowded| crowded.most_co_resident.map(i64::from)),
                     crowded.map(|crowded| i64::from(crowded.memory_brake)),
-                    crowded.map(|crowded| crowded.last_killed_at_unix_ms as i64)
+                    crowded.map(|crowded| crowded.last_killed_at_unix_ms as i64),
+                    test_phase.map(|phase| phase.peak_bytes as i64),
+                    test_phase.map(|phase| phase.bytes_per_concurrent_test() as i64)
                 ],
             )
             .await?;
@@ -1371,6 +1415,7 @@ pub(super) fn cold_start_prior(
         concurrency_units: 1,
         source: ResourceReservationSource::Unmeasured,
         measured_peak_bytes: None,
+        test_phase: None,
     }
 }
 
@@ -1438,6 +1483,7 @@ fn fleet_prior(
         // reader from mistaking another machine's history for this one's.
         source: ResourceReservationSource::Unmeasured,
         measured_peak_bytes: None,
+        test_phase: None,
     })
 }
 
@@ -2234,6 +2280,7 @@ fn reservation_for_profile(
             false => prior.source,
         },
         measured_peak_bytes: None,
+        test_phase: None,
     }
 }
 
@@ -2316,6 +2363,7 @@ pub(super) fn oom_killed_for_test(
             bound_bytes: None,
         }),
         cell_origin: None,
+        test_phase: None,
     }
 }
 
@@ -2658,8 +2706,19 @@ mod process_peak_tests {
         let id = identity("rust-tests-a");
         let suite = suite_key("cairn", Some(&id), CellCommandClass::CargoTest);
         assert_eq!(suite.as_deref(), Some("cairn/rust-tests"));
-        for (peak, at) in [(10 * GIB, 1), (4 * GIB, 2)] {
-            let meta = completed(peak, at);
+        // The test phase rises too, its two figures independently: the
+        // second lane's tree was smaller but ran fewer tests at once.
+        for (peak, at, test_peak, concurrent_tests) in
+            [(10 * GIB, 1, 4 * GIB, 8), (4 * GIB, 2, 3 * GIB, 2)]
+        {
+            let meta = CellExecutionMeta {
+                test_phase: Some(TestPhaseMeasurement {
+                    entered_at_unix_ms: at,
+                    peak_bytes: test_peak,
+                    concurrent_tests,
+                }),
+                ..completed(peak, at)
+            };
             observe_suite(
                 db.clone(),
                 suite.as_deref(),
@@ -2691,6 +2750,34 @@ mod process_peak_tests {
         assert_eq!(demand.peak_bytes, 10 * GIB);
         assert_eq!(demand.name.as_deref(), Some("rustc"));
         assert_eq!(demand.measured_on.as_deref(), Some("fedora:fedora"));
+        let test_phase = |machine: &str| {
+            let db = db.clone();
+            let suite = suite.clone();
+            let context = context(machine);
+            async move {
+                resolve_process_demand(
+                    db,
+                    None,
+                    suite.as_deref(),
+                    CellCommandClass::CargoTest,
+                    &context,
+                )
+                .await
+                .test_phase
+            }
+        };
+        assert_eq!(
+            test_phase("fedora:fedora").await,
+            Some(TestPhaseEvidence {
+                peak_bytes: 4 * GIB,
+                bytes_per_concurrent_test: 3 * GIB / 2,
+            })
+        );
+        assert_eq!(
+            test_phase("bbs:bbs").await,
+            None,
+            "a test phase measured on fedora does not speak for another machine"
+        );
     }
 
     /// A tiered lane's never-seen identity is judged on its suite, measured
@@ -3485,6 +3572,7 @@ mod tests {
                 concurrency_units,
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
+                test_phase: None,
             };
             for sample_count in [0, 1, 4, MIN_CONFIDENT_SAMPLES, 500] {
                 let reservation = reservation_for_profile(
@@ -3518,6 +3606,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         for sample_count in 0..MIN_CONFIDENT_SAMPLES {
             let smaller = reservation_for_profile(
@@ -3568,6 +3657,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             None,
             false,
@@ -3604,6 +3694,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
+            test_phase: None,
         }
     }
 
@@ -3758,6 +3849,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         let profile = |upper_peak_rss_bytes| ResourceProfile {
             sample_count: 50,
@@ -3942,6 +4034,7 @@ mod tests {
             containment: None,
             stop: None,
             cell_origin: None,
+            test_phase: None,
         };
         for round in 0..20 {
             let identity = CommandResourceIdentity {
@@ -4024,6 +4117,7 @@ mod tests {
             containment: None,
             stop: None,
             cell_origin: None,
+            test_phase: None,
         };
 
         observe_completed(
@@ -4061,6 +4155,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             None,
             test_duration_context(),
@@ -4111,6 +4206,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         let resolved = resolve_reservation(
             db,
@@ -4655,6 +4751,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             Some(100),
             true,
@@ -4718,6 +4815,7 @@ mod tests {
             containment: None,
             stop: None,
             cell_origin: None,
+            test_phase: None,
         }
     }
 

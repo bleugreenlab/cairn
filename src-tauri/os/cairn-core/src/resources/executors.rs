@@ -5819,8 +5819,17 @@ fn render_running_now(
                 format!("request {}", request.request_id),
             ),
         };
+        // A phased test lane names the charge it holds and the phase it is
+        // in, so a retained compile reserve reads apart from a measured test
+        // reserve.
+        let charge = match request.memory_charge() {
+            (charged, Some(phase)) => {
+                format!("; {} charged ({})", bytes(charged), phase.describe())
+            }
+            (_, None) => String::new(),
+        };
         out.push_str(&format!(
-            "- {place}: `{command}` [{}] ({identity}, started {}): {}{build_jobs}\n",
+            "- {place}: `{command}` [{}] ({identity}, started {}): {}{build_jobs}{charge}\n",
             request.command_class.as_str(),
             age(now.saturating_sub(request.started_at_unix_ms)),
             usage(request.live_usage)
@@ -9906,6 +9915,7 @@ mod tests {
             command: Some("cargo check".into()),
             charge_bytes: 9 * GIB,
             resident_bytes: Some(GIB),
+            phase: None,
         }];
         let rendered = render_executor(&executor);
         assert!(
@@ -12292,6 +12302,7 @@ mod tests {
                     concurrency_units: 1,
                     source: ResourceReservationSource::Learned,
                     measured_peak_bytes: None,
+                    test_phase: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -13070,6 +13081,7 @@ mod running_now_tests {
                 live_usage: None,
                 build_jobs,
                 adopted: None,
+                memory_phase: None,
             }],
             ..FleetSnapshot::default()
         }
@@ -13090,6 +13102,39 @@ mod running_now_tests {
         // An executor that does not report build jobs leaves the row as it was.
         let silent = render_running_now(&running(None), None, 60_000);
         assert!(silent.contains("usage not measured yet\n"), "{silent}");
+    }
+
+    /// A test lane names the charge it holds and the phase that charge
+    /// belongs to, so a retained compile reserve reads apart from a measured
+    /// test reserve.
+    #[test]
+    fn a_test_lane_names_its_phase_and_charge() {
+        use cairn_common::executor_protocol::{LanePhase, ResourceReservation, TestPhaseEvidence};
+        let mut snapshot = running(Some(BuildJobs::new(8, None)));
+        let lane = &mut snapshot.executing_requests[0];
+        lane.resource_reservation = ResourceReservation {
+            measured_peak_bytes: Some(31 * GIB),
+            test_phase: Some(TestPhaseEvidence {
+                peak_bytes: 4 * GIB,
+                bytes_per_concurrent_test: GIB / 2,
+            }),
+            ..ResourceReservation::default()
+        };
+        lane.memory_phase = Some(LanePhase::Compile);
+        let compiling = render_running_now(&snapshot, None, 60_000);
+        assert!(
+            compiling.contains("; 31.0 GiB charged (compile phase)\n"),
+            "{compiling}"
+        );
+        snapshot.executing_requests[0].memory_phase = Some(LanePhase::Test {
+            since_unix_ms: 19 * 3_600_000 + 2 * 60_000,
+            tests: 1_000,
+        });
+        let testing = render_running_now(&snapshot, None, 60_000);
+        assert!(
+            testing.contains("; 5.0 GiB charged (test phase, since 19:02 UTC)\n"),
+            "{testing}"
+        );
     }
 
     /// Every running row carries its class; an adopted build reads as what

@@ -291,6 +291,7 @@ pub(crate) fn declared_check_reservation(
         concurrency_units: 0,
         source: ResourceReservationSource::Declared,
         measured_peak_bytes: None,
+        test_phase: None,
     }
 }
 

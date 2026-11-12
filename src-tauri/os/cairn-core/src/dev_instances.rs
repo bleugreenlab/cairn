@@ -1319,6 +1319,7 @@ async fn run_launch_session_from(
                     concurrency_units: 1,
                     source: ResourceReservationSource::Declared,
                     measured_peak_bytes: None,
+                    test_phase: None,
                 }),
                 process: ResidentProcessSpec {
                     stdout_framing: ResidentStreamFraming::Bytes,

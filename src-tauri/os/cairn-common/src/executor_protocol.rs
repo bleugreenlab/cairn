@@ -8217,6 +8217,18 @@ pub struct LearnedResourceEstimate {
 /// runner's own classification of the command it places, and the
 /// prerequisite verdict it now gates on is judged by the runner from what the
 /// executor already reports.
+///
+/// cairn/6446 does not move the number. A test lane's memory charge steps
+/// down at its observed compile-to-test boundary: `ResourceReservation` gains
+/// an optional `testPhase` (the runner's learned test-phase evidence),
+/// `ExecutingCellRequest` an optional `memoryPhase`, `OwingWork` an optional
+/// `phase`, and `CellExecutionMeta` an optional `testPhase` (the executor's
+/// measurement). Every one is defaulted and read as absent evidence. What a
+/// runner gets wrong talking to an older executor: nothing; that executor
+/// never steps a charge down, so its lanes keep the whole-suite charge they
+/// always had, and it reports no test phase, so the runner learns none from
+/// it. An older runner sends no `testPhase`, and a newer executor then keeps
+/// the whole-suite charge, fail-closed.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10348,6 +10360,35 @@ pub struct ResourceReservation {
     /// `None` when nothing has been measured anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_peak_bytes: Option<u64>,
+    /// What this work's test phase has been measured to hold on this machine,
+    /// for a suite whose lane compiles and then runs its tests. Admission steps
+    /// a running lane's charge down to [`Self::test_phase_charge_bytes`] once
+    /// the lane's own output shows it has entered that phase. `None` when no
+    /// test phase of this work has been measured on this machine: the lane
+    /// then keeps its whole-suite charge throughout, because an unmeasured
+    /// demand fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_phase: Option<TestPhaseEvidence>,
+}
+
+/// A suite's test phase as measured on one machine: rise-only high-water
+/// marks of its lane's process tree from the moment nextest started its tests
+/// until a compile began again.
+///
+/// Two figures, because the test phase's tree grows with how many tests run
+/// at once, which is the test threads the lane was granted (or fewer, when it
+/// selected fewer tests). A peak measured on a narrow lane says too little
+/// about a wide one, so the per-test figure prices a lane at its own
+/// concurrency; the peak keeps a lane that runs few tests from being priced
+/// below what was measured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestPhaseEvidence {
+    /// The largest test-phase tree measured.
+    pub peak_bytes: u64,
+    /// The largest test-phase tree measured divided by the tests that could
+    /// run at once in it ([`TestPhaseMeasurement::concurrent_tests`]).
+    pub bytes_per_concurrent_test: u64,
 }
 
 const fn default_concurrency_units() -> u32 {
@@ -10362,6 +10403,7 @@ impl Default for ResourceReservation {
             concurrency_units: default_concurrency_units(),
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
+            test_phase: None,
         }
     }
 }
@@ -10382,6 +10424,175 @@ impl ResourceReservation {
     /// memory: its reservation, or its measured peak where that is larger.
     pub fn memory_charge_bytes(&self) -> u64 {
         self.memory_bytes.max(self.measured_peak_bytes.unwrap_or(0))
+    }
+
+    /// What a lane of this work is charged once its test phase has been
+    /// observed, running `concurrent_tests` tests at once: the larger of the
+    /// measured test-phase peak and the measured per-test figure at this
+    /// lane's concurrency, with measured headroom, and never more than
+    /// [`Self::memory_charge_bytes`]. `None` without test-phase evidence.
+    ///
+    /// Every co-placed lane is charged its own whole figure, so identical
+    /// suites whose heaviest tests run in lockstep (cairn/6441) are summed at
+    /// their peaks, never averaged.
+    pub fn test_phase_charge_bytes(&self, concurrent_tests: u32) -> Option<u64> {
+        let evidence = self.test_phase?;
+        let scaled = evidence
+            .bytes_per_concurrent_test
+            .saturating_mul(u64::from(concurrent_tests.max(1)));
+        Some(
+            with_measured_headroom(evidence.peak_bytes.max(scaled)).min(self.memory_charge_bytes()),
+        )
+    }
+}
+
+/// Where a running test lane is, as its own output says. Inferred from no
+/// memory reading: a lane whose output never shows the boundary stays
+/// [`LanePhase::Compile`] to its end.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "phase",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LanePhase {
+    /// Compiling, or not yet shown to be testing.
+    Compile,
+    /// nextest printed `Starting N tests across M binaries` at
+    /// `since_unix_ms`, and no compile has been seen since.
+    Test { since_unix_ms: u64, tests: u32 },
+}
+
+/// The phase a running command's memory charge belongs to, as the decline
+/// text and the executor page name it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "phase",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ChargedPhase {
+    /// Before the lane's test phase was observed: the whole-suite charge.
+    Compile,
+    /// In the test phase since `since_unix_ms`, charged the learned
+    /// test-phase figure.
+    Test { since_unix_ms: u64 },
+    /// In the test phase since `since_unix_ms`, but no test phase of this
+    /// work has been measured on this machine, so the whole-suite charge
+    /// stands.
+    TestUnmeasured { since_unix_ms: u64 },
+}
+
+impl ChargedPhase {
+    /// `compile phase`, `test phase, since 03:02 UTC`.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Compile => "compile phase".to_string(),
+            Self::Test { since_unix_ms } => {
+                format!("test phase, since {}", utc_clock(since_unix_ms))
+            }
+            Self::TestUnmeasured { since_unix_ms } => format!(
+                "test phase since {}, unmeasured here: whole-suite charge kept",
+                utc_clock(since_unix_ms)
+            ),
+        }
+    }
+}
+
+/// `HH:MM UTC` for an instant: UTC because the executor that writes a decline
+/// and the reader who reads it need not share a time zone.
+fn utc_clock(unix_ms: u64) -> String {
+    let minutes = unix_ms / 60_000;
+    format!("{:02}:{:02} UTC", (minutes / 60) % 24, minutes % 60)
+}
+
+#[cfg(test)]
+mod lane_charge_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The fedora specimen's lane: 31 GiB charged whole, a test phase
+    /// measured at 4 GiB, half a GiB a concurrent test.
+    fn lane() -> ResourceReservation {
+        ResourceReservation {
+            measured_peak_bytes: Some(31 * GIB),
+            test_phase: Some(TestPhaseEvidence {
+                peak_bytes: 4 * GIB,
+                bytes_per_concurrent_test: GIB / 2,
+            }),
+            ..ResourceReservation::default()
+        }
+    }
+
+    #[test]
+    fn a_lane_is_charged_by_the_phase_its_output_showed() {
+        let testing = Some(LanePhase::Test {
+            since_unix_ms: 0,
+            tests: 1_000,
+        });
+        let eight = Some(BuildJobs::new(8, None));
+        assert_eq!(
+            lane_memory_charge(&lane(), Some(LanePhase::Compile), eight),
+            (31 * GIB, Some(ChargedPhase::Compile))
+        );
+        // The peak stands at eight threads: 8 x 0.5 GiB is no more than 4 GiB.
+        assert_eq!(
+            lane_memory_charge(&lane(), testing, eight),
+            (5 * GIB, Some(ChargedPhase::Test { since_unix_ms: 0 }))
+        );
+        // A wider lane is priced at its own concurrency, never above the
+        // whole-suite charge.
+        assert_eq!(
+            lane_memory_charge(&lane(), testing, Some(BuildJobs::new(16, None))).0,
+            10 * GIB
+        );
+        assert_eq!(
+            lane_memory_charge(&lane(), testing, None).0,
+            31 * GIB,
+            "unknown threads are the tests themselves, capped at the whole charge"
+        );
+        let unmeasured = ResourceReservation {
+            test_phase: None,
+            ..lane()
+        };
+        assert_eq!(
+            lane_memory_charge(&unmeasured, testing, eight),
+            (
+                31 * GIB,
+                Some(ChargedPhase::TestUnmeasured { since_unix_ms: 0 })
+            )
+        );
+        assert_eq!(lane_memory_charge(&lane(), None, eight), (31 * GIB, None));
+    }
+}
+
+/// What admission charges a running command against memory, and the phase
+/// that charge belongs to (`None` for a command that is not a phased lane).
+///
+/// A lane in its test phase is charged the learned test-phase figure at the
+/// tests it can run at once: the smaller of the test threads it was granted
+/// and the tests it started. Anything short of that evidence keeps the
+/// whole-suite charge.
+pub fn lane_memory_charge(
+    reservation: &ResourceReservation,
+    phase: Option<LanePhase>,
+    build_jobs: Option<BuildJobs>,
+) -> (u64, Option<ChargedPhase>) {
+    let whole = reservation.memory_charge_bytes();
+    match phase {
+        None => (whole, None),
+        Some(LanePhase::Compile) => (whole, Some(ChargedPhase::Compile)),
+        Some(LanePhase::Test {
+            since_unix_ms,
+            tests,
+        }) => {
+            let concurrent = build_jobs.map_or(tests, |jobs| jobs.jobs.min(tests));
+            match reservation.test_phase_charge_bytes(concurrent) {
+                Some(charge) => (charge, Some(ChargedPhase::Test { since_unix_ms })),
+                None => (whole, Some(ChargedPhase::TestUnmeasured { since_unix_ms })),
+            }
+        }
     }
 }
 
@@ -11253,6 +11464,33 @@ pub struct CellExecutionMeta {
     /// one derivation, [`CellExecutionMeta::for_batch_item`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<CommandStop>,
+    /// The command's test phase, when its output showed one. See
+    /// [`TestPhaseMeasurement`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_phase: Option<TestPhaseMeasurement>,
+}
+
+/// The test phase of a command as its executor measured it: the largest its
+/// process tree held while nextest was running tests (from its `Starting N
+/// tests` line until a compile began again), and how many tests could run at
+/// once. Where a batch had several test phases, the largest.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TestPhaseMeasurement {
+    /// When the measured test phase began.
+    pub entered_at_unix_ms: u64,
+    pub peak_bytes: u64,
+    /// The smaller of the test threads the command was granted and the tests
+    /// it started; at least one.
+    pub concurrent_tests: u32,
+}
+
+impl TestPhaseMeasurement {
+    /// What each concurrent test held, rounded up.
+    pub fn bytes_per_concurrent_test(&self) -> u64 {
+        self.peak_bytes
+            .div_ceil(u64::from(self.concurrent_tests.max(1)))
+    }
 }
 
 /// The largest single process a command's tree held at any census, and what
@@ -11600,6 +11838,10 @@ impl CellExecutionMeta {
             )
         });
         meta.stop = item.stop.clone();
+        // A test phase belongs to the item it began in.
+        meta.test_phase = self.test_phase.filter(|phase| {
+            (item.started_at_unix_ms..=item.finished_at_unix_ms).contains(&phase.entered_at_unix_ms)
+        });
         meta
     }
 
@@ -11791,12 +12033,16 @@ pub struct OwingWork {
     /// The command line, for a command; absent for a resident.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// The larger of its reservation and its measured peak.
+    /// The larger of its reservation and its measured peak, or for a lane in
+    /// its test phase the learned test-phase figure ([`lane_memory_charge`]).
     pub charge_bytes: u64,
     /// What its tree holds now, or `None` before the sampler has read it, in
     /// which case it owes its whole charge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident_bytes: Option<u64>,
+    /// The phase its charge belongs to, for a phased test lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ChargedPhase>,
 }
 
 impl OwingWork {
@@ -11805,7 +12051,8 @@ impl OwingWork {
             .saturating_sub(self.resident_bytes.unwrap_or(0))
     }
 
-    /// `` `cargo check` in slot-118: 9.0 GiB charged, 0.4 GiB resident ``.
+    /// `` `cargo check` in slot-118: 9.0 GiB charged, 0.4 GiB resident ``, or
+    /// for a test lane `` 6.2 GiB charged (test phase, since 03:02 UTC) ``.
     pub fn describe(&self) -> String {
         let what = match (&self.command, &self.subject) {
             (Some(command), _) => format!("`{command}` in {}", self.cell_id),
@@ -11819,8 +12066,12 @@ impl OwingWork {
         let resident = self
             .resident_bytes
             .map_or_else(|| "not yet read".to_string(), describe_gib);
+        let phase = self
+            .phase
+            .map(|phase| format!(" ({})", phase.describe()))
+            .unwrap_or_default();
         format!(
-            "{what}: {} charged, {resident} resident",
+            "{what}: {} charged{phase}, {resident} resident",
             describe_gib(self.charge_bytes)
         )
     }
@@ -12592,6 +12843,7 @@ impl ResidencyFootprint {
             concurrency_units: 0,
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
+            test_phase: None,
         }
     }
 }
@@ -13068,6 +13320,7 @@ impl CellOccupancy {
             concurrency_units: 0,
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         for (key, process) in self.live_processes() {
             let fallback = ResourceReservation::default();
@@ -13621,6 +13874,22 @@ pub struct ExecutingCellRequest {
     /// `cell_id` is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted: Option<AdoptedTree>,
+    /// Where a test lane is ([`LanePhase`]), for a command whose class runs
+    /// tests; `None` for every other command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_phase: Option<LanePhase>,
+}
+
+impl ExecutingCellRequest {
+    /// What admission charges this command against memory, and the phase
+    /// that charge belongs to ([`lane_memory_charge`]).
+    pub fn memory_charge(&self) -> (u64, Option<ChargedPhase>) {
+        lane_memory_charge(
+            &self.resource_reservation,
+            self.memory_phase,
+            self.build_jobs,
+        )
+    }
 }
 
 /// Where an adopted tree came from: the launchd label that runs it and the
@@ -23509,6 +23778,7 @@ mod tests {
                 label: adoption.label.clone(),
                 leader_pid: 42,
             }),
+            memory_phase: None,
         };
         let wire = serde_json::to_value(&executing).unwrap();
         assert_eq!(wire["adopted"]["leaderPid"], 42);
@@ -24635,6 +24905,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         let process = |status: ResidentProcessStatus| ResidentProcess {
             generation: 1,
@@ -25057,6 +25328,7 @@ mod tests {
                     concurrency_units: 1,
                     source: ResourceReservationSource::Learned,
                     measured_peak_bytes: None,
+                    test_phase: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -25158,6 +25430,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             learned_estimate: None,
             scratch_sync: None,
@@ -25694,6 +25967,7 @@ mod tests {
                 concurrency_units: 0,
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
+                test_phase: None,
             }),
             live_usage: None,
             charge: None,
@@ -25910,6 +26184,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         let learned_estimate = LearnedResourceEstimate {
             sample_count: 5,
@@ -25976,6 +26251,7 @@ mod tests {
                             command: Some("cargo check".into()),
                             charge_bytes: 4,
                             resident_bytes: Some(1),
+                            phase: None,
                         }],
                     },
                     HostPressureCondition::MemoryStall {
@@ -26750,6 +27026,7 @@ mod tests {
                     live_usage: None,
                     build_jobs: None,
                     adopted: None,
+                    memory_phase: None,
                 }],
                 in_flight_residency_operations: HashMap::new(),
                 recent_completions: vec![CellCompletion {
@@ -26807,6 +27084,7 @@ mod tests {
                         containment: None,
                         stop: None,
                         cell_origin: None,
+                        test_phase: None,
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -28974,6 +29252,7 @@ mod tests {
                 containment: None,
                 stop: None,
                 cell_origin: None,
+                test_phase: None,
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),

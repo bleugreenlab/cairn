@@ -184,6 +184,7 @@ mod tests {
             live_usage: None,
             build_jobs: None,
             adopted: None,
+            memory_phase: None,
         }
     }
 

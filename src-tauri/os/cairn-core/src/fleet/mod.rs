@@ -18409,6 +18409,7 @@ mod process_fit_tests {
             demand: Some(demand.clone()),
             unattributed: None,
             unmeasured_compile: false,
+            test_phase: None,
         };
         match judge_process_evidence(
             &evidence,
@@ -18525,6 +18526,7 @@ mod process_fit_tests {
                 basis: Default::default(),
             }),
             unmeasured_compile: false,
+            test_phase: None,
         };
         let budget = Some(24 * GIB / 100 * 85);
         for kernel_kills in [false, true] {
@@ -18557,6 +18559,7 @@ mod process_fit_tests {
             demand: Some(rustc(10 * GIB, None)),
             unattributed: None,
             unmeasured_compile: false,
+            test_phase: None,
         };
         let judge = |kernel_kills| {
             judge_process_evidence(
@@ -18596,6 +18599,7 @@ mod process_fit_tests {
                 ..rustc(2 * GIB, None)
             }),
             unmeasured_compile: false,
+            test_phase: None,
         };
         assert_eq!(
             judge_process_evidence(&evidence, 13 * GIB, Some(GIB), None, "m-device:m", true),
@@ -21245,7 +21249,9 @@ impl ReservationPlan {
             )
             .await;
         }
-        let mut evidence = resource_profiles::ProcessEvidence::default();
+        // Folded from the first item rather than from empty evidence, which
+        // has no test phase and would take every batch's away.
+        let mut evidence: Option<resource_profiles::ProcessEvidence> = None;
         for (identity, suite, class) in &self.batch_suites {
             let item = resource_profiles::resolve_process_demand(
                 self.db.clone(),
@@ -21255,9 +21261,12 @@ impl ReservationPlan {
                 context,
             )
             .await;
-            evidence = resource_profiles::ProcessEvidence::max(evidence, item);
+            evidence = Some(match evidence {
+                Some(held) => resource_profiles::ProcessEvidence::max(held, item),
+                None => item,
+            });
         }
-        evidence
+        evidence.unwrap_or_default()
     }
 
     fn profile_context(selected: &SelectedExecutor) -> resource_profiles::ProfileContext {
@@ -25045,6 +25054,7 @@ mod tests {
                 toolchain_fingerprint: None,
                 containment: None,
                 stop: None,
+                test_phase: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -26236,6 +26246,7 @@ mod tests {
             concurrency_units: 1,
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
+            test_phase: None,
         };
         let resolved = ReservationPlan::new(db.clone(), &request, None)
             .resolve_for(
@@ -26871,6 +26882,7 @@ mod tests {
                     live_usage: None,
                     build_jobs: None,
                     adopted: None,
+                    memory_phase: None,
                 }],
                 ..FleetSnapshot::default()
             },
@@ -28276,6 +28288,7 @@ mod tests {
                     live_usage: None,
                     build_jobs: None,
                     adopted: None,
+                    memory_phase: None,
                 }],
                 ..FleetSnapshot::default()
             },
@@ -32166,6 +32179,7 @@ mod tests {
                     label: "computer.cairn.rebuild".into(),
                     leader_pid: 4242,
                 }),
+                memory_phase: None,
             }],
             ..FleetSnapshot::default()
         };
@@ -33643,6 +33657,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -34717,6 +34732,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -34774,6 +34790,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -34907,6 +34924,7 @@ mod tests {
                 concurrency_units: 1,
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -36494,6 +36512,7 @@ mod tests {
             live_usage: None,
             build_jobs: None,
             adopted: None,
+            memory_phase: None,
         }];
         let mut remote = fleet_entry("remote-a", "linux", 0, &[]).1;
         remote.identity.display_name = "BGLab UB".into();
@@ -36553,6 +36572,7 @@ mod tests {
             live_usage: None,
             build_jobs: None,
             adopted: None,
+            memory_phase: None,
         }];
         Arc::make_mut(&mut busy.health).machine.memory =
             cairn_common::executor_protocol::Measurement::measured(
@@ -36640,6 +36660,7 @@ mod tests {
                 concurrency_units: 3,
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
         });
         let mut second = fleet_entry("second", "linux", 0, &[]).1;
@@ -36651,6 +36672,7 @@ mod tests {
                 concurrency_units: 5,
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
+                test_phase: None,
             },
         });
         pool.lock_connections()
@@ -38240,6 +38262,7 @@ mod tests {
             live_usage: None,
             build_jobs: None,
             adopted: None,
+            memory_phase: None,
         }
     }
 
@@ -39850,6 +39873,7 @@ mod tests {
             live_usage: None,
             build_jobs: None,
             adopted: None,
+            memory_phase: None,
         }
     }
 
@@ -43340,6 +43364,7 @@ mod tests {
                 containment: None,
                 stop: None,
                 cell_origin: None,
+                test_phase: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -43981,6 +44006,7 @@ mod tests {
                 containment: None,
                 stop: None,
                 cell_origin: None,
+                test_phase: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),

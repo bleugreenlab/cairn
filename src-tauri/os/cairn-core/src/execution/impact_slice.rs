@@ -523,6 +523,7 @@ fn runner_account(started_at: u64, duration_ms: u64) -> CellExecutionMeta {
         toolchain_fingerprint: None,
         containment: None,
         stop: None,
+        test_phase: None,
     }
 }
 

@@ -285,6 +285,7 @@ pub(crate) async fn spawn_workflow_process(
                     concurrency_units: 1,
                     source: ResourceReservationSource::Declared,
                     measured_peak_bytes: None,
+                    test_phase: None,
                 }),
                 process: ResidentProcessSpec {
                     stdout_framing: ResidentStreamFraming::Bytes,
