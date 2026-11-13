@@ -140,7 +140,6 @@ async fn install(orch: &Orchestrator, threads: &[&str]) {
             BindingKind::Ambient,
             MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .unwrap());

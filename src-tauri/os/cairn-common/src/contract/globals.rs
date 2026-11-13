@@ -63,17 +63,26 @@ pub(crate) const CHANNELS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Channels,
     uri_template: "cairn://channels",
     name: "Channels",
-    description: "The channel providers, one row each: the in-app channel (`app`, whose conversations are the operator's own messages at cairn://operator) and the external transports (Discord, iMessage, Telegram), each with whether it is enabled, its runtime health and detail (Discord's card-pin degradation is reported here, once), the operator's purpose line for it, operator presence (for iMessage, the presence its local probe reads), when the operator last wrote on it, and a link to its conversations at cairn://channels/{provider}. The purpose is the line an agent reads to decide which provider a message belongs on. Only the verified desktop operator may patch {provider, purpose}; an agent's or any run-less caller's patch is refused.",
+    description: "The channel providers, one row each: the in-app channel (`app`, whose conversations are the operator's own messages at cairn://operator) and the external transports (Discord, iMessage, Telegram), each with whether it is enabled, its runtime health and detail (Discord's card-pin degradation is reported here, once), the operator's purpose line for it, operator presence (for iMessage, the presence its local probe reads), when the operator last wrote on it, and a link to its conversations at cairn://channels/{provider}. The purpose is the line an agent reads to decide which provider a message belongs on. An Unaddressed text section says where bare phone text goes (its native reply-to, else the thread whose operator message on that transport is the latest within 24 h, else the default project's general thread) and names that general thread. Only the verified desktop operator may patch {provider, purpose} or {defaultProject}; an agent's or any run-less caller's patch is refused.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Patch,
-        required: &[CHANNEL_PROVIDER, CHANNEL_PURPOSE],
-        optional: &[],
-        label: "set a provider's purpose (desktop operator only)",
-        example: "write({changes:[{target:\"cairn://channels\",mode:\"patch\",payload:{provider:\"telegram\",purpose:\"urgent: reaches the operator's phone\"}}]})",
-    }],
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[CHANNEL_PROVIDER, CHANNEL_PURPOSE],
+            optional: &[],
+            label: "set a provider's purpose (desktop operator only)",
+            example: "write({changes:[{target:\"cairn://channels\",mode:\"patch\",payload:{provider:\"telegram\",purpose:\"urgent: reaches the operator's phone\"}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[CHANNEL_DEFAULT_PROJECT],
+            optional: &[],
+            label: "set the default project whose general thread takes unaddressed phone text (desktop operator only)",
+            example: "write({changes:[{target:\"cairn://channels\",mode:\"patch\",payload:{defaultProject:\"cairn\"}}]})",
+        },
+    ],
 };
 
 pub(crate) const CHANNELS_PROVIDER_CONTRACT: ResourceContract = ResourceContract {

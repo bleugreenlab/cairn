@@ -1612,11 +1612,11 @@ pub(super) mod tests {
               VALUES (103, '1', 'issue_thread', '{project_key}', 'cairn://p/{project_key}/1', 102, 1);
             INSERT INTO channel_state_card(provider, conversation, subject_uri, target_uri, project_key, job_id, created_at, updated_at)
               VALUES ('discord', 'discord:1/103', 'cairn://p/{project_key}/1', 'cairn://p/{project_key}/1', '{project_key}', 'channel-job', 1, 1);
-            INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, followed_at)
+            INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, bound_at)
               VALUES ('discord', 'discord:1/103', 'cairn://p/{project_key}/1', 'structural', 7, 1);
             INSERT INTO discord_surface(id, guild_id, surface_kind, project_key, target_uri, parent_surface_id, updated_at)
               VALUES (104, '1', 'ambient_home', '{project_key}', 'cairn://p/{project_key}', 101, 1);
-            INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, followed_at)
+            INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, bound_at)
               VALUES ('discord', 'discord:1/104', 'cairn://p/{project_key}', 'ambient', 8, 1);
             INSERT INTO channel_inbound(id, channel, sender, text, received_at, conversation, target_uri, binding_kind)
               VALUES ('inbound-ambient-{project_key}', 'discord', 'operator', 'who owns this?', 1, 'discord:1/104', 'cairn://p/{project_key}', 'ambient'),

@@ -474,18 +474,10 @@ mod tests {
         );
         let bindings = || async {
             db.query_all(
-                "SELECT conversation, target_uri, binding_kind, message_classes, selected_at
+                "SELECT conversation, target_uri, binding_kind, message_classes
                    FROM channel_conversation_binding ORDER BY conversation",
                 (),
-                |row| {
-                    Ok((
-                        row.text(0)?,
-                        row.text(1)?,
-                        row.text(2)?,
-                        row.i64(3)?,
-                        row.opt_i64(4)?,
-                    ))
-                },
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.i64(3)?)),
             )
             .await
             .unwrap()
@@ -495,7 +487,6 @@ mod tests {
             "cairn://p/cairn".to_string(),
             "ambient".to_string(),
             super::super::bindings::MESSAGE_CLASS_AGENT_TEXT,
-            None,
         )];
         assert_eq!(bindings().await, expected);
 
@@ -1825,7 +1816,6 @@ impl DiscordSurfaceReconciler {
             kind,
             classes,
             now,
-            0,
         )
         .await
         .map(|_| ())

@@ -15,10 +15,7 @@
 
 use cairn_uri::{encode_path_segment, parse_uri, CairnResource};
 
-use super::{
-    bindings::{legacy_conversation, BindingKind},
-    ledger, ConversationAddress, ConversationProvider,
-};
+use super::{bindings::BindingKind, ledger, ConversationAddress, ConversationProvider};
 use crate::storage::LocalDb;
 
 pub const CHANNELS_URI: &str = "cairn://channels";
@@ -75,15 +72,10 @@ fn target_parts(target: &str) -> Option<(String, Option<String>)> {
     }
 }
 
-fn is_placeholder(provider: ConversationProvider, conversation: &str) -> bool {
-    legacy_conversation(provider.id()).is_ok_and(|placeholder| placeholder == conversation)
-}
-
 /// The human name of a conversation: `#channels · cairn · Discord`,
 /// `#ambient · cairn · Discord`, `Ops · Telegram` (the chat's own `title`,
 /// fetched by `titles`) or `operator chat · Telegram` without one,
-/// `+15551234567 · iMessage`. A follow placeholder, which stands for the follow
-/// stream rather than a destination, reads `follow stream · {provider}`.
+/// `+15551234567 · iMessage`.
 pub fn conversation_label(
     provider: ConversationProvider,
     conversation: &str,
@@ -92,9 +84,6 @@ pub fn conversation_label(
     title: Option<&str>,
 ) -> String {
     let display = provider.display_name();
-    if is_placeholder(provider, conversation) {
-        return format!("follow stream · {display}");
-    }
     match provider {
         ConversationProvider::Discord => {
             let ambient = binding_kind == Some(BindingKind::Ambient.as_str());
@@ -120,17 +109,14 @@ pub fn conversation_label(
 }
 
 /// The `cairn://channels/...` resource a conversation is read and written at,
-/// or `None` when it has none: a follow placeholder, or a Discord channel with
-/// no structural or ambient binding to name it.
+/// or `None` when it has none: a Discord channel with no structural or ambient
+/// binding to name it.
 pub fn conversation_uri(
     provider: ConversationProvider,
     conversation: &str,
     binding_kind: Option<&str>,
     target: Option<&str>,
 ) -> Option<String> {
-    if is_placeholder(provider, conversation) {
-        return None;
-    }
     let base = provider_uri(provider);
     match provider {
         ConversationProvider::Discord => {
@@ -189,13 +175,9 @@ pub struct ResolvedConversation {
 }
 
 impl ResolvedConversation {
-    /// The binding that names the conversation: Discord's structural or
-    /// ambient row, or the first binding on a Telegram or iMessage chat.
+    /// The binding that names the conversation: its first.
     pub fn primary(&self) -> Option<&ledger::ActiveBinding> {
-        self.bindings
-            .iter()
-            .find(|binding| binding.binding_kind != BindingKind::Follow.as_str())
-            .or_else(|| self.bindings.first())
+        self.bindings.first()
     }
 
     /// The conversation's label, with the provider's own `title` for it when
@@ -328,7 +310,7 @@ mod tests {
             conversation_label(
                 ConversationProvider::Telegram,
                 "telegram:42",
-                Some("follow"),
+                None,
                 None,
                 None
             ),
@@ -338,21 +320,11 @@ mod tests {
             conversation_label(
                 ConversationProvider::Telegram,
                 "telegram:42",
-                Some("follow"),
+                None,
                 None,
                 Some("Ops")
             ),
             "Ops · Telegram"
-        );
-        assert_eq!(
-            conversation_label(
-                ConversationProvider::Telegram,
-                "telegram:0",
-                Some("follow"),
-                None,
-                Some("Ops")
-            ),
-            "follow stream · Telegram"
         );
         assert_eq!(
             conversation_label(
@@ -396,20 +368,12 @@ mod tests {
             ),
             Some("cairn://channels/discord/cairn/6772".into())
         );
-        assert_eq!(
-            conversation_uri(
-                discord,
-                "discord:0/0",
-                Some("follow"),
-                Some("cairn://p/cairn/6772")
-            ),
-            None
-        );
+        assert_eq!(conversation_uri(discord, "discord:1/4", None, None), None);
         assert_eq!(
             conversation_uri(
                 ConversationProvider::Telegram,
                 "telegram:-100123",
-                Some("follow"),
+                None,
                 None
             ),
             Some("cairn://channels/telegram/-100123".into())
@@ -418,7 +382,7 @@ mod tests {
             conversation_uri(
                 ConversationProvider::IMessage,
                 "imessage:+15551234567",
-                Some("follow"),
+                None,
                 None
             ),
             Some("cairn://channels/imessage/%2B15551234567".into())
@@ -444,7 +408,7 @@ mod tests {
             ),
         ] {
             assert!(
-                ledger::bind_target(&db, "discord", conversation, target, kind, classes, 1, 0)
+                ledger::bind_target(&db, "discord", conversation, target, kind, classes, 1)
                     .await
                     .unwrap()
             );

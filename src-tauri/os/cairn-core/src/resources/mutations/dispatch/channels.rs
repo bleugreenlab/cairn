@@ -310,7 +310,6 @@ mod tests {
                 kind,
                 classes,
                 1,
-                0
             )
             .await
             .unwrap());
@@ -490,6 +489,68 @@ mod tests {
         .await
         .unwrap_err();
         assert!(elsewhere.contains("not a channels resource"), "{elsewhere}");
+    }
+
+    /// The default project is the verified desktop operator's too: the door
+    /// sets it to an existing project, refuses an unknown one by name, clears
+    /// it back to the oldest project, and drops the retired `defaultThread`.
+    #[tokio::test]
+    async fn only_the_verified_operator_sets_the_default_project() {
+        let orch = orchestrator().await;
+        let patch = |key: &str| ChangeItem {
+            target: "cairn://channels".into(),
+            mode: ChangeMode::Patch,
+            payload: Some(serde_json::json!({ "defaultProject": key })),
+        };
+        let default_project = || {
+            crate::config::settings::load_settings(&orch.config_dir)
+                .channels
+                .default_project
+        };
+        for run in [Some("r-live"), None] {
+            let refused = dispatch_resource_change(&orch, &request(run), 0, &patch("prj"), false)
+                .await
+                .unwrap_err()
+                .error;
+            assert!(refused.contains("Only the operator"), "{run:?}: {refused}");
+        }
+        assert_eq!(default_project(), None);
+
+        let operator = |key: &str| {
+            crate::channels::write_as_operator(
+                &orch,
+                "cairn://channels",
+                "patch",
+                Some(serde_json::json!({ "defaultProject": key })),
+            )
+        };
+        let unknown = operator("zzz").await.unwrap_err();
+        assert!(
+            unknown.contains("Unknown project 'zzz'") && unknown.contains("known: prj"),
+            "{unknown}"
+        );
+        assert_eq!(default_project(), None);
+
+        let path = crate::config::settings::get_settings_path(&orch.config_dir);
+        let mut yaml = std::fs::read_to_string(&path).unwrap();
+        yaml.push_str("  defaultThread: cairn://p/CAIRN/3404\n");
+        std::fs::write(&path, yaml).unwrap();
+        let set = operator("PRJ").await.unwrap();
+        assert!(set.contains("Set the default project to prj"), "{set}");
+        assert_eq!(default_project().as_deref(), Some("prj"));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("defaultThread"), "{written}");
+        assert!(
+            crate::config::settings::load_settings(&orch.config_dir)
+                .channels
+                .discord
+                .enabled,
+            "the rest of the document survives"
+        );
+
+        let cleared = operator("").await.unwrap();
+        assert!(cleared.contains("Cleared the default project"), "{cleared}");
+        assert_eq!(default_project(), None);
     }
 
     /// The verified operator reaches every binding: the listing names another

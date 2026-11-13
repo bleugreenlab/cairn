@@ -154,11 +154,19 @@ pub struct AppChannelConfig {
 }
 
 /// Workspace-owned delivery policy for external message channels.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelsConfig {
-    #[serde(default = "default_channel_thread")]
-    pub default_thread: String,
+    /// The project whose general thread takes unaddressed phone text that no
+    /// reply-to and no recent operator message claims. Absent means the
+    /// workspace's oldest project, resolved when the text arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_project: Option<String>,
+    /// The retired `defaultThread` (a thread or issue URI), read only so the
+    /// settings loader can convert it once into `default_project`; never
+    /// written back.
+    #[serde(default, rename = "defaultThread", skip_serializing)]
+    pub legacy_default_thread: Option<String>,
     #[serde(default)]
     pub app: AppChannelConfig,
     #[serde(default)]
@@ -167,22 +175,6 @@ pub struct ChannelsConfig {
     pub telegram: TelegramChannelConfig,
     #[serde(default)]
     pub discord: DiscordChannelConfig,
-}
-
-fn default_channel_thread() -> String {
-    "cairn://p/CAIRN/3404".to_string()
-}
-
-impl Default for ChannelsConfig {
-    fn default() -> Self {
-        Self {
-            default_thread: default_channel_thread(),
-            app: AppChannelConfig::default(),
-            imessage: IMessageChannelConfig::default(),
-            telegram: TelegramChannelConfig::default(),
-            discord: DiscordChannelConfig::default(),
-        }
-    }
 }
 
 /// iMessage delivery configuration. Empty addresses keep the provider

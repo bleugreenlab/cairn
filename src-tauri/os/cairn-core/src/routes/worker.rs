@@ -6,10 +6,10 @@
 //! trigger matches, queueing the row for the route lane if one does. It never
 //! runs a route, so a slow route cannot delay a thread wake.
 //!
-//! The **route lane** runs matched rows one at a time, in id order (which
-//! keeps a followed thread's stream in order), each under a timeout. It hands
-//! the channel submissions a row produces to the channel routers, choosing
-//! recipients by the sink's destination or the source's [`Audience`].
+//! The **route lane** runs matched rows one at a time, in id order, each
+//! under a timeout. It hands the channel submissions a row produces to the
+//! channel routers: the addressed conversation's provider, or every provider
+//! for an undirected sink.
 //!
 //! A source may also declare **addressee** fields: URIs naming who a row is
 //! for (a post's mentions, a commented post's author, a camp, an issue). The
@@ -48,7 +48,7 @@ use cairn_attention::wakes::{
 };
 
 use super::log::{clauses_need_hydration, hydrate, stored_fact, Hydrated};
-use super::{matches, Audience, Fact, FactRegistry, RouteContext};
+use super::{matches, Fact, FactRegistry, RouteContext};
 use crate::models::DeliveryUrgency;
 use crate::orchestrator::wakes::{
     render_rebuild_firing, Addressed, MutedDelivery, WakeSubscriptionState,
@@ -1741,86 +1741,32 @@ async fn run_route_row(
     )
     .await
     .unwrap_or_else(|_| Err("timeout".to_string()));
-    let handover = hand_over(orch, &hydrated, submissions).await;
+    let handover = hand_over(orch, submissions).await;
     match (result, handover) {
         (Ok(()), Ok(())) => (route_state::DONE, None),
         (Err(error), _) | (Ok(()), Err(error)) => (route_state::FAILED, Some(error)),
     }
 }
 
-/// Give each channel submission to the routers that should deliver it.
-///
-/// A sink addressed to one conversation reaches that conversation's provider
-/// (the channel runtime filters on the destination). An undirected sink
-/// reaches the source's audience: every provider, or only the providers that
-/// were following the fact's thread when it was said. Each provider's router
-/// gates, defers, delivers, and journals its own copy.
+/// Give each channel submission to the channel routers. A sink addressed to
+/// one conversation reaches that conversation's provider (the channel runtime
+/// filters on the destination); an undirected sink reaches every provider.
+/// Each provider's router gates, defers, delivers, and journals its own copy.
 async fn hand_over(
     orch: &Orchestrator,
-    hydrated: &Hydrated,
     submissions: Vec<super::ChannelSubmission>,
 ) -> Result<(), String> {
-    let registry = FactRegistry::default();
-    let audience = registry
-        .source(&hydrated.fact.source)
-        .map_or(Audience::AllProviders, |spec| spec.audience);
     for submission in submissions {
-        let recipients = match (&submission.destination, audience) {
-            (Some(_), _) | (None, Audience::AllProviders) => vec![submission],
-            (None, Audience::FollowersOf(field)) => {
-                let target = hydrated
-                    .fact
-                    .fields
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let followers = followers_at(orch, target, hydrated.occurred_at_ms).await?;
-                if followers.is_empty() {
-                    super::dispatcher::record_channel_drop(orch, &submission, "no_follower")
-                        .await?;
-                    continue;
-                }
-                followers
-                    .into_iter()
-                    .map(|provider| {
-                        let mut addressed = submission.clone();
-                        addressed.provider = Some(provider);
-                        addressed
-                    })
-                    .collect()
-            }
-        };
-        for submission in recipients {
-            if let Err(submission) = crate::channels::submit_route(submission) {
-                super::record_channel_outcome(
-                    orch,
-                    &submission,
-                    Err("channel runtime is unavailable".into()),
-                )
-                .await?;
-            }
+        if let Err(submission) = crate::channels::submit_route(submission) {
+            super::record_channel_outcome(
+                orch,
+                &submission,
+                Err("channel runtime is unavailable".into()),
+            )
+            .await?;
         }
     }
     Ok(())
-}
-
-/// Providers following `target` whose follow began no later than the fact.
-/// A follow starts at the thread's live edge, so an utterance said before it
-/// is not that provider's to receive. The transcript dates an utterance to the
-/// second, so the comparison is at second granularity.
-async fn followers_at(
-    orch: &Orchestrator,
-    target: &str,
-    occurred_at_ms: Option<i64>,
-) -> Result<Vec<String>, String> {
-    let follows = crate::channels::ledger::list_follow_providers(&orch.db.local, target).await?;
-    Ok(follows
-        .into_iter()
-        .filter(|(_, followed_at)| {
-            occurred_at_ms.is_none_or(|occurred| followed_at / 1000 <= occurred / 1000)
-        })
-        .map(|(provider, _)| provider)
-        .collect())
 }
 
 async fn prune_pass(orch: &Orchestrator, policy: &EventLogPolicy) -> Result<(), String> {

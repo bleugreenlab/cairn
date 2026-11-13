@@ -18,6 +18,11 @@ pub(crate) const CHANNEL_PURPOSE: KeySpec = KeySpec::new(
     KeyType::Str,
     "one line on what the provider is for; empty clears it",
 );
+pub(crate) const CHANNEL_DEFAULT_PROJECT: KeySpec = KeySpec::new(
+    "defaultProject",
+    KeyType::Str,
+    "the project key whose general thread takes unaddressed phone text; empty clears it to the oldest project",
+);
 pub(crate) const AMBIENT_FEEDBACK_EVENT: KeySpec = KeySpec::new(
     "event",
     KeyType::Any,

@@ -46,6 +46,12 @@ struct ListQuery {
 /// restores content from records.
 fn parse_match(source: &str, value: &str) -> Result<crate::routes::TriggerClause, String> {
     let registry = FactRegistry::default();
+    if registry.source(source).is_none() {
+        return Err(format!(
+            "Query parameter 'match': '{source}' is not a registered fact source, so no trigger clause can test its rows; list them without `match=`. Registered sources: {}",
+            registry.source_names().join(", ")
+        ));
+    }
     let mut clause = crate::routes::TriggerClause::new();
     clause.insert("fact".into(), Value::String(source.into()));
     for test in value.split(',') {
@@ -122,14 +128,12 @@ fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
         }
         seen.push(key);
         match key {
+            // An unregistered source is accepted: rows minted under a source
+            // since retired are history and still list. The listing says the
+            // source is unregistered, and `match=` refuses it.
             "source" => {
-                let sources = FactRegistry::default().source_names();
-                if !sources.contains(&param.value.as_str()) {
-                    return Err(format!(
-                        "Unknown fact source '{}'. Valid sources: {}",
-                        param.value,
-                        sources.join(", ")
-                    ));
+                if param.value.trim().is_empty() {
+                    return Err("Query parameter 'source' must name a fact source".to_string());
                 }
                 query.source = Some(param.value.clone());
             }
@@ -496,6 +500,15 @@ pub(crate) async fn list_page(
     let mut out = format!(
         "{title}\n\nNewest first. Each row points at its record; read the record for content.\n"
     );
+    if let Some(source) = &query.source {
+        let registry = FactRegistry::default();
+        if registry.source(source).is_none() {
+            out.push_str(&format!(
+                "\n'{source}' is not a registered fact source: any rows listed are history, kept with their stored fields and record pointers. Registered sources: {}\n",
+                registry.source_names().join(", ")
+            ));
+        }
+    }
     if rows.is_empty() {
         out.push_str("\nNo events match.\n");
     }
@@ -531,11 +544,11 @@ pub(crate) async fn list_page(
     })
 }
 
-/// What a source's `record_id` is a key of.
+/// What a source's `record_id` is a key of. A row of a source no longer in
+/// the registry is history: its key is shown under a generic label.
 fn record_id_label(source: &str) -> &'static str {
     match source {
         "attention" => "issues.id",
-        "thread_stream" => "transcript events.rowid",
         "github_comment" => "GitHub comment id",
         "file_changed" => "file_changes.id",
         "post_created" => "posts.id",
@@ -543,7 +556,8 @@ fn record_id_label(source: &str) -> &'static str {
         "ingress" => "ingress_events.id",
         "channel_message" => "channel_inbound.id",
         crate::fleet::unreturned::EXECUTOR_UPDATE_UNRETURNED => "executor id",
-        _ => "record id",
+        _ if FactRegistry::default().source(source).is_some() => "record id",
+        _ => "record id (unregistered source)",
     }
 }
 
@@ -764,11 +778,23 @@ mod tests {
         assert!(parse_list_query(&params(&[("limit", "1"), ("limit", "2")]))
             .unwrap_err()
             .contains("once"));
-        let unknown = parse_list_query(&params(&[("source", "tool_called")])).unwrap_err();
-        assert!(
-            unknown.contains("file_changed") && unknown.contains("thread_stream"),
-            "{unknown}"
+        // An unregistered source lists (its rows are history); only `match=`
+        // over it is refused, by name.
+        assert_eq!(
+            parse_list_query(&params(&[("source", "tool_called")]))
+                .unwrap()
+                .source
+                .as_deref(),
+            Some("tool_called")
         );
+        let unmatched =
+            parse_list_query(&params(&[("source", "tool_called"), ("match", "a:b")])).unwrap_err();
+        assert!(
+            unmatched.contains("'tool_called' is not a registered fact source")
+                && unmatched.contains("file_changed"),
+            "{unmatched}"
+        );
+        assert!(parse_list_query(&params(&[("source", " ")])).is_err());
         assert!(parse_list_query(&params(&[("limit", "201")])).is_err());
     }
 
@@ -877,5 +903,103 @@ mod tests {
             .collect();
         assert_eq!(woken.len(), 2, "{listed}");
         assert_eq!(listed_ids, woken, "{listed}");
+    }
+
+    /// A row minted under a fact source since retired is history: it keeps
+    /// its stored fields and record pointer, settles without being hydrated,
+    /// and still renders in the listing, its own page, and the route history
+    /// of the route that fired on it. The literal source and route names are
+    /// the retired `thread_stream` fact and its bundled route.
+    #[tokio::test]
+    async fn a_row_of_a_retired_source_and_its_firing_still_render() {
+        use crate::routes::fixture::orchestrator;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        let identity = "cairn://p/cairn/ui:event:7";
+        let id = crate::storage::insert_fact(
+            &db,
+            crate::storage::NewFact {
+                project_id: Some("p".into()),
+                source: "thread_stream".into(),
+                identity: identity.into(),
+                record_ref: identity.into(),
+                record_id: Some("7".into()),
+                fields_json: r#"{"project":"cairn","threadUri":"cairn://p/cairn/ui"}"#.into(),
+                summary: Some("a followed turn".into()),
+                presence: "away".into(),
+                actor_job_id: None,
+                origin_principal_json: None,
+                origin_appearance_json: None,
+                route_provenance: None,
+                minted_at: 1_700_000_000_000,
+            },
+            crate::storage::LogDedupe::Unique,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        cairn_db::storage::insert_route_firing(
+            &db,
+            cairn_db::storage::NewRouteFiring {
+                route_id: "followed-thread-stream".into(),
+                scope_key: "workspace".into(),
+                project_id: Some("p".into()),
+                trigger_source: "thread_stream".into(),
+                fact_identity: identity.into(),
+                fact_summary: Some("a followed turn".into()),
+                status: "fired".into(),
+                drop_reason: None,
+                transforms_json: None,
+                sink_kind: "channel".into(),
+                sink_ref: Some("imessage:legacy".into()),
+                payload_text: Some("a followed turn".into()),
+                error: None,
+                created_at: 1_700_000_000_000,
+                fact_log_id: Some(id),
+            },
+        )
+        .await
+        .unwrap();
+        // A row still pending when its source was retired settles, unmatched.
+        crate::routes::drain_fact_log(&orch).await;
+
+        let listed = list(
+            &orch,
+            Some("cairn"),
+            &params(&[("source", "thread_stream")]),
+        )
+        .await;
+        assert!(listed.contains(&format!("[#{id}]")), "{listed}");
+        assert!(
+            listed.contains("'thread_stream' is not a registered fact source"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("unmatched (source is not in the fact registry)"),
+            "{listed}"
+        );
+        assert!(listed.contains("[followed-thread-stream #1]"), "{listed}");
+
+        let refused = list(
+            &orch,
+            Some("cairn"),
+            &params(&[("source", "thread_stream"), ("match", "threadUri:x")]),
+        )
+        .await;
+        assert!(
+            refused.contains("'thread_stream' is not a registered fact source"),
+            "{refused}"
+        );
+
+        let page = member(&orch, Some("cairn"), id, &[]).await;
+        assert!(
+            page.contains("- record id (unregistered source): 7"),
+            "{page}"
+        );
+        assert!(page.contains("\"threadUri\""), "{page}");
+
+        let history = super::super::routes::history(&orch, "followed-thread-stream", None).await;
+        assert!(history.contains("· fired · thread_stream ·"), "{history}");
     }
 }

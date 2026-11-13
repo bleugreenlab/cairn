@@ -1374,6 +1374,15 @@ mod tests {
             commands.len(),
             super::super::commands::CHANNEL_COMMANDS.len()
         );
+        // The menu a phone shows is republished from the registry on every
+        // start, so retired commands leave it at the next provider start.
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.command.as_str())
+                .collect::<Vec<_>>(),
+            ["help"]
+        );
         for (telegram, canonical) in commands
             .iter()
             .zip(super::super::commands::CHANNEL_COMMANDS)

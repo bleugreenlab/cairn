@@ -385,10 +385,7 @@ async fn bound_conversation(
     })?;
     let rendered = address.to_string();
     let configured = crate::resources::channels::configured_conversations(orch).await;
-    match configured
-        .iter()
-        .find(|row| row.address == rendered && !row.placeholder)
-    {
+    match configured.iter().find(|row| row.address == rendered) {
         None => Err(SinkDrop::new(
             "undeliverable",
             Some(rendered.clone()),
@@ -1182,11 +1179,6 @@ pub struct ChannelSubmission {
     /// The fact log row this submission came from, so its outcome joins the row.
     #[serde(default)]
     pub fact_log_id: Option<i64>,
-    /// The one provider an undirected submission is addressed to, when the
-    /// fact's audience is narrower than every provider (a followed thread's
-    /// stream reaches only the providers following it).
-    #[serde(default)]
-    pub provider: Option<String>,
 }
 
 /// Run every route in `routes` whose trigger matches one fact log row.
@@ -1434,7 +1426,6 @@ async fn dispatch_into(
                         initiated_by: initiated_by.clone(),
                         destination,
                         fact_log_id,
-                        provider: None,
                     });
                 }
                 RouteSink::Message { target, .. } => {
@@ -1540,31 +1531,6 @@ fn submission_sink(submission: &ChannelSubmission) -> RouteSink {
         initiated_by: submission.initiated_by.clone(),
         body: None,
     }
-}
-
-/// Journal a channel submission that no provider was left to receive.
-pub(crate) async fn record_channel_drop(
-    orch: &Orchestrator,
-    submission: &ChannelSubmission,
-    reason: &'static str,
-) -> Result<(), String> {
-    let sink = submission_sink(submission);
-    record(
-        orch,
-        Firing {
-            route_id: &submission.route_id,
-            scope_key: &submission.scope_key,
-            project_id: submission.project_id.as_deref(),
-            fact: &submission.fact,
-            sink: FiringSink::Route(&sink),
-            created_at: submission.created_at,
-            fact_log_id: submission.fact_log_id,
-        },
-        submission.transforms_json.clone(),
-        Outcome::dropped(reason),
-    )
-    .await?;
-    Ok(())
 }
 
 async fn record(
@@ -1673,9 +1639,9 @@ mod tests {
             .map(|()| submissions)
     }
 
-    fn thread_fact(text: &str) -> RouteFact {
+    fn attention_fact(text: &str) -> RouteFact {
         RouteFact {
-            source: "thread_stream".into(),
+            source: "attention".into(),
             identity: "event:1".into(),
             fields: BTreeMap::from([("text".into(), Value::String(text.into()))]),
             origin: None,
@@ -1724,10 +1690,10 @@ mod tests {
     #[tokio::test]
     async fn response_transforms_preserve_the_exact_origin_snapshot() {
         let definition = definition(
-            "name: Preserve origin\ndescription: transforms content only\nnodes:\n  - id: input\n    type: trigger\n    when: { fact: thread_stream }\n  - id: transform\n    type: response\n    response: conveyor\n  - id: issue\n    type: sink\n    sink: { kind: issue, labels: [routed] }\nedges:\n  - { from: input, to: transform }\n  - { from: transform, to: issue }\n",
+            "name: Preserve origin\ndescription: transforms content only\nnodes:\n  - id: input\n    type: trigger\n    when: { fact: attention }\n  - id: transform\n    type: response\n    response: conveyor\n  - id: issue\n    type: sink\n    sink: { kind: issue, labels: [routed] }\nedges:\n  - { from: input, to: transform }\n  - { from: transform, to: issue }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
-        let mut fact = thread_fact("original");
+        let mut fact = attention_fact("original");
         fact.origin = Some(external_authorship());
         let expected = fact.origin.clone();
         let run: RunResponse =
@@ -1998,7 +1964,7 @@ mod tests {
     #[tokio::test]
     async fn two_branches_off_one_trigger_carry_their_own_content_to_their_own_sink() {
         let definition = definition(
-            "name: Split\ndescription: condensed to the phone, full text to the stream\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: thread, to: stream }\n",
+            "name: Split\ndescription: condensed to the phone, full text to the stream\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: attention }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: thread, to: stream }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let run: RunResponse = &|_response: &str, _args: Value| -> ResponseFuture {
@@ -2007,7 +1973,7 @@ mod tests {
 
         let walked = walk(
             &graph,
-            &thread_fact("the whole long message"),
+            &attention_fact("the whole long message"),
             Presence::Away,
             run,
             &never_decides,
@@ -2033,7 +1999,7 @@ mod tests {
     #[tokio::test]
     async fn a_shared_prefix_runs_once_however_many_sinks_hang_off_it() {
         let definition = definition(
-            "name: Fan out\ndescription: one condense, two deliveries\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: condense, to: stream }\n",
+            "name: Fan out\ndescription: one condense, two deliveries\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: attention }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: condense, to: stream }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -2047,7 +2013,7 @@ mod tests {
 
         let walked = walk(
             &graph,
-            &thread_fact("long"),
+            &attention_fact("long"),
             Presence::Away,
             counted,
             &never_decides,
@@ -2065,7 +2031,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_response_records_itself_and_passes_its_input_through() {
         let definition = definition(
-            "name: Chain\ndescription: two steps\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: first\n    type: response\n    response: broken\n  - id: second\n    type: response\n    response: conveyor\n    args:\n      text: { field: text }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: first }\n  - { from: first, to: second }\n  - { from: second, to: stream }\n",
+            "name: Chain\ndescription: two steps\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: attention }\n  - id: first\n    type: response\n    response: broken\n  - id: second\n    type: response\n    response: conveyor\n    args:\n      text: { field: text }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: first }\n  - { from: first, to: second }\n  - { from: second, to: stream }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let seen: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
@@ -2088,7 +2054,7 @@ mod tests {
 
         let walked = walk(
             &graph,
-            &thread_fact("original"),
+            &attention_fact("original"),
             Presence::Away,
             recording,
             &never_decides,
@@ -2113,14 +2079,14 @@ mod tests {
     #[tokio::test]
     async fn only_the_branches_below_a_matching_trigger_are_walked() {
         let definition = definition(
-            "name: Two triggers\ndescription: each with its own sink\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: attention\n    type: trigger\n    when: { fact: attention }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\n  - id: board\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/2' }\nedges:\n  - { from: thread, to: stream }\n  - { from: attention, to: board }\n",
+            "name: Two triggers\ndescription: each with its own sink\nnodes:\n  - id: attention\n    type: trigger\n    when: { fact: attention }\n  - id: comment\n    type: trigger\n    when: { fact: github_comment }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\n  - id: board\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/2' }\nedges:\n  - { from: attention, to: stream }\n  - { from: comment, to: board }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let run: RunResponse =
             &|_: &str, _: Value| -> ResponseFuture { Box::pin(async { Ok(String::new()) }) };
         let walked = walk(
             &graph,
-            &thread_fact("hello"),
+            &attention_fact("hello"),
             Presence::Away,
             run,
             &never_decides,
@@ -2165,7 +2131,7 @@ mod tests {
                VALUES('i', 'p', 42, 'Target', 'active', 1, 1);";
 
     fn message_route(name: &str, extra: &str) -> String {
-        format!("name: {name}\ndescription: Routes a thread update into an issue stream\nnodes:\n  - id: thread\n    type: trigger\n    when: {{ fact: thread_stream }}\n  - id: stream\n    type: sink\n    sink: {{ kind: message, target: 'cairn://p/cairn/42' }}\nedges:\n  - {{ from: thread, to: stream }}\n{extra}")
+        format!("name: {name}\ndescription: Routes a thread update into an issue stream\nnodes:\n  - id: thread\n    type: trigger\n    when: {{ fact: attention }}\n  - id: stream\n    type: sink\n    sink: {{ kind: message, target: 'cairn://p/cairn/42' }}\nedges:\n  - {{ from: thread, to: stream }}\n{extra}")
     }
 
     #[tokio::test]
@@ -2180,7 +2146,7 @@ mod tests {
 
         dispatch(
             &orch,
-            thread_fact("routed update"),
+            attention_fact("routed update"),
             Presence::Away,
             RouteContext {
                 project_id: Some("p"),
@@ -2219,7 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn every_sink_journals_its_own_row_for_the_path_that_reached_it() {
         let temp = tempfile::tempdir().unwrap();
-        let route = "name: Split\ndescription: one branch transformed, one not\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: transformed\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/42' }\n  - id: verbatim\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/43' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: transformed }\n  - { from: thread, to: verbatim }\n";
+        let route = "name: Split\ndescription: one branch transformed, one not\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: attention }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: transformed\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/42' }\n  - id: verbatim\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/43' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: transformed }\n  - { from: thread, to: verbatim }\n";
         let (orch, db) = orchestrator(temp.path(), &[("split", route)]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
         db.execute_batch(
@@ -2231,7 +2197,7 @@ mod tests {
 
         dispatch(
             &orch,
-            thread_fact("routed update"),
+            attention_fact("routed update"),
             Presence::Away,
             RouteContext {
                 project_id: Some("p"),
@@ -2286,7 +2252,7 @@ mod tests {
 
         dispatch(
             &orch,
-            thread_fact("routed update"),
+            attention_fact("routed update"),
             Presence::Away,
             context(),
         )
@@ -2294,7 +2260,7 @@ mod tests {
         .unwrap();
         dispatch(
             &orch,
-            thread_fact("routed update"),
+            attention_fact("routed update"),
             Presence::Away,
             context(),
         )
@@ -2322,7 +2288,7 @@ mod tests {
     #[tokio::test]
     async fn dedupe_records_one_drop_however_many_sinks_the_route_has() {
         let temp = tempfile::tempdir().unwrap();
-        let route = "name: Two sinks\ndescription: both deduped together\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: first\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/42' }\n  - id: second\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/43' }\nedges:\n  - { from: thread, to: first }\n  - { from: thread, to: second }\ndedupe: 10m\n";
+        let route = "name: Two sinks\ndescription: both deduped together\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: attention }\n  - id: first\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/42' }\n  - id: second\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/43' }\nedges:\n  - { from: thread, to: first }\n  - { from: thread, to: second }\ndedupe: 10m\n";
         let (orch, db) = orchestrator(temp.path(), &[("two-sinks", route)]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
         db.execute_batch(
@@ -2337,10 +2303,10 @@ mod tests {
             event: None,
         };
 
-        dispatch(&orch, thread_fact("update"), Presence::Away, context())
+        dispatch(&orch, attention_fact("update"), Presence::Away, context())
             .await
             .unwrap();
-        dispatch(&orch, thread_fact("update"), Presence::Away, context())
+        dispatch(&orch, attention_fact("update"), Presence::Away, context())
             .await
             .unwrap();
 
@@ -2397,7 +2363,7 @@ mod tests {
         let body = body
             .map(|body| format!(", body: {}", serde_json::to_string(body).unwrap()))
             .unwrap_or_default();
-        format!("name: Body\ndescription: deterministic text\nnodes:\n  - {{ id: input, type: trigger, when: {{ fact: thread_stream }} }}\n  - {{ id: out, type: sink, sink: {{ {sink}{body} }} }}\nedges:\n  - {{ from: input, to: out }}\n")
+        format!("name: Body\ndescription: deterministic text\nnodes:\n  - {{ id: input, type: trigger, when: {{ fact: attention }} }}\n  - {{ id: out, type: sink, sink: {{ {sink}{body} }} }}\nedges:\n  - {{ from: input, to: out }}\n")
     }
 
     #[tokio::test]
@@ -2410,7 +2376,7 @@ mod tests {
             let preview = test_definition(
                 &orch,
                 &definition(&route),
-                thread_fact("hello {{literal}}"),
+                attention_fact("hello {{literal}}"),
                 Presence::Away,
                 in_project(),
             )
@@ -2431,7 +2397,7 @@ mod tests {
             );
             let submissions = dispatch(
                 &orch,
-                thread_fact("hello {{literal}}"),
+                attention_fact("hello {{literal}}"),
                 Presence::Away,
                 in_project(),
             )
@@ -2471,7 +2437,7 @@ mod tests {
                 let route = body_route(kind, Some("Before {{text}} after"));
                 let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
                 db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-                let mut fact = thread_fact("upstream must never leak");
+                let mut fact = attention_fact("upstream must never leak");
                 if empty_list {
                     fact.fields.insert("text".into(), serde_json::json!([]));
                 } else {
@@ -2569,7 +2535,7 @@ mod tests {
             let route = body_route(kind, Some("Re {{event}}"));
             let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
             db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-            let fact = thread_fact("hello");
+            let fact = attention_fact("hello");
             let (id, uri) = logged(&orch, &fact, Some("p")).await;
             assert_eq!(uri, format!("cairn://p/cairn/events/{id}"));
             let expected = format!("Re {uri}");
@@ -2607,7 +2573,7 @@ mod tests {
         let route = body_route("message", Some("Re {{event}}"));
         let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-        let fact = thread_fact("hello");
+        let fact = attention_fact("hello");
         let (id, uri) = logged(&orch, &fact, None).await;
         assert_eq!(uri, format!("cairn://routes/events/{id}"));
         dispatch(&orch, fact, Presence::Away, at_event(None, id, &uri))
@@ -2625,7 +2591,7 @@ mod tests {
         let route = body_route("message", Some("Re {{event}}"));
         let (orch, db) = orchestrator(temp.path(), &[]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-        let fact = thread_fact("hello");
+        let fact = attention_fact("hello");
         let (id, uri) = logged(&orch, &fact, Some("p")).await;
 
         let sampled = test_definition(
@@ -2679,7 +2645,7 @@ mod tests {
             )
             .await;
             db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-            let submissions = dispatch(&orch, thread_fact(""), Presence::Away, in_project())
+            let submissions = dispatch(&orch, attention_fact(""), Presence::Away, in_project())
                 .await
                 .unwrap();
             if kind == "channel" {
@@ -2883,7 +2849,7 @@ mod tests {
             );
         let definition = definition(&route);
         let graph = RouteGraph::new(&definition).unwrap();
-        let fact = thread_fact("original text");
+        let fact = attention_fact("original text");
         let run: RunResponse = &|_, _| -> ResponseFuture {
             Box::pin(async { Ok("transformed producer text".into()) })
         };
@@ -2905,20 +2871,20 @@ mod tests {
             let route = body_route(kind, Some("Prepared {{text}}"))
                 .replace(
                     "target: 'cairn://p/cairn/42'",
-                    "target: { field: threadUri }",
+                    "target: { field: detailUri }",
                 )
                 .replace(
                     "destination: 'discord:1/2'",
                     "destination: { field: conversation }",
                 );
             let route = if kind == "channel" {
-                route.replace("fact: thread_stream", "fact: channel_message")
+                route.replace("fact: attention", "fact: channel_message")
             } else {
                 route
             };
             let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
             db.execute_batch(PROJECT_FIXTURE).await.unwrap();
-            let mut fact = thread_fact("content");
+            let mut fact = attention_fact("content");
             if kind == "channel" {
                 fact.source = "channel_message".into();
             }
@@ -2952,14 +2918,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let route = body_route("message", Some("Prepared {{text}}")).replace(
             "target: 'cairn://p/cairn/42'",
-            "target: { field: threadUri }",
+            "target: { field: detailUri }",
         );
         let (orch, db) = orchestrator(temp.path(), &[("body", &route)]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
         db.execute_batch("INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at) VALUES('i43', 'p', 43, 'Second', 'active', 1, 1);").await.unwrap();
-        let mut fact = thread_fact("{{text}}");
+        let mut fact = attention_fact("{{text}}");
         fact.fields.insert(
-            "threadUri".into(),
+            "detailUri".into(),
             serde_json::json!(["cairn://p/cairn/42", "cairn://p/cairn/43"]),
         );
         dispatch(&orch, fact, Presence::Away, in_project())
@@ -3094,7 +3060,7 @@ mod tests {
         let result = test_definition(
             &orch,
             &draft,
-            thread_fact("preview only"),
+            attention_fact("preview only"),
             Presence::Away,
             RouteContext {
                 project_id: Some("p"),
@@ -3306,7 +3272,6 @@ mod tests {
             crate::channels::bindings::BindingKind::Ambient,
             crate::channels::bindings::MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .unwrap());

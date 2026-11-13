@@ -430,8 +430,8 @@ async fn a_project_post_stays_in_its_project_and_a_workspace_post_reaches_all() 
 }
 
 /// Acceptance 4. A comment addresses its post's author and whoever it names,
-/// never the Posts watchers; and a `mentions` trigger hears a thread citing the
-/// post in the same vocabulary.
+/// never the Posts watchers; and a `mentions` trigger hears another thread's
+/// post citing the post, in the same vocabulary.
 #[tokio::test]
 async fn a_comment_reaches_the_author_and_its_mentions_and_triggers_hear_citations() {
     let temp = tempfile::tempdir().unwrap();
@@ -462,59 +462,42 @@ async fn a_comment_reaches_the_author_and_its_mentions_and_triggers_hear_citatio
         "watcher2",
         &serde_json::json!([
             {"fact": "post_commented", "postUri": design_uri},
-            {"fact": "thread_stream", "mentions": design_uri}
+            {"fact": "post_created", "mentions": design_uri}
         ])
         .to_string(),
     )
     .await;
-    // The speaking thread holds the same citation trigger: its own utterance
-    // must not wake it (the row's actor is the speaker).
+    // The citing thread holds the same citation trigger: its own post must
+    // not wake it (the row's actor is its author).
     standing_triggers(
         &db,
         "watcher",
-        &serde_json::json!([{"fact": "thread_stream", "mentions": design_uri}]).to_string(),
+        &serde_json::json!([{"fact": "post_created", "mentions": design_uri}]).to_string(),
     )
     .await;
     drain_fact_log(&orch).await;
 
     let on_design = comment(&orch, &design, "cc cairn://p/cairn/ui", human(), None).await;
     let on_other = comment(&orch, &other, "unrelated", human(), None).await;
-    for (n, text) in [
-        (1, format!("see {design_uri}")),
-        (2, "nothing cited".to_string()),
-    ] {
-        let detail = format!("cairn://p/cairn/ui:event:{n}");
-        let fields = crate::channels::router::thread_stream_fields(
-            &db,
-            "cairn",
-            "cairn://p/cairn/ui",
-            &detail,
-            text,
-            "ctx".into(),
-            "watcher".into(),
-        )
-        .await;
-        crate::routes::mint(
-            &orch,
-            crate::routes::Mint {
-                fact: crate::routes::RouteFact {
-                    source: "thread_stream".into(),
-                    identity: detail.clone(),
-                    fields,
-                    origin: None,
-                    summary: None,
-                    route_provenance: None,
-                },
-                record_ref: detail,
-                record_id: Some(n.to_string()),
-                project_id: Some("p"),
-                presence: crate::routes::Presence::Away,
-                actor_job_id: Some("watcher"),
-            },
-        )
-        .await
-        .unwrap();
-    }
+    let ui = agent("cairn://p/cairn/ui");
+    let citing = post(
+        &orch,
+        Some("p"),
+        "Citing",
+        &format!("see {design_uri}"),
+        ui.clone(),
+        Some("watcher"),
+    )
+    .await;
+    let uncited = post(
+        &orch,
+        Some("p"),
+        "Uncited",
+        "nothing cited",
+        ui,
+        Some("watcher"),
+    )
+    .await;
     drain_fact_log(&orch).await;
 
     let row = row_of(&db, &comment_uri(&on_design)).await;
@@ -539,11 +522,14 @@ async fn a_comment_reaches_the_author_and_its_mentions_and_triggers_hear_citatio
         vec![job("writer", Some("postAuthor"))]
     );
     assert_eq!(
-        woke(&db, "cairn://p/cairn/ui:event:1").await,
-        vec![job("watcher2", None)],
-        "another thread's citation of the post matches the same mentions clause; the speaker's own does not wake it"
+        woke(&db, &post_uri(&citing)).await,
+        vec![job("reader", None), job("watcher2", None)],
+        "another thread's citation of the post matches the same mentions clause; the author's own does not wake it"
     );
-    assert!(woke(&db, "cairn://p/cairn/ui:event:2").await.is_empty());
+    assert_eq!(
+        woke(&db, &post_uri(&uncited)).await,
+        vec![job("reader", None)]
+    );
 
     // The events view explains a mention wake as the row's own address.
     let explained = read(
@@ -846,8 +832,8 @@ async fn a_comment_reads_at_its_own_uri_under_its_post() {
 }
 
 /// A post past the log's list bound still addresses its last reference, and a
-/// thread's utterance still matches on its last citation: reference sets are
-/// stored whole.
+/// trigger still matches on that last reference: reference sets are stored
+/// whole.
 #[tokio::test]
 async fn a_reference_past_the_list_bound_still_addresses_and_matches() {
     let temp = tempfile::tempdir().unwrap();
@@ -866,40 +852,9 @@ async fn a_reference_past_the_list_bound_still_addresses_and_matches() {
     standing_triggers(
         &db,
         "watcher2",
-        r#"[{"fact":"thread_stream","mentions":"cairn://posts/999"}]"#,
+        r#"[{"fact":"post_created","mentions":"cairn://p/cairn/ui"}]"#,
     )
     .await;
-    let detail = "cairn://p/cairn/feed:event:1";
-    let stream_fields = crate::channels::router::thread_stream_fields(
-        &db,
-        "cairn",
-        "cairn://p/cairn/feed",
-        detail,
-        format!("{citations}and cairn://posts/999"),
-        "ctx".into(),
-        "reader".into(),
-    )
-    .await;
-    crate::routes::mint(
-        &orch,
-        crate::routes::Mint {
-            fact: crate::routes::RouteFact {
-                source: "thread_stream".into(),
-                identity: detail.into(),
-                fields: stream_fields,
-                origin: None,
-                summary: None,
-                route_provenance: None,
-            },
-            record_ref: detail.into(),
-            record_id: Some("1".into()),
-            project_id: Some("p"),
-            presence: crate::routes::Presence::Away,
-            actor_job_id: Some("reader"),
-        },
-    )
-    .await
-    .unwrap();
     drain_fact_log(&orch).await;
 
     let mentions = fields(&row_of(&db, &post_uri(&long)).await)["mentions"].clone();
@@ -907,9 +862,8 @@ async fn a_reference_past_the_list_bound_still_addresses_and_matches() {
     assert_eq!(mentions[70], "cairn://p/cairn/ui");
     assert_eq!(
         woke(&db, &post_uri(&long)).await,
-        vec![job("watcher", Some("mentions"))]
+        vec![job("watcher", Some("mentions")), job("watcher2", None)]
     );
-    assert_eq!(woke(&db, detail).await, vec![job("watcher2", None)]);
 }
 
 /// An explicit or migrated Posts watch is exactly the scope a

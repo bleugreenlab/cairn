@@ -1,10 +1,10 @@
 use crate::{
     channels::{
         bindings::{
-            canonical_conversation, legacy_conversation, BindingKind, MESSAGE_CLASS_AGENT_TEXT,
-            MESSAGE_CLASS_NOTIFY, MESSAGE_CLASS_PERMISSION, MESSAGE_CLASS_QUESTION,
+            canonical_conversation, BindingKind, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_NOTIFY,
+            MESSAGE_CLASS_PERMISSION, MESSAGE_CLASS_QUESTION,
         },
-        conversation_capabilities,
+        conversation_capabilities, default_project,
         label::{self, Sender},
         ledger, runtime_status, ConversationAddress, ConversationCapabilities,
         ConversationProvider,
@@ -48,11 +48,11 @@ fn message_class_names(bits: i64) -> Vec<&'static str> {
 pub struct ConversationRow {
     pub address: String,
     pub label: String,
-    /// The conversation's `cairn://channels/...` resource; absent on a follow
-    /// placeholder and on a Discord channel no binding names.
+    /// The conversation's `cairn://channels/...` resource; absent on a Discord
+    /// channel no binding names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// The binding kind: `structural`, `follow`, or `ambient`.
+    /// The binding kind: `structural` or `ambient`.
     pub binding: String,
     pub provider: String,
     pub deliverability: ConversationDeliverability,
@@ -66,11 +66,6 @@ pub struct ConversationRow {
     /// [`ConversationRow::sendable`] holds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send: Option<String>,
-    /// Set (and serialized) only on a follow row's placeholder address, which
-    /// stands for the follow stream rather than naming a destination, so nothing
-    /// can ever be sent to it whatever its classes say.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub placeholder: bool,
     /// Set (and serialized) only on an ambient conversation: one bound to a
     /// whole project, whose classes are fixed at agent text, so the operator
     /// has no agent-text switch to flip there.
@@ -97,14 +92,14 @@ impl ConversationRow {
     }
 
     /// Whether an agent may send free text here: the operator granted
-    /// `agent_text`, the provider runtime is running (up or degraded), and the
-    /// address is a real destination. Degradation never withholds a send:
+    /// `agent_text` and the provider runtime is running (up or degraded).
+    /// Degradation never withholds a send:
     /// neither a provider-level gap the runtime keeps delivering through nor a
     /// prior outbound failure, which refusing on would let one failure silence
     /// the conversation. Only a stopped, dead, offline, or invalid runtime does.
     /// The one predicate drives both the `send` affordance and write admission.
     pub fn sendable(&self) -> bool {
-        self.grants_agent_text() && self.runtime_running() && !self.placeholder
+        self.grants_agent_text() && self.runtime_running()
     }
 
     fn with_send_affordance(mut self) -> Self {
@@ -121,12 +116,6 @@ impl ConversationRow {
     fn send_refusal(&self) -> Option<String> {
         if self.sendable() {
             return None;
-        }
-        if self.placeholder {
-            return Some(format!(
-                "{} is the follow placeholder, which stands for the operator's follow stream rather than naming a deliverable conversation",
-                self.label
-            ));
         }
         if !self.grants_agent_text() {
             return Some(format!(
@@ -156,13 +145,6 @@ fn send_example(uri: &str) -> String {
     format!("write({{changes:[{{target:\"{uri}\",mode:\"append\",payload:{{content:\"...\"}}}}]}})")
 }
 
-/// A follow row's conversation is the provider's placeholder address
-/// (`imessage:legacy`, `telegram:0`, `discord:0/0`).
-fn is_placeholder(address: &ConversationAddress) -> bool {
-    legacy_conversation(address.provider().id())
-        .is_ok_and(|placeholder| placeholder == address.to_string())
-}
-
 /// The operator's grant or revocation of `agent_text` on one binding.
 ///
 /// This is the only writer of a binding's classes outside the reconciler and
@@ -170,10 +152,6 @@ fn is_placeholder(address: &ConversationAddress) -> bool {
 /// runner exposes it only as the `set_conversation_agent_text` invoke, which
 /// refuses a caller without the desktop operator credential. An agent can
 /// therefore never grant itself a conversation.
-///
-/// Granting on a follow placeholder is refused because the placeholder names
-/// no destination, so the grant could never deliver anything. Revoking there is
-/// allowed: it only removes an inert bit.
 pub async fn set_agent_text(
     db: &crate::storage::LocalDb,
     conversation: &str,
@@ -184,11 +162,6 @@ pub async fn set_agent_text(
         .parse::<ConversationAddress>()
         .map_err(|error| format!("'{conversation}' is not a conversation address: {error}"))?;
     let provider = address.provider().id();
-    if granted && is_placeholder(&address) {
-        return Err(format!(
-            "{conversation} is {provider}'s follow placeholder, which names no destination, so agent text granted there could never be delivered"
-        ));
-    }
     if !ledger::set_message_class(
         db,
         provider,
@@ -248,7 +221,6 @@ fn row_for_status(
         last_error,
         failed_count,
         send: None,
-        placeholder: is_placeholder(&address),
         ambient: binding == BindingKind::Ambient.as_str(),
         message_classes,
         runtime_state: state,
@@ -315,7 +287,7 @@ async fn conversation_titles(
             continue;
         };
         let conversation = address.to_string();
-        if is_placeholder(&address) || !asked.insert(conversation.clone()) {
+        if !asked.insert(conversation.clone()) {
             continue;
         }
         if let Some(title) =
@@ -391,7 +363,6 @@ where
                 last_error: Some(status.detail.unwrap_or_else(|| error.to_string())),
                 failed_count: status.failed_count,
                 send: None,
-                placeholder: false,
                 ambient,
                 message_classes: binding.message_classes,
                 runtime_state: "invalid",
@@ -502,10 +473,7 @@ impl ChannelReader {
         match self {
             Self::Operator => true,
             Self::Thread { thread, .. } => {
-                home_ambient
-                    || (row.target == *thread
-                        && !row.placeholder
-                        && (structural || row.grants_agent_text()))
+                home_ambient || (row.target == *thread && (structural || row.grants_agent_text()))
             }
             Self::Issue { issue, .. } => home_ambient || (row.target == *issue && structural),
         }
@@ -538,8 +506,7 @@ pub async fn channel_reader(
     ChannelReader::from_home(&agent.home, &agent.job_id)
 }
 
-/// Every active binding `reader` reaches on `provider`, follow placeholders
-/// left out: they name no conversation to read.
+/// Every active binding `reader` reaches on `provider`.
 pub async fn reachable(
     orch: &Orchestrator,
     reader: &ChannelReader,
@@ -548,7 +515,7 @@ pub async fn reachable(
     configured_conversations(orch)
         .await
         .into_iter()
-        .filter(|row| row.provider == provider.id() && !row.placeholder && reader.reaches(row))
+        .filter(|row| row.provider == provider.id() && reader.reaches(row))
         .collect()
 }
 
@@ -853,7 +820,40 @@ pub async fn render_channels(
             summary.last_seen(),
         ));
     }
+    out.push_str(&unaddressed_text_section(orch).await);
     out
+}
+
+/// How the operator sets the default project.
+const DEFAULT_PROJECT_HOW: &str = "the operator sets it under Settings > Channels > Default project, or with patch {defaultProject} on cairn://channels from the desktop; empty clears it";
+
+/// The `cairn://channels` section saying where bare phone text goes, ending
+/// with the general thread the third rule resolves to right now.
+async fn unaddressed_text_section(orch: &Orchestrator) -> String {
+    let resolved = match default_project::resolve(orch).await {
+        Err(error) => format!("unknown; the default project could not be read: {error}"),
+        Ok(None) => {
+            "none; the workspace has no project, so unaddressed text is refused".to_string()
+        }
+        Ok(Some(project)) => {
+            let uri = default_project::general_thread_uri(&project.key);
+            let source = format!(
+                "default project: {}, {}",
+                project.key,
+                project.source.word()
+            );
+            match default_project::open_general_thread(orch, &project.key).await {
+                Ok(true) => format!("{uri} ({source})"),
+                Ok(false) => format!(
+                    "none; {uri} is missing or closed ({source}), so unaddressed text is refused with no_default_thread"
+                ),
+                Err(error) => format!("{uri} ({source}); whether it is open could not be read: {error}"),
+            }
+        }
+    };
+    format!(
+        "\n## Unaddressed text\n\nBare text the operator sends on iMessage or Telegram goes to the first of:\n\n1. the message it natively replies to (reply-to wins);\n2. else the thread whose operator message on that transport is the latest within 24 h;\n3. else the default project's general thread.\n\nA single outstanding question or permission ask from the same handle still takes bare text first.\n\n- general thread: {resolved}\n- default project: {DEFAULT_PROJECT_HOW}\n"
+    )
 }
 
 /// `cairn://channels/app`: the app channel's row, pointing at where its
@@ -874,9 +874,9 @@ async fn render_app_provider(orch: &Orchestrator) -> String {
     )
 }
 
-/// The operator's `patch {provider, purpose}` on `cairn://channels`. Only a
-/// request the channels door stamped as the verified desktop operator may make
-/// it. An empty purpose clears the line.
+/// The operator's `patch {provider, purpose}` or `patch {defaultProject}` on
+/// `cairn://channels`. Only a request the channels door stamped as the verified
+/// desktop operator may make either. An empty value clears it.
 pub async fn set_purpose(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -884,7 +884,10 @@ pub async fn set_purpose(
     dry_run: bool,
 ) -> Result<String, String> {
     if !request.is_desktop_operator() {
-        return Err("Only the operator may set a channel provider's purpose, from the desktop; agents read it on cairn://channels.".to_string());
+        return Err("Only the operator may set a channel provider's purpose or the default project, from the desktop; agents read them on cairn://channels.".to_string());
+    }
+    if let Some(value) = payload.get("defaultProject") {
+        return set_default_project(orch, value, dry_run).await;
     }
     let provider = payload
         .get("provider")
@@ -956,6 +959,103 @@ pub async fn set_purpose(
         "{verb} {display_name}'s purpose; read {} to see it.",
         label::CHANNELS_URI
     ))
+}
+
+/// Every project key in the workspace, canonical and sorted.
+async fn project_keys(orch: &Orchestrator) -> Result<Vec<String>, String> {
+    let mut keys = Vec::new();
+    for db in orch.db.all_dbs().await {
+        keys.extend(
+            db.query_all("SELECT key FROM projects", (), |row| {
+                use crate::storage::RowExt;
+                row.text(0)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(cairn_uri::canonical_project),
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+/// The operator's `patch {defaultProject}`: an existing project's canonical
+/// key, or an empty string to clear it back to the oldest project. Writing it
+/// also drops the retired `defaultThread`, which would otherwise be converted
+/// again on the next load.
+async fn set_default_project(
+    orch: &Orchestrator,
+    value: &serde_json::Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    let requested =
+        match value {
+            serde_json::Value::String(key) => {
+                Some(cairn_uri::canonical_project(key.trim())).filter(|key| !key.is_empty())
+            }
+            serde_json::Value::Null => None,
+            _ => return Err(
+                "payload.defaultProject must be a project key string; an empty string clears it"
+                    .to_string(),
+            ),
+        };
+    if let Some(key) = &requested {
+        let known = project_keys(orch).await?;
+        if !known.contains(key) {
+            return Err(format!(
+                "Unknown project '{key}': defaultProject must name a project in this workspace ({})",
+                if known.is_empty() {
+                    "there are none".to_string()
+                } else {
+                    format!("known: {}", known.join(", "))
+                }
+            ));
+        }
+    }
+    if dry_run {
+        return Ok(match &requested {
+            Some(key) => format!("Would set the default project to {key}."),
+            None => "Would clear the default project.".to_string(),
+        });
+    }
+    crate::config::settings::mutate_workspace_settings(
+        &orch.config_dir,
+        "channels: default project",
+        |document| {
+            use serde_yaml::{Mapping, Value};
+            let channels = document
+                .entry(Value::from("channels"))
+                .or_insert(Value::Null);
+            if channels.is_null() {
+                *channels = Value::Mapping(Mapping::new());
+            }
+            let channels = channels
+                .as_mapping_mut()
+                .ok_or("settings key channels is not a mapping")?;
+            channels.remove(Value::from("defaultThread"));
+            match &requested {
+                Some(key) => {
+                    channels.insert(Value::from("defaultProject"), Value::from(key.as_str()));
+                }
+                None => {
+                    channels.remove(Value::from("defaultProject"));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(match requested {
+        Some(key) => format!(
+            "Set the default project to {key}; read {} to see it.",
+            label::CHANNELS_URI
+        ),
+        None => format!(
+            "Cleared the default project, so it is the oldest project; read {} to see it.",
+            label::CHANNELS_URI
+        ),
+    })
 }
 
 /// The request the channels door makes its reads and writes with: no run, and
@@ -1218,12 +1318,11 @@ pub struct ReachedConversation {
 
 impl ReachedConversation {
     /// The row the conversation is presented and sent through: a sendable one
-    /// when there is one, else its naming binding.
+    /// when there is one, else its first binding.
     pub fn row(&self) -> Option<&ConversationRow> {
         self.rows
             .iter()
             .find(|row| row.sendable())
-            .or_else(|| self.rows.iter().find(|row| row.binding != "follow"))
             .or_else(|| self.rows.first())
     }
 }
@@ -1282,13 +1381,21 @@ pub async fn reach_conversation(
     })
 }
 
-fn inbound_rejection(reason: &str) -> String {
+/// `default_project` is the default project as it resolves now, which is what
+/// a `no_default_thread` rejection names.
+fn inbound_rejection(reason: &str, default_project: Option<&str>) -> String {
     let why = match reason {
-        "allowlist" => "the sender is not on this provider's allowlist",
-        "policy" => "this provider's inbound capabilities refuse it",
-        "unmatched" => "it replied to nothing Cairn is waiting on",
-        "unbound_conversation" => "this channel is bound to no Cairn thread",
-        _ => "",
+        "allowlist" => "the sender is not on this provider's allowlist".to_string(),
+        "policy" => "this provider's inbound capabilities refuse it".to_string(),
+        "unmatched" => "it replied to nothing Cairn is waiting on".to_string(),
+        "unbound_conversation" => "this channel is bound to no Cairn thread".to_string(),
+        "no_default_thread" => match default_project {
+            Some(project) => {
+                format!("the default project {project} has no open general thread")
+            }
+            None => "the workspace has no project to be the default".to_string(),
+        },
+        _ => String::new(),
     };
     if why.is_empty() {
         format!("rejected: {reason}")
@@ -1336,6 +1443,61 @@ async fn render_addressed_by(
         tokens.push(named.unwrap_or_else(|| token.to_string()));
     }
     tokens.join(" ")
+}
+
+/// An outbound row as an inbound's reason names it: an operator message by its
+/// `cairn://operator` URI, anything else by its `out` id, with when it was
+/// sent. `None` when the row is no longer in the ledger.
+async fn outbound_reference(
+    db: &crate::storage::LocalDb,
+    outbound: &str,
+) -> (String, Option<String>) {
+    let record = ledger::get_by_id(db, outbound).await.ok().flatten();
+    let Some(record) = record else {
+        return (format!("out {outbound}"), None);
+    };
+    let label = (record.kind == crate::channels::operator_message::KIND)
+        .then(|| crate::channels::operator_message::message_id(&record.binding_ref))
+        .flatten()
+        .map(|id| format!("{OPERATOR_URI}/{id}"))
+        .unwrap_or_else(|| format!("out {}", record.id));
+    let time = record.sent_at.map(|sent| format!("sent {}", at_ms(sent)));
+    (label, time)
+}
+
+/// Why an inbound reached `target`, from its `addressed_by` token.
+async fn inbound_reason(
+    db: &crate::storage::LocalDb,
+    provider: ConversationProvider,
+    conversation: &str,
+    target: &str,
+    addressed_by: &str,
+) -> String {
+    match ledger::InboundAddress::parse(addressed_by) {
+        ledger::InboundAddress::Typed(typed) => format!(
+            "delivered to {target}, addressed by {}",
+            render_addressed_by(db, conversation, &typed).await
+        ),
+        ledger::InboundAddress::Reply { outbound } => {
+            let (label, time) = outbound_reference(db, &outbound).await;
+            match time {
+                Some(time) => format!("delivered to {target}, as your reply to {label} ({time})"),
+                None => format!("delivered to {target}, as your reply to {label}"),
+            }
+        }
+        ledger::InboundAddress::RecentOperatorMessage { outbound } => {
+            let (label, time) = outbound_reference(db, &outbound).await;
+            format!(
+                "delivered to {target}: no reply-to, and {target} sent you the latest operator message on {} within 24 h ({})",
+                provider.id(),
+                time.map(|time| format!("{label}, {time}")).unwrap_or(label)
+            )
+        }
+        ledger::InboundAddress::DefaultProject { .. } => format!(
+            "delivered to {target}: no reply-to and no operator message on {} in the last 24 h, so the default project's general thread",
+            provider.id()
+        ),
+    }
 }
 
 fn quoted(text: &str) -> String {
@@ -1507,6 +1669,20 @@ async fn conversation_view(
         acknowledgements.push(ledger::route_acknowledgement(db, provider.id(), firing).await?);
     }
 
+    // Resolved only when a rejection on this page names it.
+    let default_project = if messages
+        .iter()
+        .any(|message| message.state.as_deref() == Some("no_default_thread"))
+    {
+        default_project::resolve(orch)
+            .await
+            .ok()
+            .flatten()
+            .map(|project| project.key)
+    } else {
+        None
+    };
+
     let row = reached.row();
     let status = runtime_status(orch, provider.id()).await;
     let binding = resolved.primary();
@@ -1564,7 +1740,7 @@ async fn conversation_view(
                     .filter(|(firing, _)| firing.inbound_id == message.id)
                     .collect::<Vec<_>>();
                 let action = match (message.state.as_deref(), message.reference.as_deref()) {
-                    (Some(reason), _) => inbound_rejection(reason),
+                    (Some(reason), _) => inbound_rejection(reason, default_project.as_deref()),
                     (None, Some(target))
                         if message.binding_kind.as_deref()
                             == Some(BindingKind::Ambient.as_str())
@@ -1578,10 +1754,9 @@ async fn conversation_view(
                         }
                     }
                     (None, Some(target)) => match message.detail.as_deref() {
-                        Some(addressed_by) => format!(
-                            "delivered to {target}, addressed by {}",
-                            render_addressed_by(db, conversation, addressed_by).await
-                        ),
+                        Some(addressed_by) => {
+                            inbound_reason(db, provider, conversation, target, addressed_by).await
+                        }
                         None => format!("delivered to {target}"),
                     },
                     (None, None) => "recorded".to_string(),
@@ -1919,13 +2094,6 @@ mod tests {
                 Some("channel is not running"),
                 None,
             ),
-            row(
-                ConversationAddress::telegram("0").unwrap(),
-                MESSAGE_CLASS_AGENT_TEXT,
-                "bridgeUp",
-                None,
-                None,
-            ),
         ] {
             assert!(!unsendable.sendable());
             assert!(serde_json::to_value(&unsendable)
@@ -2051,13 +2219,6 @@ mod tests {
                 None,
             ),
             row(
-                ConversationAddress::telegram("0").unwrap(),
-                MESSAGE_CLASSES_ALL | MESSAGE_CLASS_AGENT_TEXT,
-                "bridgeUp",
-                None,
-                None,
-            ),
-            row(
                 ConversationAddress::telegram("42").unwrap(),
                 MESSAGE_CLASS_AGENT_TEXT,
                 "dead",
@@ -2090,8 +2251,6 @@ mod tests {
                 && unbound.contains("cairn://channels/discord/cairn/general"),
             "{unbound}"
         );
-        let placeholder = refusal("telegram:0");
-        assert!(placeholder.contains("placeholder"), "{placeholder}");
         let not_granted = refusal("discord:1/3");
         assert!(
             not_granted.contains("agent messages are not enabled for #general · cairn · Discord")
@@ -2106,41 +2265,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn only_a_placeholder_row_serializes_the_placeholder_flag() {
-        let placeholder = row(
-            ConversationAddress::telegram("0").unwrap(),
-            MESSAGE_CLASSES_ALL,
-            "bridgeUp",
-            None,
-            None,
-        );
-        assert_eq!(
-            serde_json::to_value(&placeholder).unwrap()["placeholder"],
-            true
-        );
-        let real = row(
-            ConversationAddress::telegram("42").unwrap(),
-            MESSAGE_CLASSES_ALL,
-            "bridgeUp",
-            None,
-            None,
-        );
-        assert!(serde_json::to_value(&real)
-            .unwrap()
-            .get("placeholder")
-            .is_none());
-    }
-
     #[tokio::test]
     async fn the_operator_grant_moves_agent_text_and_refuses_what_cannot_deliver() {
         use crate::channels::bindings::BindingKind;
         let db = crate::storage::migrated_test_db("channels-operator-agent-text.db").await;
-        assert!(
-            ledger::follow_target(&db, "telegram", "cairn://p/cairn/1", 1, 0)
-                .await
-                .unwrap()
-        );
         assert!(ledger::bind_target(
             &db,
             "discord",
@@ -2149,7 +2277,6 @@ mod tests {
             BindingKind::Structural,
             MESSAGE_CLASSES_ALL,
             1,
-            0,
         )
         .await
         .unwrap());
@@ -2177,16 +2304,6 @@ mod tests {
             .unwrap();
         assert_eq!(classes("discord:1/2").await, Some(MESSAGE_CLASSES_ALL));
 
-        let placeholder = set_agent_text(&db, "telegram:0", "cairn://p/cairn/1", true)
-            .await
-            .unwrap_err();
-        assert!(placeholder.contains("follow placeholder"), "{placeholder}");
-        assert_eq!(classes("telegram:0").await, Some(MESSAGE_CLASSES_ALL));
-        // Revoking on a placeholder only clears an inert bit, so it is allowed.
-        set_agent_text(&db, "telegram:0", "cairn://p/cairn/1", false)
-            .await
-            .unwrap();
-
         let unbound = set_agent_text(&db, "discord:1/9", "cairn://p/cairn/general", true)
             .await
             .unwrap_err();
@@ -2212,7 +2329,6 @@ mod tests {
             BindingKind::Ambient,
             MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .unwrap());
@@ -2224,7 +2340,6 @@ mod tests {
             BindingKind::Structural,
             MESSAGE_CLASSES_ALL | MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .unwrap());
@@ -2301,7 +2416,6 @@ mod tests {
                     BindingKind::Structural,
                     MESSAGE_CLASSES_ALL,
                     1,
-                    0,
                 )
                 .await
                 .unwrap_or_else(|error| panic!("{provider} binding {n}: {error}")));
@@ -2409,24 +2523,7 @@ mod tests {
             "ambient",
             MESSAGE_CLASS_AGENT_TEXT,
         );
-        let granted = bound_row("telegram:42", "cairn://p/prj/general", "follow", agent);
-        let ungranted = bound_row(
-            "telegram:43",
-            "cairn://p/prj/general",
-            "follow",
-            MESSAGES_CLASSES_ALL_ONLY,
-        );
-        let placeholder = bound_row("telegram:0", "cairn://p/prj/general", "follow", agent);
-        let rows = [
-            &own,
-            &other,
-            &issue,
-            &ambient,
-            &elsewhere,
-            &granted,
-            &ungranted,
-            &placeholder,
-        ];
+        let rows = [&own, &other, &issue, &ambient, &elsewhere];
         let reached = |reader: &ChannelReader| {
             rows.iter()
                 .filter(|row| reader.reaches(row))
@@ -2435,10 +2532,7 @@ mod tests {
         };
 
         let thread = ChannelReader::from_home("cairn://p/PRJ/general", "job").unwrap();
-        assert_eq!(
-            reached(&thread),
-            ["discord:1/2", "discord:1/9", "telegram:42"]
-        );
+        assert_eq!(reached(&thread), ["discord:1/2", "discord:1/9"]);
         let task = ChannelReader::from_home("cairn://p/prj/general/task/scan", "job").unwrap();
         assert_eq!(reached(&task), reached(&thread));
         let node = ChannelReader::from_home("cairn://p/prj/42/1/builder", "job").unwrap();
@@ -2450,7 +2544,6 @@ mod tests {
     }
 
     const MESSAGES_ALL_AGENT: i64 = MESSAGE_CLASSES_ALL | MESSAGE_CLASS_AGENT_TEXT;
-    const MESSAGES_CLASSES_ALL_ONLY: i64 = MESSAGE_CLASSES_ALL;
 
     /// A Telegram chat is listed by the title its running provider gives it,
     /// fetched when read rather than stored on the binding.
@@ -2470,10 +2563,9 @@ mod tests {
             "telegram",
             "telegram:42",
             "cairn://p/prj/general",
-            BindingKind::Follow,
+            BindingKind::Structural,
             MESSAGES_ALL_AGENT,
             1,
-            0
         )
         .await
         .unwrap());
@@ -2539,18 +2631,11 @@ mod tests {
                 MESSAGES_ALL_AGENT,
             ),
         ] {
-            assert!(ledger::bind_target(
-                &local,
-                "discord",
-                conversation,
-                target,
-                kind,
-                classes,
-                1,
-                0
-            )
-            .await
-            .unwrap());
+            assert!(
+                ledger::bind_target(&local, "discord", conversation, target, kind, classes, 1,)
+                    .await
+                    .unwrap()
+            );
         }
         let config_dir = tempfile::tempdir().unwrap().keep();
         std::fs::write(
@@ -2909,6 +2994,113 @@ mod tests {
         assert!(
             listing.find("#ambient").unwrap() < listing.find("#channels ·").unwrap(),
             "newest activity first: {listing}"
+        );
+    }
+
+    /// Each unaddressed-text rule names itself on the message it routed, and a
+    /// refusal names the default project that had no open general thread.
+    #[tokio::test]
+    async fn each_inbound_says_which_rule_routed_it() {
+        let orch = conversation_orchestrator().await;
+        let db = &orch.db.local;
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-12T05:29:18.189Z")
+            .unwrap()
+            .timestamp_millis();
+        let operator_ref = crate::channels::operator_message::binding_ref("m-1");
+        assert!(ledger::insert_intent(
+            db,
+            &ledger::NewOutbound {
+                id: "out-op",
+                channel: "discord",
+                kind: crate::channels::operator_message::KIND,
+                binding_ref: &operator_ref,
+                conversation: "discord:1/9",
+                job_id: None,
+                rendered_text: "Ship it?",
+                rendering: "text",
+                created_at: at,
+            },
+        )
+        .await
+        .unwrap());
+        assert!(ledger::mark_sent(db, "out-op", "g-op", None, None, at)
+            .await
+            .unwrap());
+        let rows = [
+            ("in-reply", Some("reply:out-op"), None),
+            ("in-recent", Some("recent:out-op"), None),
+            ("in-gone", Some("reply:out-gone"), None),
+            ("in-default", Some("default:prj"), None),
+            ("in-typed", Some("<#2>"), None),
+            ("in-refused", None, Some("no_default_thread")),
+        ];
+        for (offset, (id, addressed_by, rejection)) in rows.into_iter().enumerate() {
+            assert!(ledger::insert_inbound(
+                db,
+                &ledger::InboundRecord {
+                    id: id.into(),
+                    channel: "discord".into(),
+                    provider_guid: None,
+                    sender: "1234".into(),
+                    text: "yes".into(),
+                    received_at: at + 1 + offset as i64,
+                    rejection_reason: rejection.map(str::to_string),
+                    acknowledged_at: None,
+                    conversation: Some("discord:1/9".into()),
+                    target_uri: rejection
+                        .is_none()
+                        .then(|| "cairn://p/prj/channels".to_string()),
+                    binding_kind: Some("none".into()),
+                    addressed_by: addressed_by.map(str::to_string),
+                    message_guid: None,
+                },
+            )
+            .await
+            .unwrap());
+        }
+
+        let rendered = view(&orch, &["prj"], &[]).await;
+        for expected in [
+            "delivered to cairn://p/prj/channels, as your reply to cairn://operator/m-1 (sent 2026-11-12 05:29:18.189Z)",
+            "delivered to cairn://p/prj/channels: no reply-to, and cairn://p/prj/channels sent you the latest operator message on discord within 24 h (cairn://operator/m-1, sent 2026-11-12 05:29:18.189Z)",
+            "delivered to cairn://p/prj/channels, as your reply to out out-gone\n",
+            "delivered to cairn://p/prj/channels: no reply-to and no operator message on discord in the last 24 h, so the default project's general thread",
+            "delivered to cairn://p/prj/channels, addressed by #channels",
+            "rejected: no_default_thread (the default project prj has no open general thread)",
+        ] {
+            assert!(rendered.contains(expected), "{expected}\n{rendered}");
+        }
+    }
+
+    /// The root says where bare text goes and which general thread the third
+    /// rule resolves to now, and says so when that thread is not open.
+    #[tokio::test]
+    async fn the_root_names_the_general_thread_unaddressed_text_reaches() {
+        let orch = conversation_orchestrator().await;
+        let request = operator_request("read_batch");
+        let closed = render_channels(&orch, &request, &[]).await;
+        assert!(
+            closed.contains("## Unaddressed text")
+                && closed.contains("reply-to wins")
+                && closed.contains("latest within 24 h")
+                && closed.contains("A single outstanding question or permission ask")
+                && closed.contains("- general thread: none; cairn://p/prj/general is missing or closed (default project: prj, oldest project)"),
+            "{closed}"
+        );
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+                 VALUES ('t-general', 'p', 'general', 'active', 1, 1);",
+            )
+            .await
+            .unwrap();
+        let open = render_channels(&orch, &request, &[]).await;
+        assert!(
+            open.contains(
+                "- general thread: cairn://p/prj/general (default project: prj, oldest project)"
+            ),
+            "{open}"
         );
     }
 

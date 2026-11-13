@@ -190,19 +190,6 @@ pub struct Fact<'a> {
 pub use crate::orchestrator::wakes::MutedDelivery;
 pub use crate::storage::LogDedupe;
 
-/// Who receives an undirected channel sink (`ChannelDestination::Subscriptions`)
-/// for a fact of this source. A sink addressed to one conversation always goes
-/// to that conversation's provider; the audience only answers "which providers
-/// does the default destination mean".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Audience {
-    /// Every registered channel provider.
-    AllProviders,
-    /// Only providers holding a live follow on the URI in this field, and only
-    /// for facts that happened after the follow began.
-    FollowersOf(&'static str),
-}
-
 /// What kind of address a field's value is, when it is one a sink can deliver
 /// to. A sink address bound to a field is refused at load unless the field
 /// carries the kind of address that sink takes.
@@ -241,7 +228,6 @@ pub struct FieldSpec {
 pub struct SourceSpec {
     pub fields: HashMap<&'static str, FieldSpec>,
     pub dedupe: LogDedupe,
-    pub audience: Audience,
     /// The longest stored scalar for this source, when it is not the log's
     /// default bound. Only a source whose row is the sole local copy of its
     /// content sets this, and then to the external record's own limit, so a
@@ -251,8 +237,9 @@ pub struct SourceSpec {
     /// addressed to. The index lane expands each to the jobs it reaches now and
     /// wakes them with no standing trigger, beside the clause consumers and
     /// under the same actor, jurisdiction, and one-wake-per-row rules. Empty
-    /// for a source whose rows address no one: a field like `mentions` on
-    /// `thread_stream` is then matchable but delivers nothing by itself.
+    /// for a source whose rows address no one. Being an addressee does not
+    /// stop a field being matched: a post's `mentions` wakes the homes it
+    /// names and also matches a clause like `{fact: post_created, mentions: …}`.
     pub addressees: &'static [&'static str],
     /// The stored field naming the home whose own writing a row is, beside
     /// the minting job. The index lane resolves it when the row is indexed and
@@ -371,9 +358,10 @@ pub struct FactRegistry {
 
 const FILE_CHANGE_STATUSES: &[&str] = &["added", "modified", "deleted", "renamed"];
 /// How a `channel_message` reached its target: the conversation's structural
-/// or ambient binding, a focused follow, or no binding at all (the configured
-/// default thread, or a reply in an unbound conversation).
-const CHANNEL_BINDING_KINDS: &[&str] = &["structural", "follow", "ambient", "none"];
+/// or ambient binding, or no binding at all (a reply, or unaddressed text
+/// routed to the last thread that messaged the operator or to the default
+/// project's general thread).
+const CHANNEL_BINDING_KINDS: &[&str] = &["structural", "ambient", "none"];
 
 /// The value vocabulary for one fact field. Fields not named here are free text.
 fn vocabulary_for(source: &str, field: &str) -> FieldVocabulary {
@@ -417,7 +405,6 @@ fn fields(entries: &[(&'static str, FieldKind, bool)]) -> HashMap<&'static str, 
 /// delivery targets and are not listed.
 const ADDRESS_FIELDS: &[(&str, &str, AddressKind)] = &[
     ("attention", "detailUri", AddressKind::Target),
-    ("thread_stream", "threadUri", AddressKind::Target),
     ("channel_message", "target", AddressKind::Target),
     ("channel_message", "conversation", AddressKind::Conversation),
 ];
@@ -427,7 +414,6 @@ impl Default for FactRegistry {
         use FieldKind::{List, Scalar};
         let attention = SourceSpec {
             dedupe: LogDedupe::Transition,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
@@ -443,25 +429,6 @@ impl Default for FactRegistry {
                 ("text", Scalar, STORED),
             ]),
         };
-        let thread = SourceSpec {
-            dedupe: LogDedupe::Unique,
-            audience: Audience::FollowersOf("threadUri"),
-            max_stored_chars: None,
-            addressees: &[],
-            actor_home: None,
-            whole_lists: true,
-            muted: MutedDelivery::Drop,
-            untrusted: None,
-            fields: fields(&[
-                ("project", Scalar, STORED),
-                ("threadUri", Scalar, STORED),
-                ("detailUri", Scalar, STORED),
-                ("text", Scalar, HYDRATED),
-                ("context", Scalar, STORED),
-                ("jobId", Scalar, STORED),
-                ("mentions", List, STORED),
-            ]),
-        };
         // The relay holds GitHub events only in memory, so the row is the only
         // local copy of the comment (its canonical record is the comment on
         // GitHub, at `url`). The comment text is stored once, whole, up to
@@ -471,7 +438,6 @@ impl Default for FactRegistry {
         // so the summary is built from labels, never from the comment.
         let github_comment = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: Some(GITHUB_COMMENT_MAX_CHARS),
             addressees: &[],
             actor_home: None,
@@ -492,7 +458,6 @@ impl Default for FactRegistry {
         };
         let file_changed = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
@@ -518,7 +483,6 @@ impl Default for FactRegistry {
         // exactly as it does a camp notice.
         let post_created = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &["camp", "mentions"],
             actor_home: Some("author"),
@@ -540,7 +504,6 @@ impl Default for FactRegistry {
         // through a trigger.
         let post_commented = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &["postAuthor", "camp", "mentions"],
             actor_home: Some("author"),
@@ -565,7 +528,6 @@ impl Default for FactRegistry {
         // outsiders, so the summary is `{endpoint} {type}`.
         let ingress = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
@@ -587,7 +549,6 @@ impl Default for FactRegistry {
         // sender writes the text, so the summary is built from labels.
         let channel_message = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
@@ -617,7 +578,6 @@ impl Default for FactRegistry {
         // the runner's own words, and the summary is the fleet page's line.
         let executor_update_unreturned = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &[],
             actor_home: None,
@@ -640,7 +600,6 @@ impl Default for FactRegistry {
         // a base camp member is told passively.
         let camp_notice = SourceSpec {
             dedupe: LogDedupe::Unique,
-            audience: Audience::AllProviders,
             max_stored_chars: None,
             addressees: &["camp"],
             actor_home: None,
@@ -657,7 +616,6 @@ impl Default for FactRegistry {
         };
         let triggers = [
             ("attention", attention),
-            ("thread_stream", thread),
             ("github_comment", github_comment),
             ("file_changed", file_changed),
             ("post_created", post_created),
@@ -1085,16 +1043,16 @@ mod tests {
             Some(AddressKind::Target)
         );
         assert_eq!(registry.field_address("channel_message", "text"), None);
-        let channel = registry
+        let attention = registry
             .describe()
             .into_iter()
-            .find(|source| source.fact == "thread_stream")
+            .find(|source| source.fact == "attention")
             .unwrap();
         assert_eq!(
-            channel
+            attention
                 .fields
                 .iter()
-                .find(|field| field.name == "threadUri")
+                .find(|field| field.name == "detailUri")
                 .unwrap()
                 .address,
             Some(AddressKind::Target)
@@ -1104,7 +1062,7 @@ mod tests {
     #[test]
     fn predicates_are_or_of_ands_and_support_prefix_and_presence() {
         let clauses: Vec<BTreeMap<String, Value>> = serde_yaml::from_str(
-            "- { fact: attention, status: [failed], presence: away }\n- { fact: thread_stream, detailUriPrefix: 'cairn://p/cairn/', presence: away }"
+            "- { fact: attention, status: [failed], presence: away }\n- { fact: attention, detailUriPrefix: 'cairn://p/cairn/', presence: away }"
         ).unwrap();
         let fields = BTreeMap::from([
             (
@@ -1116,7 +1074,7 @@ mod tests {
         assert!(matches(
             &clauses,
             &Fact {
-                source: "thread_stream",
+                source: "attention",
                 fields: &fields,
                 presence: Presence::Away
             }
@@ -1124,7 +1082,7 @@ mod tests {
         assert!(!matches(
             &clauses,
             &Fact {
-                source: "thread_stream",
+                source: "attention",
                 fields: &fields,
                 presence: Presence::Active
             }
@@ -1147,7 +1105,6 @@ mod tests {
                 "ingress",
                 "post_commented",
                 "post_created",
-                "thread_stream"
             ]
         );
         let github_comment = described
@@ -1233,7 +1190,7 @@ mod tests {
             names.sort_unstable();
             names
         };
-        assert_eq!(hydrated("thread_stream"), vec!["text"]);
+        assert_eq!(hydrated("channel_message"), vec!["text"]);
         assert_eq!(hydrated("github_comment"), vec!["body"]);
         assert_eq!(hydrated("ingress"), vec!["body"]);
         for source in [
@@ -1244,10 +1201,6 @@ mod tests {
         ] {
             assert!(hydrated(source).is_empty(), "{source} hydrates nothing");
         }
-        assert_eq!(
-            registry.source("thread_stream").unwrap().audience,
-            Audience::FollowersOf("threadUri")
-        );
         assert_eq!(
             registry.source("attention").unwrap().dedupe,
             LogDedupe::Transition
@@ -1330,9 +1283,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            registry.source("thread_stream").unwrap().fields["mentions"].kind,
+            registry.source("post_created").unwrap().fields["mentions"].kind,
             FieldKind::List,
-            "thread_stream mentions are matchable with the same predicate shape"
+            "an addressee field is still matchable with the list predicate shape"
         );
     }
 
@@ -1546,8 +1499,8 @@ mod tests {
         for name in registry.source_names() {
             assert!(!registry.source_has_field(name, EVENT_FIELD), "{name}");
         }
-        let mut spec = registry.source("thread_stream").unwrap().clone();
-        assert_eq!(source_fields_problem("thread_stream", &spec), None);
+        let mut spec = registry.source("attention").unwrap().clone();
+        assert_eq!(source_fields_problem("attention", &spec), None);
         spec.fields.insert(
             EVENT_FIELD,
             FieldSpec {
@@ -1556,7 +1509,7 @@ mod tests {
                 stored: true,
             },
         );
-        assert!(source_fields_problem("thread_stream", &spec)
+        assert!(source_fields_problem("attention", &spec)
             .unwrap()
             .contains("reserves for the fact log row's URI"));
     }
@@ -1565,11 +1518,11 @@ mod tests {
     fn registry_rejects_unknown_sources_and_fields() {
         let registry = FactRegistry::default();
         let bad = BTreeMap::from([
-            ("fact".into(), Value::String("thread_stream".into())),
+            ("fact".into(), Value::String("attention".into())),
             ("mystery".into(), Value::Bool(true)),
         ]);
         assert!(registry
-            .validate_clause("thread_stream", &bad)
+            .validate_clause("attention", &bad)
             .unwrap_err()
             .contains("unknown field"));
         assert!(registry
@@ -1620,7 +1573,6 @@ mod tests {
                 "ingress",
                 "post_commented",
                 "post_created",
-                "thread_stream"
             ]
         );
     }

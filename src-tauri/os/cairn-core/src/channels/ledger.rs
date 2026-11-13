@@ -125,7 +125,7 @@ pub struct ActiveBinding {
 /// List every persisted binding that currently carries at least one outbound
 /// message class -- operator attention or agent text. This is a read-only
 /// registry projection; callers layer provider configuration and runtime health
-/// onto it. A zero-class row is a focus placeholder and is not a binding.
+/// onto it. A zero-class row carries nothing and is not listed.
 pub async fn list_active_bindings(db: &LocalDb) -> Result<Vec<ActiveBinding>, String> {
     db.query_all(
         "SELECT provider, conversation, target_uri, message_classes, binding_kind
@@ -163,7 +163,7 @@ pub async fn binding_for_target(
            FROM channel_conversation_binding
           WHERE provider = ?1 AND target_uri = ?2 AND binding_kind = ?3
             AND message_classes != 0
-          ORDER BY followed_at DESC, conversation
+          ORDER BY bound_at DESC, conversation
           LIMIT 1",
         params![
             provider.to_string(),
@@ -387,19 +387,6 @@ pub struct DomainActionLease {
     pub token: String,
 }
 
-pub async fn remove_home_relative_focus(db: &LocalDb, channel: &str) -> Result<bool, String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    db.execute(
-        "DELETE FROM channel_conversation_binding
-          WHERE provider = ?1 AND conversation = ?2 AND selected_at IS NOT NULL
-            AND (target_uri = 'cairn:~' OR target_uri LIKE 'cairn:~/%')",
-        params![channel.to_string(), conversation],
-    )
-    .await
-    .map(|changed| changed > 0)
-    .map_err(|error| error.to_string())
-}
-
 pub async fn lookup_conversation_target(
     db: &LocalDb,
     provider: &str,
@@ -437,7 +424,7 @@ pub async fn set_message_class(
     }
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
     // Ask the row its kind before validating the target: an ambient row's
-    // target is a project root, which the follow-target check below refuses
+    // target is a project root, which the thread-or-issue check below refuses
     // with an error that would hide why the change is impossible.
     let kind = db
         .query_opt_text(
@@ -480,12 +467,12 @@ pub const AMBIENT_CLASSES_FIXED: &str =
     "ambient conversations carry only agent text; their classes can't be changed";
 
 fn canonical_persisted_target(uri: &str) -> Result<String, String> {
-    canonical_binding_target(uri, super::bindings::BindingKind::Follow)
+    canonical_binding_target(uri, super::bindings::BindingKind::Structural)
 }
 
-/// The canonical target a binding of `kind` persists. Follow and structural
-/// bindings target a thread or issue; an ambient binding targets exactly a
-/// project root.
+/// The canonical target a binding of `kind` persists. A structural binding
+/// targets a thread or issue; an ambient binding targets exactly a project
+/// root.
 fn canonical_binding_target(
     uri: &str,
     kind: super::bindings::BindingKind,
@@ -502,8 +489,8 @@ fn canonical_binding_target(
             ambient_target_project(&uri)
                 .ok_or_else(|| format!("an ambient binding targets a project root: {uri}"))?;
         }
-        super::bindings::BindingKind::Follow | super::bindings::BindingKind::Structural => {
-            super::bindings::FollowTarget::parse(&uri)?;
+        super::bindings::BindingKind::Structural => {
+            super::bindings::BindingTarget::parse(&uri)?;
         }
     }
     Ok(uri)
@@ -623,18 +610,6 @@ pub async fn set_pending_route_submission(
     .map_err(|error| error.to_string())
 }
 
-pub async fn is_target_followed(db: &LocalDb, channel: &str, uri: &str) -> Result<bool, String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    let uri = canonical_persisted_target(uri)?;
-    db.query_opt_i64(
-        format!(
-            "SELECT 1 FROM channel_conversation_binding WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3 AND {}",
-            live_follow()
-        ),
-        params![channel.to_string(), conversation, uri],
-    ).await.map(|value| value.is_some()).map_err(|error| error.to_string())
-}
-
 pub async fn is_bound(
     db: &LocalDb,
     provider: &str,
@@ -673,63 +648,6 @@ pub async fn claim_outbound_cleanup(
     ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
-pub async fn advance_follow_cursor(
-    db: &LocalDb,
-    channel: &str,
-    uri: &str,
-    cursor_rowid: i64,
-) -> Result<(), String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    advance_binding_cursor(db, channel, &conversation, uri, cursor_rowid).await
-}
-
-pub async fn advance_binding_cursor(
-    db: &LocalDb,
-    provider: &str,
-    conversation: &str,
-    uri: &str,
-    cursor_rowid: i64,
-) -> Result<(), String> {
-    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
-    let uri = canonical_persisted_target(uri)?;
-    db.execute(
-        "UPDATE channel_conversation_binding SET cursor_rowid = MAX(cursor_rowid, ?4)
-          WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3",
-        params![provider.to_string(), conversation, uri, cursor_rowid.max(0)],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Follow {
-    pub uri: String,
-    pub followed_at: i64,
-    pub cursor_rowid: i64,
-}
-
-pub async fn follow_target(
-    db: &LocalDb,
-    channel: &str,
-    uri: &str,
-    followed_at: i64,
-    cursor_rowid: i64,
-) -> Result<bool, String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    bind_target(
-        db,
-        channel,
-        &conversation,
-        uri,
-        super::bindings::BindingKind::Follow,
-        super::bindings::MESSAGE_CLASSES_ALL,
-        followed_at,
-        cursor_rowid,
-    )
-    .await
-}
-
 /// Every `(conversation, target_uri)` key bound for `provider`: the identity
 /// `bind_target` inserts under, so a sweep can bind only what is missing.
 pub async fn bound_conversation_targets(
@@ -746,7 +664,6 @@ pub async fn bound_conversation_targets(
     .map_err(|error| error.to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn bind_target(
     db: &LocalDb,
     provider: &str,
@@ -754,123 +671,26 @@ pub async fn bind_target(
     uri: &str,
     binding_kind: super::bindings::BindingKind,
     message_classes: i64,
-    followed_at: i64,
-    cursor_rowid: i64,
+    bound_at: i64,
 ) -> Result<bool, String> {
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
     let uri = canonical_binding_target(uri, binding_kind)?;
     db.execute(
         "INSERT OR IGNORE INTO channel_conversation_binding
-          (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+          (provider, conversation, target_uri, binding_kind, message_classes, bound_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             provider.to_string(),
             conversation,
             uri,
             binding_kind.as_str(),
             message_classes.max(0),
-            followed_at,
-            cursor_rowid.max(0)
+            bound_at
         ],
     )
     .await
     .map(|changed| changed == 1)
     .map_err(|error| error.to_string())
-}
-
-/// Move a follow (and the focus, when it points there) onto the canonical URI
-/// for the same target, merging with a canonical row that already exists.
-///
-/// A follow's URI is its identity everywhere downstream: it is the primary key
-/// here, the poll's checkmark lookup, and the prefix of the `binding_ref` that
-/// makes stream delivery once-only. So an alias and its canonical form are two
-/// identities for one conversation — the poll shows the target unfollowed while
-/// it is streaming, following it again adds a second row, and every update then
-/// arrives twice under two distinct binding refs. Canonicalizing the row is what
-/// keeps one target to one identity.
-///
-/// The merged cursor is the LATER of the two. Events between the two cursors
-/// were already delivered under the row that had read further, so taking the
-/// maximum leaves no gap and repeats nothing; the earlier `followed_at` is kept
-/// because that is when the operator actually started following.
-pub async fn canonicalize_follow(
-    db: &LocalDb,
-    channel: &str,
-    from_uri: &str,
-    to_uri: &str,
-) -> Result<(), String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    canonicalize_binding(db, channel, &conversation, from_uri, to_uri).await
-}
-
-pub async fn canonicalize_binding(
-    db: &LocalDb,
-    provider: &str,
-    conversation: &str,
-    from_uri: &str,
-    to_uri: &str,
-) -> Result<(), String> {
-    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
-    let provider = provider.to_string();
-    let from_uri = cairn_uri::canonicalize_uri_identity(from_uri);
-    let to_uri = cairn_uri::canonicalize_uri_identity(to_uri);
-    db.write(move |conn| {
-        let provider = provider.clone();
-        let conversation = conversation.clone();
-        let from_uri = from_uri.clone();
-        let to_uri = to_uri.clone();
-        Box::pin(async move {
-            let mut focus_rows = conn.query(
-                "SELECT MAX(selected_at) FROM channel_conversation_binding
-                  WHERE provider = ?1 AND conversation = ?2 AND target_uri IN (?3, ?4)",
-                params![provider.as_str(), conversation.as_str(), from_uri.as_str(), to_uri.as_str()],
-            ).await?;
-            let selected_at = match focus_rows.next().await? {
-                Some(row) => row.opt_i64(0)?,
-                None => None,
-            };
-            conn.execute(
-                "UPDATE channel_conversation_binding SET selected_at = NULL
-                  WHERE provider = ?1 AND conversation = ?2 AND target_uri IN (?3, ?4)",
-                params![provider.as_str(), conversation.as_str(), from_uri.as_str(), to_uri.as_str()],
-            ).await?;
-            conn.execute(
-                "INSERT INTO channel_conversation_binding
-                   (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid, suppressed_updates, selected_at)
-                 SELECT ?1, ?2, ?4, binding_kind, message_classes, followed_at, cursor_rowid, suppressed_updates, selected_at
-                   FROM channel_conversation_binding
-                  WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3
-                 ON CONFLICT(provider, conversation, target_uri) DO UPDATE SET
-                   cursor_rowid = MAX(cursor_rowid, excluded.cursor_rowid),
-                   followed_at = MIN(followed_at, excluded.followed_at),
-                   suppressed_updates = MAX(suppressed_updates, excluded.suppressed_updates),
-                   selected_at = COALESCE(channel_conversation_binding.selected_at, excluded.selected_at)",
-                params![provider.as_str(), conversation.as_str(), from_uri.as_str(), to_uri.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM channel_conversation_binding
-                  WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3",
-                params![provider.as_str(), conversation.as_str(), from_uri.as_str()],
-            )
-            .await?;
-            if let Some(selected_at) = selected_at {
-                conn.execute(
-                    "UPDATE channel_conversation_binding SET selected_at = ?4
-                      WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3",
-                    params![provider.as_str(), conversation.as_str(), to_uri.as_str(), selected_at],
-                ).await?;
-            }
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub async fn unfollow_target(db: &LocalDb, channel: &str, uri: &str) -> Result<bool, String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    unbind_target(db, channel, &conversation, uri, Some("follow")).await
 }
 
 pub async fn unbind_target(
@@ -880,57 +700,22 @@ pub async fn unbind_target(
     uri: &str,
     binding_kind: Option<&str>,
 ) -> Result<bool, String> {
-    let provider = provider.to_string();
-    let conversation = super::bindings::canonical_conversation(&provider, conversation)?;
+    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
     let uri = canonical_persisted_target(uri)?;
-    let binding_kind = binding_kind.map(str::to_string);
-    db.write(|conn| {
-        let provider = provider.clone();
-        let conversation = conversation.clone();
-        let uri = uri.clone();
-        let binding_kind = binding_kind.clone();
-        Box::pin(async move {
-            let changed = conn
-                .execute(
-                    "DELETE FROM channel_conversation_binding
-                      WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3
-                        AND (?4 IS NULL OR binding_kind = ?4)",
-                    params![
-                        provider.as_str(),
-                        conversation.as_str(),
-                        uri.as_str(),
-                        binding_kind.as_deref()
-                    ],
-                )
-                .await?;
-            conn.execute(
-                "UPDATE channel_conversation_binding SET selected_at = ?4
-                  WHERE provider = ?1 AND conversation = ?2 AND target_uri = (
-                    SELECT target_uri FROM channel_conversation_binding
-                     WHERE provider = ?1 AND conversation = ?2 AND binding_kind = 'follow'
-                     ORDER BY followed_at DESC, target_uri ASC LIMIT 1
-                  ) AND NOT EXISTS (
-                    SELECT 1 FROM channel_conversation_binding
-                     WHERE provider = ?1 AND conversation = ?2 AND selected_at IS NOT NULL
-                  )",
-                params![
-                    provider.as_str(),
-                    conversation.as_str(),
-                    uri.as_str(),
-                    chrono::Utc::now().timestamp_millis()
-                ],
-            )
-            .await?;
-            Ok(changed == 1)
-        })
-    })
+    db.execute(
+        "DELETE FROM channel_conversation_binding
+          WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3
+            AND (?4 IS NULL OR binding_kind = ?4)",
+        params![
+            provider.to_string(),
+            conversation,
+            uri,
+            binding_kind.map(str::to_string)
+        ],
+    )
     .await
+    .map(|changed| changed == 1)
     .map_err(|error| error.to_string())
-}
-
-pub async fn list_follows(db: &LocalDb, channel: &str) -> Result<Vec<Follow>, String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    list_stream_subscriptions(db, channel, &conversation).await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,143 +771,6 @@ pub async fn list_eligible_bindings(
                 binding_kind: row.text(2)?,
             })
         },
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-/// What makes a binding a live follow: a follow row carrying an operator
-/// attention class. Agent text is a grant to speak in a conversation, never a
-/// follow, so it does not count. The one definition the follow check, the
-/// stream sweep, and the route lane's follower lookup all read.
-fn live_follow() -> String {
-    format!(
-        "binding_kind = 'follow' AND (message_classes & {}) != 0",
-        super::bindings::MESSAGE_CLASSES_ALL
-    )
-}
-
-/// Every provider following `target_uri`, with when its follow began.
-///
-/// A provider's follow sweep streams its legacy conversation's follows, so
-/// that conversation's follow is the one that makes the provider a follower.
-pub async fn list_follow_providers(
-    db: &LocalDb,
-    target_uri: &str,
-) -> Result<Vec<(String, i64)>, String> {
-    let target_uri = canonical_persisted_target(target_uri)?;
-    let rows = db
-        .query_all(
-            format!(
-                "SELECT provider, conversation, followed_at FROM channel_conversation_binding
-                  WHERE target_uri = ?1 AND {}
-                  ORDER BY provider",
-                live_follow()
-            ),
-            params![target_uri],
-            |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)?)),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(rows
-        .into_iter()
-        .filter(|(provider, conversation, _)| {
-            super::bindings::legacy_conversation(provider)
-                .is_ok_and(|legacy| &legacy == conversation)
-        })
-        .map(|(provider, _, followed_at)| (provider, followed_at))
-        .collect())
-}
-
-pub async fn list_stream_subscriptions(
-    db: &LocalDb,
-    provider: &str,
-    conversation: &str,
-) -> Result<Vec<Follow>, String> {
-    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
-    db.query_all(
-        format!(
-            "SELECT target_uri, followed_at, cursor_rowid FROM channel_conversation_binding
-              WHERE provider = ?1 AND conversation = ?2 AND {}
-              ORDER BY followed_at DESC, target_uri ASC",
-            live_follow()
-        ),
-        params![provider.to_string(), conversation],
-        |row| {
-            Ok(Follow {
-                uri: row.text(0)?,
-                followed_at: row.i64(1)?,
-                cursor_rowid: row.i64(2)?,
-            })
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())
-}
-
-pub async fn set_focus(
-    db: &LocalDb,
-    channel: &str,
-    uri: &str,
-    selected_at: i64,
-) -> Result<(), String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    select_focus(db, channel, &conversation, uri, selected_at).await
-}
-
-pub async fn select_focus(
-    db: &LocalDb,
-    provider: &str,
-    conversation: &str,
-    uri: &str,
-    selected_at: i64,
-) -> Result<(), String> {
-    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
-    let uri = canonical_persisted_target(uri)?;
-    let provider = provider.to_string();
-    db.write(move |conn| {
-        let provider = provider.clone();
-        let conversation = conversation.clone();
-        let uri = uri.clone();
-        Box::pin(async move {
-        conn.execute(
-            "INSERT OR IGNORE INTO channel_conversation_binding (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid) VALUES (?1, ?2, ?3, 'follow', 0, 0, 0)",
-            params![provider.as_str(), conversation.as_str(), uri.as_str()],
-        ).await?;
-        conn.execute(
-            "UPDATE channel_conversation_binding SET selected_at = NULL
-              WHERE provider = ?1 AND conversation = ?2 AND selected_at IS NOT NULL",
-            params![provider.as_str(), conversation.as_str()],
-        ).await?;
-        let changed = conn.execute(
-            "UPDATE channel_conversation_binding SET selected_at = ?4
-              WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3 AND binding_kind = 'follow'",
-            params![provider.as_str(), conversation.as_str(), uri.as_str(), selected_at],
-        ).await?;
-        if changed != 1 {
-            return Err(crate::storage::DbError::internal("focused target is not followed in this conversation"));
-        }
-        Ok(())
-        })
-    }).await.map_err(|error| error.to_string())
-}
-
-pub async fn get_focus(db: &LocalDb, channel: &str) -> Result<Option<String>, String> {
-    let conversation = super::bindings::legacy_conversation(channel)?;
-    get_conversation_focus(db, channel, &conversation).await
-}
-
-pub async fn get_conversation_focus(
-    db: &LocalDb,
-    provider: &str,
-    conversation: &str,
-) -> Result<Option<String>, String> {
-    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
-    db.query_opt(
-        "SELECT target_uri FROM channel_conversation_binding
-          WHERE provider = ?1 AND conversation = ?2 AND selected_at IS NOT NULL",
-        params![provider.to_string(), conversation],
-        |row| row.text(0),
     )
     .await
     .map_err(|error| error.to_string())
@@ -1761,11 +1409,10 @@ pub struct InboundRecord {
     /// admitted.
     pub target_uri: Option<String>,
     /// For an admitted message, the kind of binding that resolved its target:
-    /// `structural`, `follow`, `ambient`, or `none`.
+    /// `structural`, `ambient`, or `none`.
     pub binding_kind: Option<String>,
-    /// For a message delivered from an ambient conversation, the address it
-    /// opened with (`@channels`, `<#123>`), space-separated, which the router
-    /// consumed before delivering the rest.
+    /// Why the message reached its target, as [`InboundAddress::token`]
+    /// writes it. Read it through [`InboundAddress::parse`].
     pub addressed_by: Option<String>,
     /// The message's own provider id, which a native reply to it references.
     /// (`provider_guid` is the id of the message this one replied to.)
@@ -1773,6 +1420,115 @@ pub struct InboundRecord {
 }
 
 const INBOUND_COLUMNS: &str = "id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at, conversation, target_uri, binding_kind, addressed_by, message_guid";
+
+/// Why an admitted inbound message reached the target it did: the one encoder
+/// and decoder of `channel_inbound.addressed_by` and of a `channel_message`
+/// fact's `addressedBy` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundAddress {
+    /// The leading addresses an ambient message opened with, as typed
+    /// (`@channels <#123>`), which the router consumed before delivering the
+    /// rest.
+    Typed(String),
+    /// A native reply to the outbound row `outbound`, delivered to its sender.
+    Reply { outbound: String },
+    /// Unaddressed text, delivered to the sender of the outbound row
+    /// `outbound`: the latest operator message on the transport within
+    /// [`UNADDRESSED_WINDOW_MS`].
+    RecentOperatorMessage { outbound: String },
+    /// Unaddressed text with no recent operator message, delivered to the
+    /// default project's general thread.
+    DefaultProject { project: String },
+}
+
+impl InboundAddress {
+    const REPLY: &'static str = "reply:";
+    const RECENT: &'static str = "recent:";
+    const DEFAULT: &'static str = "default:";
+
+    /// The stored form. A typed address always starts with `@` or `<#`, so it
+    /// can never collide with the three prefixed reasons.
+    pub fn token(&self) -> String {
+        match self {
+            Self::Typed(typed) => typed.clone(),
+            Self::Reply { outbound } => format!("{}{outbound}", Self::REPLY),
+            Self::RecentOperatorMessage { outbound } => format!("{}{outbound}", Self::RECENT),
+            Self::DefaultProject { project } => format!("{}{project}", Self::DEFAULT),
+        }
+    }
+
+    /// Read a stored token back. Anything that is not one of the prefixed
+    /// reasons is a typed address.
+    pub fn parse(token: &str) -> Self {
+        if let Some(outbound) = token.strip_prefix(Self::REPLY) {
+            Self::Reply {
+                outbound: outbound.to_string(),
+            }
+        } else if let Some(outbound) = token.strip_prefix(Self::RECENT) {
+            Self::RecentOperatorMessage {
+                outbound: outbound.to_string(),
+            }
+        } else if let Some(project) = token.strip_prefix(Self::DEFAULT) {
+            Self::DefaultProject {
+                project: project.to_string(),
+            }
+        } else {
+            Self::Typed(token.to_string())
+        }
+    }
+}
+
+/// How long an operator message keeps the operator's unaddressed text on its
+/// transport: a message sent this long ago or longer no longer does.
+pub const UNADDRESSED_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The most recent operator message on `channel` sent into `conversation`
+/// after `since_ms` (exclusive). Answered messages count, since the
+/// conversation continues.
+///
+/// Matched by conversation, never by sender: a Telegram group's operator
+/// row names the chat (`-100123`) while its inbound sender is the user who
+/// typed (`7`). An iMessage inbound's conversation is its sender's handle, so
+/// for iMessage this is the handle match.
+pub async fn latest_operator_send(
+    db: &LocalDb,
+    channel: &str,
+    conversation: &str,
+    since_ms: i64,
+) -> Result<Option<OutboundRecord>, String> {
+    let conversation = conversation_key(channel, conversation);
+    let sent = db
+        .query_all(
+            format!(
+                "SELECT {OUTBOUND_COLUMNS} FROM channel_outbound
+                  WHERE kind = ?1 AND channel = ?2 AND sent_at IS NOT NULL AND sent_at > ?3
+                  ORDER BY sent_at DESC, rowid DESC"
+            ),
+            params![super::operator_message::KIND, channel.to_string(), since_ms],
+            OutboundRecord::from_row,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(sent
+        .into_iter()
+        .find(|record| conversation_key(channel, &record.conversation) == conversation))
+}
+
+/// One conversation's comparable form on `channel`, whether it is written
+/// canonically (`telegram:-100123`, as inbound events carry it) or as the bare
+/// destination an operator row stores (`-100123`, `+15551234567`). An address
+/// that does not parse compares as written.
+fn conversation_key(channel: &str, conversation: &str) -> String {
+    let qualified = if conversation.starts_with(&format!("{channel}:")) {
+        conversation.to_string()
+    } else {
+        format!("{channel}:{conversation}")
+    };
+    qualified
+        .parse::<super::ConversationAddress>()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| conversation.to_string())
+}
 
 impl InboundRecord {
     fn from_row(row: &Row) -> DbResult<Self> {
@@ -2302,44 +2058,42 @@ mod tests {
 
     #[tokio::test]
     async fn active_bindings_are_carrying_rows_in_canonical_order() {
+        use super::super::bindings::{
+            BindingKind, MESSAGE_CLASS_NOTIFY, MESSAGE_CLASS_PERMISSION, MESSAGE_CLASS_QUESTION,
+        };
         let db = migrated_test_db("channel-ledger-active-bindings.db").await;
-        bind_target(
-            &db,
-            "telegram",
-            "telegram:20",
-            "cairn://p/cairn/general",
-            super::super::bindings::BindingKind::Follow,
-            super::super::bindings::MESSAGE_CLASS_NOTIFY,
-            1,
-            0,
-        )
-        .await
-        .unwrap();
-        bind_target(
-            &db,
-            "imessage",
-            "imessage:a@example.com",
-            "cairn://p/cairn/4026",
-            super::super::bindings::BindingKind::Follow,
-            super::super::bindings::MESSAGE_CLASS_QUESTION
-                | super::super::bindings::MESSAGE_CLASS_PERMISSION,
-            2,
-            0,
-        )
-        .await
-        .unwrap();
-        bind_target(
-            &db,
-            "imessage",
-            "imessage:a@example.com",
-            "cairn://p/cairn/general",
-            super::super::bindings::BindingKind::Follow,
-            0,
-            3,
-            0,
-        )
-        .await
-        .unwrap();
+        for (provider, conversation, target, classes) in [
+            (
+                "telegram",
+                "telegram:20",
+                "cairn://p/cairn/general",
+                MESSAGE_CLASS_NOTIFY,
+            ),
+            (
+                "imessage",
+                "imessage:a@example.com",
+                "cairn://p/cairn/4026",
+                MESSAGE_CLASS_QUESTION | MESSAGE_CLASS_PERMISSION,
+            ),
+            (
+                "imessage",
+                "imessage:b@example.com",
+                "cairn://p/cairn/general",
+                0,
+            ),
+        ] {
+            bind_target(
+                &db,
+                provider,
+                conversation,
+                target,
+                BindingKind::Structural,
+                classes,
+                1,
+            )
+            .await
+            .unwrap();
+        }
 
         assert_eq!(
             list_active_bindings(&db).await.unwrap(),
@@ -2349,27 +2103,27 @@ mod tests {
                     conversation: "imessage:a@example.com".into(),
                     target_uri: "cairn://p/cairn/4026".into(),
                     message_classes: 3,
-                    binding_kind: "follow".into(),
+                    binding_kind: "structural".into(),
                 },
                 ActiveBinding {
                     provider: "telegram".into(),
                     conversation: "telegram:20".into(),
                     target_uri: "cairn://p/cairn/general".into(),
                     message_classes: 4,
-                    binding_kind: "follow".into(),
+                    binding_kind: "structural".into(),
                 },
             ]
         );
     }
 
-    /// An ambient binding targets exactly a project root, is never a follow or
-    /// a structural target, never carries operator attention, and refuses a
-    /// class change instructively rather than with a target or CHECK error.
+    /// An ambient binding targets exactly a project root, is never a structural
+    /// target, never carries operator attention, and refuses a class change
+    /// instructively rather than with a target or CHECK error.
     #[tokio::test]
-    async fn ambient_bindings_name_a_project_and_stay_out_of_every_follow_reader() {
+    async fn ambient_bindings_name_a_project_and_never_carry_attention() {
         use super::super::bindings::{
-            BindingKind, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_NOTIFY, MESSAGE_CLASS_PERMISSION,
-            MESSAGE_CLASS_QUESTION,
+            BindingKind, MESSAGE_CLASSES_ALL, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_NOTIFY,
+            MESSAGE_CLASS_PERMISSION, MESSAGE_CLASS_QUESTION,
         };
         let db = migrated_test_db("channel-ledger-ambient.db").await;
         assert!(bind_target(
@@ -2380,7 +2134,6 @@ mod tests {
             BindingKind::Ambient,
             MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .unwrap_err()
@@ -2393,7 +2146,6 @@ mod tests {
             BindingKind::Structural,
             MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .is_err());
@@ -2405,13 +2157,20 @@ mod tests {
             BindingKind::Ambient,
             MESSAGE_CLASS_AGENT_TEXT,
             1,
-            0,
         )
         .await
         .unwrap());
-        follow_target(&db, "discord", "cairn://p/cairn/general", 2, 0)
-            .await
-            .unwrap();
+        assert!(bind_target(
+            &db,
+            "discord",
+            "discord:1/8",
+            "cairn://p/cairn/general",
+            BindingKind::Structural,
+            MESSAGE_CLASSES_ALL,
+            2,
+        )
+        .await
+        .unwrap());
 
         assert_eq!(
             ambient_project(&db, "discord", "discord:1/9")
@@ -2429,19 +2188,6 @@ mod tests {
             list_ambient_conversations(&db, "discord").await.unwrap(),
             vec![("discord:1/9".to_string(), "cairn".to_string())]
         );
-        assert_eq!(
-            list_follows(&db, "discord")
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|follow| follow.uri)
-                .collect::<Vec<_>>(),
-            vec!["cairn://p/cairn/general".to_string()]
-        );
-        assert!(list_stream_subscriptions(&db, "discord", "discord:1/9")
-            .await
-            .unwrap()
-            .is_empty());
         assert_eq!(
             lookup_conversation_target(&db, "discord", "discord:1/9")
                 .await
@@ -2499,33 +2245,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn followed_state_reflects_follow_and_unfollow() {
-        let db = migrated_test_db("channel-ledger-follow-state.db").await;
-        let thread = "cairn://p/cairn/3404";
-
-        assert!(!is_target_followed(&db, "imessage", thread).await.unwrap());
-        assert!(follow_target(&db, "imessage", thread, 10, 20)
-            .await
-            .unwrap());
-        assert!(is_target_followed(&db, "imessage", thread).await.unwrap());
-        assert!(unfollow_target(&db, "imessage", thread).await.unwrap());
-        assert!(!is_target_followed(&db, "imessage", thread).await.unwrap());
-    }
-
-    #[tokio::test]
     async fn home_relative_targets_never_cross_the_ledger_boundary() {
         let db = migrated_test_db("channel-ledger-relative-target.db").await;
 
-        assert!(follow_target(&db, "imessage", "cairn:~/", 10, 20)
-            .await
-            .unwrap_err()
-            .contains("must be resolved"));
-        assert!(set_focus(&db, "imessage", "cairn:~", 10)
-            .await
-            .unwrap_err()
-            .contains("must be resolved"));
-        assert!(list_follows(&db, "imessage").await.unwrap().is_empty());
-        assert_eq!(get_focus(&db, "imessage").await.unwrap(), None);
+        assert!(bind_target(
+            &db,
+            "imessage",
+            "imessage:a@example.com",
+            "cairn:~/",
+            super::super::bindings::BindingKind::Structural,
+            super::super::bindings::MESSAGE_CLASSES_ALL,
+            10,
+        )
+        .await
+        .unwrap_err()
+        .contains("must be resolved"));
+        assert!(list_active_bindings(&db).await.unwrap().is_empty());
     }
 
     fn intent<'a>(id: &'a str) -> NewOutbound<'a> {
@@ -3495,125 +3230,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn thread_focus_tracks_the_most_recent_selection_and_follows_survive() {
-        let db = migrated_test_db("channel-ledger-thread-focus.db").await;
-        assert!(follow_target(&db, "imessage", "cairn://p/cairn/1", 10, 42)
-            .await
-            .unwrap());
-        set_focus(&db, "imessage", "cairn://p/cairn/1", 10)
-            .await
-            .unwrap();
-        set_focus(&db, "imessage", "cairn://p/cairn/2", 11)
-            .await
-            .unwrap();
-        assert_eq!(
-            get_focus(&db, "imessage").await.unwrap().as_deref(),
-            Some("cairn://p/cairn/2")
-        );
-        assert_eq!(
-            list_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
-            42
-        );
-    }
-
-    #[tokio::test]
-    async fn restart_rebases_surviving_follow_to_the_current_live_edge() {
-        let db = migrated_test_db("channel-ledger-thread-restart.db").await;
-        assert!(follow_target(&db, "imessage", "cairn://p/cairn/1", 10, 5)
-            .await
-            .unwrap());
-
-        advance_follow_cursor(&db, "imessage", "cairn://p/cairn/1", 99)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            list_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
-            99,
-            "events accumulated before the restarted session's live edge are skipped"
-        );
-    }
-
-    #[tokio::test]
-    async fn refollow_starts_at_the_new_live_edge_instead_of_replaying_backlog() {
-        let db = migrated_test_db("channel-ledger-thread-refollow.db").await;
-        assert!(follow_target(&db, "imessage", "cairn://p/cairn/1", 10, 5)
-            .await
-            .unwrap());
-        assert!(unfollow_target(&db, "imessage", "cairn://p/cairn/1")
-            .await
-            .unwrap());
-        assert!(follow_target(&db, "imessage", "cairn://p/cairn/1", 20, 99)
-            .await
-            .unwrap());
-        assert_eq!(
-            list_follows(&db, "imessage").await.unwrap()[0].cursor_rowid,
-            99
-        );
-    }
     /// Agent text is a grant to speak in a conversation, not operator attention:
-    /// it never makes a row a follow or a stream subscription, a follow never
-    /// acquires it, and a gate cannot ask for it -- but it does make the row an
-    /// active binding.
+    /// it makes the row an active binding, but no gate can ask for it and it
+    /// never makes the row eligible for an attention class.
     #[tokio::test]
     async fn agent_text_is_a_binding_grant_and_never_operator_attention() {
-        use super::super::bindings::{BindingKind, MESSAGE_CLASSES_ALL, MESSAGE_CLASS_AGENT_TEXT};
+        use super::super::bindings::{
+            BindingKind, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_QUESTION,
+        };
         let db = migrated_test_db("channel-ledger-agent-text.db").await;
-        assert!(follow_target(&db, "telegram", "cairn://p/cairn/1", 10, 0)
-            .await
-            .unwrap());
         assert!(bind_target(
             &db,
             "telegram",
             "telegram:0",
             "cairn://p/cairn/2",
-            BindingKind::Follow,
+            BindingKind::Structural,
             MESSAGE_CLASS_AGENT_TEXT,
             10,
-            0,
         )
         .await
         .unwrap());
 
-        let classes = |uri: &'static str| {
-            let db = &db;
-            async move {
-                db.query_opt_i64(
-                    "SELECT message_classes FROM channel_conversation_binding WHERE target_uri = ?1",
-                    (uri,),
-                )
-                .await
-                .unwrap()
-            }
-        };
-        assert_eq!(
-            classes("cairn://p/cairn/1").await,
-            Some(MESSAGE_CLASSES_ALL)
-        );
-
-        assert!(is_target_followed(&db, "telegram", "cairn://p/cairn/1")
-            .await
-            .unwrap());
-        assert!(!is_target_followed(&db, "telegram", "cairn://p/cairn/2")
-            .await
-            .unwrap());
-        assert_eq!(
-            list_stream_subscriptions(&db, "telegram", "telegram:0")
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|follow| follow.uri)
-                .collect::<Vec<_>>(),
-            vec!["cairn://p/cairn/1"]
-        );
-        assert_eq!(
-            list_follow_providers(&db, "cairn://p/cairn/2")
-                .await
-                .unwrap(),
-            Vec::<(String, i64)>::new(),
-            "an agent-text grant does not make its provider a follower"
-        );
         assert_eq!(
             list_active_bindings(&db)
                 .await
@@ -3621,8 +3258,17 @@ mod tests {
                 .into_iter()
                 .map(|binding| binding.target_uri)
                 .collect::<Vec<_>>(),
-            vec!["cairn://p/cairn/1", "cairn://p/cairn/2"]
+            vec!["cairn://p/cairn/2"]
         );
+        assert!(list_eligible_bindings(
+            &db,
+            "telegram",
+            "cairn://p/cairn/2",
+            MESSAGE_CLASS_QUESTION
+        )
+        .await
+        .unwrap()
+        .is_empty());
         assert!(list_eligible_bindings(
             &db,
             "telegram",
@@ -3633,13 +3279,12 @@ mod tests {
         .is_err());
     }
 
-    /// The operator's toggle moves exactly one bit, and following a target the
-    /// operator already shaped (the router's re-follow) leaves their choice as
-    /// they made it rather than re-applying the follow defaults.
+    /// The operator's toggle moves exactly one bit and refuses a mask or a
+    /// binding that does not exist.
     #[tokio::test]
-    async fn operator_class_choices_survive_a_re_follow() {
+    async fn operator_class_toggle_moves_exactly_one_bit() {
         use super::super::bindings::{
-            MESSAGE_CLASSES_ALL, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_NOTIFY,
+            BindingKind, MESSAGE_CLASSES_ALL, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_NOTIFY,
         };
         let db = migrated_test_db("channel-ledger-operator-classes.db").await;
         let classes = || async {
@@ -3650,9 +3295,17 @@ mod tests {
             .await
             .unwrap()
         };
-        assert!(follow_target(&db, "telegram", "cairn://p/cairn/1", 10, 0)
-            .await
-            .unwrap());
+        assert!(bind_target(
+            &db,
+            "telegram",
+            "telegram:0",
+            "cairn://p/cairn/1",
+            BindingKind::Structural,
+            MESSAGE_CLASSES_ALL,
+            10,
+        )
+        .await
+        .unwrap());
 
         for (class, granted, expected) in [
             (
@@ -3676,9 +3329,6 @@ mod tests {
             )
             .await
             .unwrap());
-            assert!(!follow_target(&db, "telegram", "cairn://p/cairn/1", 20, 0)
-                .await
-                .unwrap());
             assert_eq!(classes().await, Some(expected));
         }
 
@@ -3720,7 +3370,6 @@ mod tests {
                 super::super::bindings::BindingKind::Structural,
                 classes,
                 10,
-                0,
             )
             .await
             .unwrap());
@@ -3733,7 +3382,6 @@ mod tests {
             super::super::bindings::BindingKind::Structural,
             super::super::bindings::MESSAGE_CLASSES_ALL,
             10,
-            0,
         )
         .await
         .unwrap());

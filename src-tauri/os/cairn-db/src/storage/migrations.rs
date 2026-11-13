@@ -7227,4 +7227,133 @@ mod camps_conversations_migration_tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn retiring_channel_following_drops_follows_and_keeps_every_inbound_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("retire-following.turso.db"))
+            .await
+            .unwrap();
+        let name = "retire_channel_following";
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != name)
+            .copied()
+            .collect::<Vec<_>>();
+        let target = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == name)
+            .copied()
+            .expect("retire_channel_following is in the private lineage");
+        MigrationRunner::new(before).run(&db).await.unwrap();
+
+        db.execute_script(
+            "INSERT INTO channel_conversation_binding(provider, conversation, target_uri,
+               binding_kind, message_classes, followed_at, cursor_rowid, suppressed_updates,
+               selected_at)
+             VALUES ('imessage', 'imessage:legacy', 'cairn://p/cairn/1', 'follow', 7, 100, 42, 3, 150),
+                    ('imessage', 'imessage:legacy', 'cairn://p/cairn/2', 'follow', 7, 110, 0, 0, NULL),
+                    ('discord', 'discord:g/c1', 'cairn://p/cairn/general', 'structural', 15, 200, 0, 0, NULL),
+                    ('discord', 'discord:g/c2', 'cairn://p/cairn', 'ambient', 8, 300, 0, 0, NULL);
+             INSERT INTO channel_inbound(id, channel, provider_guid, sender, text, received_at,
+               acknowledged_at, rejection_reason, conversation, target_uri, binding_kind,
+               addressed_by, message_guid)
+             VALUES ('i1', 'imessage', 'g1', '+1555', 'via follow', 10, 11, NULL,
+                       'imessage:+1555', 'cairn://p/cairn/1', 'follow', NULL, 'm1'),
+                    ('i2', 'discord', 'g2', 'u1', 'structural', 20, NULL, NULL,
+                       'discord:g/c1', 'cairn://p/cairn/general', 'structural', NULL, NULL),
+                    ('i3', 'discord', 'g3', 'u1', 'ambient', 30, 31, NULL,
+                       'discord:g/c2', 'cairn://p/cairn/general', 'ambient', '@general', 'm3'),
+                    ('i4', 'discord', 'g4', 'u2', 'unbound', 40, NULL, 'unbound_conversation',
+                       'discord:g/c3', NULL, 'none', NULL, NULL),
+                    ('i5', 'imessage', NULL, '+1555', 'legacy', 50, NULL, NULL,
+                       NULL, NULL, NULL, NULL, NULL);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![target]).run(&db).await.unwrap();
+
+        let bindings = db
+            .query_all(
+                "SELECT provider || '|' || conversation || '|' || target_uri || '|' ||
+                        binding_kind || '|' || message_classes || '|' || bound_at
+                   FROM channel_conversation_binding ORDER BY bound_at",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bindings,
+            [
+                "discord|discord:g/c1|cairn://p/cairn/general|structural|15|200",
+                "discord|discord:g/c2|cairn://p/cairn|ambient|8|300",
+            ]
+        );
+
+        let inbound = db
+            .query_all(
+                "SELECT id || '|' || channel || '|' || COALESCE(provider_guid, '-') || '|' ||
+                        sender || '|' || text || '|' || received_at || '|' ||
+                        COALESCE(acknowledged_at, '-') || '|' || COALESCE(rejection_reason, '-')
+                        || '|' || COALESCE(conversation, '-') || '|' || COALESCE(target_uri, '-')
+                        || '|' || COALESCE(binding_kind, '-') || '|' || COALESCE(addressed_by, '-')
+                        || '|' || COALESCE(message_guid, '-')
+                   FROM channel_inbound ORDER BY received_at",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inbound,
+            [
+                "i1|imessage|g1|+1555|via follow|10|11|-|imessage:+1555|cairn://p/cairn/1|none|-|m1",
+                "i2|discord|g2|u1|structural|20|-|-|discord:g/c1|cairn://p/cairn/general|structural|-|-",
+                "i3|discord|g3|u1|ambient|30|31|-|discord:g/c2|cairn://p/cairn/general|ambient|@general|m3",
+                "i4|discord|g4|u2|unbound|40|-|unbound_conversation|discord:g/c3|-|none|-|-",
+                "i5|imessage|-|+1555|legacy|50|-|-|-|-|-|-|-",
+            ]
+        );
+
+        db.execute_script(
+            "INSERT INTO channel_inbound(id, channel, sender, text, received_at, rejection_reason,
+               conversation, binding_kind)
+             VALUES ('i6', 'imessage', '+1555', 'nowhere', 60, 'no_default_thread',
+               'imessage:+1555', 'none');",
+        )
+        .await
+        .unwrap();
+        for refused in [
+            "INSERT INTO channel_inbound(id, channel, sender, text, received_at, binding_kind)
+             VALUES ('i7', 'imessage', '+1555', 'x', 70, 'follow');",
+            "INSERT INTO channel_conversation_binding(provider, conversation, target_uri,
+               binding_kind, message_classes, bound_at)
+             VALUES ('imessage', 'imessage:legacy', 'cairn://p/cairn/3', 'follow', 7, 400);",
+            "INSERT INTO channel_conversation_binding(provider, conversation, target_uri,
+               binding_kind, message_classes, bound_at)
+             VALUES ('discord', 'discord:g/c4', 'cairn://p/cairn', 'ambient', 7, 400);",
+        ] {
+            assert!(db.execute_script(refused).await.is_err(), "{refused}");
+        }
+
+        let index_count = |index: &str| {
+            format!("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = '{index}'")
+        };
+        assert_eq!(
+            count(&db, &index_count("channel_conversation_binding_focus")).await,
+            0
+        );
+        for index in [
+            "channel_conversation_binding_structural",
+            "channel_conversation_binding_ambient",
+            "idx_channel_binding_target",
+            "idx_channel_inbound_received",
+            "idx_channel_inbound_target",
+            "idx_channel_inbound_conversation",
+        ] {
+            assert_eq!(count(&db, &index_count(index)).await, 1, "{index} exists");
+        }
+    }
 }

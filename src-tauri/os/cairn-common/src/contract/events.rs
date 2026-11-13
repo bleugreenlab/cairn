@@ -10,7 +10,7 @@ use cairn_uri::ResourceKind;
 const LIST_KEYS: &[ProjectionSpec] = &[
     ProjectionSpec {
         key: "source",
-        values: "a fact source (attention, file_changed, github_comment, ingress, post_created, post_commented, thread_stream)",
+        values: "a fact source (attention, channel_message, file_changed, github_comment, ingress, post_created, post_commented, …); a retired source still lists its historical rows but takes no match",
     },
     ProjectionSpec {
         key: "match",

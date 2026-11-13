@@ -505,7 +505,14 @@ async fn answer(
     if dry_run {
         return Ok(format!("Would answer {uri} to {}.", message.sender_home));
     }
-    let answer_ref = messages::deliver_answer(orch, &message, "operator", content).await?;
+    let answer_ref = messages::deliver_answer(
+        orch,
+        &message,
+        "operator",
+        content,
+        messages::AnswerHeader::Reply,
+    )
+    .await?;
     crate::operator::record_answered(
         orch,
         id,

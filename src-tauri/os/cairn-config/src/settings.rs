@@ -689,6 +689,28 @@ pub fn load_event_log_settings(config_dir: &std::path::Path) -> EventLogSettings
         .unwrap_or_default()
 }
 
+/// Convert the retired `channels.defaultThread` (a thread or issue URI such as
+/// `cairn://p/CAIRN/3404`) into `defaultProject`, its canonical project key,
+/// unless `defaultProject` is already set. Every writer of `channels` drops the
+/// legacy key, so the conversion holds only until the next channels save.
+fn adopt_legacy_default_thread(mut channels: ChannelsConfig) -> ChannelsConfig {
+    if let Some(legacy) = channels.legacy_default_thread.take() {
+        if channels.default_project.is_none() {
+            channels.default_project = legacy_default_thread_project(&legacy);
+        }
+    }
+    channels
+}
+
+fn legacy_default_thread_project(uri: &str) -> Option<String> {
+    uri.trim()
+        .strip_prefix("cairn://p/")?
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|project| !project.is_empty())
+        .map(cairn_uri::canonical_project)
+}
+
 /// Map legacy preferredModels to tier presets.
 ///
 /// For each legacy model, find the tier whose default model matches it and
@@ -960,7 +982,11 @@ impl SettingsFile {
             private_dedicated_process_capacity: self
                 .private_dedicated_process_capacity
                 .filter(|ceiling| *ceiling > 0),
-            channels: self.channels.clone().unwrap_or_default(),
+            channels: self
+                .channels
+                .clone()
+                .map(adopt_legacy_default_thread)
+                .unwrap_or_default(),
         }
     }
 
@@ -2108,6 +2134,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
         value.imessage.purpose = current.channels.imessage.purpose.take();
         value.telegram.purpose = current.channels.telegram.purpose.take();
         value.discord.purpose = current.channels.discord.purpose.take();
+        // `defaultProject` has the same single writer, the same patch.
+        value.default_project = current.channels.default_project.take();
+        value.legacy_default_thread = None;
         current.channels = value;
     }
 }
@@ -2512,13 +2541,11 @@ externalReplies: disabled
             defaults.to_settings().channels.discord,
             DiscordChannelConfig::default()
         );
-        assert_eq!(
-            defaults.to_settings().channels.default_thread,
-            "cairn://p/CAIRN/3404"
-        );
+        assert_eq!(defaults.to_settings().channels.default_project, None);
 
         let channels = ChannelsConfig {
-            default_thread: "cairn://p/CAIRN/3404".to_string(),
+            default_project: Some("cairn".to_string()),
+            legacy_default_thread: None,
             app: crate::models::AppChannelConfig {
                 purpose: Some("everything else".to_string()),
             },
@@ -3017,6 +3044,50 @@ buildServices:
         assert_eq!(
             load_settings_file(dir).unwrap().log_level,
             Some(LogLevel::Verbose)
+        );
+    }
+
+    /// The retired `defaultThread` names its project once as `defaultProject`;
+    /// an explicit `defaultProject` wins, and no save writes the old key.
+    #[test]
+    fn a_legacy_default_thread_becomes_the_default_project() {
+        let legacy: SettingsFile = serde_yaml::from_str(
+            "channels:\n  defaultThread: cairn://p/CAIRN/3404\n  imessage:\n    enabled: true\n",
+        )
+        .unwrap();
+        let settings = legacy.to_settings();
+        assert_eq!(settings.channels.default_project.as_deref(), Some("cairn"));
+        assert_eq!(settings.channels.legacy_default_thread, None);
+        assert!(settings.channels.imessage.enabled);
+
+        let explicit: SettingsFile = serde_yaml::from_str(
+            "channels:\n  defaultThread: cairn://p/CAIRN/3404\n  defaultProject: other\n",
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.to_settings().channels.default_project.as_deref(),
+            Some("other")
+        );
+
+        let written = serde_yaml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
+        assert!(!written.contains("defaultThread"), "{written}");
+        assert!(written.contains("defaultProject: cairn"), "{written}");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            get_settings_path(dir.path()),
+            "channels:\n  defaultThread: cairn://p/CAIRN/3404\n",
+        )
+        .unwrap();
+        save_settings(dir.path(), &load_settings(dir.path())).unwrap();
+        let saved = std::fs::read_to_string(get_settings_path(dir.path())).unwrap();
+        assert!(!saved.contains("defaultThread"), "{saved}");
+        assert_eq!(
+            load_settings(dir.path())
+                .channels
+                .default_project
+                .as_deref(),
+            Some("cairn")
         );
     }
 

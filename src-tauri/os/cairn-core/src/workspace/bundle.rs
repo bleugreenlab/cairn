@@ -288,7 +288,7 @@ mod tests {
             "agents/build.md",
             "recipes/build.yaml",
             "responses/conveyor.md",
-            "routes/followed-thread-stream.yaml",
+            "routes/ambient-channel.yaml",
             "routes/github-mention.yaml",
             "skills/browser/SKILL.md",
             "workflows/fan-out/workflow.yaml",
@@ -300,12 +300,18 @@ mod tests {
             assert!(!repo.join(path).exists(), "{path} is not copied out");
         }
         let core = pack_lock::read_lock(&repo, "core").expect("core lock");
-        for id in ["followed-thread-stream", "github-mention"] {
+        for id in ["ambient-channel", "github-mention"] {
             assert!(
                 core.item(PackItemKind::Route, id).is_some(),
                 "core must record shipped route `{id}` as a pack item"
             );
         }
+        assert!(
+            !repo
+                .join("packs/core/routes/followed-thread-stream.yaml")
+                .exists(),
+            "the retired route is not installed"
+        );
         let roots = LibraryRoots::workspace(&repo);
         assert_eq!(
             crate::config::agents::resolve_agent(&roots, "build")
@@ -708,6 +714,38 @@ mod tests {
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
                 .unwrap();
         assert_eq!(again, PackSyncResult::default());
+    }
+
+    /// A route deleted from its pack's source leaves a workspace that had it
+    /// installed at the next sync: the staged tree is replaced whole, so the
+    /// installed copy goes and the pack no longer records it.
+    #[test]
+    fn a_route_deleted_from_its_pack_is_removed_from_an_installed_workspace() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_complete_resources(&resources);
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        let installed = repo.join("packs/core/routes/followed.yaml");
+        assert!(installed.exists());
+
+        std::fs::remove_file(source_pack(&resources, "core").join("routes/followed.yaml")).unwrap();
+        write(
+            &source_pack(&resources, "core").join("cairn-pack.yaml"),
+            "id: core\nname: core\nversion: 1.0.0\ndefault: true\nretired:\n  - routes/followed.yaml\n",
+        );
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+
+        assert!(!installed.exists(), "the installed copy is removed");
+        let core = pack_lock::read_lock(&repo, "core").expect("core lock");
+        assert!(core.item(PackItemKind::Route, "followed").is_none());
+        assert!(
+            crate::config::routes::get_route(&LibraryRoots::workspace(&repo), "followed")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

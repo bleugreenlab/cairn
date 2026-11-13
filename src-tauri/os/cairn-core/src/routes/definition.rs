@@ -1640,7 +1640,7 @@ mod tests {
         )
         .replace(
             "  - id: sink-1",
-            "  - { id: second, type: trigger, when: { fact: thread_stream } }\n  - id: sink-1",
+            "  - { id: second, type: trigger, when: { fact: attention } }\n  - id: sink-1",
         )
         .replace(
             "  - { from: trigger-1, to: sink-1 }",
@@ -1657,7 +1657,7 @@ mod tests {
 
     #[test]
     fn literal_sinks_and_the_core_pack_routes_load_and_re_save_unchanged() {
-        for name in ["followed-thread-stream", "github-mention"] {
+        for name in ["ambient-channel", "github-mention"] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("../../packs/core/routes/{name}.yaml"));
             let yaml = std::fs::read_to_string(path).unwrap();
@@ -1729,7 +1729,7 @@ mod tests {
 
     #[test]
     fn a_legacy_linear_file_heals_into_the_graph_and_then_round_trips() {
-        let legacy = "name: test\ndescription: test\nwhen:\n  - fact: attention\n  - fact: thread_stream\ntransforms:\n  - response: conveyor\nto:\n  - { kind: channel, register: notify }\n  - { kind: message, target: 'cairn://p/cairn/1' }\ndedupe: 10m\n";
+        let legacy = "name: test\ndescription: test\nwhen:\n  - fact: attention\n  - fact: github_comment\ntransforms:\n  - response: conveyor\nto:\n  - { kind: channel, register: notify }\n  - { kind: message, target: 'cairn://p/cairn/1' }\ndedupe: 10m\n";
         let healed = parse(legacy).unwrap();
         assert_eq!(
             healed
@@ -1952,7 +1952,7 @@ mod tests {
     /// rather than resolving to nothing at fire time.
     #[test]
     fn a_node_binding_is_refused_when_a_second_trigger_can_skip_the_node_it_reads() {
-        let skippable = "name: test\ndescription: test\nnodes:\n  - id: trigger-a\n    type: trigger\n    when: { fact: attention }\n  - id: trigger-b\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: consumer\n    type: response\n    response: conveyor\n    args:\n      text: { from: condense }\n  - id: sink-1\n    type: sink\n    sink: { kind: channel, register: notify }\nedges:\n  - { from: trigger-a, to: condense }\n  - { from: condense, to: consumer }\n  - { from: trigger-b, to: consumer }\n  - { from: consumer, to: sink-1 }\n";
+        let skippable = "name: test\ndescription: test\nnodes:\n  - id: trigger-a\n    type: trigger\n    when: { fact: attention }\n  - id: trigger-b\n    type: trigger\n    when: { fact: github_comment }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: consumer\n    type: response\n    response: conveyor\n    args:\n      text: { from: condense }\n  - id: sink-1\n    type: sink\n    sink: { kind: channel, register: notify }\nedges:\n  - { from: trigger-a, to: condense }\n  - { from: condense, to: consumer }\n  - { from: trigger-b, to: consumer }\n  - { from: consumer, to: sink-1 }\n";
         assert!(parse(skippable)
             .unwrap_err()
             .contains("does not run on every path"));
@@ -1978,14 +1978,14 @@ mod tests {
 
     #[test]
     fn a_field_binding_must_be_carried_by_every_trigger_that_feeds_it() {
-        let both = "name: test\ndescription: test\nnodes:\n  - id: trigger-1\n    type: trigger\n    when: { fact: attention }\n  - id: trigger-2\n    type: trigger\n    when: { fact: thread_stream }\n  - id: sink-1\n    type: sink\n    sink: { kind: label, issue: { field: threadUri }, labels: [signal] }\nedges:\n  - { from: trigger-1, to: sink-1 }\n  - { from: trigger-2, to: sink-1 }\n";
-        // `threadUri` is a thread_stream field; the attention trigger also feeds
-        // this sink, so the binding cannot be satisfied.
-        assert!(parse(both).unwrap_err().contains("threadUri"));
-        // With only the thread trigger feeding it, the same binding is fine.
+        let both = "name: test\ndescription: test\nnodes:\n  - id: trigger-1\n    type: trigger\n    when: { fact: github_comment }\n  - id: trigger-2\n    type: trigger\n    when: { fact: attention }\n  - id: sink-1\n    type: sink\n    sink: { kind: label, issue: { field: detailUri }, labels: [signal] }\nedges:\n  - { from: trigger-1, to: sink-1 }\n  - { from: trigger-2, to: sink-1 }\n";
+        // `detailUri` is an attention field; the github_comment trigger also
+        // feeds this sink, so the binding cannot be satisfied.
+        assert!(parse(both).unwrap_err().contains("detailUri"));
+        // With only the attention trigger feeding it, the same binding is fine.
         let narrowed = both
             .replace(
-                "  - id: trigger-1\n    type: trigger\n    when: { fact: attention }\n",
+                "  - id: trigger-1\n    type: trigger\n    when: { fact: github_comment }\n",
                 "",
             )
             .replace("  - { from: trigger-1, to: sink-1 }\n", "");

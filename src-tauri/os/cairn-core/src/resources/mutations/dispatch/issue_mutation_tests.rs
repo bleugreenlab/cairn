@@ -111,7 +111,7 @@ async fn route_preview_resolves_response_bindings_and_issue_recipes() {
             Some(serde_json::json!({"definition": {
                 "name": "Bad field",
                 "description": "invalid",
-                "when": [{"fact": "attention"}, {"fact": "thread_stream"}],
+                "when": [{"fact": "attention"}, {"fact": "post_created"}],
                 "transforms": [{"response": "summarize", "args": {"input": {"field": "attention"}}}],
                 "to": {"kind": "channel", "register": "notify"}
             }})),

@@ -604,8 +604,31 @@ pub async fn record_answered(
     Ok(message)
 }
 
+/// How an answer reached the message's sender, which its header says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerHeader<'a> {
+    /// The operator answered this message itself: in the app, or by a native
+    /// reply on a transport.
+    Reply,
+    /// The operator texted without a reply-to on `provider`, and the text was
+    /// routed here only because this message is the latest any thread sent
+    /// him there in 24 hours. It may not be about the message at all.
+    Inferred { provider: &'a str },
+}
+
+impl AnswerHeader<'_> {
+    fn render(self, message_uri: &str) -> String {
+        match self {
+            Self::Reply => format!("[Reply to {message_uri}]"),
+            Self::Inferred { provider } => format!(
+                "[Unaddressed text from the operator, delivered to you because {message_uri} is the latest message any thread sent him on {provider} in 24 h]"
+            ),
+        }
+    }
+}
+
 /// Deliver the operator's answer to the job that sent the message, headed by
-/// the message it answers. A thread's own session takes it through the
+/// how it reached the sender. A thread's own session takes it through the
 /// thread's append, which steers it; any other sender (an issue node, or a
 /// task of a thread or node) takes it on its own job, never a sibling or its
 /// issue's root. Returns the thread message id when there is one.
@@ -614,8 +637,9 @@ pub async fn deliver_answer(
     message: &Message,
     sender_name: &str,
     text: &str,
+    header: AnswerHeader<'_>,
 ) -> Result<Option<String>, String> {
-    let delivered = format!("[Reply to {}] {text}", message.uri());
+    let delivered = format!("{} {text}", header.render(&message.uri()));
     if let Some(cairn_uri::CairnResource::Thread {
         project,
         name,

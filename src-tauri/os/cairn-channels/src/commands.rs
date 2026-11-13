@@ -7,33 +7,13 @@ pub struct ChannelCommandSpec {
     pub takes_argument: bool,
 }
 
-pub const CHANNEL_COMMANDS: &[ChannelCommandSpec] = &[
-    ChannelCommandSpec {
-        name: "threads",
-        description: "List and follow threads",
-        takes_argument: false,
-    },
-    ChannelCommandSpec {
-        name: "issues",
-        description: "List and follow issues",
-        takes_argument: false,
-    },
-    ChannelCommandSpec {
-        name: "focus",
-        description: "Focus a followed thread or issue",
-        takes_argument: true,
-    },
-    ChannelCommandSpec {
-        name: "unfollow",
-        description: "Stop following a thread or issue",
-        takes_argument: true,
-    },
-    ChannelCommandSpec {
-        name: "help",
-        description: "Show channel commands",
-        takes_argument: false,
-    },
-];
+/// Every command a channel answers. Providers that publish a command menu
+/// (Telegram's `setMyCommands`, on every provider start) publish exactly this.
+pub const CHANNEL_COMMANDS: &[ChannelCommandSpec] = &[ChannelCommandSpec {
+    name: "help",
+    description: "Show where your messages go",
+    takes_argument: false,
+}];
 
 pub fn command_spec(name: &str) -> Option<&'static ChannelCommandSpec> {
     CHANNEL_COMMANDS

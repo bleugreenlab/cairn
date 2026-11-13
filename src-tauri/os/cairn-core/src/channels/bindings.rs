@@ -12,32 +12,30 @@ pub const MESSAGE_CLASS_NOTIFY: i64 = 1 << 2;
 ///
 /// Deliberately not every bit. [`MESSAGE_CLASS_AGENT_TEXT`] is a different kind
 /// of grant -- it lets an agent speak in a conversation rather than carrying an
-/// ask to the operator -- so a follow never acquires it by default, a gate can
-/// never request it, and a caller that wants it names it explicitly.
+/// ask to the operator -- so a gate can never request it, and a caller that
+/// wants it names it explicitly.
 pub const MESSAGE_CLASSES_ALL: i64 =
     MESSAGE_CLASS_QUESTION | MESSAGE_CLASS_PERMISSION | MESSAGE_CLASS_NOTIFY;
 /// The operator's grant for agents to send free text into this conversation
 /// by appending to the conversation's resource under `cairn://channels`. Discord structural surfaces (a
-/// thread's or issue's own channel) carry it by default; follow rows, which are
-/// the operator's pocket, do not.
+/// thread's or issue's own channel) carry it by default.
 pub const MESSAGE_CLASS_AGENT_TEXT: i64 = 1 << 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingKind {
-    Follow,
+    /// A conversation that is one thread's or issue's own surface.
     Structural,
     /// A conversation bound to a whole project rather than to one thread: its
-    /// target is the project root, it carries exactly
-    /// [`MESSAGE_CLASS_AGENT_TEXT`], and it is never focused. Unaddressed text
-    /// there is a `channel_message` fact for routes to act on, and threads
-    /// reply into it with agent text. Never resolved as a [`FollowTarget`].
+    /// target is the project root and it carries exactly
+    /// [`MESSAGE_CLASS_AGENT_TEXT`]. Unaddressed text there is a
+    /// `channel_message` fact for routes to act on, and threads reply into it
+    /// with agent text. Never resolved as a [`BindingTarget`].
     Ambient,
 }
 
 impl BindingKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Follow => "follow",
             Self::Structural => "structural",
             Self::Ambient => "ambient",
         }
@@ -45,12 +43,12 @@ impl BindingKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FollowTarget {
+pub enum BindingTarget {
     Thread { project: String, name: String },
     Issue { project: String, number: i32 },
 }
 
-impl FollowTarget {
+impl BindingTarget {
     pub fn parse(uri: &str) -> Result<Self, String> {
         match parse_uri(uri) {
             Some(CairnResource::Thread {
@@ -59,7 +57,7 @@ impl FollowTarget {
                 path,
             }) if path.is_empty() => Ok(Self::Thread { project, name }),
             Some(CairnResource::Issue { project, number }) => Ok(Self::Issue { project, number }),
-            _ => Err(format!("not a followable Cairn URI: {uri}")),
+            _ => Err(format!("not a thread or issue URI: {uri}")),
         }
     }
 
@@ -101,26 +99,17 @@ pub fn canonical_conversation(provider: &str, conversation: &str) -> Result<Stri
     Ok(canonical)
 }
 
-pub fn legacy_conversation(provider: &str) -> Result<String, String> {
-    match provider {
-        "imessage" => Ok("imessage:legacy".into()),
-        "telegram" => Ok("telegram:0".into()),
-        "discord" => Ok("discord:0/0".into()),
-        _ => Err(format!("unsupported conversation provider: {provider}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn follow_target_round_trips_canonical_vocabulary() {
+    fn binding_target_round_trips_canonical_vocabulary() {
         for uri in ["cairn://p/cairn/general", "cairn://p/cairn/4006"] {
-            assert_eq!(FollowTarget::parse(uri).unwrap().uri(), uri);
+            assert_eq!(BindingTarget::parse(uri).unwrap().uri(), uri);
         }
-        assert!(FollowTarget::parse("cairn:~/general").is_err());
-        assert!(FollowTarget::parse("cairn://p/cairn/general/messages").is_err());
+        assert!(BindingTarget::parse("cairn:~/general").is_err());
+        assert!(BindingTarget::parse("cairn://p/cairn/general/messages").is_err());
     }
 
     #[test]

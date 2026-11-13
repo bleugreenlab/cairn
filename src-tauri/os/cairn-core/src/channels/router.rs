@@ -7,12 +7,12 @@ use std::{
 use cairn_db::sql::placeholders;
 use cairn_db::turso::{params, Value};
 use cairn_uri::{parse_uri, CairnResource};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{
     agent_message,
-    bindings::{BindingKind, FollowTarget},
+    bindings::{BindingKind, BindingTarget},
     ledger, operator_message, render_text_floor, AskOption, ChannelProvider, InboundEvent,
     OperatorPresence, OutboundAsk, OutboundInitiator, OutboundMessage, ResolvedQuestionMessage,
 };
@@ -60,16 +60,6 @@ const RECEIPT_WINDOW_MS: i64 = 72 * 60 * 60 * 1000;
 /// How long an undirected Discord route waits for its subject's structural
 /// surface to be created before its firing is recorded as failed.
 const SURFACE_WAIT: Duration = Duration::from_secs(10 * 60);
-const FOLLOW_POLL_LIMIT: usize = 10;
-/// How much of a target's title a poll option carries before it is elided. A
-/// Messages balloon renders an option as a wrapped block, so a full thread title
-/// pushes the rest of the list off the screen.
-const FOLLOW_POLL_TITLE_LIMIT: usize = 64;
-/// The durable binding prefix for a follow poll's ledger row. Command polls are
-/// not backed by a Cairn prompt, so the gate sweep recognizes this namespace and
-/// leaves their provider bindings intact until a newer poll of the same kind
-/// supersedes them.
-const FOLLOW_POLL_PREFIX: &str = "threads:";
 
 /// What a provider's router inbox carries: a route-sink submission, or an
 /// agent message the write side has already ledgered as a `pending` intent.
@@ -174,10 +164,6 @@ fn channel_sender_name(provider_id: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelCommand {
-    Threads,
-    Issues,
-    Focus(String),
-    Unfollow(Option<String>),
     Help,
 }
 
@@ -198,10 +184,6 @@ fn channel_command(text: &str) -> Option<ChannelCommand> {
         return None;
     }
     match (spec.name, argument) {
-        ("threads", None) => Some(ChannelCommand::Threads),
-        ("issues", None) => Some(ChannelCommand::Issues),
-        ("focus", Some(selector)) => Some(ChannelCommand::Focus(selector.to_string())),
-        ("unfollow", selector) => Some(ChannelCommand::Unfollow(selector.map(str::to_string))),
         ("help", None) => Some(ChannelCommand::Help),
         _ => None,
     }
@@ -209,17 +191,21 @@ fn channel_command(text: &str) -> Option<ChannelCommand> {
 
 fn ambient_help(project: &str) -> String {
     format!(
-        "This is {project}'s ambient channel. A message here is logged to {}/events for routes to act on. Start it with @<thread> (or @<issue number>) or a #channel mention to deliver it straight there. Commands: /threads, /issues, /help.",
+        "This is {project}'s ambient channel. A message here is logged to {}/events for routes to act on. Start it with @<thread> (or @<issue number>) or a #channel mention to deliver it straight there. Commands: /help.",
         cairn_uri::build_project_uri(project)
     )
 }
 
-fn follow_poll_kind(binding_ref: &str) -> Option<PollKind> {
-    let kind = binding_ref
-        .strip_prefix(FOLLOW_POLL_PREFIX)?
-        .split(':')
-        .next()?;
-    serde_json::from_value(serde_json::Value::String(kind.to_string())).ok()
+/// The `/help` answer outside an ambient conversation: the one command, and
+/// where unaddressed text goes.
+fn channel_help(default_project: Option<&str>) -> String {
+    let general = match default_project {
+        Some(project) => format!("the {project} general thread"),
+        None => "the default project's general thread".to_string(),
+    };
+    format!(
+        "Commands: /help. Reply to a thread's message to answer it. Other text goes to the thread that last messaged you here within 24 hours, otherwise to {general}."
+    )
 }
 
 fn route_binding_target(binding_ref: &str) -> Option<&str> {
@@ -231,7 +217,7 @@ fn route_binding_target(binding_ref: &str) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AmbientAddress {
     /// `@name`: a thread by name, or an issue by number, in the conversation's
-    /// project -- the vocabulary `FollowTarget::selector` writes.
+    /// project -- the vocabulary `BindingTarget::selector` writes.
     Selector(String),
     /// `<#id>`: a Discord channel mention, resolved through its binding.
     Channel(String),
@@ -286,7 +272,6 @@ fn canonical_inbound_conversation(conversation: &str) -> String {
 /// the command branches and never become a `channel_message`.
 fn is_channel_command(text: &str) -> bool {
     channel_command(text).is_some()
-        || poll_command(text).is_some()
         || starts_with_known_slash_command(text)
         || text.trim_start().starts_with('/')
 }
@@ -294,8 +279,10 @@ fn is_channel_command(text: &str) -> bool {
 /// What `resolve_bare` does with free text no command or ask claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FreeTextFallback {
-    /// Deliver it to the focused follow, or to `channels.defaultThread`.
-    FocusOrDefault,
+    /// Route it as unaddressed text: to the sender of the latest operator
+    /// message on this transport within 24 h, else to the default project's
+    /// general thread.
+    Unaddressed,
     /// Never: an ambient conversation's free text is the route engine's, and
     /// reaching the fallback from there is a router bug.
     Never,
@@ -330,8 +317,9 @@ struct AdmittedMessage<'a> {
     addressed: bool,
     /// The ledger record a reply answered.
     reply_of: Option<String>,
-    /// The leading address an ambient message opened with, as typed.
-    addressed_by: Option<String>,
+    /// Why the message reached its target, when a rule beyond its binding
+    /// decided it.
+    addressed_by: Option<ledger::InboundAddress>,
 }
 
 impl AmbientAddress {
@@ -366,78 +354,6 @@ fn routed_gate_target(uri: &str) -> Option<String> {
             resource.project()?,
             resource.issue_number()?
         )),
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct FollowPollOptions {
-    labels: Vec<String>,
-    bindings: HashMap<String, String>,
-}
-
-fn follow_poll_options(record: &ledger::OutboundRecord) -> Option<FollowPollOptions> {
-    let json = record.options_json.as_deref()?;
-    serde_json::from_str(json).ok().or_else(|| {
-        let bindings: HashMap<String, String> = serde_json::from_str(json).ok()?;
-        let labels = record
-            .rendered_text
-            .lines()
-            .filter_map(|line| {
-                let (number, label) = line.split_once(". ")?;
-                number.parse::<usize>().ok()?;
-                bindings.contains_key(label).then(|| label.to_string())
-            })
-            .collect();
-        Some(FollowPollOptions { labels, bindings })
-    })
-}
-
-fn follow_poll_answer(record: &ledger::OutboundRecord, text: &str) -> String {
-    let trimmed = text.trim();
-    let Some(index) = super::imessage::parse_reply_number(trimmed, usize::MAX) else {
-        return trimmed.to_string();
-    };
-    follow_poll_options(record)
-        .and_then(|options| options.labels.get(index).cloned())
-        .unwrap_or_else(|| trimmed.to_string())
-}
-
-/// The two collections a poll command offers as follow targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum PollKind {
-    Threads,
-    Issues,
-}
-
-impl PollKind {
-    fn caption(self) -> &'static str {
-        match self {
-            Self::Threads => "Follow threads",
-            Self::Issues => "Follow issues",
-        }
-    }
-
-    fn nothing_active(self) -> &'static str {
-        match self {
-            Self::Threads => "No active threads right now.",
-            Self::Issues => "No active issues right now.",
-        }
-    }
-
-    fn failure_prefix(self) -> &'static str {
-        match self {
-            Self::Threads => "Could not list active threads",
-            Self::Issues => "Could not list active issues",
-        }
-    }
-
-    fn binding_prefix(self) -> String {
-        let kind = serde_json::to_value(self).expect("poll kind serializes");
-        format!(
-            "{FOLLOW_POLL_PREFIX}{}:",
-            kind.as_str().expect("poll kind serializes as a string")
-        )
     }
 }
 
@@ -513,173 +429,6 @@ impl SweepSchedule {
     }
 }
 
-/// One assistant event from a followed target, with everything the route fact
-/// built from it needs.
-struct FollowedEvent {
-    rowid: i64,
-    data: String,
-    context: String,
-    job_id: String,
-    project_id: String,
-}
-
-/// The jobs whose transcript a followed target streams, with the context every
-/// event of that target carries.
-///
-/// Resolving the TARGET first is the whole shape of the follow read. Both reads
-/// below used to drive from `events.rowid > cursor` — an open-ended range over
-/// the events primary key — and join outward to discover which target each event
-/// belonged to. So a sweep read every event the WORKSPACE had produced since the
-/// cursor, joined it four ways, and discarded nearly all of it at the project
-/// and issue predicates: the cost followed total event history rather than the
-/// followed target's own transcript. On an installation with 1.5M events that
-/// was 15-17 seconds per follow, repeated every five seconds by every enabled
-/// provider (CAIRN-4208).
-struct FollowSource {
-    /// Empty when the target has no session yet — a dormant thread, or an issue
-    /// that has never run. Both reads then answer without touching `events`.
-    job_ids: Vec<String>,
-    context: String,
-    project_id: String,
-}
-
-/// The jobs a followed THREAD streams. A thread's session is addressed by its
-/// SHAPE, never by "some job of this thread": the sub-agent tasks it spawns and
-/// the pre-cutover thread-issue's jobs carry its id too, and they are newer.
-///
-/// `CROSS JOIN` is the join ORDER, not a cross product: it pins projects as the
-/// outer loop so the thread is found by the `(project_id, name)` key and its
-/// jobs by `thread_id`. Left free, the planner drove from `jobs` and scanned it,
-/// because on a workspace with no gathered statistics the two orders look alike
-/// to it and only one of them is bounded by the followed target. Projects leads
-/// because `LOWER(p.key)` can use no index by construction, and a workspace's
-/// project list is the one table here that is small on purpose.
-fn follow_thread_jobs_sql() -> String {
-    format!(
-        "SELECT j.id, p.key, t.name, p.id
-           FROM projects p
-           CROSS JOIN threads t ON t.project_id = p.id
-           CROSS JOIN jobs j ON j.thread_id = t.id
-          WHERE LOWER(p.key) = ?1 AND t.name = ?2 AND {}",
-        crate::threads::SESSION_JOB_SHAPE
-    )
-}
-
-/// The jobs a followed ISSUE streams: every node of every execution it has run.
-const FOLLOW_ISSUE_JOBS_SQL: &str = "SELECT j.id, p.key, i.number, i.title, p.id
-   FROM projects p
-   CROSS JOIN issues i ON i.project_id = p.id
-   CROSS JOIN jobs j ON j.issue_id = i.id
-  WHERE LOWER(p.key) = ?1 AND i.number = ?2";
-
-/// The assistant events a resolved target's jobs have produced since the cursor.
-/// Built for a given job count so the regression test can plan the shape the
-/// sweep runs, at a cardinality that exposes a planner flip.
-fn followed_events_sql(jobs: usize) -> String {
-    format!(
-        "SELECT e.rowid, e.data, r.job_id
-           FROM runs r
-           JOIN events e ON e.run_id = r.id
-          WHERE r.job_id IN ({}) AND e.event_type = 'assistant' AND e.rowid > ?
-          ORDER BY e.rowid",
-        placeholders(jobs)
-    )
-}
-
-/// The newest rowid a resolved target's jobs have reached, over EVERY event type
-/// — a follow starts at the target's live edge, not at its last assistant turn,
-/// so a session mid-turn does not replay the rest of that turn onto the phone.
-fn follow_live_edge_sql(jobs: usize) -> String {
-    format!(
-        "SELECT COALESCE(MAX(e.rowid), 0)
-           FROM runs r
-           JOIN events e ON e.run_id = r.id
-          WHERE r.job_id IN ({})",
-        placeholders(jobs)
-    )
-}
-
-/// A candidate follow target, before labelling decides how much of its address
-/// the operator needs to see.
-struct PollCandidate {
-    updated_at: i64,
-    project: String,
-    head: String,
-    title: Option<String>,
-    uri: String,
-}
-
-/// The candidates a poll can show, labelled and bound, paired with how many
-/// there were in total across every database.
-///
-/// Already-followed targets sort ahead of the rest. The ten slots span every
-/// open database, and this poll is the only surface that manages follows, so a
-/// followed target pushed past the limit by busier projects would be streaming
-/// to the phone with no way to turn it off.
-///
-/// A label IS the poll's binding key: a selection arrives as its option text and
-/// resolves through `bindings`, so two candidates may never share one or the map
-/// silently drops one target and toggles the other in its place. Thread names
-/// and issue numbers are unique within a project but not across projects, and
-/// this poll spans every open database, so a poll carrying more than one project
-/// qualifies every label with its project key.
-fn poll_targets(
-    mut candidates: Vec<PollCandidate>,
-    followed: &HashSet<String>,
-) -> (Vec<(String, String)>, usize) {
-    candidates.sort_by_key(|candidate| {
-        (
-            !followed.contains(&candidate.uri),
-            std::cmp::Reverse(candidate.updated_at),
-        )
-    });
-    let total = candidates.len();
-    candidates.truncate(FOLLOW_POLL_LIMIT);
-    let qualify = candidates
-        .iter()
-        .map(|candidate| candidate.project.as_str())
-        .collect::<HashSet<_>>()
-        .len()
-        > 1;
-    (
-        candidates
-            .iter()
-            .map(|candidate| {
-                let head = if qualify {
-                    format!("{}/{}", candidate.project, candidate.head)
-                } else {
-                    candidate.head.clone()
-                };
-                (
-                    poll_label(&head, candidate.title.as_deref()),
-                    candidate.uri.clone(),
-                )
-            })
-            .collect(),
-        total,
-    )
-}
-
-/// One label, elided to a width a poll balloon can show.
-fn poll_label(head: &str, title: Option<&str>) -> String {
-    let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) else {
-        return head.to_string();
-    };
-    let elided = if title.chars().count() > FOLLOW_POLL_TITLE_LIMIT {
-        format!(
-            "{}…",
-            title
-                .chars()
-                .take(FOLLOW_POLL_TITLE_LIMIT)
-                .collect::<String>()
-                .trim_end()
-        )
-    } else {
-        title.to_string()
-    };
-    format!("{head} · {elided}")
-}
-
 #[derive(Default)]
 struct ReviewGates {
     gates: Vec<Gate>,
@@ -689,92 +438,6 @@ struct ReviewGates {
     /// cost are readable together: a duration that climbs while this stays flat
     /// means the loader started paying for something other than the backlog.
     scanned: usize,
-}
-
-/// The poll a bare command asks for, matched as an exact case-insensitive word.
-/// `threads` means threads: the operator's muscle memory is the word, and after
-/// the thread cutover the word means the entity.
-fn poll_command(text: &str) -> Option<PollKind> {
-    match channel_command(text)? {
-        ChannelCommand::Threads => Some(PollKind::Threads),
-        ChannelCommand::Issues => Some(PollKind::Issues),
-        _ => None,
-    }
-}
-
-fn unfollow_selector(text: &str) -> Option<Option<String>> {
-    match channel_command(text)? {
-        ChannelCommand::Unfollow(selector) => Some(selector),
-        _ => None,
-    }
-}
-
-fn focus_selector(text: &str) -> Option<String> {
-    match channel_command(text)? {
-        ChannelCommand::Focus(selector) => Some(selector),
-        _ => None,
-    }
-}
-
-/// A command the operator typed is answered synchronously, so a delivery that
-/// never reached the wire has to say WHY. The ledger already recorded the
-/// provider's own error against the intent; repeating a generic failure instead
-/// is what left a bare "native thread poll delivery failed" on the phone with no
-/// way to tell a transient send from a broken bridge.
-fn require_command_delivery(delivered: bool, last_error: Option<String>) -> Result<(), String> {
-    delivered.then_some(()).ok_or_else(|| {
-        last_error.unwrap_or_else(|| "the provider made no delivery attempt".to_string())
-    })
-}
-
-/// The fields of one `thread_stream` fact: where the utterance was said, and
-/// its own structural references in the same vocabulary a post's carry, so one
-/// `mentions` clause matches both.
-pub(crate) async fn thread_stream_fields(
-    db: &crate::storage::LocalDb,
-    project: &str,
-    thread_uri: &str,
-    detail_uri: &str,
-    text: String,
-    context: String,
-    job_id: String,
-) -> std::collections::BTreeMap<String, serde_json::Value> {
-    let mentions = crate::routes::structural_mentions(db, &text).await;
-    std::collections::BTreeMap::from([
-        (
-            "project".into(),
-            serde_json::Value::String(project.to_string()),
-        ),
-        (
-            "threadUri".into(),
-            serde_json::Value::String(thread_uri.to_string()),
-        ),
-        (
-            "detailUri".into(),
-            serde_json::Value::String(detail_uri.to_string()),
-        ),
-        (
-            "mentions".into(),
-            serde_json::Value::Array(
-                mentions
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        ),
-        ("text".into(), serde_json::Value::String(text)),
-        ("context".into(), serde_json::Value::String(context)),
-        ("jobId".into(), serde_json::Value::String(job_id)),
-    ])
-}
-
-pub(crate) fn assistant_text(data: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()?
-        .get("content")?
-        .as_str()
-        .map(str::to_string)
-        .filter(|text| !text.is_empty())
 }
 
 async fn cleanup_resolved_question(
@@ -920,22 +583,20 @@ struct HeldRoute {
 }
 
 /// The issue or thread a route's fact is about. On Discord that subject's
-/// structural conversation is where an undirected route lands. A thread-stream
-/// fact names the followed target; an attention fact names a resource under
-/// its issue (the issue itself, or a node or artifact beneath it).
-fn route_subject(fact: &RouteFact) -> Option<FollowTarget> {
-    ["threadUri", "detailUri"]
-        .into_iter()
-        .filter_map(|field| fact.fields.get(field)?.as_str())
-        .find_map(|uri| match parse_uri(uri)? {
-            CairnResource::Thread { project, name, .. } => {
-                Some(FollowTarget::Thread { project, name })
-            }
-            resource => Some(FollowTarget::Issue {
-                project: resource.project()?.to_string(),
-                number: resource.issue_number()?,
-            }),
-        })
+/// structural conversation is where an undirected route lands. An attention
+/// fact names a resource under its issue or thread (the issue itself, or a
+/// node or artifact beneath it).
+fn route_subject(fact: &RouteFact) -> Option<BindingTarget> {
+    let uri = fact.fields.get("detailUri")?.as_str()?;
+    match parse_uri(uri)? {
+        CairnResource::Thread { project, name, .. } => {
+            Some(BindingTarget::Thread { project, name })
+        }
+        resource => Some(BindingTarget::Issue {
+            project: resource.project()?.to_string(),
+            number: resource.issue_number()?,
+        }),
+    }
 }
 
 fn cancel_resolved_attention(
@@ -1939,97 +1600,6 @@ impl ChannelRouter {
         Ok(false)
     }
 
-    async fn followed_uri(&self, selector: &str) -> Result<Option<String>, String> {
-        let follows = ledger::list_follows(self.ledger(), self.provider_id).await?;
-        if let Some(exact) = follows
-            .iter()
-            .find(|follow| follow.uri.eq_ignore_ascii_case(selector))
-        {
-            return Ok(Some(exact.uri.clone()));
-        }
-        let mut matches = follows.into_iter().filter(|follow| {
-            FollowTarget::parse(&follow.uri).is_ok_and(|target| {
-                target.selector().eq_ignore_ascii_case(selector)
-                    || format!("{}/{}", target.project(), target.selector())
-                        .eq_ignore_ascii_case(selector)
-            })
-        });
-        let first = matches.next().map(|follow| follow.uri);
-        if first.is_some() && matches.next().is_some() {
-            return Err(format!(
-                "More than one follow matches {selector}; use project/{selector}."
-            ));
-        }
-        Ok(first)
-    }
-
-    async fn follow_or_focus(&self, uri: &str, conversation: &str) -> Result<(), String> {
-        let target = self.resolve_target(uri).await?;
-        let canonical = target.uri();
-        let already_followed =
-            ledger::is_target_followed(self.ledger(), self.provider_id, &canonical).await?;
-        if already_followed {
-            ledger::set_focus(
-                self.ledger(),
-                self.provider_id,
-                &canonical,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .await?;
-        } else {
-            self.follow(&canonical).await?;
-        }
-        let action = if already_followed {
-            "Focused"
-        } else {
-            "Following"
-        };
-        self.send_notice(
-            conversation,
-            &format!(
-                "{action} {} — loose messages now go here. /threads to switch.",
-                target.selector()
-            ),
-        )
-        .await
-    }
-
-    async fn unfollow_selector_command(
-        &self,
-        selector: &str,
-        conversation: &str,
-    ) -> Result<(), String> {
-        let Some(uri) = self.followed_uri(selector).await? else {
-            return self
-                .send_notice(conversation, "That follow was not found.")
-                .await;
-        };
-        self.unfollow_uri_command(&uri, conversation).await
-    }
-
-    async fn unfollow_uri_command(&self, uri: &str, conversation: &str) -> Result<(), String> {
-        self.unfollow(uri).await?;
-        let target = FollowTarget::parse(uri)?;
-        self.send_notice(conversation, &format!("Unfollowed {}.", target.selector()))
-            .await
-    }
-
-    async fn focus_selector_command(
-        &self,
-        selector: &str,
-        conversation: &str,
-    ) -> Result<(), String> {
-        let Some(uri) = self.followed_uri(selector).await? else {
-            return self
-                .send_notice(
-                    conversation,
-                    "That follow was not found. Use /threads or /issues to follow it first.",
-                )
-                .await;
-        };
-        self.follow_or_focus(&uri, conversation).await
-    }
-
     /// Every delivery intent lives in the private database. Channel state is tied
     /// to this runner's provider process and personal messaging account, so
     /// `channel_outbound` is private-lineage and a team replica does not carry it
@@ -2070,58 +1640,6 @@ impl ChannelRouter {
             fenced += result.0;
             expired_dangling += result.1;
         }
-        if ledger::remove_home_relative_focus(self.ledger(), self.provider_id).await? {
-            log::warn!("channel removed unresolvable home-relative focus");
-        }
-        for follow in ledger::list_follows(self.ledger(), self.provider_id).await? {
-            if follow.uri == "cairn:~"
-                || follow.uri.starts_with("cairn:~/")
-                || follow.uri.starts_with("cairn:@")
-            {
-                // A home-relative URI only has meaning together with the session
-                // that emitted it. Legacy ledger rows retained neither that
-                // context nor a stable identity, so guessing would risk routing
-                // operator messages to an unrelated session after restart.
-                log::warn!(
-                    "channel removed unresolvable home-relative followed URI {}",
-                    follow.uri
-                );
-                ledger::unfollow_target(self.ledger(), self.provider_id, &follow.uri).await?;
-                continue;
-            }
-            // A URI that cannot PARSE is permanently unusable: skip it, with a
-            // note, rather than parking the whole channel behind one dangling
-            // follow forever. Everything past this point is a database error,
-            // which is transient and must propagate: a cursor left unrebased
-            // because a read failed is a cursor the first successful sweep
-            // delivers a whole session's backlog from.
-            let Ok(parsed) = FollowTarget::parse(&follow.uri) else {
-                log::warn!("channel skipped unusable followed URI {}", follow.uri);
-                continue;
-            };
-            let target = self.resolve_target(&follow.uri).await?;
-            // A follow recorded under an address its target no longer answers to
-            // — a number a thread migration vacated — becomes a second identity
-            // for one conversation the moment the poll offers the canonical form.
-            // Startup is where that is settled, once, before anything reads it.
-            if parsed != target {
-                ledger::canonicalize_follow(
-                    self.ledger(),
-                    self.provider_id,
-                    &follow.uri,
-                    &target.uri(),
-                )
-                .await?;
-            }
-            let live_edge = self.live_edge(&target).await?;
-            ledger::advance_follow_cursor(
-                self.ledger(),
-                self.provider_id,
-                &target.uri(),
-                live_edge,
-            )
-            .await?;
-        }
         if fenced > 0 || expired_dangling > 0 {
             log::info!(
                 "channel sealed the pre-session backlog: {fenced} gate(s) sealed, {expired_dangling} dangling review(s) expired"
@@ -2130,273 +1648,14 @@ impl ChannelRouter {
         Ok(())
     }
 
-    async fn follow_poll_selection(
-        &self,
-        record: &ledger::OutboundRecord,
-        selected_label: &str,
-        conversation: &str,
-    ) -> Result<(), String> {
-        let options = follow_poll_options(record)
-            .ok_or_else(|| "follow poll has no option bindings".to_string())?;
-        let uri = options
-            .bindings
-            .get(selected_label)
-            .ok_or_else(|| format!("unknown follow poll option: {selected_label}"))?;
-        let uri = self.resolve_bound_target(record, uri).await?;
-        self.follow_or_focus(&uri, conversation).await
-    }
-
-    /// Resolve a binding while the outbound row still carries the emitting
-    /// session's job. Once reduced to a follow row, a home-relative URI has no
-    /// context and cannot be recovered safely.
-    async fn resolve_bound_target(
-        &self,
-        record: &ledger::OutboundRecord,
-        uri: &str,
-    ) -> Result<String, String> {
-        let Some(suffix) = uri
-            .strip_prefix("cairn:~/")
-            .or_else(|| (uri == "cairn:~").then_some(""))
-        else {
-            return Ok(uri.to_string());
-        };
-        let job_id = record
-            .job_id
-            .as_deref()
-            .ok_or_else(|| format!("home-relative follow binding has no session context: {uri}"))?;
-        for db in self.orch.db.all_dbs().await {
-            if let Some(home) = crate::jobs::queries::home_uri_for_job(&db, job_id)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return if suffix.is_empty() {
-                    Ok(home)
-                } else {
-                    Ok(format!("{}/{suffix}", home.trim_end_matches('/')))
-                };
-            }
-        }
-        Err(format!(
-            "home-relative follow binding references unknown job {job_id}"
-        ))
-    }
-
-    /// Record a follow under the target's CANONICAL URI, whatever address the
-    /// operator reached it by. That URI is the follow's identity everywhere
-    /// downstream — the ledger's key, the poll's checkmark, and the prefix of the
-    /// binding ref that makes stream delivery once-only — so storing an alias
-    /// would make one conversation into two.
-    async fn follow(&self, uri: &str) -> Result<(), String> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let target = self.resolve_target(uri).await?;
-        let canonical = target.uri();
-        let live_edge = self.live_edge(&target).await?;
-        ledger::follow_target(self.ledger(), self.provider_id, &canonical, now, live_edge).await?;
-        ledger::set_focus(self.ledger(), self.provider_id, &canonical, now).await
-    }
-
-    async fn unfollow(&self, uri: &str) -> Result<(), String> {
-        ledger::unfollow_target(self.ledger(), self.provider_id, uri).await?;
-        for update in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
-            if update.kind == "review"
-                && update.binding_ref.starts_with(&format!("{uri}:event:"))
-                && ledger::claim_outbound_cleanup(
-                    self.ledger(),
-                    &update.id,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await?
-            {
-                let _ = cleanup_claimed_question(
-                    self.ledger(),
-                    self.provider.as_ref(),
-                    &update,
-                    "✓ unfollowed",
-                    false,
-                )
-                .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn send_follow_poll(&self, conversation: &str, kind: PollKind) -> Result<(), String> {
-        // Unlike an answered one-shot question, a follow poll is a standing
-        // control surface. Its GUID binding remains live through ordinary gate
-        // sweeps and outbound traffic; only a newer poll of the same kind replaces it.
-        let followed = ledger::list_follows(self.ledger(), self.provider_id)
-            .await?
-            .into_iter()
-            .map(|follow| follow.uri)
-            .collect::<HashSet<_>>();
-        let (mut targets, total) = match kind {
-            PollKind::Threads => self.active_threads(&followed).await?,
-            PollKind::Issues => self.active_issues(&followed).await?,
-        };
-        if targets.is_empty() {
-            return self.send_notice(conversation, kind.nothing_active()).await;
-        }
-        for (label, uri) in &mut targets {
-            if followed.contains(uri) {
-                *label = format!("✓ {label}");
-            }
-        }
-        let caption = if total > targets.len() {
-            format!(
-                "{} (showing {} most recent of {total})",
-                kind.caption(),
-                targets.len()
-            )
-        } else {
-            kind.caption().to_string()
-        };
-        let binding_ref = format!("{}{}", kind.binding_prefix(), Uuid::new_v4());
-        let gate = Gate {
-            conversation: None,
-            target_uri: None,
-            kind: "question",
-            initiated_by: OutboundInitiator::OperatorInbound,
-            binding_ref: binding_ref.clone(),
-            job_id: None,
-            context: String::new(),
-            // A poll Cairn is putting TO the operator. It answers no agent's
-            // ask and no push was ever minted for it.
-            ask_key: None,
-            held_since: None,
-            ask: OutboundAsk::Question {
-                prompt_id: binding_ref.clone(),
-                question_index: 0,
-                text: caption,
-                options: targets
-                    .iter()
-                    .map(|(label, _)| AskOption {
-                        label: label.clone(),
-                        description: None,
-                    })
-                    .collect(),
-            },
-            reply_to: None,
-        };
-        let Some(id) = claim_gate_for_provider(
-            &self.claims,
-            self.ledger(),
-            self.provider_id,
-            conversation,
-            "poll",
-            &gate,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        let delivered = self.send_claimed(id.clone(), gate, false).await?;
-        require_command_delivery(
-            delivered,
-            ledger::get_by_binding(self.ledger(), self.provider_id, "question", &binding_ref)
-                .await?
-                .and_then(|record| record.last_error),
-        )?;
-        let bindings: HashMap<String, String> = targets.iter().cloned().collect();
-        let options = FollowPollOptions {
-            labels: targets.into_iter().map(|(label, _)| label).collect(),
-            bindings,
-        };
-        ledger::update_options(
-            self.ledger(),
-            &id,
-            &serde_json::to_string(&options).map_err(|error| error.to_string())?,
-        )
-        .await?;
-
-        for previous in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
-            if previous.id != id
-                && previous.status == "sent"
-                && previous.conversation == conversation
-                && follow_poll_kind(&previous.binding_ref) == Some(kind)
-            {
-                self.finish_question(&previous, "✓ replaced by a newer command")
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Every active first-class thread, addressed by name.
-    async fn active_threads(
-        &self,
-        followed: &HashSet<String>,
-    ) -> Result<(Vec<(String, String)>, usize), String> {
-        let mut rows = Vec::new();
-        for db in self.orch.db.all_dbs().await {
-            let mut found = db
-                .query_all(
-                    "SELECT p.key, t.name, t.updated_at FROM threads t JOIN projects p ON p.id = t.project_id WHERE LOWER(t.status) = 'active' ORDER BY t.updated_at DESC",
-                    (),
-                    |row| {
-                        Ok(PollCandidate {
-                            updated_at: row.i64(2)?,
-                            project: row.text(0)?,
-                            head: row.text(1)?,
-                            // A thread's name IS its label, so there is nothing
-                            // for the elision to shorten; issues still carry a
-                            // title and still take the `Some` arm.
-                            title: None,
-                            uri: format!(
-                                "cairn://p/{}/{}",
-                                cairn_uri::canonical_project(row.text(0)?),
-                                row.text(1)?
-                            ),
-                        })
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            rows.append(&mut found);
-        }
-        Ok(poll_targets(rows, followed))
-    }
-
-    /// Every active issue, addressed by number. The operator's follow vocabulary
-    /// covers issue nodes too; only the poll that offers them is separate.
-    async fn active_issues(
-        &self,
-        followed: &HashSet<String>,
-    ) -> Result<(Vec<(String, String)>, usize), String> {
-        let mut rows = Vec::new();
-        for db in self.orch.db.all_dbs().await {
-            let mut found = db
-                .query_all(
-                    "SELECT p.key, i.number, i.title, i.updated_at FROM issues i JOIN projects p ON p.id = i.project_id WHERE LOWER(i.status) = 'active' ORDER BY i.updated_at DESC",
-                    (),
-                    |row| {
-                        Ok(PollCandidate {
-                            updated_at: row.i64(3)?,
-                            project: row.text(0)?,
-                            head: row.i64(1)?.to_string(),
-                            title: Some(row.text(2)?),
-                            uri: format!(
-                                "cairn://p/{}/{}",
-                                cairn_uri::canonical_project(row.text(0)?),
-                                row.i64(1)?
-                            ),
-                        })
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            rows.append(&mut found);
-        }
-        Ok(poll_targets(rows, followed))
-    }
-
-    /// Resolve a follow URI to its target, mapping a number a thread migration
-    /// vacated onto that thread. `channels.defaultThread` and every follow
-    /// recorded before the cutover still carry a numeric address, and the
-    /// canonical alias resolver is the single place that knows which numbers a
-    /// thread now answers to.
-    async fn resolve_target(&self, uri: &str) -> Result<FollowTarget, String> {
-        let target = FollowTarget::parse(uri)?;
-        let FollowTarget::Issue { project, .. } = &target else {
+    /// Resolve a thread or issue URI to its target, mapping a number a thread
+    /// migration vacated onto that thread. A binding or route recorded before
+    /// the cutover can still carry a numeric address, and the canonical alias
+    /// resolver is the single place that knows which numbers a thread now
+    /// answers to.
+    async fn resolve_target(&self, uri: &str) -> Result<BindingTarget, String> {
+        let target = BindingTarget::parse(uri)?;
+        let BindingTarget::Issue { project, .. } = &target else {
             return Ok(target);
         };
         let db = self.orch.db.for_project(project).await;
@@ -2411,7 +1670,7 @@ impl ChannelRouter {
             .await
             .map_err(|error| error.to_string())?;
         Ok(match alias {
-            Some((_, _, name)) => FollowTarget::Thread {
+            Some((_, _, name)) => BindingTarget::Thread {
                 project: project.clone(),
                 name,
             },
@@ -2419,130 +1678,15 @@ impl ChannelRouter {
         })
     }
 
-    /// Resolve a followed target to the jobs that carry its transcript, once,
-    /// before either event read runs. See [`FollowSource`] for why the reads are
-    /// shaped this way.
-    async fn follow_source(&self, target: &FollowTarget) -> Result<FollowSource, String> {
-        let db = self.orch.db.for_project(target.project()).await;
-        let rows = match target {
-            FollowTarget::Thread { project, name } => {
-                db.query_all(
-                    follow_thread_jobs_sql(),
-                    params![cairn_uri::canonical_project(project), name.clone()],
-                    |row| {
-                        Ok((
-                            row.text(0)?,
-                            // A thread's one identifier, written the way its URI
-                            // and its pane header write it. An issue, which has a
-                            // number AND a title, still reads "KEY-N Title".
-                            format!("{}/{}", row.text(1)?, row.text(2)?),
-                            row.text(3)?,
-                        ))
-                    },
-                )
-                .await
-            }
-            FollowTarget::Issue { project, number } => {
-                db.query_all(
-                    FOLLOW_ISSUE_JOBS_SQL,
-                    params![cairn_uri::canonical_project(project), *number],
-                    |row| {
-                        Ok((
-                            row.text(0)?,
-                            format!(
-                                "{}/{} {}",
-                                row.text(1)?.to_lowercase(),
-                                row.i64(2)?,
-                                row.text(3)?
-                            ),
-                            row.text(4)?,
-                        ))
-                    },
-                )
-                .await
-            }
-        }
-        .map_err(|error| error.to_string())?;
-
-        // Every row of either statement describes the same target, so the
-        // context and project are read off the first one.
-        let Some((_, context, project_id)) = rows.first().cloned() else {
-            return Ok(FollowSource {
-                job_ids: Vec::new(),
-                context: String::new(),
-                project_id: String::new(),
-            });
-        };
-        Ok(FollowSource {
-            job_ids: rows.into_iter().map(|(job_id, ..)| job_id).collect(),
-            context,
-            project_id,
-        })
-    }
-
-    /// The newest event a target's session has produced. A new follow starts here
-    /// so neither a restart nor a re-follow replays history.
-    async fn live_edge(&self, target: &FollowTarget) -> Result<i64, String> {
-        let source = self.follow_source(target).await?;
-        if source.job_ids.is_empty() {
-            return Ok(0);
-        }
-        let db = self.orch.db.for_project(target.project()).await;
-        let sql = follow_live_edge_sql(source.job_ids.len());
-        let binds: Vec<Value> = source.job_ids.into_iter().map(Value::Text).collect();
-        db.query_opt_i64(sql, binds)
-            .await
-            .map(|edge| edge.unwrap_or(0))
-            .map_err(|error| error.to_string())
-    }
-
-    /// The assistant text a followed target has produced since `cursor`, carrying
-    /// the context each event needs to become a route fact.
-    async fn followed_events(
-        &self,
-        target: &FollowTarget,
-        cursor: i64,
-    ) -> Result<Vec<FollowedEvent>, String> {
-        let source = self.follow_source(target).await?;
-        if source.job_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let db = self.orch.db.for_project(target.project()).await;
-        let sql = followed_events_sql(source.job_ids.len());
-        let mut binds: Vec<Value> = source
-            .job_ids
-            .iter()
-            .cloned()
-            .map(Value::Text)
-            .collect::<Vec<_>>();
-        binds.push(Value::Integer(cursor));
-        let FollowSource {
-            context,
-            project_id,
-            ..
-        } = source;
-        db.query_all(sql, binds, move |row| {
-            Ok(FollowedEvent {
-                rowid: row.i64(0)?,
-                data: row.text(1)?,
-                context: context.clone(),
-                job_id: row.text(2)?,
-                project_id: project_id.clone(),
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())
-    }
-
     /// Deliver operator text into a target's session. A thread takes the same
     /// append the desktop composer takes — the message becomes visible in the
     /// thread and its session is steered, warm or cold. An issue node takes the
     /// ordinary queue-at-send job path.
-    async fn route_to_target(&self, target: &FollowTarget, text: &str) -> Result<(), String> {
+    async fn route_to_target(&self, target: &BindingTarget, text: &str) -> Result<(), String> {
         let db = self.orch.db.for_project(target.project()).await;
         let sender_name = channel_sender_name(self.provider_id);
         match target {
-            FollowTarget::Thread { project, name } => {
+            BindingTarget::Thread { project, name } => {
                 let thread_id = db
                     .query_opt(
                         "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2",
@@ -2563,7 +1707,7 @@ impl ChannelRouter {
                 .await
                 .map(|_| ())
             }
-            FollowTarget::Issue { project, number } => {
+            BindingTarget::Issue { project, number } => {
                 let job_id = db.query_opt(
                     "SELECT j.id FROM jobs j JOIN runs r ON r.job_id = j.id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND j.parent_job_id IS NULL ORDER BY r.created_at DESC LIMIT 1",
                     params![cairn_uri::canonical_project(project), *number],
@@ -2595,10 +1739,10 @@ impl ChannelRouter {
         sender: &str,
         text: &str,
         delivered: Option<&str>,
-        target: &FollowTarget,
+        target: &BindingTarget,
         binding_kind: Option<BindingKind>,
         reply_of: Option<String>,
-        addressed_by: Option<String>,
+        addressed_by: Option<ledger::InboundAddress>,
     ) -> Result<(), String> {
         self.route_to_target(target, delivered.unwrap_or(text))
             .await?;
@@ -2658,7 +1802,10 @@ impl ChannelRouter {
                 conversation: Some(message.conversation.into()),
                 target_uri: Some(message.target_uri.clone()),
                 binding_kind: Some(binding_kind.into()),
-                addressed_by: message.addressed_by.clone(),
+                addressed_by: message
+                    .addressed_by
+                    .as_ref()
+                    .map(ledger::InboundAddress::token),
                 message_guid: inbound_message_guid(),
             },
         )
@@ -2763,7 +1910,10 @@ impl ChannelRouter {
             fields.insert("replyOf".to_string(), serde_json::json!(reply_of));
         }
         if let Some(addressed_by) = &message.addressed_by {
-            fields.insert("addressedBy".to_string(), serde_json::json!(addressed_by));
+            fields.insert(
+                "addressedBy".to_string(),
+                serde_json::json!(addressed_by.token()),
+            );
         }
         let origin = match crate::routes::installation_machine_origin(&self.orch) {
             Ok(origin) => Some(origin),
@@ -2901,11 +2051,13 @@ impl ChannelRouter {
             Some(uri) => format!("[{label}] {rest}\n{uri}"),
             None => format!("[{label}] {rest}"),
         };
-        let addressed_by = addresses
-            .iter()
-            .map(AmbientAddress::token)
-            .collect::<Vec<_>>()
-            .join(" ");
+        let addressed_by = ledger::InboundAddress::Typed(
+            addresses
+                .iter()
+                .map(AmbientAddress::token)
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         for target in targets {
             self.deliver_inbound(
                 conversation,
@@ -2929,7 +2081,7 @@ impl ChannelRouter {
         conversation: &str,
         project: &str,
         address: &AmbientAddress,
-    ) -> Result<Option<FollowTarget>, String> {
+    ) -> Result<Option<BindingTarget>, String> {
         let project = cairn_uri::canonical_project(project);
         match address {
             AmbientAddress::Selector(selector) => {
@@ -3111,9 +2263,6 @@ impl ChannelRouter {
         }
         if let Err(error) = self.deliver_pending_agent_messages().await {
             log::warn!("channel agent message sweep failed: {error}");
-        }
-        if let Err(error) = self.sweep_followed_updates().await {
-            log::warn!("channel followed-target update sweep failed: {error}");
         }
         if let Err(error) = self.sweep_pending_domain_actions().await {
             log::warn!("channel ask domain-action sweep failed: {error}");
@@ -3351,91 +2500,6 @@ impl ChannelRouter {
         Ok(())
     }
 
-    async fn sweep_followed_updates(&self) -> Result<(), String> {
-        let follows = ledger::list_follows(self.ledger(), self.provider_id).await?;
-        for follow in follows {
-            // One unresolvable follow must not silence every other one, so a
-            // failure here is reported and skipped rather than aborting the sweep.
-            let target = match self.resolve_target(&follow.uri).await {
-                Ok(target) => target,
-                Err(error) => {
-                    log::warn!("channel skipped followed {}: {error}", follow.uri);
-                    continue;
-                }
-            };
-            let events = match self.followed_events(&target, follow.cursor_rowid).await {
-                Ok(events) => events,
-                Err(error) => {
-                    log::warn!(
-                        "channel could not read updates for followed {}: {error}",
-                        follow.uri
-                    );
-                    continue;
-                }
-            };
-            for event in events {
-                if let Some(text) = assistant_text(&event.data) {
-                    let detail_uri = format!("{}:event:{}", follow.uri, event.rowid);
-                    let actor_job_id = event.job_id.clone();
-                    let fields = thread_stream_fields(
-                        &self.orch.db.local,
-                        target.project(),
-                        &follow.uri,
-                        &detail_uri,
-                        text,
-                        event.context,
-                        event.job_id,
-                    )
-                    .await;
-                    let fact = RouteFact {
-                        source: "thread_stream".into(),
-                        identity: detail_uri.clone(),
-                        summary: fields
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned),
-                        fields,
-                        origin: Some(crate::routes::installation_machine_origin(&self.orch)?),
-                        route_provenance: None,
-                    };
-                    // One local insert, then on to the next event: the sweep
-                    // never waits on a route. Every following provider's sweep
-                    // mints the same utterance; the log keeps one row, and the
-                    // route lane fans its stream out to every follower.
-                    if let Err(error) = crate::routes::mint(
-                        &self.orch,
-                        crate::routes::Mint {
-                            fact,
-                            record_ref: detail_uri,
-                            record_id: Some(event.rowid.to_string()),
-                            project_id: Some(&event.project_id),
-                            presence: crate::routes::log::operator_presence().await,
-                            // The thread that said this is its actor, so its own
-                            // standing triggers never wake it on its own words.
-                            actor_job_id: Some(&actor_job_id),
-                        },
-                    )
-                    .await
-                    {
-                        log::warn!(
-                            "could not mint followed {} event {}: {error}",
-                            follow.uri,
-                            event.rowid
-                        );
-                    }
-                }
-                ledger::advance_follow_cursor(
-                    self.ledger(),
-                    self.provider_id,
-                    &follow.uri,
-                    event.rowid,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
     async fn sweep_live_gates(&self) -> Result<(), String> {
         let mut gates = Vec::new();
         let mut snapshot_complete = true;
@@ -3520,7 +2584,6 @@ impl ChannelRouter {
             for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
                 if record.kind == "question"
                     && record.status == "sent"
-                    && !record.binding_ref.starts_with(FOLLOW_POLL_PREFIX)
                     && !live.contains(&record.binding_ref)
                 {
                     self.finish_question(&record, "✓ question closed in Cairn")
@@ -4052,15 +3115,19 @@ impl ChannelRouter {
             .is_some_and(|record| record.kind == "permission")
         {
             InboundCapability::Permissions
-        } else if bound.as_ref().is_some_and(|record| {
-            record.binding_ref.starts_with(FOLLOW_POLL_PREFIX)
-                || matches!(record.kind.as_str(), "question" | "review")
-        }) || channel_command(text).is_some()
-            || poll_command(text).is_some()
-            || starts_with_known_slash_command(text)
+        } else if bound
+            .as_ref()
+            .is_some_and(|record| matches!(record.kind.as_str(), "question" | "review"))
+            || channel_command(text).is_some()
+            // Any slash command is a channel control, a retired one included:
+            // it is answered with help and never reaches a thread or an ask.
+            || text.trim_start().starts_with('/')
         {
             InboundCapability::Answers
-        } else if guid.is_none() {
+        } else if bound.is_none() {
+            // A reply to a message the ledger does not know is routed as bare
+            // text, so it is admitted as bare text: an outstanding ask it
+            // would claim needs that ask's capability.
             let unresolved = ledger::list_unresolved(self.ledger(), self.provider_id)
                 .await?
                 .into_iter()
@@ -4240,15 +3307,18 @@ impl ChannelRouter {
         }
     }
 
-    /// The operator's reply to a message he was sent: delivered to its sender
+    /// The operator's text for a message he was sent: delivered to its sender
     /// (a thread steered through its own append, an issue node through its
-    /// job), headed by the message it answers, and recorded as the answer.
+    /// job), headed by how it got there, and recorded as the answer. A native
+    /// reply is headed as a reply; unaddressed text routed by recency says so,
+    /// since it may not be about the message at all.
     async fn deliver_operator_reply(
         &self,
         record: ledger::OutboundRecord,
         conversation: &str,
         sender: &str,
         text: &str,
+        addressed_by: ledger::InboundAddress,
     ) -> Result<(), String> {
         let id = operator_message::message_id(&record.binding_ref)
             .ok_or_else(|| format!("operator reply names no message: {}", record.binding_ref))?
@@ -4259,13 +3329,21 @@ impl ChannelRouter {
         let project_key = parse_uri(&message.sender_home)
             .and_then(|home| home.project().map(cairn_uri::canonical_project))
             .ok_or_else(|| format!("operator message {id} has no sender to answer"))?;
-        // The answer goes to the job that asked, not to the issue-level
-        // target a followed conversation resolves to.
+        // The answer goes to the job that asked, not to its issue's root.
+        let header = match addressed_by {
+            ledger::InboundAddress::RecentOperatorMessage { .. } => {
+                crate::operator::messages::AnswerHeader::Inferred {
+                    provider: self.provider_id,
+                }
+            }
+            _ => crate::operator::messages::AnswerHeader::Reply,
+        };
         crate::operator::messages::deliver_answer(
             &self.orch,
             &message,
             &channel_sender_name(self.provider_id),
             text,
+            header,
         )
         .await?;
         let binding_kind = self.reply_binding_kind(conversation).await?;
@@ -4280,7 +3358,7 @@ impl ChannelRouter {
                 project_key,
                 addressed: true,
                 reply_of: Some(record.id),
-                addressed_by: None,
+                addressed_by: Some(addressed_by),
             })
             .await;
         crate::operator::record_answered(
@@ -4307,47 +3385,6 @@ impl ChannelRouter {
         if let Some(record) =
             ledger::get_by_provider_guid(self.ledger(), self.provider_id, guid).await?
         {
-            if record.kind == "review" {
-                if let Some(requested) = unfollow_selector(text) {
-                    let bound_uri = record.binding_ref.split(":event:").next();
-                    let bound_project = bound_uri
-                        .and_then(parse_uri)
-                        .and_then(|uri| uri.project().map(str::to_string));
-                    let followed_uri = match requested {
-                        None => bound_uri.map(str::to_string),
-                        // A selector names a target the way the operator saw it:
-                        // a thread by name, an issue by number.
-                        Some(selector) => ledger::list_follows(self.ledger(), self.provider_id)
-                            .await?
-                            .into_iter()
-                            .find(|follow| {
-                                FollowTarget::parse(&follow.uri).is_ok_and(|target| {
-                                    target.selector().eq_ignore_ascii_case(&selector)
-                                        && Some(target.project()) == bound_project.as_deref()
-                                })
-                            })
-                            .map(|follow| follow.uri),
-                    };
-                    let Some(followed_uri) = followed_uri else {
-                        return self
-                            .send_notice(conversation, "That follow was not found.")
-                            .await;
-                    };
-                    let changed =
-                        ledger::is_target_followed(self.ledger(), self.provider_id, &followed_uri)
-                            .await?;
-                    if changed {
-                        self.unfollow(&followed_uri).await?;
-                    }
-                    let confirmation = if changed {
-                        format!("Unfollowed {followed_uri}.")
-                    } else {
-                        format!("{followed_uri} was already unfollowed.")
-                    };
-                    self.send_notice(conversation, &confirmation).await?;
-                    return Ok(());
-                }
-            }
             if record.kind == "route" {
                 let Some(target_uri) = route_binding_target(&record.binding_ref) else {
                     // A route's acknowledgement in an ambient conversation names
@@ -4367,6 +3404,7 @@ impl ChannelRouter {
                 };
                 let target = self.resolve_target(target_uri).await?;
                 let binding_kind = self.reply_binding_kind(conversation).await?;
+                let outbound = record.id.clone();
                 return self
                     .deliver_inbound(
                         conversation,
@@ -4376,7 +3414,7 @@ impl ChannelRouter {
                         &target,
                         binding_kind,
                         Some(record.id),
-                        None,
+                        Some(ledger::InboundAddress::Reply { outbound }),
                     )
                     .await;
             }
@@ -4393,6 +3431,7 @@ impl ChannelRouter {
                     })?;
                 let target = self.resolve_target(&target_uri).await?;
                 let binding_kind = self.reply_binding_kind(conversation).await?;
+                let outbound = record.id.clone();
                 return self
                     .deliver_inbound(
                         conversation,
@@ -4402,22 +3441,27 @@ impl ChannelRouter {
                         &target,
                         binding_kind,
                         Some(record.id),
-                        None,
+                        Some(ledger::InboundAddress::Reply { outbound }),
                     )
                     .await;
             }
             if record.kind == operator_message::KIND {
+                let outbound = record.id.clone();
                 return self
-                    .deliver_operator_reply(record, conversation, sender, text)
+                    .deliver_operator_reply(
+                        record,
+                        conversation,
+                        sender,
+                        text,
+                        ledger::InboundAddress::Reply { outbound },
+                    )
                     .await;
             }
             return self.resolve_record(record, sender, text).await;
         }
-        if poll_command(text).is_some() || text.trim_start().starts_with('/') {
-            return self.resolve_bare(conversation, sender, text).await;
-        }
-        self.store_unsolicited(Some(guid), conversation, sender, text)
-            .await
+        // A reply to a message the ledger does not know names nothing, so it
+        // is routed as the unaddressed text it effectively is.
+        self.resolve_bare(conversation, sender, text).await
     }
 
     async fn resolve_selection(
@@ -4435,24 +3479,6 @@ impl ChannelRouter {
                 .store_unsolicited(Some(guid), conversation, sender, text)
                 .await;
         };
-        if record.binding_ref.starts_with(FOLLOW_POLL_PREFIX) {
-            let options = follow_poll_options(&record)
-                .ok_or_else(|| "follow poll has no option bindings".to_string())?;
-            if let Some(uri) = options.bindings.get(text) {
-                if selected {
-                    self.follow_or_focus(uri, &record.conversation).await?;
-                } else {
-                    self.unfollow(uri).await?;
-                    let target = FollowTarget::parse(uri)?;
-                    self.send_notice(
-                        &record.conversation,
-                        &format!("Unfollowed {}.", target.selector()),
-                    )
-                    .await?;
-                }
-            }
-            return Ok(());
-        }
         if selected {
             self.resolve_record(record, sender, text).await
         } else {
@@ -4466,7 +3492,7 @@ impl ChannelRouter {
         sender: &str,
         text: &str,
     ) -> Result<(), String> {
-        self.resolve_bare_with(conversation, sender, text, FreeTextFallback::FocusOrDefault)
+        self.resolve_bare_with(conversation, sender, text, FreeTextFallback::Unaddressed)
             .await
     }
 
@@ -4477,42 +3503,22 @@ impl ChannelRouter {
         text: &str,
         fallback: FreeTextFallback,
     ) -> Result<(), String> {
-        if let Some(kind) = poll_command(text) {
-            if let Err(error) = self.send_follow_poll(conversation, kind).await {
-                log::warn!("channel could not answer the {kind:?} command: {error}");
-                self.send_notice(conversation, &format!("{}: {error}", kind.failure_prefix()))
-                    .await?;
-            }
-            return Ok(());
-        }
-        if let Some(selector) = unfollow_selector(text) {
-            return match selector {
-                Some(selector) => {
-                    self.unfollow_selector_command(&selector, conversation)
-                        .await
-                }
-                None => {
-                    let Some(focused) = ledger::get_focus(self.ledger(), self.provider_id).await?
-                    else {
-                        return self
-                            .send_notice(conversation, "There is no focused follow to unfollow.")
-                            .await;
-                    };
-                    self.unfollow_uri_command(&focused, conversation).await
-                }
-            };
-        }
-        if let Some(selector) = focus_selector(text) {
-            return self.focus_selector_command(&selector, conversation).await;
-        }
         if matches!(channel_command(text), Some(ChannelCommand::Help)) {
-            return self.send_notice(conversation, "Commands: /threads, /issues, /focus <name>, /unfollow [name], /help. Without a name, /unfollow stops the current focus. Reply to a pushed update to message that thread directly.").await;
-        }
-        if starts_with_known_slash_command(text) {
+            let project = super::default_project::resolve(&self.orch).await?;
             return self
                 .send_notice(
                     conversation,
-                    "Invalid command usage. Use /help for channel commands.",
+                    &channel_help(project.as_ref().map(|project| project.key.as_str())),
+                )
+                .await;
+        }
+        // Before the ask matcher, so an outstanding ask never takes a command
+        // as its answer.
+        if text.trim_start().starts_with('/') {
+            return self
+                .send_notice(
+                    conversation,
+                    "Unknown command. Use /help for channel commands.",
                 )
                 .await;
         }
@@ -4533,46 +3539,89 @@ impl ChannelRouter {
         if matches.len() > 1 {
             return self.send_notice(conversation, "I found more than one active ask. Please reply to the specific message you want to answer.").await;
         }
-        if !text.trim_start().starts_with('/') {
-            if fallback == FreeTextFallback::Never {
-                debug_assert!(
-                    false,
-                    "ambient free text reached the focus/default fallback: {text:?}"
-                );
-                return self
-                    .send_notice(
-                        conversation,
-                        "Unknown command. Use /help for channel commands.",
-                    )
-                    .await;
-            }
-            let (focused, binding_kind) =
-                match ledger::get_focus(self.ledger(), self.provider_id).await? {
-                    Some(focused) => (focused, Some(BindingKind::Follow)),
-                    None => (
-                        crate::config::settings::load_settings(&self.orch.config_dir)
-                            .channels
-                            .default_thread,
-                        None,
-                    ),
-                };
-            let target = self.resolve_target(&focused).await?;
+        if fallback == FreeTextFallback::Never {
+            debug_assert!(
+                false,
+                "ambient free text reached the unaddressed fallback: {text:?}"
+            );
             return self
-                .deliver_inbound(
+                .send_notice(
                     conversation,
-                    sender,
-                    text,
-                    None,
-                    &target,
-                    binding_kind,
-                    None,
-                    None,
+                    "Unknown command. Use /help for channel commands.",
                 )
                 .await;
         }
-        self.send_notice(
+        self.resolve_unaddressed(conversation, sender, text).await
+    }
+
+    /// Free text with no reply-to that no ask claimed. It goes to the thread
+    /// whose operator message is the latest sent into this conversation on
+    /// this transport within 24 hours, answering that message; failing that, to
+    /// the default project's general thread; failing that, nowhere, by name.
+    async fn resolve_unaddressed(
+        &self,
+        conversation: &str,
+        sender: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(record) = ledger::latest_operator_send(
+            self.ledger(),
+            self.provider_id,
             conversation,
-            "Unknown command. Use /help for channel commands.",
+            now_ms - ledger::UNADDRESSED_WINDOW_MS,
+        )
+        .await?
+        {
+            let outbound = record.id.clone();
+            return self
+                .deliver_operator_reply(
+                    record,
+                    conversation,
+                    sender,
+                    text,
+                    ledger::InboundAddress::RecentOperatorMessage { outbound },
+                )
+                .await;
+        }
+        let project = super::default_project::resolve(&self.orch).await?;
+        let refusal = match &project {
+            None => Some("there is no project".to_string()),
+            Some(project)
+                if !super::default_project::open_general_thread(&self.orch, &project.key)
+                    .await? =>
+            {
+                Some(format!(
+                    "project {} has no open general thread",
+                    project.key
+                ))
+            }
+            Some(_) => None,
+        };
+        let (Some(project), None) = (project, refusal.as_ref()) else {
+            self.store_rejected(None, conversation, sender, text, "no_default_thread", false)
+                .await?;
+            let notice = format!(
+                "No thread can take this: {}. Set Settings > Channels > Default project.",
+                refusal.unwrap_or_default()
+            );
+            return self.send_notice(conversation, &notice).await;
+        };
+        let target = BindingTarget::Thread {
+            project: project.key.clone(),
+            name: crate::projects::crud::GENERAL_THREAD_NAME.to_string(),
+        };
+        self.deliver_inbound(
+            conversation,
+            sender,
+            text,
+            None,
+            &target,
+            None,
+            None,
+            Some(ledger::InboundAddress::DefaultProject {
+                project: project.key,
+            }),
         )
         .await
     }
@@ -4588,12 +3637,6 @@ impl ChannelRouter {
         }
         match record.kind.as_str() {
             "question" => {
-                if record.binding_ref.starts_with(FOLLOW_POLL_PREFIX) {
-                    let selected_label = follow_poll_answer(&record, text);
-                    return self
-                        .follow_poll_selection(&record, &selected_label, &record.conversation)
-                        .await;
-                }
                 let answer = question_answer(&record, text);
                 let (prompt_id, _) = record
                     .binding_ref
@@ -5866,7 +4909,7 @@ mod tests {
         // notices runs.
         let router = ChannelRouter::new_for_provider(
             orch,
-            Arc::new(RecordingPollProvider::new()),
+            Arc::new(RecordingProvider::new()),
             "imessage",
             "+15551234567".into(),
             MessageClassPolicy {
@@ -6010,7 +5053,7 @@ mod tests {
 
         let discord = ChannelRouter::new_for_provider(
             orch,
-            Arc::new(RecordingPollProvider::new()),
+            Arc::new(RecordingProvider::new()),
             "discord",
             "9".into(),
             MessageClassPolicy::default(),
@@ -6024,7 +5067,6 @@ mod tests {
             crate::channels::bindings::BindingKind::Structural,
             crate::channels::bindings::MESSAGE_CLASSES_ALL,
             1,
-            0,
         )
         .await
         .unwrap();
@@ -6271,7 +5313,7 @@ mod tests {
         };
         // One recording provider behind all three routers, so the message ids
         // it mints stay unique on the shared channel.
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let providers: Vec<_> = (0..3)
             .map(|n| {
                 ChannelRouter::new_for_provider(
@@ -6425,216 +5467,6 @@ mod tests {
         assert_eq!(
             gate_source_staleness(&snapshot(glacial, glacial), 4, now),
             Some("reconcile-horizon")
-        );
-    }
-
-    /// The follow sweep re-reads every followed target every five seconds, so
-    /// what that read costs has to follow the TARGET. It used to follow the
-    /// workspace: both statements drove from `events.rowid > cursor`, an
-    /// open-ended range over the events primary key, and joined outward to
-    /// discover which target each event belonged to — so a sweep read every event
-    /// the workspace had produced since the cursor and discarded nearly all of it
-    /// at the project and issue predicates. On a 1.5M-row `events` table that was
-    /// 15-17 seconds per follow (CAIRN-4208).
-    ///
-    /// The plan is what pins this, for the same reason it pins the review backlog
-    /// next door: the old shape returned the same rows this one does, in the same
-    /// number of statements. Only its plan said that reading one thread's last
-    /// word meant reading the whole workspace's history.
-    ///
-    /// The job list is planned at a realistic width rather than at one, because
-    /// an `IN` list of a single value is exactly the cardinality at which a
-    /// planner will pick a different path than it picks in production.
-    #[tokio::test]
-    async fn followed_target_statements_never_walk_the_event_table() {
-        let db = migrated_test_db("channel-router-follow-plan.db").await;
-        const JOBS: usize = 8;
-        let job_ids: Vec<Value> = (0..JOBS).map(|n| Value::Text(format!("job-{n}"))).collect();
-
-        let issue_jobs = query_plan(
-            &db,
-            FOLLOW_ISSUE_JOBS_SQL,
-            vec![Value::Text("cairn".into()), Value::Integer(4208)],
-        )
-        .await;
-        assert!(
-            issue_jobs.contains("idx_issues_project_number")
-                && issue_jobs.contains("idx_jobs_issue_id"),
-            "a followed issue is found by its (project, number) key and reaches \
-             its jobs through issues(id):\n{issue_jobs}"
-        );
-        let thread_jobs = query_plan(
-            &db,
-            &follow_thread_jobs_sql(),
-            vec![
-                Value::Text("cairn".into()),
-                Value::Text("performance".into()),
-            ],
-        )
-        .await;
-        assert!(
-            seeks_by(&thread_jobs, "t", "") && thread_jobs.contains("idx_jobs_thread_id"),
-            "a followed thread is found by its (project, name) key and reaches \
-             its session job through threads(id):\n{thread_jobs}"
-        );
-        for plan in [&issue_jobs, &thread_jobs] {
-            assert!(
-                !plan.contains("events"),
-                "resolving WHICH jobs a target owns must not touch the event \
-                 table at all:\n{plan}"
-            );
-            assert!(
-                !plan.contains("SCAN jobs")
-                    && !plan.contains("SCAN issues")
-                    && !plan.contains("SCAN threads"),
-                "only projects may be scanned here — it is the one table in this \
-                 join that a workspace keeps small, and LOWER(p.key) can use no \
-                 index by construction. Everything else is reached by key:\n{plan}"
-            );
-        }
-
-        let mut event_binds = job_ids.clone();
-        event_binds.push(Value::Integer(0));
-        let events = query_plan(&db, &followed_events_sql(JOBS), event_binds).await;
-        let edge = query_plan(&db, &follow_live_edge_sql(JOBS), job_ids).await;
-        for plan in [&events, &edge] {
-            assert!(
-                seeks_by(plan, "r", "idx_runs_job_id"),
-                "the resolved jobs drive the read:\n{plan}"
-            );
-            assert!(
-                seeks_by(plan, "e", "idx_events"),
-                "and each run seeks its own events:\n{plan}"
-            );
-            assert!(
-                !plan.contains("SCAN e") && !plan.contains("e USING INTEGER PRIMARY KEY"),
-                "driving from the events primary key is the workspace walk \
-                 coming back: it reads every event the workspace produced after \
-                 the cursor and joins outward to find out whose it was:\n{plan}"
-            );
-        }
-    }
-
-    /// The measurement behind the rewrite, kept runnable because a migrated
-    /// empty database cannot show it: every plan here is cheap at zero rows, and
-    /// what changed is which table's SIZE the read is proportional to.
-    ///
-    /// Ignored by default because it builds a live-sized `events` table (the
-    /// installation this was diagnosed on had 1,477,400 rows). Run it with
-    /// `cargo test -p cairn-core --features test-utils --lib measure_follow_read -- --ignored --nocapture`.
-    #[tokio::test]
-    #[ignore = "measurement: seeds a live-sized events table"]
-    async fn measure_follow_read_at_live_scale() {
-        const RUNS: usize = 300;
-        const EVENTS_PER_RUN: usize = 5_000;
-        const BATCH: usize = 500;
-        // The followed target's own transcript. A follow is a TAP: the target
-        // says something occasionally, and the workspace goes on producing
-        // between its turns.
-        const TARGET_EVENTS: usize = 200;
-        const TARGET_NEW_EVENTS: usize = 5;
-
-        let db = migrated_test_db("channel-router-follow-scale.db").await;
-        db.execute_batch(
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1);
-             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);",
-        )
-        .await
-        .unwrap();
-        for run in 0..RUNS {
-            db.execute_batch(&format!(
-                "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-                   VALUES ('i-{run}', 'p', {run}, 'Issue {run}', 'active', 1, 1);
-                 INSERT INTO jobs (id, issue_id, project_id, status, uri_segment, created_at, updated_at)
-                   VALUES ('j-{run}', 'i-{run}', 'p', 'complete', 'builder', 1, 1);
-                 INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
-                   VALUES ('r-{run}', 'p', 'j-{run}', 'complete', 1, 1);"
-            ))
-            .await
-            .unwrap();
-        }
-
-        let insert_events = |run: usize, from: usize, count: usize| {
-            let values: Vec<String> = (from..from + count)
-                .map(|n| {
-                    format!(
-                        "('e-{run}-{n}', 'r-{run}', {n}, {n}, 'assistant', '{{\"content\":\"turn {n}\",\"toolUses\":[]}}', {n})"
-                    )
-                })
-                .collect();
-            format!(
-                "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at) VALUES {};",
-                values.join(", ")
-            )
-        };
-
-        // The target speaks first, and the follow cursor stops there.
-        db.execute_batch(&insert_events(0, 0, TARGET_EVENTS))
-            .await
-            .unwrap();
-        let cursor = db
-            .query_one("SELECT MAX(rowid) FROM events", (), |row| row.i64(0))
-            .await
-            .unwrap();
-
-        // Then the rest of the workspace produces, at length, while the followed
-        // target says nothing. Every one of these events sits between the follow
-        // cursor and the end of the primary key, and the old statement read all
-        // of them on every sweep to discover that none of them were the
-        // target's.
-        let seeding = Instant::now();
-        for run in 1..RUNS {
-            for chunk in (0..EVENTS_PER_RUN).step_by(BATCH) {
-                db.execute_batch(&insert_events(run, chunk, BATCH))
-                    .await
-                    .unwrap();
-            }
-        }
-        let total = TARGET_EVENTS + (RUNS - 1) * EVENTS_PER_RUN;
-        println!("seeded {total} events in {:?}", seeding.elapsed());
-
-        // And then the target speaks again: the sweep that has something to say.
-        db.execute_batch(&insert_events(0, TARGET_EVENTS, TARGET_NEW_EVENTS))
-            .await
-            .unwrap();
-
-        let old = Instant::now();
-        let old_rows = db
-            .query_all(
-                "SELECT e.rowid, e.data, p.key, i.number, i.title, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
-                params!["cairn", 0_i64, cursor],
-                |row| row.i64(0),
-            )
-            .await
-            .unwrap();
-        let old = old.elapsed();
-
-        let new = Instant::now();
-        let jobs: Vec<String> = db
-            .query_all(FOLLOW_ISSUE_JOBS_SQL, params!["cairn", 0_i64], |row| {
-                row.text(0)
-            })
-            .await
-            .unwrap();
-        let mut binds: Vec<Value> = jobs.iter().cloned().map(Value::Text).collect();
-        binds.push(Value::Integer(cursor));
-        let new_rows = db
-            .query_all(followed_events_sql(jobs.len()), binds, |row| row.i64(0))
-            .await
-            .unwrap();
-        let new = new.elapsed();
-
-        println!(
-            "events={total} rows={} old={old:?} new={new:?}",
-            new_rows.len()
-        );
-        assert_eq!(old_rows, new_rows, "both shapes return the same events");
-        assert_eq!(new_rows.len(), TARGET_NEW_EVENTS);
-        assert!(
-            new * 20 < old,
-            "the target-driven read must not be within an order of magnitude of \
-             the workspace walk: old={old:?} new={new:?}"
         );
     }
 
@@ -7041,16 +5873,6 @@ mod tests {
     }
 
     #[test]
-    fn poll_commands_are_exact_case_insensitive_bare_words() {
-        assert_eq!(poll_command("threads"), Some(PollKind::Threads));
-        assert_eq!(poll_command("  Threads\n"), Some(PollKind::Threads));
-        assert_eq!(poll_command("/threads"), Some(PollKind::Threads));
-        assert_eq!(poll_command("issues"), Some(PollKind::Issues));
-        assert_eq!(poll_command("/Issues"), Some(PollKind::Issues));
-        assert_eq!(poll_command("threads please"), None);
-    }
-
-    #[test]
     fn registered_commands_and_parser_stay_in_agreement() {
         for spec in super::super::commands::CHANNEL_COMMANDS {
             let text = if spec.takes_argument {
@@ -7067,113 +5889,6 @@ mod tests {
 
         assert!(channel_command("/not-registered").is_none());
         assert!(!starts_with_known_slash_command("/not-registered"));
-    }
-
-    #[test]
-    fn a_follow_uri_reads_as_a_thread_name_or_an_issue_number() {
-        assert_eq!(
-            FollowTarget::parse("cairn://p/cairn/settings-ui").unwrap(),
-            FollowTarget::Thread {
-                project: "cairn".into(),
-                name: "settings-ui".into()
-            }
-        );
-        assert_eq!(
-            FollowTarget::parse("cairn://p/cairn/3404").unwrap(),
-            FollowTarget::Issue {
-                project: "cairn".into(),
-                number: 3404
-            }
-        );
-        assert_eq!(
-            FollowTarget::parse("cairn://p/cairn/settings-ui")
-                .unwrap()
-                .uri(),
-            "cairn://p/cairn/settings-ui"
-        );
-        assert!(FollowTarget::parse("not-a-uri").is_err());
-    }
-
-    #[test]
-    fn unfollow_names_a_target_the_way_the_operator_saw_it() {
-        assert_eq!(unfollow_selector("unfollow"), Some(None));
-        assert_eq!(
-            unfollow_selector(" UnFollow 3404 "),
-            Some(Some("3404".into()))
-        );
-        assert_eq!(
-            unfollow_selector("unfollow settings-ui"),
-            Some(Some("settings-ui".into()))
-        );
-        assert_eq!(unfollow_selector("unfollow 3404 please"), None);
-        assert_eq!(unfollow_selector("follow 3404"), None);
-
-        let bound_project = parse_uri("cairn://p/cairn/settings-ui")
-            .and_then(|uri| uri.project().map(str::to_string));
-        let follows = [
-            "cairn://p/OTHER/settings-ui",
-            "cairn://p/cairn/3404",
-            "cairn://p/cairn/settings-ui",
-        ];
-        let selected = follows.into_iter().find(|uri| {
-            FollowTarget::parse(uri).is_ok_and(|target| {
-                target.selector().eq_ignore_ascii_case("settings-ui")
-                    && Some(target.project()) == bound_project.as_deref()
-            })
-        });
-        assert_eq!(selected, Some("cairn://p/cairn/settings-ui"));
-    }
-
-    #[test]
-    fn a_poll_label_elides_a_title_a_balloon_cannot_show() {
-        assert_eq!(poll_label("general", Some("General")), "general · General");
-        assert_eq!(poll_label("general", None), "general");
-        assert_eq!(poll_label("general", Some("   ")), "general");
-        let long = "A".repeat(FOLLOW_POLL_TITLE_LIMIT + 20);
-        let label = poll_label("3757", Some(&long));
-        assert!(label.ends_with('…'));
-        assert_eq!(label.chars().count(), FOLLOW_POLL_TITLE_LIMIT + 8);
-    }
-
-    struct RejectingPollProvider {
-        sends: Mutex<Vec<OutboundAsk>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ChannelProvider for RejectingPollProvider {
-        fn capabilities(&self) -> crate::channels::ChannelCapabilities {
-            crate::channels::ChannelCapabilities {
-                state_cards: false,
-                structured_asks: true,
-                open_options: false,
-                edit_in_place: false,
-                max_text_len: None,
-                native_reply: false,
-            }
-        }
-
-        async fn send(
-            &self,
-            message: &OutboundMessage,
-        ) -> Result<crate::channels::SentIds, String> {
-            self.sends.lock().unwrap().push(message.ask.clone());
-            match message.ask {
-                OutboundAsk::Question { .. } => Err("poll bridge unavailable".into()),
-                OutboundAsk::Notify { .. } => Ok(crate::channels::SentIds {
-                    primary_guid: "fallback-guid".into(),
-                    caption_guid: None,
-                }),
-                OutboundAsk::Permission { .. } => unreachable!(),
-            }
-        }
-
-        fn subscribe(&self) -> tokio::sync::mpsc::Receiver<InboundEvent> {
-            tokio::sync::mpsc::channel(1).1
-        }
-
-        fn health(&self) -> crate::channels::ChannelHealth {
-            crate::channels::ChannelHealth::Ready
-        }
     }
 
     struct PresentProvider {
@@ -7220,273 +5935,49 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[serial_test::serial(operator_presence)]
-    async fn bundled_followed_thread_route_matches_presence_and_records_history() {
-        super::super::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Active);
-        use crate::db::DbState;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::SearchIndex;
-
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(migrated_test_db("channel-router-follow-presence.db").await);
-        db.execute_batch(
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
-             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
-             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-               VALUES ('i', 'p', 1, 'Followed work', 'active', 1, 1);
-             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
-               VALUES ('e', 'build', 'i', 'p', 'running', 1, 1);
-             INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
-               VALUES ('j', 'e', 'i', 'p', 'running', 'builder', 'builder', 1, 1);
-             INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at)
-               VALUES ('r', 'j', 'i', 'running', 1, 1);
-             INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
-               VALUES ('event-1', 'r', 1, 1, 'assistant', '{\"content\":\"first active update\",\"toolUses\":[]}', 1),
-                      ('event-2', 'r', 2, 2, 'assistant', '{\"content\":\"second active update\",\"toolUses\":[]}', 2);",
-        )
-        .await
-        .unwrap();
-        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/1", 1, 0)
-            .await
-            .unwrap();
-
-        // The shipped route is core-pack content; no pack sync runs here, so the
-        // test installs the real shipped file the way the sync would.
-        let config = temp.path().join("config");
-        std::fs::create_dir_all(config.join("routes")).unwrap();
-        std::fs::copy(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../packs/core/routes/followed-thread-stream.yaml"),
-            config.join("routes/followed-thread-stream.yaml"),
-        )
-        .expect("the core pack ships the followed-thread-stream route");
-
-        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
-        let orch = Orchestrator::builder(
-            Arc::new(DbState::new(db.clone(), search)),
-            Arc::new(TestServicesBuilder::new().build()),
-            config,
-        )
-        .boot_at(0)
-        .build();
-        let provider = Arc::new(PresentProvider {
-            sends: Mutex::new(Vec::new()),
-            presence_checks: Mutex::new(0),
-            presence: Mutex::new(OperatorPresence::Present),
-        });
-        let router = ChannelRouter::new(
-            orch,
-            provider.clone(),
-            IMessageChannelConfig {
-                enabled: true,
-                to: "+15551234567".into(),
-                ..Default::default()
-            },
-        );
-
-        router.sweep_followed_updates().await.unwrap();
-        drain_route_lane_into(&router, OperatorPresence::Present).await;
-
-        {
-            let sends = provider.sends.lock().unwrap();
-            assert!(sends.is_empty());
-        }
-        // The sweep minted both utterances and matched nothing: the bundled
-        // route only streams while the operator is away.
-        assert_eq!(
-            db.query_text(
-                "SELECT group_concat(route_state, ',') FROM (SELECT route_state FROM fact_log WHERE source = 'thread_stream' ORDER BY id)",
-                (),
-            )
-            .await
-            .unwrap()
-            .as_deref(),
-            Some("unmatched,unmatched")
-        );
-        assert!(ledger::get_by_binding(
-            &db,
-            CHANNEL,
-            "route",
-            "route:followed-thread-stream:cairn://p/cairn/1:event:1",
-        )
-        .await
-        .unwrap()
-        .is_none());
-        assert_eq!(
-            ledger::list_follows(&db, CHANNEL).await.unwrap()[0].cursor_rowid,
-            2
-        );
-        assert!(
-            crate::storage::list_route_firings(&db, "workspace", "followed-thread-stream", 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(router.deferred_attention.lock().unwrap().is_empty());
-
-        db.execute(
-            "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at) VALUES ('event-away', 'r', 3, 3, 'assistant', '{\"content\":\"away update\",\"toolUses\":[]}', 3)",
-            (),
-        )
-        .await
-        .unwrap();
-        *provider.presence.lock().unwrap() = OperatorPresence::Away;
-        super::super::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Idle);
-        let restarted = ChannelRouter::new(
-            router.orch.clone(),
-            provider.clone(),
-            IMessageChannelConfig {
-                enabled: true,
-                to: "+15551234567".into(),
-                ..Default::default()
-            },
-        );
-        restarted.sweep_followed_updates().await.unwrap();
-        drain_route_lane_into(&restarted, OperatorPresence::Away).await;
-        let route_intent = ledger::get_by_binding(
-            &db,
-            CHANNEL,
-            "route",
-            "route:followed-thread-stream:cairn://p/cairn/1:event:3",
-        )
-        .await
-        .unwrap();
-        let early_firings =
-            crate::storage::list_route_firings(&db, "workspace", "followed-thread-stream", 10)
-                .await
-                .unwrap();
-        let outbound = ledger::list_unresolved(&db, CHANNEL).await.unwrap();
-        {
-            let sends = provider.sends.lock().unwrap();
-            assert_eq!(
-                sends.len(),
-                1,
-                "route intent: {route_intent:?}; outbound: {outbound:?}; firings: {early_firings:?}"
-            );
-            assert!(matches!(
-                &sends[0].ask,
-                OutboundAsk::Notify { text } if text == "away update"
-            ));
-        }
-        let firings =
-            crate::storage::list_route_firings(&db, "workspace", "followed-thread-stream", 10)
-                .await
-                .unwrap();
-        assert_eq!(firings.len(), 1);
-        assert_eq!(firings[0].fact_identity, "cairn://p/cairn/1:event:3");
-        assert_eq!(firings[0].status, "fired");
-        assert!(
-            firings[0].fact_log_id.is_some(),
-            "the firing joins its fact log row"
-        );
-        super::super::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Auto);
-    }
-
-    const FOLLOWED_FIXTURE: &str = "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
-         INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-           VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
-         INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-           VALUES ('i', 'p', 1, 'Followed work', 'active', 1, 1);
-         INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
-           VALUES ('e', 'build', 'i', 'p', 'running', 1, 1);
-         INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
-           VALUES ('j', 'e', 'i', 'p', 'running', 'builder', 'builder', 1, 1);
-         INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at)
-           VALUES ('r', 'j', 'i', 'running', 1, 1);
-         INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
-           VALUES ('event-1', 'r', 1, 1, 'assistant', '{\"content\":\"first update\",\"toolUses\":[]}', 1),
-                  ('event-2', 'r', 2, 2, 'assistant', '{\"content\":\"second update\",\"toolUses\":[]}', 2);";
-
-    async fn followed_orchestrator(
-        temp: &std::path::Path,
-        name: &str,
-        routes: &[(&str, &str)],
-    ) -> (Orchestrator, Arc<LocalDb>) {
-        use crate::db::DbState;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::SearchIndex;
-        let config = temp.join("config");
-        std::fs::create_dir_all(config.join("routes")).unwrap();
-        for (id, body) in routes {
-            std::fs::write(config.join(format!("routes/{id}.yaml")), body).unwrap();
-        }
-        let db = Arc::new(migrated_test_db(name).await);
-        db.execute_batch(FOLLOWED_FIXTURE).await.unwrap();
-        let search = Arc::new(SearchIndex::open_or_create(temp.join("search")).unwrap());
-        let orch = Orchestrator::builder(
-            Arc::new(DbState::new(db.clone(), search)),
-            Arc::new(TestServicesBuilder::new().build()),
-            config,
-        )
-        .boot_at(0)
-        .build();
-        (orch, db)
-    }
-
-    /// Mint one utterance of `cairn://p/cairn/1` the way a following
-    /// provider's sweep does.
-    async fn mint_utterance(orch: &Orchestrator, db: &LocalDb, event: &str) {
-        let rowid = db
-            .query_opt_i64(
-                "SELECT rowid FROM events WHERE id = ?1",
-                (event.to_string(),),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let detail = format!("cairn://p/cairn/1:event:{rowid}");
-        crate::routes::mint(
-            orch,
-            crate::routes::Mint {
-                fact: RouteFact {
-                    source: "thread_stream".into(),
-                    identity: detail.clone(),
-                    fields: std::collections::BTreeMap::from([
-                        ("project".into(), serde_json::json!("cairn")),
-                        ("threadUri".into(), serde_json::json!("cairn://p/cairn/1")),
-                        ("detailUri".into(), serde_json::json!(detail)),
-                        ("context".into(), serde_json::json!("cairn/1 Followed work")),
-                        ("jobId".into(), serde_json::json!("j")),
-                    ]),
-                    origin: None,
-                    summary: Some("update".into()),
-                    route_provenance: None,
-                },
-                record_ref: detail,
-                record_id: Some(rowid.to_string()),
-                project_id: Some("p"),
-                presence: crate::routes::Presence::Away,
-                actor_job_id: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    const STREAM_ROUTE: &str = "name: Stream\ndescription: every utterance to its followers\nnodes:\n  - id: in\n    type: trigger\n    when: { fact: thread_stream }\n  - id: out\n    type: sink\n    sink: { kind: channel, register: notify }\nedges:\n  - { from: in, to: out }\n";
-
     /// A route that runs out the route lane's bound must not cost the routes
     /// before it on the same row their deliveries.
     #[tokio::test]
     #[serial_test::serial(operator_presence)]
     async fn a_timed_out_row_still_hands_over_what_earlier_routes_prepared() {
         let temp = tempfile::tempdir().unwrap();
+        let deliver = "name: Deliver\ndescription: every mention to the phone\nnodes:\n  - id: in\n    type: trigger\n    when: { fact: github_comment }\n  - id: out\n    type: sink\n    sink: { kind: channel, register: notify }\nedges:\n  - { from: in, to: out }\n";
         let hang = format!(
-            "name: Hang\ndescription: never answers\nnodes:\n  - id: in\n    type: trigger\n    when: {{ fact: thread_stream }}\n  - id: wait\n    type: response\n    response: {}\n  - id: out\n    type: sink\n    sink: {{ kind: message, target: 'cairn://p/cairn/1' }}\nedges:\n  - {{ from: in, to: wait }}\n  - {{ from: wait, to: out }}\n",
+            "name: Hang\ndescription: never answers\nnodes:\n  - id: in\n    type: trigger\n    when: {{ fact: github_comment }}\n  - id: wait\n    type: response\n    response: {}\n  - id: out\n    type: sink\n    sink: {{ kind: message, target: 'cairn://p/cairn/42' }}\nedges:\n  - {{ from: in, to: wait }}\n  - {{ from: wait, to: out }}\n",
             crate::routes::HANGING_RESPONSE
         );
-        let (orch, db) = followed_orchestrator(
+        let (orch, db) = crate::routes::fixture::orchestrator(
             temp.path(),
-            "channel-router-timeout-handover.db",
-            &[("a-deliver", STREAM_ROUTE), ("b-hang", &hang)],
+            &[("a-deliver", deliver), ("b-hang", &hang)],
         )
         .await;
-        ledger::follow_target(&db, "imessage", "cairn://p/cairn/1", 1, 0)
-            .await
-            .unwrap();
-        mint_utterance(&orch, &db, "event-1").await;
+        let url = "https://github.com/o/r/issues/1#issuecomment-1";
+        let id = crate::routes::mint(
+            &orch,
+            crate::routes::Mint {
+                fact: RouteFact {
+                    source: "github_comment".into(),
+                    identity: "github-comment:1".into(),
+                    fields: std::collections::BTreeMap::from([
+                        ("project".into(), serde_json::json!("cairn")),
+                        ("url".into(), serde_json::json!(url)),
+                        ("title".into(), serde_json::json!("GitHub mention")),
+                        ("text".into(), serde_json::json!("@cairn please look")),
+                    ]),
+                    origin: None,
+                    summary: Some("GitHub mention".into()),
+                    route_provenance: None,
+                },
+                record_ref: url.into(),
+                record_id: Some("1".into()),
+                project_id: Some("p"),
+                presence: crate::routes::Presence::Away,
+                actor_job_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         super::super::route_submission_slot()
@@ -7511,364 +6002,21 @@ mod tests {
             delivered, 1,
             "the finished route's delivery reaches its router once"
         );
-        let row = crate::storage::get_fact(&db, 1).await.unwrap().unwrap();
+        let row = crate::storage::get_fact(&db, id).await.unwrap().unwrap();
         assert_eq!(
             (row.route_state.as_str(), row.route_note.as_deref()),
             ("failed", Some("timeout"))
         );
     }
 
-    /// One utterance followed on several providers is one log row, and the
-    /// route lane hands each live follower its own copy -- and nobody else.
-    #[tokio::test]
-    #[serial_test::serial(operator_presence)]
-    async fn one_utterance_is_one_row_and_one_delivery_per_live_follower() {
-        let temp = tempfile::tempdir().unwrap();
-        let (orch, db) = followed_orchestrator(
-            temp.path(),
-            "channel-router-two-followers.db",
-            &[("stream", STREAM_ROUTE)],
-        )
-        .await;
-        let target = "cairn://p/cairn/1";
-        ledger::follow_target(&db, "imessage", target, 1, 0)
-            .await
-            .unwrap();
-        ledger::follow_target(&db, "telegram", target, 1, 0)
-            .await
-            .unwrap();
-        // Discord began following long after the utterance was said.
-        ledger::follow_target(&db, "discord", target, 10_000_000, 0)
-            .await
-            .unwrap();
-
-        // Two providers' sweeps observe the same utterance.
-        mint_utterance(&orch, &db, "event-1").await;
-        mint_utterance(&orch, &db, "event-1").await;
-        assert_eq!(
-            db.query_opt_i64("SELECT COUNT(*) FROM fact_log", ())
-                .await
-                .unwrap(),
-            Some(1)
-        );
-        let row = crate::storage::get_fact(&db, 1).await.unwrap().unwrap();
-        let stored: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&row.fields_json).unwrap();
-        assert!(
-            !stored.contains_key("text") && !row.fields_json.contains("first update"),
-            "the utterance stays in the transcript: {}",
-            row.fields_json
-        );
-        let hydrated = crate::routes::log::hydrate(&orch, &row).await.unwrap();
-        assert_eq!(hydrated.fact.fields["text"], "first update");
-
-        let providers = ["imessage", "telegram", "discord"];
-        let mut receivers = Vec::new();
-        for provider in providers {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            super::super::route_submission_slot()
-                .lock()
-                .unwrap()
-                .insert(provider, tx);
-            receivers.push(rx);
-        }
-        crate::routes::drain_fact_log(&orch).await;
-        for provider in providers {
-            super::super::route_submission_slot()
-                .lock()
-                .unwrap()
-                .remove(provider);
-        }
-        let received: Vec<Vec<Option<String>>> = receivers
-            .iter_mut()
-            .map(|rx| {
-                let mut addressed = Vec::new();
-                while let Ok(RouterSubmission::Route(submission)) = rx.try_recv() {
-                    if submission.route_id == "stream" {
-                        addressed.push(submission.provider);
-                    }
-                }
-                addressed
-            })
-            .collect();
-        assert_eq!(
-            received,
-            vec![
-                vec![Some("imessage".to_string())],
-                vec![Some("telegram".to_string())],
-                vec![],
-            ],
-            "each live follower receives exactly its own copy"
-        );
-
-        for provider in providers {
-            ledger::unfollow_target(&db, provider, target)
-                .await
-                .unwrap();
-        }
-        mint_utterance(&orch, &db, "event-2").await;
-        crate::routes::drain_fact_log(&orch).await;
-        let firings = crate::storage::list_route_firings(&db, "workspace", "stream", 10)
-            .await
-            .unwrap();
-        assert_eq!(
-            (
-                firings[0].status.as_str(),
-                firings[0].drop_reason.as_deref()
-            ),
-            ("dropped", Some("no_follower"))
-        );
-    }
-
-    /// The channel sweep only mints: a route whose response never answers
-    /// cannot hold it up (cairn/4480).
-    #[tokio::test]
-    async fn the_follow_sweep_never_waits_on_a_route() {
-        let temp = tempfile::tempdir().unwrap();
-        let hang = "name: Hang\ndescription: never answers\nnodes:\n  - id: in\n    type: trigger\n    when: { fact: thread_stream }\n  - id: wait\n    type: response\n    response: test-hang\n  - id: out\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: in, to: wait }\n  - { from: wait, to: out }\n";
-        let (orch, db) = followed_orchestrator(
-            temp.path(),
-            "channel-router-hung-route.db",
-            &[("hang", hang)],
-        )
-        .await;
-        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/1", 1, 0)
-            .await
-            .unwrap();
-        let router = ChannelRouter::new(
-            orch,
-            Arc::new(PresentProvider {
-                sends: Mutex::new(Vec::new()),
-                presence_checks: Mutex::new(0),
-                presence: Mutex::new(OperatorPresence::Away),
-            }),
-            IMessageChannelConfig {
-                enabled: true,
-                to: "+15551234567".into(),
-                ..Default::default()
-            },
-        );
-        tokio::time::timeout(Duration::from_secs(1), router.sweep_followed_updates())
-            .await
-            .expect("the sweep returns without waiting on routes")
-            .unwrap();
-        assert_eq!(
-            db.query_opt_i64(
-                "SELECT COUNT(*) FROM fact_log WHERE route_state = 'pending'",
-                ()
-            )
-            .await
-            .unwrap(),
-            Some(2),
-            "both utterances are minted and left for the worker"
-        );
-    }
-
-    /// A followed thread's utterance is minted as that thread's own row, so a
-    /// standing trigger it matches wakes every other thread holding it but
-    /// never the thread that said it -- which would otherwise wake itself on
-    /// each reply that cites what it watches.
-    #[tokio::test]
-    async fn a_thread_is_never_woken_by_its_own_followed_utterance() {
-        let temp = tempfile::tempdir().unwrap();
-        let (orch, db) =
-            followed_orchestrator(temp.path(), "channel-router-own-utterance.db", &[]).await;
-        db.execute_batch(
-            "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
-               VALUES ('t-speaker', 'p', 'speaker', 'active', 1, 1),
-                      ('t-listener', 'p', 'listener', 'active', 1, 1);
-             INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, created_at, updated_at)
-               VALUES ('speaker', 't-speaker', 'p', 'running', 'thread', 1, 1),
-                      ('listener', 't-listener', 'p', 'running', 'thread', 1, 1);
-             INSERT INTO runs (id, job_id, status, created_at, updated_at)
-               VALUES ('speaker-run', 'speaker', 'running', 1, 1);
-             INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
-               VALUES ('event-speaker', 'speaker-run', 1, 3, 'assistant', '{\"content\":\"see cairn://posts/7\",\"toolUses\":[]}', 3);",
-        )
-        .await
-        .unwrap();
-        let target = "cairn://p/cairn/speaker";
-        let clause: Vec<crate::routes::TriggerClause> = serde_json::from_value(
-            serde_json::json!([{ "fact": "thread_stream", "threadUri": target }]),
-        )
-        .unwrap();
-        for job in ["speaker", "listener"] {
-            let clause = clause.clone();
-            db.write(move |conn| {
-                let clause = clause.clone();
-                Box::pin(async move {
-                    crate::orchestrator::wakes::rebuild_derived_thread_subscriptions_conn(
-                        conn, job, &clause,
-                    )
-                    .await
-                })
-            })
-            .await
-            .unwrap();
-        }
-        ledger::follow_target(&db, CHANNEL, target, 1, 0)
-            .await
-            .unwrap();
-        let router = ChannelRouter::new(
-            orch,
-            Arc::new(PresentProvider {
-                sends: Mutex::new(Vec::new()),
-                presence_checks: Mutex::new(0),
-                presence: Mutex::new(OperatorPresence::Away),
-            }),
-            IMessageChannelConfig {
-                enabled: true,
-                to: "+15551234567".into(),
-                ..Default::default()
-            },
-        );
-
-        router.sweep_followed_updates().await.unwrap();
-        crate::routes::drain_fact_log(&router.orch).await;
-
-        let (actor, wakes, fields) = db
-            .query_one(
-                "SELECT actor_job_id, wakes_json, fields_json FROM fact_log WHERE source = 'thread_stream'",
-                (),
-                |row| {
-                    Ok((
-                        crate::storage::RowExt::opt_text(row, 0)?,
-                        crate::storage::RowExt::opt_text(row, 1)?,
-                        crate::storage::RowExt::text(row, 2)?,
-                    ))
-                },
-            )
-            .await
-            .unwrap();
-        let woken: Vec<String> =
-            serde_json::from_str::<Vec<serde_json::Value>>(wakes.as_deref().unwrap_or("[]"))
-                .unwrap()
-                .iter()
-                .filter_map(|wake| wake["job"].as_str().map(str::to_owned))
-                .collect();
-        assert_eq!(
-            woken,
-            vec!["listener".to_string()],
-            "the other thread wakes; the speaker does not wake itself"
-        );
-        assert_eq!(
-            actor.as_deref(),
-            Some("speaker"),
-            "the utterance's row names the job that said it"
-        );
-        let fields: serde_json::Value = serde_json::from_str(&fields).unwrap();
-        assert_eq!(
-            fields["mentions"],
-            serde_json::json!(["cairn://posts/7"]),
-            "the sweep stores the utterance's structural mentions"
-        );
-    }
-
-    /// Run the fact log's lanes, then hand this router every channel submission
-    /// the route lane addressed to its provider, the way its route task does.
-    async fn drain_route_lane_into(router: &ChannelRouter, presence: OperatorPresence) {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        super::super::route_submission_slot()
-            .lock()
-            .unwrap()
-            .insert(router.provider_id, tx);
-        crate::routes::drain_fact_log(&router.orch).await;
-        super::super::route_submission_slot()
-            .lock()
-            .unwrap()
-            .remove(router.provider_id);
-        while let Ok(submission) = rx.try_recv() {
-            let RouterSubmission::Route(submission) = submission else {
-                continue;
-            };
-            router
-                .submit_route(*submission, presence, Instant::now())
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_native_poll_attempts_text_fallback_without_recording_bindings() {
-        use crate::db::DbState;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::SearchIndex;
-
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(migrated_test_db("channel-router-poll-fallback.db").await);
-        db.execute_batch(
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
-             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
-             INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
-               VALUES ('t1', 'p', 'general', 'active', 1, 2),
-                      ('t2', 'p', 'performance', 'active', 1, 3);",
-        )
-        .await
-        .unwrap();
-        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
-        let orch = Orchestrator::builder(
-            Arc::new(DbState::new(db.clone(), search)),
-            Arc::new(TestServicesBuilder::new().build()),
-            temp.path().join("config"),
-        )
-        .boot_at(0)
-        .build();
-        let provider = Arc::new(RejectingPollProvider {
-            sends: Mutex::new(Vec::new()),
-        });
-        let router = ChannelRouter::new(
-            orch,
-            provider.clone(),
-            IMessageChannelConfig {
-                enabled: true,
-                to: "+15551234567".into(),
-                ..Default::default()
-            },
-        );
-
-        router
-            .handle_inbound(InboundEvent::Reply {
-                conversation: "imessage:+15551234567".into(),
-                bound_guid: "stale-messages-reply-guid".into(),
-                sender: "+15551234567".into(),
-                text: "Threads".into(),
-                message_guid: None,
-            })
-            .await
-            .unwrap();
-
-        {
-            let sends = provider.sends.lock().unwrap();
-            assert!(
-                matches!(sends.as_slice(), [OutboundAsk::Question { .. }, OutboundAsk::Notify { text }]
-                    if text.contains("Could not list active threads")
-                        && text.contains("poll bridge unavailable")),
-                "the operator is told what the provider actually refused: {sends:?}"
-            );
-        }
-        let poll = ledger::list_unresolved(&db, CHANNEL)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|record| record.binding_ref.starts_with(FOLLOW_POLL_PREFIX))
-            .unwrap();
-        assert_eq!(poll.status, "failed");
-        assert_eq!(poll.options_json, None);
-        assert!(
-            ledger::list_inbound(&db, CHANNEL, 10).await.unwrap().is_empty(),
-            "a command carrying a stale Messages reply GUID must route as a command, not unsolicited text"
-        );
-    }
-
-    struct RecordingPollProvider {
+    struct RecordingProvider {
         sends: Mutex<Vec<OutboundAsk>>,
         deliveries: Mutex<Vec<OutboundMessage>>,
         next_guid: std::sync::atomic::AtomicUsize,
         cleanups: std::sync::atomic::AtomicUsize,
     }
 
-    impl RecordingPollProvider {
+    impl RecordingProvider {
         fn new() -> Self {
             Self {
                 sends: Mutex::new(Vec::new()),
@@ -7880,7 +6028,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ChannelProvider for RecordingPollProvider {
+    impl ChannelProvider for RecordingProvider {
         fn capabilities(&self) -> crate::channels::ChannelCapabilities {
             crate::channels::ChannelCapabilities {
                 state_cards: false,
@@ -7923,374 +6071,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follow_poll_selection_focuses_on_tap_and_only_deselection_unfollows() {
-        use crate::db::DbState;
-        use crate::services::testing::TestServicesBuilder;
-        use crate::storage::SearchIndex;
-
-        let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(migrated_test_db("channel-router-standing-thread-poll.db").await);
-        db.execute_batch(
-            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
-             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
-             INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
-               VALUES ('t1', 'p', 'general', 'active', 1, 3),
-                      ('t2', 'p', 'performance', 'active', 1, 2);",
-        )
-        .await
-        .unwrap();
-        assert!(
-            ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/general", 1, 0)
-                .await
-                .unwrap()
-        );
-        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
-        let orch = Orchestrator::builder(
-            Arc::new(DbState::new(db.clone(), search)),
-            Arc::new(TestServicesBuilder::new().build()),
-            temp.path().join("config"),
-        )
-        .boot_at(0)
-        .build();
-        let provider = Arc::new(RecordingPollProvider::new());
-        let router = ChannelRouter::new(
-            orch,
-            provider.clone(),
-            IMessageChannelConfig {
-                enabled: true,
-                to: "+15551234567".into(),
-                ..Default::default()
-            },
-        );
-
-        router
-            .send_follow_poll("+15551234567", PollKind::Threads)
-            .await
-            .unwrap();
-        match &provider.sends.lock().unwrap()[0] {
-            OutboundAsk::Question { options, .. } => {
-                assert_eq!(options[0].label, "✓ general");
-                assert_eq!(options[1].label, "performance");
-            }
-            _ => panic!("threads command must send a poll"),
-        }
-        let legacy_bindings = serde_json::json!({
-            "✓ general": "cairn://p/cairn/general",
-            "performance": "cairn://p/cairn/performance"
-        })
-        .to_string();
-        db.execute(
-            "UPDATE channel_outbound SET options_json = ?1 WHERE provider_guid = 'poll-1'",
-            params![legacy_bindings],
-        )
-        .await
-        .unwrap();
-
-        router
-            .send_notice("+15551234567", "intervening routed update")
-            .await
-            .unwrap();
-        router.sweep_live_gates().await.unwrap();
-        assert_eq!(
-            provider.cleanups.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "ordinary traffic and the next gate sweep must not clear a command poll"
-        );
-
-        router
-            .handle_inbound(InboundEvent::Reply {
-                conversation: "imessage:+15551234567".into(),
-                bound_guid: "poll-1".into(),
-                sender: "+15551234567".into(),
-                text: "1".into(),
-                message_guid: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/general"),
-            "tap-only providers focus an existing follow instead of toggling it off"
-        );
-        router
-            .handle_inbound(InboundEvent::Reply {
-                conversation: "imessage:+15551234567".into(),
-                bound_guid: "poll-1".into(),
-                sender: "+15551234567".into(),
-                text: "1".into(),
-                message_guid: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
-                .await
-                .unwrap()
-        );
-
-        let native_label = match &provider.sends.lock().unwrap()[0] {
-            OutboundAsk::Question { options, .. } => options[0].label.clone(),
-            _ => unreachable!(),
-        };
-        for selected in [false, false] {
-            router
-                .handle_inbound(InboundEvent::Selection {
-                    conversation: "imessage:+15551234567".into(),
-                    bound_guid: "poll-1".into(),
-                    sender: "+15551234567".into(),
-                    option_id: "option-1".into(),
-                    option_text: native_label.clone(),
-                    selected,
-                })
-                .await
-                .unwrap();
-        }
-        assert!(
-            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
-                .await
-                .unwrap()
-        );
-        for selected in [true, true] {
-            router
-                .handle_inbound(InboundEvent::Selection {
-                    conversation: "imessage:+15551234567".into(),
-                    bound_guid: "poll-1".into(),
-                    sender: "+15551234567".into(),
-                    option_id: "option-1".into(),
-                    option_text: native_label.clone(),
-                    selected,
-                })
-                .await
-                .unwrap();
-        }
-        assert!(
-            ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
-                .await
-                .unwrap()
-        );
-
-        router
-            .send_follow_poll("+15551234567", PollKind::Threads)
-            .await
-            .unwrap();
-        {
-            let sends = provider.sends.lock().unwrap();
-            assert!(
-                matches!(sends.iter().rev().find(|ask| matches!(ask, OutboundAsk::Question { .. })), Some(OutboundAsk::Question { options, .. }) if options[0].label.starts_with("✓ "))
-            );
-        }
-        let polls = ledger::list_unresolved(&db, CHANNEL)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|record| record.binding_ref.starts_with(FOLLOW_POLL_PREFIX))
-            .collect::<Vec<_>>();
-        assert_eq!(polls.len(), 1);
-        assert!(polls.iter().all(|poll| poll.status == "sent"));
-        assert_eq!(
-            provider.cleanups.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a newer /threads replaces the old keyboard after the new poll is delivered"
-        );
-
-        ledger::insert_intent(
-            &db,
-            &ledger::NewOutbound {
-                id: "stream-intent",
-                channel: CHANNEL,
-                kind: "review",
-                binding_ref: "cairn://p/cairn/general:event:42",
-                conversation: "+15551234567",
-                job_id: Some("unused-for-unfollow"),
-                rendered_text: "stream update",
-                rendering: "text",
-                created_at: 10,
-            },
-        )
-        .await
-        .unwrap();
-        ledger::mark_sent(&db, "stream-intent", "stream-guid", None, None, 10)
-            .await
-            .unwrap();
-        router
-            .handle_inbound(InboundEvent::Reply {
-                conversation: "imessage:+15551234567".into(),
-                bound_guid: "stream-guid".into(),
-                sender: "+15551234567".into(),
-                text: "unfollow".into(),
-                message_guid: None,
-            })
-            .await
-            .unwrap();
-        assert!(
-            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
-                .await
-                .unwrap()
-        );
-        assert!(matches!(
-            provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text }) if text == "Unfollowed cairn://p/cairn/general."
-        ));
-        let stream = ledger::get_by_provider_guid(&db, CHANNEL, "stream-guid")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stream.status, "resolved");
-    }
-
-    #[tokio::test]
-    async fn slash_commands_switch_focus_and_unfollow_without_provider_deselection() {
-        let (orch, db) = route_test_orchestrator("channel-router-slash-controls.db").await;
-        seed_threads_and_an_issue(&db).await;
-        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/general", 1, 0)
-            .await
-            .unwrap();
-        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/performance", 2, 0)
-            .await
-            .unwrap();
-        ledger::set_focus(&db, CHANNEL, "cairn://p/cairn/performance", 2)
-            .await
-            .unwrap();
-        let (router, provider) = test_router(orch);
-
-        ledger::insert_intent(
-            &db,
-            &ledger::NewOutbound {
-                id: "bound-update",
-                channel: CHANNEL,
-                kind: "route",
-                binding_ref: "route:follow:cairn://p/cairn/performance:event:9",
-                conversation: "operator",
-                job_id: None,
-                rendered_text: "update",
-                rendering: "text",
-                created_at: 3,
-            },
-        )
-        .await
-        .unwrap();
-        ledger::mark_sent(&db, "bound-update", "bound-guid", None, None, 3)
-            .await
-            .unwrap();
-
-        for (id, guid, created_at) in [
-            ("active-ask-one", "ask-guid-one", 4),
-            ("active-ask-two", "ask-guid-two", 5),
-        ] {
-            ledger::insert_intent(
-                &db,
-                &ledger::NewOutbound {
-                    id,
-                    channel: CHANNEL,
-                    kind: "question",
-                    binding_ref: id,
-                    conversation: "operator",
-                    job_id: None,
-                    rendered_text: "question",
-                    rendering: "text",
-                    created_at,
-                },
-            )
-            .await
-            .unwrap();
-            ledger::mark_sent(&db, id, guid, None, None, created_at)
-                .await
-                .unwrap();
-        }
-
-        router
-            .resolve_bound("bound-guid", "operator", "operator", "/focus general")
-            .await
-            .unwrap();
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/general")
-        );
-        assert!(matches!(
-            provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text }) if text.starts_with("Focused general")
-        ));
-
-        let messages_before_commands = db
-            .query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
-            .await
-            .unwrap();
-        router
-            .resolve_bare("operator", "operator", "/unfollow")
-            .await
-            .unwrap();
-        assert!(
-            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/performance"),
-            "unfollowing the focus moves loose-message routing to a remaining follow"
-        );
-        assert!(matches!(
-            provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text }) if text == "Unfollowed general."
-        ));
-        router
-            .resolve_bare("operator", "operator", "/help")
-            .await
-            .unwrap();
-        assert!(matches!(
-            provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text })
-                if text.contains("/unfollow [name]")
-                    && text.contains("stops the current focus")
-        ));
-        router
-            .resolve_bare("operator", "operator", "/focus general extra")
-            .await
-            .unwrap();
-        assert!(matches!(
-            provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text }) if text.starts_with("Invalid command usage.")
-        ));
-        assert_eq!(
-            db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
-                .await
-                .unwrap(),
-            messages_before_commands,
-            "known loose commands are neither ask answers nor routed chat text"
-        );
-
-        router
-            .resolve_bare("operator", "operator", "ambiguous answer")
-            .await
-            .unwrap();
-        assert!(matches!(
-            provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text }) if text.starts_with("I found more than one active ask.")
-        ));
-        assert_eq!(
-            db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
-                .await
-                .unwrap(),
-            messages_before_commands,
-            "an ambiguous free-text answer is not routed to the focused thread"
-        );
-    }
-
-    #[tokio::test]
-    async fn replying_to_a_followed_update_routes_with_each_providers_attribution() {
+    async fn replying_to_a_route_update_routes_with_each_providers_attribution() {
         for (provider_id, db_name) in [
             ("imessage", "channel-router-imessage-route-reply.db"),
             ("telegram", "channel-router-telegram-route-reply.db"),
         ] {
             let (orch, db) = route_test_orchestrator(db_name).await;
             seed_threads_and_an_issue(&db).await;
-            let provider = Arc::new(RecordingPollProvider::new());
+            let provider = Arc::new(RecordingProvider::new());
             let router = ChannelRouter::new_for_provider(
                 orch,
                 provider,
@@ -8309,7 +6097,7 @@ mod tests {
                     id: "route-update",
                     channel: provider_id,
                     kind: "route",
-                    binding_ref: "route:follow:cairn://p/cairn/general:event:42",
+                    binding_ref: "route:route-test:cairn://p/cairn/general:event:42",
                     conversation: "operator",
                     job_id: None,
                     rendered_text: "thread update",
@@ -8384,8 +6172,8 @@ mod tests {
         session
     }
 
-    fn test_router(orch: Orchestrator) -> (ChannelRouter, Arc<RecordingPollProvider>) {
-        let provider = Arc::new(RecordingPollProvider::new());
+    fn test_router(orch: Orchestrator) -> (ChannelRouter, Arc<RecordingProvider>) {
+        let provider = Arc::new(RecordingProvider::new());
         let router = ChannelRouter::new(
             orch,
             provider.clone(),
@@ -8401,7 +6189,7 @@ mod tests {
     #[tokio::test]
     async fn capability_rejection_notice_returns_to_the_arriving_discord_conversation() {
         let (orch, db) = route_test_orchestrator("channel-router-discord-bounded-notice.db").await;
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = ChannelRouter::new_for_provider(
             orch,
             provider.clone(),
@@ -8444,13 +6232,7 @@ mod tests {
     async fn unbound_discord_bare_and_stale_reply_reject_at_the_arriving_conversation() {
         let (orch, db) = route_test_orchestrator("channel-router-discord-unbound-inbound.db").await;
         seed_threads_and_an_issue(&db).await;
-        ledger::follow_target(&db, "discord", "cairn://p/cairn/general", 1, 0)
-            .await
-            .unwrap();
-        ledger::set_focus(&db, "discord", "cairn://p/cairn/general", 2)
-            .await
-            .unwrap();
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = ChannelRouter::new_for_provider(
             orch,
             provider.clone(),
@@ -8495,7 +6277,7 @@ mod tests {
                 .await
                 .unwrap(),
             0,
-            "unbound Discord input must not fall through to the legacy global focus"
+            "unbound Discord input never falls through to another thread"
         );
         let deliveries = provider.deliveries.lock().unwrap();
         assert_eq!(
@@ -8591,17 +6373,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumed_session_preserves_backlog_and_follow_cursor() {
+    async fn resumed_session_preserves_backlog() {
         let (orch, db) = route_test_orchestrator("channel-router-resumed-session.db").await;
         seed_run(&db).await;
         seed_prompt(&db, "during-outage", 500).await;
-        db.execute_batch(
-            "INSERT INTO channel_conversation_binding
-               (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid, selected_at)
-             VALUES ('imessage', 'imessage:legacy', 'cairn:~/', 'follow', 7, 4, 30, 4);",
-        )
-        .await
-        .unwrap();
         let (router, _provider) = test_router(orch);
 
         router
@@ -8609,9 +6384,6 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(follows.len(), 1);
-        assert_eq!(follows[0].cursor_rowid, 30);
         assert_eq!(
             db.query_opt_i64("SELECT COUNT(*) FROM channel_outbound", ())
                 .await
@@ -8621,319 +6393,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn startup_drops_an_orphaned_home_relative_focus() {
-        let (orch, db) = route_test_orchestrator("channel-router-relative-focus.db").await;
-        db.execute(
-            "INSERT INTO channel_conversation_binding
-               (provider, conversation, target_uri, binding_kind, message_classes, followed_at, selected_at)
-             VALUES ('imessage', 'imessage:legacy', 'cairn:~/', 'follow', 7, 4, 4)",
-            (),
-        )
-        .await
-        .unwrap();
-        let (router, _provider) = test_router(orch);
-
-        router
-            .draw_the_session_line(SessionBoundary::Fresh)
-            .await
-            .unwrap();
-
-        assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn startup_drops_a_home_relative_follow_and_its_focus() {
-        let (orch, db) = route_test_orchestrator("channel-router-relative-follow.db").await;
-        db.execute_batch(
-            "INSERT INTO channel_conversation_binding
-               (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid, selected_at)
-             VALUES ('imessage', 'imessage:legacy', 'cairn:~/', 'follow', 7, 4, 30, 4);",
-        )
-        .await
-        .unwrap();
-        let (router, _provider) = test_router(orch);
-
-        router
-            .draw_the_session_line(SessionBoundary::Fresh)
-            .await
-            .unwrap();
-
-        assert!(ledger::list_follows(&db, CHANNEL).await.unwrap().is_empty());
-        assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
-    }
-
-    /// `threads` offers threads and `issues` offers issues — each labelled and
-    /// bound the way its own entity is addressed.
-    #[tokio::test]
-    async fn each_poll_lists_its_own_entity_with_its_own_uri() {
-        let (orch, db) = route_test_orchestrator("channel-router-thread-poll-contents.db").await;
-        seed_threads_and_an_issue(&db).await;
-        let (router, provider) = test_router(orch);
-
-        let (threads, thread_total) = router.active_threads(&HashSet::new()).await.unwrap();
-        assert_eq!(
-            threads,
-            vec![
-                ("general".to_string(), "cairn://p/cairn/general".to_string()),
-                (
-                    "performance".to_string(),
-                    "cairn://p/cairn/performance".to_string()
-                ),
-            ],
-            "a closed thread is not offered, and a thread is offered as its one name"
-        );
-        assert_eq!(thread_total, 2);
-
-        let (issues, issue_total) = router.active_issues(&HashSet::new()).await.unwrap();
-        assert_eq!(
-            issues,
-            vec![(
-                "3757 · Resource library slice 1".to_string(),
-                "cairn://p/cairn/3757".to_string()
-            )]
-        );
-        assert_eq!(issue_total, 1);
-
-        router
-            .send_follow_poll("+15551234567", PollKind::Issues)
-            .await
-            .unwrap();
-        match &provider.sends.lock().unwrap()[0] {
-            OutboundAsk::Question { text, options, .. } => {
-                assert_eq!(text, "Follow issues");
-                assert_eq!(options[0].label, "3757 · Resource library slice 1");
-            }
-            other => panic!("the issues command must send a poll, got {other:?}"),
-        };
-    }
-
-    /// Two projects can each have a thread named `general`, and the poll draws
-    /// from every open database. The label is the binding key a selection
-    /// arrives as, so an unqualified label would drop one of them and toggle the
-    /// other in its place.
-    #[tokio::test]
-    async fn a_poll_spanning_projects_qualifies_every_label_so_no_binding_collides() {
-        let (orch, db) = route_test_orchestrator("channel-router-poll-collision.db").await;
-        seed_threads_and_an_issue(&db).await;
-        db.execute_batch(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p2', 'w', 'Aggflow', 'AGG', '/tmp/agg', 1, 1);
-             INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
-               VALUES ('t-agg', 'p2', 'general', 'active', 1, 10);",
-        )
-        .await
-        .unwrap();
-        let (router, _provider) = test_router(orch);
-
-        let (targets, _) = router.active_threads(&HashSet::new()).await.unwrap();
-        assert_eq!(
-            targets,
-            vec![
-                (
-                    "AGG/general".to_string(),
-                    "cairn://p/agg/general".to_string()
-                ),
-                (
-                    "cairn/general".to_string(),
-                    "cairn://p/cairn/general".to_string()
-                ),
-                (
-                    "cairn/performance".to_string(),
-                    "cairn://p/cairn/performance".to_string()
-                ),
-            ]
-        );
-        let bindings: HashMap<String, String> = targets.iter().cloned().collect();
-        assert_eq!(
-            bindings.len(),
-            targets.len(),
-            "every option keeps its own binding"
-        );
-    }
-
-    /// A follow reached by a migrated number and the canonical thread URI the
-    /// poll offers are two identities for one conversation. Left alone, the poll
-    /// shows a streaming thread as unfollowed; following it adds a second row;
-    /// and every update then arrives twice under two distinct binding refs.
-    #[tokio::test]
-    async fn a_follow_recorded_under_a_migrated_number_becomes_canonical_at_startup() {
-        let (orch, db) = route_test_orchestrator("channel-router-follow-canonical.db").await;
-        seed_threads_and_an_issue(&db).await;
-        db.execute(
-            "UPDATE threads SET migrated_from_number = 3404 WHERE id = 't-general'",
-            (),
-        )
-        .await
-        .unwrap();
-        assert!(
-            ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/3404", 5, 40)
-                .await
-                .unwrap()
-        );
-        ledger::set_focus(&db, CHANNEL, "cairn://p/cairn/3404", 5)
-            .await
-            .unwrap();
-        let (router, _provider) = test_router(orch);
-
-        router
-            .draw_the_session_line(SessionBoundary::Fresh)
-            .await
-            .unwrap();
-
-        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(
-            follows.iter().map(|f| f.uri.as_str()).collect::<Vec<_>>(),
-            vec!["cairn://p/cairn/general"],
-            "one target keeps one identity"
-        );
-        assert_eq!(follows[0].followed_at, 5, "the follow is as old as it was");
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/general"),
-            "bare text still routes to the thread the operator last chose"
-        );
-
-        // The poll offers the canonical URI, so the checkmark now finds it.
-        let followed = ledger::list_follows(&db, CHANNEL)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|follow| follow.uri)
-            .collect::<HashSet<_>>();
-        let (targets, _) = router.active_threads(&followed).await.unwrap();
-        assert!(followed.contains(&targets[0].1));
-    }
-
-    /// Merging an alias into a canonical row that already exists must not replay
-    /// what one of them already delivered, nor skip what neither has.
-    #[tokio::test]
-    async fn canonicalizing_onto_an_existing_row_keeps_the_further_cursor() {
-        let db = migrated_test_db("channel-ledger-canonicalize-merge.db").await;
-        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/3404", 5, 90)
-            .await
-            .unwrap();
-        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/general", 9, 40)
-            .await
-            .unwrap();
-
-        ledger::canonicalize_follow(
-            &db,
-            CHANNEL,
-            "cairn://p/cairn/3404",
-            "cairn://p/cairn/general",
-        )
-        .await
-        .unwrap();
-
-        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(follows.len(), 1);
-        assert_eq!(follows[0].uri, "cairn://p/cairn/general");
-        assert_eq!(
-            follows[0].cursor_rowid, 90,
-            "nothing already sent is resent"
-        );
-        assert_eq!(follows[0].followed_at, 5);
-    }
-
-    /// The ten slots span every open database, and this poll is the only surface
-    /// that manages follows — so a followed target must never be the one the
-    /// limit drops.
-    #[tokio::test]
-    async fn a_followed_target_is_never_crowded_out_of_the_poll_that_manages_it() {
-        let (orch, db) = route_test_orchestrator("channel-router-poll-ordering.db").await;
-        seed_threads_and_an_issue(&db).await;
-        let mut busier = String::new();
-        for index in 0..FOLLOW_POLL_LIMIT {
-            busier.push_str(&format!(
-                "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
-                   VALUES ('t-busy-{index}', 'p', 'busy-{index}', 'active', 1, {});",
-                100 + index
-            ));
-        }
-        db.execute_batch(&busier).await.unwrap();
-        let followed = HashSet::from(["cairn://p/cairn/performance".to_string()]);
-        let (router, _provider) = test_router(orch);
-
-        let (targets, total) = router.active_threads(&followed).await.unwrap();
-
-        assert_eq!(targets.len(), FOLLOW_POLL_LIMIT);
-        assert_eq!(total, FOLLOW_POLL_LIMIT + 2);
-        assert_eq!(
-            targets[0],
-            (
-                "performance".to_string(),
-                "cairn://p/cairn/performance".to_string()
-            ),
-            "the followed thread leads, then the most recently active"
-        );
-        assert_eq!(targets[1].1, "cairn://p/cairn/busy-9");
-    }
-
-    /// Following a thread has to resolve through the thread's SESSION job. Its
-    /// sub-agent tasks carry the thread's id too and are newer, so a tap that
-    /// matched on the thread alone would text the operator a task's chatter and
-    /// start every follow past the thread's own last word.
-    #[tokio::test]
-    async fn a_followed_thread_taps_its_session_and_not_the_tasks_it_spawned() {
-        let (orch, db) = route_test_orchestrator("channel-router-thread-tap.db").await;
-        seed_threads_and_an_issue(&db).await;
-        let (router, _provider) = test_router(orch);
-
-        let target = router
-            .resolve_target("cairn://p/cairn/general")
-            .await
-            .unwrap();
-        assert_eq!(
-            target,
-            FollowTarget::Thread {
-                project: "cairn".into(),
-                name: "general".into()
-            }
-        );
-        let session_rowid = db
-            .query_one(
-                "SELECT rowid FROM events WHERE id = 'e-session'",
-                (),
-                |row| row.i64(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(router.live_edge(&target).await.unwrap(), session_rowid);
-
-        let events = router.followed_events(&target, 0).await.unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| (event.rowid, event.context.clone()))
-                .collect::<Vec<_>>(),
-            vec![(session_rowid, "cairn/general".to_string())]
-        );
-        assert!(assistant_text(&events[0].data).as_deref() == Some("the thread speaking"));
-
-        // A fresh follow starts at the live edge, so nothing already said is
-        // replayed onto the phone.
-        router.follow("cairn://p/cairn/general").await.unwrap();
-        let follow = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(follow[0].uri, "cairn://p/cairn/general");
-        assert_eq!(follow[0].cursor_rowid, session_rowid);
-        assert!(router
-            .followed_events(&target, follow[0].cursor_rowid)
-            .await
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/general"),
-            "the newest selection is what bare text routes to"
-        );
-    }
-
     /// Inbound text reaches the thread the same way the desktop composer does:
     /// the message becomes visible in the thread and its session is steered —
     /// including a dormant thread, which acquires its session on the way.
     #[tokio::test]
-    async fn inbound_text_lands_in_the_followed_threads_transcript() {
+    async fn inbound_text_lands_in_the_threads_transcript() {
         use crate::db::DbState;
         use crate::services::testing::{RecordingProcessSpawner, TestServicesBuilder};
         use crate::storage::SearchIndex;
@@ -9023,7 +6487,7 @@ mod tests {
             "a dormant thread acquires its session before the message is visible"
         );
 
-        let missing = FollowTarget::Thread {
+        let missing = BindingTarget::Thread {
             project: "cairn".into(),
             name: "no-such-thread".into(),
         };
@@ -9034,12 +6498,12 @@ mod tests {
             .contains("no thread named"));
     }
 
-    /// The numeric address a thread migration vacated still resolves — that is
-    /// what `channels.defaultThread` and every pre-cutover follow carry — while a
+    /// The numeric address a thread migration vacated still resolves -- a
+    /// binding or route recorded before the cutover can carry one -- while a
     /// number an issue still owns stays an issue.
     #[tokio::test]
     async fn a_migrated_number_resolves_to_its_thread_and_a_live_issue_does_not() {
-        let (orch, db) = route_test_orchestrator("channel-router-migrated-follow.db").await;
+        let (orch, db) = route_test_orchestrator("channel-router-migrated-number.db").await;
         seed_threads_and_an_issue(&db).await;
         db.execute(
             "UPDATE threads SET migrated_from_number = 3404 WHERE id = 't-general'",
@@ -9051,33 +6515,17 @@ mod tests {
 
         assert_eq!(
             router.resolve_target("cairn://p/cairn/3404").await.unwrap(),
-            FollowTarget::Thread {
+            BindingTarget::Thread {
                 project: "cairn".into(),
                 name: "general".into()
             }
         );
         assert_eq!(
             router.resolve_target("cairn://p/cairn/3757").await.unwrap(),
-            FollowTarget::Issue {
+            BindingTarget::Issue {
                 project: "cairn".into(),
                 number: 3757
             }
-        );
-    }
-
-    #[test]
-    fn thread_tap_emits_every_assistant_text_segment_and_no_tool_call() {
-        let turn = [
-            r#"{"content":"first","toolUses":[]}"#,
-            r#"{"toolUses":[{"name":"read","input":{}}]}"#,
-            r#"{"content":"second","toolUses":[]}"#,
-            r#"{"content":"third","toolUses":[]}"#,
-        ];
-        assert_eq!(
-            turn.into_iter()
-                .filter_map(assistant_text)
-                .collect::<Vec<_>>(),
-            vec!["first", "second", "third"]
         );
     }
 
@@ -9125,7 +6573,6 @@ mod tests {
             initiated_by: None,
             destination: None,
             fact_log_id: None,
-            provider: None,
         }
     }
 
@@ -9864,7 +7311,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let provider = Arc::new(RecordingPollProvider::new());
+            let provider = Arc::new(RecordingProvider::new());
             let router = agent_message_router(orch, provider.clone(), provider_id);
 
             let id = enqueue_agent_message(&db, conversation, home).await;
@@ -10106,7 +7553,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = agent_message_router(orch, provider, "imessage");
         for (id, home, job) in [
             ("m-builder", "cairn://p/cairn/3757/1/builder", "j-builder"),
@@ -10153,13 +7600,68 @@ mod tests {
         }
     }
 
+    /// Every admitted inbound row's `addressed_by`, oldest first.
+    async fn addressed_by(db: &LocalDb) -> Vec<Option<String>> {
+        db.query_all(
+            "SELECT addressed_by FROM channel_inbound
+              WHERE target_uri IS NOT NULL ORDER BY received_at, rowid",
+            (),
+            |row| row.opt_text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Every notice the router texted back, in order.
+    fn notices(provider: &RecordingProvider) -> Vec<String> {
+        provider
+            .deliveries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|delivery| match &delivery.ask {
+                OutboundAsk::Notify { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Send operator message `id` from `home` (job `job`) on iMessage, stamp
+    /// its send `ago_ms` before now, and return its provider guid.
+    async fn sent_operator_message(
+        router: &ChannelRouter,
+        db: &LocalDb,
+        id: &str,
+        home: &str,
+        job: &str,
+        ago_ms: i64,
+    ) -> String {
+        operator_message_row(db, id, home, job).await;
+        router.submit_agent_message(id).await.unwrap();
+        db.execute(
+            "UPDATE channel_outbound SET sent_at = ?2 WHERE id = ?1",
+            params![
+                id.to_string(),
+                chrono::Utc::now().timestamp_millis() - ago_ms
+            ],
+        )
+        .await
+        .unwrap();
+        ledger::get_by_id(db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .provider_guid
+            .unwrap()
+    }
+
     /// An operator row whose message is gone is expired with a named error on
     /// the hand-off and on the sweep alike, and never reaches the provider.
     #[tokio::test]
     async fn an_operator_row_whose_message_is_gone_expires_unsent() {
         let (orch, db) = route_test_orchestrator("operator-orphan.db").await;
         let session = seed_threads_and_an_issue(&db).await;
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = agent_message_router(orch, provider.clone(), "imessage");
         for id in ["m-handoff", "m-sweep"] {
             operator_message_row(&db, id, "cairn://p/cairn/general", &session).await;
@@ -10197,17 +7699,24 @@ mod tests {
         .is_empty());
     }
 
-    /// A message to the operator asks nothing, so it never stands as the active
-    /// ask that unaddressed text answers: not once it is answered, and not
-    /// beside a real question.
+    /// A message to the operator asks nothing, so it is never the active ask
+    /// bare text answers. Bare text reaches its sender by recency instead,
+    /// even after it was answered in the app.
     #[tokio::test]
     async fn an_operator_message_is_never_the_active_ask_bare_text_answers() {
         let (orch, db) = route_test_orchestrator("operator-not-an-ask.db").await;
         let session = seed_threads_and_an_issue(&db).await;
-        let provider = Arc::new(RecordingPollProvider::new());
-        let router = agent_message_router(orch.clone(), provider.clone(), "imessage");
-        operator_message_row(&db, "m-done", "cairn://p/cairn/general", &session).await;
-        router.submit_agent_message("m-done").await.unwrap();
+        let router =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "imessage");
+        sent_operator_message(
+            &router,
+            &db,
+            "m-done",
+            "cairn://p/cairn/general",
+            &session,
+            0,
+        )
+        .await;
         crate::operator::record_answered(
             &orch,
             "m-done",
@@ -10220,46 +7729,617 @@ mod tests {
         let record = ledger::get_by_id(&db, "m-done").await.unwrap().unwrap();
         assert!(!is_answerable_ask(&record));
 
-        // With no ask standing, bare text falls through to the focus/default
-        // fallback (whose default thread this fixture lacks); what it must
-        // never do is resolve against the operator row.
-        if let Err(error) = router
-            .handle_inbound(InboundEvent::Bare {
-                conversation: "operator".into(),
-                sender: "operator".into(),
-                text: "unrelated news".into(),
-                message_guid: None,
-            })
+        router
+            .handle_inbound(bare("operator", "unrelated news"))
             .await
-        {
-            assert!(
-                !error.contains("unknown channel outbound kind"),
-                "bare text was resolved against the operator row: {error}"
-            );
+            .unwrap();
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![Some("recent:m-done".to_string())]
+        );
+        assert_eq!(thread_messages(&db, "t-general").await.len(), 1);
+    }
+
+    /// A thread's assistant text is its transcript, never a channel's: sweeps
+    /// over a thread that keeps talking send nothing and mint nothing.
+    #[tokio::test]
+    async fn a_threads_assistant_text_never_reaches_a_channel() {
+        let (orch, db) = route_test_orchestrator("no-thread-stream.db").await;
+        seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+        for sequence in 2..5_i64 {
+            db.execute(
+                "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
+                   VALUES (?1, 'r-session', ?2, ?2, 'assistant', '{\"content\":\"still talking\",\"toolUses\":[]}', ?2)",
+                params![format!("e-more-{sequence}"), sequence],
+            )
+            .await
+            .unwrap();
+            router.sweep().await;
         }
 
+        assert!(provider.deliveries.lock().unwrap().is_empty());
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM channel_outbound", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM fact_log
+                  WHERE fields_json LIKE '%cairn://p/cairn/general%'
+                     OR fields_json LIKE '%still talking%'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(0)
+        );
+    }
+
+    /// The retired follow and poll commands are unknown commands; `/help`
+    /// names only itself and where unaddressed text goes, and a bare word that
+    /// used to be a command is ordinary text.
+    #[tokio::test]
+    async fn retired_commands_answer_unknown_command_help() {
+        let (orch, db) = route_test_orchestrator("retired-commands.db").await;
+        seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+        let retired = [
+            "/follow",
+            "/follow cairn://p/cairn/general",
+            "/unfollow",
+            "/focus general",
+            "/threads",
+            "/issues",
+        ];
+        for command in retired.into_iter().chain(["/help"]) {
+            router
+                .handle_inbound(bare("operator", command))
+                .await
+                .unwrap();
+        }
+
+        let notices = notices(&provider);
+        assert_eq!(notices.len(), retired.len() + 1, "{notices:?}");
+        for notice in &notices[..retired.len()] {
+            assert_eq!(notice, "Unknown command. Use /help for channel commands.");
+        }
+        let help = &notices[retired.len()];
+        assert_eq!(*help, channel_help(Some("cairn")));
+        assert!(
+            help.starts_with("Commands: /help. Reply to a thread's message to answer it.")
+                && help.ends_with("otherwise to the cairn general thread."),
+            "{help}"
+        );
+        assert!(thread_messages(&db, "t-general").await.is_empty());
+
+        router
+            .handle_inbound(bare("operator", "focus"))
+            .await
+            .unwrap();
+        assert_eq!(thread_messages(&db, "t-general").await, vec!["focus"]);
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![Some("default:cairn".to_string())]
+        );
+    }
+
+    /// Rule 1: a native reply reaches whoever sent the message it replies to,
+    /// and records which message it answered.
+    #[tokio::test]
+    async fn a_native_reply_reaches_the_replied_to_sender() {
+        let (orch, db) = route_test_orchestrator("native-reply.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let imessage =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "imessage");
+        let guid = sent_operator_message(
+            &imessage,
+            &db,
+            "m-op",
+            "cairn://p/cairn/general",
+            &session,
+            0,
+        )
+        .await;
+        imessage
+            .handle_inbound(reply("operator", &guid, "yes"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            operator_state(&db, "m-op").await,
+            crate::operator::State::Answered { .. }
+        ));
+        assert_eq!(
+            thread_messages(&db, "t-general").await,
+            vec!["[Reply to cairn://operator/messages/m-op] yes"]
+        );
+
+        let telegram = agent_message_router(orch, Arc::new(RecordingProvider::new()), "telegram");
+        let agent = enqueue_agent_message(&db, "telegram:77", "cairn://p/cairn/performance").await;
+        telegram.deliver_pending_agent_messages().await.unwrap();
+        let guid = ledger::get_by_id(&db, &agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .provider_guid
+            .unwrap();
+        telegram
+            .handle_inbound(reply("telegram:77", &guid, "on it"))
+            .await
+            .unwrap();
+        assert_eq!(thread_messages(&db, "t-perf").await, vec!["on it"]);
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![
+                Some("reply:m-op".to_string()),
+                Some(format!("reply:{agent}"))
+            ]
+        );
+    }
+
+    /// A reply to a message the ledger never sent names nothing, so it is
+    /// unaddressed text, never refused as an unsolicited answer.
+    #[tokio::test]
+    async fn an_unresolvable_reply_is_unaddressed_text() {
+        let (orch, db) = route_test_orchestrator("unresolvable-reply.db").await;
+        seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+
+        router
+            .handle_inbound(reply("operator", "unknown-guid", "about that"))
+            .await
+            .unwrap();
+
+        assert_eq!(thread_messages(&db, "t-general").await, vec!["about that"]);
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![Some("default:cairn".to_string())]
+        );
+        assert!(notices(&provider).is_empty(), "{:?}", notices(&provider));
+    }
+
+    /// Rule 2: unaddressed text answers the latest operator message that
+    /// reached this sender on this transport within 24 hours. A row not yet
+    /// sent, a failed one, and one on another transport never count.
+    #[tokio::test]
+    async fn bare_text_reaches_the_last_operator_message_sender_within_24h() {
+        let (orch, db) = route_test_orchestrator("recent-operator-message.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let router = agent_message_router(orch, Arc::new(RecordingProvider::new()), "imessage");
+        sent_operator_message(
+            &router,
+            &db,
+            "m-edge",
+            "cairn://p/cairn/general",
+            &session,
+            ledger::UNADDRESSED_WINDOW_MS - 5_000,
+        )
+        .await;
+        db.execute(
+            "INSERT INTO channel_outbound
+               (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, created_at, sent_at)
+             VALUES ('m-pending', 'imessage', 'operator', 'operator:m-pending', 'operator', 'x', 'text', 'pending', ?1, NULL),
+                    ('m-failed', 'imessage', 'operator', 'operator:m-failed', 'operator', 'x', 'text', 'failed', ?1, NULL),
+                    ('m-telegram', 'telegram', 'operator', 'operator:m-telegram', 'operator', 'x', 'text', 'sent', ?1, ?1)",
+            params![chrono::Utc::now().timestamp_millis()],
+        )
+        .await
+        .unwrap();
+
+        router
+            .handle_inbound(bare("operator", "first"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            operator_state(&db, "m-edge").await,
+            crate::operator::State::Answered { .. }
+        ));
+        assert!(thread_messages(&db, "t-general").await[0].ends_with("] first"));
+
+        sent_operator_message(
+            &router,
+            &db,
+            "m-latest",
+            "cairn://p/cairn/performance",
+            &session,
+            1_000,
+        )
+        .await;
+        router
+            .handle_inbound(bare("operator", "second"))
+            .await
+            .unwrap();
+        assert!(thread_messages(&db, "t-perf").await[0].ends_with("] second"));
+        assert_eq!(thread_messages(&db, "t-general").await.len(), 1);
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![
+                Some("recent:m-edge".to_string()),
+                Some("recent:m-latest".to_string())
+            ]
+        );
+    }
+
+    /// The sender learns how the text reached it: a native reply is headed as
+    /// a reply, while recency-routed text says it may not be about the message
+    /// at all. Both hold for a thread's session and for an issue node.
+    #[tokio::test]
+    async fn inferred_and_native_answers_carry_different_headers() {
+        let (orch, db) = route_test_orchestrator("answer-headers.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        db.execute_batch(
+            "INSERT INTO jobs (id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+               VALUES ('j-builder', 'i-live', 'p', 'complete', 'builder', 'builder', 10, 10);
+             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('r-builder', 'p', 'j-builder', 'complete', 10, 10);",
+        )
+        .await
+        .unwrap();
+        let router = agent_message_router(orch, Arc::new(RecordingProvider::new()), "imessage");
+        let inferred = |id: &str| {
+            format!(
+                "[Unaddressed text from the operator, delivered to you because cairn://operator/messages/{id} is the latest message any thread sent him on imessage in 24 h] bare"
+            )
+        };
+        let native = |id: &str| format!("[Reply to cairn://operator/messages/{id}] replied");
+        for (home, job, first, second) in [
+            ("cairn://p/cairn/general", session.as_str(), "m-t1", "m-t2"),
+            (
+                "cairn://p/cairn/3757/1/builder",
+                "j-builder",
+                "m-n1",
+                "m-n2",
+            ),
+        ] {
+            sent_operator_message(&router, &db, first, home, job, 0).await;
+            router
+                .handle_inbound(bare("operator", "bare"))
+                .await
+                .unwrap();
+            let guid = sent_operator_message(&router, &db, second, home, job, 0).await;
+            router
+                .handle_inbound(reply("operator", &guid, "replied"))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            thread_messages(&db, "t-general").await,
+            vec![inferred("m-t1"), native("m-t2")]
+        );
+        let queued = db
+            .query_all(
+                "SELECT content FROM queued_messages WHERE job_id = 'j-builder' ORDER BY rowid",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued[0].contains(&inferred("m-n1")), "{queued:?}");
+        assert!(queued[1].contains(&native("m-n2")), "{queued:?}");
+    }
+
+    /// Rule 3: an operator message older than 24 hours no longer keeps the
+    /// text, so it goes to the default project's general thread.
+    #[tokio::test]
+    async fn bare_text_after_24h_falls_to_the_default_projects_general() {
+        let (orch, db) = route_test_orchestrator("stale-operator-message.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let router = agent_message_router(orch, Arc::new(RecordingProvider::new()), "imessage");
+        sent_operator_message(
+            &router,
+            &db,
+            "m-stale",
+            "cairn://p/cairn/performance",
+            &session,
+            ledger::UNADDRESSED_WINDOW_MS + 5_000,
+        )
+        .await;
+
+        router
+            .handle_inbound(bare("operator", "late"))
+            .await
+            .unwrap();
+
+        assert_eq!(thread_messages(&db, "t-general").await, vec!["late"]);
+        assert!(thread_messages(&db, "t-perf").await.is_empty());
+        assert_eq!(
+            admitted_inbound(&db)
+                .await
+                .into_iter()
+                .map(|(_, target, kind)| (target, kind))
+                .collect::<Vec<_>>(),
+            vec![("cairn://p/cairn/general".to_string(), "none".to_string())]
+        );
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![Some("default:cairn".to_string())]
+        );
+        assert_eq!(
+            operator_state(&db, "m-stale").await,
+            crate::operator::State::Delivered
+        );
+    }
+
+    /// With no `channels.defaultProject`, the oldest project's general thread
+    /// takes unaddressed text; setting it moves the text there.
+    #[tokio::test]
+    async fn default_project_unset_uses_the_oldest_project() {
+        let (orch, db) = route_test_orchestrator("default-project-oldest.db").await;
+        seed_threads_and_an_issue(&db).await;
+        db.execute_batch(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p-older', 'w', 'Older', 'older', '/tmp/older', 0, 0);
+             INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+               VALUES ('t-older', 'p-older', 'general', 'active', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let router =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "imessage");
+        router
+            .handle_inbound(bare("operator", "unset"))
+            .await
+            .unwrap();
+
+        std::fs::create_dir_all(&orch.config_dir).unwrap();
+        let mut settings = crate::config::settings::load_settings(&orch.config_dir);
+        settings.channels.default_project = Some("cairn".into());
+        crate::config::settings::save_settings(&orch.config_dir, &settings).unwrap();
+        router
+            .handle_inbound(bare("operator", "set"))
+            .await
+            .unwrap();
+
+        assert_eq!(thread_messages(&db, "t-older").await, vec!["unset"]);
+        assert_eq!(thread_messages(&db, "t-general").await, vec!["set"]);
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![
+                Some("default:older".to_string()),
+                Some("default:cairn".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_open_general_thread_refuses_by_name() {
+        let (orch, db) = route_test_orchestrator("default-project-closed.db").await;
+        seed_threads_and_an_issue(&db).await;
+        db.execute(
+            "UPDATE threads SET status = 'closed' WHERE id = 't-general'",
+            (),
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+
+        router
+            .handle_inbound(bare("operator", "anyone?"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notices(&provider),
+            vec!["No thread can take this: project cairn has no open general thread. Set Settings > Channels > Default project."]
+        );
+        assert!(thread_messages(&db, "t-general").await.is_empty());
+        assert!(admitted_inbound(&db).await.is_empty());
+        assert_eq!(
+            db.query_opt_text("SELECT rejection_reason FROM channel_inbound", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("no_default_thread")
+        );
+    }
+
+    /// The one outstanding ask takes bare text before any recent operator
+    /// message does.
+    #[tokio::test]
+    async fn a_single_outstanding_ask_still_takes_bare_text() {
+        let (orch, db) = route_test_orchestrator("ask-before-recent.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+        sent_operator_message(&router, &db, "m-op", "cairn://p/cairn/general", &session, 0).await;
         db.execute_batch(
             "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, provider_guid, created_at, sent_at)
                VALUES ('q-open', 'imessage', 'question', 'prompt-x:0', 'operator', 'Pick one', 'text', 'sent', 'q-guid', 5, 5);",
         )
         .await
         .unwrap();
-        let _ = router
-            .handle_inbound(InboundEvent::Bare {
-                conversation: "operator".into(),
-                sender: "operator".into(),
-                text: "1".into(),
-                message_guid: None,
-            })
-            .await;
-        let notices = provider.deliveries.lock().unwrap().clone();
-        assert!(
-            notices.iter().all(|sent| !matches!(
-                &sent.ask,
-                OutboundAsk::Notify { text } if text.contains("more than one active ask")
-            )),
-            "the question is the one active ask: {notices:?}"
+
+        // The prompt behind the ask is not seeded, so finishing the answer
+        // fails after the claim; the claim is what this asserts.
+        let _ = router.handle_inbound(bare("operator", "1")).await;
+
+        assert!(ledger::get_by_id(&db, "q-open")
+            .await
+            .unwrap()
+            .unwrap()
+            .options_json
+            .is_some_and(|answer| answer.contains("answer")));
+        assert_eq!(
+            operator_state(&db, "m-op").await,
+            crate::operator::State::Delivered
         );
+        assert!(thread_messages(&db, "t-general").await.is_empty());
+        assert!(notices(&provider)
+            .iter()
+            .all(|notice| !notice.contains("more than one active ask")));
+    }
+
+    /// A reply to a message the ledger does not know is admitted as the bare
+    /// text it is routed as: with answers disabled it cannot claim the one
+    /// outstanding question that bare text would.
+    #[tokio::test]
+    async fn an_unknown_reply_needs_the_answers_capability_to_claim_an_ask() {
+        let (orch, db) = route_test_orchestrator("unknown-reply-admission.db").await;
+        seed_threads_and_an_issue(&db).await;
+        db.execute_batch(
+            "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, provider_guid, created_at, sent_at)
+               VALUES ('q-open', 'imessage', 'question', 'prompt-x:0', 'operator', 'Pick one', 'text', 'sent', 'q-guid', 5, 5);",
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new());
+        let router = ChannelRouter::new_for_provider(
+            orch,
+            provider.clone(),
+            "imessage",
+            "operator".into(),
+            MessageClassPolicy::default(),
+            ChannelInboundCapabilities {
+                permissions: true,
+                answers: false,
+                free_text: true,
+            },
+        );
+
+        router
+            .handle_inbound(reply("operator", "no-such-guid", "1"))
+            .await
+            .unwrap();
+
+        assert!(ledger::get_by_id(&db, "q-open")
+            .await
+            .unwrap()
+            .unwrap()
+            .options_json
+            .is_none());
+        assert_eq!(
+            notices(&provider),
+            vec!["Answers and channel controls are disabled for this channel.".to_string()]
+        );
+        assert!(thread_messages(&db, "t-general").await.is_empty());
+    }
+
+    /// A retired command is answered with help even while asks are
+    /// outstanding: one ask never takes it as its answer, and two never turn
+    /// it into a which-ask prompt.
+    #[tokio::test]
+    async fn retired_commands_never_answer_an_outstanding_ask() {
+        let (orch, db) = route_test_orchestrator("retired-commands-with-asks.db").await;
+        seed_threads_and_an_issue(&db).await;
+        db.execute_batch(
+            "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, provider_guid, created_at, sent_at)
+               VALUES ('q-one', 'imessage', 'question', 'prompt-x:0', 'operator', 'Pick one', 'text', 'sent', 'q-one-guid', 5, 5);",
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+        for command in ["/threads", "/focus general"] {
+            router
+                .handle_inbound(bare("operator", command))
+                .await
+                .unwrap();
+        }
+        assert!(ledger::get_by_id(&db, "q-one")
+            .await
+            .unwrap()
+            .unwrap()
+            .options_json
+            .is_none());
+
+        db.execute_batch(
+            "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, provider_guid, created_at, sent_at)
+               VALUES ('q-two', 'imessage', 'question', 'prompt-y:0', 'operator', 'Pick another', 'text', 'sent', 'q-two-guid', 6, 6);",
+        )
+        .await
+        .unwrap();
+        router
+            .handle_inbound(bare("operator", "/unfollow"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notices(&provider),
+            vec!["Unknown command. Use /help for channel commands.".to_string(); 3]
+        );
+        assert!(thread_messages(&db, "t-general").await.is_empty());
+    }
+
+    /// Rule 2 matches a Telegram group by its chat, not by who typed: the
+    /// operator row names chat `-100123` while the inbound sender is user `7`.
+    #[tokio::test]
+    async fn bare_text_in_a_telegram_group_reaches_the_last_operator_message_sender() {
+        let (orch, db) = route_test_orchestrator("telegram-group-recent.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        operator_message_row(&db, "m-group", "cairn://p/cairn/general", &session).await;
+        db.execute(
+            "UPDATE channel_outbound
+                SET channel = 'telegram', conversation = '-100123', status = 'sent', sent_at = ?1
+              WHERE id = 'm-group'",
+            params![chrono::Utc::now().timestamp_millis()],
+        )
+        .await
+        .unwrap();
+        let router = agent_message_router(orch, Arc::new(RecordingProvider::new()), "telegram");
+
+        router
+            .handle_inbound(InboundEvent::Bare {
+                conversation: "telegram:-100123".into(),
+                sender: "7".into(),
+                text: "ship it".into(),
+                message_guid: Some("-100123:10".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            addressed_by(&db).await,
+            vec![Some("recent:m-group".to_string())]
+        );
+        assert!(thread_messages(&db, "t-general").await[0].ends_with("] ship it"));
+    }
+
+    /// A question reaches the provider's default conversation with no binding
+    /// rows at all: the gate never needed a follow.
+    #[tokio::test]
+    #[serial_test::serial(operator_presence)]
+    async fn a_question_reaches_the_default_conversation_without_follow_rows() {
+        let (orch, db) = route_test_orchestrator("question-default-conversation.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "live", 500).await;
+        let provider = Arc::new(PresentProvider {
+            sends: Mutex::new(Vec::new()),
+            presence_checks: Mutex::new(0),
+            presence: Mutex::new(OperatorPresence::Away),
+        });
+        let router = ChannelRouter::new(
+            orch,
+            provider.clone(),
+            IMessageChannelConfig {
+                enabled: true,
+                to: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        crate::channels::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Idle);
+        let swept = router.sweep_live_gates().await;
+        crate::channels::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Auto);
+        swept.unwrap();
+
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM channel_conversation_binding", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        let sends = provider.sends.lock().unwrap().clone();
+        assert_eq!(sends.len(), 1, "{sends:?}");
+        assert_eq!(sends[0].conversation, "+15551234567");
+        assert!(matches!(sends[0].ask, OutboundAsk::Question { .. }));
     }
 
     #[tokio::test]
@@ -11556,27 +9636,6 @@ mod tests {
     }
 
     #[test]
-    fn followed_thread_stream_is_a_presence_aware_subscription_push() {
-        let subscription = Gate {
-            conversation: None,
-            target_uri: None,
-            kind: "review",
-            initiated_by: OutboundInitiator::OperatorSubscription,
-            binding_ref: "cairn://p/cairn/1: event:1".into(),
-            job_id: None,
-            context: String::new(),
-            ask_key: None,
-            held_since: None,
-            ask: OutboundAsk::Notify {
-                text: "subscribed update".into(),
-            },
-            reply_to: None,
-        };
-
-        assert!(subscription.is_presence_aware());
-    }
-
-    #[test]
     fn losing_presence_escalates_before_the_deadline() {
         let now = Instant::now();
         assert_eq!(
@@ -11668,7 +9727,6 @@ mod tests {
             super::super::bindings::BindingKind::Structural,
             super::super::bindings::MESSAGE_CLASSES_ALL,
             1,
-            0,
         )
         .await
         .unwrap();
@@ -11737,7 +9795,7 @@ mod tests {
             .submit_route(
                 undirected_route_submission(
                     "thread-subject",
-                    "threadUri",
+                    "detailUri",
                     "cairn://p/cairn/channels",
                 ),
                 OperatorPresence::Away,
@@ -11853,7 +9911,7 @@ mod tests {
             summary: None,
             route_provenance: None,
         };
-        let issue = FollowTarget::Issue {
+        let issue = BindingTarget::Issue {
             project: "cairn".into(),
             number: 42,
         };
@@ -11866,11 +9924,15 @@ mod tests {
             Some(issue)
         );
         assert_eq!(
-            route_subject(&fact("threadUri", "cairn://p/cairn/channels")),
-            Some(FollowTarget::Thread {
+            route_subject(&fact("detailUri", "cairn://p/cairn/channels")),
+            Some(BindingTarget::Thread {
                 project: "cairn".into(),
                 name: "channels".into()
             })
+        );
+        assert_eq!(
+            route_subject(&fact("threadUri", "cairn://p/cairn/channels")),
+            None
         );
         assert_eq!(route_subject(&fact("detailUri", "cairn://posts")), None);
         assert_eq!(route_subject(&fact("url", "cairn://p/cairn/42")), None);
@@ -12081,7 +10143,7 @@ mod tests {
             ),
         ] {
             assert!(
-                ledger::bind_target(&db, "discord", conversation, target, kind, classes, 1, 0)
+                ledger::bind_target(&db, "discord", conversation, target, kind, classes, 1)
                     .await
                     .unwrap()
             );
@@ -12176,7 +10238,7 @@ mod tests {
 
     /// Unaddressed text in the ambient channel is recorded and minted for the
     /// route engine, and nothing else happens: no rejection, no notice, no
-    /// fallback to the focused follow. The inbound loop, the sweep, and the
+    /// fallback to a thread. The inbound loop, the sweep, and the
     /// session line never wait on the route that takes the fact, even one that
     /// never answers.
     #[tokio::test]
@@ -12193,13 +10255,7 @@ mod tests {
             &[("hang", &hang)],
         )
         .await;
-        ledger::follow_target(&db, "discord", "cairn://p/cairn/general", 1, 0)
-            .await
-            .unwrap();
-        ledger::set_focus(&db, "discord", "cairn://p/cairn/general", 2)
-            .await
-            .unwrap();
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = agent_message_router(orch.clone(), provider.clone(), "discord");
 
         let bound = Duration::from_secs(1);
@@ -12232,7 +10288,7 @@ mod tests {
             .is_empty());
         assert!(
             thread_messages(&db, "t-general").await.is_empty(),
-            "ambient text never falls back to the focused follow"
+            "ambient text never falls through to the general thread"
         );
         assert!(provider
             .deliveries
@@ -12295,7 +10351,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (orch, db) =
             ambient_orchestrator(temp.path(), "channel-router-ambient-summary.db", &[]).await;
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = agent_message_router(orch, provider, "discord");
         router
             .handle_inbound(bare(
@@ -12335,7 +10391,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let provider = Arc::new(RecordingPollProvider::new());
+        let provider = Arc::new(RecordingProvider::new());
         let router = agent_message_router(orch.clone(), provider.clone(), "discord");
 
         for event in [
@@ -12373,7 +10429,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(addressed_by, ["@General", "<#4>", "-", "-"]);
+        assert_eq!(
+            addressed_by,
+            [
+                "@General",
+                "<#4>",
+                "reply:route-record",
+                "reply:agent-record"
+            ]
+        );
 
         router
             .handle_inbound(bare("discord:1/9", "@nobody hello?"))
@@ -12458,23 +10522,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (orch, db) =
             ambient_orchestrator(temp.path(), "channel-router-ambient-paths.db", &[]).await;
-        // `channels.defaultThread` defaults to cairn/3404.
-        db.execute_batch(
-            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-               VALUES ('i-default', 'p', 3404, 'Default thread', 'active', 1, 1);
-             INSERT INTO jobs (id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
-               VALUES ('j-default', 'i-default', 'p', 'complete', 'builder', 'builder', 9, 9);
-             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
-               VALUES ('r-default', 'p', 'j-default', 'complete', 9, 9);",
-        )
-        .await
-        .unwrap();
-        let discord = agent_message_router(
-            orch.clone(),
-            Arc::new(RecordingPollProvider::new()),
-            "discord",
-        );
-        let telegram_provider = Arc::new(RecordingPollProvider::new());
+        let discord =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "discord");
+        let telegram_provider = Arc::new(RecordingProvider::new());
         let telegram = agent_message_router(orch.clone(), telegram_provider.clone(), "telegram");
 
         discord
@@ -12485,21 +10535,11 @@ mod tests {
             .handle_inbound(bare("telegram:77", "to whoever is the default"))
             .await
             .unwrap();
-        ledger::follow_target(&db, "telegram", "cairn://p/cairn/performance", 1, 0)
-            .await
-            .unwrap();
-        ledger::set_focus(&db, "telegram", "cairn://p/cairn/performance", 2)
-            .await
-            .unwrap();
-        telegram
-            .handle_inbound(bare("telegram:77", "to my focus"))
-            .await
-            .unwrap();
 
         // None of these resolves to a target, so none is a project event.
         let bounded = ChannelRouter::new_for_provider(
             orch.clone(),
-            Arc::new(RecordingPollProvider::new()),
+            Arc::new(RecordingProvider::new()),
             "telegram",
             "operator".into(),
             MessageClassPolicy::default(),
@@ -12573,15 +10613,14 @@ mod tests {
                     true,
                     p.clone()
                 ),
-                ("telegram".into(), "follow".into(), "cairn".into(), true, p),
+                ("telegram".into(), "none".into(), "cairn".into(), true, p),
             ]
         );
         assert_eq!(rows[0].fields["target"], "cairn://p/cairn/general");
-        assert!(rows[1].fields["target"]
-            .as_str()
-            .unwrap()
-            .ends_with("/3404"));
-        assert_eq!(rows[2].fields["target"], "cairn://p/cairn/performance");
+        // Unaddressed text, and a reply to a message the ledger never sent,
+        // reach the default project's general thread.
+        assert_eq!(rows[1].fields["target"], "cairn://p/cairn/general");
+        assert_eq!(rows[2].fields["target"], "cairn://p/cairn/general");
         assert_eq!(admitted_inbound(&db).await.len(), 3);
         let unrouted = db
             .query_all(
@@ -12597,9 +10636,8 @@ mod tests {
             vec![
                 "discord:unbound_conversation:an unbound channel".to_string(),
                 "telegram:policy:policy says no".to_string(),
-                "telegram:unmatched:replying to nothing".to_string(),
             ],
-            "the policy refusal, the unsolicited reply, and the unbound channel are recorded as before"
+            "the policy refusal and the unbound channel are recorded as before"
         );
     }
 
@@ -12611,13 +10649,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (orch, db) =
             ambient_orchestrator(temp.path(), "channel-router-imessage-canonical.db", &[]).await;
-        ledger::follow_target(&db, "imessage", "cairn://p/cairn/general", 1, 0)
-            .await
-            .unwrap();
-        ledger::set_focus(&db, "imessage", "cairn://p/cairn/general", 2)
-            .await
-            .unwrap();
-        let router = agent_message_router(orch, Arc::new(RecordingPollProvider::new()), "imessage");
+        let router = agent_message_router(orch, Arc::new(RecordingProvider::new()), "imessage");
         for (raw, text) in [
             ("+15551234567", "from a +1 number"),
             ("Operator@Example.com", "from a mixed-case email"),
@@ -12667,11 +10699,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let discord = agent_message_router(
-            orch.clone(),
-            Arc::new(RecordingPollProvider::new()),
-            "discord",
-        );
+        let discord =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "discord");
         discord
             .handle_inbound(reply("discord:1/9", "g-ack", "no, this is performance's"))
             .await
@@ -12683,11 +10712,8 @@ mod tests {
         assert_eq!(rows[0].fields["target"], "cairn://p/cairn");
         assert_eq!(rows[0].fields["replyOf"], "ack");
 
-        let telegram = agent_message_router(
-            orch.clone(),
-            Arc::new(RecordingPollProvider::new()),
-            "telegram",
-        );
+        let telegram =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "telegram");
         assert!(telegram
             .handle_inbound(reply("telegram:77", "g-ack-2", "hm"))
             .await
@@ -12765,11 +10791,8 @@ mod tests {
 
         // The status agrees with what real matching does on a real message
         // from the conversation.
-        let router = agent_message_router(
-            orch.clone(),
-            Arc::new(RecordingPollProvider::new()),
-            "discord",
-        );
+        let router =
+            agent_message_router(orch.clone(), Arc::new(RecordingProvider::new()), "discord");
         router
             .handle_inbound(bare("discord:1/9", "anyone?"))
             .await
@@ -12817,61 +10840,6 @@ mod tests {
             status[0].consuming_routes
         );
         assert!(status[0].detail.is_some());
-    }
-
-    #[tokio::test]
-    async fn a_session_relative_poll_binding_persists_its_canonical_thread_uri() {
-        let (orch, db) = route_test_orchestrator("channel-router-relative-binding.db").await;
-        let session = seed_threads_and_an_issue(&db).await;
-        let (router, _provider) = test_router(orch);
-        let options = FollowPollOptions {
-            labels: vec!["general".to_string()],
-            bindings: HashMap::from([("general".to_string(), "cairn:~/".to_string())]),
-        };
-        let record = ledger::OutboundRecord {
-            id: "relative-poll".to_string(),
-            channel: CHANNEL.to_string(),
-            kind: "question".to_string(),
-            binding_ref: format!("{FOLLOW_POLL_PREFIX}relative"),
-            conversation: "+15551234567".to_string(),
-            job_id: Some(session),
-            rendered_text: "Follow threads\n1. general".to_string(),
-            rendering: "poll".to_string(),
-            options_json: Some(serde_json::to_string(&options).unwrap()),
-            status: "sent".to_string(),
-            provider_guid: Some("poll-guid".to_string()),
-            caption_guid: None,
-            created_at: 1,
-            sent_at: Some(1),
-            resolved_at: None,
-            last_error: None,
-            attempts: 0,
-            next_attempt_at: None,
-            last_attempt_at: None,
-            reply_to: None,
-            reply_to_guid: None,
-        };
-
-        assert_eq!(
-            router
-                .resolve_bound_target(&record, "cairn:~/task/example")
-                .await
-                .unwrap(),
-            "cairn://p/cairn/general/task/example"
-        );
-
-        router
-            .follow_poll_selection(&record, "general", &record.conversation)
-            .await
-            .unwrap();
-
-        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(follows.len(), 1);
-        assert_eq!(follows[0].uri, "cairn://p/cairn/general");
-        assert_eq!(
-            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/cairn/general")
-        );
     }
 
     /// The subject has no Discord thread yet: the route asks for one, waits with

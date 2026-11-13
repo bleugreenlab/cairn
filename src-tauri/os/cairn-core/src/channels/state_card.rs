@@ -588,7 +588,7 @@ mod tests {
              INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',7,'Card','active',1,1);
              INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e','build','i','p','running',1,1);
              INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,node_name,started_at,created_at,updated_at) VALUES('j','e','i','p','running','builder','Builder',1,1,1);
-             INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,followed_at,selected_at) VALUES('discord','discord:1/2','cairn://p/cairn/7','structural',7,1,1);",
+             INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,bound_at) VALUES('discord','discord:1/2','cairn://p/cairn/7','structural',7,1);",
         )
         .await
         .unwrap();
@@ -1052,7 +1052,7 @@ mod tests {
                  INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES('e{n}','build','i{n}','p','completed',1,1);
                  INSERT INTO jobs(id,execution_id,issue_id,project_id,status,uri_segment,node_name,started_at,completed_at,created_at,updated_at) VALUES('j{n}','e{n}','i{n}','p','complete','builder','Builder',1,2,1,1);
                  INSERT INTO check_result_cache(project_id,tree_hash,input_hash,check_name,exit_code,passed,output_tail,duration_ms,ran_at,job_id,target_results_json) VALUES('p','t{n}','in{n}','typecheck',0,1,'',1,1,'j{n}','{{\"parser\":\"tsc\",\"passed\":0,\"failed\":0,\"skipped\":0,\"failures\":[]}}');
-                 INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,followed_at,selected_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}','structural',7,1,1);
+                 INSERT INTO channel_conversation_binding(provider,conversation,target_uri,binding_kind,message_classes,bound_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}','structural',7,1);
                  INSERT INTO channel_state_card(provider,conversation,subject_uri,target_uri,project_key,job_id,status,created_at,updated_at) VALUES('discord','discord:1/{n}','cairn://p/cairn/{n}/1/builder','cairn://p/cairn/{n}','cairn','j{n}','settled',1,1);"
             ));
         }

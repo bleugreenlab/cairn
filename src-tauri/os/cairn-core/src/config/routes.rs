@@ -273,7 +273,6 @@ mod tests {
     use cairn_config::library::{LibraryRoots, Origin};
     use tempfile::tempdir;
 
-    const FOLLOWED_ID: &str = "followed-thread-stream";
     const GITHUB_MENTION_ID: &str = "github-mention";
     const AMBIENT_ID: &str = "ambient-channel";
 
@@ -315,16 +314,15 @@ mod tests {
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".cairn/routes")).unwrap();
         let shipped =
-            std::fs::read_to_string(config.join("packs/core/routes/followed-thread-stream.yaml"))
-                .unwrap();
+            std::fs::read_to_string(config.join("packs/core/routes/github-mention.yaml")).unwrap();
         std::fs::write(
-            project.join(".cairn/routes/followed-thread-stream.yaml"),
-            shipped.replace("Followed thread stream", "Project route"),
+            project.join(".cairn/routes/github-mention.yaml"),
+            shipped.replace("GitHub mentions", "Project route"),
         )
         .unwrap();
 
         let workspace = list_routes(&LibraryRoots::workspace(&config)).unwrap();
-        for id in [FOLLOWED_ID, GITHUB_MENTION_ID, AMBIENT_ID] {
+        for id in [GITHUB_MENTION_ID, AMBIENT_ID] {
             let route = ok_route(&workspace, id);
             assert_eq!(route.origin, Origin::Pack { id: "core".into() });
             assert_eq!(
@@ -337,19 +335,55 @@ mod tests {
         let routes = list_routes(&crate::config::trusted_roots(&config, &project)).unwrap();
         assert_eq!(
             routes.len(),
-            3,
+            2,
             "the project copy shadows, never duplicates"
         );
-        let route = ok_route(&routes, FOLLOWED_ID);
+        let route = ok_route(&routes, GITHUB_MENTION_ID);
         assert!(route.is_project_scoped());
         assert_eq!(route.definition.name, "Project route");
-        assert!(!ok_route(&routes, GITHUB_MENTION_ID).is_project_scoped());
         assert!(!ok_route(&routes, AMBIENT_ID).is_project_scoped());
         assert_eq!(
             workspace.len(),
-            3,
+            2,
             "one workspace route per shipped filename"
         );
+    }
+
+    /// A project that kept its own copy of a route the core pack retired now
+    /// names a fact source that no longer exists. That copy is reported as an
+    /// invalid route, naming the unknown source, and the shipped routes beside
+    /// it still load.
+    #[test]
+    fn a_project_copy_of_a_retired_route_naming_a_retired_fact_loads_as_invalid() {
+        let temp = tempdir().unwrap();
+        let config = synced_workspace(temp.path());
+        assert!(
+            !config
+                .join("packs/core/routes/followed-thread-stream.yaml")
+                .exists(),
+            "the core pack no longer ships the route"
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".cairn/routes")).unwrap();
+        std::fs::write(
+            project.join(".cairn/routes/followed-thread-stream.yaml"),
+            "name: Followed thread stream\ndescription: retired\nenabled: true\nnodes:\n  - { id: thread-stream, type: trigger, when: { fact: thread_stream, presence: away } }\n  - { id: phone, type: sink, sink: { kind: channel, register: notify, initiatedBy: operator_subscription } }\nedges:\n  - { from: thread-stream, to: phone }\ndedupe: 10m\n",
+        )
+        .unwrap();
+
+        let routes = list_routes(&crate::config::trusted_roots(&config, &project)).unwrap();
+        let invalid: Vec<_> = routes
+            .iter()
+            .filter_map(|route| match route {
+                ConfigResult::Err { path, error } => Some((path.clone(), error.clone())),
+                ConfigResult::Ok(_) => None,
+            })
+            .collect();
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert!(invalid[0].0.ends_with("followed-thread-stream.yaml"));
+        assert!(invalid[0].1.contains("thread_stream"), "{}", invalid[0].1);
+        ok_route(&routes, GITHUB_MENTION_ID);
+        ok_route(&routes, AMBIENT_ID);
     }
 
     /// Deleting a shipped route records its removal from the pack, and the
@@ -375,7 +409,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(get_route(&LibraryRoots::workspace(&config), FOLLOWED_ID)
+        assert!(get_route(&LibraryRoots::workspace(&config), AMBIENT_ID)
             .unwrap()
             .is_some());
     }
@@ -390,7 +424,7 @@ mod tests {
         std::fs::create_dir_all(config.join("routes")).unwrap();
         std::fs::write(
             config.join("routes/legacy.yaml"),
-            "name: Legacy\ndescription: written before routes were graphs\nwhen:\n  - fact: thread_stream\n    presence: away\ntransforms: []\nto:\n  kind: channel\n  register: notify\n  initiatedBy: operator_subscription\ndedupe: 10m\n",
+            "name: Legacy\ndescription: written before routes were graphs\nwhen:\n  - fact: attention\n    presence: away\ntransforms: []\nto:\n  kind: channel\n  register: notify\n  initiatedBy: operator_subscription\ndedupe: 10m\n",
         )
         .unwrap();
 
@@ -409,14 +443,13 @@ mod tests {
         let config = synced_workspace(temp.path());
         let project = temp.path().join("project");
         let shipped =
-            std::fs::read_to_string(config.join("packs/core/routes/followed-thread-stream.yaml"))
-                .unwrap();
+            std::fs::read_to_string(config.join("packs/core/routes/github-mention.yaml")).unwrap();
         std::fs::create_dir_all(project.join(".cairn/routes")).unwrap();
         std::fs::create_dir_all(config.join("routes")).unwrap();
         std::fs::write(config.join("routes/workspace.yaml"), &shipped).unwrap();
         std::fs::write(
             project.join(".cairn/routes/project.yaml"),
-            shipped.replace("Followed thread stream", "Project only"),
+            shipped.replace("GitHub mentions", "Project only"),
         )
         .unwrap();
 
@@ -429,6 +462,8 @@ mod tests {
         assert_eq!(route.id, "project");
         assert!(route.is_project_scoped());
         assert!(get_project_route(&roots, "workspace").unwrap().is_none());
-        assert!(get_project_route(&roots, FOLLOWED_ID).unwrap().is_none());
+        assert!(get_project_route(&roots, GITHUB_MENTION_ID)
+            .unwrap()
+            .is_none());
     }
 }

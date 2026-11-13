@@ -187,15 +187,13 @@ pub async fn ensure_discord_thread_surface(
     Ok(())
 }
 
-/// The one provider a route submission is for, if it is not for every
-/// provider: the destination's provider for a directed sink, otherwise the
-/// provider the route lane addressed it to.
+/// The one provider a route submission is for: the destination's provider
+/// for a directed sink. An undirected submission is for every provider.
 fn route_submission_provider(submission: &crate::routes::ChannelSubmission) -> Option<&str> {
     submission
         .destination
         .as_ref()
         .map(|address| address.provider().id())
-        .or(submission.provider.as_deref())
 }
 
 pub async fn configured_conversations_json(
@@ -1270,6 +1268,7 @@ fn feed_state(liveness: Option<ChannelLiveness>, now: i64) -> &'static str {
 pub mod agent_message;
 pub mod ambient_feedback;
 pub mod bindings;
+pub mod default_project;
 pub mod discord_surfaces;
 pub mod imessage;
 pub mod imessage_receipts;
@@ -1767,7 +1766,6 @@ mod tests {
             initiated_by: None,
             destination: Some("discord:1/2".parse().unwrap()),
             fact_log_id: None,
-            provider: None,
         };
         assert_eq!(route_submission_provider(&submission), Some("discord"));
         let providers = ["imessage", "telegram", "discord"];
