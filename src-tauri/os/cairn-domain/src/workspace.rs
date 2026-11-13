@@ -142,12 +142,25 @@ where
     Ok(Some(value))
 }
 
+/// The in-app channel: messages to the operator that stay in Cairn, at
+/// `cairn://operator`. It is not a transport, so the operator's purpose line is
+/// all there is to configure.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppChannelConfig {
+    /// The operator's one line on what the app channel is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+}
+
 /// Workspace-owned delivery policy for external message channels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelsConfig {
     #[serde(default = "default_channel_thread")]
     pub default_thread: String,
+    #[serde(default)]
+    pub app: AppChannelConfig,
     #[serde(default)]
     pub imessage: IMessageChannelConfig,
     #[serde(default)]
@@ -164,6 +177,7 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             default_thread: default_channel_thread(),
+            app: AppChannelConfig::default(),
             imessage: IMessageChannelConfig::default(),
             telegram: TelegramChannelConfig::default(),
             discord: DiscordChannelConfig::default(),

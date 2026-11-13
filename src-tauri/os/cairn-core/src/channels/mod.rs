@@ -1234,8 +1234,10 @@ pub mod ambient_feedback;
 pub mod bindings;
 pub mod discord_surfaces;
 pub mod imessage;
+pub mod imessage_receipts;
 pub mod label;
 pub mod ledger;
+pub mod operator_message;
 pub mod router;
 pub mod state_card;
 

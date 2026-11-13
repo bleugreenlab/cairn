@@ -63,7 +63,7 @@ pub(crate) const CHANNELS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Channels,
     uri_template: "cairn://channels",
     name: "Channels",
-    description: "The external-channel providers (Discord, iMessage, Telegram), one row each: whether it is enabled, its runtime health and detail (Discord's card-pin degradation is reported here, once), the operator's purpose line for it, operator presence (for iMessage, the presence its local probe reads), when the operator last wrote on it, and a link to its conversations at cairn://channels/{provider}. The purpose is the line an agent reads to decide which provider a message belongs on. Only the verified desktop operator may patch {provider, purpose}; an agent's or any run-less caller's patch is refused.",
+    description: "The channel providers, one row each: the in-app channel (`app`, whose conversations are the operator's own messages at cairn://operator) and the external transports (Discord, iMessage, Telegram), each with whether it is enabled, its runtime health and detail (Discord's card-pin degradation is reported here, once), the operator's purpose line for it, operator presence (for iMessage, the presence its local probe reads), when the operator last wrote on it, and a link to its conversations at cairn://channels/{provider}. The purpose is the line an agent reads to decide which provider a message belongs on. Only the verified desktop operator may patch {provider, purpose}; an agent's or any run-less caller's patch is refused.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

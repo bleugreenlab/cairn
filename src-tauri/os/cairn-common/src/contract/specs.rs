@@ -8,8 +8,11 @@ use cairn_uri::ResourceKind;
 // where the key name + type + example don't already make the value obvious; an
 // empty note renders as just `key(type)`.
 pub(crate) const CONTENT: KeySpec = KeySpec::new("content", KeyType::Str, "");
-pub(crate) const CHANNEL_PROVIDER: KeySpec =
-    KeySpec::new("provider", KeyType::Str, "discord | imessage | telegram");
+pub(crate) const CHANNEL_PROVIDER: KeySpec = KeySpec::new(
+    "provider",
+    KeyType::Str,
+    "app | discord | imessage | telegram",
+);
 pub(crate) const CHANNEL_PURPOSE: KeySpec = KeySpec::new(
     "purpose",
     KeyType::Str,
@@ -28,6 +31,26 @@ pub(crate) const AMBIENT_FEEDBACK_TO: KeySpec = KeySpec::new(
     "the chartered thread URI that owns it; required for reroute, refused for not_mine",
 );
 pub(crate) const AMBIENT_FEEDBACK_NOTE: KeySpec = KeySpec::new("note", KeyType::Str, "");
+pub(crate) const OPERATOR_CONTENT: KeySpec = KeySpec::new(
+    "content",
+    KeyType::Str,
+    "the claim, at most 400 characters and the channel's own limit; refused, never truncated",
+);
+pub(crate) const OPERATOR_VIA: KeySpec = KeySpec::new(
+    "via",
+    KeyType::Str,
+    "cairn://channels/app | cairn://channels/imessage | cairn://channels/telegram; a channel cairn://operator lists with a purpose line",
+);
+pub(crate) const OPERATOR_DEFAULT: KeySpec = KeySpec::new(
+    "default",
+    KeyType::Str,
+    "what you will do, on what assumption, and when, without a reply (at most 400 characters); makes the message wait on him",
+);
+pub(crate) const OPERATOR_HEADLINE: KeySpec = KeySpec::new(
+    "headline",
+    KeyType::Any,
+    "your thread's headline row URI (cairn://p/{project}/{thread}/db/headlines/{id}), or {line, ref, until} to write one (counts against the 10 live)",
+);
 pub(crate) const CHANNEL_MESSAGE_CONTENT: KeySpec = KeySpec::new(
     "content",
     KeyType::Str,

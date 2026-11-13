@@ -287,6 +287,11 @@ pub trait IMessageExecutor: Send + Sync {
     }
 
     async fn run(&self, args: Vec<String>) -> Result<CommandResult, String>;
+    /// Run `sh` with `args` where imsg runs: the one read-only query over the
+    /// Messages database that read receipts need (see `imessage_receipts`).
+    async fn run_shell(&self, _args: Vec<String>) -> Result<CommandResult, String> {
+        Err("this iMessage placement cannot read the Messages database".to_string())
+    }
     async fn watch(
         &self,
         args: Vec<String>,
@@ -324,6 +329,25 @@ impl IMessageExecutor for LocalProcessExecutor {
         })
         .await
         .map_err(|error| format!("imsg task failed: {error}"))?
+    }
+
+    async fn run_shell(&self, args: Vec<String>) -> Result<CommandResult, String> {
+        let process = self.process.clone();
+        tokio::task::spawn_blocking(move || {
+            let output = process.run(SpawnConfig::new("sh").args(&args))?;
+            if !output.success {
+                return Err(format!(
+                    "sh exited unsuccessfully: {}",
+                    output.stderr.trim()
+                ));
+            }
+            Ok(CommandResult {
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        })
+        .await
+        .map_err(|error| format!("sh task failed: {error}"))?
     }
 
     async fn watch(
@@ -434,6 +458,20 @@ impl IMessageExecutor for PlacedProcessExecutor {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if output.exit_code != Some(0) {
             return Err(command_error(&stderr));
+        }
+        Ok(CommandResult { stdout, stderr })
+    }
+
+    async fn run_shell(&self, args: Vec<String>) -> Result<CommandResult, String> {
+        let output = self
+            .lease
+            .run_one_shot("sh", args, PLACED_COMMAND_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string())?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.exit_code != Some(0) {
+            return Err(format!("sh exited unsuccessfully: {}", stderr.trim()));
         }
         Ok(CommandResult { stdout, stderr })
     }
@@ -1166,6 +1204,17 @@ impl ChannelProvider for IMessageProvider {
 
     async fn cleanup_question(&self, message: &ResolvedQuestionMessage) -> Result<(), String> {
         IMessageProvider::cleanup_question(self, message).await
+    }
+
+    async fn read_receipts(&self, guids: &[String]) -> Result<Vec<(String, i64)>, String> {
+        let Some(sql) = super::imessage_receipts::receipt_query(guids) else {
+            return Ok(Vec::new());
+        };
+        let output = self
+            .executor
+            .run_shell(super::imessage_receipts::query_command(&sql))
+            .await?;
+        super::imessage_receipts::parse(&output.stdout)
     }
 }
 

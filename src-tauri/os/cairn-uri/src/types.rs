@@ -1075,7 +1075,8 @@ pub enum CairnResource {
     /// presence.
     Channels,
     /// One provider's conversations the reader can reach. `provider` is
-    /// `discord`, `imessage`, or `telegram`.
+    /// `app`, `discord`, `imessage`, or `telegram`; `app` has no conversations
+    /// and points at `cairn://operator`.
     ChannelsProvider {
         provider: String,
     },
@@ -1090,6 +1091,13 @@ pub enum CairnResource {
     /// The ambient Discord route's label set: one row per routing outcome,
     /// read by judgment and labelled by the receiving threads.
     ChannelsAmbientFeedback,
+    /// The operator as a recipient: his channels with their purpose lines, his
+    /// presence and last-seen, and the reader's own messages to him.
+    Operator,
+    /// One message addressed to the operator, by its id.
+    OperatorMessage {
+        id: String,
+    },
     /// Workspace-level fleet collection: every enrolled executor by public name.
     ///
     /// Machines are machine-scoped rather than project-scoped, so the family
@@ -1360,6 +1368,8 @@ impl CairnResource {
             Self::ChannelsProvider { .. } => ResourceKind::ChannelsProvider,
             Self::ChannelsConversation { .. } => ResourceKind::ChannelsConversation,
             Self::ChannelsAmbientFeedback => ResourceKind::ChannelsAmbientFeedback,
+            Self::Operator => ResourceKind::Operator,
+            Self::OperatorMessage { .. } => ResourceKind::OperatorMessage,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,
             Self::Requests => ResourceKind::Requests,

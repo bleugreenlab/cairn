@@ -1654,6 +1654,8 @@ impl CairnResource {
                 uri
             }
             Self::ChannelsAmbientFeedback => "cairn://channels/ambient/feedback".to_string(),
+            Self::Operator => "cairn://operator".to_string(),
+            Self::OperatorMessage { id } => format!("cairn://operator/messages/{id}"),
             Self::Executors => "cairn://executors".to_string(),
             Self::Requests => "cairn://requests".to_string(),
             Self::Request { id } => format!("cairn://requests/{id}"),

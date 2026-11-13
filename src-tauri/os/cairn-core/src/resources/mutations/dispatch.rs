@@ -35,6 +35,7 @@ mod messages;
 mod models;
 mod models_accounts;
 mod nodes;
+mod operator;
 mod packs;
 mod pages;
 mod posts;
@@ -704,6 +705,10 @@ pub(crate) async fn dispatch_resource_change_under_store(
         summary
     } else if let Some(summary) =
         off_frame(|| channels::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| operator::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else {

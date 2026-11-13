@@ -2511,6 +2511,9 @@ externalReplies: disabled
 
         let channels = ChannelsConfig {
             default_thread: "cairn://p/CAIRN/3404".to_string(),
+            app: crate::models::AppChannelConfig {
+                purpose: Some("everything else".to_string()),
+            },
             imessage: IMessageChannelConfig {
                 enabled: true,
                 executor: Some("bglab-mac".to_string()),

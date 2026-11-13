@@ -13,8 +13,8 @@ use uuid::Uuid;
 use super::{
     agent_message,
     bindings::{BindingKind, FollowTarget},
-    ledger, render_text_floor, AskOption, ChannelProvider, InboundEvent, OperatorPresence,
-    OutboundAsk, OutboundInitiator, OutboundMessage, ResolvedQuestionMessage,
+    ledger, operator_message, render_text_floor, AskOption, ChannelProvider, InboundEvent,
+    OperatorPresence, OutboundAsk, OutboundInitiator, OutboundMessage, ResolvedQuestionMessage,
 };
 use crate::routes::{ChannelSubmission, RouteFact};
 use crate::{
@@ -51,7 +51,12 @@ const SWEEP_FLOOR: Duration = Duration::from_secs(1);
 const ATTENTION_GRACE: Duration = Duration::from_secs(3 * 60);
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_CAP: Duration = Duration::from_secs(5 * 60);
-const MAX_ATTEMPTS: i64 = 6;
+pub(crate) const MAX_ATTEMPTS: i64 = 6;
+/// How often the iMessage router asks the Messages database for read receipts,
+/// and only while an operator message it sent is still unread.
+const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(120);
+/// How long after sending an operator message a read receipt is looked for.
+const RECEIPT_WINDOW_MS: i64 = 72 * 60 * 60 * 1000;
 /// How long an undirected Discord route waits for its subject's structural
 /// surface to be created before its firing is recorded as failed.
 const SURFACE_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -324,6 +329,17 @@ impl AmbientAddress {
             Self::Channel(id) => format!("<#{id}>"),
         }
     }
+}
+
+/// Whether a sent outbound row is an ask that unaddressed text can answer. An
+/// agent's message and a message to the operator ask nothing: only a reply
+/// attributed to them by guid reaches their sender, so they never stand as the
+/// one active ask bare text resolves against.
+fn is_answerable_ask(record: &ledger::OutboundRecord) -> bool {
+    !matches!(
+        record.kind.as_str(),
+        agent_message::KIND | operator_message::KIND
+    )
 }
 
 fn routed_gate_target(uri: &str) -> Option<String> {
@@ -1267,6 +1283,12 @@ pub struct ChannelRouter {
     /// Keyed by binding ref, so a fact re-submitted while its surface is still
     /// being created waits once.
     held_routes: Mutex<HashMap<String, HeldRoute>>,
+    /// When this router last asked its provider for operator-message read
+    /// receipts.
+    receipts_polled_at: Mutex<Option<Instant>>,
+    /// Operator messages whose receipt lookup failure was already logged, so a
+    /// standing failure logs once per message rather than every poll.
+    receipt_failures_logged: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1346,6 +1368,8 @@ impl ChannelRouter {
             gate_snapshots: Mutex::new(HashMap::new()),
             unsent: Mutex::new(HashSet::new()),
             held_routes: Mutex::new(HashMap::new()),
+            receipts_polled_at: Mutex::new(None),
+            receipt_failures_logged: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1748,15 +1772,31 @@ impl ChannelRouter {
         Ok(())
     }
 
-    /// Deliver one ledgered agent message through the ordinary outbound path, so
-    /// its claim, retry backoff, `last_error`, and attempt cap are the same as
-    /// every other intent's. Reports whether it went on the wire.
+    /// Deliver one ledgered agent message, or message to the operator, through
+    /// the ordinary outbound path, so its claim, retry backoff, `last_error`,
+    /// and attempt cap are the same as every other intent's. Reports whether it
+    /// went on the wire.
     async fn deliver_agent_message(&self, record: ledger::OutboundRecord) -> Result<bool, String> {
-        let context = agent_message::sender_home(&record.binding_ref)
+        let (kind, sender_home) = if record.kind == operator_message::KIND {
+            let sender = match operator_message::message_id(&record.binding_ref) {
+                Some(id) => crate::operator::messages::get(&self.orch.db.local, id)
+                    .await?
+                    .map(|message| message.sender_home),
+                None => None,
+            };
+            (operator_message::KIND, sender)
+        } else {
+            (
+                agent_message::KIND,
+                agent_message::sender_home(&record.binding_ref).map(str::to_string),
+            )
+        };
+        let context = sender_home
+            .as_deref()
             .map(agent_message::context_header)
             .unwrap_or_else(|| "[Cairn]".to_string());
         let gate = Gate {
-            kind: agent_message::KIND,
+            kind,
             initiated_by: OutboundInitiator::Agent,
             binding_ref: record.binding_ref,
             job_id: record.job_id,
@@ -1782,9 +1822,13 @@ impl ChannelRouter {
         let Some(record) = ledger::get_by_id(self.ledger(), intent_id).await? else {
             return Err(format!("agent message intent {intent_id} is not ledgered"));
         };
-        if record.kind != agent_message::KIND || record.channel != self.provider_id {
+        if !matches!(
+            record.kind.as_str(),
+            agent_message::KIND | operator_message::KIND
+        ) || record.channel != self.provider_id
+        {
             return Err(format!(
-                "intent {intent_id} is a {} {} row, not a {} agent message",
+                "intent {intent_id} is a {} {} row, not a {} agent or operator message",
                 record.channel, record.kind, self.provider_id
             ));
         }
@@ -1796,14 +1840,21 @@ impl ChannelRouter {
     /// failed rows whose retry is due. Racing the inbox is safe because
     /// `begin_delivery` / `begin_retry_delivery` admit exactly one sender.
     async fn deliver_pending_agent_messages(&self) -> Result<(), String> {
-        let due = ledger::list_due_deliveries(
-            self.ledger(),
-            self.provider_id,
-            agent_message::KIND,
-            chrono::Utc::now().timestamp_millis(),
-            MAX_ATTEMPTS,
-        )
-        .await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut due = Vec::new();
+        for kind in [agent_message::KIND, operator_message::KIND] {
+            due.extend(
+                ledger::list_due_deliveries(
+                    self.ledger(),
+                    self.provider_id,
+                    kind,
+                    now,
+                    MAX_ATTEMPTS,
+                )
+                .await?,
+            );
+        }
+        due.sort_by_key(|record| record.created_at);
         let mut delivered = 0;
         for record in due {
             if delivered == SWEEP_LIMIT {
@@ -2538,8 +2589,8 @@ impl ChannelRouter {
     /// awaited here, so a slow or hanging route never holds the inbound loop.
     /// Failures are logged rather than returned, because the message itself has
     /// already been delivered (or, for unaddressed ambient text, is now the
-    /// route engine's to act on).
-    async fn admit_message(&self, message: AdmittedMessage<'_>) {
+    /// route engine's to act on). Returns the inbound id it recorded.
+    async fn admit_message(&self, message: AdmittedMessage<'_>) -> Option<String> {
         let conversation = canonical_inbound_conversation(message.conversation);
         let message = AdmittedMessage {
             conversation: &conversation,
@@ -2579,7 +2630,7 @@ impl ChannelRouter {
                 self.provider_id,
                 message.conversation
             );
-            return;
+            return None;
         }
         let _ = self.orch.services.emitter.emit(
             "db-change",
@@ -2591,6 +2642,7 @@ impl ChannelRouter {
                 message.conversation
             );
         }
+        Some(id)
     }
 
     async fn mint_channel_message(
@@ -3023,6 +3075,58 @@ impl ChannelRouter {
         if let Err(error) = self.sweep_pending_cleanup().await {
             log::warn!("channel ask cleanup sweep failed: {error}");
         }
+        if let Err(error) = self.sweep_operator_receipts().await {
+            log::warn!("channel operator receipt sweep failed: {error}");
+        }
+    }
+
+    /// Ask the provider for read receipts on the operator messages it sent in
+    /// the last three days that are still unread, at most once per
+    /// [`RECEIPT_POLL_INTERVAL`] and only while there are some. A failed
+    /// lookup is inert: it touches no delivery state and logs once per message.
+    async fn sweep_operator_receipts(&self) -> Result<(), String> {
+        if self.provider_id != "imessage" {
+            return Ok(());
+        }
+        if self
+            .receipts_polled_at
+            .lock()
+            .expect("receipt poll lock poisoned")
+            .is_some_and(|at| at.elapsed() < RECEIPT_POLL_INTERVAL)
+        {
+            return Ok(());
+        }
+        let since = chrono::Utc::now().timestamp_millis() - RECEIPT_WINDOW_MS;
+        let unread = ledger::unread_operator_sends(self.ledger(), self.provider_id, since).await?;
+        if unread.is_empty() {
+            return Ok(());
+        }
+        *self
+            .receipts_polled_at
+            .lock()
+            .expect("receipt poll lock poisoned") = Some(Instant::now());
+        let guids = unread
+            .iter()
+            .map(|(_, guid)| guid.clone())
+            .collect::<Vec<_>>();
+        let receipts = match self.provider.read_receipts(&guids).await {
+            Ok(receipts) => receipts,
+            Err(error) => {
+                let mut logged = self
+                    .receipt_failures_logged
+                    .lock()
+                    .expect("receipt failure set poisoned");
+                for (binding_ref, _) in &unread {
+                    if logged.insert(binding_ref.clone()) {
+                        log::warn!("no read receipt for {binding_ref}: {error}");
+                    }
+                }
+                return Ok(());
+            }
+        };
+        super::imessage_receipts::apply(&self.orch, self.provider_id, &unread, &receipts)
+            .await
+            .map(|_| ())
     }
 
     async fn sweep_pending_domain_actions(&self) -> Result<(), String> {
@@ -3903,6 +4007,7 @@ impl ChannelRouter {
                 .into_iter()
                 .filter(|record| {
                     record.status == "sent"
+                        && is_answerable_ask(record)
                         && super::address::normalize_imessage_handle(&record.conversation)
                             == super::address::normalize_imessage_handle(sender)
                 })
@@ -4076,6 +4181,60 @@ impl ChannelRouter {
         }
     }
 
+    /// The operator's reply to a message he was sent: delivered to its sender
+    /// (a thread steered through its own append, an issue node through its
+    /// job), headed by the message it answers, and recorded as the answer.
+    async fn deliver_operator_reply(
+        &self,
+        record: ledger::OutboundRecord,
+        conversation: &str,
+        sender: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        let id = operator_message::message_id(&record.binding_ref)
+            .ok_or_else(|| format!("operator reply names no message: {}", record.binding_ref))?
+            .to_string();
+        let message = crate::operator::messages::get(&self.orch.db.local, &id)
+            .await?
+            .ok_or_else(|| format!("operator reply names an unknown message: {id}"))?;
+        let project_key = parse_uri(&message.sender_home)
+            .and_then(|home| home.project().map(cairn_uri::canonical_project))
+            .ok_or_else(|| format!("operator message {id} has no sender to answer"))?;
+        // The answer goes to the job that asked, not to the issue-level
+        // target a followed conversation resolves to.
+        crate::operator::messages::deliver_answer(
+            &self.orch,
+            &message,
+            &channel_sender_name(self.provider_id),
+            text,
+        )
+        .await?;
+        let binding_kind = self.reply_binding_kind(conversation).await?;
+        let inbound = self
+            .admit_message(AdmittedMessage {
+                conversation,
+                sender,
+                text,
+                binding_kind,
+                target_uri: routed_gate_target(&message.sender_home)
+                    .unwrap_or_else(|| message.sender_home.clone()),
+                project_key,
+                addressed: true,
+                reply_of: Some(record.id),
+                addressed_by: None,
+            })
+            .await;
+        crate::operator::record_answered(
+            &self.orch,
+            &id,
+            crate::operator::AnsweredVia::Reply,
+            inbound.as_deref(),
+            chrono::Utc::now().timestamp(),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn resolve_bound(
         &self,
         guid: &str,
@@ -4188,6 +4347,11 @@ impl ChannelRouter {
                     )
                     .await;
             }
+            if record.kind == operator_message::KIND {
+                return self
+                    .deliver_operator_reply(record, conversation, sender, text)
+                    .await;
+            }
             return self.resolve_record(record, sender, text).await;
         }
         if poll_command(text).is_some() || text.trim_start().starts_with('/') {
@@ -4298,6 +4462,7 @@ impl ChannelRouter {
             .into_iter()
             .filter(|record| {
                 record.status == "sent"
+                    && is_answerable_ask(record)
                     && super::address::normalize_imessage_handle(&record.conversation)
                         == super::address::normalize_imessage_handle(sender)
             })
@@ -9631,6 +9796,269 @@ mod tests {
         let record = ledger::get_by_id(&db, &id).await.unwrap().unwrap();
         assert_eq!(record.status, "sent");
         crate::channels::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Auto);
+    }
+
+    /// A message to the operator on his iMessage conversation, written as the
+    /// `cairn://operator` append writes it.
+    async fn operator_message_row(db: &LocalDb, id: &str, home: &str, job_id: &str) {
+        use crate::operator::messages::{insert, NewDelivery, NewMessage};
+        insert(
+            db,
+            &NewMessage {
+                id: id.to_string(),
+                project_id: "p".to_string(),
+                sender_home: home.to_string(),
+                sender_job_id: job_id.to_string(),
+                via: crate::operator::Via::IMessage,
+                content: "Ship it?".to_string(),
+                default_text: Some("I ship Friday".to_string()),
+                headline: None,
+                created_at: 1,
+            },
+            Some(&NewDelivery {
+                channel: "imessage",
+                conversation: "operator".to_string(),
+                rendered_text: operator_message::render("Ship it?", Some("I ship Friday")),
+                created_at_ms: chrono::Utc::now().timestamp_millis(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn operator_state(db: &LocalDb, id: &str) -> crate::operator::State {
+        let message = crate::operator::messages::get(db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        let row = crate::operator::messages::delivery(db, &message)
+            .await
+            .unwrap();
+        crate::operator::messages::state(&message, row.as_ref())
+    }
+
+    /// The operator's purpose line is the grant: his message goes out on the
+    /// hand-off while he is at the desktop, never parked for presence, and his
+    /// reply to it reaches the sending thread and answers it.
+    #[tokio::test]
+    #[serial_test::serial(operator_presence)]
+    async fn an_operator_message_sends_while_present_and_a_reply_answers_it() {
+        crate::channels::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Active);
+        let (orch, db) = route_test_orchestrator("operator-message-present.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(PresentProvider {
+            sends: Mutex::new(Vec::new()),
+            presence_checks: Mutex::new(0),
+            presence: Mutex::new(OperatorPresence::Present),
+        });
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+        operator_message_row(&db, "m-op", "cairn://p/cairn/general", &session).await;
+        assert_eq!(
+            operator_state(&db, "m-op").await,
+            crate::operator::State::Sent
+        );
+
+        router.submit_agent_message("m-op").await.unwrap();
+        crate::channels::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Auto);
+
+        let sends = provider.sends.lock().unwrap().clone();
+        assert_eq!(sends.len(), 1, "sent on the hand-off");
+        assert!(router.deferred_attention.lock().unwrap().is_empty());
+        assert_eq!(sends[0].initiated_by, OutboundInitiator::Agent);
+        assert_eq!(sends[0].conversation, "operator");
+        assert_eq!(sends[0].context_header, "[Cairn · cairn/general]");
+        assert!(matches!(
+            &sends[0].ask,
+            OutboundAsk::Notify { text } if text == "Ship it?\n\nIf I don't hear back: I ship Friday"
+        ));
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM channel_outbound WHERE kind = 'operator'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            operator_state(&db, "m-op").await,
+            crate::operator::State::Delivered
+        );
+
+        router
+            .resolve_bound("stream-guid", "operator", "operator", "yes, ship it")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT content FROM messages WHERE channel_type = 'thread' ORDER BY created_at DESC LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("[Reply to cairn://operator/messages/m-op] yes, ship it"),
+            "the reply lands in the sending thread through its own append, which steers it"
+        );
+        let answered = crate::operator::messages::get(&db, "m-op")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            answered.answered_via,
+            Some(crate::operator::AnsweredVia::Reply)
+        );
+        let inbound = answered.answer_ref.expect("the inbound row is the answer");
+        assert!(ledger::get_inbound(&db, &inbound).await.unwrap().is_some());
+        assert!(matches!(
+            operator_state(&db, "m-op").await,
+            crate::operator::State::Answered { .. }
+        ));
+    }
+
+    /// A reply reaches exactly the job that sent the message: one of two
+    /// nodes on the same issue, or a thread's task, never the issue's root
+    /// job or the thread's session.
+    #[tokio::test]
+    async fn a_reply_to_an_operator_message_reaches_the_job_that_sent_it() {
+        let (orch, db) = route_test_orchestrator("operator-reply-sender.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        db.execute_batch(
+            "INSERT INTO jobs (id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+               VALUES ('j-root', 'i-live', 'p', 'complete', 'planner', 'planner', 9, 9),
+                      ('j-builder', 'i-live', 'p', 'complete', 'builder', 'builder', 10, 10);
+             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('r-root', 'p', 'j-root', 'complete', 20, 20),
+                      ('r-builder', 'p', 'j-builder', 'complete', 10, 10);",
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(RecordingPollProvider::new());
+        let router = agent_message_router(orch, provider, "imessage");
+        for (id, home, job) in [
+            ("m-builder", "cairn://p/cairn/3757/1/builder", "j-builder"),
+            ("m-task", "cairn://p/cairn/general/task/survey", "j-task"),
+        ] {
+            operator_message_row(&db, id, home, job).await;
+            router.submit_agent_message(id).await.unwrap();
+            let guid = ledger::get_by_id(&db, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .provider_guid
+                .unwrap();
+            router
+                .resolve_bound(&guid, "operator", "operator", "go ahead")
+                .await
+                .unwrap();
+            let queued = db
+                .query_all("SELECT job_id, content FROM queued_messages", (), |row| {
+                    Ok((row.text(0)?, row.text(1)?))
+                })
+                .await
+                .unwrap();
+            let to_sender = queued
+                .iter()
+                .filter(|(job_id, content)| {
+                    job_id == job
+                        && content.contains(&format!(
+                            "[Reply to cairn://operator/messages/{id}] go ahead"
+                        ))
+                })
+                .count();
+            assert_eq!(to_sender, 1, "{id}: {queued:?}");
+            assert!(
+                queued
+                    .iter()
+                    .all(|(job_id, _)| job_id != "j-root" && *job_id != session),
+                "{id}: no other job hears it: {queued:?}"
+            );
+            assert!(matches!(
+                operator_state(&db, id).await,
+                crate::operator::State::Answered { .. }
+            ));
+        }
+    }
+
+    /// A message to the operator asks nothing, so it never stands as the active
+    /// ask that unaddressed text answers: not once it is answered, and not
+    /// beside a real question.
+    #[tokio::test]
+    async fn an_operator_message_is_never_the_active_ask_bare_text_answers() {
+        let (orch, db) = route_test_orchestrator("operator-not-an-ask.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(RecordingPollProvider::new());
+        let router = agent_message_router(orch.clone(), provider.clone(), "imessage");
+        operator_message_row(&db, "m-done", "cairn://p/cairn/general", &session).await;
+        router.submit_agent_message("m-done").await.unwrap();
+        crate::operator::record_answered(
+            &orch,
+            "m-done",
+            crate::operator::AnsweredVia::App,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        let record = ledger::get_by_id(&db, "m-done").await.unwrap().unwrap();
+        assert!(!is_answerable_ask(&record));
+
+        // With no ask standing, bare text falls through to the focus/default
+        // fallback (whose default thread this fixture lacks); what it must
+        // never do is resolve against the operator row.
+        if let Err(error) = router
+            .handle_inbound(InboundEvent::Bare {
+                conversation: "operator".into(),
+                sender: "operator".into(),
+                text: "unrelated news".into(),
+            })
+            .await
+        {
+            assert!(
+                !error.contains("unknown channel outbound kind"),
+                "bare text was resolved against the operator row: {error}"
+            );
+        }
+
+        db.execute_batch(
+            "INSERT INTO channel_outbound (id, channel, kind, binding_ref, conversation, rendered_text, rendering, status, provider_guid, created_at, sent_at)
+               VALUES ('q-open', 'imessage', 'question', 'prompt-x:0', 'operator', 'Pick one', 'text', 'sent', 'q-guid', 5, 5);",
+        )
+        .await
+        .unwrap();
+        let _ = router
+            .handle_inbound(InboundEvent::Bare {
+                conversation: "operator".into(),
+                sender: "operator".into(),
+                text: "1".into(),
+            })
+            .await;
+        let notices = provider.deliveries.lock().unwrap().clone();
+        assert!(
+            notices.iter().all(|sent| !matches!(
+                &sent.ask,
+                OutboundAsk::Notify { text } if text.contains("more than one active ask")
+            )),
+            "the question is the one active ask: {notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_operator_message_reads_delivery_failed_with_its_attempts() {
+        let (orch, db) = route_test_orchestrator("operator-message-failed.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let router = agent_message_router(orch, Arc::new(FailingNotifyProvider), "imessage");
+        operator_message_row(&db, "m-fail", "cairn://p/cairn/general", &session).await;
+
+        router.deliver_pending_agent_messages().await.unwrap();
+        assert_eq!(
+            operator_state(&db, "m-fail").await,
+            crate::operator::State::DeliveryFailed {
+                error: "bridge send failed".to_string(),
+                attempts: 1,
+                retrying: true,
+            }
+        );
     }
 
     #[tokio::test]

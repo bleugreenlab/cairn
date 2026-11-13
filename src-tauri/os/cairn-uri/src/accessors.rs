@@ -308,6 +308,8 @@ impl CairnResource {
             | Self::ChannelsProvider { .. }
             | Self::ChannelsConversation { .. }
             | Self::ChannelsAmbientFeedback
+            | Self::Operator
+            | Self::OperatorMessage { .. }
             | Self::Executors
             | Self::Executor { .. }
             | Self::Requests
@@ -526,6 +528,8 @@ impl CairnResource {
             | Self::ChannelsProvider { .. }
             | Self::ChannelsConversation { .. }
             | Self::ChannelsAmbientFeedback
+            | Self::Operator
+            | Self::OperatorMessage { .. }
             | Self::Executors
             | Self::Executor { .. }
             | Self::Requests

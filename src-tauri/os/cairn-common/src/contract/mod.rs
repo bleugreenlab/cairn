@@ -21,6 +21,7 @@ mod issues;
 mod jobs;
 mod models;
 mod nodes;
+mod operator;
 mod pages;
 mod posts;
 mod projects;
@@ -91,6 +92,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::CHANNELS_PROVIDER_CONTRACT,
     globals::CHANNELS_CONVERSATION_CONTRACT,
     globals::CHANNELS_AMBIENT_FEEDBACK_CONTRACT,
+    operator::OPERATOR_CONTRACT,
+    operator::OPERATOR_MESSAGE_CONTRACT,
     globals::EXECUTORS_CONTRACT,
     globals::EXECUTOR_CONTRACT,
     requests::REQUESTS_CONTRACT,

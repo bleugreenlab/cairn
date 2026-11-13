@@ -2581,6 +2581,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "headline_read_cursors",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // Messages addressed to this install's operator, with whether he has seen
+    // and answered each: his own correspondence, private for the same reason
+    // as his read cursors.
+    (
+        "operator_messages",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     // How far this operator has read each camp's posts, private like the
     // posts it counts and for the same reason as the read positions above.
     (
@@ -7090,5 +7097,134 @@ mod camps_conversations_migration_tests {
                 "camp-passive:post_created.camp"
             ]
         );
+    }
+
+    /// The `operator` kind rebuilds `channel_outbound`: every row of every
+    /// earlier kind and status keeps every value (attempts, guids, schedules),
+    /// gains a NULL `read_at`, and the CHECK still refuses a kind it never
+    /// named.
+    #[tokio::test]
+    async fn operator_messages_rebuild_keeps_every_outbound_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("operator-messages.turso.db"))
+            .await
+            .unwrap();
+        let name = "operator_messages";
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != name)
+            .copied()
+            .collect::<Vec<_>>();
+        let target = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == name)
+            .copied()
+            .expect("operator_messages is in the private lineage");
+        MigrationRunner::new(before).run(&db).await.unwrap();
+
+        let kinds = ["question", "permission", "review", "route", "message"];
+        let statuses = [
+            "pending",
+            "sent",
+            "cleanup_pending",
+            "resolved",
+            "failed",
+            "expired",
+        ];
+        let mut script = String::new();
+        let mut expected = Vec::new();
+        for (k, kind) in kinds.iter().enumerate() {
+            for (s, status) in statuses.iter().enumerate() {
+                let n = k * statuses.len() + s;
+                let row = format!(
+                    "o{n}|imessage|{kind}|ref-{n}|imessage:+1555|job-{k}|text {n}|text|{{\"n\":{n}}}|{status}|g{n}|c{n}|{n}|{sent}|{resolved}|err {n}|{s}|{next}|{last}",
+                    sent = 100 + n,
+                    resolved = 200 + n,
+                    next = 300 + n,
+                    last = 400 + n,
+                );
+                script.push_str(&format!(
+                    "INSERT INTO channel_outbound(id, channel, kind, binding_ref, conversation, job_id,
+                       rendered_text, rendering, options_json, status, provider_guid, caption_guid,
+                       created_at, sent_at, resolved_at, last_error, attempts, next_attempt_at, last_attempt_at)
+                     VALUES ('o{n}', 'imessage', '{kind}', 'ref-{n}', 'imessage:+1555', 'job-{k}',
+                       'text {n}', 'text', '{{\"n\":{n}}}', '{status}', 'g{n}', 'c{n}',
+                       {n}, {sent}, {resolved}, 'err {n}', {s}, {next}, {last});\n",
+                    sent = 100 + n,
+                    resolved = 200 + n,
+                    next = 300 + n,
+                    last = 400 + n,
+                ));
+                expected.push(row);
+            }
+        }
+        db.execute_script(&script).await.unwrap();
+
+        MigrationRunner::new(vec![target]).run(&db).await.unwrap();
+
+        let survived = db
+            .query_all(
+                "SELECT id || '|' || channel || '|' || kind || '|' || binding_ref || '|' ||
+                        conversation || '|' || job_id || '|' || rendered_text || '|' || rendering
+                        || '|' || options_json || '|' || status || '|' || provider_guid || '|' ||
+                        caption_guid || '|' || created_at || '|' || sent_at || '|' || resolved_at
+                        || '|' || last_error || '|' || attempts || '|' || next_attempt_at || '|' ||
+                        last_attempt_at
+                   FROM channel_outbound ORDER BY created_at",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(survived, expected);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM channel_outbound WHERE read_at IS NOT NULL"
+            )
+            .await,
+            0
+        );
+
+        db.execute_script(
+            "INSERT INTO channel_outbound(id, channel, kind, binding_ref, conversation, rendered_text,
+               rendering, status, created_at)
+             VALUES ('op', 'imessage', 'operator', 'operator:m1', 'imessage:+1555', 'hi', 'text',
+               'pending', 999);",
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .execute_script(
+                "INSERT INTO channel_outbound(id, channel, kind, binding_ref, conversation,
+                   rendered_text, rendering, status, created_at)
+                 VALUES ('bogus', 'imessage', 'bogus', 'b', 'imessage:+1555', 'x', 'text',
+                   'pending', 1);",
+            )
+            .await
+            .is_err());
+
+        for index in [
+            "idx_channel_outbound_status_created",
+            "idx_channel_outbound_provider_guid",
+            "idx_channel_outbound_caption_guid",
+            "idx_channel_outbound_conversation",
+            "operator_messages_project",
+            "operator_messages_sender",
+            "operator_messages_headline",
+            "operator_messages_waiting",
+        ] {
+            assert_eq!(
+                count(
+                    &db,
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = '{index}'"
+                    )
+                )
+                .await,
+                1,
+                "{index} exists"
+            );
+        }
     }
 }

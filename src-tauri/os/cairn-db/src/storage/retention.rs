@@ -512,6 +512,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("messages", AUTHORED).budget(256),
     keep("memories", AUTHORED),
     keep("posts", AUTHORED),
+    keep("operator_messages", AUTHORED),
     keep("post_comments", AUTHORED),
     keep("tenets", AUTHORED),
     keep("tenet_ruling_imports", AUTHORED),

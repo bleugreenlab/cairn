@@ -33,6 +33,7 @@ mod messages;
 pub(crate) mod models;
 pub mod mutations;
 mod node;
+pub(crate) mod operator;
 pub mod packs;
 pub(crate) mod paging;
 pub(crate) mod posts;

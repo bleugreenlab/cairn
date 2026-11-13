@@ -2129,7 +2129,9 @@ async fn render_resource_body(
         CairnResource::DevDb => produce_dev_db_sql_resource(&params, None).await.content,
         CairnResource::DevPid => produce_dev_pid_resource(&params, None).await.content,
         CairnResource::Logs => logs_resource_body(&cairn_common::paths::cairn_log_dir(), &params),
-        CairnResource::Channels => crate::resources::channels::render_channels(orch, &params).await,
+        CairnResource::Channels => {
+            crate::resources::channels::render_channels(orch, request, &params).await
+        }
         CairnResource::ChannelsProvider { provider } => {
             crate::resources::channels::render_provider(orch, request, &provider, &params).await
         }
@@ -2141,6 +2143,12 @@ async fn render_resource_body(
         }
         CairnResource::ChannelsAmbientFeedback => {
             crate::resources::channels::render_ambient_feedback(orch, &params).await
+        }
+        CairnResource::Operator => {
+            crate::resources::operator::render_operator(orch, request, &params).await
+        }
+        CairnResource::OperatorMessage { id } => {
+            crate::resources::operator::render_message(orch, request, &id).await
         }
         // The fleet is machine-scoped, so both arms read the runner's cached
         // projection rather than any project's database. `captured_at` is taken

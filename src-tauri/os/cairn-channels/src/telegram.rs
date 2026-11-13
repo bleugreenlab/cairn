@@ -664,7 +664,8 @@ where
 }
 
 /// Telegram's per-message limit, counted in rendered (visible) characters.
-const TELEGRAM_TEXT_LIMIT: usize = 4096;
+/// Telegram's message limit, in characters.
+pub const TELEGRAM_TEXT_LIMIT: usize = 4096;
 
 fn compose_text(header: &str, body: String) -> String {
     if header.trim().is_empty() {

@@ -586,14 +586,34 @@ const PROVIDERS: [ConversationProvider; 3] = [
     ConversationProvider::Telegram,
 ];
 
+/// The in-app channel's provider word. It is a row on `cairn://channels` with a
+/// purpose line like any other, but not a transport: it has no conversations,
+/// and the messages it carries are the operator's own, at `cairn://operator`.
+pub const APP_PROVIDER: &str = "app";
+
+const OPERATOR_URI: &str = "cairn://operator";
+
+/// The refusal for a conversation path under the app channel.
+fn app_has_no_conversations() -> String {
+    format!(
+        "{}/{APP_PROVIDER} is the in-app channel and has no conversations: messages to the operator, whichever channel carries them, are at {OPERATOR_URI}.",
+        label::CHANNELS_URI
+    )
+}
+
 fn provider_named(provider: &str) -> Result<ConversationProvider, String> {
+    if provider == APP_PROVIDER {
+        return Err(app_has_no_conversations());
+    }
     provider.parse::<ConversationProvider>().map_err(|_| {
-        format!("Unknown channel provider '{provider}'; expected discord, imessage, or telegram")
+        format!(
+            "Unknown channel provider '{provider}'; expected app, discord, imessage, or telegram"
+        )
     })
 }
 
 /// An epoch-milliseconds instant as `2026-11-12 05:29:18.189Z`.
-fn at_ms(ms: i64) -> String {
+pub(crate) fn at_ms(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|at| at.format("%Y-%m-%d %H:%M:%S%.3fZ").to_string())
         .unwrap_or_else(|| ms.to_string())
@@ -631,26 +651,91 @@ fn health_line(state: &str, detail: Option<&str>) -> String {
     }
 }
 
-/// `cairn://channels`: one section per provider.
-pub async fn render_channels(orch: &Orchestrator, params: &[QueryParam]) -> String {
-    if let Some(param) = params.first() {
-        return format!(
-            "Unsupported query parameter '{}' for {}",
-            param.key,
-            label::CHANNELS_URI
-        );
+/// How the operator sets a purpose line, for a channel that has none.
+pub const PURPOSE_HOW: &str =
+    "the operator sets one with patch {provider, purpose} on cairn://channels, from the desktop";
+
+/// One channel provider as `cairn://channels` and `cairn://operator` both
+/// render it, so the two can never describe a channel differently.
+#[derive(Debug, Clone)]
+pub struct ProviderSummary {
+    /// `app`, `discord`, `imessage`, or `telegram`.
+    pub provider: &'static str,
+    pub display_name: &'static str,
+    /// `cairn://channels/{provider}`.
+    pub uri: String,
+    pub enabled: bool,
+    /// Whether the operator's own conversation on it is configured (iMessage
+    /// `to`, Telegram `chat_id`, Discord `guild_id`); always true for the app.
+    pub configured: bool,
+    pub purpose: Option<String>,
+    pub health: String,
+    pub presence: String,
+    /// What last-seen means on this channel, and when, in epoch milliseconds.
+    pub last_seen_label: &'static str,
+    pub last_seen_ms: Option<i64>,
+}
+
+impl ProviderSummary {
+    pub fn last_seen(&self) -> String {
+        format!(
+            "{}: {}",
+            self.last_seen_label,
+            self.last_seen_ms
+                .map(at_ms)
+                .unwrap_or_else(|| "never".to_string())
+        )
     }
+}
+
+/// The app channel's last-seen: when the operator last moved his headline
+/// cursor on any thread, which is the app's one record of him reading.
+async fn last_read_headlines_ms(orch: &Orchestrator) -> Option<i64> {
+    orch.db
+        .local
+        .query_opt(
+            "SELECT MAX(seen_at) FROM headline_read_cursors WHERE reader = ?1",
+            cairn_db::turso::params![crate::threads::headlines::OPERATOR_READER],
+            |row| {
+                use crate::storage::RowExt;
+                row.opt_i64(0)
+            },
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .map(|seconds| seconds * 1000)
+}
+
+/// Every channel provider's summary: the app first, then the transports.
+pub async fn provider_summaries(orch: &Orchestrator) -> Vec<ProviderSummary> {
     let channels = crate::config::settings::load_settings(&orch.config_dir).channels;
-    let mut out = String::from(
-        "# Channels\n\nThe external-channel providers. Each one lists the conversations you can reach at its link; read a conversation for its messages and its send.\n",
-    );
+    let app_presence = crate::channels::operator_presence_status().await;
+    let mut summaries = vec![ProviderSummary {
+        provider: APP_PROVIDER,
+        display_name: "App",
+        uri: format!("{}/{APP_PROVIDER}", label::CHANNELS_URI),
+        enabled: true,
+        configured: true,
+        purpose: channels.app.purpose.clone(),
+        health: "in-app".to_string(),
+        presence: format!(
+            "{} (mode {}); inferred from the desktop",
+            word(&app_presence.presence),
+            word(&app_presence.mode)
+        ),
+        last_seen_label: "last read headlines",
+        last_seen_ms: last_read_headlines_ms(orch).await,
+    }];
     for provider in PROVIDERS {
         let (enabled, purpose) = provider_purpose(&channels, provider);
+        let configured = match provider {
+            ConversationProvider::Discord => !channels.discord.guild_id.trim().is_empty(),
+            ConversationProvider::IMessage => !channels.imessage.to.trim().is_empty(),
+            ConversationProvider::Telegram => !channels.telegram.chat_id.trim().is_empty(),
+        };
         let status = runtime_status(orch, provider.id()).await;
-        let last = ledger::last_operator_message(&orch.db.local, provider.id())
-            .await
-            .ok()
-            .flatten();
         let presence = format!(
             "{} (mode {})",
             word(&status.operator_presence),
@@ -661,17 +746,84 @@ pub async fn render_channels(orch: &Orchestrator, params: &[QueryParam]) -> Stri
         } else {
             presence
         };
+        summaries.push(ProviderSummary {
+            provider: provider.id(),
+            display_name: provider.display_name(),
+            uri: label::provider_uri(provider),
+            enabled,
+            configured,
+            purpose,
+            health: health_line(status.state, status.detail.as_deref()),
+            presence,
+            last_seen_label: "last operator message",
+            last_seen_ms: ledger::last_operator_message(&orch.db.local, provider.id())
+                .await
+                .ok()
+                .flatten(),
+        });
+    }
+    summaries
+}
+
+/// `cairn://channels`: one section per provider. Presence and when the
+/// operator last wrote are his, so the root answers the same readers the
+/// provider and conversation renders do: a run-less caller is refused.
+pub async fn render_channels(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    params: &[QueryParam],
+) -> String {
+    if let Err(refusal) = channel_reader(orch, request).await {
+        return refusal;
+    }
+    if let Some(param) = params.first() {
+        return format!(
+            "Unsupported query parameter '{}' for {}",
+            param.key,
+            label::CHANNELS_URI
+        );
+    }
+    let mut out = String::from(
+        "# Channels\n\nThe channel providers: the in-app channel and the external transports. Each transport lists the conversations you can reach at its link; read a conversation for its messages and its send. The purpose line says which messages to the operator belong on it (cairn://operator).\n",
+    );
+    for summary in provider_summaries(orch).await {
+        let conversations = if summary.provider == APP_PROVIDER {
+            format!("none; messages to the operator are at {OPERATOR_URI}")
+        } else {
+            summary.uri.clone()
+        };
         out.push_str(&format!(
-            "\n## {}\n\n- conversations: {}\n- enabled: {}\n- health: {}\n- purpose: {}\n- operator presence: {presence}\n- last operator message: {}\n",
-            provider.display_name(),
-            label::provider_uri(provider),
-            if enabled { "yes" } else { "no" },
-            health_line(status.state, status.detail.as_deref()),
-            purpose.unwrap_or_else(|| "none set (the operator sets one with patch {provider, purpose})".to_string()),
-            last.map(at_ms).unwrap_or_else(|| "never".to_string()),
+            "\n## {}\n\n- conversations: {conversations}\n- enabled: {}\n- health: {}\n- purpose: {}\n- operator presence: {}\n- {}\n",
+            summary.display_name,
+            if summary.enabled { "yes" } else { "no" },
+            summary.health,
+            summary
+                .purpose
+                .clone()
+                .unwrap_or_else(|| format!("none set ({PURPOSE_HOW})")),
+            summary.presence,
+            summary.last_seen(),
         ));
     }
     out
+}
+
+/// `cairn://channels/app`: the app channel's row, pointing at where its
+/// messages are.
+async fn render_app_provider(orch: &Orchestrator) -> String {
+    let summaries = provider_summaries(orch).await;
+    let app = summaries
+        .iter()
+        .find(|summary| summary.provider == APP_PROVIDER)
+        .expect("the app channel is always summarized");
+    format!(
+        "# App channel\n\nThe in-app channel: a message to the operator sent through it stays in Cairn and reaches him in the app. It has no conversations; messages to the operator, whichever channel carries them, are at {OPERATOR_URI}.\n\n- purpose: {}\n- operator presence: {}\n- {}\n",
+        app.purpose
+            .clone()
+            .unwrap_or_else(|| format!("none set, so it is not offered ({PURPOSE_HOW})")),
+        app.presence,
+        app.last_seen(),
+    )
 }
 
 /// The operator's `patch {provider, purpose}` on `cairn://channels`. Only a
@@ -689,8 +841,13 @@ pub async fn set_purpose(
     let provider = payload
         .get("provider")
         .and_then(serde_json::Value::as_str)
-        .ok_or("payload.provider is required: discord, imessage, or telegram")?;
-    let provider = provider_named(provider)?;
+        .ok_or("payload.provider is required: app, discord, imessage, or telegram")?;
+    let (provider_id, display_name) = if provider == APP_PROVIDER {
+        (APP_PROVIDER, "App")
+    } else {
+        let provider = provider_named(provider)?;
+        (provider.id(), provider.display_name())
+    };
     let purpose = match payload.get("purpose") {
         Some(serde_json::Value::String(purpose)) => {
             Some(purpose.trim()).filter(|purpose| !purpose.is_empty())
@@ -706,15 +863,14 @@ pub async fn set_purpose(
     let verb = if purpose.is_some() { "Set" } else { "Cleared" };
     if dry_run {
         return Ok(format!(
-            "Would {} {}'s purpose.",
+            "Would {} {display_name}'s purpose.",
             verb.to_lowercase(),
-            provider.display_name()
         ));
     }
     let purpose = purpose.map(str::to_string);
     crate::config::settings::mutate_workspace_settings(
         &orch.config_dir,
-        &format!("channels: {} purpose", provider.id()),
+        &format!("channels: {provider_id} purpose"),
         |document| {
             use serde_yaml::{Mapping, Value};
             let mapping = |value: &mut Value, key: &str| -> Result<(), String> {
@@ -733,9 +889,9 @@ pub async fn set_purpose(
             let entry = channels
                 .as_mapping_mut()
                 .expect("checked mapping")
-                .entry(Value::from(provider.id()))
+                .entry(Value::from(provider_id))
                 .or_insert(Value::Null);
-            mapping(entry, provider.id())?;
+            mapping(entry, provider_id)?;
             let entry = entry.as_mapping_mut().expect("checked mapping");
             match purpose {
                 Some(purpose) => {
@@ -749,8 +905,7 @@ pub async fn set_purpose(
         },
     )?;
     Ok(format!(
-        "{verb} {}'s purpose; read {} to see it.",
-        provider.display_name(),
+        "{verb} {display_name}'s purpose; read {} to see it.",
         label::CHANNELS_URI
     ))
 }
@@ -766,8 +921,8 @@ fn operator_request(tool: &str) -> McpCallbackRequest {
     }
 }
 
-/// The channels resource a door target names, or the refusal for one that is
-/// not under `cairn://channels`.
+/// The resource a door target names, or the refusal for one the door does not
+/// open: the channels tree and the operator's own messages.
 fn channels_target(target: &str) -> Result<(CairnResource, Vec<QueryParam>), String> {
     let split = cairn_common::query::split_target_query(target)?;
     let resource = parse_uri(&split.identity)
@@ -777,29 +932,38 @@ fn channels_target(target: &str) -> Result<(CairnResource, Vec<QueryParam>), Str
                 CairnResource::Channels
                     | CairnResource::ChannelsProvider { .. }
                     | CairnResource::ChannelsConversation { .. }
+                    | CairnResource::Operator
+                    | CairnResource::OperatorMessage { .. }
             )
         })
         .ok_or_else(|| {
-            format!("{target} is not a channels resource; the operator's channels door reads and writes cairn://channels and the conversations under it")
+            format!("{target} is not a channels resource; the operator's channels door reads and writes cairn://channels and the conversations under it, and cairn://operator and its messages")
         })?;
     Ok((resource, split.params))
 }
 
-/// The verified desktop operator reading the channels tree: every provider,
-/// every active binding, every conversation's history. The caller has already
-/// checked the desktop operator credential.
+/// The verified desktop operator reading the channels tree (every provider,
+/// every active binding, every conversation's history) or his own messages.
+/// Opening one message here is what marks it seen in the app. The caller has
+/// already checked the desktop operator credential.
 pub async fn operator_read(orch: &Orchestrator, target: &str) -> Result<String, String> {
     let (resource, params) = channels_target(target)?;
     let request = operator_request("read_batch");
     Ok(match resource {
-        CairnResource::Channels => render_channels(orch, &params).await,
+        CairnResource::Channels => render_channels(orch, &request, &params).await,
         CairnResource::ChannelsProvider { provider } => {
             render_provider(orch, &request, &provider, &params).await
         }
         CairnResource::ChannelsConversation { provider, path } => {
             render_conversation(orch, &request, &provider, &path, &params).await
         }
-        _ => unreachable!("channels_target admits only the channels tree"),
+        CairnResource::Operator => {
+            crate::resources::operator::render_operator(orch, &request, &params).await
+        }
+        CairnResource::OperatorMessage { id } => {
+            crate::resources::operator::render_message(orch, &request, &id).await
+        }
+        _ => unreachable!("channels_target admits only the channels tree and the operator"),
     })
 }
 
@@ -830,7 +994,12 @@ pub async fn operator_write(
     .map_err(|failure| failure.error)
 }
 
-fn bounded_limit(params: &[QueryParam], uri: &str, default: i64, max: i64) -> Result<i64, String> {
+pub(crate) fn bounded_limit(
+    params: &[QueryParam],
+    uri: &str,
+    default: i64,
+    max: i64,
+) -> Result<i64, String> {
     match params.iter().find(|param| param.key == "limit") {
         Some(param) => param
             .value
@@ -881,6 +1050,9 @@ async fn provider_listing(
     provider: &str,
     params: &[QueryParam],
 ) -> Result<String, String> {
+    if provider == APP_PROVIDER {
+        return Ok(render_app_provider(orch).await);
+    }
     let provider = provider_named(provider)?;
     let uri = label::provider_uri(provider);
     if let Some(param) = params
@@ -2320,10 +2492,11 @@ mod tests {
         crate::mcp::run_bearer::hold_to_machine_credential(&mut machine).unwrap();
         assert!(machine.is_unverified_local());
         for request in [run_less_request(None), machine] {
+            let root = render_channels(&orch, &request, &[]).await;
             let listing = render_provider(&orch, &request, "discord", &[]).await;
             let history =
                 render_conversation(&orch, &request, "discord", &["prj".to_string()], &[]).await;
-            for body in [listing, history] {
+            for body in [root, listing, history] {
                 assert!(
                     body.starts_with("Refused: this request speaks for no run")
                         && !body.contains("#ambient"),

@@ -84,6 +84,39 @@ fn parses_and_roundtrips_the_channels_tree() {
 }
 
 #[test]
+fn parses_and_roundtrips_the_operator() {
+    let operator = CairnResource::Operator;
+    assert_eq!(
+        parse_uri("cairn://operator?limit=5"),
+        Some(operator.clone())
+    );
+    assert_eq!(operator.to_uri(), "cairn://operator");
+    assert_eq!(operator.kind(), ResourceKind::Operator);
+    assert_eq!(operator.project(), None);
+
+    let message = CairnResource::OperatorMessage {
+        id: "0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10".into(),
+    };
+    let uri = "cairn://operator/messages/0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10";
+    assert_eq!(parse_uri(uri), Some(message.clone()));
+    assert_eq!(message.to_uri(), uri);
+    assert_eq!(message.kind(), ResourceKind::OperatorMessage);
+    assert_eq!(
+        message.label(&LabelContext::default()),
+        "Message to operator · 0193a5e2"
+    );
+    assert_eq!(parse_uri("cairn://operator/messages"), None);
+
+    // The in-app channel is a provider word with no conversations of its own.
+    assert_eq!(
+        parse_uri("cairn://channels/app"),
+        Some(CairnResource::ChannelsProvider {
+            provider: "app".into()
+        })
+    );
+}
+
+#[test]
 fn parses_and_roundtrips_ambient_feedback() {
     let resource = CairnResource::ChannelsAmbientFeedback;
     assert_eq!(

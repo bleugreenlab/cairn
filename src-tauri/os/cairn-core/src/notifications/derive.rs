@@ -182,7 +182,9 @@ fn entry(
 
 /// Give each entry the line a thread wrote about its cause: the newest live
 /// headline whose `ref` is the entry's source, or failing that the issue the
-/// source sits under (a PR's artifact, a node's review).
+/// source sits under (a PR's artifact, a node's review). An entry whose source
+/// already named its line (a message to the operator linked to a headline)
+/// keeps it.
 ///
 /// Any thread in the project counts, not only the one the entry's job lives
 /// in: a builder's PR has no thread of its own, and the thread that writes
@@ -207,10 +209,63 @@ pub(super) async fn attach_headlines(
             return;
         }
     };
-    for entry in entries {
+    for entry in entries.iter_mut().filter(|entry| entry.headline.is_none()) {
         entry.headline =
             crate::threads::headlines::about(&about, &project.key, &[&entry.source_uri]);
     }
+}
+
+/// A message to the operator that states a default: open until he answers
+/// it, resolved inside the window after. Read from the private database,
+/// where his messages live whichever database the project's other sources
+/// come from. The entry carries the message's linked headline line itself,
+/// since that headline's `ref` need not be the message.
+pub(super) async fn operator_messages(
+    local: &LocalDb,
+    project: &ProjectRef,
+    since: i64,
+) -> Result<Vec<OperatorNotification>, String> {
+    let mut entries = Vec::new();
+    for message in crate::operator::messages::waiting(local, &project.id, since).await? {
+        let uri = message.uri();
+        let mut entry = entry(
+            project,
+            format!("operator_message:{}", message.id),
+            NotificationKind::OperatorMessage,
+            message.created_at,
+            message.content.clone(),
+            uri.clone(),
+            message.answered_at,
+            Some(NotificationAction::Reply {
+                message: uri,
+                default_text: message.default_text.clone().unwrap_or_default(),
+            }),
+        );
+        entry.headline = linked_headline(&message).await;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// The line of the headline a message links, if its store still has it.
+async fn linked_headline(
+    message: &crate::operator::Message,
+) -> Option<crate::threads::headlines::HeadlineAbout> {
+    let (uri, thread_id, row_id) = (
+        message.headline.clone()?,
+        message.headline_thread_id.as_deref()?,
+        message.headline_row_id?,
+    );
+    let store = crate::threads::db_store::open_existing(thread_id)
+        .await
+        .ok()
+        .flatten()?;
+    let line = store
+        .query_opt_text("SELECT line FROM headlines WHERE id = ?1", params![row_id])
+        .await
+        .ok()
+        .flatten()?;
+    Some(crate::threads::headlines::HeadlineAbout { line, uri })
 }
 
 fn db_error(error: DbError) -> String {
@@ -257,11 +312,13 @@ async fn open_and_recent<T: Send + 'static>(
 /// far back resolved entries are read.
 pub(super) async fn from_sources(
     db: &LocalDb,
+    local: &LocalDb,
     project: &ProjectRef,
     since: i64,
     now: i64,
 ) -> Result<(Vec<OperatorNotification>, Option<i64>), String> {
     let mut entries = Vec::new();
+    entries.extend(operator_messages(local, project, since).await?);
     entries.extend(questions(db, project, since).await?);
     entries.extend(permissions(db, project, since).await?);
     entries.extend(tenets(db, project, since).await?);

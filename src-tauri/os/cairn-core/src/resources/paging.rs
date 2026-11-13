@@ -75,6 +75,7 @@ pub(crate) fn paging(kind: ResourceKind) -> Paging {
         | K::ChannelsAmbientFeedback
         | K::ChannelsProvider
         | K::ChannelsConversation
+        | K::Operator
         | K::IssueMessages
         | K::NodeMessages
         | K::TaskMessages

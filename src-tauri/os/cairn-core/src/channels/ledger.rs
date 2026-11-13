@@ -1984,6 +1984,56 @@ pub async fn last_activity(
     Ok(rows.into_iter().collect())
 }
 
+/// Operator sends on `channel` still awaiting a read receipt: sent at or after
+/// `since_ms`, with a provider guid and no `read_at`, as
+/// `(binding_ref, provider_guid)`.
+pub async fn unread_operator_sends(
+    db: &LocalDb,
+    channel: &str,
+    since_ms: i64,
+) -> Result<Vec<(String, String)>, String> {
+    db.query_all(
+        "SELECT binding_ref, provider_guid FROM channel_outbound
+          WHERE channel = ?1 AND kind = 'operator' AND status = 'sent'
+            AND read_at IS NULL AND provider_guid IS NOT NULL AND sent_at >= ?2
+          ORDER BY sent_at",
+        params![channel.to_string(), since_ms],
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Stamp the transport's read receipt on the row `provider_guid` names, once.
+/// Status and attempts are not touched: a receipt says nothing about delivery.
+pub async fn mark_read(
+    db: &LocalDb,
+    channel: &str,
+    provider_guid: &str,
+    read_at: i64,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET read_at = ?3
+          WHERE channel = ?1 AND provider_guid = ?2 AND read_at IS NULL",
+        params![channel.to_string(), provider_guid.to_string(), read_at],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
+/// The transport's read receipt on one outbound row, epoch milliseconds.
+pub async fn read_at(db: &LocalDb, id: &str) -> Result<Option<i64>, String> {
+    db.query_opt(
+        "SELECT read_at FROM channel_outbound WHERE id = ?1",
+        params![id.to_string()],
+        |row| row.opt_i64(0),
+    )
+    .await
+    .map(Option::flatten)
+    .map_err(|error| error.to_string())
+}
+
 /// When the operator last wrote on a provider: its newest admitted inbound.
 pub async fn last_operator_message(db: &LocalDb, provider: &str) -> Result<Option<i64>, String> {
     db.query_opt(

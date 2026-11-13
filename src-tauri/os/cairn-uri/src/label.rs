@@ -144,6 +144,7 @@ fn thread(project: &str, name: &str, uri: &str) -> String {
 /// `Word`, or `Word id` when the address names one member.
 fn channel_provider_name(provider: &str) -> &str {
     match provider {
+        "app" => "App",
         "discord" => "Discord",
         "imessage" => "iMessage",
         "telegram" => "Telegram",
@@ -237,6 +238,13 @@ impl CairnResource {
                 }
             }
             Self::ChannelsAmbientFeedback => "Channel ambient feedback".to_string(),
+            Self::Operator => "Operator".to_string(),
+            Self::OperatorMessage { id } => {
+                format!(
+                    "Message to operator · {}",
+                    id.chars().take(8).collect::<String>()
+                )
+            }
             Self::Executors => "Executors".to_string(),
             Self::Executor { name } => workspace("Executor", Some(name)),
             Self::Requests => "Requests".to_string(),

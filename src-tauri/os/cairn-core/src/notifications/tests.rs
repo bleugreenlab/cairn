@@ -95,6 +95,7 @@ async fn a_pr_entry_carries_the_newest_headline_about_its_issue() {
 
     let snapshot = derive_snapshot(
         &db,
+        &db,
         &HoldRegistry::default(),
         "p-nh",
         1_000,

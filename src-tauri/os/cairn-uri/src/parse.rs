@@ -61,11 +61,12 @@ pub fn removed_executor_verb_refusal(uri: &str) -> Option<String> {
     ))
 }
 
-/// The external-channel providers `cairn://channels/{provider}` names. Any
-/// other word under `cairn://channels` is not a provider, so
-/// `cairn://channels/ambient/feedback` keeps its own meaning.
+/// The channel providers `cairn://channels/{provider}` names: the in-app
+/// channel `app` and the external transports. Any other word under
+/// `cairn://channels` is not a provider, so `cairn://channels/ambient/feedback`
+/// keeps its own meaning.
 pub fn is_channel_provider(segment: &str) -> bool {
-    matches!(segment, "discord" | "imessage" | "telegram")
+    matches!(segment, "app" | "discord" | "imessage" | "telegram")
 }
 
 pub fn parse_uri(uri: &str) -> Option<CairnResource> {
@@ -123,6 +124,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["logs"] => Some(CairnResource::Logs),
         ["channels"] => Some(CairnResource::Channels),
         ["channels", "ambient", "feedback"] => Some(CairnResource::ChannelsAmbientFeedback),
+        ["operator"] => Some(CairnResource::Operator),
+        ["operator", "messages", id] if !id.is_empty() => Some(CairnResource::OperatorMessage {
+            id: (*id).to_string(),
+        }),
         ["channels", provider] if is_channel_provider(provider) => {
             Some(CairnResource::ChannelsProvider {
                 provider: (*provider).to_string(),

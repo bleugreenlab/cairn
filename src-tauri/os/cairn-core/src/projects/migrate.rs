@@ -473,6 +473,7 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("pack_catalog", "project_id = ?1"),
     delete_only("pack_catalog_references", "project_id = ?1"),
     delete_only("posts", "project_id = ?1"),
+    delete_only("operator_messages", "project_id = ?1"),
     delete_only("camp_read_cursors", "camp_id IN (SELECT id FROM camps WHERE project_id = ?1)"),
     delete_only("post_comments", "post_id IN (SELECT id FROM posts WHERE project_id = ?1)"),
     delete_only("landing_allocations", "project_id = ?1"),

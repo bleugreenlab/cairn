@@ -61,6 +61,9 @@ pub enum NotificationKind {
     AgentFailed,
     AwaitingReview,
     Hold,
+    /// A thread's message to the operator that states a default, open until
+    /// he answers it.
+    OperatorMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -117,6 +120,14 @@ pub enum NotificationAction {
         reason: String,
         expected_release: Option<ExpectedRelease>,
         override_label: String,
+    },
+    /// `write_channel_resource` append `{content}` on `message`, the
+    /// message's `cairn://operator/messages/{id}`. `default_text` is what its
+    /// sender does if he does not reply.
+    #[serde(rename_all = "camelCase")]
+    Reply {
+        message: String,
+        default_text: String,
     },
 }
 
@@ -209,13 +220,15 @@ pub(crate) async fn rebuild_operator_notifications(
         .map_err(|error| error.to_string())?;
     let dismissals = load_dismissals(&dbs.local, project_id).await?;
     let now = chrono::Utc::now().timestamp();
-    derive_snapshot(&db, holds, project_id, now, &dismissals).await
+    derive_snapshot(&db, &dbs.local, holds, project_id, now, &dismissals).await
 }
 
 /// Every entry one project's sources produce at `now`, with `dismissals`
-/// (entry key to dismissal time) applied.
+/// (entry key to dismissal time) applied. `db` is the project's owning
+/// database; `local` the private one, which holds the operator's own messages.
 pub(crate) async fn derive_snapshot(
     db: &LocalDb,
+    local: &LocalDb,
     holds: &HoldRegistry,
     project_id: &str,
     now: i64,
@@ -236,7 +249,8 @@ pub(crate) async fn derive_snapshot(
         key,
     };
     let since = now - RECENT_WINDOW_SECS;
-    let (mut entries, next_change_at) = derive::from_sources(db, &project, since, now).await?;
+    let (mut entries, next_change_at) =
+        derive::from_sources(db, local, &project, since, now).await?;
     entries.extend(derive::holds(holds, &project));
     derive::attach_headlines(db, &project, &mut entries).await;
     for entry in &mut entries {

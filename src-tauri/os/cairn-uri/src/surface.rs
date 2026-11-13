@@ -233,6 +233,8 @@ impl CairnResource {
             | Self::ChannelsProvider { .. }
             | Self::ChannelsConversation { .. }
             | Self::ChannelsAmbientFeedback
+            | Self::Operator
+            | Self::OperatorMessage { .. }
             | Self::Grants
             | Self::Grant { .. }
             | Self::Models

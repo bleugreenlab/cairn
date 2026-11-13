@@ -468,6 +468,8 @@ resource_samples! {
         path: vec!["cairn".to_string(), "channels".to_string()],
     } => Parser,
     ChannelsAmbientFeedback {} => Parser,
+    Operator {} => Parser,
+    OperatorMessage { id: "0193a5e2-7c1d-7b1e-9f3a-5d2c8e4b6a10".to_string() } => Parser,
     Executors {} => Parser,
     Executor { name: "mac-mini".to_string() } => Parser,
     Requests {} => Parser,

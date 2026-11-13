@@ -371,6 +371,7 @@ async fn seed_top_level_run(
 async fn operator_entries(orch: &Orchestrator) -> Vec<crate::notifications::OperatorNotification> {
     crate::notifications::derive_snapshot(
         &orch.db.local,
+        &orch.db.local,
         &crate::notifications::HoldRegistry::default(),
         "p-attn",
         // Past the settle window, when an unrecovered crash becomes an entry.

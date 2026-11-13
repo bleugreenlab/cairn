@@ -213,6 +213,12 @@ pub trait ChannelProvider: Send + Sync {
     async fn cleanup_question(&self, _message: &ResolvedQuestionMessage) -> Result<(), String> {
         Ok(())
     }
+    /// The read receipts the transport holds for messages this provider sent,
+    /// as `(guid, read_at)` with `read_at` in epoch milliseconds. A guid with
+    /// no receipt is simply absent; a provider with no receipts returns none.
+    async fn read_receipts(&self, _guids: &[String]) -> Result<Vec<(String, i64)>, String> {
+        Ok(Vec::new())
+    }
     async fn post_state_card(&self, _message: &StateCardMessage) -> Result<PostedCard, String> {
         Err("state cards are not supported by this provider".into())
     }

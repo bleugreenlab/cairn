@@ -47,9 +47,9 @@ pub use common::{
 
 // Workspace and settings
 pub use workspace::{
-    ChannelInboundCapabilities, ChannelsConfig, DiscordChannelConfig, ExternalReplyMode,
-    IMessageChannelConfig, MessageClassPolicy, OpenRouterRouting, OpenRouterSort, Settings,
-    TelegramChannelConfig, UpdateSettings,
+    AppChannelConfig, ChannelInboundCapabilities, ChannelsConfig, DiscordChannelConfig,
+    ExternalReplyMode, IMessageChannelConfig, MessageClassPolicy, OpenRouterRouting,
+    OpenRouterSort, Settings, TelegramChannelConfig, UpdateSettings,
 };
 
 // Project types
