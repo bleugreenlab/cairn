@@ -171,14 +171,8 @@ unified_exec = false
 # own 10 s timeout, per attempt), so a slow shell rc stalls or fails every
 # session start for no benefit.
 shell_snapshot = false
-# Disable Codex's native multi-agent/collab tools (spawn_agent, wait,
-# send_message). Cairn's task delegation (cairn:~/tasks -> child jobs with
-# their own transcripts) is the canonical path; native collab threads run
-# inside the same app-server process and their events would multiplex into
-# the parent session's transcript untagged. `multi_agent` is the current
-# feature key; `collab` is its legacy alias, set for older Codex builds.
-multi_agent = false
-collab = false
+# `multi_agent_v2` must stay off: an enabled V2 runtime outranks
+# `[agents].enabled = false` below and would re-register subagent tools.
 multi_agent_v2 = false
 # Disable Codex's native image generation tool (image_gen.imagegen). It is on
 # by default; its result is an opaque tool result carrying base64 image data,
@@ -196,6 +190,17 @@ image_generation = false
 # (codex `core-plugins/src/manager.rs`, maybe_start_plugin_startup_tasks_for_config).
 # MCP servers passed through `-c mcp_servers` are not plugins and still load.
 plugins = false
+
+# Disable Codex's native subagent tools (spawn_agent, wait_agent,
+# send_message). Cairn's task delegation (cairn:~/tasks -> child jobs with
+# their own transcripts) is the canonical path; native subagent threads run
+# inside the same app-server process and their events would multiplex into
+# the parent session's transcript untagged. Codex resolves the runtime as
+# `[features].multi_agent_v2`, then this switch, then the model catalog's
+# `multi_agent_version`, then the deprecated `[features].multi_agent` (alias
+# `collab`) V1 fallback, so `enabled = false` wins over every model.
+[agents]
+enabled = false
 
 # Disable Codex's own product analytics. Under a ChatGPT login it posts events
 # to chatgpt.com/backend-api/codex/analytics-events from every app-server
@@ -244,11 +249,10 @@ fn write_codex_model_catalog_override(
 ///   `model_info.multi_agent_version.unwrap_or_else(|| config.multi_agent_version_from_features())`
 ///   (codex `core/src/session/mod.rs`). A model entry that carries
 ///   `"multi_agent_version": "v1"`/`"v2"` is therefore a `Some(_)` that
-///   short-circuits the fallback and registers native `spawn_agent`/collab
-///   tools even though the `multi_agent`/`collab`/`multi_agent_v2` feature
-///   flags are all false. Explicitly disabling the model capability closes that
-///   path directly; the feature flags remain the lower-precedence defense for
-///   models without the field.
+///   short-circuits the feature fallback and registers native `spawn_agent`
+///   tools. The generated config's `[agents].enabled = false` outranks the
+///   model field in current Codex; disabling the model capability as well
+///   keeps the model layer closed on its own, independent of that switch.
 ///
 /// All other model metadata is preserved unchanged.
 fn harden_codex_model_catalog(catalog_json: &str) -> Result<String, String> {
@@ -354,17 +358,30 @@ mod tests {
         // events would be persisted into the parent transcript untagged.
         // Delegation must instead go through Cairn child task jobs.
         let config = render_codex_config_toml("");
-        for flag in [
-            "goals = true",
-            "multi_agent = false",
-            "collab = false",
-            "multi_agent_v2 = false",
-        ] {
+        let parsed: toml::Table = toml::from_str(&config).expect("config is TOML");
+        assert_eq!(
+            parsed["agents"]["enabled"].as_bool(),
+            Some(false),
+            "config must set `[agents] enabled = false`, got:\n{config}"
+        );
+        let features = parsed["features"].as_table().expect("[features] table");
+        assert_eq!(
+            features
+                .get("multi_agent_v2")
+                .and_then(toml::Value::as_bool),
+            Some(false),
+            "an enabled multi_agent_v2 outranks [agents].enabled, got:\n{config}"
+        );
+        assert_eq!(
+            features.get("goals").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        // Codex 0.168.0 warns on an explicit `[features].multi_agent` (and
+        // `collab` is only its alias), so neither may reappear.
+        for deprecated in ["multi_agent", "collab"] {
             assert!(
-                config.lines().any(|line| line.trim() == flag),
-                "config must set `{}` to disable native multi-agent tools, got:\n{}",
-                flag,
-                config
+                !features.contains_key(deprecated),
+                "config must not set deprecated `[features].{deprecated}`, got:\n{config}"
             );
         }
     }

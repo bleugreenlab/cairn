@@ -658,6 +658,12 @@ pub fn mcp_tool_call_items(env: &ContractEnv) -> CaseResult {
     c.that(offered.iter().any(|tool| tool.contains("echo")), || {
         format!("Codex did not offer the fixture's echo tool to the model: {offered:?}")
     })?;
+    // Both of Codex's subagent runtimes (V1 and V2) register `spawn_agent`;
+    // Cairn's config disables them so delegation goes through Cairn tasks.
+    c.that(
+        !offered.iter().any(|tool| tool.contains("spawn_agent")),
+        || format!("Codex offered native subagent tools despite Cairn's config: {offered:?}"),
+    )?;
     let item = |method: &str| {
         messages.iter().find_map(|message| {
             let item = message.pointer("/params/item")?;
