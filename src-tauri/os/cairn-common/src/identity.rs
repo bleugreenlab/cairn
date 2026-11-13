@@ -421,6 +421,10 @@ impl Address {
     }
 }
 
+/// The only scheme a [`VerificationMethod::DeviceOwnerAuthentication`] record
+/// names today.
+pub const DEVICE_OWNER_AUTHENTICATION_ISSUER: &str = "macos_local_authentication";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationMethod {
@@ -444,6 +448,18 @@ pub enum VerificationMethod {
     /// never the key or its hash. Unlike [`Self::SourceCredential`], it
     /// authenticates the mapped client principal, not a delivery boundary.
     ApiClientCredential,
+    /// The desktop ran macOS LocalAuthentication's device-owner policy (Touch
+    /// ID or the Mac password; the API does not say which) for this one act,
+    /// on a fresh context with no reuse window, before forwarding it with the
+    /// desktop operator credential. `issuer` names the scheme and
+    /// `credential_ref` the operator credential that carried it.
+    ///
+    /// It shows that someone who can unlock this Mac was present at that
+    /// moment, not which person, and it is only as strong as the desktop
+    /// process asserting it: no artifact exists that the runner can verify. It
+    /// never stands in for [`Self::SecureEnclaveUserPresence`] or satisfies a
+    /// provably-human gate.
+    DeviceOwnerAuthentication,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,6 +687,12 @@ impl VerificationRecord {
                 VerificationMethod::SourceCredential | VerificationMethod::ApiClientCredential => {
                     issuer.is_some()
                         && subject.is_some()
+                        && session.is_none()
+                        && credential_ref.is_some()
+                }
+                VerificationMethod::DeviceOwnerAuthentication => {
+                    issuer.as_deref() == Some(DEVICE_OWNER_AUTHENTICATION_ISSUER)
+                        && subject.is_none()
                         && session.is_none()
                         && credential_ref.is_some()
                 }
@@ -1094,6 +1116,7 @@ mod tests {
             VerificationMethod::NodeSession,
             VerificationMethod::SourceCredential,
             VerificationMethod::ApiClientCredential,
+            VerificationMethod::DeviceOwnerAuthentication,
         ] {
             assert_eq!(
                 serde_json::from_str::<VerificationMethod>(&serde_json::to_string(&value).unwrap())
@@ -1121,6 +1144,10 @@ mod tests {
             serde_json::to_string(&VerificationMethod::ApiClientCredential).unwrap(),
             "\"api_client_credential\""
         );
+        assert_eq!(
+            serde_json::to_string(&VerificationMethod::DeviceOwnerAuthentication).unwrap(),
+            "\"device_owner_authentication\""
+        );
         assert!(serde_json::from_str::<AppearanceTransport>("\"carrier_pigeon\"").is_err());
         assert!(serde_json::from_str::<VerificationMethod>("\"remote_intent\"").is_err());
     }
@@ -1133,6 +1160,7 @@ mod tests {
             VerificationMethod::SecureEnclaveUserPresence,
             VerificationMethod::ChannelAllowlist,
             VerificationMethod::NodeSession,
+            VerificationMethod::DeviceOwnerAuthentication,
         ] {
             let record = VerificationRecord::new(
                 method,
@@ -1148,6 +1176,49 @@ mod tests {
             assert_eq!(record.method(), method);
             assert_eq!(record.status(), VerificationStatus::None);
         }
+    }
+
+    /// A device-owner record keeps the desktop operator credential it rode on
+    /// and names the LocalAuthentication scheme; it claims no subject.
+    #[test]
+    fn a_device_owner_authentication_record_names_its_scheme_and_carrying_credential() {
+        let record = |issuer: Option<&str>, subject: Option<&str>, credential: Option<&str>| {
+            VerificationRecord::new(
+                VerificationMethod::DeviceOwnerAuthentication,
+                VerificationStatus::Verified,
+                issuer.map(str::to_string),
+                subject.map(str::to_string),
+                None,
+                credential.map(|value| CredentialRef::new(value).unwrap()),
+                VerificationStrength::new("device_owner_authentication").unwrap(),
+                10,
+            )
+        };
+        let valid = record(
+            Some(DEVICE_OWNER_AUTHENTICATION_ISSUER),
+            None,
+            Some("desktop_operator_credential"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<VerificationRecord>(&serde_json::to_string(&valid).unwrap())
+                .unwrap(),
+            valid
+        );
+        assert!(record(
+            Some("windows_hello"),
+            None,
+            Some("desktop_operator_credential")
+        )
+        .is_err());
+        assert!(record(None, None, Some("desktop_operator_credential")).is_err());
+        assert!(record(
+            Some(DEVICE_OWNER_AUTHENTICATION_ISSUER),
+            Some("mitch"),
+            Some("desktop_operator_credential")
+        )
+        .is_err());
+        assert!(record(Some(DEVICE_OWNER_AUTHENTICATION_ISSUER), None, None).is_err());
     }
 
     #[test]

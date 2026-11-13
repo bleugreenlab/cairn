@@ -513,6 +513,7 @@ pub(crate) fn assemble_facts(inputs: FactsInputs, now: i64) -> ActorFacts {
         base_commit: None,
         policy_project_id: Some(inputs.source.project_id),
         drain: None,
+        fenced_command: None,
     }
 }
 

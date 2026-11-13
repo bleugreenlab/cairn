@@ -24,6 +24,8 @@ pub(crate) enum BlockingKind {
     Tasks,
     Calls,
     Questions,
+    /// A `cairn://requests` filing whose call waits for its outcome.
+    Requests,
 }
 
 /// Classify a change item as a blocking append, if it is one. Only `mode=append`
@@ -38,7 +40,16 @@ pub(crate) fn blocking_append_kind(item: &ChangeItem) -> Option<BlockingKind> {
     if item.mode != ChangeMode::Append {
         return None;
     }
-    let resource = cairn_uri::delegate_thread_descendant(parse_uri(&item.target)?).ok()?;
+    let resource = parse_uri(&item.target)?;
+    if matches!(resource, CairnResource::Requests) {
+        // A malformed `wait` is not blocking, so the ordinary filing path
+        // refuses it by name.
+        let waits = item.payload.as_ref().is_some_and(|payload| {
+            crate::operator_requests::wait::wait_requested(payload) == Ok(true)
+        });
+        return waits.then_some(BlockingKind::Requests);
+    }
+    let resource = cairn_uri::delegate_thread_descendant(resource).ok()?;
     match resource {
         CairnResource::NodeTasks { .. } => Some(BlockingKind::Tasks),
         CairnResource::NodeCalls { .. } => Some(BlockingKind::Calls),
@@ -62,27 +73,39 @@ pub(crate) fn validate_blocking_group(
     let mut tasks = 0usize;
     let mut calls = 0usize;
     let mut questions = 0usize;
+    let mut requests = 0usize;
     for &i in indices {
         match blocking_append_kind(&changes[i]) {
             Some(BlockingKind::Tasks) => tasks += 1,
             Some(BlockingKind::Calls) => calls += 1,
             Some(BlockingKind::Questions) => questions += 1,
+            Some(BlockingKind::Requests) => requests += 1,
             None => {}
         }
     }
-    let categories = (tasks > 0) as u8 + (calls > 0) as u8 + (questions > 0) as u8;
+    let categories =
+        (tasks > 0) as u8 + (calls > 0) as u8 + (questions > 0) as u8 + (requests > 0) as u8;
     if categories > 1 {
         return Err(
-            "Cannot mix task, call, and question appends in a single change call".to_string(),
+            "Cannot mix task, call, question, and waiting request appends in a single change call"
+                .to_string(),
         );
     }
     if questions > 1 {
         return Err("Only one questions append is supported per change call".to_string());
     }
+    if requests > 1 {
+        return Err(
+            "Only one waiting request filing is supported per change call; file the others with wait:false"
+                .to_string(),
+        );
+    }
     Ok(Some(if tasks > 0 {
         BlockingKind::Tasks
     } else if calls > 0 {
         BlockingKind::Calls
+    } else if requests > 0 {
+        BlockingKind::Requests
     } else {
         BlockingKind::Questions
     }))
@@ -231,6 +254,31 @@ pub(crate) async fn run_blocking_group(
     match kind {
         BlockingKind::Tasks => run_tasks_group(orch, request, changes, indices).await,
         BlockingKind::Calls => run_calls_group(orch, request, changes, indices).await,
+        BlockingKind::Requests => {
+            let index = indices[0];
+            let Some(payload) = changes[index].payload.as_ref() else {
+                return BlockingGroupOutcome::refuse_all(
+                    indices,
+                    "Request filing requires payload",
+                );
+            };
+            match crate::operator_requests::wait::file_and_wait(orch, request, payload).await {
+                Ok((filed, outcome)) => BlockingGroupOutcome {
+                    blocking: Some(BlockingResult {
+                        text: outcome,
+                        artifact_uri: Some(filed.request.uri.clone()),
+                        answers: None,
+                    }),
+                    applied: vec![BlockingApplied {
+                        index,
+                        summary: crate::operator_requests::wait::filed_summary(&filed),
+                        data: serde_json::to_value(&filed).unwrap_or_default(),
+                    }],
+                    failures: Vec::new(),
+                },
+                Err(error) => BlockingGroupOutcome::refuse_all(indices, error),
+            }
+        }
         BlockingKind::Questions => {
             let Some(payload) = changes[indices[0]].payload.clone() else {
                 return "Question append requires payload with a questions array"
@@ -1258,6 +1306,53 @@ mod blocking_group_tests {
         let mut create = append("cairn://p/cairn/1/1/builder/tasks");
         create.mode = ChangeMode::Create;
         assert_eq!(blocking_append_kind(&create), None);
+    }
+
+    fn filing(payload: serde_json::Value) -> ChangeItem {
+        ChangeItem {
+            payload: Some(payload),
+            ..append("cairn://requests")
+        }
+    }
+
+    /// A filing blocks only when its call waits: by default for
+    /// `fenced_command`, never for a `wait:false` filing (which returns at
+    /// once through the ordinary dispatcher), and never for a malformed flag,
+    /// which that dispatcher refuses by name.
+    #[test]
+    fn a_request_filing_blocks_only_when_its_call_waits() {
+        use serde_json::json;
+        let fenced = json!({"kind":"fenced_command","rationale":"r"});
+        assert_eq!(
+            blocking_append_kind(&filing(fenced.clone())),
+            Some(BlockingKind::Requests)
+        );
+        let mut immediate = fenced.clone();
+        immediate["wait"] = json!(false);
+        assert_eq!(blocking_append_kind(&filing(immediate)), None);
+        let mut malformed = fenced;
+        malformed["wait"] = json!("soon");
+        assert_eq!(blocking_append_kind(&filing(malformed)), None);
+        assert_eq!(
+            blocking_append_kind(&filing(json!({"kind":"rebuild","rationale":"r"}))),
+            None
+        );
+        assert_eq!(
+            blocking_append_kind(&filing(
+                json!({"kind":"rebuild","rationale":"r","wait":true})
+            )),
+            Some(BlockingKind::Requests)
+        );
+        let two = vec![
+            filing(json!({"kind":"fenced_command","rationale":"a"})),
+            filing(json!({"kind":"fenced_command","rationale":"b"})),
+        ];
+        assert!(validate_blocking_group(&two, &[0, 1]).is_err());
+        let mixed = vec![
+            filing(json!({"kind":"fenced_command","rationale":"a"})),
+            append("cairn://p/cairn/1/1/builder/questions"),
+        ];
+        assert!(validate_blocking_group(&mixed, &[0, 1]).is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@ const _: () = assert!(WHOLE_RUN_BATCH_WIRE_BYTES < RELAY_RESPONSE_BYTE_BUDGET);
 /// door's reply) is outside it, so a batch holding one can compose past it; the
 /// agent-facing edges pass the text through untouched either way. A batch
 /// composed for code never applies it.
-const MAX_RUN_RESULT_BYTES: usize = 45_000;
+pub(crate) const MAX_RUN_RESULT_BYTES: usize = 45_000;
 
 /// How much of each item a composed batch result may carry, chosen by whoever
 /// the result is for.

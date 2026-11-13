@@ -69,6 +69,9 @@ pub(crate) async fn drain_once(orch: &Orchestrator) -> Result<usize, String> {
 async fn deliver(orch: &Orchestrator, intent: &RequestOutbox) -> Result<(), String> {
     match intent.kind.as_str() {
         "changed" => {
+            // Every transition enqueues this per member in its own transaction,
+            // so it is the one post-commit signal a waiting filer needs.
+            super::wait::request_changed(&intent.request_id);
             // Requests belong to the install, not to one project's replica. An
             // unscoped frame invalidates every project's private-request badge.
             orch.services.emitter.emit(

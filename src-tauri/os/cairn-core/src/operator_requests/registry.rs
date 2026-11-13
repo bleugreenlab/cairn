@@ -13,15 +13,12 @@ use serde_json::Value;
 use super::AcceptedRequestContext;
 use crate::orchestrator::Orchestrator;
 use cairn_common::requests::{
-    DrainAcceptance, RequestAcceptance, RequestAttemptOutcome, RequestKind,
+    DrainAcceptance, FencedCommandAcceptance, RequestAcceptance, RequestAttemptOutcome, RequestKind,
 };
 
-pub const REGISTERED_KINDS: &[&str] = &["rebuild", "bump_version", "lift_drain"];
+pub const REGISTERED_KINDS: &[&str] = &["rebuild", "bump_version", "lift_drain", "fenced_command"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcceptancePolicy {
-    OperatorCredential,
-}
+pub use cairn_common::requests::AcceptancePolicy;
 
 #[derive(Debug, Clone, Copy)]
 pub struct KindDefinition {
@@ -49,6 +46,12 @@ pub const DEFINITIONS: &[KindDefinition] = &[
         actor: "execution.fleet",
         dependency: "cairn/6383 execution-owned generation-attributed FleetConfig drain adapter",
         acceptance_policy: AcceptancePolicy::OperatorCredential,
+    },
+    KindDefinition {
+        name: "fenced_command",
+        actor: super::fenced_command::ACTOR,
+        dependency: "the fenced_command consumer, which dispatches through the fleet's operator-act path",
+        acceptance_policy: AcceptancePolicy::LocalUserVerification,
     },
 ];
 
@@ -132,6 +135,9 @@ pub(crate) struct ActorFacts {
     pub base_commit: Option<String>,
     pub policy_project_id: Option<String>,
     pub drain: Option<DrainAcceptance>,
+    /// The act and executor witness a `fenced_command` card would accept.
+    #[serde(default)]
+    pub fenced_command: Option<FencedCommandAcceptance>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,16 +270,39 @@ impl RequestRegistry {
     }
 }
 
+/// The digest an acceptance's binding names. A `fenced_command` act binds each
+/// field of its frozen act and executor witness through the canonical encoder,
+/// so the binding names the machine, the measurement and the exact bytes.
 pub(crate) fn act_digest(
     kind: RequestKind,
     target: Option<&str>,
+    fenced: Option<&FencedCommandAcceptance>,
 ) -> cairn_common::authorization::ActDigest {
-    cairn_common::authorization::ActDigest::of(kind.as_str(), |encoder| match target {
-        Some(target) => {
-            encoder.field("target", target);
-        }
-        None => {
-            encoder.field("target", "");
+    cairn_common::authorization::ActDigest::of(kind.as_str(), |encoder| {
+        encoder.field("target", target.unwrap_or(""));
+        if let Some(fenced) = fenced {
+            let (act, witness) = (&fenced.act, &fenced.witness);
+            encoder.field("executor_id", &act.executor_id);
+            encoder.field("device_id", &act.device_id);
+            encoder.field("project_id", &act.project_id);
+            encoder.field("branch", &act.branch);
+            encoder.field("commit", &act.commit);
+            encoder.field("cwd", &act.cwd);
+            encoder.field("command", &act.command);
+            encoder.field("timeout_ms", &act.timeout_ms.to_string());
+            encoder.field("node", &act.node);
+            encoder.field(
+                "connection_generation",
+                &witness.connection_generation.to_string(),
+            );
+            encoder.field("executor_build_id", &witness.executor_build_id);
+            encoder.field("boot_generation", &witness.boot_generation);
+            encoder.field("floor_fingerprint", &witness.floor_fingerprint);
+            encoder.field(
+                "floor_measured_at_unix_ms",
+                &witness.floor_measured_at_unix_ms.to_string(),
+            );
+            encoder.field("scratch_head", fenced.scratch_head.as_deref().unwrap_or(""));
         }
     })
 }

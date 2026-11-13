@@ -20,6 +20,7 @@ pub mod machine_services;
 pub mod management;
 pub mod models;
 pub(crate) mod occupancy;
+mod operator_act;
 pub(crate) mod output_guard;
 pub(crate) mod placement;
 pub(crate) mod placement_default;
@@ -14241,13 +14242,30 @@ impl Fleet {
                     }
                     cairn_common::executor_protocol::SandboxDenial::Command => None,
                 };
-                let crossing = fence::Crossing::for_denied_item(
+                let mut crossing = fence::Crossing::for_denied_item(
                     denied_path,
                     rerun.as_ref(),
                     &command,
                     &command,
                     reported_denial.as_deref(),
                 );
+                // The binding names the executor that ran the item, so a
+                // refusal can offer running it there once by request.
+                if let Some(binding) = context.executor_binding.as_ref() {
+                    let declared_check = match (denied_path, context.run_context.as_ref()) {
+                        (None, Some(run_context)) => {
+                            crate::mcp::handlers::run::is_declared_check(
+                                orch,
+                                &run_context.project_id,
+                                &request.cwd,
+                                &command,
+                            )
+                            .await
+                        }
+                        _ => false,
+                    };
+                    crossing = crossing.offering_request(&binding.executor_id, declared_check);
+                }
                 match fence::raise_fence_with_handoff(
                     orch,
                     &run_id,
@@ -48543,16 +48561,18 @@ mod handoff_tests {
     #[tokio::test]
     async fn a_relayed_denial_with_no_bounded_rerun_is_refused_without_a_permission() {
         let orch = fence_orchestrator(true).await;
-        for (denial, rerun, expected) in [
+        for (denial, rerun, expected, offers) in [
             (
                 SandboxDenial::Command,
                 Some(no_path_rerun()),
                 cairn_sandbox::NO_PATH_RECOVERED.to_string(),
+                true,
             ),
             (
                 SandboxDenial::Path("/outside/a".into()),
                 None,
                 "predates bounded reruns".to_string(),
+                false,
             ),
         ] {
             let result = orch
@@ -48574,6 +48594,13 @@ mod handoff_tests {
             match result {
                 RunnerCallbackResult::Rejected { diagnostic } => {
                     assert!(diagnostic.contains(&expected), "{diagnostic}");
+                    // The bound executor is not connected, so the offer says
+                    // why the request is unavailable on it.
+                    assert_eq!(
+                        diagnostic.contains("(a `fenced_command` request) is not available here"),
+                        offers,
+                        "{diagnostic}"
+                    );
                 }
                 other => panic!("expected a refusal, got {other:?}"),
             }

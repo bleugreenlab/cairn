@@ -92,6 +92,21 @@ pub(crate) async fn resolve_current_for_read(
     })
 }
 
+/// A project's own repository: what a run batch's `ColocatedPath` names, and
+/// what its version-control store is derived from.
+pub(crate) async fn project_repository_path(
+    orch: &Orchestrator,
+    project_id: &str,
+) -> Result<PathBuf, String> {
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let project = project_context_by_id_in_db(&db, project_id).await?;
+    project
+        .project_path
+        .ok_or_else(|| format!("project '{project_id}' has no local repository"))
+}
+
 /// The calling run's project and the branch its job's work merges into
 /// (`jobs.base_branch`: the parent issue's branch for a stacked child), or
 /// `None` when the job records none and so merges into the project default.

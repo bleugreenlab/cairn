@@ -19,7 +19,7 @@ use crate::write_refusal::resolve_through_existing_ancestor;
 use crate::{paths_overlap, NetworkScope, ReadScope, SandboxPolicy};
 
 /// Why a denial that recovered no path cannot be approved.
-pub const NO_PATH_RECOVERED: &str = "This item's output reads as a permission denial, and the sandbox could not say which path, if any, it refused. So there is nothing bounded to approve: an approval would have to rerun the item with no sandbox at all, and an approval never does that. If the denial is the fence's, keep the work inside the checkout or `$TMPDIR`. If the work genuinely needs to reach outside them, an operator can set this agent's fence to `allow`.";
+pub const NO_PATH_RECOVERED: &str = "This item's output reads as a permission denial, and the sandbox could not say which path, if any, it refused. So there is nothing bounded to approve: an approval would have to rerun the item with no sandbox at all, and an approval never does that. If the denial is the fence's, keep the work inside the checkout or `$TMPDIR`. If the work genuinely needs to reach outside them, ask the operator to run this exact command once outside the fence: a `fenced_command` request to `cairn://requests`, which the operator decides.";
 
 /// Why a denial under a spawn the fence did not confine cannot be approved.
 pub const NO_POLICY_TO_WIDEN: &str = "This item ran with no fence policy, so the refusal did not come from the fence and no approval changes it.";

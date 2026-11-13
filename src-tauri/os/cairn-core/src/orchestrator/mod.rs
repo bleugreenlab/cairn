@@ -2797,6 +2797,9 @@ impl Orchestrator {
         if let Err(error) = crate::fleet::lift_drain::install(self) {
             tracing::error!(%error, "lift_drain adapter registration failed");
         }
+        if let Err(error) = crate::operator_requests::fenced_command::consumer::install(self) {
+            tracing::error!(%error, "fenced_command adapter registration failed");
+        }
         #[cfg(target_os = "macos")]
         if let Err(error) = crate::rebuilds::consumer::install(self) {
             tracing::error!(%error, "rebuild adapter registration failed");

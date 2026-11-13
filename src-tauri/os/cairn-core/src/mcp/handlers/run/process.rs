@@ -516,13 +516,22 @@ pub(crate) async fn run_one(
                 };
                 let reported =
                     sandbox::reported_denial_line(&format!("{}\n{}", exec.stdout, exec.stderr));
+                // A host spawn runs on the colocated executor's machine, which
+                // is `local` to the fleet.
+                let declared_check = match (denied_path, run_context) {
+                    (None, Some(context)) => {
+                        super::is_declared_check(orch, &context.project_id, cwd, command).await
+                    }
+                    _ => false,
+                };
                 let crossing = fence::Crossing::for_denied_item(
                     denied_path,
                     Some(&rerun),
                     &header,
                     command,
                     reported.as_deref(),
-                );
+                )
+                .offering_request("local", declared_check);
                 match fence::raise_fence(orch, &run_id, fence_mode, request, crossing).await {
                     fence::FenceDecision::Allow => {
                         let grant = match (denied_path, &rerun) {

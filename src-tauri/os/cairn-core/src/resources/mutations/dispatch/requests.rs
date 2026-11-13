@@ -5,9 +5,18 @@ use crate::orchestrator::Orchestrator;
 use cairn_common::requests::FileOperatorRequest;
 use cairn_uri::CairnResource;
 
+/// The filing record of a filing that does not wait. A waiting one is a
+/// blocking append and never reaches this dispatcher, so a `wait` that
+/// resolves true here means the call was routed around its wait.
 fn file_input(payload: &serde_json::Value) -> Result<FileOperatorRequest, String> {
-    serde_json::from_value(payload.clone())
-        .map_err(|error| format!("Invalid request filing: {error}"))
+    let (input, wait) = crate::operator_requests::wait::split_filing(payload)?;
+    if wait {
+        return Err(
+            "A waiting request filing runs as its write call's blocking append; nothing was filed"
+                .into(),
+        );
+    }
+    Ok(input)
 }
 
 fn check_withdraw(payload: &serde_json::Value) -> Result<(), String> {
@@ -57,11 +66,7 @@ pub(super) async fn dispatch(
             let filed = crate::operator_requests::file(orch, request, input)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-            let summary = format!(
-                "{} operator request {}",
-                if filed.created { "Filed" } else { "Joined" },
-                filed.request.uri
-            );
+            let summary = crate::operator_requests::wait::filed_summary(&filed);
             *applied_data = Some(
                 serde_json::to_value(filed)
                     .map_err(|error| build_failure(index, item, error.to_string()))?,
@@ -109,6 +114,21 @@ mod tests {
         for kind in ["rebuild", "bump_version", "lift_drain"] {
             assert!(error.contains(kind), "{error}");
         }
+    }
+    #[test]
+    fn a_non_waiting_filing_strips_its_flag_and_a_bad_flag_is_refused_by_name() {
+        let filed =
+            file_input(&json!({"kind":"fenced_command","rationale":"r","wait":false})).unwrap();
+        assert_eq!(
+            filed.kind,
+            cairn_common::requests::RequestKind::FencedCommand
+        );
+        assert!(file_input(&json!({"kind":"rebuild","rationale":"r"})).is_ok());
+        let error =
+            file_input(&json!({"kind":"rebuild","rationale":"r","wait":"yes"})).unwrap_err();
+        assert!(error.contains("`wait`"), "{error}");
+        // A waiting filing reaching this dispatcher files nothing.
+        assert!(file_input(&json!({"kind":"fenced_command","rationale":"r"})).is_err());
     }
     #[test]
     fn withdrawal_cannot_accept_or_change_actor_state() {

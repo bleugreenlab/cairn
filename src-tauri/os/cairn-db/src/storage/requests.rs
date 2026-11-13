@@ -162,6 +162,7 @@ async fn get_conn(conn: &TrackedConnection, request: &str) -> DbResult<Option<Op
         unavailable_reason: Some(
             "consumer availability is supplied by the registered runner service".into(),
         ),
+        acceptance_policy: Default::default(),
         headline: None,
     };
     drop(rows);
@@ -567,7 +568,46 @@ fn validate_acceptance(a: &RequestAcceptance) -> DbResult<()> {
     {
         return Err(error("missing or unsupported frozen acceptance fields"));
     }
+    if (a.kind == RequestKind::FencedCommand) != a.fenced_command.is_some() {
+        return Err(error(
+            "a fenced_command acceptance, and only one, carries its frozen act",
+        ));
+    }
     match a.kind {
+        RequestKind::FencedCommand => {
+            let f = a
+                .fenced_command
+                .as_ref()
+                .ok_or_else(|| error("missing fenced command act"))?;
+            let act = &f.act;
+            let encoded = serde_json::to_string(act)
+                .map_err(|e| error(format!("unencodable fenced command act: {e}")))?;
+            if a.target.as_deref() != Some(encoded.as_str())
+                || a.target_identity != act.executor_id
+                || [
+                    &act.executor_id,
+                    &act.device_id,
+                    &act.project_id,
+                    &act.branch,
+                    &act.commit,
+                    &act.command,
+                    &act.node,
+                    &f.witness.executor_build_id,
+                    &f.witness.boot_generation,
+                    &f.witness.floor_fingerprint,
+                ]
+                .iter()
+                .any(|s| !nonblank(s))
+                || act.timeout_ms == 0
+                || f.witness.floor_measured_at_unix_ms == 0
+                || a.drain.is_some()
+                || a.candidate_commit.is_some()
+            {
+                return Err(error(
+                    "fenced_command acceptance requires its exact frozen act, executor identity and credential-floor witness",
+                ));
+            }
+        }
         RequestKind::Rebuild => {
             if a.candidate_commit.as_ref().is_none_or(|s| !nonblank(s))
                 || a.target.is_some()
@@ -1391,6 +1431,7 @@ mod tests {
             base_commit: Some("b".repeat(40)),
             policy_project_id: Some("canonical".into()),
             drain: None,
+            fenced_command: None,
             operator,
             appearance,
             accepted_at: 3,

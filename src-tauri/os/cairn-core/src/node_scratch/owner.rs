@@ -164,6 +164,20 @@ pub async fn open_for_owner(local: &LocalDb, owner: &ScratchOwner) -> DbResult<N
         .ok_or_else(|| crate::storage::DbError::Row("node scratch vanished after insert".into()))
 }
 
+/// The open scratch of the node at `uri`, if it has one. Never creates one.
+pub async fn open_by_uri(local: &LocalDb, uri: &str) -> DbResult<Option<NodeScratch>> {
+    local
+        .query_opt(
+            format!(
+                "SELECT {COLUMNS} FROM node_scratches
+                 WHERE owner_uri = ?1 AND closed_at IS NULL LIMIT 1"
+            ),
+            (node_uri(uri).to_owned(),),
+            from_row,
+        )
+        .await
+}
+
 pub async fn load(local: &LocalDb, scratch_id: &str) -> DbResult<Option<NodeScratch>> {
     local
         .query_opt(

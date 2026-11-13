@@ -31,7 +31,7 @@ use cairn_common::executor_protocol::{CrossingAccess, CrossingRerun};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
-use crate::services::sandbox::NO_PATH_RECOVERED;
+use crate::services::sandbox::{NO_PATH_RECOVERED, NO_POLICY_TO_WIDEN};
 
 use super::permission::{await_permission_decision, fence_policy_for_run, Handoff, PermissionWait};
 
@@ -188,6 +188,19 @@ pub struct Crossing {
     /// Such a crossing is refused rather than put in front of anyone, and a
     /// session grant does not answer it either.
     unapprovable: Option<String>,
+    /// Where the denied item ran, for the `fenced_command` request a refusal
+    /// that no approval can answer offers instead. `None` offers nothing.
+    offer: Option<RequestOffer>,
+}
+
+/// What a refused `run` crossing needs to offer the operator request.
+#[derive(Debug, Clone)]
+struct RequestOffer {
+    /// The executor's public name or stable id.
+    executor: String,
+    /// Whether the canonical project configuration declares the command as a
+    /// check, which already runs unfenced as one.
+    declared_check: bool,
 }
 
 impl Crossing {
@@ -203,6 +216,7 @@ impl Crossing {
             command: None,
             reported: None,
             unapprovable: None,
+            offer: None,
         }
     }
 
@@ -216,6 +230,7 @@ impl Crossing {
             command: None,
             reported: None,
             unapprovable: None,
+            offer: None,
         }
     }
 
@@ -239,6 +254,7 @@ impl Crossing {
             command: Some(command.to_string()),
             reported: None,
             unapprovable: None,
+            offer: None,
         }
     }
 
@@ -257,6 +273,7 @@ impl Crossing {
             command: Some(command.to_string()),
             reported: None,
             unapprovable: None,
+            offer: None,
         }
     }
 
@@ -313,7 +330,52 @@ impl Crossing {
             command: Some(command.to_string()),
             reported: None,
             unapprovable: Some(NO_PATH_RECOVERED.to_string()),
+            offer: None,
         }
+    }
+
+    /// This crossing, offering a `fenced_command` request for its exact
+    /// command on `executor` (a public name or stable id) when it is refused
+    /// for having no path to approve.
+    pub(crate) fn offering_request(self, executor: &str, declared_check: bool) -> Self {
+        Crossing {
+            offer: Some(RequestOffer {
+                executor: executor.to_string(),
+                declared_check,
+            }),
+            ..self
+        }
+    }
+
+    /// The offer a refused command-scoped crossing appends, or `None`.
+    ///
+    /// Only a denial that recovered no path gets one: a path-scoped crossing
+    /// has a bounded rerun or a reason specific to its path, and a spawn the
+    /// fence did not confine was not refused by the fence at all. The floor is
+    /// read live, so an executor that cannot take the act gets the reason
+    /// rather than a request it would refuse.
+    fn request_offer(&self, orch: &Orchestrator) -> Option<String> {
+        if self.kind != CrossingKind::ShellCommandEscape
+            || self.unapprovable.as_deref() == Some(NO_POLICY_TO_WIDEN)
+        {
+            return None;
+        }
+        let offer = self.offer.as_ref()?;
+        let command = self.command.as_deref()?;
+        let (name, floor) =
+            match crate::fleet::management::resolve_executor_reference(orch, &offer.executor) {
+                Ok(id) => (
+                    crate::fleet::management::public_name(orch, &id),
+                    crate::operator_requests::fenced_command::executor_floor(orch, &id).map(|_| ()),
+                ),
+                Err(error) => (offer.executor.clone(), Err(error)),
+            };
+        Some(crate::operator_requests::fenced_command::offer_for(
+            command,
+            Some(&name),
+            floor,
+            offer.declared_check,
+        ))
     }
 
     /// A kernel denial whose path was not recovered, inside the item that ran
@@ -579,8 +641,14 @@ pub(crate) fn decide_without_asking(
             if let Some(refusal) = crossing.route_refusal() {
                 return Some(FenceDecision::Deny(refusal));
             }
+            // An unapprovable command escape still has one route that is not a
+            // rerun: the operator running the exact command once. The refusal
+            // offers that request; it files nothing.
             if let Some(reason) = &crossing.unapprovable {
-                return Some(FenceDecision::Deny(reason.clone()));
+                return Some(FenceDecision::Deny(match crossing.request_offer(orch) {
+                    Some(offer) => format!("{reason}\n\n{offer}"),
+                    None => reason.clone(),
+                }));
             }
             // A grant answers only its own descriptor. A read is not answered
             // by a write grant on its path: an agent may give itself the write,
@@ -870,12 +938,62 @@ mod tests {
     /// all, and the route inside the sandbox.
     #[test]
     fn the_pathless_refusal_names_the_missing_path_the_absent_sandbox_and_the_route() {
-        for phrase in ["could not say which path", "no sandbox at all", "`$TMPDIR`"] {
+        for phrase in [
+            "could not say which path",
+            "no sandbox at all",
+            "`$TMPDIR`",
+            "`fenced_command` request",
+        ] {
             assert!(
                 NO_PATH_RECOVERED.contains(phrase),
                 "{phrase}: {NO_PATH_RECOVERED}"
             );
         }
+        assert!(
+            !NO_PATH_RECOVERED.contains("`allow`"),
+            "{NO_PATH_RECOVERED}"
+        );
+    }
+
+    /// A refusal no approval can answer offers the one route left, the
+    /// operator running the exact command once, and only for a command escape
+    /// the fence refused. The test runner has no executor whose credential
+    /// floor is measured, so the offer is the reason the act is unavailable;
+    /// either way nothing is filed and nobody is asked.
+    #[tokio::test]
+    async fn only_a_pathless_fence_refusal_offers_the_operator_request() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        let deny = |crossing: Crossing| match decide_without_asking(&orch, Fence::Ask, &crossing) {
+            Some(FenceDecision::Deny(refusal)) => refusal,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let widened = CrossingRerun::Widened {
+            access: CrossingAccess::Write,
+        };
+        let unfenced = CrossingRerun::Refused {
+            reason: NO_POLICY_TO_WIDEN.to_string(),
+        };
+        let denied = |path: Option<&Path>, rerun: Option<&CrossingRerun>| {
+            Crossing::for_denied_item(path, rerun, "sh -c", "make install", None)
+        };
+
+        let offered = deny(denied(None, Some(&widened)).offering_request("local", false));
+        assert!(offered.starts_with(NO_PATH_RECOVERED), "{offered}");
+        assert!(
+            offered.contains("(a `fenced_command` request) is not available here"),
+            "{offered}"
+        );
+
+        assert_eq!(deny(denied(None, Some(&widened))), NO_PATH_RECOVERED);
+        assert_eq!(
+            deny(denied(None, Some(&unfenced)).offering_request("local", false)),
+            NO_POLICY_TO_WIDEN
+        );
+        assert_eq!(
+            deny(denied(Some(Path::new("/outside/a")), None).offering_request("local", false)),
+            EXECUTOR_PREDATES_BOUNDED_RERUN
+        );
+        assert_eq!(permission_rows(&orch).await, 0);
     }
 
     /// A read and a write of one path are two grants, and neither answers the

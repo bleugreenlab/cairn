@@ -122,6 +122,16 @@ pub(crate) enum Condition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         settlement: Option<Box<super::run::PersistedSettlement>>,
     },
+    /// A waiting `cairn://requests` filing, answered by its request's outcome
+    /// ([`crate::operator_requests::wait`]). Level-triggered from the request
+    /// row, so a restart re-arms it like a `waitFor`.
+    OperatorRequest {
+        request_id: String,
+        /// Attempts that had already reported when the call filed, so a
+        /// joined request's earlier failure does not answer this wait.
+        #[serde(default)]
+        settled_attempts: Vec<String>,
+    },
 }
 
 /// Retire a wait whose continuation has been taken over by a more specific
@@ -581,6 +591,7 @@ impl Condition {
             Condition::Checks { .. } => "checks",
             Condition::McpContinuation { .. } => "mcp_continuation",
             Condition::RunBatch { .. } => "run_batch",
+            Condition::OperatorRequest { .. } => "operator_request",
         }
     }
 
@@ -609,6 +620,9 @@ impl Condition {
                 label: Some(label), ..
             } => format!("run: {label}"),
             Condition::RunBatch { label: None, .. } => "run batch".to_string(),
+            Condition::OperatorRequest { request_id, .. } => {
+                format!("write: operator request cairn://requests/{request_id}")
+            }
         }
     }
 }
@@ -3270,6 +3284,10 @@ async fn resolution_after_restart(
                 Err(error) => serde_json::json!({"outcome":"error","error":error}).to_string(),
             }
         }
+        Condition::OperatorRequest {
+            request_id,
+            settled_attempts,
+        } => crate::operator_requests::wait::trigger(orch, request_id, settled_attempts).await,
     }
 }
 
@@ -5112,6 +5130,10 @@ mod tests {
             },
             Condition::McpContinuation { state: mcp_state() },
             run_batch_condition(false, None),
+            Condition::OperatorRequest {
+                request_id: "request-1".into(),
+                settled_attempts: vec![],
+            },
         ] {
             let json = serde_json::to_value(&condition).unwrap();
             assert_eq!(json["kind"], condition.kind(), "{json}");
@@ -7346,6 +7368,96 @@ mod tests {
             orch.process_state.get_current_turn_id("run-1").as_deref(),
             Some(successors[0].0.as_str())
         );
+    }
+
+    /// A parked waiting filing resumes once with its request's rendered
+    /// outcome, signalled by the request outbox. Redelivering the same intent
+    /// (its acknowledgement lost) and re-arming the row as a restart would
+    /// answers nothing twice.
+    #[tokio::test]
+    async fn an_operator_request_wait_resumes_once_across_a_redelivered_signal() {
+        let (orch, mut record, _) = durable_env().await;
+        record.condition = Condition::OperatorRequest {
+            request_id: "request-wait".into(),
+            settled_attempts: vec![],
+        };
+        record.deadline = None;
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO request_cohorts(id,workspace_id,kind,state,created_at,updated_at)
+                 VALUES('cohort-wait','default','rebuild','open',1,1);
+                 INSERT INTO requests(id,workspace_id,kind,target_identity,cohort_id,state,created_at,updated_at)
+                 VALUES('request-wait','default','rebuild','install','cohort-wait','open',1,1);",
+            )
+            .await
+            .unwrap();
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        let parked = tokio::spawn(crate::operator_requests::wait::resolve_parked(
+            orch.clone(),
+            orch.db.local.clone(),
+            record.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            wait_state(&orch).await,
+            "pending",
+            "an open request holds the park"
+        );
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE requests SET state='declined',report_json='{\"decision\":\"declined\",\"reason\":\"not on a Friday\"}' WHERE id='request-wait';
+                 INSERT INTO request_outbox(id,request_id,kind,payload_json,created_at)
+                 VALUES('changed-wait','request-wait','changed','{}',1);",
+            )
+            .await
+            .unwrap();
+        crate::operator_requests::delivery::drain_once(&orch)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), parked)
+            .await
+            .expect("the delivered change resolves the park")
+            .unwrap();
+        assert_eq!(wait_state(&orch).await, "resolved");
+
+        orch.db
+            .local
+            .execute(
+                "UPDATE request_outbox SET delivered_at=NULL WHERE id='changed-wait'",
+                (),
+            )
+            .await
+            .unwrap();
+        crate::operator_requests::delivery::drain_once(&orch)
+            .await
+            .unwrap();
+        crate::operator_requests::wait::resolve_parked(
+            orch.clone(),
+            orch.db.local.clone(),
+            record.clone(),
+        )
+        .await;
+
+        assert_eq!(tool_result_count(&orch).await, 1, "one answer for the call");
+        assert_eq!(
+            wait_resolved_turns(&orch).await.len(),
+            1,
+            "one continuation"
+        );
+        let answer: String = orch
+            .db
+            .local
+            .query_one(
+                "SELECT data FROM events WHERE event_type='tool_result'",
+                (),
+                |r| r.text(0),
+            )
+            .await
+            .unwrap();
+        assert!(answer.contains("not on a Friday"), "{answer}");
     }
 
     /// Insert a foreign (non-wait_resolved) successor of the predecessor in the

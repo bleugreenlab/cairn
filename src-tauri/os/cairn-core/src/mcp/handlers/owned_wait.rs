@@ -514,7 +514,9 @@ pub(super) async fn trigger(
         }
         // A run batch has no pollable condition: its trigger is the awaited
         // executor result, which only the suspending host holds.
-        Condition::RunBatch { .. } | Condition::McpContinuation { .. } => {
+        Condition::RunBatch { .. }
+        | Condition::McpContinuation { .. }
+        | Condition::OperatorRequest { .. } => {
             Err("this durable suspension has no waitFor condition to await".into())
         }
     }

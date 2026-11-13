@@ -6,14 +6,18 @@
 //! intentionally absent until their physical enforcement is implemented.
 
 pub(crate) mod delivery;
+pub(crate) mod fenced_command;
 pub mod registry;
 #[cfg(test)]
 mod tests;
+pub(crate) mod wait;
 
 use std::sync::Arc;
 
 use cairn_common::authorization::ActBinding;
-use cairn_common::identity::{AppearanceSnapshot, AppearanceTransport, PrincipalRef};
+use cairn_common::identity::{
+    AppearanceSnapshot, AppearanceTransport, PrincipalRef, VerificationMethod, VerificationStatus,
+};
 use cairn_common::protocol::CallbackRequest;
 use cairn_common::requests::*;
 use cairn_db::storage::requests as store;
@@ -82,6 +86,9 @@ async fn decorate(orch: &Orchestrator, mut request: OperatorRequest) -> Operator
     };
     request.unavailable_reason = request.unavailable_reason.map(scrub_text);
     request.available = request.unavailable_reason.is_none();
+    if let Ok(definition) = registry::definition(request.kind.as_str()) {
+        request.acceptance_policy = definition.acceptance_policy;
+    }
     request
 }
 
@@ -391,6 +398,19 @@ async fn identical_open_filing(
     }
 }
 
+/// The text target of a kind whose target is one address or version. Only a
+/// kind that declares a structured target accepts an object.
+fn text_target(kind: RequestKind, target: Option<Value>) -> Result<Option<String>, String> {
+    match target {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(format!(
+            "{} takes a string target; only fenced_command declares a structured one",
+            kind.as_str()
+        )),
+    }
+}
+
 pub async fn file(
     orch: &Orchestrator,
     request: &CallbackRequest,
@@ -404,12 +424,20 @@ pub async fn file(
         );
     }
     let waiting = waiting_uris(input.waiting)?;
-    let facts = adapter.facts(orch, None, input.target.as_deref()).await?;
+    // A structured target is frozen into its canonical stored form before
+    // anything reads it, so facts, filing identity and storage name one act.
+    let target_text = match input.kind {
+        RequestKind::FencedCommand => Some(fenced_command::encode_act(
+            &fenced_command::freeze(orch, request, input.target.as_ref()).await?,
+        )?),
+        kind => text_target(kind, input.target)?,
+    };
+    let facts = adapter.facts(orch, None, target_text.as_deref()).await?;
     let install = orch.anon_device_manager.device_id();
     let mut explicit_requirements = input.requirements.clone();
     explicit_requirements.commits.sort();
     explicit_requirements.commits.dedup();
-    let filing = json!({"target":input.target,"requirements":explicit_requirements});
+    let filing = json!({"target":target_text,"requirements":explicit_requirements});
     let rationale = scrub_text(input.rationale);
     if input.kind == RequestKind::BumpVersion {
         bump_policy(orch, facts.policy_project_id.as_deref()).await?;
@@ -435,7 +463,7 @@ pub async fn file(
     let mut requirements = input.requirements;
     let (target, identity, key, minimum, mut normalized) = match input.kind {
         RequestKind::Rebuild => {
-            if input.target.is_some() {
+            if target_text.is_some() {
                 return Err(
                     "rebuild has no target; use requirements.commits for verification".into(),
                 );
@@ -475,8 +503,7 @@ pub async fn file(
                 return Err("requirements.commits is supported only for rebuild".into());
             }
             bump_policy(orch, facts.policy_project_id.as_deref()).await?;
-            let requested = input
-                .target
+            let requested = target_text
                 .as_deref()
                 .ok_or("bump_version requires sm, md, lg or plain X.Y.Z")?;
             let running =
@@ -494,8 +521,7 @@ pub async fn file(
             if !requirements.commits.is_empty() {
                 return Err("requirements.commits is supported only for rebuild".into());
             }
-            let uri = input
-                .target
+            let uri = target_text
                 .as_deref()
                 .ok_or("lift_drain requires a canonical public executor URI")?;
             let parsed =
@@ -517,6 +543,22 @@ pub async fn file(
                 format!("lift_drain:{}", resolved.executor_id),
                 None,
                 json!({"executorUri":resolved.uri,"executorId":resolved.executor_id,"drainKey":resolved.drain_key}),
+            )
+        }
+        RequestKind::FencedCommand => {
+            if !requirements.commits.is_empty() {
+                return Err("requirements.commits is supported only for rebuild".into());
+            }
+            let encoded = target_text
+                .clone()
+                .ok_or("fenced_command requires a target")?;
+            let act = fenced_command::decode_act(Some(&encoded))?;
+            (
+                Some(encoded.clone()),
+                act.executor_id.clone(),
+                fenced_command::coalescing_key(&encoded),
+                None,
+                json!({"act":act}),
             )
         }
     };
@@ -604,6 +646,50 @@ pub(crate) async fn refresh_facts(orch: &Orchestrator, id: &str) -> Result<(), S
     refresh_facts_for(orch, &request, adapter.as_ref()).await
 }
 
+/// How long a device-owner check counts for the acceptance it was run for.
+/// The desktop runs it immediately before forwarding, on a fresh context with
+/// no reuse window, so an earlier unlock can never stand in for this one.
+const LOCAL_VERIFICATION_WINDOW_MS: i64 = 60_000;
+/// Tolerated clock disagreement between the desktop and the runner.
+const LOCAL_VERIFICATION_SKEW_MS: i64 = 5_000;
+
+/// Whether an acceptance's appearance carries the assurance its kind requires.
+/// `now_ms` is the acceptance moment; a recheck at claim passes `None`, since
+/// freshness belonged to the acceptance and the appearance is immutable.
+fn meets_policy(
+    kind: RequestKind,
+    appearance: &AppearanceSnapshot,
+    now_ms: Option<i64>,
+) -> Result<(), String> {
+    match registry::definition(kind.as_str())?.acceptance_policy {
+        registry::AcceptancePolicy::OperatorCredential => Ok(()),
+        registry::AcceptancePolicy::LocalUserVerification => {
+            let evidence = appearance.evidence();
+            let verification = &evidence.verification;
+            if verification.method() != VerificationMethod::DeviceOwnerAuthentication
+                || verification.status() != VerificationStatus::Verified
+                || evidence.transport != AppearanceTransport::AuthenticatedDesktop
+            {
+                return Err(format!(
+                    "{} requires local user verification: accept it in the Cairn desktop app on macOS, which asks for Touch ID or the Mac password",
+                    kind.as_str()
+                ));
+            }
+            if let Some(now) = now_ms {
+                let at = verification.verified_at();
+                if at > now + LOCAL_VERIFICATION_SKEW_MS || now - at > LOCAL_VERIFICATION_WINDOW_MS
+                {
+                    return Err(
+                        "The local user verification is not fresh; accept again to verify again"
+                            .into(),
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// This is defense in depth, not a credential verifier. Only the invoke
 /// boundary can establish operator proof; a snapshot is immutable attribution,
 /// never a bearer granting authority.
@@ -632,9 +718,14 @@ pub async fn accept(
     appearance: &AppearanceSnapshot,
 ) -> Result<OperatorRequest, String> {
     let request = require_request(orch, id).await?;
-    match registry::definition(request.kind.as_str())?.acceptance_policy {
-        registry::AcceptancePolicy::OperatorCredential => validate_operator(principal, appearance)?,
-    }
+    validate_operator(principal, appearance)?;
+    // Refused before any fact is read or anything is written: the kind's
+    // code, not the request or the caller, sets the assurance required.
+    meets_policy(
+        request.kind,
+        appearance,
+        Some(chrono::Utc::now().timestamp_millis()),
+    )?;
     let adapter = consumer(orch, request.kind).await?;
     if request.state != RequestState::Open {
         return Err("Only an open operator request can be accepted".into());
@@ -669,6 +760,7 @@ pub async fn accept(
         binding: ActBinding::fresh(&registry::act_digest(
             request.kind,
             request.target.as_deref(),
+            facts.fenced_command.as_ref(),
         )),
         facts_version,
         revision,
@@ -676,6 +768,7 @@ pub async fn accept(
         base_commit: facts.base_commit.clone(),
         policy_project_id: facts.policy_project_id.clone(),
         drain: facts.drain.clone(),
+        fenced_command: facts.fenced_command.clone(),
         operator: principal.clone(),
         appearance: appearance.clone(),
         accepted_at: now(),
@@ -741,6 +834,23 @@ async fn check_snapshot(
                 .await?;
             if current.drain != acceptance.drain {
                 return Err("The drain state changed since this card's facts were published (an owner, generation or the machine revision moved); refresh the card before accepting".into());
+            }
+        }
+        RequestKind::FencedCommand => {
+            let accepted = acceptance
+                .fenced_command
+                .as_ref()
+                .ok_or("fenced_command requires the displayed act and executor witness")?;
+            if accepted.act != fenced_command::decode_act(request.target.as_deref())? {
+                return Err("The displayed act differs from the request's frozen act".into());
+            }
+            // The card's facts were published earlier. The operator's decision
+            // pairs only with the machine and measurement standing now.
+            let current = adapter
+                .facts(orch, Some(&request.id), request.target.as_deref())
+                .await?;
+            if current.fenced_command.as_ref() != Some(accepted) {
+                return Err("The executor's connection or credential-floor measurement changed since this card's facts were published; refresh the card before accepting".into());
             }
         }
     }
@@ -871,9 +981,11 @@ impl AcceptedRequestContext {
         if !self.acceptance.binding.names(&registry::act_digest(
             self.acceptance.kind,
             self.acceptance.target.as_deref(),
+            self.acceptance.fenced_command.as_ref(),
         )) {
             return Err("Request acceptance act binding does not match".into());
         }
+        meets_policy(self.acceptance.kind, &self.acceptance.appearance, None)?;
         store::recheck_request(
             &orch.db.local,
             &self.event_id,
@@ -972,7 +1084,7 @@ impl AcceptedRequestContext {
                         offset += 200;
                     }
                 }
-                RequestKind::LiftDrain => {}
+                RequestKind::LiftDrain | RequestKind::FencedCommand => {}
             }
         }
         covered.sort();
@@ -1007,7 +1119,9 @@ pub(crate) async fn dispatch_accepted(orch: &Orchestrator, event_id: &str) -> Re
         || !expected.binding.names(&registry::act_digest(
             expected.kind,
             expected.target.as_deref(),
+            expected.fenced_command.as_ref(),
         ))
+        || meets_policy(expected.kind, &expected.appearance, None).is_err()
     {
         return Err(
             "Request acceptance does not name this install, registered actor and exact act".into(),
@@ -1116,6 +1230,7 @@ pub(crate) async fn recover_claimed_request(
         || !intended.binding.names(&registry::act_digest(
             intended.kind,
             intended.target.as_deref(),
+            intended.fenced_command.as_ref(),
         ))
     {
         return Err(

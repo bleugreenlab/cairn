@@ -40,6 +40,7 @@ impl TestConsumer {
                     generation: 7,
                     machine_revision: 9,
                 }),
+                fenced_command: None,
             }),
             contexts: Mutex::new(Vec::new()),
             dispatch_error: Mutex::new(None),
@@ -191,7 +192,7 @@ fn callback(run: &str) -> CallbackRequest {
 fn input(kind: RequestKind, target: Option<&str>, rationale: &str) -> FileOperatorRequest {
     FileOperatorRequest {
         kind,
-        target: target.map(str::to_string),
+        target: target.map(|target| serde_json::Value::String(target.into())),
         rationale: rationale.into(),
         waiting: vec!["cairn://p/project/1".into()],
         requirements: Default::default(),
@@ -2763,5 +2764,182 @@ mod production_lift_drain {
         consumer.recover(&orch).await.unwrap();
         assert_eq!(state(&orch, &card.id).await.state, RequestState::Open);
         assert_eq!(standing(&orch), vec![DrainOwner::Operator]);
+    }
+}
+
+/// The kind's assurance is enforced by the runner, not by the desktop's
+/// choice to prompt: a desktop that skipped the ceremony (a dropped or renamed
+/// `acceptance_policy` reads as the plain operator credential there) still
+/// cannot accept, and a refusal writes nothing.
+mod fenced_command_acceptance {
+    use super::*;
+    use cairn_common::identity::DEVICE_OWNER_AUTHENTICATION_ISSUER;
+    use cairn_common::requests::{ExecutorFloorWitness, FencedCommandAcceptance, FencedCommandAct};
+
+    fn act() -> FencedCommandAct {
+        FencedCommandAct {
+            executor_id: "exec-1".into(),
+            device_id: "device-1".into(),
+            project_id: "project".into(),
+            branch: "agent/x".into(),
+            commit: commit('a'),
+            cwd: String::new(),
+            command: "touch ~/probe".into(),
+            timeout_ms: 60_000,
+            node: "cairn://p/project/1/1/builder".into(),
+        }
+    }
+
+    fn device_owner(verified_at_ms: i64) -> (PrincipalRef, AppearanceSnapshot) {
+        let principal = PrincipalRef::Machine {
+            device_id: "test-device".into(),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::DeviceOwnerAuthentication,
+            VerificationStatus::Verified,
+            Some(DEVICE_OWNER_AUTHENTICATION_ISSUER.into()),
+            None,
+            None,
+            Some(CredentialRef::new("desktop_operator_credential").unwrap()),
+            VerificationStrength::new("device_owner_authentication").unwrap(),
+            verified_at_ms,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::AuthenticatedDesktop,
+            Address::Desktop {
+                device_id: "test-device".into(),
+            },
+            verification,
+            verified_at_ms,
+            None,
+        )
+        .unwrap();
+        let appearance =
+            AppearanceSnapshot::new(principal.clone(), evidence, vec![], None).unwrap();
+        (principal, appearance)
+    }
+
+    /// Filed through the store the service files through, so no live executor
+    /// is needed to freeze the act; the facts come from the test consumer.
+    async fn filed(orch: &Orchestrator) -> OperatorRequest {
+        let consumer = register(orch, RequestKind::FencedCommand);
+        // Exactly the shape `fenced_command::facts` produces: no commit, drain
+        // or policy fields, which storage refuses on this kind's acceptance.
+        *consumer.facts.lock().unwrap() = ActorFacts {
+            document: json!({"source":"test-only physical evidence"}),
+            running_version: None,
+            main_commit: None,
+            candidate_commit: None,
+            base_commit: None,
+            policy_project_id: None,
+            drain: None,
+            fenced_command: None,
+        };
+        consumer.facts.lock().unwrap().fenced_command = Some(FencedCommandAcceptance {
+            act: act(),
+            witness: ExecutorFloorWitness {
+                connection_generation: 4,
+                executor_build_id: "build-9".into(),
+                boot_generation: "boot-1".into(),
+                floor_fingerprint: "f".repeat(64),
+                floor_measured_at_unix_ms: 1,
+            },
+            scratch_head: None,
+        });
+        let encoded = fenced_command::encode_act(&act()).unwrap();
+        let (origin_uri, wake_destination, run_id, principal) =
+            origin(orch, &callback("run")).await.unwrap();
+        let filed = store::file_request(
+            &orch.db.local,
+            &store::NormalizedRequest {
+                workspace_id: crate::authorization::WORKSPACE_ID.into(),
+                kind: RequestKind::FencedCommand,
+                target: Some(encoded.clone()),
+                target_identity: act().executor_id,
+                coalescing_key: Some(fenced_command::coalescing_key(&encoded)),
+                contribution: RequestContribution {
+                    id: String::new(),
+                    request_id: String::new(),
+                    origin_uri,
+                    run_id,
+                    principal,
+                    wake_destination,
+                    rationale: "probe".into(),
+                    waiting: vec!["cairn://p/project/1".into()],
+                    requirements: Default::default(),
+                    minimum_target: None,
+                    normalized_target: json!({"act": act()}),
+                    active: true,
+                    satisfied_by_attempt: None,
+                    created_at: 0,
+                },
+            },
+            now(),
+        )
+        .await
+        .unwrap();
+        refresh_facts(orch, &filed.request.id).await.unwrap();
+        get(orch, &filed.request.id).await.unwrap().unwrap()
+    }
+
+    async fn authorization_events(orch: &Orchestrator) -> i64 {
+        orch.db
+            .local
+            .query_opt("SELECT COUNT(*) FROM authorization_events", (), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn accept_as(
+        orch: &Orchestrator,
+        card: &OperatorRequest,
+        (principal, appearance): (PrincipalRef, AppearanceSnapshot),
+    ) -> Result<OperatorRequest, String> {
+        accept(
+            orch,
+            &card.id,
+            card.revision,
+            card.facts.as_ref().unwrap().version,
+            &principal,
+            &appearance,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn only_a_fresh_device_owner_check_accepts_and_every_refusal_writes_nothing() {
+        let orch = fixture().await;
+        let card = filed(&orch).await;
+        let before = authorization_events(&orch).await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let plain = accept_as(&orch, &card, operator()).await.unwrap_err();
+        assert!(
+            plain.contains("requires local user verification"),
+            "{plain}"
+        );
+        for stale_at in [now_ms - 120_000, now_ms + 60_000] {
+            let stale = accept_as(&orch, &card, device_owner(stale_at))
+                .await
+                .unwrap_err();
+            assert!(stale.contains("not fresh"), "{stale}");
+        }
+        assert_eq!(authorization_events(&orch).await, before);
+        let unchanged = get(&orch, &card.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.state, RequestState::Open);
+        assert!(unchanged.attempts.is_empty());
+
+        let accepted = accept_as(&orch, &card, device_owner(now_ms)).await.unwrap();
+        assert_eq!(accepted.attempts.len(), 1);
+        assert!(authorization_events(&orch).await > before);
+        // At claim the frozen appearance is held to the same policy, with no
+        // clock: freshness belonged to the acceptance.
+        let frozen = &accepted.attempts[0].acceptance;
+        assert!(meets_policy(RequestKind::FencedCommand, &frozen.appearance, None).is_ok());
+        assert!(meets_policy(RequestKind::FencedCommand, &operator().1, None).is_err());
     }
 }

@@ -35,9 +35,10 @@ pub(crate) use machine_route::{
     machine_os, serves as machine_service_serves,
     takes_named_call as machine_service_takes_named_call,
 };
+pub(crate) use output::MAX_RUN_RESULT_BYTES;
 pub(crate) use process::{record_cache_checkpoint, MAX_BUFFER_SIZE};
 pub(crate) use redact::redact_command;
-pub(crate) use sandbox_policy::{resolve_run_confinement, RunCheckout};
+pub(crate) use sandbox_policy::{is_declared_check, resolve_run_confinement, RunCheckout};
 pub use types::{
     CheckStatusEntry, CheckStatusPayload, ChecksWaitEvent, ChecksWaitKind, RunCompletePayload,
     RunItem, RunItemPayload, RunOutputPayload, RunPayload, TerminalWaitEvent, TerminalWaitKind,

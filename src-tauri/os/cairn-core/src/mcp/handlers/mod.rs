@@ -180,6 +180,7 @@ mod suspension_markers {
             DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX, DELEGATED_TASKS_SUSPENDED_SUFFIX,
         },
         mcp::handlers::run::{RUN_BATCH_SUSPENDED_MARKER, RUN_ITEM_SUSPENDED_MARKER},
+        operator_requests::wait::REQUEST_WAIT_SUSPENDED_MARKER,
         orchestrator::lifecycle::USER_STOP_TOOL_RESULT,
     };
 
@@ -195,6 +196,7 @@ mod suspension_markers {
         RUN_ITEM_SUSPENDED_MARKER,
         DELEGATED_TASKS_SUSPENDED_SUFFIX,
         DELEGATED_TASKS_SUSPENDED_PARENT_SUFFIX,
+        REQUEST_WAIT_SUSPENDED_MARKER,
     ];
 
     /// The vocabulary of a refusal. A suspension marker carrying any of it hands

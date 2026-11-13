@@ -157,6 +157,30 @@ impl RunConfinement {
     }
 }
 
+/// Whether `command` is a check or test the project declares, judged from the
+/// project's canonical main checkout (the worktree `cwd` only when the
+/// project's repository is unresolved), so a branch cannot declare its own.
+/// A whole-line `bash -lc '<cmd>'` is read as `<cmd>`.
+pub(crate) async fn is_declared_check(
+    orch: &Orchestrator,
+    project_id: &str,
+    cwd: &str,
+    command: &str,
+) -> bool {
+    let command = command_for_classification(command);
+    let main_repo = crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, project_id)
+        .await
+        .ok()
+        .and_then(|(path, _key)| path);
+    let source = main_repo
+        .as_deref()
+        .map(std::path::Path::new)
+        .unwrap_or_else(|| std::path::Path::new(cwd));
+    let checks = crate::config::project_settings::load_checks(source).unwrap_or_default();
+    let scripts = crate::config::check_exemption::load_project_scripts(source);
+    crate::config::check_exemption::is_exempt_check_command(&command, &checks, &scripts)
+}
+
 /// Decide what a process spawned for a run is wrapped in.
 ///
 /// Two separate questions are answered here. The fence dial decides whether a
@@ -205,18 +229,8 @@ pub(crate) async fn resolve_run_confinement(
     // self-grant an unconfined run by committing its own check or package script.
     // See `crate::config::check_exemption` and docs/worktree-fence.md.
     if !readonly_non_worktree {
-        if let (Some(cmd), Some(pid)) = (classified, project_id) {
-            let main_repo = crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, pid)
-                .await
-                .ok()
-                .and_then(|(path, _key)| path);
-            let source = main_repo
-                .as_deref()
-                .map(std::path::Path::new)
-                .unwrap_or_else(|| std::path::Path::new(cwd));
-            let checks = crate::config::project_settings::load_checks(source).unwrap_or_default();
-            let scripts = crate::config::check_exemption::load_project_scripts(source);
-            if crate::config::check_exemption::is_exempt_check_command(cmd, &checks, &scripts) {
+        if let (Some(cmd), Some(pid)) = (command, project_id) {
+            if is_declared_check(orch, pid, cwd, cmd).await {
                 log::info!(
                     "check-command exemption: running declared check/test unconfined (cwd={cwd})"
                 );

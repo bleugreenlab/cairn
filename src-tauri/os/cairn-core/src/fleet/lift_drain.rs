@@ -326,6 +326,7 @@ impl RequestConsumer for LiftDrainConsumer {
                 generation: operator.generation,
                 machine_revision: revision,
             }),
+            fenced_command: None,
         })
     }
 

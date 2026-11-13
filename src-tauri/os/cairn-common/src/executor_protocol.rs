@@ -8281,6 +8281,13 @@ pub struct LearnedResourceEstimate {
 /// runner's tag-first decode of snapshot frames moved here unchanged. No byte
 /// on the wire changes. What a runner gets wrong talking to an older
 /// executor: nothing.
+///
+/// cairn/5815's refusal offer does not move the number. Only the prose of
+/// `NO_PATH_RECOVERED`, which an executor sends as a `CrossingRerun::Refused`
+/// reason, changes: it now points to a `fenced_command` request instead of the
+/// `allow` fence. No frame, variant or field changes, and the runner appends
+/// its request offer itself. What a runner gets wrong talking to an older
+/// executor: nothing; the refusal it relays still reads the older sentence.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
