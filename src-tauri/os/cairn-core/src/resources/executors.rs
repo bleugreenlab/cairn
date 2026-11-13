@@ -1922,7 +1922,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     if let Some(owed) = health.admission.owed_memory_bytes {
         let owing = &health.admission.owing;
         out.push_str(&format!(
-            "- Owed memory: {} still to be taken by {} running {}{}\n",
+            "- Owed memory: {} still to be taken by {} admitted {}{}\n",
             cairn_common::executor_protocol::describe_gib(owed),
             owing.len(),
             if owing.len() == 1 { "item" } else { "items" },
@@ -10108,7 +10108,7 @@ mod tests {
         let rendered = render_executor(&executor);
         assert!(
             rendered.contains(
-                "Owed memory: 17.0 GiB still to be taken by 1 running item \
+                "Owed memory: 17.0 GiB still to be taken by 1 admitted item \
                  (`cargo check` in slot-118: 9.0 GiB charged, 1.0 GiB resident)"
             ),
             "{rendered}"

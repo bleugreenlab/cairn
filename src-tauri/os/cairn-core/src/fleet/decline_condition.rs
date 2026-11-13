@@ -399,7 +399,9 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
     // the offer carries to it.
     let disk_write_stalled = StallInstrument::DiskWrite.holds_class(request.command_class)
         && health.host.stall(StallInstrument::DiskWrite).state == StallInstrumentState::Pressured;
-    let floor = admission_memory_floor(request.resource_reservation.memory_bytes);
+    // The charge, as the executor floors it: the larger of the reservation and
+    // the measured peak, the figure owed memory holds the work at once admitted.
+    let floor = admission_memory_floor(request.resource_reservation.memory_charge_bytes());
     let owed = owed_memory_bytes(machine);
     let available = health
         .machine
@@ -1591,12 +1593,13 @@ mod tests {
                 memory_stalled: false,
                 available_memory_bytes: Some(10 * GIB),
                 owed_memory_bytes: 16 * GIB,
-                memory_floor_bytes: 2 * GIB,
+                // The third's charge, its measured peak, as the executor floors it.
+                memory_floor_bytes: 9 * GIB,
             }
         );
         assert_eq!(
             held.evidence.describe_at(NOW),
-            "held: memory 10.0 GiB available less 16.0 GiB owed (floor 2.0 GiB)"
+            "held: memory 10.0 GiB available less 16.0 GiB owed (floor 9.0 GiB)"
         );
 
         let older = held_by_runner_account(&view, &third, &snapshot, &roomy);

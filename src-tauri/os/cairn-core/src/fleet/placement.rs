@@ -559,6 +559,7 @@ mod tests {
             floor_bytes: 2,
             owed_bytes: 0,
             owing: Vec::new(),
+            total_bytes: None,
         }]))
         .is_capacity());
         assert!(settled(&held(vec![HostPressureCondition::MemoryStall {
@@ -585,6 +586,7 @@ mod tests {
                 floor_bytes: 2,
                 owed_bytes: 0,
                 owing: Vec::new(),
+                total_bytes: None,
             },
             HostPressureCondition::DiskFree {
                 inodes: None,

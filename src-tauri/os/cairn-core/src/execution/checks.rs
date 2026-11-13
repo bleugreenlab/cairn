@@ -21340,6 +21340,7 @@ cairn-common = { path = "../cairn-common" }
                         floor_bytes: 2,
                         owed_bytes: 0,
                         owing: Vec::new(),
+                        total_bytes: None,
                     }]),
                 ),
                 SubstrateFailureShape::Capacity,
@@ -21500,6 +21501,7 @@ cairn-common = { path = "../cairn-common" }
                     floor_bytes: 2,
                     owed_bytes: 0,
                     owing: Vec::new(),
+                    total_bytes: None,
                 }]),
             ),
             deadline(

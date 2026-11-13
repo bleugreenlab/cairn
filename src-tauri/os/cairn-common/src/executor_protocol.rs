@@ -8244,6 +8244,17 @@ pub struct LearnedResourceEstimate {
 /// wrong talking to an older executor: nothing it concludes about placement or
 /// admission; its page shows no unreclaimable block and the former root's
 /// bytes inside live cells, as before. An older runner ignores the fields.
+///
+/// cairn/7073 does not move the number. Owed memory now counts admitted work
+/// from the moment it is admitted (a claim awaiting its grant, an admission
+/// whose cell is still being prepared), and `HostPressureCondition::
+/// MemoryAvailable` gains an optional `totalBytes`, defaulted and skipped when
+/// absent. No frame changes shape. What a runner gets wrong talking to an
+/// older executor: nothing new; that executor posts the narrower owed sum it
+/// always has, and its refusals carry no total, which the runner renders
+/// without one. An older runner reads the wider sum as the same field and
+/// subtracts it as before, so its placement pre-filter only becomes more
+/// accurate, and it ignores `totalBytes`.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -11949,17 +11960,25 @@ pub enum HostPressureCondition {
     /// floor_bytes`.
     MemoryAvailable {
         available_bytes: u64,
-        /// `max(ADMISSION_MEMORY_FLOOR_BYTES, requested)`.
+        /// `max(ADMISSION_MEMORY_FLOOR_BYTES, charge)`, where the charge is
+        /// the arriving request's [`ResourceReservation::memory_charge_bytes`].
         floor_bytes: u64,
-        /// What running commands and unmeasured residents have yet to take:
-        /// each one's charge (the larger of its reservation and its measured
-        /// peak) less what its tree holds now. Available memory is a lagging
-        /// signal, and this is the growth it has not seen yet.
+        /// What admitted work has yet to take: every command from the moment
+        /// it is admitted (a claim awaiting its grant, an admission whose cell
+        /// is still being prepared, a running command) and every unmeasured
+        /// resident, each at its charge (the larger of its reservation and its
+        /// measured peak) less what its tree holds now. Available memory is a
+        /// lagging signal, and this is the growth it has not seen yet.
         #[serde(default)]
         owed_bytes: u64,
         /// The work that owes it, each with its charge and current resident.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         owing: Vec<OwingWork>,
+        /// The machine's memory, from the same sample as `available_bytes`:
+        /// the capacity owed memory is held under. Absent from an executor
+        /// that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_bytes: Option<u64>,
     },
     /// Free bytes under the floor, or, when `inodes` is present, free inodes
     /// under their line ([`free_inode_line`]) on a volume whose bytes are not
@@ -12093,28 +12112,31 @@ impl OwingWork {
 }
 
 /// The refusal [`HostPressureCondition::MemoryAvailable`] reads as, with its
-/// numbers: `memory short: available 6.1 GiB less 17.4 GiB owed by 2 running
-/// commands (...), under the 2.0 GiB floor`.
+/// numbers: `memory short: owed 96.0 GiB + 32.0 GiB for this request >
+/// available 125.0 GiB of 125.0 GiB, owed by 3 admitted items (...)`. The
+/// request's figure is its floor: its charge, or the reserve every admission
+/// leaves ([`ADMISSION_MEMORY_FLOOR_BYTES`]) when that is larger.
 pub fn describe_memory_short(
     available_bytes: u64,
+    total_bytes: Option<u64>,
     owed_bytes: u64,
     owing: &[OwingWork],
     floor_bytes: u64,
 ) -> String {
     let mut out = format!(
-        "memory short: available {} less {} owed",
+        "memory short: owed {} + {} for this request > available {}",
+        describe_gib(owed_bytes),
+        describe_gib(floor_bytes),
         describe_gib(available_bytes),
-        describe_gib(owed_bytes)
     );
+    if let Some(total) = total_bytes {
+        out.push_str(&format!(" of {}", describe_gib(total)));
+    }
     if !owing.is_empty() {
         out.push_str(&format!(
-            " by {} running {} ({})",
+            ", owed by {} admitted {} ({})",
             owing.len(),
-            if owing.len() == 1 {
-                "command"
-            } else {
-                "commands"
-            },
+            if owing.len() == 1 { "item" } else { "items" },
             owing
                 .iter()
                 .map(OwingWork::describe)
@@ -12122,7 +12144,6 @@ pub fn describe_memory_short(
                 .join("; ")
         ));
     }
-    out.push_str(&format!(", under the {} floor", describe_gib(floor_bytes)));
     out
 }
 
@@ -26346,6 +26367,7 @@ mod tests {
                             resident_bytes: Some(1),
                             phase: None,
                         }],
+                        total_bytes: Some(8),
                     },
                     HostPressureCondition::MemoryStall {
                         full_avg10_millis: 230,
