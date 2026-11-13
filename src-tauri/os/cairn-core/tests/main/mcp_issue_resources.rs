@@ -333,8 +333,13 @@ async fn a_delegated_tasks_return_never_surfaces_as_its_parents_artifact() {
         "cairn://p/mcp/1/1/builder/artifact",
     ] {
         let read = read_resource(&fixture.orch, address.to_string()).await;
+        // Nothing is stored at either address: `/return` is a name this node
+        // does not declare, and the generic alias holds nothing yet.
         assert!(
-            read.contains("No artifact found for node 'builder'"),
+            read.contains("is not an artifact this node declares or has written")
+                || read.contains(
+                    "Nothing has been written at `cairn://p/mcp/1/1/builder/artifact` yet"
+                ),
             "{address}: {read}"
         );
         assert!(!read.contains("code map"), "{address}: {read}");

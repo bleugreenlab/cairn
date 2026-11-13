@@ -1374,7 +1374,20 @@ pub(crate) async fn produce_cairn_resource(
         // addressed name actually validates against, so a copied example is a
         // valid write even for a custom schema (CAIRN #170). Fall back to the
         // static contract block when no schema resolves.
+        //
+        // A thread session keeps no artifacts and refuses every write to one, so
+        // its artifact addresses keep their filters (`format=json` still reads
+        // the stored history) and offer no write.
+        let thread_session_artifact = matches!(
+            &resource,
+            CairnResource::NodeArtifact { number, exec_seq, node_id, .. }
+                if matches!(
+                    cairn_uri::NodeAddress::new(*number, *exec_seq, node_id),
+                    cairn_uri::NodeAddress::Thread { .. }
+                )
+        );
         let schema_spec = match &resource {
+            _ if thread_session_artifact => None,
             CairnResource::NodeArtifact {
                 project,
                 number,
@@ -1420,8 +1433,13 @@ pub(crate) async fn produce_cairn_resource(
         // rendered, so a schema-derived artifact and a contract-derived resource
         // cannot advertise different things to a reader and to a client that
         // builds writes from the structure.
-        let spec =
+        let mut spec =
             schema_spec.or_else(|| affordance_spec_for_kind(resource.kind(), Some(&resource)));
+        if thread_session_artifact {
+            if let Some(spec) = spec.as_mut() {
+                spec.actions.clear();
+            }
+        }
         let block = spec.as_ref().map(render_affordance).unwrap_or_default();
         (!block.is_empty()).then_some(Affordance {
             kind: SegmentKind::Resource,
@@ -3031,6 +3049,7 @@ async fn render_resource_body(
             Err(error) => error,
             Ok((format, _)) => {
                 read_task_artifact(
+                    orch,
                     db,
                     ArtifactCoordinates {
                         project_key: &project,

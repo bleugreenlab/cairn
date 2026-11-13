@@ -663,9 +663,15 @@ pub(crate) fn pointer_affordance_block(block: &str) -> Option<String> {
 /// which is why the *spec* has to come from here and not just the rendered
 /// markdown: a consumer assembling a write from `ActionSpec.required` would
 /// otherwise be handed `{title, content}` for an artifact that declares neither.
+///
+/// `borrowed_from` names the declared output artifact whose schema an
+/// undeclared name borrows. The offer stays (writing a second name beside the
+/// output is a real capability), but its guidance says where the payload shape
+/// came from and that the write does not hand off the turn.
 pub(super) fn artifact_affordance_spec_with_schema(
     kind: ResourceKind,
     addressed_name: Option<&str>,
+    borrowed_from: Option<&str>,
     schema: &serde_json::Value,
     current: Option<&CairnResource>,
 ) -> Option<AffordanceSpec> {
@@ -737,7 +743,11 @@ pub(super) fn artifact_affordance_spec_with_schema(
         example: format!(
             "write({{changes:[{{target:\"{example_uri}\",mode:\"create\",payload:{payload}}}]}})"
         ),
-        guidance: None,
+        guidance: addressed_name.zip(borrowed_from).map(|(name, output)| {
+            format!(
+                "; `{name}` is not an artifact this node declares: this creates a new artifact under that name, validated against the schema of the node's declared output artifact `{output}`. It does not end the turn or satisfy the output contract; that is `cairn:~/{output}`"
+            )
+        }),
     }];
 
     if let Some(patch) = contract.mutation(ChangeMode::Patch) {
@@ -760,9 +770,10 @@ pub(super) fn artifact_affordance_spec_with_schema(
 fn artifact_affordance_with_schema(
     kind: ResourceKind,
     addressed_name: Option<&str>,
+    borrowed_from: Option<&str>,
     schema: &serde_json::Value,
 ) -> Option<String> {
-    artifact_affordance_spec_with_schema(kind, addressed_name, schema, None)
+    artifact_affordance_spec_with_schema(kind, addressed_name, borrowed_from, schema, None)
         .map(|spec| render_affordance(&spec))
 }
 
@@ -1548,9 +1559,13 @@ mod tests {
                 "scratch": { "type": "string" }
             }
         });
-        let schema_block =
-            artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("board"), &schema)
-                .expect("schema with properties yields a block");
+        let schema_block = artifact_affordance_with_schema(
+            ResourceKind::NodeArtifact,
+            Some("board"),
+            None,
+            &schema,
+        )
+        .expect("schema with properties yields a block");
         assert!(
             pointer_affordance_block(&schema_block).is_none(),
             "schema-aware artifact block must not collapse: {schema_block}"
@@ -1578,9 +1593,13 @@ mod tests {
                 "action_items": { "type": "array" }
             }
         });
-        let block =
-            artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("board"), &schema)
-                .expect("a schema with properties yields a block");
+        let block = artifact_affordance_with_schema(
+            ResourceKind::NodeArtifact,
+            Some("board"),
+            None,
+            &schema,
+        )
+        .expect("a schema with properties yields a block");
 
         // The example addresses the artifact by its real name and lists the
         // required key in the head.
@@ -1617,9 +1636,59 @@ mod tests {
         assert!(artifact_affordance_with_schema(
             ResourceKind::NodeArtifact,
             Some("board"),
+            None,
             &schema
         )
         .is_none());
+    }
+
+    #[test]
+    fn undeclared_artifact_offer_names_the_schema_it_borrows() {
+        // An undeclared name keeps its copy-ready create offer (writing a
+        // second name beside the output is a designed capability), but the
+        // offer says whose schema it carries and that it does not hand off.
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": { "title": { "type": "string" } }
+        });
+        let borrowed = artifact_affordance_spec_with_schema(
+            ResourceKind::NodeArtifact,
+            Some("board"),
+            Some("plan"),
+            &schema,
+            None,
+        )
+        .expect("a schema with properties yields a spec");
+        let create = &borrowed.actions[0];
+        assert_eq!(create.mode, "create");
+        let guidance = create
+            .guidance
+            .as_deref()
+            .expect("borrowed offer carries guidance");
+        assert!(guidance.contains("`board` is not an artifact this node declares"));
+        assert!(guidance.contains("declared output artifact `plan`"));
+        assert!(guidance.contains("cairn:~/plan"));
+
+        let block = render_affordance(&borrowed);
+        assert!(block.contains("[write artifact]"), "{block}");
+        assert!(block.contains("target:\"cairn:~/board\""), "{block}");
+        assert!(
+            block.contains("not an artifact this node declares"),
+            "{block}"
+        );
+
+        let declared = artifact_affordance_with_schema(
+            ResourceKind::NodeArtifact,
+            Some("board"),
+            None,
+            &schema,
+        )
+        .expect("a schema with properties yields a block");
+        assert!(
+            !declared.contains("not an artifact this node declares"),
+            "{declared}"
+        );
     }
 
     #[test]

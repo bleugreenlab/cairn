@@ -204,12 +204,55 @@ pub(crate) struct ResolvedArtifactContract {
     pub confirm_policy: ConfirmPolicy,
     /// Schema the addressed write validates against (`None` = no schema).
     pub validation_schema: Option<crate::models::OutputSchema>,
-    /// Whether the addressed name is a `context-self` living doc.
-    pub is_ctx_self: bool,
+    /// What the addressed name is to this node.
+    pub addressed: AddressedArtifact,
     /// Canonical name of the terminal (context-out) artifact, if any.
     pub terminal_name: Option<String>,
     /// Whether the terminal contract carries a schema.
     pub terminal_has_schema: bool,
+    /// Names of the `context-self` living docs this node declares.
+    pub context_self_names: Vec<String>,
+}
+
+impl ResolvedArtifactContract {
+    pub fn is_ctx_self(&self) -> bool {
+        self.addressed == AddressedArtifact::ContextSelf
+    }
+}
+
+/// What an addressed artifact name is to the node that would hold it. The one
+/// discriminator both the read-side affordance and the write-side confirm
+/// policy consult, so a read never describes a name differently from how a
+/// write treats it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressedArtifact {
+    /// The node's declared output artifact: its terminal name, the generic
+    /// `/artifact` alias, or any name under a schema'd but unnamed contract
+    /// (mirrors `output_artifact_name_matches`).
+    Terminal,
+    /// A declared `context-self` living doc.
+    ContextSelf,
+    /// A name this node does not declare. A write here borrows the terminal
+    /// schema and never arms the handoff.
+    Undeclared,
+}
+
+fn classify_addressed(
+    artifact_name: Option<&str>,
+    terminal_name: Option<&str>,
+    terminal_has_schema: bool,
+    is_ctx_self: bool,
+) -> AddressedArtifact {
+    if is_ctx_self {
+        return AddressedArtifact::ContextSelf;
+    }
+    match (artifact_name, terminal_name) {
+        (None, _) => AddressedArtifact::Terminal,
+        (Some(addressed), Some(terminal)) if addressed == terminal => AddressedArtifact::Terminal,
+        (Some(_), Some(_)) => AddressedArtifact::Undeclared,
+        (Some(_), None) if terminal_has_schema => AddressedArtifact::Terminal,
+        (Some(_), None) => AddressedArtifact::Undeclared,
+    }
 }
 
 /// A thread session's own artifact is refused before anything resolves or
@@ -307,43 +350,49 @@ pub(crate) async fn resolve_artifact_contract(
             .iter()
             .find(|t| t.artifact_name.as_deref() == Some(name))
     });
-    let is_ctx_self = ctx_self_target.is_some();
     let terminal_has_schema = terminal_schema.is_some();
-    let (confirm_policy, validation_schema) = match ctx_self_target {
-        Some(target) => (ConfirmPolicy::Auto, Some(target.schema.clone())),
-        None => (
-            addressed_confirm_policy(artifact_name, terminal_name.as_deref(), terminal_policy),
-            terminal_schema,
-        ),
+    let addressed = classify_addressed(
+        artifact_name,
+        terminal_name.as_deref(),
+        terminal_has_schema,
+        ctx_self_target.is_some(),
+    );
+    let confirm_policy = addressed_confirm_policy(addressed, terminal_policy);
+    let validation_schema = match ctx_self_target {
+        Some(target) => Some(target.schema.clone()),
+        None => terminal_schema,
     };
+    let context_self_names = self_targets
+        .iter()
+        .filter_map(|target| target.artifact_name.clone())
+        .collect();
 
     ResolvedArtifactContract {
         confirm_policy,
         validation_schema,
-        is_ctx_self,
+        addressed,
         terminal_name,
         terminal_has_schema,
+        context_self_names,
     }
 }
 
-/// The confirm policy for a write that is not a `context-self` living doc.
+/// The confirm policy an addressed write takes.
 ///
 /// Only the terminal artifact is a gate: it is the one chain confirmation
 /// resolves (`confirm_latest_artifact_conn` targets the terminal name). A
-/// second name the node writes beside it takes the terminal's schema but not
-/// its `user` policy, or it would start an unconfirmed chain nothing can
-/// confirm, and every reader of "pending approval" (`execution::approvals`)
-/// relies on an unconfirmed newest version meaning the terminal one. The
-/// generic alias (no name) and an unnamed terminal contract keep the terminal
-/// policy, since there the addressed chain is the terminal one.
+/// `context-self` living doc always auto-confirms. An undeclared name takes
+/// the terminal's schema but not its `user` policy, or it would start an
+/// unconfirmed chain nothing can confirm, and every reader of "pending
+/// approval" (`execution::approvals`) relies on an unconfirmed newest version
+/// meaning the terminal one.
 fn addressed_confirm_policy(
-    artifact_name: Option<&str>,
-    terminal_name: Option<&str>,
+    addressed: AddressedArtifact,
     terminal_policy: ConfirmPolicy,
 ) -> ConfirmPolicy {
-    match (artifact_name, terminal_name) {
-        (Some(addressed), Some(terminal)) if addressed != terminal => ConfirmPolicy::Auto,
-        _ => terminal_policy,
+    match addressed {
+        AddressedArtifact::Terminal => terminal_policy,
+        AddressedArtifact::ContextSelf | AddressedArtifact::Undeclared => ConfirmPolicy::Auto,
     }
 }
 
@@ -536,11 +585,10 @@ pub(crate) async fn write_artifact_change(
     //    addressed name.
     let contract = resolve_artifact_contract(orch, &job_id, task_name, artifact_name).await;
     let policy = contract.confirm_policy;
-    let validation_schema = contract.validation_schema;
 
     // Only a fresh create of the terminal (context-out) artifact arms the boundary
     // interrupt; a ctx-self write never does.
-    let should_arm_terminal_interrupt = !contract.is_ctx_self
+    let should_arm_terminal_interrupt = !contract.is_ctx_self()
         && should_arm_output_artifact_interrupt(
             is_patch,
             artifact_name,
@@ -573,7 +621,7 @@ pub(crate) async fn write_artifact_change(
         .await?;
     enforce_artifact_schema(
         orch,
-        validation_schema.as_ref(),
+        contract.validation_schema.as_ref(),
         payload,
         is_patch,
         &mut effective_payload,
@@ -794,7 +842,7 @@ pub(crate) async fn write_artifact_change(
     // A revised terminal handoff can unblock a failed PR publication even when
     // the producing job was already Complete, so no status transition occurred.
     // Living documents never advance the DAG. Both create and patch are inputs.
-    if !contract.is_ctx_self {
+    if !contract.is_ctx_self() {
         let job = crate::jobs::queries::get_job(&db, &job_id)
             .await
             .map_err(|error| format!("Failed to load artifact producer: {error}"))?;
@@ -1690,28 +1738,107 @@ mod tests {
     }
 
     #[test]
+    fn classify_addressed_tells_declared_names_from_unknown_ones() {
+        use super::{classify_addressed as classify, AddressedArtifact::*};
+        let cases = [
+            (
+                Some("plan"),
+                Some("plan"),
+                true,
+                false,
+                Terminal,
+                "terminal name",
+            ),
+            (None, Some("plan"), true, false, Terminal, "generic alias"),
+            (None, None, false, false, Terminal, "alias, no contract"),
+            (
+                Some("plan"),
+                None,
+                true,
+                false,
+                Terminal,
+                "unnamed schema'd contract",
+            ),
+            (
+                Some("plan"),
+                None,
+                false,
+                false,
+                Undeclared,
+                "unnamed, no schema",
+            ),
+            (
+                Some("scratch"),
+                Some("plan"),
+                true,
+                true,
+                ContextSelf,
+                "ctx-self",
+            ),
+            (
+                Some("zzz"),
+                Some("plan"),
+                true,
+                false,
+                Undeclared,
+                "undeclared",
+            ),
+        ];
+        for (name, terminal, has_schema, ctx_self, expected, label) in cases {
+            assert_eq!(
+                classify(name, terminal, has_schema, ctx_self),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn only_the_terminal_name_takes_a_user_policy() {
-        use super::addressed_confirm_policy as policy;
+        use super::{addressed_confirm_policy as policy, classify_addressed as classify};
         assert_eq!(
-            policy(Some("plan"), Some("plan"), ConfirmPolicy::User),
+            policy(
+                classify(Some("plan"), Some("plan"), true, false),
+                ConfirmPolicy::User
+            ),
             ConfirmPolicy::User
         );
         assert_eq!(
-            policy(None, Some("plan"), ConfirmPolicy::User),
+            policy(
+                classify(None, Some("plan"), true, false),
+                ConfirmPolicy::User
+            ),
             ConfirmPolicy::User
         );
         assert_eq!(
-            policy(Some("plan"), None, ConfirmPolicy::User),
+            policy(
+                classify(Some("plan"), None, true, false),
+                ConfirmPolicy::User
+            ),
             ConfirmPolicy::User
         );
         assert_eq!(
-            policy(Some("notes"), Some("plan"), ConfirmPolicy::User),
+            policy(
+                classify(Some("notes"), Some("plan"), true, false),
+                ConfirmPolicy::User
+            ),
             ConfirmPolicy::Auto,
             "a second chain beside the terminal is never a gate"
         );
         assert_eq!(
-            policy(Some("notes"), Some("plan"), ConfirmPolicy::Auto),
+            policy(
+                classify(Some("notes"), Some("plan"), true, false),
+                ConfirmPolicy::Auto
+            ),
             ConfirmPolicy::Auto
+        );
+        assert_eq!(
+            policy(
+                classify(Some("scratch"), Some("plan"), true, true),
+                ConfirmPolicy::User
+            ),
+            ConfirmPolicy::Auto,
+            "a living doc always auto-confirms"
         );
     }
 

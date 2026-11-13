@@ -225,3 +225,119 @@ async fn ctx_self_living_doc_lifecycle_alongside_terminal_gate() {
     assert_eq!(versions(&db, "scratch").await, vec![1, 2, 3]);
     assert_eq!(versions(&db, "summary").await, vec![1]);
 }
+
+/// An artifact read tells the node's declared output, a declared context
+/// document, and a name the node does not declare apart, in both the body and
+/// the affordance. The undeclared name keeps its create offer (a second name
+/// beside the output is a designed capability), attributed to the schema it
+/// borrows, and a write there neither gates nor hands off.
+#[tokio::test]
+async fn artifact_reads_tell_declared_names_from_unknown_ones() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let summary = common::read_resource(&orch, "cairn://p/csl/1/1/worker/summary").await;
+    let scratch = common::read_resource(&orch, "cairn://p/csl/1/1/worker/scratch").await;
+    let zzz = common::read_resource(&orch, "cairn://p/csl/1/1/worker/zzz").await;
+
+    assert_ne!(summary, scratch);
+    assert_ne!(summary, zzz);
+    assert_ne!(scratch, zzz);
+    for read in [&summary, &scratch, &zzz] {
+        assert!(!read.contains("in issue"), "{read}");
+    }
+
+    assert!(
+        summary.contains(
+            "`summary` has not been written yet at `cairn://p/csl/1/1/worker/summary`; it is this node's declared output artifact."
+        ),
+        "{summary}"
+    );
+    assert!(
+        scratch.contains("`scratch` has not been written yet at `cairn://p/csl/1/1/worker/scratch`; it is a context document this node declares."),
+        "{scratch}"
+    );
+    assert!(
+        zzz.contains("Nothing is stored at `cairn://p/csl/1/1/worker/zzz`: `zzz` is not an artifact this node declares or has written."),
+        "{zzz}"
+    );
+    assert!(
+        zzz.contains("It declares `summary` (output) and `scratch` (context document)."),
+        "{zzz}"
+    );
+
+    // The affordance: only the undeclared name's offer says it borrows a schema.
+    assert!(
+        zzz.contains(
+            "validated against the schema of the node's declared output artifact `summary`"
+        ),
+        "{zzz}"
+    );
+    for read in [&summary, &scratch] {
+        assert!(
+            !read.contains("not an artifact this node declares"),
+            "{read}"
+        );
+    }
+
+    // The offer is attributed, not suppressed: it stays copy-ready and works.
+    assert!(zzz.contains("[write artifact]"), "{zzz}");
+    assert!(zzz.contains("target:\"cairn:~/zzz\""), "{zzz}");
+    let written = common::change_resource(
+        &orch,
+        write_to(
+            "cairn://p/csl/1/1/worker/zzz",
+            "create",
+            json!({"result": "borrowed-shape-proof"}),
+        ),
+    )
+    .await;
+    assert!(written.contains("version 1"), "{written}");
+    assert!(!written.contains("awaiting user confirmation"), "{written}");
+    assert_eq!(job_status(&db).await, "blocked");
+
+    let reread = common::read_resource(&orch, "cairn://p/csl/1/1/worker/zzz").await;
+    assert!(reread.contains("borrowed-shape-proof"), "{reread}");
+
+    let other = common::read_resource(&orch, "cairn://p/csl/1/1/worker/other").await;
+    assert!(other.contains("It has written `zzz`."), "{other}");
+}
+
+/// A thread keeps no artifacts and refuses every write to one, so a read of a
+/// thread session's artifact address offers no write. Its sub-agent tasks keep
+/// ordinary return artifacts, and an empty one names its own thread address
+/// rather than a reserved issue coordinate.
+#[tokio::test]
+async fn thread_artifact_addresses_name_themselves_and_offer_no_refused_write() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed(&db).await;
+    db.execute(
+        "INSERT INTO jobs (id, project_id, parent_job_id, node_name, status, uri_segment, created_at, updated_at) VALUES ('job-lead-task','p-1','job-lead','explore','complete','explore',2,2)",
+        (),
+    )
+    .await
+    .unwrap();
+    let orch = orchestrator(&temp, db.clone());
+
+    for address in ["cairn://p/csl/lead/zzz", "cairn://p/csl/lead/arc"] {
+        let read = common::read_resource(&orch, address).await;
+        assert!(
+            read.contains("A thread keeps no artifacts"),
+            "{address}: {read}"
+        );
+        assert!(!read.contains("[write artifact]"), "{address}: {read}");
+        assert!(!read.contains("mode:\"create\""), "{address}: {read}");
+    }
+
+    let task = common::read_resource(&orch, "cairn://p/csl/lead/task/explore/zzz").await;
+    assert!(
+        task.contains("Nothing is stored at `cairn://p/csl/lead/task/explore/zzz`: `zzz` is not an artifact this task declares"),
+        "{task}"
+    );
+    assert!(!task.contains("/0"), "{task}");
+    assert!(!task.contains("in issue"), "{task}");
+    assert!(!task.contains("of issue"), "{task}");
+}

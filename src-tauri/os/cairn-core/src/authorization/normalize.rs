@@ -486,7 +486,7 @@ pub(crate) fn branch_catch_up_request(
 }
 
 /// `a`, `a and b`, `a, b and c`.
-fn join_and(items: &[String]) -> String {
+pub(crate) fn join_and(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),

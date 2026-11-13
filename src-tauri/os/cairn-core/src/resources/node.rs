@@ -2,6 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::authorization::normalize::join_and;
+use crate::mcp::handlers::comments_artifacts::{
+    resolve_artifact_contract, AddressedArtifact, ResolvedArtifactContract,
+};
 use crate::mcp::handlers::durable_suspend::{stuck_resolutions, StuckPhase, StuckResolution};
 
 use super::common::{
@@ -3002,7 +3006,8 @@ fn fenced_json(value: &serde_json::Value) -> String {
 /// validates against (shared with the write path via `resolve_artifact_contract`).
 /// Returns `None` when no schema resolves, leaving the caller to fall back to the
 /// static contract spec. This is what makes a copied artifact example a valid
-/// write even for a custom schema (CAIRN #170).
+/// write even for a custom schema (CAIRN #170). A name the node does not declare
+/// keeps the offer, attributed to the output artifact whose schema it borrows.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn artifact_affordance_spec(
     orch: &crate::orchestrator::Orchestrator,
@@ -3025,36 +3030,84 @@ pub(super) async fn artifact_affordance_spec(
     )
     .await
     .ok()?;
-    job_artifact_affordance_spec(orch, &job_id, task_name, artifact_name, current).await
-}
-
-/// [`artifact_affordance_spec`] for a job that is already resolved — a thread's
-/// session job, which is addressed by thread name rather than by node
-/// coordinates. Same contract, same schema, so an artifact advertises on read
-/// what it enforces on write.
-pub(super) async fn job_artifact_affordance_spec(
-    orch: &crate::orchestrator::Orchestrator,
-    job_id: &str,
-    task_name: Option<&str>,
-    artifact_name: Option<&str>,
-    current: &cairn_uri::CairnResource,
-) -> Option<cairn_common::read::AffordanceSpec> {
-    let contract = crate::mcp::handlers::comments_artifacts::resolve_artifact_contract(
-        orch,
-        job_id,
-        task_name,
-        artifact_name,
-    )
-    .await;
-    let schema = contract.validation_schema?;
+    let contract = resolve_artifact_contract(orch, &job_id, task_name, artifact_name).await;
+    let borrowed_from = match contract.addressed {
+        AddressedArtifact::Undeclared => contract.terminal_name.as_deref(),
+        AddressedArtifact::Terminal | AddressedArtifact::ContextSelf => None,
+    };
+    let schema = contract.validation_schema.as_ref()?;
     let schema_value =
-        crate::output_schemas::resolve_output_schema(orch.schema_dir.as_deref(), &schema).ok()?;
+        crate::output_schemas::resolve_output_schema(orch.schema_dir.as_deref(), schema).ok()?;
     super::common::artifact_affordance_spec_with_schema(
         current.kind(),
         artifact_name,
+        borrowed_from,
         &schema_value,
         Some(current),
     )
+}
+
+/// The names of every artifact chain a job has written.
+async fn written_artifact_names(conn: &TrackedConnection, job_id: &str) -> Vec<String> {
+    list_named_artifacts_for_job(conn, job_id)
+        .await
+        .iter()
+        .filter_map(|artifact| artifact.schema_name().map(str::to_owned))
+        .collect()
+}
+
+/// What a read of an artifact address that holds nothing says: whether the
+/// addressed name is the declared output, a declared context document, or a
+/// name the owner does not declare at all, and in that last case what it does
+/// declare and has written. `address` is the URI that was read, so a thread
+/// task names its thread address rather than a reserved issue coordinate.
+fn absent_artifact_line(
+    address: &str,
+    owner: &str,
+    addressed: Option<&str>,
+    contract: &ResolvedArtifactContract,
+    written: &[String],
+) -> String {
+    let output = contract.terminal_name.as_deref();
+    let name = addressed.unwrap_or("artifact");
+    match (contract.addressed, addressed) {
+        (AddressedArtifact::Terminal, Some(_)) => format!(
+            "`{name}` has not been written yet at `{address}`; it is this {owner}'s declared output artifact."
+        ),
+        (AddressedArtifact::Terminal, None) => match output {
+            Some(output) => format!(
+                "Nothing has been written at `{address}` yet; this {owner}'s declared output artifact is `{output}`."
+            ),
+            None => format!("Nothing has been written at `{address}` yet."),
+        },
+        (AddressedArtifact::ContextSelf, _) => format!(
+            "`{name}` has not been written yet at `{address}`; it is a context document this {owner} declares."
+        ),
+        (AddressedArtifact::Undeclared, _) => {
+            let mut line = format!(
+                "Nothing is stored at `{address}`: `{name}` is not an artifact this {owner} declares or has written."
+            );
+            let declared: Vec<String> = output
+                .map(|output| format!("`{output}` (output)"))
+                .into_iter()
+                .chain(
+                    contract
+                        .context_self_names
+                        .iter()
+                        .map(|doc| format!("`{doc}` (context document)")),
+                )
+                .collect();
+            if !declared.is_empty() {
+                line.push_str(&format!(" It declares {}.", join_and(&declared)));
+            }
+            if !written.is_empty() {
+                let written: Vec<String> =
+                    written.iter().map(|name| format!("`{name}`")).collect();
+                line.push_str(&format!(" It has written {}.", join_and(&written)));
+            }
+            line
+        }
+    }
 }
 
 fn render_gated_artifact_actions(
@@ -3121,14 +3174,19 @@ pub(super) async fn read_node_artifact(
         node_name,
         move |conn, job| {
             Box::pin(async move {
-                match wanted {
+                let artifact = match wanted {
                     Some(name) => get_named_artifact_for_job(conn, &job.id, &name).await,
                     None => get_direct_artifact_for_job(conn, &job.id).await,
-                }
+                };
+                let written = match artifact {
+                    Some(_) => Vec::new(),
+                    None => written_artifact_names(conn, &job.id).await,
+                };
+                (artifact, written)
             })
         },
     );
-    let (job, artifact) = match read.await {
+    let (job, (artifact, written)) = match read.await {
         Ok(read) => read,
         Err(error) => return error,
     };
@@ -3154,10 +3212,22 @@ pub(super) async fn read_node_artifact(
     let body = match &artifact {
         Some(a) if format == ArtifactFormat::Json => a.data.clone(),
         Some(a) => render_artifact_markdown(&a.data),
-        None => format!(
-            "No artifact found for node '{}' in issue {}/{}",
-            node_name, project_key, number
-        ),
+        None => {
+            let contract = resolve_artifact_contract(orch, &job.id, None, artifact_name).await;
+            absent_artifact_line(
+                &build_node_artifact_uri_named(
+                    project_key,
+                    number,
+                    exec_seq,
+                    node_name,
+                    artifact_name,
+                ),
+                "node",
+                artifact_name,
+                &contract,
+                &written,
+            )
+        }
     };
 
     if format == ArtifactFormat::Json {
@@ -3583,6 +3653,7 @@ async fn task_turn_id(
 }
 
 pub(super) async fn read_task_artifact(
+    orch: &crate::orchestrator::Orchestrator,
     db: &LocalDb,
     coordinates: ArtifactCoordinates<'_>,
     task_name: &str,
@@ -3607,24 +3678,43 @@ pub(super) async fn read_task_artifact(
         task_name,
         move |conn, _parent_job, task_job| {
             Box::pin(async move {
-                match wanted {
+                let artifact = match wanted {
                     Some(name) => get_named_artifact_for_job(conn, &task_job.id, &name).await,
                     None => get_direct_artifact_for_job(conn, &task_job.id).await,
-                }
+                };
+                let written = match artifact {
+                    Some(_) => Vec::new(),
+                    None => written_artifact_names(conn, &task_job.id).await,
+                };
+                (artifact, written)
             })
         },
     );
-    let artifact = match read.await {
-        Ok((_, _, artifact)) => artifact,
+    let (task_job, artifact, written) = match read.await {
+        Ok((_, task_job, (artifact, written))) => (task_job, artifact, written),
         Err(error) => return error,
     };
     match artifact {
         Some(artifact) if format == ArtifactFormat::Json => artifact.data,
         Some(artifact) => render_artifact_markdown(&artifact.data),
-        None => format!(
-            "No artifact found for task '{}' in node '{}' of issue {}/{}",
-            task_name, node_name, project_key, number
-        ),
+        None => {
+            let contract =
+                resolve_artifact_contract(orch, &task_job.id, Some(task_name), artifact_name).await;
+            absent_artifact_line(
+                &build_task_artifact_uri_named(
+                    project_key,
+                    number,
+                    exec_seq,
+                    node_name,
+                    task_name,
+                    artifact_name,
+                ),
+                "task",
+                artifact_name,
+                &contract,
+                &written,
+            )
+        }
     }
 }
 
