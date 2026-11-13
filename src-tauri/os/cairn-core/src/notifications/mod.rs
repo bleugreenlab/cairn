@@ -64,6 +64,9 @@ pub enum NotificationKind {
     /// A thread's message to the operator that states a default, open until
     /// he answers it.
     OperatorMessage,
+    /// A top-level job blocked because its turn ended without the output it
+    /// owes. A passive mark: link-only, never toasted or chimed.
+    MissingOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

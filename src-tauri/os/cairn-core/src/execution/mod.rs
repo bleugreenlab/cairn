@@ -46,6 +46,7 @@ pub(crate) mod lane_claims;
 pub(crate) mod launch_preview;
 pub(crate) mod lint_baseline;
 pub(super) mod main_incidents_store;
+pub mod missing_output;
 pub mod model_selection;
 pub mod operator_compact;
 pub mod ownership;

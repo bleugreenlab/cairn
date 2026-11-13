@@ -124,3 +124,64 @@ async fn a_pr_entry_carries_the_newest_headline_about_its_issue() {
         serde_json::json!({"line": "Merging #7 retires the old home.", "uri": "cairn://p/nh/coord/db/headlines/2"})
     );
 }
+
+#[test]
+fn the_missing_output_kind_is_snake_case_on_the_wire() {
+    assert_eq!(
+        serde_json::to_value(NotificationKind::MissingOutput).unwrap(),
+        serde_json::json!("missing_output")
+    );
+}
+
+/// cairn/5960: a planner whose turn ended without its plan is an open,
+/// link-only entry at the node, dated by the turn's end, and it leaves the
+/// list as soon as the plan is written (which makes it an approval instead).
+#[tokio::test]
+async fn a_job_blocked_on_its_missing_output_is_an_open_link_only_entry() {
+    let db = crate::storage::migrated_test_db("notif-missing-output").await;
+    crate::execution::missing_output::tests::seed_blocked_planner(&db, "i4", 4, "j-plan", 500)
+        .await;
+    let derive = || async {
+        derive_snapshot(
+            &db,
+            &db,
+            &HoldRegistry::default(),
+            "p",
+            500 + 30 * 86_400,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap()
+    };
+
+    let snapshot = derive().await;
+    let missing: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == NotificationKind::MissingOutput)
+        .collect();
+    assert_eq!(missing.len(), 1, "{:#?}", snapshot.entries);
+    let entry = missing[0];
+    assert_eq!(entry.key, "missing-output:j-plan:500");
+    assert_eq!(entry.at, 500);
+    assert_eq!(entry.summary, "#4 Planner: blocked, no plan");
+    assert_eq!(entry.source_uri, "cairn://p/prj/4/1/planner");
+    assert_eq!(entry.state, NotificationState::Open);
+    assert_eq!(entry.action, None);
+    assert!(!entry.stale);
+    assert_eq!(
+        snapshot.next_change_at, None,
+        "an age is rendered by the reader; nothing reschedules the list"
+    );
+
+    db.execute(
+        "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, confirmed, created_at, updated_at)
+         VALUES ('a1', 'j-plan', 'plan', '{}', 1, 'plan', 0, 600, 600)",
+        (),
+    )
+    .await
+    .unwrap();
+    let snapshot = derive().await;
+    let kinds: Vec<_> = snapshot.entries.iter().map(|entry| entry.kind).collect();
+    assert_eq!(kinds, vec![NotificationKind::AwaitingReview]);
+}

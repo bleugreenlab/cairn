@@ -2320,6 +2320,30 @@ struct ChildStatus {
     wont_start: Vec<String>,
     /// Gated artifacts waiting on their approver (`execution::approvals`).
     approvals: Vec<CensusApproval>,
+    /// Nodes whose turn ended without the output they owe
+    /// (`execution::missing_output`). Nobody approves these; the mark says why
+    /// the node stopped.
+    missing_outputs: Vec<CensusMissingOutput>,
+}
+
+/// One node blocked because its turn ended without the output it owes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusMissingOutput {
+    /// The node it holds, as the node facet names it.
+    node: String,
+    /// What is missing: `plan`, `create-pr`, `output`.
+    what: String,
+    /// When the turn that owed it ended.
+    since: i64,
+}
+
+impl CensusMissingOutput {
+    /// `no plan · 3d 2h 5m`. No `stale` and no approver: nothing is waiting on
+    /// anyone, so the age alone says how long the node has been stopped.
+    fn facet(&self, now: i64) -> String {
+        let age = crate::clock::format_elapsed(now.saturating_sub(self.since).max(0));
+        format!("no {} · {age}", self.what)
+    }
 }
 
 /// One gated artifact a child's node waits on its approver for.
@@ -2392,13 +2416,19 @@ impl ChildStatus {
             .first()
             .map(|approval| format!(" · awaiting {}", approval.who()))
             .unwrap_or_default();
+        // A node stopped on a missing output is the same kind of fact again.
+        let blocked = self
+            .missing_outputs
+            .first()
+            .map(|missing| format!(" · blocked: no {}", missing.what))
+            .unwrap_or_default();
         let failure = if self.failures.is_empty() {
             String::new()
         } else {
             format!(" · {}", self.failures.join(" · "))
         };
         format!(
-            "- `{}` **{}**{held}{awaiting} · {}{failure}\n",
+            "- `{}` **{}**{held}{awaiting}{blocked} · {}{failure}\n",
             self.uri,
             self.status,
             one_line(&self.title)
@@ -2438,6 +2468,9 @@ impl ChildStatus {
         // Blocked on the user: approvals first, then questions.
         for approval in &self.approvals {
             facets.push(approval.facet(now));
+        }
+        for missing in &self.missing_outputs {
+            facets.push(missing.facet(now));
         }
         match self.unanswered_questions {
             0 => {}
@@ -2583,6 +2616,7 @@ async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Chil
             held: Vec::new(),
             wont_start: Vec::new(),
             approvals: Vec::new(),
+            missing_outputs: Vec::new(),
         });
     }
     // A merged or closed child's resolution already ended its work; a gated
@@ -2617,6 +2651,29 @@ async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<Chil
                 .into_iter()
                 .map(|held| held.line)
                 .collect();
+        }
+    }
+
+    // Nodes stopped on a missing output: a seek of blocked top-level jobs,
+    // then each one's facts. Best-effort like the facets below.
+    let scope = crate::execution::approvals::ApprovalScope::Issues(unresolved.clone());
+    if let Ok(blocked) = read_resource(db, move |conn| {
+        Box::pin(async move {
+            crate::execution::missing_output::blocked_on_output_conn(conn, &scope)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await
+    {
+        for missing in blocked {
+            if let Some(child) = at.get(&missing.issue_id).map(|index| &mut children[*index]) {
+                child.missing_outputs.push(CensusMissingOutput {
+                    node: missing.node_name.clone(),
+                    what: missing.what().to_string(),
+                    since: missing.since,
+                });
+            }
         }
     }
 
@@ -4064,6 +4121,198 @@ mod tests {
             seed.content
         );
         assert!(!seed.content.contains("Planner ◐"), "{}", seed.content);
+    }
+
+    /// A child whose planner ended its turn `age` seconds before `now` without
+    /// writing its plan, its job stored `blocked`.
+    async fn child_with_missing_plan(db: &LocalDb, now: i64, age: i64) {
+        crate::execution::missing_output::tests::seed_blocked_planner(
+            db,
+            "i-plan",
+            24,
+            "job-planner",
+            now - age,
+        )
+        .await;
+        db.execute(
+            "UPDATE issues SET parent_thread_id = 't-thread' WHERE id = 'i-plan'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// cairn/5960: a planner whose turn ended without its plan is marked on
+    /// the address line and in its detail, with no approver and no confirm
+    /// line, because nobody can approve a plan that was never written.
+    #[tokio::test]
+    async fn the_census_marks_a_childs_missing_plan() {
+        let db = thread_fixture("thread-seed-missing-output.db").await;
+        let now = NOW + 100 * DAY;
+        child_with_missing_plan(&db, now, 3 * DAY + 2 * 3600 + 5 * 60).await;
+        let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
+        assert!(
+            seed.content.contains(
+                "- `cairn://p/prj/24` **active** · blocked: no plan · Plan the backoff\n  \
+                 Planner ◼ · no plan · 3d 2h 5m"
+            ),
+            "the blocked child's census is wrong: {}",
+            seed.content
+        );
+        assert!(!seed.content.contains("awaiting"), "{}", seed.content);
+        assert!(
+            !seed.content.contains("confirm cairn://p/prj/24"),
+            "{}",
+            seed.content
+        );
+        assert!(!seed.content.contains("stale"), "{}", seed.content);
+    }
+
+    /// cairn/5960: the missing-output mark is read, never sent. A planner
+    /// driven to Blocked through the real sweep, then read through every
+    /// surface that marks it, now and a month later, produces no message, no
+    /// attention push and no new turn or run (no re-prompt).
+    #[tokio::test]
+    async fn a_missing_output_block_sends_nothing_now_or_a_month_later() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = Arc::new(thread_fixture("thread-seed-missing-output-silent.db").await);
+        let now = NOW + 100 * DAY;
+        child_with_missing_plan(&db, now, 3600).await;
+        // The sweep has not yet seen the turn end: the job still reads running.
+        db.execute(
+            "UPDATE jobs SET status = 'running' WHERE id = 'job-planner'",
+            (),
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(dir.path().join("search")).unwrap());
+        let (effect_tx, _effects) = tokio::sync::mpsc::unbounded_channel();
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            dir.path().join("config"),
+        )
+        .effect_tx(Some(effect_tx))
+        .build();
+        let sent = || async {
+            let mut counts = Vec::new();
+            for table in ["messages", "attention_pushes", "turns", "runs"] {
+                counts.push(
+                    db.query_one(&format!("SELECT COUNT(*) FROM {table}"), (), |row| {
+                        row.i64(0)
+                    })
+                    .await
+                    .unwrap(),
+                );
+            }
+            counts
+        };
+        let before = sent().await;
+
+        crate::execution::advancement::recompute_execution_jobs(&orch, "e-i-plan").unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT status FROM jobs WHERE id = 'job-planner'",
+                (),
+                |row| row.text(0)
+            )
+            .await
+            .unwrap(),
+            "blocked",
+            "the sweep must really block the job, or this proves nothing"
+        );
+
+        for at in [now, now + 30 * DAY] {
+            let seed = compose_thread_seed(&db, THREAD_JOB, at).await.unwrap();
+            assert!(
+                seed.content.contains("blocked: no plan"),
+                "{}",
+                seed.content
+            );
+            let snapshot = crate::notifications::derive_snapshot(
+                &db,
+                &db,
+                &crate::notifications::HoldRegistry::default(),
+                "p",
+                at,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                snapshot.entries.iter().any(
+                    |entry| entry.kind == crate::notifications::NotificationKind::MissingOutput
+                ),
+                "{:#?}",
+                snapshot.entries
+            );
+        }
+        let summary =
+            crate::resources::node::read_node(&orch, "prj", 24, 1, "planner", false).await;
+        assert!(summary.starts_with("# planner [◼]\n"), "{summary}");
+        assert!(
+            summary.contains("Blocked: its turn ended without `plan` "),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(" ago. Nothing resumes it until someone messages it.\n"),
+            "{summary}"
+        );
+
+        assert_eq!(
+            sent().await,
+            before,
+            "messages, attention pushes, turns and runs are unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_census_marks_no_missing_output_where_none_is_owed() {
+        let cases: [(&str, &str); 3] = [
+            (
+                "an unconfirmed plan waits on its approver",
+                "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, confirmed, created_at, updated_at)
+                 VALUES ('a-plan','job-planner','plan','{}',1,'plan',0,1,1)",
+            ),
+            (
+                "a task job owes its parent a return",
+                "UPDATE jobs SET parent_job_id = 'job-planner' WHERE id = 'job-planner'",
+            ),
+            (
+                "a merged child is history",
+                "UPDATE issues SET status = 'merged' WHERE id = 'i-plan'",
+            ),
+        ];
+        for (index, (case, sql)) in cases.into_iter().enumerate() {
+            let db = thread_fixture(&format!("thread-seed-no-missing-output-{index}.db")).await;
+            let now = NOW + 100 * DAY;
+            child_with_missing_plan(&db, now, 3600).await;
+            db.execute(sql, ()).await.unwrap();
+            let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
+            assert!(
+                !seed.content.contains("blocked: no"),
+                "{case}: {}",
+                seed.content
+            );
+            assert!(
+                !seed.content.contains("no plan ·"),
+                "{case}: {}",
+                seed.content
+            );
+            if index == 0 {
+                assert!(
+                    seed.content.contains("· awaiting you ·"),
+                    "{case}: {}",
+                    seed.content
+                );
+            }
+        }
     }
 
     #[tokio::test]

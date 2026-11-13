@@ -229,6 +229,20 @@ pub fn derive_job_status(facts: &JobFacts) -> JobStatus {
     JobStatus::Pending
 }
 
+/// Whether a job's facts derive Blocked because it ended its turn without the
+/// output it owes: rung 3's missing-output gate, and no other Blocked cause.
+///
+/// That gate is the only Blocked path with no artifact row. A User confirm gate
+/// blocks on an artifact that exists but is unconfirmed, and a command
+/// checkpoint blocks on the unconfirmed artifact its failing command seeded, so
+/// `!artifact_present` separates this cause from both. The sweep, the census,
+/// the notification center and the node summary all ask this one question.
+pub fn blocked_on_missing_output(facts: &JobFacts) -> bool {
+    derive_job_status(facts) == JobStatus::Blocked
+        && facts.requires_output
+        && !facts.artifact_present
+}
+
 /// Settle a job's derived status for an issue that is merged or closed.
 ///
 /// A resolved issue takes no more work, so only a recorded outcome survives the
@@ -626,6 +640,59 @@ mod tests {
             settle_for_terminal_issue(JobStatus::Failed),
             JobStatus::Failed
         );
+    }
+
+    #[test]
+    fn missing_output_is_the_blocked_cause_with_no_artifact() {
+        let complete = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            requires_output: true,
+        };
+        assert!(blocked_on_missing_output(&complete), "a completed turn");
+        let truncated = facts! {
+            dag_ready: true,
+            turn_truncated: true,
+            requires_output: true,
+        };
+        assert!(blocked_on_missing_output(&truncated), "a truncated turn");
+
+        let confirm_gate = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            requires_output: true,
+            artifact_present: true,
+            checkpoint: CheckpointGate::ConfirmGate,
+        };
+        assert_eq!(derive_job_status(&confirm_gate), JobStatus::Blocked);
+        assert!(
+            !blocked_on_missing_output(&confirm_gate),
+            "an unconfirmed artifact is an approval, not a missing output"
+        );
+        let abandoned = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            requires_output: true,
+            output_abandoned: true,
+        };
+        assert!(
+            !blocked_on_missing_output(&abandoned),
+            "an abandoned output fails the job"
+        );
+        let command = facts! {
+            dag_ready: true,
+            checkpoint: CheckpointGate::Command,
+            artifact_present: true,
+        };
+        assert_eq!(derive_job_status(&command), JobStatus::Blocked);
+        assert!(!blocked_on_missing_output(&command), "a failed command");
+        let live = facts! {
+            dag_ready: true,
+            live_turn: true,
+            turn_complete: true,
+            requires_output: true,
+        };
+        assert!(!blocked_on_missing_output(&live), "a live turn is Running");
     }
 
     #[test]

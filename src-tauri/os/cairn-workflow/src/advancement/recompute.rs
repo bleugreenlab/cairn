@@ -19,7 +19,8 @@ use super::*;
 use crate::models::{RecipeNode, RecipeNodeType, TurnState};
 use crate::transitions::outcome::{recompute_execution_status_conn, recompute_issue_status_conn};
 use crate::transitions::projection::{
-    derive_job_status, settle_for_terminal_issue, CheckpointGate, JobFacts, Resolution,
+    blocked_on_missing_output, derive_job_status, settle_for_terminal_issue, CheckpointGate,
+    JobFacts, Resolution,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -136,6 +137,11 @@ impl JobStatusChange {
     /// Missing required output is an internal Blocked gate, not a user-facing
     /// lifecycle event. Other Blocked causes (approval/checkpoint gates) still
     /// emit the normal blocked message.
+    ///
+    /// The missing-output cause is surfaced passively instead, read from the
+    /// same rule ([`blocked_on_missing_output`]) by `execution::missing_output`
+    /// in cairn-core for the census, the notification center and the node
+    /// summary. It is never sent as a message.
     pub fn emits_blocked_lifecycle_message(&self) -> bool {
         self.to == JobStatus::Blocked && self.blocked_reason.is_none()
     }
@@ -255,6 +261,11 @@ pub struct TurnFacts {
     /// End reason of the absolute latest turn (the turn `latest_state`
     /// describes).
     pub latest_end_reason: Option<crate::models::TurnEndReason>,
+    /// When the latest work turn (the turn `work_state` describes) ended, or
+    /// last moved if it never recorded an end. For a job blocked on a missing
+    /// output this is the moment the turn that owed it stopped; a later
+    /// memory-review turn does not move it.
+    pub work_ended_at: Option<i64>,
 }
 
 impl TurnFacts {
@@ -355,6 +366,9 @@ pub async fn turn_facts(
                 ORDER BY created_at DESC, sequence DESC LIMIT 1),
                (SELECT end_reason FROM turns
                 WHERE job_id = ?1 AND NOT {UNSERVED_LAUNCH}
+                ORDER BY created_at DESC, sequence DESC LIMIT 1),
+               (SELECT COALESCE(ended_at, updated_at) FROM turns
+                WHERE job_id = ?1 AND start_reason != 'memory_review' AND NOT {UNSERVED_LAUNCH}
                 ORDER BY created_at DESC, sequence DESC LIMIT 1)"
             ),
             (job_id,),
@@ -392,6 +406,7 @@ pub async fn turn_facts(
         latest_state,
         work_end_reason,
         latest_end_reason,
+        work_ended_at: row.opt_i64(6)?,
     })
 }
 
@@ -926,33 +941,76 @@ pub async fn derive_terminal_issue_status_conn(
     current: &JobStatus,
 ) -> DbResult<JobStatus> {
     if let (Some(execution_id), Some(node_id)) = (execution_id, recipe_node_id) {
-        let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
-        if snapshot.recipe.nodes.iter().any(|node| node.id == node_id) {
-            let all_nodes_db = snapshot_nodes_to_db(&snapshot);
-            let all_edges_db = snapshot_edges_to_db(&snapshot);
-            let node_map_db: HashMap<&str, &DbRecipeNode> =
-                all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
-            let upstream_failed =
-                dependency_impossible_nodes_conn(conn, execution_id, &snapshot, &HashSet::new())
-                    .await?
-                    .contains(node_id);
-            let gathered = node_job_facts_conn(
+        let graph = SnapshotGraph::load(conn, execution_id).await?;
+        if graph
+            .snapshot
+            .recipe
+            .nodes
+            .iter()
+            .any(|node| node.id == node_id)
+        {
+            let upstream_failed = dependency_impossible_nodes_conn(
                 conn,
-                job_id,
                 execution_id,
-                &snapshot,
-                node_id,
-                &all_edges_db,
-                &node_map_db,
-                upstream_failed,
+                &graph.snapshot,
+                &HashSet::new(),
             )
-            .await?;
+            .await?
+            .contains(node_id);
+            let gathered = graph
+                .node_job_facts(conn, job_id, execution_id, node_id, upstream_failed)
+                .await?;
             return Ok(settle_for_terminal_issue(derive_job_status(
                 &gathered.at_terminal_issue(),
             )));
         }
     }
     node_less_terminal_status_conn(conn, job_id, current).await
+}
+
+/// An execution's snapshot with its nodes and edges in the shape readiness
+/// reads, prepared once for a single job's derivation.
+struct SnapshotGraph {
+    snapshot: crate::models::ExecutionSnapshot,
+    nodes: Vec<DbRecipeNode>,
+    edges: Vec<DbRecipeEdge>,
+}
+
+impl SnapshotGraph {
+    async fn load(
+        conn: &cairn_db::storage::TrackedConnection,
+        execution_id: &str,
+    ) -> DbResult<Self> {
+        let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
+        Ok(SnapshotGraph {
+            nodes: snapshot_nodes_to_db(&snapshot),
+            edges: snapshot_edges_to_db(&snapshot),
+            snapshot,
+        })
+    }
+
+    async fn node_job_facts(
+        &self,
+        conn: &cairn_db::storage::TrackedConnection,
+        job_id: &str,
+        execution_id: &str,
+        node_id: &str,
+        upstream_failed: bool,
+    ) -> DbResult<NodeJobFacts> {
+        let node_map: HashMap<&str, &DbRecipeNode> =
+            self.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        node_job_facts_conn(
+            conn,
+            job_id,
+            execution_id,
+            &self.snapshot,
+            node_id,
+            &self.edges,
+            &node_map,
+            upstream_failed,
+        )
+        .await
+    }
 }
 
 /// Derive a node-backed job's status from its facts, ignoring the sticky
@@ -963,27 +1021,67 @@ pub async fn derive_node_job_status_conn(
     execution_id: &str,
     node_id: &str,
 ) -> DbResult<JobStatus> {
-    let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
-    let all_nodes_db = snapshot_nodes_to_db(&snapshot);
-    let all_edges_db = snapshot_edges_to_db(&snapshot);
-    let node_map_db: HashMap<&str, &DbRecipeNode> =
-        all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
+    let graph = SnapshotGraph::load(conn, execution_id).await?;
     let upstream_failed =
-        dependency_impossible_nodes_conn(conn, execution_id, &snapshot, &HashSet::new())
+        dependency_impossible_nodes_conn(conn, execution_id, &graph.snapshot, &HashSet::new())
             .await?
             .contains(node_id);
-    let gathered = node_job_facts_conn(
-        conn,
-        job_id,
-        execution_id,
-        &snapshot,
-        node_id,
-        &all_edges_db,
-        &node_map_db,
-        upstream_failed,
-    )
-    .await?;
+    let gathered = graph
+        .node_job_facts(conn, job_id, execution_id, node_id, upstream_failed)
+        .await?;
     Ok(derive_job_status(&gathered.facts))
+}
+
+/// A job held Blocked because its turn ended without the output it owes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingOutput {
+    /// The artifact it owes (`plan`, `create-pr`), when its contract names one.
+    pub output_name: Option<String>,
+    /// When the work turn that should have produced it ended.
+    pub since: Option<i64>,
+}
+
+/// Whether a node-backed job is blocked on a missing output, read through the
+/// same facts and the same rule ([`blocked_on_missing_output`]) the sweep
+/// derives its status from, so the passive mark can never disagree with it.
+///
+/// Dependency failure is passed as `false`, as [`node_failed_on_own_facts_conn`]
+/// does: the missing-output gate is rung 3 of the projection and outranks the
+/// upstream cascade, so the answer does not depend on it.
+pub async fn missing_output_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    job_id: &str,
+    execution_id: &str,
+    node_id: &str,
+) -> DbResult<Option<MissingOutput>> {
+    let graph = SnapshotGraph::load(conn, execution_id).await?;
+    let gathered = graph
+        .node_job_facts(conn, job_id, execution_id, node_id, false)
+        .await?;
+    Ok(
+        blocked_on_missing_output(&gathered.facts).then(|| MissingOutput {
+            output_name: gathered.required_artifact_name,
+            since: gathered.turn.work_ended_at,
+        }),
+    )
+}
+
+/// The log line a missing-output Blocked change carries, or `None` for every
+/// other change. Never a message: see
+/// [`JobStatusChange::emits_blocked_lifecycle_message`].
+fn missing_output_reason(
+    derived: &JobStatus,
+    facts: &JobFacts,
+    required_artifact_name: Option<&str>,
+) -> Option<String> {
+    (*derived == JobStatus::Blocked && blocked_on_missing_output(facts)).then(|| {
+        format!(
+            "agent ended its turn without producing required output{}",
+            required_artifact_name
+                .map(|name| format!(": `{name}`"))
+                .unwrap_or_default()
+        )
+    })
 }
 
 /// Lift the jobs a terminal resolution cancelled back onto their facts, once
@@ -1635,23 +1733,11 @@ async fn project_execution_jobs_conn(
                 // C4: distinguish Blocked-on-missing-output from Blocked-for-
                 // approval so the surfaced reason is actionable. The process is
                 // warm/idle; writing the artifact recomputes it to Complete.
-                let facts = &gathered.facts;
-                let blocked_reason = if derived == JobStatus::Blocked
-                    && facts.turn_complete
-                    && facts.requires_output
-                    && !facts.artifact_present
-                {
-                    Some(format!(
-                        "agent ended its turn without producing required output{}",
-                        gathered
-                            .required_artifact_name
-                            .as_deref()
-                            .map(|name| format!(": `{name}`"))
-                            .unwrap_or_default()
-                    ))
-                } else {
-                    None
-                };
+                let blocked_reason = missing_output_reason(
+                    &derived,
+                    &gathered.facts,
+                    gathered.required_artifact_name.as_deref(),
+                );
                 check_reachable(&current, &derived, &j.id);
                 write_job_status(conn, &j.id, &current, &derived).await?;
                 status.insert(j.id.clone(), derived.clone());
@@ -2669,23 +2755,51 @@ mod gate_tests {
         assert!(!change.fires_job_ended());
     }
 
+    /// A completed turn and a watchdog- or provider-truncated one owe their
+    /// output alike, and neither announces the block. The truncated case once
+    /// fell outside a hand-written copy of the rule and emitted "blocked
+    /// waiting for approval" for a job nobody could approve.
     #[test]
     fn missing_output_block_does_not_emit_lifecycle_message() {
-        let change = JobStatusChange {
-            job_id: "job-1".to_string(),
-            from: JobStatus::Running,
-            to: JobStatus::Blocked,
-            issue_id: Some("issue-1".to_string()),
-            project_id: "project-1".to_string(),
-            parent_job_id: None,
-            parent_tool_use_id: None,
-            blocked_reason: Some(
-                "agent ended its turn without producing required output: `create-pr`".to_string(),
-            ),
-            cause: ChangeCause::Derived,
+        let owed = |turn_complete: bool, turn_truncated: bool| JobFacts {
+            dag_ready: true,
+            upstream_failed: false,
+            live_turn: false,
+            turn_failed: false,
+            turn_complete,
+            turn_truncated,
+            checkpoint: CheckpointGate::None,
+            resolution: Resolution::Pending,
+            requires_output: true,
+            artifact_present: false,
+            output_abandoned: false,
+            long_running: false,
         };
-
-        assert!(!change.emits_blocked_lifecycle_message());
+        for (case, facts) in [
+            ("complete", owed(true, false)),
+            ("truncated", owed(false, true)),
+        ] {
+            let derived = derive_job_status(&facts);
+            assert_eq!(derived, JobStatus::Blocked, "{case}");
+            let blocked_reason = missing_output_reason(&derived, &facts, Some("create-pr"));
+            assert_eq!(
+                blocked_reason.as_deref(),
+                Some("agent ended its turn without producing required output: `create-pr`"),
+                "{case}"
+            );
+            let change = JobStatusChange {
+                job_id: "job-1".to_string(),
+                from: JobStatus::Running,
+                to: derived,
+                issue_id: Some("issue-1".to_string()),
+                project_id: "project-1".to_string(),
+                parent_job_id: None,
+                parent_tool_use_id: None,
+                blocked_reason,
+                cause: ChangeCause::Derived,
+            };
+            assert!(!change.emits_blocked_lifecycle_message(), "{case}");
+        }
     }
 
     #[test]
