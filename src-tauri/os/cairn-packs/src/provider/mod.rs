@@ -273,8 +273,10 @@ struct ProviderFile {
 struct OptionFile {
     key: String,
     label: String,
+    /// A literal `[[value, label], …]` list, or `{from: …}`: the choices a
+    /// request made with the provider's credential returns.
     #[serde(default)]
-    select: Option<Vec<(String, String)>>,
+    select: Option<serde_yaml::Value>,
     #[serde(default)]
     number: Option<NumberFile>,
     #[serde(default)]
@@ -285,6 +287,12 @@ struct OptionFile {
     default: Option<serde_yaml::Value>,
     #[serde(default)]
     required: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectFromFile {
+    from: serde_yaml::Value,
 }
 
 #[derive(Deserialize)]
@@ -465,7 +473,15 @@ pub fn parse_credential(name: &str, text: &str) -> Result<CredentialDecl, String
     })
 }
 
-fn parse_option(option: OptionFile) -> Result<ProviderOption, String> {
+/// The credential a provider names, as a `select.from` request needs it: the
+/// provider's own, resolved once before its options are parsed.
+type OptionCredential<'a> = Option<Result<&'a CredentialDecl, String>>;
+
+fn parse_option(
+    slot: Slot,
+    credential: &OptionCredential<'_>,
+    option: OptionFile,
+) -> Result<ProviderOption, String> {
     let key = option.key;
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!("option key `{key}` must be letters, digits or `_`"));
@@ -481,13 +497,57 @@ fn parse_option(option: OptionFile) -> Result<ProviderOption, String> {
             "option `{key}` must declare exactly one of `select`, `number`, `text`, `bool`"
         ));
     }
-    if option.required && option.text.is_none() {
+    let (from, choices) = match option.select {
+        Some(select @ serde_yaml::Value::Mapping(_)) => (
+            Some(
+                serde_yaml::from_value::<SelectFromFile>(select)
+                    .map_err(|e| format!("option `{key}`'s `select`: {e}"))?
+                    .from,
+            ),
+            None,
+        ),
+        Some(list) => (
+            None,
+            Some(
+                serde_yaml::from_value::<Vec<(String, String)>>(list).map_err(|e| {
+                    format!(
+                        "option `{key}`'s `select` must be `[[value, label], …]` or \
+                         `{{from: …}}`: {e}"
+                    )
+                })?,
+            ),
+        ),
+        None => (None, None),
+    };
+    if option.required && option.text.is_none() && from.is_none() {
         return Err(format!(
-            "option `{key}`: only a `text` option can be `required`"
+            "option `{key}`: only a `text` option or a `select.from` can be `required`"
         ));
     }
     let default = option.default;
-    let control = if let Some(choices) = option.select {
+    let control = if let Some(from) = from {
+        if default.is_some() {
+            return Err(format!(
+                "option `{key}`: a `select.from` has no `default`; its choices are only known once fetched"
+            ));
+        }
+        let credential = match credential {
+            None => {
+                return Err(format!(
+                    "option `{key}`: a `select.from` request sends the provider's credential, \
+                     and this provider names no `credential:`"
+                ))
+            }
+            Some(Err(error)) => return Err(error.clone()),
+            Some(Ok(credential)) => credential,
+        };
+        OptionControl::DynamicSelect {
+            from: Box::new(
+                http::parse_choice_source(slot, credential, from)
+                    .map_err(|e| format!("option `{key}`: {e}"))?,
+            ),
+        }
+    } else if let Some(choices) = choices {
         if choices.is_empty() {
             return Err(format!("option `{key}` has no choices"));
         }
@@ -658,10 +718,14 @@ pub fn parse_provider(
             slot.as_str()
         ));
     }
+    let credential = file
+        .credential
+        .as_deref()
+        .map(|name| named_credential(slot, Some(name), credentials));
     let mut keys = BTreeSet::new();
     let mut options = Vec::new();
     for option in file.options {
-        let option = parse_option(option)?;
+        let option = parse_option(slot, &credential, option)?;
         if !keys.insert(option.key.clone()) {
             return Err(format!("option `{}` is declared twice", option.key));
         }

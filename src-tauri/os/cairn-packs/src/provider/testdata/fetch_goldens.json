@@ -171,7 +171,15 @@
     },
     "cloudflare_no_account": {
       "before": "The Cloudflare Browser Run web-fetch provider is missing its account ID. Set your Cloudflare account ID in Settings → Web Services.",
-      "now": "Cloudflare Browser Run web fetch needs its Account ID. Set it in the Library."
+      "now": "Cloudflare Browser Run web fetch needs its Cloudflare account. Set it in the Library."
+    },
+    "cloudflare_choose_account": {
+      "before": "Cloudflare Browser Run web fetch needs its Account ID. Set it in the Library.",
+      "now": "Cloudflare Browser Run web fetch needs its Cloudflare account, and the connected login reaches 2: Acme, Personal. Choose one in the Library."
+    },
+    "cloudflare_no_reachable_account": {
+      "before": "Cloudflare Browser Run web fetch needs its Account ID. Set it in the Library.",
+      "now": "The connected Cloudflare Browser Run login reaches no Cloudflare account. Connect a login that does in the Library."
     },
     "bmd_not_connected": {
       "before": "The bmd web-fetch provider is not configured. Add and connect the bmd MCP server in Settings → Web Services, or switch providers.",

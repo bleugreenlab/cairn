@@ -522,6 +522,9 @@ fn brokered_plaintext_is_unwrapped_only_where_it_is_injected() {
             "cairn-transport/src/mcp_gateway.rs",
             "mcp/handlers/search_web.rs",
             "mcp/handlers/fetch_web.rs",
+            // A provider's credential-sourced choices (Cloudflare's accounts),
+            // listed with that credential through the web providers' gated send.
+            "web_providers/choices.rs",
             "account/team_token_minter.rs",
             // Channel provider clients inject credentials into their SDK transports.
             "channels/mod.rs",

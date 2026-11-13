@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use cairn_packs::provider::http::{self, Inputs, PreparedRequest};
 use tempfile::TempDir;
 
+use super::choices::Settled;
 use super::*;
 use crate::config::secrets::{self, mock_keychain};
 use crate::mcp::oauth::store::{self as oauth_store, StoredAuth};
@@ -465,19 +466,27 @@ fn a_connected_cloudflare_keeps_fetching_after_upgrade() {
     assert!(!views.contains("cf-Lz40Hd"), "{views}");
     assert!(views.contains("\"kind\":\"oauth\""), "{views}");
 
-    // A blank required option is "needs setup", naming it.
-    upsert_options(
+    // An account is never stored blank; one left unset is "needs setup",
+    // naming it.
+    assert!(upsert_options(
         &config,
         Slot::WebFetch,
         "cloudflare",
         &HashMap::from([("accountId".to_string(), serde_yaml::Value::from(""))]),
+    )
+    .is_err());
+    upsert_options(
+        &config,
+        Slot::WebFetch,
+        "cloudflare",
+        &HashMap::from([("browser".to_string(), serde_yaml::Value::from("kitesurf"))]),
     )
     .unwrap();
     let fetch = provider_of(resolve(&config, Slot::WebFetch));
     assert_eq!(
         readiness(&config, &fetch.provider),
         Some(NotReady::NeedsSetup {
-            missing: vec!["Account ID".into()]
+            missing: vec!["Cloudflare account".into()]
         })
     );
 
@@ -973,6 +982,375 @@ async fn a_search_with_a_blank_required_option_sends_nothing() {
         .unwrap();
     assert!(guidance.contains("needs its Account"), "{guidance}");
     assert!(guidance.contains(LIBRARY_LOCATION), "{guidance}");
+}
+
+/// A resource dir holding one fetch provider pack named `id` whose required
+/// `account` is a select fetched with its secret credential (var `var`) from
+/// `api.<id>.test`, which cannot resolve.
+fn choices_pack(resources: &Path, id: &str, var: &str) {
+    let root = resources.join("packs").join(id);
+    write(
+        &root.join("cairn-pack.yaml"),
+        &format!("cairnVersion: 1\nid: {id}\nname: Fixture {id}\nversion: 1.0.0\ndescription: d\ndefault: false\n"),
+    );
+    write(
+        &root.join("credentials/api-key.yaml"),
+        &format!("label: Key\nkind: secret\nvar: {var}\nhosts: [api.{id}.test]\naccessors: [provider:web-fetch]\n"),
+    );
+    write(
+        &root.join("providers/web-fetch.yaml"),
+        &r#"label: Fixture
+provides: web-fetch
+credential: api-key
+options:
+  - key: account
+    label: Account
+    required: true
+    select:
+      from:
+        request: { method: GET, url: "https://api.ID.test/accounts", headers: { X-Key: "${credential}" } }
+        items: result
+        value: id
+        label: name
+  - { key: mode, label: Mode, select: [[a, A], [b, B]], default: a }
+adapter:
+  http:
+    request:
+      method: GET
+      url: https://api.ID.test/accounts/${options.account|query}/render?u=${target|query}&m=${options.mode|query}
+      headers: { X-Key: "${credential}" }
+    response:
+      markdown: body
+"#
+        .replace("ID", id),
+    );
+}
+
+fn accounts(items: &str) -> String {
+    format!(r#"{{"success":true,"result":[{items}]}}"#)
+}
+
+/// The settle rule, against a real installed declaration: several choices are
+/// left for the operator, sorted; none and a failure are reported; one is
+/// stored beside the other options; and a stored value is never replaced.
+#[test]
+fn a_fetched_choice_settles_by_one_rule() {
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+    choices_pack(&resources, "wp-settle", "WP_SETTLE_KEY");
+    install(&resources, &config, "wp-settle");
+    settings(
+        &config,
+        "activeWebFetch: wp-settle\nwebFetch:\n  wp-settle:\n    mode: b\n",
+    );
+    let provider = installed_provider(&config, "wp-settle", Slot::WebFetch)
+        .unwrap()
+        .unwrap();
+    let pending = choices::pending(&config, &provider);
+    assert_eq!(
+        pending.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(),
+        ["account"]
+    );
+    let option = &pending[0];
+    let respond =
+        |status: u16, body: &str| choices::choices_from_response("Fixture", option, status, body);
+    let record = |result| choices::record(&config, &provider, option, result);
+
+    let two = respond(
+        200,
+        &accounts(r#"{"id":"z9","name":"Zeta"},{"id":"a1","name":"Acme"}"#),
+    );
+    let Settled::Choose(choices) = record(two) else {
+        panic!("two choices are the operator's");
+    };
+    assert_eq!(
+        choices.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+        ["Acme", "Zeta"]
+    );
+    assert_eq!(record(respond(200, &accounts(""))), Settled::None);
+    for failure in [
+        respond(403, r#"{"success":false}"#),
+        respond(200, "not json"),
+    ] {
+        assert!(matches!(record(failure), Settled::Failed(_)));
+    }
+    assert_eq!(
+        choices::pending(&config, &provider).len(),
+        1,
+        "nothing stored"
+    );
+
+    let one = respond(200, &accounts(r#"{"id":"acct-1","name":"Acme"}"#));
+    assert!(matches!(record(one), Settled::Stored(_)));
+    let stored = load_options(&config, Slot::WebFetch, "wp-settle");
+    assert_eq!(stored["account"], serde_yaml::Value::from("acct-1"));
+    assert_eq!(stored["mode"], serde_yaml::Value::from("b"));
+    assert!(choices::pending(&config, &provider).is_empty());
+
+    let other = respond(200, &accounts(r#"{"id":"acct-2","name":"Other"}"#));
+    record(other);
+    assert_eq!(
+        load_options(&config, Slot::WebFetch, "wp-settle")["account"],
+        serde_yaml::Value::from("acct-1"),
+        "a stored value is never replaced"
+    );
+
+    let fetch = provider_of(resolve(&config, Slot::WebFetch));
+    assert_eq!(
+        readiness(&config, &fetch.provider),
+        Some(NotReady::MissingVars {
+            vars: vec!["WP_SETTLE_KEY".into()]
+        })
+    );
+    let prepared = prepare(&fetch, Some("https://example.com/"), "k");
+    assert!(
+        prepared
+            .url
+            .starts_with("https://api.wp-settle.test/accounts/acct-1/render?"),
+        "{}",
+        prepared.url
+    );
+}
+
+/// At use, a blank fetched choice is the credential's gap while the credential
+/// holds nothing, and once it does the listing really goes out through `send`:
+/// this fixture's host cannot resolve, so it fails, and the read fails naming
+/// the option rather than sending a request with no account in it.
+#[tokio::test]
+async fn a_fetch_fills_its_blank_choice_from_the_credential_or_says_why_not() {
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let (resources, config) = (temp.path().join("res"), temp.path().join("home"));
+    std::fs::create_dir_all(&config).unwrap();
+    choices_pack(&resources, "wp-fill", "WP_FILL_KEY");
+    install(&resources, &config, "wp-fill");
+    settings(&config, "activeWebFetch: wp-fill\n");
+
+    let mut active = provider_of(resolve(&config, Slot::WebFetch));
+    assert!(matches!(
+        choices::fill_required(&config, &mut active).await,
+        choices::Gap::Credential(CredentialKind::Secret { .. })
+    ));
+
+    store_credential(&config, "wp-fill", "api-key", "wf-Hx20Qa").unwrap();
+    let gap = choices::fill_required(&config, &mut active).await;
+    let choices::Gap::Failed { option, error } = &gap else {
+        panic!("an unreachable listing is a failure, got {gap:?}");
+    };
+    assert_eq!(option, "Account");
+    assert!(
+        error.contains("Fixture could not list its Account choices"),
+        "{error}"
+    );
+    assert!(!error.contains("wf-Hx20Qa"), "{error}");
+
+    let orch = orchestrator(&config).await;
+    let read = crate::mcp::handlers::fetch_web::read_fetch_markdown(&orch, "https://example.com/")
+        .await
+        .unwrap_err();
+    assert!(
+        read.starts_with("Fixture web fetch needs its Account, and listing the choices failed"),
+        "{read}"
+    );
+}
+
+/// A copy of the shipped Cloudflare pack under its own id, so the keychain
+/// account its token is stored under belongs to this test alone.
+fn cloudflare_copy(resources: &Path, id: &str) {
+    let shipped = app_resources().join("packs/cloudflare");
+    for rel in [
+        "cairn-pack.yaml",
+        "mcp.yaml",
+        "credentials/browser-run.yaml",
+        "providers/web-fetch.yaml",
+    ] {
+        let text = std::fs::read_to_string(shipped.join(rel)).unwrap();
+        let text = text.replace("id: cloudflare\n", &format!("id: {id}\n"));
+        write(&resources.join("packs").join(id).join(rel), &text);
+    }
+}
+
+/// A listing stand-in that records each request and answers with `answer`.
+fn listing(
+    seen: &std::sync::Arc<std::sync::Mutex<Vec<PreparedRequest>>>,
+    answer: impl Fn() -> choices::test_listing::Answer + Send + Sync + 'static,
+) -> choices::test_listing::StandIn {
+    let seen = seen.clone();
+    std::sync::Arc::new(move |request| {
+        seen.lock().unwrap().push(request);
+        answer()
+    })
+}
+
+fn answered(status: u16, body: &'static str) -> choices::test_listing::Answer {
+    Box::pin(async move { Ok((status, body.to_string())) })
+}
+
+/// Connect's tail as `complete` runs it once the token is stored: the bounded
+/// settle, then what the connect reports it still needs.
+async fn connect_settles(
+    config: &Path,
+    pack: &str,
+    stand_in: choices::test_listing::StandIn,
+) -> Option<NotReady> {
+    choices::test_listing::LISTING
+        .scope(
+            stand_in,
+            choices::settle_after_connect(config, pack, "browser-run"),
+        )
+        .await;
+    choices::still_needs(config, pack, "browser-run")
+}
+
+/// Against the shipped Cloudflare declaration with a stored login: a refused
+/// listing, a malformed one, and one that never answers each leave the login
+/// connected and still needing its account, within the connect's bound; one
+/// account is stored, and the Browser Run request then names it; and a login
+/// connected before the option existed is filled at its first fetch.
+#[tokio::test(start_paused = true)]
+async fn a_connected_cloudflare_login_settles_its_account_or_says_what_it_still_needs() {
+    mock_keychain::install();
+    let temp = TempDir::new().unwrap();
+    let resources = temp.path().join("res");
+    cloudflare_copy(&resources, "wp-cf");
+    oauth_store::save(
+        &oauth::account("wp-cf", "browser-run"),
+        &stored_auth("cf-Qm71Tz"),
+    )
+    .unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let needs_account = Some(NotReady::NeedsSetup {
+        missing: vec!["Cloudflare account".into()],
+    });
+
+    let config = temp.path().join("home");
+    install(&resources, &config, "wp-cf");
+    settings(&config, "activeWebFetch: wp-cf\n");
+    for stand_in in [
+        listing(&seen, || {
+            answered(
+                403,
+                r#"{"success":false,"errors":[{"message":"Authentication error"}]}"#,
+            )
+        }),
+        listing(&seen, || answered(200, "<html>not json</html>")),
+    ] {
+        assert_eq!(
+            connect_settles(&config, "wp-cf", stand_in).await,
+            needs_account
+        );
+    }
+
+    let started = tokio::time::Instant::now();
+    let stalled = listing(&seen, || Box::pin(std::future::pending()));
+    assert_eq!(
+        connect_settles(&config, "wp-cf", stalled.clone()).await,
+        needs_account
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= choices::LIST_DEADLINE && waited < choices::CONNECT_SETTLE_DEADLINE,
+        "{waited:?}"
+    );
+    let mut active = provider_of(resolve(&config, Slot::WebFetch));
+    let gap = choices::test_listing::LISTING
+        .scope(stalled, choices::fill_required(&config, &mut active))
+        .await;
+    let choices::Gap::Failed { error, .. } = &gap else {
+        panic!("a listing that never answers is a failure, got {gap:?}");
+    };
+    assert!(error.contains("no answer within 10 seconds"), "{error}");
+
+    let one = || {
+        answered(
+            200,
+            r#"{"success":true,"result":[{"id":"acct-77","name":"Acme"}]}"#,
+        )
+    };
+    assert_eq!(
+        connect_settles(&config, "wp-cf", listing(&seen, one)).await,
+        None
+    );
+    let request = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (request.method.as_str(), request.url.as_str()),
+        (
+            "GET",
+            "https://api.cloudflare.com/client/v4/accounts?per_page=50"
+        )
+    );
+    assert!(request
+        .headers
+        .contains(&("Authorization".into(), "Bearer cf-Qm71Tz".into())));
+    let fetch = provider_of(resolve(&config, Slot::WebFetch));
+    let account_url =
+        "https://api.cloudflare.com/client/v4/accounts/acct-77/browser-rendering/markdown?";
+    let prepared = prepare(&fetch, Some("https://example.com/"), "cf-Qm71Tz");
+    assert!(prepared.url.starts_with(account_url), "{}", prepared.url);
+
+    // A login connected before the option existed: the first fetch fills it.
+    let earlier = temp.path().join("earlier");
+    install(&resources, &earlier, "wp-cf");
+    settings(&earlier, "activeWebFetch: wp-cf\n");
+    let mut active = provider_of(resolve(&earlier, Slot::WebFetch));
+    let gap = choices::test_listing::LISTING
+        .scope(
+            listing(&seen, one),
+            choices::fill_required(&earlier, &mut active),
+        )
+        .await;
+    assert_eq!(gap, choices::Gap::Ready);
+    let prepared = prepare(&active, Some("https://example.com/"), "cf-Qm71Tz");
+    assert!(prepared.url.starts_with(account_url), "{}", prepared.url);
+}
+
+/// Reading a pack credential's value is a security decision: each site is a
+/// place the value leaves the keychain. Today the two slots read it to send
+/// their request, and the choice listing reads it to send its own.
+#[test]
+fn a_pack_credential_value_is_read_only_by_the_slots_and_their_choices() {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    let mut found: Vec<String> = files
+        .iter()
+        .filter(|path| !path.ends_with("web_providers/tests.rs"))
+        .filter(|path| {
+            std::fs::read_to_string(path).unwrap().lines().any(|line| {
+                line.contains("credential_value(") && !line.contains("fn credential_value(")
+            })
+        })
+        .map(|path| {
+            path.strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            "mcp/handlers/fetch_web.rs",
+            "mcp/handlers/search_web.rs",
+            "web_providers/choices.rs",
+        ],
+        "the set of places that read a pack credential's value changed. Each is a place the \
+         value leaves the keychain, so adding one is a security decision: confirm it sends the \
+         value only through `web_providers::send` and never into a response, a log line or a \
+         spawn environment, then update this list."
+    );
 }
 
 /// Read `target` the way `read` does for an `http(s)://` target.

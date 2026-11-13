@@ -852,14 +852,131 @@ fn two_credentials_in_one_pack_may_not_claim_one_relay() {
 }
 
 #[test]
-fn only_a_text_option_can_be_required() {
+fn only_a_text_option_or_a_fetched_select_can_be_required() {
     let error = load_error(
         CREDENTIAL,
         &PROVIDER.replace("default: 5 }", "default: 5, required: true }"),
     );
     assert!(
-        error.contains("only a `text` option can be `required`"),
+        error.contains("only a `text` option or a `select.from` can be `required`"),
         "{error}"
+    );
+}
+
+const ACCOUNTS: &str = "  - key: account\n    label: Account\n    required: true\n    select:\n      from:\n        request:\n          method: GET\n          url: https://api.example.test/accounts\n          headers: { Authorization: \"Bearer ${credential}\" }\n        items: result\n        value: id\n        label: name\n";
+
+fn with_accounts(provider: &str, accounts: &str) -> String {
+    provider.replace("options:\n", &format!("options:\n{accounts}"))
+}
+
+/// A select may take its choices from a request made with the provider's own
+/// credential; it is required like a text option and has no default.
+#[test]
+fn a_select_may_take_its_choices_from_the_providers_credential() {
+    let (_temp, root) = pack(CREDENTIAL, &with_accounts(PROVIDER, ACCOUNTS));
+    let providers = load_pack_providers(&root, "example").unwrap();
+    let account = &providers[0].provider.options[0];
+    assert!(account.required);
+    let source = account.control.choice_source().expect("a dynamic select");
+    assert_eq!(source.request.host, "api.example.test");
+    let prepared = http::prepare_choices(source, "tok");
+    assert_eq!(
+        (prepared.method.as_str(), prepared.url.as_str()),
+        ("GET", "https://api.example.test/accounts")
+    );
+    assert_eq!(
+        prepared.headers,
+        vec![("Authorization".to_string(), "Bearer tok".to_string())]
+    );
+    // A label never falls back to the value, an id the operator has no use
+    // for: an unnamed item reads `Unnamed`, and a repeated name is numbered.
+    let choices = http::map_choices(
+        source,
+        r#"{"result":[{"id":"b2","name":"beta"},{"id":"a1","name":"Alpha"},{"id":7},{"id":"a0","name":"alpha"}]}"#,
+    )
+    .unwrap();
+    let pairs: Vec<_> = choices
+        .iter()
+        .map(|c| (c.value.as_str(), c.label.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("a0", "alpha"),
+            ("a1", "Alpha 2"),
+            ("b2", "beta"),
+            ("7", "Unnamed")
+        ]
+    );
+    assert_eq!(http::map_choices(source, r#"{"result":null}"#), Ok(vec![]));
+    assert!(http::map_choices(source, r#"{"result":{}}"#).is_err());
+    assert!(http::map_choices(source, r#"{"result":[{"name":"x"}]}"#).is_err());
+    assert!(http::map_choices(source, "not json").is_err());
+}
+
+/// Each way a fetched-choices request could send the credential somewhere it
+/// should not, or be shaped by something other than it, is refused by name.
+#[test]
+fn a_fetched_select_is_refused_by_name_when_it_would_misuse_the_credential() {
+    let no_credential = with_accounts(PROVIDER, ACCOUNTS).replace("credential: api-key\n", "");
+    let (_temp, root) = pack(CREDENTIAL, &no_credential);
+    let error = load_pack_providers(&root, "example").unwrap_err();
+    assert!(
+        error.contains("this provider names no `credential:`"),
+        "{error}"
+    );
+
+    for (from, to, expect) in [
+        (
+            "https://api.example.test/accounts",
+            "https://api.evil.test/accounts",
+            "would send credential `api-key` (API_KEY) to `api.evil.test`",
+        ),
+        (
+            "https://api.example.test/accounts",
+            "https://${credential|raw}/accounts",
+            "interpolates into its host",
+        ),
+        (
+            "https://api.example.test/accounts",
+            "https://api.example.test/accounts?q=${options.count|query}",
+            "may interpolate only `${credential}`, not `${options.count}`",
+        ),
+        (
+            "Bearer ${credential}",
+            "Bearer ${query}",
+            "may interpolate only `${credential}`, not `${query}`",
+        ),
+        (
+            "    required: true\n",
+            "    required: true\n    default: a1\n",
+            "a `select.from` has no `default`",
+        ),
+    ] {
+        let error = load_error(
+            CREDENTIAL,
+            &with_accounts(PROVIDER, &ACCOUNTS.replace(from, to)),
+        );
+        assert!(error.contains(expect), "{to}: {error}");
+    }
+}
+
+/// The shipped Cloudflare fetch provider lists its accounts with the token it
+/// already holds, from the host that token may reach.
+#[test]
+fn the_cloudflare_account_is_chosen_from_the_connected_login() {
+    let cloudflare = bundled("cloudflare", Slot::WebFetch);
+    let account = cloudflare
+        .provider
+        .options
+        .iter()
+        .find(|option| option.key == "accountId")
+        .unwrap();
+    assert!(account.required);
+    let prepared = http::prepare_choices(account.control.choice_source().unwrap(), "cf-tok");
+    assert_eq!(
+        prepared.url,
+        "https://api.cloudflare.com/client/v4/accounts?per_page=50"
     );
 }
 

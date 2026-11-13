@@ -20,6 +20,7 @@ use cairn_packs::provider::http::{self, HttpAdapter, Inputs, MarkdownFailure, Re
 use cairn_packs::provider::{Adapter, CredentialKind, Slot};
 
 use crate::orchestrator::Orchestrator;
+use crate::web_providers::choices::{self, Gap};
 use crate::web_providers::{self, McpOutcome, Resolved, LIBRARY_LOCATION};
 
 /// Convert an `http(s)://` target to markdown via the active fetch provider.
@@ -34,7 +35,7 @@ pub(crate) async fn read_fetch_markdown(
             "The web-fetch provider `{name}` is installed, but its declaration does not \
              load: {error}. Update or reinstall it from {LIBRARY_LOCATION}."
         )),
-        Resolved::Provider(active) => pack_fetch(orch, &active, target).await,
+        Resolved::Provider(mut active) => pack_fetch(orch, &mut active, target).await,
     }
 }
 
@@ -53,6 +54,13 @@ fn not_authorized_message(label: &str) -> String {
     format!("{label} web fetch is not authorized. Connect it in {LIBRARY_LOCATION}.")
 }
 
+fn no_credential_message(label: &str, kind: &CredentialKind) -> String {
+    match kind {
+        CredentialKind::Secret { .. } => no_key_message(label),
+        CredentialKind::OAuth { .. } => not_authorized_message(label),
+    }
+}
+
 fn needs_option_message(label: &str, option: &str) -> String {
     format!("{label} web fetch needs its {option}. Set it in {LIBRARY_LOCATION}.")
 }
@@ -64,20 +72,27 @@ fn not_connected_message(label: &str, server: &str) -> String {
     )
 }
 
-/// A pack's web-fetch provider: a required option left blank is guidance, then
-/// the adapter runs.
+/// A pack's web-fetch provider: a required choice the credential can fill is
+/// filled, any other required option left blank is guidance, then the adapter
+/// runs.
 async fn pack_fetch(
     orch: &Orchestrator,
-    active: &web_providers::Active,
+    active: &mut web_providers::Active,
     target: &str,
 ) -> Result<String, String> {
-    let provider = &active.provider;
-    let label = provider.provider.label.as_str();
-    if let Some(option) =
-        cairn_packs::provider_options::missing_required(&provider.provider.options, &active.options)
-    {
-        return Ok(needs_option_message(label, &option.label));
+    let label = active.provider.provider.label.clone();
+    match choices::fill_required(&orch.config_dir, active).await {
+        Gap::Ready => {}
+        Gap::Blank(option) => return Ok(needs_option_message(&label, &option)),
+        Gap::Credential(kind) => return Ok(no_credential_message(&label, &kind)),
+        gap => {
+            return choices::choice_guidance(&label, "web fetch", &gap)
+                .expect("every other gap is a choice gap")
+        }
     }
+    let active = &*active;
+    let provider = &active.provider;
+    let label = label.as_str();
     match &provider.provider.adapter {
         Adapter::Http(adapter) => http_fetch(active, adapter, target).await,
         Adapter::Mcp(binding) => {
@@ -112,10 +127,7 @@ async fn http_fetch(
     let Some(token) =
         web_providers::credential_value(&provider.pack, credential, "web fetch request").await?
     else {
-        return Ok(match credential.kind {
-            CredentialKind::Secret { .. } => no_key_message(label),
-            CredentialKind::OAuth { .. } => not_authorized_message(label),
-        });
+        return Ok(no_credential_message(label, &credential.kind));
     };
     let prepared = http::prepare(
         &provider.provider,
@@ -411,9 +423,48 @@ mod tests {
             now("cloudflare_not_authorized")
         );
         assert_eq!(
-            needs_option_message("Cloudflare Browser Run", "Account ID"),
+            needs_option_message("Cloudflare Browser Run", "Cloudflare account"),
             now("cloudflare_no_account")
         );
+        let choice = |value: &str, label: &str| cairn_packs::provider_options::Choice {
+            value: value.into(),
+            label: label.into(),
+        };
+        let guidance = |gap: Gap| {
+            choices::choice_guidance("Cloudflare Browser Run", "web fetch", &gap).unwrap()
+        };
+        let choose = guidance(Gap::Choose {
+            option: "Cloudflare account".into(),
+            choices: vec![
+                choice("6f0c1e2a9b", "Acme"),
+                choice("9d3b7c4e1f", "Personal"),
+            ],
+        });
+        assert_eq!(
+            choose.as_deref(),
+            Ok(now("cloudflare_choose_account").as_str())
+        );
+        let unreachable = guidance(Gap::Unreachable {
+            option: "Cloudflare account".into(),
+        });
+        assert_eq!(
+            unreachable.as_deref(),
+            Ok(now("cloudflare_no_reachable_account").as_str())
+        );
+        // The operator never sees an account id: guidance names accounts only.
+        assert!(!choose.unwrap().contains("6f0c1e2a9b"));
+        let many = guidance(Gap::Choose {
+            option: "Cloudflare account".into(),
+            choices: (1..=7)
+                .map(|n| choice(&format!("id-{n}"), &format!("A{n}")))
+                .collect(),
+        })
+        .unwrap();
+        assert!(
+            many.contains("reaches 7: A1, A2, A3, A4, A5, 2 more."),
+            "{many}"
+        );
+        assert!(!many.contains("id-"), "{many}");
         assert_eq!(
             not_connected_message("bmd", "bmd"),
             now("bmd_not_connected")

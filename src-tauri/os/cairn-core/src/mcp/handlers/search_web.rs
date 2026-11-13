@@ -16,12 +16,13 @@ use cairn_packs::provider::http::{self, Inputs, ResponseMapping, SearchHit};
 use cairn_packs::provider::Slot;
 
 use crate::orchestrator::Orchestrator;
+use crate::web_providers::choices::{self, Gap};
 use crate::web_providers::{self, Resolved, LIBRARY_LOCATION};
 
 /// Run a web search for `query` through the selected provider and return a
 /// rendered ranked list.
 pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<String, String> {
-    let active = match web_providers::resolve(&orch.config_dir, Slot::WebSearch) {
+    let mut active = match web_providers::resolve(&orch.config_dir, Slot::WebSearch) {
         Resolved::Unconfigured => {
             return Ok(no_provider_message(&web_providers::offered_labels(
                 &orch.config_dir,
@@ -32,8 +33,21 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
         Resolved::Invalid { name, error } => return Ok(invalid_message(&name, &error)),
         Resolved::Provider(active) => active,
     };
+    // Before the request is built: one with a blank required value would go
+    // out credentialed and fail at the provider. A choice the credential can
+    // fill is filled first.
+    let label = active.provider.provider.label.clone();
+    match choices::fill_required(&orch.config_dir, &mut active).await {
+        Gap::Ready => {}
+        Gap::Blank(option) => return Ok(needs_option_message(&label, &option)),
+        Gap::Credential(_) => return Ok(missing_key_message(&label)),
+        gap => {
+            return choices::choice_guidance(&label, "web search", &gap)
+                .expect("every other gap is a choice gap")
+        }
+    }
+    let label = label.as_str();
     let provider = &active.provider;
-    let label = provider.provider.label.as_str();
     let (Some(adapter), Some(credential)) = (provider.provider.http(), &provider.credential) else {
         return Err(format!(
             "The {label} web-search provider is not an HTTP provider"
@@ -42,13 +56,6 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
     let ResponseMapping::Search(mapping) = &adapter.response else {
         return Err(format!("The {label} web-search provider maps no results"));
     };
-    // Before the credential is read: a request with a blank required value
-    // would go out credentialed and fail at the provider.
-    if let Some(option) =
-        cairn_packs::provider_options::missing_required(&provider.provider.options, &active.options)
-    {
-        return Ok(needs_option_message(label, &option.label));
-    }
 
     // Through the broker, so the key is a scrub target before it is put in a
     // header or a request body: a provider that quotes a rejected key in its

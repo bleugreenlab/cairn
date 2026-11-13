@@ -121,8 +121,18 @@ fn issuer_of(authorize: &str) -> Option<String> {
     Some(format!("{}://{}", url.scheme(), url.host_str()?))
 }
 
+/// Drop the pending authorization of the credential that claims `relay`: the
+/// callback carried an error, or no code, so it will not complete. A relay no
+/// credential claims has nothing pending.
+pub fn abandon_relay(config_dir: &Path, relay: &str) {
+    if let Ok((pack, credential)) = resolve_relay(config_dir, relay) {
+        abandon(&pack, &credential);
+    }
+}
+
 /// Finish an authorization: consume the pending record, check its age and
-/// `state`, exchange the code, and store the token.
+/// `state`, exchange the code, and store the token. Then any option whose
+/// choices the token can list is settled; that never fails the connect.
 pub async fn complete(
     config_dir: &Path,
     pack: &str,
@@ -170,6 +180,7 @@ pub async fn complete(
             rejected_at: None,
         },
     )?;
+    super::choices::settle_after_connect(config_dir, pack, credential).await;
     Ok(store::status(&account))
 }
 

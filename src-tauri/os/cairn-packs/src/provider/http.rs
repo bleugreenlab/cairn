@@ -33,6 +33,16 @@
 //! A stored option value of the wrong type, or a select value that is no
 //! longer one of the declared choices, falls back to the declared default.
 //!
+//! # Choices fetched with the credential
+//!
+//! A select option may declare `select: {from: {request, items, value,
+//! label}}` instead of a literal list: its choices are what that request
+//! returns ([`ChoiceSource`]). The request is the same grammar as an adapter's,
+//! checked against the same credential `hosts`, but it may interpolate only
+//! `${credential}`: it runs before any option is known, and is never shaped by
+//! a target or a query. `items` is the dotted path to the array, and `value`
+//! and `label` are dotted paths inside each item.
+//!
 //! # What it deliberately cannot do
 //!
 //! No conditionals, loops beyond the one results array, arithmetic, regex,
@@ -47,7 +57,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{CredentialDecl, ProviderDecl, Slot};
-use crate::provider_options::{OptionControl, ProviderOption};
+use crate::provider_options::{Choice, OptionControl, ProviderOption};
 
 /// A parsed, validated HTTP adapter.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +99,16 @@ pub struct JsonMarkdown {
 struct SuccessGate {
     path: Vec<String>,
     error: Vec<Vec<String>>,
+}
+
+/// Where a select option's choices come from: a request sent with the
+/// provider's credential, and the paths that read its response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChoiceSource {
+    pub request: RequestTemplate,
+    items: Vec<String>,
+    value: Vec<String>,
+    label: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +179,15 @@ struct RequestFile {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ChoiceFile {
+    request: RequestFile,
+    items: String,
+    value: String,
+    label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResponseFile {
     #[serde(default)]
     results: Option<String>,
@@ -209,10 +238,18 @@ struct Scope<'a> {
     /// Whether `${credential}` is defined: an HTTP adapter sends its pack
     /// credential, an MCP binding has none.
     credential: bool,
+    /// A choice request, which may interpolate `${credential}` and nothing
+    /// else.
+    choice: bool,
 }
 
 impl Scope<'_> {
     fn var(&self, name: &str) -> Result<Var, String> {
+        if self.choice && name != "credential" {
+            return Err(format!(
+                "a `select.from` request may interpolate only `${{credential}}`, not `${{{name}}}`"
+            ));
+        }
         match name {
             "query" if self.slot == Slot::WebSearch => Ok(Var::Query),
             "query" => Err("`${query}` is defined only for a web-search provider".to_string()),
@@ -376,6 +413,7 @@ pub(crate) fn json_template(
         slot,
         options,
         credential: false,
+        choice: false,
     }
     .json(value)
 }
@@ -433,38 +471,9 @@ pub(super) fn parse_adapter(
         slot,
         options,
         credential: true,
+        choice: false,
     };
-
-    let method = file.request.method.to_ascii_uppercase();
-    if !["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&method.as_str()) {
-        return Err(format!("unsupported `method` `{}`", file.request.method));
-    }
-    let host = url_host(&file.request.url, credential)?;
-    let url = scope.template(&file.request.url, Place::Url)?;
-    let mut headers = Vec::new();
-    for (name, value) in file.request.headers {
-        let name = name
-            .as_str()
-            .ok_or_else(|| "a header name must be text".to_string())?
-            .to_string();
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(format!(
-                "header name `{name}` must be literal letters, digits or `-`"
-            ));
-        }
-        let value = value
-            .as_str()
-            .ok_or_else(|| format!("header `{name}` must be text"))?;
-        headers.push((name, scope.template(value, Place::Header)?));
-    }
-    let json = file.request.json.map(|json| scope.json(json)).transpose()?;
-    if json.is_some() && method == "GET" {
-        return Err("a `GET` request cannot carry a `json` body".to_string());
-    }
+    let request = parse_request(&scope, file.request, credential)?;
 
     let response = file.response;
     let response = match slot {
@@ -497,15 +506,77 @@ pub(super) fn parse_adapter(
         Slot::WebFetch | Slot::Pdf => parse_markdown(response)?,
     };
 
-    Ok(HttpAdapter {
-        request: RequestTemplate {
-            method,
-            host,
-            url,
-            headers,
-            json,
-        },
-        response,
+    Ok(HttpAdapter { request, response })
+}
+
+/// Parse a select option's `from` block: a request that may send only the
+/// provider's credential, to a host that credential lists.
+pub(crate) fn parse_choice_source(
+    slot: Slot,
+    credential: &CredentialDecl,
+    body: serde_yaml::Value,
+) -> Result<ChoiceSource, String> {
+    let file: ChoiceFile =
+        serde_yaml::from_value(body).map_err(|e| format!("`select.from`: {e}"))?;
+    let scope = Scope {
+        slot,
+        options: &[],
+        credential: true,
+        choice: true,
+    };
+    let request = parse_request(&scope, file.request, credential)?;
+    if request.json.is_some() {
+        return Err("a `select.from` request carries no `json` body".to_string());
+    }
+    Ok(ChoiceSource {
+        request,
+        items: parse_path(&file.items)?,
+        value: parse_path(&file.value)?,
+        label: parse_path(&file.label)?,
+    })
+}
+
+fn parse_request(
+    scope: &Scope<'_>,
+    file: RequestFile,
+    credential: &CredentialDecl,
+) -> Result<RequestTemplate, String> {
+    let method = file.method.to_ascii_uppercase();
+    if !["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&method.as_str()) {
+        return Err(format!("unsupported `method` `{}`", file.method));
+    }
+    let host = url_host(&file.url, credential)?;
+    let url = scope.template(&file.url, Place::Url)?;
+    let mut headers = Vec::new();
+    for (name, value) in file.headers {
+        let name = name
+            .as_str()
+            .ok_or_else(|| "a header name must be text".to_string())?
+            .to_string();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "header name `{name}` must be literal letters, digits or `-`"
+            ));
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("header `{name}` must be text"))?;
+        headers.push((name, scope.template(value, Place::Header)?));
+    }
+    let json = file.json.map(|json| scope.json(json)).transpose()?;
+    if json.is_some() && method == "GET" {
+        return Err("a `GET` request cannot carry a `json` body".to_string());
+    }
+    Ok(RequestTemplate {
+        method,
+        host,
+        url,
+        headers,
+        json,
     })
 }
 
@@ -544,6 +615,14 @@ fn option_value(option: &ProviderOption, stored: Option<&serde_yaml::Value>) -> 
                 .and_then(serde_yaml::Value::as_str)
                 .filter(|value| choices.iter().any(|choice| choice.value == *value))
                 .unwrap_or(default)
+                .to_string(),
+        ),
+        // Membership is only knowable over the network, so the stored value is
+        // sent as is; a blank one never reaches here (the slot gates on it).
+        OptionControl::DynamicSelect { .. } => Value::String(
+            stored
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default()
                 .to_string(),
         ),
         OptionControl::Number {
@@ -665,11 +744,33 @@ pub fn prepare(
     adapter: &HttpAdapter,
     inputs: &Inputs<'_>,
 ) -> PreparedRequest {
-    let request = &adapter.request;
-    let resolver = Resolver {
-        options: &provider.options,
-        inputs,
-    };
+    resolve_request(
+        &adapter.request,
+        &Resolver {
+            options: &provider.options,
+            inputs,
+        },
+    )
+}
+
+/// Build a choice request. Its only variable is the credential.
+pub fn prepare_choices(source: &ChoiceSource, credential: &str) -> PreparedRequest {
+    let options = HashMap::new();
+    resolve_request(
+        &source.request,
+        &Resolver {
+            options: &[],
+            inputs: &Inputs {
+                query: None,
+                target: None,
+                credential,
+                options: &options,
+            },
+        },
+    )
+}
+
+fn resolve_request(request: &RequestTemplate, resolver: &Resolver<'_>) -> PreparedRequest {
     PreparedRequest {
         method: request.method.clone(),
         url: resolver.text(&request.url),
@@ -833,6 +934,61 @@ pub fn error_detail(mapping: &JsonMarkdown, body: &str) -> Option<String> {
     let gate = mapping.success.as_ref()?;
     let value: Value = serde_json::from_str(body).ok()?;
     gate_error(&value, gate)
+}
+
+/// The label a choice with no name of its own is shown under.
+const UNNAMED_CHOICE: &str = "Unnamed";
+
+/// Read a choice response's 2xx body into choices sorted by label. An item
+/// whose value is not text (or a number, written as text) is a shape error.
+///
+/// A value is an identifier the operator has no use for, so a label never
+/// falls back to it: a blank label reads [`UNNAMED_CHOICE`], and labels that
+/// repeat are told apart by a numeric suffix (`Acme`, `Acme 2`).
+pub fn map_choices(source: &ChoiceSource, body: &str) -> Result<Vec<Choice>, String> {
+    let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let items = match lookup(&value, &source.items)? {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(format!("{} is not a list", describe(&source.items))),
+    };
+    let text = |item: &Value, path: &[String], index: usize| -> Result<Option<String>, String> {
+        match lookup(item, path)? {
+            None => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.trim().to_string())),
+            Some(Value::Number(number)) => Ok(Some(number.to_string())),
+            Some(_) => Err(format!(
+                "{} of item {} is not text",
+                describe(path),
+                index + 1
+            )),
+        }
+    };
+    let mut choices = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let value = text(item, &source.value, index)?
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("item {} has no {}", index + 1, describe(&source.value)))?;
+        let label = text(item, &source.label, index)?
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| UNNAMED_CHOICE.to_string());
+        choices.push(Choice { value, label });
+    }
+    choices.sort_by(|a, b| {
+        a.label
+            .to_lowercase()
+            .cmp(&b.label.to_lowercase())
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for choice in &mut choices {
+        let count = seen.entry(choice.label.to_lowercase()).or_default();
+        *count += 1;
+        if *count > 1 {
+            choice.label = format!("{} {count}", choice.label);
+        }
+    }
+    Ok(choices)
 }
 
 /// Map a web-search response body into the slot's result list. The error is a

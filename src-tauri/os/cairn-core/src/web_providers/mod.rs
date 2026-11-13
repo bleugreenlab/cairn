@@ -20,7 +20,13 @@
 //! every slot, so an agent reads it as a failed read. A configuration gap
 //! (nothing selected, not installed, no key, not authorized, needs setup) is
 //! `Ok` guidance naming where to fix it.
+//!
+//! An option whose choices come from the provider's credential is filled from
+//! that credential where it can be, at connect and at use ([`choices`]).
+//! [`readiness`] never makes that request: it stays a synchronous read of what
+//! is stored.
 
+pub mod choices;
 mod migrate;
 pub mod oauth;
 
