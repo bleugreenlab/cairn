@@ -4,14 +4,16 @@
 //! The channels it lists are the same per-provider summaries
 //! `cairn://channels` renders ([`super::channels::provider_summaries`]), so the
 //! two never describe a channel differently. An agent reads its own messages;
-//! the desktop operator, through the channels door, reads all of them, and
-//! opening one there is what marks it seen in the app.
+//! the desktop operator, through the channels door, reads all of them. Every
+//! read here is pure: the app marks a message seen with its own write once it
+//! has rendered it (see the `patch {seen}` arm in
+//! `resources/mutations/dispatch/operator.rs`).
 
 use cairn_common::query::QueryParam;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::operator::messages::{self, Message};
-use crate::operator::{SeenVia, Via};
+use crate::operator::Via;
 use crate::orchestrator::Orchestrator;
 use crate::resources::channels::{at_ms, bounded_limit, provider_summaries, PURPOSE_HOW};
 
@@ -141,8 +143,8 @@ async fn operator_view(
     Ok(out)
 }
 
-/// `cairn://operator/messages/{id}`. The operator's read marks it seen in the
-/// app; an agent's never does, and an agent reads only its own.
+/// `cairn://operator/messages/{id}`. A read never marks it seen, the
+/// operator's included; an agent reads only its own.
 pub async fn render_message(orch: &Orchestrator, request: &McpCallbackRequest, id: &str) -> String {
     match message_view(orch, request, id).await {
         Ok(body) | Err(body) => body,
@@ -156,30 +158,14 @@ async fn message_view(
 ) -> Result<String, String> {
     let reader = reader(orch, request).await?;
     let uri = messages::message_uri(id);
-    let Some(mut message) = messages::get(&orch.db.local, id).await? else {
+    let Some(message) = messages::get(&orch.db.local, id).await? else {
         return Err(format!("{uri} names no message to the operator."));
     };
-    match &reader {
-        Reader::Agent { home, .. } if *home != message.sender_home => {
+    if let Reader::Agent { home } = &reader {
+        if *home != message.sender_home {
             return Err(format!(
                 "{uri} is not one of your messages to the operator; read {OPERATOR_URI} for yours."
             ));
-        }
-        Reader::Agent { .. } => {}
-        Reader::Operator => {
-            let now = chrono::Utc::now().timestamp();
-            if let Some(seen) = crate::operator::record_seen(
-                orch,
-                crate::operator::MessageFilter::Ids(vec![message.id.clone()]),
-                SeenVia::App,
-                now,
-            )
-            .await?
-            .into_iter()
-            .next()
-            {
-                message = seen;
-            }
         }
     }
     let now = chrono::Utc::now().timestamp();

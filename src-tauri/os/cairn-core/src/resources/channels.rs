@@ -993,8 +993,9 @@ fn channels_target(target: &str) -> Result<(CairnResource, Vec<QueryParam>), Str
 
 /// The verified desktop operator reading the channels tree (every provider,
 /// every active binding, every conversation's history) or his own messages.
-/// Opening one message here is what marks it seen in the app. The caller has
-/// already checked the desktop operator credential.
+/// A read here writes nothing: the app marks a message seen with its own
+/// [`operator_write`] once it has rendered it. The caller has already checked
+/// the desktop operator credential.
 pub async fn operator_read(orch: &Orchestrator, target: &str) -> Result<String, String> {
     let (resource, params) = channels_target(target)?;
     let request = operator_request("read_batch");

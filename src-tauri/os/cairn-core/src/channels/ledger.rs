@@ -1203,6 +1203,27 @@ pub async fn mark_expired(db: &LocalDb, id: &str, expired_at: i64) -> Result<boo
     .map_err(|error| error.to_string())
 }
 
+/// Expire a row still owed a delivery (`pending`, or `failed` awaiting a
+/// retry) that can never be sent, recording why in `last_error`. Unlike
+/// [`mark_failed`] it spends no attempt and schedules nothing: no sweep picks
+/// the row up again.
+pub async fn expire_undeliverable(
+    db: &LocalDb,
+    id: &str,
+    error: &str,
+    expired_at: i64,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound
+            SET status = 'expired', resolved_at = ?3, last_error = ?2, next_attempt_at = NULL
+          WHERE id = ?1 AND status IN ('pending', 'failed')",
+        params![id.to_string(), error.to_string(), expired_at],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundRecord {
     pub id: String,

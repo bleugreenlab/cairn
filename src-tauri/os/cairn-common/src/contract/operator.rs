@@ -24,15 +24,24 @@ pub(crate) const OPERATOR_MESSAGE_CONTRACT: ResourceContract = ResourceContract 
     kind: ResourceKind::OperatorMessage,
     uri_template: "cairn://operator/messages/{id}",
     name: "Message to the operator",
-    description: "One message to the operator: its sender, channel, content, default, linked headline, state, the delivery row for a phone channel (conversation, attempts, last error, sent and read times), and the reply that answered it. Opening it in the app marks it seen; an agent's read never does. Only the operator answers it, from the app.",
+    description: "One message to the operator: its sender, channel, content, default, linked headline, state, the delivery row for a phone channel (conversation, attempts, last error, sent and read times), and the reply that answered it. Reading it never marks it seen, the operator's read included: the app marks it seen once it has shown it to him. Only the operator answers it, from the app.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Append,
-        required: &[CONTENT],
-        optional: &[],
-        label: "the operator's reply, from the app only",
-        example: "write({changes:[{target:\"cairn://operator/messages/ID\",mode:\"append\",payload:{content:\"...\"}}]})",
-    }],
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[CONTENT],
+            optional: &[],
+            label: "the operator's reply, from the app only",
+            example: "write({changes:[{target:\"cairn://operator/messages/ID\",mode:\"append\",payload:{content:\"...\"}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[OPERATOR_SEEN],
+            optional: &[],
+            label: "mark it seen in the app, by the operator only",
+            example: "write({changes:[{target:\"cairn://operator/messages/ID\",mode:\"patch\",payload:{seen:true}}]})",
+        },
+    ],
 };

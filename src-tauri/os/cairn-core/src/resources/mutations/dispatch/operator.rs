@@ -1,5 +1,5 @@
 //! Writes to `cairn://operator`: an agent sending the operator a message, and
-//! the operator answering one from the app.
+//! the operator answering one, or marking it seen, from the app.
 
 use cairn_db::turso::{params, Value};
 use cairn_uri::{parse_uri, CairnResource};
@@ -9,7 +9,7 @@ use super::append_payload;
 use crate::channels::{agent_message, operator_message, provider_notify_fit};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::operator::messages::{self, HeadlineLink, NewDelivery, NewMessage, MAX_CHARS};
-use crate::operator::{AnsweredVia, Via};
+use crate::operator::{AnsweredVia, MessageFilter, SeenVia, Via};
 use crate::orchestrator::Orchestrator;
 use crate::resources::channels::{check_send_length, provider_summaries};
 use crate::storage::RowExt;
@@ -34,6 +34,16 @@ pub(super) async fn dispatch(
         (CairnResource::OperatorMessage { id }, ChangeMode::Append) => {
             let payload = append_payload(index, item)?;
             answer(orch, request, id, payload, dry_run)
+                .await
+                .map(Some)
+                .map_err(fail)
+        }
+        (CairnResource::OperatorMessage { id }, ChangeMode::Patch) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+            mark_seen(orch, request, id, payload, dry_run)
                 .await
                 .map(Some)
                 .map_err(fail)
@@ -510,6 +520,46 @@ async fn answer(
     ))
 }
 
+/// The operator having seen a message in the app. The app writes this after
+/// it has rendered the message, so the door's read stays a pure read; the
+/// transition and its one passive notice to the sender are `record_seen`'s,
+/// shared with the read receipt and the headline cursor.
+async fn mark_seen(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    id: &str,
+    payload: &serde_json::Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    if !request.is_desktop_operator() {
+        return Err("Refused: only the operator marks a message seen, by opening it in the app; an agent's read never does.".to_string());
+    }
+    if payload.get("seen") != Some(&serde_json::Value::Bool(true)) {
+        return Err(
+            "payload.seen must be true: a message is marked seen, never unseen".to_string(),
+        );
+    }
+    let uri = messages::message_uri(id);
+    if messages::get(&orch.db.local, id).await?.is_none() {
+        return Err(format!("{uri} names no message to the operator"));
+    }
+    if dry_run {
+        return Ok(format!("Would mark {uri} seen in the app."));
+    }
+    let moved = crate::operator::record_seen(
+        orch,
+        MessageFilter::Ids(vec![id.to_string()]),
+        SeenVia::App,
+        chrono::Utc::now().timestamp(),
+    )
+    .await?;
+    Ok(if moved.is_empty() {
+        format!("{uri} was already seen; nothing changed.")
+    } else {
+        format!("Marked {uri} seen in the app.")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dispatch_resource_change;
@@ -517,7 +567,7 @@ mod tests {
     use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
     use crate::operator::{messages, SeenVia, State};
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
-    use crate::services::testing::TestServicesBuilder;
+    use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
     use crate::storage::{LocalDb, SearchIndex};
     use std::sync::Arc;
 
@@ -526,6 +576,12 @@ mod tests {
     /// A project `prj` with threads `general` and `other`, each with a live
     /// run, their stores in a temporary directory, and `SETTINGS`.
     async fn orchestrator(name: &str) -> Orchestrator {
+        orchestrator_capturing(name).await.0
+    }
+
+    /// [`orchestrator`], handing back the emitter it announces through.
+    async fn orchestrator_capturing(name: &str) -> (Orchestrator, Arc<CapturingEmitter>) {
+        let emitter = Arc::new(CapturingEmitter::new());
         let dir = tempfile::tempdir().unwrap().keep();
         let local = LocalDb::open_migrated_for_test(dir.join("t.db"))
             .await
@@ -565,12 +621,17 @@ mod tests {
         )
         .unwrap();
         let search = Arc::new(SearchIndex::open_or_create(dir.join("search")).unwrap());
-        OrchestratorBuilder::new(
+        let orch = OrchestratorBuilder::new(
             Arc::new(DbState::new(Arc::new(local), search)),
-            Arc::new(TestServicesBuilder::new().build()),
+            Arc::new(
+                TestServicesBuilder::new()
+                    .with_emitter(emitter.clone())
+                    .build(),
+            ),
             config_dir,
         )
-        .build()
+        .build();
+        (orch, emitter)
     }
 
     fn request(run_id: Option<&str>) -> McpCallbackRequest {
@@ -980,7 +1041,7 @@ mod tests {
         let opened = crate::channels::read_as_operator(&orch, &uri)
             .await
             .unwrap();
-        assert!(opened.contains("seen in the app"), "{opened}");
+        assert!(opened.contains("- content: Rename?"), "{opened}");
         let answered = crate::channels::write_as_operator(
             &orch,
             &uri,
@@ -1009,6 +1070,98 @@ mod tests {
             Some(format!("[Reply to {uri}] yes, rename it"))
         );
         assert!(entries(&orch).await.iter().all(|entry| !entry.is_open()));
+    }
+
+    /// The operator's read through the door writes nothing: no `seen_at`, no
+    /// notice to the sender, no announcement. The app's `patch {seen:true}`
+    /// after it renders records seen in the app once, with one passive notice;
+    /// a repeat moves nothing, and an agent may not write it.
+    #[tokio::test]
+    async fn the_operator_read_writes_nothing_and_the_seen_write_records_it_once() {
+        let (orch, emitter) = orchestrator_capturing("pure-read").await;
+        let id = sent_id(
+            &send(
+                &orch,
+                Some("r-live"),
+                serde_json::json!({"content": "Rename?", "via": "cairn://channels/app", "default": "I rename Friday"}),
+            )
+            .await
+            .unwrap(),
+        );
+        let uri = messages::message_uri(&id);
+        let notices = || async {
+            orch.db
+                .local
+                .query_opt_i64(
+                    "SELECT COUNT(*) FROM messages WHERE id = ?1",
+                    cairn_db::turso::params![format!(
+                        "reconcile:{}",
+                        messages::seen_notice_key(&id)
+                    )],
+                )
+                .await
+                .unwrap()
+                .unwrap_or_default()
+        };
+        let announced = || emitter.events_named("db-change").len();
+
+        let before = announced();
+        let opened = crate::channels::read_as_operator(&orch, &uri)
+            .await
+            .unwrap();
+        assert!(opened.contains("delivered, not yet seen"), "{opened}");
+        let unread = messages::get(&orch.db.local, &id).await.unwrap().unwrap();
+        assert_eq!((unread.seen_at, unread.seen_via), (None, None));
+        assert_eq!(notices().await, 0);
+        assert_eq!(announced(), before, "a read announces nothing");
+
+        let refused = dispatch_resource_change(
+            &orch,
+            &request(Some("r-live")),
+            0,
+            &ChangeItem {
+                target: uri.clone(),
+                mode: ChangeMode::Patch,
+                payload: Some(serde_json::json!({"seen": true})),
+            },
+            false,
+        )
+        .await
+        .unwrap_err()
+        .error;
+        assert!(
+            refused.contains("only the operator marks a message seen"),
+            "{refused}"
+        );
+        assert_eq!(state_of(&orch, &id).await, State::Delivered);
+
+        let seen = || {
+            crate::channels::write_as_operator(
+                &orch,
+                &uri,
+                "patch",
+                Some(serde_json::json!({"seen": true})),
+            )
+        };
+        let marked = seen().await.unwrap();
+        assert!(marked.starts_with("Marked"), "{marked}");
+        assert!(matches!(
+            state_of(&orch, &id).await,
+            State::Seen {
+                via: Some(SeenVia::App),
+                ..
+            }
+        ));
+        assert_eq!(notices().await, 1);
+        assert!(emitter
+            .events_named("db-change")
+            .iter()
+            .skip(before)
+            .any(|event| event["table"] == "operator_messages"));
+
+        let again = seen().await.unwrap();
+        assert!(again.contains("already seen"), "{again}");
+        assert_eq!(notices().await, 1, "one notice, however often it is opened");
     }
 
     #[tokio::test]

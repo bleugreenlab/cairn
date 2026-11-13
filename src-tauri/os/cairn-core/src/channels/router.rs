@@ -1794,15 +1794,33 @@ impl ChannelRouter {
     /// the ordinary outbound path, so its claim, retry backoff, `last_error`,
     /// and attempt cap are the same as every other intent's. Reports whether it
     /// went on the wire.
+    ///
+    /// A message to the operator whose `operator_messages` row is gone is
+    /// expired, never sent: its sender is known only through that row, and
+    /// without it the text would reach his phone under the bare `[Cairn]`
+    /// header, an agent's words in Cairn's name.
     async fn deliver_agent_message(&self, record: ledger::OutboundRecord) -> Result<bool, String> {
         let (kind, sender_home) = if record.kind == operator_message::KIND {
-            let sender = match operator_message::message_id(&record.binding_ref) {
-                Some(id) => crate::operator::messages::get(&self.orch.db.local, id)
-                    .await?
-                    .map(|message| message.sender_home),
+            let message = match operator_message::message_id(&record.binding_ref) {
+                Some(id) => crate::operator::messages::get(&self.orch.db.local, id).await?,
                 None => None,
             };
-            (operator_message::KIND, sender)
+            let Some(message) = message else {
+                let error = format!(
+                    "the message to the operator this row delivers ({}) no longer exists, so it has no sender to attribute; expired unsent",
+                    record.binding_ref
+                );
+                ledger::expire_undeliverable(
+                    self.ledger(),
+                    &record.id,
+                    &error,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                log::warn!("channel operator message {}: {error}", record.id);
+                return Ok(false);
+            };
+            (operator_message::KIND, Some(message.sender_home))
         } else {
             (
                 agent_message::KIND,
@@ -10133,6 +10151,50 @@ mod tests {
                 crate::operator::State::Answered { .. }
             ));
         }
+    }
+
+    /// An operator row whose message is gone is expired with a named error on
+    /// the hand-off and on the sweep alike, and never reaches the provider.
+    #[tokio::test]
+    async fn an_operator_row_whose_message_is_gone_expires_unsent() {
+        let (orch, db) = route_test_orchestrator("operator-orphan.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let provider = Arc::new(RecordingPollProvider::new());
+        let router = agent_message_router(orch, provider.clone(), "imessage");
+        for id in ["m-handoff", "m-sweep"] {
+            operator_message_row(&db, id, "cairn://p/cairn/general", &session).await;
+        }
+        db.execute_batch("DELETE FROM operator_messages")
+            .await
+            .unwrap();
+
+        router.submit_agent_message("m-handoff").await.unwrap();
+        router.deliver_pending_agent_messages().await.unwrap();
+
+        assert!(provider.sends.lock().unwrap().is_empty());
+        assert!(provider.deliveries.lock().unwrap().is_empty());
+        for id in ["m-handoff", "m-sweep"] {
+            let row = ledger::get_by_id(&db, id).await.unwrap().unwrap();
+            assert_eq!((row.status.as_str(), row.attempts), ("expired", 0), "{id}");
+            assert!(
+                row.last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("no longer exists")
+                        && error.contains(&format!("operator:{id}"))),
+                "{id}: {:?}",
+                row.last_error
+            );
+        }
+        assert!(ledger::list_due_deliveries(
+            &db,
+            "imessage",
+            operator_message::KIND,
+            i64::MAX,
+            MAX_ATTEMPTS
+        )
+        .await
+        .unwrap()
+        .is_empty());
     }
 
     /// A message to the operator asks nothing, so it never stands as the active

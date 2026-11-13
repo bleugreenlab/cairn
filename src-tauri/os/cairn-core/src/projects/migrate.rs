@@ -395,7 +395,11 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("events", "run_id IN (SELECT id FROM runs WHERE project_id = ?1)"),
     spec("prompts", "run_id IN (SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))"),
     spec("permission_requests", "run_id IN (SELECT id FROM runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))"),
-    owned("channel_outbound", &[owner(OwnerSet::Jobs, "job_id IN {ids}")]),
+    // Messages to the operator before their delivery rows, which this sweep
+    // reaches in reverse: a row of kind `operator` belongs to the project its
+    // message does, whichever job sent it.
+    delete_only("operator_messages", "project_id = ?1"),
+    owned("channel_outbound", &[owner(OwnerSet::Jobs, "job_id IN {ids}"), direct("binding_ref IN (SELECT 'operator:' || id FROM operator_messages WHERE project_id = ?1)")]),
     // Terminal ask rows whose prompt has already been pruned are intentionally
     // unreachable here. They are inert; live ask rows retain either their
     // prompt or permission request and are swept through that owner.
@@ -473,7 +477,6 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     delete_only("pack_catalog", "project_id = ?1"),
     delete_only("pack_catalog_references", "project_id = ?1"),
     delete_only("posts", "project_id = ?1"),
-    delete_only("operator_messages", "project_id = ?1"),
     delete_only("camp_read_cursors", "camp_id IN (SELECT id FROM camps WHERE project_id = ?1)"),
     delete_only("post_comments", "post_id IN (SELECT id FROM posts WHERE project_id = ?1)"),
     delete_only("landing_allocations", "project_id = ?1"),
@@ -1864,6 +1867,62 @@ pub(super) mod tests {
         let reconciler = DiscordSurfaceReconciler::new(db, api.clone());
         assert_eq!(reconciler.reconcile_due(2).await.unwrap(), 0);
         assert_eq!(api.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A pending delivery row of a message to the operator goes with its
+    /// project even when the job named on it is not the project's, so no row
+    /// outlives its message to be sent unattributed. Another project's row
+    /// stays.
+    #[tokio::test]
+    async fn routed_delete_sweeps_operator_delivery_rows_by_their_message() {
+        let db =
+            Arc::new(migrated_db("project-delete-operator.db", TURSO_MIGRATIONS.to_vec()).await);
+        seed_complete_project_graph(&db).await;
+        db.execute_batch(
+            r#"
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES ('project-kept', 'ws-delete', 'Kept', 'KEPT', '/tmp/kept', 1, 1);
+            INSERT INTO operator_messages(id, project_id, sender_home, sender_job_id, via, content, created_at)
+              VALUES ('m-delete', 'project-delete', 'cairn://p/delete/thread', 'job-elsewhere', 'imessage', 'Ship it?', 1),
+                     ('m-kept', 'project-kept', 'cairn://p/kept/thread', 'job-elsewhere', 'imessage', 'Ship it?', 1);
+            INSERT INTO channel_outbound(id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at)
+              VALUES ('m-delete', 'imessage', 'operator', 'operator:m-delete', 'operator', 'job-elsewhere', 'Ship it?', 'text', 'pending', 1),
+                     ('m-kept', 'imessage', 'operator', 'operator:m-kept', 'operator', 'job-elsewhere', 'Ship it?', 'text', 'pending', 1);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let search = Arc::new(SearchIndex::open_or_create(tempdir().unwrap().keep()).unwrap());
+        let dbs = DbState::new(db.clone(), search);
+        crate::projects::crud::delete_routed(&dbs, "project-delete")
+            .await
+            .unwrap();
+
+        let remaining = |table: &'static str| {
+            let db = db.clone();
+            async move {
+                db.query_all(format!("SELECT id FROM {table} ORDER BY id"), (), |row| {
+                    row.text(0)
+                })
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            remaining("operator_messages").await,
+            vec!["m-kept".to_string()]
+        );
+        assert_eq!(
+            db.query_all(
+                "SELECT id FROM channel_outbound WHERE kind = 'operator' ORDER BY id",
+                (),
+                |row| row.text(0)
+            )
+            .await
+            .unwrap(),
+            vec!["m-kept".to_string()]
+        );
     }
 
     #[tokio::test]

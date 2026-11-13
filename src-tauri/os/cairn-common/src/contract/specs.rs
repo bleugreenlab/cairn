@@ -51,6 +51,11 @@ pub(crate) const OPERATOR_HEADLINE: KeySpec = KeySpec::new(
     KeyType::Any,
     "your thread's headline row URI (cairn://p/{project}/{thread}/db/headlines/{id}), or {line, ref, until} to write one (counts against the 10 live)",
 );
+pub(crate) const OPERATOR_SEEN: KeySpec = KeySpec::new(
+    "seen",
+    KeyType::Bool,
+    "true; a message is marked seen, never unseen",
+);
 pub(crate) const CHANNEL_MESSAGE_CONTENT: KeySpec = KeySpec::new(
     "content",
     KeyType::Str,
