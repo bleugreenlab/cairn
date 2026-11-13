@@ -292,6 +292,7 @@ pub(crate) fn declared_check_reservation(
         source: ResourceReservationSource::Declared,
         measured_peak_bytes: None,
         test_phase: None,
+        build_job_memory: None,
     }
 }
 

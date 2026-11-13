@@ -8255,6 +8255,17 @@ pub struct LearnedResourceEstimate {
 /// without one. An older runner reads the wider sum as the same field and
 /// subtracts it as before, so its placement pre-filter only becomes more
 /// accurate, and it ignores `totalBytes`.
+///
+/// cairn/5685 does not move the number. `CellExecutionMeta` and
+/// `ProcessBatchItemOutcome` gain an optional `buildJobProcesses`,
+/// `ResourceReservation` an optional `buildJobMemory`,
+/// and `MemoryJobBound` a `reserve` defaulted to `assumed`; each is defaulted
+/// and the two options skipped when absent. No frame changes shape. What a
+/// runner gets wrong talking to an older executor: nothing; that executor
+/// ignores the learned figure and sizes build jobs at its assumed reserve, its
+/// bound reads back as assumed, which it was, and it reports no census, so
+/// the runner learns nothing from it. An older runner ignores the census and
+/// the reserve's source and sends no learned figure.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10395,6 +10406,24 @@ pub struct ResourceReservation {
     /// demand fails closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_phase: Option<TestPhaseEvidence>,
+    /// What one build job of this work has been measured to hold on this
+    /// machine, which sizes the build jobs the executor grants it at spawn.
+    /// `None` until a run here measured enough job processes: the executor
+    /// then assumes a fixed reserve per job and says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_job_memory: Option<BuildJobMemoryEvidence>,
+}
+
+/// What a suite's build jobs have been measured to hold in one machine
+/// context: rise-only high-water marks of [`BuildJobProcesses`] over the runs
+/// that measured enough job processes to say.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildJobMemoryEvidence {
+    pub largest_bytes: u64,
+    pub typical_bytes: u64,
+    /// The runs that taught these figures.
+    pub samples: u32,
 }
 
 /// A suite's test phase as measured on one machine: rise-only high-water
@@ -10430,6 +10459,7 @@ impl Default for ResourceReservation {
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         }
     }
 }
@@ -11494,6 +11524,76 @@ pub struct CellExecutionMeta {
     /// [`TestPhaseMeasurement`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_phase: Option<TestPhaseMeasurement>,
+    /// The processes of the command's tree that did a build job's work. See
+    /// [`BuildJobProcesses`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_job_processes: Option<BuildJobProcesses>,
+}
+
+/// The processes of a command's tree that did a build job's work, each taken
+/// at the largest any census read it: every member that grew past
+/// [`Self::FLOOR_BYTES`], which in a compile is its rustc processes and in a
+/// test phase its test binaries, and leaves out the shells, wrappers and
+/// short helpers around them. The driver (cargo, nextest) is one such process
+/// among many and moves the upper median by at most one place.
+///
+/// What one build job needs, measured per process. A tree's peak divided by
+/// the jobs it ran is not that: a workspace compile's peak is its largest
+/// crate plus whatever ran beside it, so at one job it is the largest crate
+/// alone, and sizing the next run by it holds the command at one job for
+/// good. Each process's own peak does not depend on how many ran at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildJobProcesses {
+    pub processes: u32,
+    /// The largest job process: the one a machine holds whatever the width.
+    pub largest_bytes: u64,
+    /// The upper median of the job processes: what each further job holds.
+    pub typical_bytes: u64,
+}
+
+impl BuildJobProcesses {
+    /// The size below which a process is not counted as a build job.
+    pub const FLOOR_BYTES: u64 = 128 << 20;
+
+    /// The fewest job processes whose median speaks for a typical job. A run
+    /// that rebuilt a handful of crates, as a warm compile of the crates under
+    /// change does, measured those crates rather than the work's typical one.
+    pub const TYPICAL_FROM_PROCESSES: u32 = 8;
+
+    /// The census of a tree whose members peaked at `peaks`, or `None` when
+    /// none reached the floor.
+    pub fn from_peaks(mut peaks: Vec<u64>) -> Option<Self> {
+        peaks.retain(|bytes| *bytes >= Self::FLOOR_BYTES);
+        peaks.sort_unstable();
+        let largest_bytes = *peaks.last()?;
+        Some(Self {
+            processes: u32::try_from(peaks.len()).unwrap_or(u32::MAX),
+            largest_bytes,
+            typical_bytes: peaks[peaks.len() / 2],
+        })
+    }
+
+    /// Whether this census ran enough job processes for its median to be
+    /// learned as a typical job.
+    pub fn speaks_for_a_typical_job(&self) -> bool {
+        self.processes >= Self::TYPICAL_FROM_PROCESSES
+    }
+
+    /// One census for two sets of processes, as a batch's items are read
+    /// together: their counts summed and the larger of each figure. The
+    /// median of a union lies between its parts' medians, so the larger one
+    /// is never below it.
+    pub fn combine(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(Self {
+                processes: left.processes.saturating_add(right.processes),
+                largest_bytes: left.largest_bytes.max(right.largest_bytes),
+                typical_bytes: left.typical_bytes.max(right.typical_bytes),
+            }),
+            (one, other) => one.or(other),
+        }
+    }
 }
 
 /// The test phase of a command as its executor measured it: the largest its
@@ -11589,16 +11689,41 @@ pub struct BuildJobs {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryJobBound {
-    /// Available memory over the per-job reserve, split evenly across the
-    /// commands sharing it, never below one.
+    /// The jobs the command's share of the available memory holds, never
+    /// below one. See [`JobMemoryReserve`] for how.
     pub jobs: u32,
     pub available_bytes: u64,
     pub measured_at_unix_ms: u64,
-    /// What one job is assumed to need.
+    /// What each job is reserved: the assumed figure, or the learned typical
+    /// job, beyond the learned largest one.
     pub per_job_reserve_bytes: u64,
     /// Compile-class commands (and concurrent items of one batch) sharing that
     /// memory, this one included.
     pub sharers: u32,
+    /// Where the reserve came from. A record from before it was kept reads as
+    /// assumed, which every such record was.
+    #[serde(default)]
+    pub reserve: JobMemoryReserve,
+}
+
+/// Where a command's per-job memory reserve came from.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JobMemoryReserve {
+    /// Nothing about this work's build jobs was learned on this machine: each
+    /// job is assumed to need `per_job_reserve_bytes`, and the jobs are the
+    /// available memory over it.
+    #[default]
+    Assumed,
+    /// Learned from this work's own job processes on this machine
+    /// ([`BuildJobMemoryEvidence`]): the largest job is held first, at
+    /// `largest_bytes`, and each further job at the typical one
+    /// (`per_job_reserve_bytes`).
+    Learned { largest_bytes: u64, samples: u32 },
 }
 
 impl MemoryJobBound {
@@ -11624,6 +11749,80 @@ impl MemoryJobBound {
             measured_at_unix_ms,
             per_job_reserve_bytes,
             sharers,
+            reserve: JobMemoryReserve::Assumed,
+        }
+    }
+
+    /// The jobs the command's share of the available memory holds at its
+    /// learned job sizes: its largest job, then as many typical ones as fit
+    /// beside it, `1 + (share - largest) / typical`.
+    ///
+    /// The jobs a past run used do not enter: both figures are single
+    /// processes' peaks, so a run held to one job teaches the same sizes as
+    /// one run wide, and its own narrowness cannot hold the next run narrow.
+    pub fn learned(
+        available_bytes: u64,
+        measured_at_unix_ms: u64,
+        evidence: BuildJobMemoryEvidence,
+        sharers: u32,
+    ) -> Self {
+        let sharers = sharers.max(1);
+        let share = available_bytes / u64::from(sharers);
+        let further = share.saturating_sub(evidence.largest_bytes) / evidence.typical_bytes.max(1);
+        let jobs = u32::try_from(further).unwrap_or(u32::MAX).saturating_add(1);
+        Self {
+            jobs,
+            available_bytes,
+            measured_at_unix_ms,
+            per_job_reserve_bytes: evidence.typical_bytes,
+            sharers,
+            reserve: JobMemoryReserve::Learned {
+                largest_bytes: evidence.largest_bytes,
+                samples: evidence.samples,
+            },
+        }
+    }
+
+    /// The same reading and reserve, shared by `sharers` commands.
+    fn shared_among(self, sharers: u32) -> Self {
+        match self.reserve {
+            JobMemoryReserve::Assumed => Self::new(
+                self.available_bytes,
+                self.measured_at_unix_ms,
+                self.per_job_reserve_bytes,
+                sharers,
+            ),
+            JobMemoryReserve::Learned {
+                largest_bytes,
+                samples,
+            } => Self::learned(
+                self.available_bytes,
+                self.measured_at_unix_ms,
+                BuildJobMemoryEvidence {
+                    largest_bytes,
+                    typical_bytes: self.per_job_reserve_bytes,
+                    samples,
+                },
+                sharers,
+            ),
+        }
+    }
+
+    /// How the reserve divided the memory, as the memory-bound sentence ends.
+    fn describe_reserve(&self) -> String {
+        let per_job = human_bytes(self.per_job_reserve_bytes);
+        match self.reserve {
+            JobMemoryReserve::Assumed => {
+                format!("{per_job} per job (assumed: no build job of this work measured here)")
+            }
+            JobMemoryReserve::Learned {
+                largest_bytes,
+                samples,
+            } => format!(
+                "{} for the largest job and {per_job} per further job, learned from {samples} run{} here",
+                human_bytes(largest_bytes),
+                if samples == 1 { "" } else { "s" }
+            ),
         }
     }
 }
@@ -11644,14 +11843,8 @@ impl BuildJobs {
         let items = items.max(1);
         Self::new(
             self.cpu_width / items,
-            self.memory.map(|memory| {
-                MemoryJobBound::new(
-                    memory.available_bytes,
-                    memory.measured_at_unix_ms,
-                    memory.per_job_reserve_bytes,
-                    memory.sharers.saturating_mul(items),
-                )
-            }),
+            self.memory
+                .map(|memory| memory.shared_among(memory.sharers.saturating_mul(items))),
         )
     }
 
@@ -11672,11 +11865,11 @@ impl BuildJobs {
                     String::new()
                 };
                 format!(
-                    "{} build jobs, held below the CPU width of {} by memory: {} available at start / {} per job{split}",
+                    "{} build jobs, held below the CPU width of {} by memory: {} available at start / {}{split}",
                     self.jobs,
                     self.cpu_width,
                     human_bytes(memory.available_bytes),
-                    human_bytes(memory.per_job_reserve_bytes),
+                    memory.describe_reserve(),
                 )
             }
             Some(memory) => format!(
@@ -11852,6 +12045,7 @@ impl CellExecutionMeta {
         meta.duration_ms = Some(item.duration_ms);
         meta.peak_rss_bytes = item.peak_rss_bytes;
         meta.peak_process = item.peak_process.clone();
+        meta.build_job_processes = item.build_job_processes;
         meta.disk_delta_bytes = item.disk_delta_bytes;
         meta.environment_fingerprint = item.environment_fingerprint.clone();
         meta.cpu = item.cpu;
@@ -12880,6 +13074,7 @@ impl ResidencyFootprint {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         }
     }
 }
@@ -13357,6 +13552,7 @@ impl CellOccupancy {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         for (key, process) in self.live_processes() {
             let fallback = ResourceReservation::default();
@@ -22885,6 +23081,8 @@ pub struct ProcessBatchItemOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_process: Option<PeakProcess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_job_processes: Option<BuildJobProcesses>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuTime>,
     /// The width this item was told to use. Items running concurrently in one
     /// batch share the command's width, so an item's grant can be smaller.
@@ -24261,6 +24459,117 @@ mod tests {
         assert_eq!(unread.delivered_units_millis, None);
     }
 
+    /// A cairn workspace compile run at one job on a 12 GiB machine: cargo,
+    /// a few build scripts, forty crates at 0.4-1.6 GiB, and cairn_core at
+    /// 8.2 GiB, each at the largest a census read it.
+    fn single_crate_dominated_compile() -> Vec<u64> {
+        const MIB: u64 = 1 << 20;
+        let mut peaks = vec![300 * MIB, 20 * MIB, 40 * MIB, 90 * MIB, 8_400 * MIB];
+        peaks.extend((0..40).map(|crate_index| 400 * MIB + crate_index * 30 * MIB));
+        peaks
+    }
+
+    #[test]
+    fn a_learned_reserve_is_not_narrowed_by_its_own_narrow_run() {
+        const GIB: u64 = 1 << 30;
+        let census = BuildJobProcesses::from_peaks(single_crate_dominated_compile()).unwrap();
+        // The shells under the floor are not jobs; cargo is one among many.
+        assert_eq!(census.processes, 42);
+        assert_eq!(census.largest_bytes, 8_400 << 20);
+        assert!(census.speaks_for_a_typical_job());
+        assert!(census.typical_bytes < GIB, "{}", census.typical_bytes);
+
+        // The ratio this replaces: the run's tree peak over the one job it
+        // ran is the largest crate, which holds the next run at one job.
+        let available = 21 * GIB / 2;
+        let tree_peak_per_job = census.largest_bytes + GIB / 2;
+        assert_eq!(
+            MemoryJobBound::new(available, 1, tree_peak_per_job, 1).jobs,
+            1
+        );
+
+        // The learned reserve holds cairn_core first and fits typical crates
+        // beside it: more than one job, from a run that used one.
+        let evidence = BuildJobMemoryEvidence {
+            largest_bytes: census.largest_bytes,
+            typical_bytes: census.typical_bytes,
+            samples: 1,
+        };
+        let learned = MemoryJobBound::learned(available, 1, evidence, 1);
+        assert_eq!(learned.jobs, 3);
+        assert_eq!(
+            learned.reserve,
+            JobMemoryReserve::Learned {
+                largest_bytes: 8_400 << 20,
+                samples: 1
+            }
+        );
+        assert_eq!(learned.per_job_reserve_bytes, census.typical_bytes);
+        // Under the 2.5 GiB assumption the same machine would run four, and
+        // four rustc beside an 8.2 GiB cairn_core do not fit 10.5 GiB.
+        assert_eq!(MemoryJobBound::new(available, 1, 5 * GIB / 2, 1).jobs, 4);
+
+        // Where memory is ample the learned figures give the width back.
+        let ample = MemoryJobBound::learned(40 * GIB, 1, evidence, 1);
+        assert!(ample.jobs > 32, "{}", ample.jobs);
+        // A share below the largest job is still one job, never zero.
+        assert_eq!(MemoryJobBound::learned(4 * GIB, 1, evidence, 1).jobs, 1);
+        // Sharers split the memory before the largest job is held.
+        let shared = BuildJobs::new(8, Some(learned)).shared_by(2);
+        assert_eq!(shared.memory.unwrap().jobs, 1);
+        assert_eq!(shared.memory.unwrap().reserve, learned.reserve);
+
+        let held = BuildJobs::new(8, Some(learned));
+        assert_eq!(
+            held.describe(),
+            "3 build jobs, held below the CPU width of 8 by memory: 10.5 GiB available at start / 8.2 GiB for the largest job and 1000 MiB per further job, learned from 1 run here"
+        );
+        let wire: BuildJobs = serde_json::from_value(serde_json::to_value(held).unwrap()).unwrap();
+        assert_eq!(wire, held);
+    }
+
+    #[test]
+    fn a_bound_recorded_before_its_source_reads_as_assumed() {
+        let old = serde_json::json!({
+            "jobs": 4,
+            "availableBytes": 12_u64 << 30,
+            "measuredAtUnixMs": 1,
+            "perJobReserveBytes": 5_u64 << 29,
+            "sharers": 1
+        });
+        let bound: MemoryJobBound = serde_json::from_value(old).unwrap();
+        assert_eq!(bound.reserve, JobMemoryReserve::Assumed);
+    }
+
+    #[test]
+    fn a_census_counts_the_processes_that_did_a_jobs_work() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(
+            BuildJobProcesses::from_peaks(vec![10 * MIB, 64 * MIB]),
+            None
+        );
+        let few = BuildJobProcesses::from_peaks(vec![200 * MIB, 3_000 * MIB, 900 * MIB]).unwrap();
+        assert_eq!(
+            few,
+            BuildJobProcesses {
+                processes: 3,
+                largest_bytes: 3_000 * MIB,
+                typical_bytes: 900 * MIB,
+            }
+        );
+        assert!(!few.speaks_for_a_typical_job());
+        let batch = BuildJobProcesses::combine(
+            Some(few),
+            BuildJobProcesses::from_peaks(vec![1_200 * MIB; 6]),
+        )
+        .unwrap();
+        assert_eq!(
+            (batch.processes, batch.largest_bytes, batch.typical_bytes),
+            (9, 3_000 * MIB, 1_200 * MIB)
+        );
+        assert_eq!(BuildJobProcesses::combine(None, Some(few)), Some(few));
+    }
+
     #[test]
     fn build_jobs_name_the_bound_that_set_them() {
         const GIB: u64 = 1 << 30;
@@ -24268,7 +24577,7 @@ mod tests {
         assert_eq!(held.jobs, 4);
         assert_eq!(
             held.describe(),
-            "4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job"
+            "4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job (assumed: no build job of this work measured here)"
         );
         let shared = held.shared_by(2);
         assert_eq!((shared.cpu_width, shared.jobs), (4, 2));
@@ -25020,6 +25329,7 @@ mod tests {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         let process = |status: ResidentProcessStatus| ResidentProcess {
             generation: 1,
@@ -25443,6 +25753,7 @@ mod tests {
                     source: ResourceReservationSource::Learned,
                     measured_peak_bytes: None,
                     test_phase: None,
+                    build_job_memory: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -25545,6 +25856,7 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             learned_estimate: None,
             scratch_sync: None,
@@ -26082,6 +26394,7 @@ mod tests {
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             }),
             live_usage: None,
             charge: None,
@@ -26299,6 +26612,7 @@ mod tests {
             source: ResourceReservationSource::Learned,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         let learned_estimate = LearnedResourceEstimate {
             sample_count: 5,
@@ -27204,6 +27518,7 @@ mod tests {
                         stop: None,
                         cell_origin: None,
                         test_phase: None,
+                        build_job_processes: None,
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -29415,6 +29730,7 @@ mod tests {
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),

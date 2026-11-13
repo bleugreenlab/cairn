@@ -20998,6 +20998,7 @@ cairn-common = { path = "../cairn-common" }
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             },
             mutation_delta: Some(Box::new(cairn_common::executor_protocol::MutationDelta {
                 base_commit: "base".to_string(),
@@ -22698,6 +22699,7 @@ cairn-common = { path = "../cairn-common" }
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             }
         };
         assert_eq!(
@@ -22751,6 +22753,7 @@ cairn-common = { path = "../cairn-common" }
             stop: None,
             cell_origin: None,
             test_phase: None,
+            build_job_processes: None,
         };
         let results = run_planned_checks(
             db.clone(),
@@ -23605,6 +23608,7 @@ cairn-common = { path = "../cairn-common" }
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             }),
             publication: None,
         })
@@ -30420,6 +30424,7 @@ mod write_check_stack_headroom {
             stop: None,
             build_jobs: None,
             unrecorded_cache_checkpoint: None,
+            build_job_processes: None,
         };
         CellOutcome::Completed {
             request_id: request.request_id.clone(),
@@ -30455,6 +30460,7 @@ mod write_check_stack_headroom {
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),

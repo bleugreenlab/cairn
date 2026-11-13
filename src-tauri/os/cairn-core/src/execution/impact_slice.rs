@@ -524,6 +524,7 @@ fn runner_account(started_at: u64, duration_ms: u64) -> CellExecutionMeta {
         containment: None,
         stop: None,
         test_phase: None,
+        build_job_processes: None,
     }
 }
 

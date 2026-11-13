@@ -242,6 +242,7 @@ mod tests {
             verdict_environment_hash: None,
             stop: None,
             unrecorded_cache_checkpoint: None,
+            build_job_processes: None,
         }
     }
 

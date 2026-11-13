@@ -12491,6 +12491,7 @@ mod tests {
                     source: ResourceReservationSource::Learned,
                     measured_peak_bytes: None,
                     test_phase: None,
+                    build_job_memory: None,
                 },
                 reservation_rationale: ReservationRationale {
                     declared_concurrency_units: Some(1),
@@ -13283,7 +13284,7 @@ mod running_now_tests {
         let rendered = render_running_now(&running(Some(held)), None, 60_000);
         assert!(
             rendered.contains(
-                "usage not measured yet; 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job\n"
+                "usage not measured yet; 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job (assumed: no build job of this work measured here)\n"
             ),
             "{rendered}"
         );

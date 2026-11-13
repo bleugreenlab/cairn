@@ -483,6 +483,7 @@ mod tests {
             stop: None,
             build_jobs: None,
             unrecorded_cache_checkpoint: None,
+            build_job_processes: None,
         };
 
         let encoded = serde_json::to_string(&vec![wire]).unwrap();

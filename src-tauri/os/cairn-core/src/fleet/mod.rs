@@ -18410,6 +18410,7 @@ mod process_fit_tests {
             unattributed: None,
             unmeasured_compile: false,
             test_phase: None,
+            build_job_memory: None,
         };
         match judge_process_evidence(
             &evidence,
@@ -18527,6 +18528,7 @@ mod process_fit_tests {
             }),
             unmeasured_compile: false,
             test_phase: None,
+            build_job_memory: None,
         };
         let budget = Some(24 * GIB / 100 * 85);
         for kernel_kills in [false, true] {
@@ -18560,6 +18562,7 @@ mod process_fit_tests {
             unattributed: None,
             unmeasured_compile: false,
             test_phase: None,
+            build_job_memory: None,
         };
         let judge = |kernel_kills| {
             judge_process_evidence(
@@ -18600,6 +18603,7 @@ mod process_fit_tests {
             }),
             unmeasured_compile: false,
             test_phase: None,
+            build_job_memory: None,
         };
         assert_eq!(
             judge_process_evidence(&evidence, 13 * GIB, Some(GIB), None, "m-device:m", true),
@@ -21313,8 +21317,15 @@ impl ReservationPlan {
             // prediction still comes from this machine's own history, because a
             // submitter that knows its own memory demand still knows nothing
             // about how fast any particular host is.
+            //
+            // Whether one process fits is the machine's size, which no
+            // caller's statement changes; nor is what this work's build jobs
+            // measured here, which sizes the jobs the executor grants.
+            let process_evidence = self.process_evidence(&context).await;
+            let mut reservation = self.stated.clone();
+            reservation.build_job_memory = process_evidence.build_job_memory;
             return resource_profiles::ResolvedResourceProfile {
-                reservation: self.stated.clone(),
+                reservation,
                 learned_estimate: request.learned_estimate.clone(),
                 rationale: resource_profiles::declared_rationale(&context, self.stated.clone()),
                 duration: self.predict_duration(&context, duration_context).await,
@@ -21322,9 +21333,7 @@ impl ReservationPlan {
                 // A stated reservation is the caller's own number, not a
                 // measurement this machine's cap could be hiding.
                 memory_fit: resource_profiles::MemoryFit::Unknown,
-                // Whether one process fits is the machine's size, which no
-                // caller's statement changes.
-                process_evidence: self.process_evidence(&context).await,
+                process_evidence,
             };
         }
         // Whether the caller declared concurrency is decided here, before the
@@ -25056,6 +25065,7 @@ mod tests {
                 containment: None,
                 stop: None,
                 test_phase: None,
+                build_job_processes: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -26248,6 +26258,7 @@ mod tests {
             source: ResourceReservationSource::Declared,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         let resolved = ReservationPlan::new(db.clone(), &request, None)
             .resolve_for(
@@ -33659,6 +33670,7 @@ mod tests {
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -34734,6 +34746,7 @@ mod tests {
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -34792,6 +34805,7 @@ mod tests {
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -34926,6 +34940,7 @@ mod tests {
                 source: ResourceReservationSource::Learned,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
@@ -36662,6 +36677,7 @@ mod tests {
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
         });
         let mut second = fleet_entry("second", "linux", 0, &[]).1;
@@ -36674,6 +36690,7 @@ mod tests {
                 source: ResourceReservationSource::Declared,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
         });
         pool.lock_connections()
@@ -43366,6 +43383,7 @@ mod tests {
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -44008,6 +44026,7 @@ mod tests {
                 stop: None,
                 cell_origin: None,
                 test_phase: None,
+                build_job_processes: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -44158,6 +44177,7 @@ mod tests {
                 stop: None,
                 build_jobs: None,
                 unrecorded_cache_checkpoint: None,
+                build_job_processes: None,
             }])
             .unwrap();
         }
@@ -44357,6 +44377,7 @@ mod tests {
             stop,
             build_jobs: None,
             unrecorded_cache_checkpoint: None,
+            build_job_processes: None,
         };
         let silent = CommandStop::Silent {
             quiet_ms: 30 * 60 * 1_000,
@@ -44487,6 +44508,7 @@ mod tests {
                         stop,
                         build_jobs: None,
                         unrecorded_cache_checkpoint: None,
+                        build_job_processes: None,
                     }
                 };
             let killed = || {

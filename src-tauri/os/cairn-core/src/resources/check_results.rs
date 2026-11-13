@@ -2156,7 +2156,7 @@ mod tests {
         let body = render(&observation);
         assert!(
             body.contains(
-                "- Build jobs: 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job\n"
+                "- Build jobs: 4 build jobs, held below the CPU width of 8 by memory: 12.0 GiB available at start / 2.5 GiB per job (assumed: no build job of this work measured here)\n"
             ),
             "{body}"
         );

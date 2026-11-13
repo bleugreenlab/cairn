@@ -1,12 +1,13 @@
 use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
-    CellCommandClass, CellExecutionMeta, CommandResourceIdentity, CommandStop, ContentionEstimate,
-    ContentionEvidence, ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence,
-    DurationFallback, ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities,
-    MeasurementQuality, MemoryCeiling, MemoryKill, ProcessDemandBasis, ReservationFallback,
-    ReservationRationale, TestPhaseEvidence, TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS,
-    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    BuildJobMemoryEvidence, BuildJobProcesses, CellCommandClass, CellExecutionMeta,
+    CommandResourceIdentity, CommandStop, ContentionEstimate, ContentionEvidence,
+    ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence, DurationFallback,
+    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
+    MemoryKill, ProcessDemandBasis, ReservationFallback, ReservationRationale, TestPhaseEvidence,
+    TestPhaseMeasurement, DURATION_PROFILE_STALE_AFTER_MS, DURATION_SAMPLE_WINDOW,
+    MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
@@ -375,6 +376,7 @@ impl ResolvedResourceProfile {
         self.reservation.measured_peak_bytes =
             measured_peak_bytes(self.reservation.measured_peak_bytes, &self.process_evidence);
         self.reservation.test_phase = self.process_evidence.test_phase;
+        self.reservation.build_job_memory = self.process_evidence.build_job_memory;
     }
 }
 
@@ -598,14 +600,27 @@ pub(super) struct ProcessEvidence {
     /// nowhere else: a test phase measured elsewhere ran at another width on
     /// another volume, and an unmeasured one keeps the whole-suite charge.
     pub test_phase: Option<TestPhaseEvidence>,
+    /// What the suite's build jobs hold in this very machine context, which
+    /// sizes the jobs the executor grants. Kept to this context for the same
+    /// reason as the test phase; an unmeasured one leaves the executor on its
+    /// assumed reserve.
+    pub build_job_memory: Option<BuildJobMemoryEvidence>,
 }
 
 impl ProcessEvidence {
-    /// A batch's evidence: the heaviest item on each side. Its test phase
-    /// stands only where both sides measured one, because whichever item is
-    /// testing must be covered by the figure the lane steps down to.
+    /// A batch's evidence: the heaviest item on each side. Its test phase and
+    /// its build jobs stand only where both sides measured them, because the
+    /// one figure must cover whichever item is running.
     pub(super) fn max(left: Self, right: Self) -> Self {
         Self {
+            build_job_memory: match (left.build_job_memory, right.build_job_memory) {
+                (Some(left), Some(right)) => Some(BuildJobMemoryEvidence {
+                    largest_bytes: left.largest_bytes.max(right.largest_bytes),
+                    typical_bytes: left.typical_bytes.max(right.typical_bytes),
+                    samples: left.samples.min(right.samples),
+                }),
+                _ => None,
+            },
             demand: ProcessDemand::max(left.demand, right.demand),
             unattributed: ProcessDemand::max(left.unattributed, right.unattributed),
             unmeasured_compile: left.unmeasured_compile || right.unmeasured_compile,
@@ -773,7 +788,8 @@ pub(super) async fn resolve_process_demand(
         demand,
         unattributed,
         unmeasured_compile,
-        test_phase: suite.and_then(|suite| suite.test_phase),
+        test_phase: suite.as_ref().and_then(|suite| suite.test_phase),
+        build_job_memory: suite.and_then(|suite| suite.build_job_memory),
     }
 }
 
@@ -802,6 +818,8 @@ struct SuiteEvidence {
     elsewhere: Option<(u64, String, String, String)>,
     /// Its test phase in this machine context.
     test_phase: Option<TestPhaseEvidence>,
+    /// Its build jobs in this machine context.
+    build_job_memory: Option<BuildJobMemoryEvidence>,
 }
 
 /// The identity's evidence on this platform, and its largest single process
@@ -898,7 +916,8 @@ async fn load_suite_evidence(
                             oom_kill_memory_brake, oom_crowded_kill_count,
                             oom_crowded_most_co_resident, oom_crowded_memory_brake,
                             oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes,
-                            upper_test_phase_bytes_per_test
+                            upper_test_phase_bytes_per_test, upper_job_largest_bytes,
+                            upper_job_typical_bytes, job_census_samples
                      FROM suite_memory_evidence
                      WHERE suite_key=?1",
                     params![suite_key],
@@ -909,6 +928,7 @@ async fn load_suite_evidence(
                 kills_here: None,
                 elsewhere: None,
                 test_phase: None,
+                build_job_memory: None,
             };
             let mut any = false;
             while let Some(row) = rows.next().await? {
@@ -955,6 +975,16 @@ async fn load_suite_evidence(
                         evidence.test_phase = Some(TestPhaseEvidence {
                             peak_bytes: peak.max(0) as u64,
                             bytes_per_concurrent_test: per_test.max(0) as u64,
+                        });
+                    }
+                    let largest = row.get::<Option<i64>>(14)?;
+                    let typical = row.get::<Option<i64>>(15)?;
+                    let samples = row.get::<i64>(16)?;
+                    if let (Some(largest), Some(typical)) = (largest, typical) {
+                        evidence.build_job_memory = Some(BuildJobMemoryEvidence {
+                            largest_bytes: largest.max(0) as u64,
+                            typical_bytes: typical.max(0) as u64,
+                            samples: u32::try_from(samples.max(0)).unwrap_or(u32::MAX),
                         });
                     }
                 }
@@ -1062,9 +1092,10 @@ pub(super) fn same_machine_total(killed_at_total: u64, total_bytes: u64) -> bool
 }
 
 /// Fold one completion into its suite's evidence in this machine context:
-/// the largest single process it held, and, for an out-of-memory kill, the
-/// victim's size and the kill, read alone or crowded by `machine`'s admission
-/// ([`SuiteKills`]).
+/// the largest single process it held, its build-job processes when it ran
+/// enough of them to speak for a typical job, and, for an out-of-memory kill,
+/// the victim's size and the kill, read alone or crowded by `machine`'s
+/// admission ([`SuiteKills`]).
 ///
 /// Every completion with a suite teaches this, measured identity or not: an
 /// agent's batch carries no command identity, and its suite is the only
@@ -1118,6 +1149,9 @@ pub(super) async fn observe_suite(
         kills,
         None,
         metadata.test_phase,
+        metadata
+            .build_job_processes
+            .filter(BuildJobProcesses::speaks_for_a_typical_job),
     )
     .await;
 }
@@ -1205,6 +1239,7 @@ pub(super) async fn observe_suite_kill(
         }),
         Some(kill.pid),
         None,
+        None,
     )
     .await;
 }
@@ -1221,8 +1256,10 @@ pub(super) const RESIDENT_KILL_LEARNING_HORIZON_MS: u64 = 24 * 60 * 60 * 1_000;
 const RESIDENT_KILL_IDENTITY_KEPT_MS: u64 = 2 * RESIDENT_KILL_LEARNING_HORIZON_MS;
 
 /// Fold one observation into the suite's row in this machine context. A
-/// test phase raises the row's test-phase peak and per-test figure, each
-/// independently and never lowering either.
+/// test phase raises the row's test-phase peak and per-test figure, and a
+/// build-job census its largest and typical job and its sample count, each
+/// figure independently and never lowering one: a warm run that rebuilt
+/// smaller crates says nothing about the cold compile's jobs.
 #[allow(clippy::too_many_arguments)]
 async fn record_suite_evidence(
     db: Arc<LocalDb>,
@@ -1233,8 +1270,10 @@ async fn record_suite_evidence(
     kills: KillsSeen,
     resident_kill: Option<u32>,
     test_phase: Option<TestPhaseMeasurement>,
+    build_jobs: Option<BuildJobProcesses>,
 ) -> Result<(), String> {
-    if peak.is_none() && kills == KillsSeen::Neither && test_phase.is_none() {
+    if peak.is_none() && kills == KillsSeen::Neither && test_phase.is_none() && build_jobs.is_none()
+    {
         return Ok(());
     }
     let suite_key = suite_key.to_string();
@@ -1277,7 +1316,11 @@ async fn record_suite_evidence(
                 context.os.clone(),
                 context.arch.clone()
             ];
-            if peak.is_none() && kills == KillsSeen::CleanRun && test_phase.is_none() {
+            if peak.is_none()
+                && kills == KillsSeen::CleanRun
+                && test_phase.is_none()
+                && build_jobs.is_none()
+            {
                 // Nothing to learn but that the kills are over: a row that
                 // does not exist has none to forget.
                 conn.execute(
@@ -1318,8 +1361,8 @@ async fn record_suite_evidence(
                 None => (None, None),
             };
             conn.execute(
-                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                r#"INSERT INTO suite_memory_evidence (suite_key, executor_class, os, arch, upper_process_peak_bytes, process_peak_name, oom_kill_count, oom_machine_total_bytes, updated_at_unix_ms, oom_kill_memory_brake, oom_crowded_kill_count, oom_crowded_most_co_resident, oom_crowded_memory_brake, oom_crowded_killed_at_unix_ms, upper_test_phase_peak_bytes, upper_test_phase_bytes_per_test, upper_job_largest_bytes, upper_job_typical_bytes, job_census_samples)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                    ON CONFLICT(suite_key, executor_class, os, arch) DO UPDATE SET
                      upper_process_peak_bytes=CASE WHEN ?5 IS NULL THEN suite_memory_evidence.upper_process_peak_bytes WHEN suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes THEN ?5 ELSE suite_memory_evidence.upper_process_peak_bytes END,
                      process_peak_name=CASE WHEN ?5 IS NOT NULL AND (suite_memory_evidence.upper_process_peak_bytes IS NULL OR ?5 >= suite_memory_evidence.upper_process_peak_bytes) THEN COALESCE(?6, suite_memory_evidence.process_peak_name) ELSE suite_memory_evidence.process_peak_name END,
@@ -1332,7 +1375,10 @@ async fn record_suite_evidence(
                      oom_crowded_memory_brake=?13,
                      oom_crowded_killed_at_unix_ms=?14,
                      upper_test_phase_peak_bytes=CASE WHEN ?15 IS NULL THEN suite_memory_evidence.upper_test_phase_peak_bytes WHEN suite_memory_evidence.upper_test_phase_peak_bytes IS NULL OR ?15 > suite_memory_evidence.upper_test_phase_peak_bytes THEN ?15 ELSE suite_memory_evidence.upper_test_phase_peak_bytes END,
-                     upper_test_phase_bytes_per_test=CASE WHEN ?16 IS NULL THEN suite_memory_evidence.upper_test_phase_bytes_per_test WHEN suite_memory_evidence.upper_test_phase_bytes_per_test IS NULL OR ?16 > suite_memory_evidence.upper_test_phase_bytes_per_test THEN ?16 ELSE suite_memory_evidence.upper_test_phase_bytes_per_test END"#,
+                     upper_test_phase_bytes_per_test=CASE WHEN ?16 IS NULL THEN suite_memory_evidence.upper_test_phase_bytes_per_test WHEN suite_memory_evidence.upper_test_phase_bytes_per_test IS NULL OR ?16 > suite_memory_evidence.upper_test_phase_bytes_per_test THEN ?16 ELSE suite_memory_evidence.upper_test_phase_bytes_per_test END,
+                     upper_job_largest_bytes=CASE WHEN ?17 IS NULL THEN suite_memory_evidence.upper_job_largest_bytes WHEN suite_memory_evidence.upper_job_largest_bytes IS NULL OR ?17 > suite_memory_evidence.upper_job_largest_bytes THEN ?17 ELSE suite_memory_evidence.upper_job_largest_bytes END,
+                     upper_job_typical_bytes=CASE WHEN ?18 IS NULL THEN suite_memory_evidence.upper_job_typical_bytes WHEN suite_memory_evidence.upper_job_typical_bytes IS NULL OR ?18 > suite_memory_evidence.upper_job_typical_bytes THEN ?18 ELSE suite_memory_evidence.upper_job_typical_bytes END,
+                     job_census_samples=suite_memory_evidence.job_census_samples + ?19"#,
                 params![
                     suite_key.clone(),
                     context.executor_class.clone(),
@@ -1349,7 +1395,10 @@ async fn record_suite_evidence(
                     crowded.map(|crowded| i64::from(crowded.memory_brake)),
                     crowded.map(|crowded| crowded.last_killed_at_unix_ms as i64),
                     test_phase.map(|phase| phase.peak_bytes as i64),
-                    test_phase.map(|phase| phase.bytes_per_concurrent_test() as i64)
+                    test_phase.map(|phase| phase.bytes_per_concurrent_test() as i64),
+                    build_jobs.map(|jobs| jobs.largest_bytes as i64),
+                    build_jobs.map(|jobs| jobs.typical_bytes as i64),
+                    i64::from(build_jobs.is_some())
                 ],
             )
             .await?;
@@ -1416,6 +1465,7 @@ pub(super) fn cold_start_prior(
         source: ResourceReservationSource::Unmeasured,
         measured_peak_bytes: None,
         test_phase: None,
+        build_job_memory: None,
     }
 }
 
@@ -1484,6 +1534,7 @@ fn fleet_prior(
         source: ResourceReservationSource::Unmeasured,
         measured_peak_bytes: None,
         test_phase: None,
+        build_job_memory: None,
     })
 }
 
@@ -2281,6 +2332,7 @@ fn reservation_for_profile(
         },
         measured_peak_bytes: None,
         test_phase: None,
+        build_job_memory: None,
     }
 }
 
@@ -2364,6 +2416,7 @@ pub(super) fn oom_killed_for_test(
         }),
         cell_origin: None,
         test_phase: None,
+        build_job_processes: None,
     }
 }
 
@@ -2694,6 +2747,100 @@ mod process_peak_tests {
             }),
             ..oom_killed_for_test(GIB, None, 0, finished_at_unix_ms)
         }
+    }
+
+    /// A run's build-job census teaches its suite, on that machine only, the
+    /// largest and typical job, each rising alone and never falling, with the
+    /// runs that taught them counted. A run of too few job processes to have
+    /// a typical one teaches nothing.
+    #[tokio::test]
+    async fn a_suites_build_jobs_are_learned_per_machine_from_enough_processes() {
+        let db = Arc::new(crate::storage::migrated_test_db("build-job-census.db").await);
+        let fedora = context("fedora:fedora");
+        let suite = suite_key(
+            "cairn",
+            Some(&identity("rust-tests-a")),
+            CellCommandClass::CargoTest,
+        );
+        let observe = |census: BuildJobProcesses, at: u64| {
+            let db = db.clone();
+            let suite = suite.clone();
+            let fedora = fedora.clone();
+            async move {
+                let meta = CellExecutionMeta {
+                    build_job_processes: Some(census),
+                    ..completed(census.largest_bytes, at)
+                };
+                observe_suite(
+                    db,
+                    suite.as_deref(),
+                    &fedora,
+                    &meta,
+                    CompletionKind::Succeeded,
+                    MachineAdmission::default(),
+                )
+                .await;
+            }
+        };
+        let learned = |machine: &str| {
+            let db = db.clone();
+            let suite = suite.clone();
+            let context = context(machine);
+            async move {
+                resolve_process_demand(
+                    db,
+                    None,
+                    suite.as_deref(),
+                    CellCommandClass::CargoTest,
+                    &context,
+                )
+                .await
+                .build_job_memory
+            }
+        };
+        // A warm run that rebuilt three crates says nothing of a typical job.
+        observe(
+            BuildJobProcesses {
+                processes: 3,
+                largest_bytes: 9 * GIB,
+                typical_bytes: 6 * GIB,
+            },
+            1,
+        )
+        .await;
+        assert_eq!(learned("fedora:fedora").await, None);
+
+        observe(
+            BuildJobProcesses {
+                processes: 40,
+                largest_bytes: 8 * GIB,
+                typical_bytes: GIB,
+            },
+            2,
+        )
+        .await;
+        // A later run with a larger typical job and a smaller largest one
+        // raises the one and keeps the other.
+        observe(
+            BuildJobProcesses {
+                processes: 12,
+                largest_bytes: 5 * GIB,
+                typical_bytes: 3 * GIB / 2,
+            },
+            3,
+        )
+        .await;
+        let evidence = BuildJobMemoryEvidence {
+            largest_bytes: 8 * GIB,
+            typical_bytes: 3 * GIB / 2,
+            samples: 2,
+        };
+        assert_eq!(learned("fedora:fedora").await, Some(evidence));
+        assert_eq!(
+            learned("bbs:bbs").await,
+            None,
+            "jobs measured on fedora do not size another machine's"
+        );
     }
 
     /// A completion teaches its identity and its suite the largest single
@@ -3573,6 +3720,7 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             };
             for sample_count in [0, 1, 4, MIN_CONFIDENT_SAMPLES, 500] {
                 let reservation = reservation_for_profile(
@@ -3607,6 +3755,7 @@ mod tests {
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         for sample_count in 0..MIN_CONFIDENT_SAMPLES {
             let smaller = reservation_for_profile(
@@ -3658,6 +3807,7 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             None,
             false,
@@ -3695,6 +3845,7 @@ mod tests {
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         }
     }
 
@@ -3850,6 +4001,7 @@ mod tests {
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         let profile = |upper_peak_rss_bytes| ResourceProfile {
             sample_count: 50,
@@ -4035,6 +4187,7 @@ mod tests {
             stop: None,
             cell_origin: None,
             test_phase: None,
+            build_job_processes: None,
         };
         for round in 0..20 {
             let identity = CommandResourceIdentity {
@@ -4118,6 +4271,7 @@ mod tests {
             stop: None,
             cell_origin: None,
             test_phase: None,
+            build_job_processes: None,
         };
 
         observe_completed(
@@ -4156,6 +4310,7 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             None,
             test_duration_context(),
@@ -4207,6 +4362,7 @@ mod tests {
             source: ResourceReservationSource::Unmeasured,
             measured_peak_bytes: None,
             test_phase: None,
+            build_job_memory: None,
         };
         let resolved = resolve_reservation(
             db,
@@ -4752,6 +4908,7 @@ mod tests {
                 source: ResourceReservationSource::Unmeasured,
                 measured_peak_bytes: None,
                 test_phase: None,
+                build_job_memory: None,
             },
             Some(100),
             true,
@@ -4816,6 +4973,7 @@ mod tests {
             stop: None,
             cell_origin: None,
             test_phase: None,
+            build_job_processes: None,
         }
     }
 

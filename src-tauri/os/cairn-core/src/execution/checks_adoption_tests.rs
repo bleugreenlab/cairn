@@ -110,6 +110,7 @@ pub(super) fn result(orch: &Orchestrator) -> crate::fleet::UnboundResult {
         stop: None,
         build_jobs: None,
         unrecorded_cache_checkpoint: None,
+        build_job_processes: None,
     };
     let mut metadata = orch.fleet.execution_meta_for_test();
     // Executors leave authenticated identity stamping to the runner link.
