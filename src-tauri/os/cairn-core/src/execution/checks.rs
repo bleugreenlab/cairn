@@ -24073,7 +24073,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert!(
             outcome
                 .output_tail
-                .contains("❌ clippy: 1 new finding(s) in your diff"),
+                .contains("❌ clippy: 1 finding(s) in files your diff changed"),
             "{}",
             outcome.output_tail
         );
