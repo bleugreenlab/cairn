@@ -3349,6 +3349,165 @@ async fn a_resource_append_then_a_blocking_append_still_checkpoints() {
     assert_eq!(item_counts(&repo).await, vec![1, 0, 0]);
 }
 
+/// A file create at index 0, then the three `item-N` message appends at
+/// indices 1-3, as one guarded call.
+fn file_then_three_appends() -> serde_json::Value {
+    let mut changes = vec![json!({
+        "target": "file:mixed.txt",
+        "mode": "create",
+        "payload": {"content": "mixed\n"}
+    })];
+    changes.extend(
+        three_appends()["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    json!({ "changes": changes, "commit_msg": "mixed write" })
+}
+
+/// cairn/5877: a mixed file+resource write dropped between its resource items
+/// has already appended two messages but committed nothing. Its claimed row is
+/// sealed with exactly that, so a redelivery replays it: no message twice, the
+/// file item `not applied`, and no commit.
+#[tokio::test]
+async fn a_mixed_write_dropped_between_items_runs_nothing_twice() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-mixed-drop";
+    let payload = file_then_three_appends();
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let head = repo.branch_head();
+    let gate = gate_resource_item("run-change", tool_use_id, 3, ItemPhase::BeforeDispatch);
+    {
+        let mut delivery = std::pin::pin!(handle_write(&repo.orch, &request));
+        tokio::select! {
+            _ = &mut delivery => panic!("the write must park before item 3"),
+            () = gate.entered() => {}
+        }
+    }
+
+    let replayed = replay_within(&repo, &request).await;
+    assert!(replayed.get("replayed").is_some(), "{replayed}");
+    assert_eq!(indices(&replayed, "applied"), vec![1, 2], "{replayed}");
+    assert!(
+        failure_error(&replayed, 0).starts_with("not applied"),
+        "the file item was never committed: {replayed}"
+    );
+    assert!(
+        failure_error(&replayed, 3).starts_with("not applied"),
+        "{replayed}"
+    );
+    assert_eq!(
+        item_counts(&repo).await,
+        vec![1, 1, 0],
+        "the replay ran nothing"
+    );
+    assert_eq!(repo.branch_head(), head, "nothing was committed");
+    assert!(!repo.logical_exists("mixed.txt"));
+}
+
+/// cairn/5877: an operator Stop between a mixed write's resource items stops it
+/// there, before its commit. The delivered report, the stop's result, and a
+/// replay all list the two appends applied and the file item and the last
+/// append `not applied`, and nothing is committed or run twice.
+#[tokio::test]
+async fn a_mixed_write_stopped_between_items_commits_nothing() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-mixed-stop";
+    let payload = file_then_three_appends();
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let head = repo.branch_head();
+    let gate = gate_resource_item("run-change", tool_use_id, 3, ItemPhase::BeforeDispatch);
+
+    let (delivered, ()) = tokio::join!(handle_write(&repo.orch, &request), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), gate.entered())
+            .await
+            .expect("the write must park before item 3");
+        let orch = repo.orch.clone();
+        let stopper =
+            tokio::task::spawn_blocking(move || lifecycle::stop_session(&orch, "run-change"));
+        while !repo.orch.write_stops.is_raised("run-change", tool_use_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        gate.release();
+        stopper.await.unwrap().unwrap();
+    });
+
+    let delivered = parse_report(&delivered);
+    assert_eq!(indices(&delivered, "applied"), vec![1, 2], "{delivered}");
+    assert_eq!(indices(&delivered, "failures"), vec![0, 3], "{delivered}");
+    for index in [0, 3] {
+        assert!(
+            failure_error(&delivered, index).starts_with("not applied"),
+            "{delivered}"
+        );
+    }
+    assert_eq!(item_counts(&repo).await, vec![1, 1, 0]);
+    assert_eq!(repo.branch_head(), head, "nothing was committed");
+
+    let stopped = parse_report(&stopped_result(&repo.orch.db.local, tool_use_id).await);
+    let stopped = parse_report(stopped["toolResult"].as_str().unwrap());
+    assert_eq!(indices(&stopped, "applied"), vec![1, 2], "{stopped}");
+    for index in [0, 3] {
+        assert!(
+            failure_error(&stopped, index).starts_with("not applied"),
+            "{stopped}"
+        );
+    }
+
+    let replayed = replay_within(&repo, &request).await;
+    assert!(replayed.get("replayed").is_some(), "{replayed}");
+    assert_eq!(indices(&replayed, "applied"), vec![1, 2], "{replayed}");
+    assert_eq!(
+        item_counts(&repo).await,
+        vec![1, 1, 0],
+        "the replay ran nothing"
+    );
+    assert_eq!(repo.branch_head(), head, "the replay committed nothing");
+}
+
+/// cairn/5877: a mixed write whose file edit fails while its appends succeed
+/// commits nothing, but its appends took effect. Its settled report is the
+/// answer: a redelivery replays it and appends nothing again.
+#[tokio::test]
+async fn a_mixed_write_whose_file_edit_failed_replays_without_rerunning_its_appends() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let mut payload = file_then_three_appends();
+    payload["changes"][0] = json!({
+        "target": "file:absent.txt",
+        "mode": "patch",
+        "payload": {"old_string": "no such anchor", "new_string": "never"}
+    });
+    let request = guarded_request(&repo, "tool-mixed-file-failed", &payload).await;
+    let head = repo.branch_head();
+
+    let delivered = parse_report(&handle_write(&repo.orch, &request).await);
+    assert_eq!(indices(&delivered, "applied"), vec![1, 2, 3], "{delivered}");
+    assert_eq!(indices(&delivered, "failures"), vec![0], "{delivered}");
+    assert_eq!(item_counts(&repo).await, vec![1, 1, 1]);
+
+    let replayed = replay_within(&repo, &request).await;
+    assert!(replayed.get("replayed").is_some(), "{replayed}");
+    assert_eq!(indices(&replayed, "applied"), vec![1, 2, 3], "{replayed}");
+    assert_eq!(indices(&replayed, "failures"), vec![0], "{replayed}");
+    assert_eq!(
+        item_counts(&repo).await,
+        vec![1, 1, 1],
+        "the replay ran nothing"
+    );
+    assert_eq!(repo.branch_head(), head, "nothing was committed");
+}
+
 #[tokio::test]
 async fn a_resource_only_write_is_deduplicated_by_the_replay_guard() {
     let Some(repo) = ChangeTestRepo::try_new().await else {

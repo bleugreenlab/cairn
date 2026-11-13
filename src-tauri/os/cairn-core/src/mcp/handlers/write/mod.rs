@@ -1097,8 +1097,8 @@ async fn handle_write_attempt(
         .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)));
 
     // Resolve the provider call before either serialization boundary: file
-    // batches use the store lock, while resource-only batches claim the replay
-    // ledger itself before dispatching any effects.
+    // batches use the store lock, and any batch carrying a resource item also
+    // claims the replay ledger itself before dispatching any effects.
     let write_call = replay::invoking_write_call(orch, request).await;
 
     // A generated draft spends one of its generation's bounded attempts, so it
@@ -1621,12 +1621,25 @@ async fn handle_write_attempt(
     };
 
     let atomic = payload.atomic.unwrap_or(false);
-    let guard_resource_report = !has_file_targets && write_call.is_some();
-    // A claimed resource-only write's progress: checkpointed after each item,
-    // stopped between items by an operator Stop, and sealed if this future is
-    // dropped before it finalizes (see `replay::ResourceWriteProgress`).
+    // A file-only batch has no effect before its commit, and records its row at
+    // that seal. A batch carrying a resource item has effects before it, so it
+    // claims its row here, before dispatching anything. For a mixed batch this
+    // runs under the store lock, so the locked replay check above already saw
+    // any row a previous delivery claimed.
+    let has_resource_items = payload
+        .changes
+        .iter()
+        .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::Resource)));
+    // A claimed write's progress: checkpointed after each resource item and at
+    // its commit, stopped between items or before the commit by an operator
+    // Stop, and sealed if this future is dropped before it finalizes (see
+    // `replay::ResourceWriteProgress`). Every return past the claim settles it
+    // through `settle_claim`.
     let mut resource_progress: Option<replay::ResourceWriteProgress> = None;
-    if let Some(call) = write_call.as_ref().filter(|_| !has_file_targets) {
+    if let Some(call) = write_call
+        .as_ref()
+        .filter(|_| !has_file_targets || has_resource_items)
+    {
         match replay::claim_resource_call(&orch.db.local, call).await {
             replay::ResourceClaim::Claimed => {
                 resource_progress = Some(replay::ResourceWriteProgress::claimed(
@@ -1701,16 +1714,11 @@ async fn handle_write_attempt(
             blocking_indices.retain(|blocked| *blocked != index);
             let IndexedFailure { failure, .. } = *build_failure(index, item, error);
             if atomic {
-                let report = change_report_json(applied, vec![failure], commit, atomic);
-                if guard_resource_report {
-                    replay::finalize_report(
-                        &orch.db.local,
-                        write_call.as_ref().expect("guarded resource call"),
-                        &report,
-                    )
-                    .await;
-                }
-                return report;
+                return settle_claim(
+                    &mut resource_progress,
+                    change_report_json(applied, vec![failure], commit, atomic),
+                )
+                .await;
             }
             failures.push(failure);
             index += 1;
@@ -1791,12 +1799,16 @@ async fn handle_write_attempt(
                                 commit: failure_commit,
                             } = *failure;
                             if atomic {
-                                return change_report_json(
-                                    applied,
-                                    vec![failure],
-                                    failure_commit.or(commit),
-                                    atomic,
-                                );
+                                return settle_claim(
+                                    &mut resource_progress,
+                                    change_report_json(
+                                        applied,
+                                        vec![failure],
+                                        failure_commit.or(commit),
+                                        atomic,
+                                    ),
+                                )
+                                .await;
                             }
                             if let Some(failure_commit) = failure_commit {
                                 commit = Some(failure_commit);
@@ -1811,21 +1823,16 @@ async fn handle_write_attempt(
                         commit: failure_commit,
                     } = *build_failure(index, item, error);
                     if atomic {
-                        let report = change_report_json(
-                            applied,
-                            vec![failure],
-                            failure_commit.or(commit),
-                            atomic,
-                        );
-                        if guard_resource_report {
-                            replay::finalize_report(
-                                &orch.db.local,
-                                write_call.as_ref().expect("guarded resource call"),
-                                &report,
-                            )
-                            .await;
-                        }
-                        return report;
+                        return settle_claim(
+                            &mut resource_progress,
+                            change_report_json(
+                                applied,
+                                vec![failure],
+                                failure_commit.or(commit),
+                                atomic,
+                            ),
+                        )
+                        .await;
                     }
                     if let Some(failure_commit) = failure_commit {
                         commit = Some(failure_commit);
@@ -1845,21 +1852,16 @@ async fn handle_write_attempt(
                     commit: failure_commit,
                 } = *build_failure(index, item, error);
                 if atomic {
-                    let report = change_report_json(
-                        applied,
-                        vec![failure],
-                        failure_commit.or(commit),
-                        atomic,
-                    );
-                    if guard_resource_report {
-                        replay::finalize_report(
-                            &orch.db.local,
-                            write_call.as_ref().expect("guarded resource call"),
-                            &report,
-                        )
-                        .await;
-                    }
-                    return report;
+                    return settle_claim(
+                        &mut resource_progress,
+                        change_report_json(
+                            applied,
+                            vec![failure],
+                            failure_commit.or(commit),
+                            atomic,
+                        ),
+                    )
+                    .await;
                 }
                 if let Some(failure_commit) = failure_commit {
                     commit = Some(failure_commit);
@@ -1884,7 +1886,15 @@ async fn handle_write_attempt(
             // dispatching runs to completion.
             if let Some(progress) = resource_progress.as_mut() {
                 if progress.stop_requested() {
-                    return progress.seal_stopped(&applied, &failures).await;
+                    return seal_stopped_before_commit(
+                        orch,
+                        progress,
+                        &promoted_memories,
+                        &deferred_pr_syncs,
+                        &mut applied,
+                        &failures,
+                    )
+                    .await;
                 }
                 progress.begin(index, &applied, &failures);
             }
@@ -1932,21 +1942,16 @@ async fn handle_write_attempt(
                         commit: failure_commit,
                     } = *resource_failure(failure);
                     if atomic {
-                        let report = change_report_json(
-                            applied,
-                            vec![failure],
-                            failure_commit.or(commit),
-                            atomic,
-                        );
-                        if guard_resource_report {
-                            replay::finalize_report(
-                                &orch.db.local,
-                                write_call.as_ref().expect("guarded resource call"),
-                                &report,
-                            )
-                            .await;
-                        }
-                        return report;
+                        return settle_claim(
+                            &mut resource_progress,
+                            change_report_json(
+                                applied,
+                                vec![failure],
+                                failure_commit.or(commit),
+                                atomic,
+                            ),
+                        )
+                        .await;
                     }
                     if let Some(failure_commit) = failure_commit {
                         commit = Some(failure_commit);
@@ -2006,21 +2011,16 @@ async fn handle_write_attempt(
                         commit: failure_commit,
                     } = *failure;
                     if atomic {
-                        let report = change_report_json(
-                            applied,
-                            vec![failure],
-                            failure_commit.or(commit),
-                            atomic,
-                        );
-                        if guard_resource_report {
-                            replay::finalize_report(
-                                &orch.db.local,
-                                write_call.as_ref().expect("guarded resource call"),
-                                &report,
-                            )
-                            .await;
-                        }
-                        return report;
+                        return settle_claim(
+                            &mut resource_progress,
+                            change_report_json(
+                                applied,
+                                vec![failure],
+                                failure_commit.or(commit),
+                                atomic,
+                            ),
+                        )
+                        .await;
                     }
                     if let Some(failure_commit) = failure_commit {
                         commit = Some(failure_commit);
@@ -2154,6 +2154,22 @@ async fn handle_write_attempt(
         write_store_guard = guard;
     }
     if let Some(first_file_change) = first_file_change {
+        // Nothing is committed yet, so the commit is one more step a Stop can
+        // land before, exactly like a resource item.
+        if let Some(progress) = resource_progress.as_mut() {
+            if progress.stop_requested() {
+                return seal_stopped_before_commit(
+                    orch,
+                    progress,
+                    &promoted_memories,
+                    &deferred_pr_syncs,
+                    &mut applied,
+                    &failures,
+                )
+                .await;
+            }
+            progress.committing(&applied, &failures);
+        }
         let _seal_phase = write_store_guard
             .as_ref()
             .map(|guard| guard.phase("logical tree publication"));
@@ -2226,7 +2242,11 @@ async fn handle_write_attempt(
                 }
                 if atomic {
                     rollback_promoted_memory_decisions(orch, &promoted_memories).await;
-                    return change_report_json(applied, vec![failure], failure_commit, atomic);
+                    return settle_claim(
+                        &mut resource_progress,
+                        change_report_json(applied, vec![failure], failure_commit, atomic),
+                    )
+                    .await;
                 }
                 if revert_commit.is_some() {
                     applied.clear();
@@ -2239,10 +2259,14 @@ async fn handle_write_attempt(
 
         // Record the publication against the call that produced it, still inside
         // the epoch that published it, so a crash cannot leave a landed commit
-        // with no ledger row for a later delivery to find. Only a batch that
-        // actually sealed a commit records: a write that published nothing has no
-        // application to suppress and should stay freely retryable.
-        if let (Some(call), Some(_)) = (
+        // with no ledger row for a later delivery to find. A claimed write
+        // checkpoints its row, still behind the pending marker. An unclaimed
+        // file-only one records only if it actually sealed a commit: a write that
+        // published nothing has no application to suppress and should stay
+        // freely retryable.
+        if let Some(progress) = resource_progress.as_mut() {
+            progress.resolved(&applied, &failures, commit.clone()).await;
+        } else if let (Some(call), Some(_)) = (
             write_call.as_ref(),
             commit.as_ref().and_then(|report| report.sha.as_ref()),
         ) {
@@ -2398,7 +2422,7 @@ async fn handle_write_attempt(
             {
                 replay::finalize_report(&orch.db.local, call, &report).await;
             }
-            return report;
+            return settle_claim(&mut resource_progress, report).await;
         }
         // No store guard or branch reservation is held from here on.
         for (index, target, mode, deferral) in &deferred_pr_syncs {
@@ -2579,7 +2603,11 @@ async fn handle_write_attempt(
                     });
                 }
                 if atomic {
-                    return change_report_json(applied, failures, commit, atomic);
+                    return settle_claim(
+                        &mut resource_progress,
+                        change_report_json(applied, failures, commit, atomic),
+                    )
+                    .await;
                 }
             }
         }
@@ -2690,10 +2718,10 @@ async fn handle_write_attempt(
                 .unwrap_or_else(|e| format!("Failed to serialize change report: {e}")),
             &check_summary,
         );
-        if guard_resource_report
-            || ordinary_ledger_claim == replay::LedgerClaim::Claimed
-            || blocking_checkpointed
-        {
+        if resource_progress.is_some() {
+            return settle_claim(&mut resource_progress, result).await;
+        }
+        if ordinary_ledger_claim == replay::LedgerClaim::Claimed || blocking_checkpointed {
             replay::finalize_report(
                 &orch.db.local,
                 write_call.as_ref().expect("guarded write call"),
@@ -2704,6 +2732,56 @@ async fn handle_write_attempt(
         result
     });
     completion.await
+}
+
+/// Settle the replay row this delivery claimed, if it holds one, with the
+/// report it is about to return. Every return past the claim comes through
+/// here: a claimed row left to the carrier's drop would be sealed as if the
+/// write had been stopped.
+async fn settle_claim(
+    progress: &mut Option<replay::ResourceWriteProgress>,
+    report: String,
+) -> String {
+    if let Some(progress) = progress.as_mut() {
+        progress.finish(&report).await;
+    }
+    report
+}
+
+/// Seal a claimed write that a Stop reached before its commit. A memory
+/// promotion stands only with the commit that carries it, so the promotions
+/// this write applied are rolled back, and the stopped report lists them not
+/// applied. A create-pr artifact it stored keeps its version, but its deferred
+/// pull-request sync never runs, and its summary says so.
+async fn seal_stopped_before_commit(
+    orch: &Orchestrator,
+    progress: &mut replay::ResourceWriteProgress,
+    promoted_memories: &[(usize, String, String, PromotedMemoryRef)],
+    deferred_pr_syncs: &[(
+        usize,
+        String,
+        String,
+        crate::pr_data::actions::DeferredPrSync,
+    )],
+    applied: &mut Vec<AppliedChange>,
+    failures: &[ChangeFailure],
+) -> String {
+    for (index, ..) in deferred_pr_syncs {
+        settle_deferred_pr_sync(
+            applied,
+            *index,
+            "pull request not synced: the write was stopped before its commit",
+        );
+    }
+    if !promoted_memories.is_empty() {
+        rollback_promoted_memory_decisions(orch, promoted_memories).await;
+        applied.retain(|change| {
+            !promoted_memories
+                .iter()
+                .any(|(index, ..)| *index == change.index)
+        });
+    }
+    progress.seal_stopped(applied, failures).await
 }
 
 /// Replace a deferred create-pr item's pending marker with what its sync did.

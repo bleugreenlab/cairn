@@ -37,14 +37,18 @@
 //!
 //! # What is recorded, and when
 //!
-//! A file-target batch records the moment it publishes a commit, inside the same
-//! store-lock epoch. A resource-only batch has no publication lock, so it first
-//! claims a pending row in the database, applies its effects only if it owns that
-//! claim, and replaces the pending marker after the complete batch settles. A
-//! concurrent redelivery waits for that settled report instead of racing the
-//! claimant into the resource dispatcher. Failed resource batches are finalized
-//! too: replay means returning the first delivery's truth, not silently retrying
-//! a call whose earlier items may already have taken effect.
+//! A file-only batch records the moment it publishes a commit, inside the same
+//! store-lock epoch; until then it has no effect to suppress. A batch carrying
+//! any resource item has effects before its commit, so before it dispatches
+//! anything it claims a pending row in the database, applies its effects only if
+//! it owns that claim, checkpoints the row behind the pending marker after each
+//! resource item and again inside the epoch that seals its commit, and replaces
+//! the marker after the complete batch settles. A concurrent redelivery waits
+//! for that settled report instead of racing the claimant into the resource
+//! dispatcher. Failed batches holding a claim are finalized too, including a
+//! mixed one whose file edits failed: replay means returning the first
+//! delivery's truth, not silently retrying a call whose earlier items may
+//! already have taken effect.
 //!
 //! The row is claimed inside the lock but its report is FINALIZED after the
 //! publication ladder resolves. Publication's later rungs — the jj→git export
@@ -206,16 +210,32 @@ fn wall_clock_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+const STILL_COMPLETING: &str = "A prior delivery of this write is still completing; replay ownership could not be acquired safely.";
+
 pub(super) async fn answer_file_replay(db: &LocalDb, call: &WriteCall) -> String {
+    // A batch carrying a resource item claims its row behind the pending
+    // marker, and that row's `finalized` column is already set, so the
+    // ownership wait below would hand the marker back as if it were a report.
+    if recorded_report(db, call)
+        .await
+        .is_some_and(|row| is_pending(&row))
+    {
+        return match await_settled_report(db, call, RESOURCE_CLAIM_WAIT).await {
+            ResourceClaim::Replayed(report) => mark_as_replay(&report),
+            ResourceClaim::Claimed | ResourceClaim::Stalled | ResourceClaim::Unguarded => {
+                STILL_COMPLETING.to_string()
+            }
+        };
+    }
     match await_file_replay_or_takeover(db, call).await {
         FileReplayClaim::Replayed(report) => mark_as_replay(&report),
         FileReplayClaim::TakenOver { owner, report } => {
             if finalize_owned_report(db, call, &owner, &report).await {
                 return mark_as_replay(&report);
             }
-            "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string()
+            STILL_COMPLETING.to_string()
         }
-        FileReplayClaim::Stalled => "A prior delivery of this write is still completing; replay ownership could not be acquired safely.".to_string(),
+        FileReplayClaim::Stalled => STILL_COMPLETING.to_string(),
     }
 }
 
@@ -546,11 +566,14 @@ pub(super) enum ResourceClaim {
     Unguarded,
 }
 
-/// Claim a resource-only call before any resource dispatcher can observe it.
-/// The unique ledger key is the serialization point shared by concurrent
-/// deliveries; only the inserter may apply effects.
+/// How long a redelivery waits for a claimed row to settle.
+const RESOURCE_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Claim a call carrying a resource item before any resource dispatcher can
+/// observe it. The unique ledger key is the serialization point shared by
+/// concurrent deliveries; only the inserter may apply effects.
 pub(super) async fn claim_resource_call(db: &LocalDb, call: &WriteCall) -> ResourceClaim {
-    claim_resource_call_with_timeout(db, call, std::time::Duration::from_secs(30)).await
+    claim_resource_call_with_timeout(db, call, RESOURCE_CLAIM_WAIT).await
 }
 
 async fn claim_resource_call_with_timeout(
@@ -562,17 +585,28 @@ async fn claim_resource_call_with_timeout(
     if claim == LedgerClaim::Claimed {
         return ResourceClaim::Claimed;
     }
+    await_settled_report(db, call, timeout).await
+}
 
-    // A competing delivery may still be applying a blocking or externally
-    // side-effecting mutation. Wait for its post-effect report rather than
-    // interpreting the pending marker as success or entering the dispatcher.
-    // Bound the wait because a cancelled claimant can leave a pending row with
-    // no process capable of finalizing it. A stalled replay fails closed instead
-    // of hanging forever or risking a duplicate side effect.
+/// Wait for another delivery's claimed row to settle: `Replayed` with its
+/// report, `Stalled` if it is still pending at `timeout`, `Unguarded` if there
+/// is no row at all.
+///
+/// A competing delivery may still be applying a blocking or externally
+/// side-effecting mutation. Wait for its post-effect report rather than
+/// interpreting the pending marker as success or entering the dispatcher.
+/// Bound the wait because a cancelled claimant can leave a pending row with
+/// no process capable of finalizing it. A stalled replay fails closed instead
+/// of hanging forever or risking a duplicate side effect.
+async fn await_settled_report(
+    db: &LocalDb,
+    call: &WriteCall,
+    timeout: std::time::Duration,
+) -> ResourceClaim {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match recorded_report(db, call).await {
-            Some(report) if !report.starts_with(RESOURCE_PENDING) => {
+            Some(report) if !is_pending(&report) => {
                 return ResourceClaim::Replayed(report);
             }
             Some(_) => {
@@ -716,18 +750,20 @@ pub(super) fn mark_as_replay(report: &str) -> String {
 // A stopped resource write
 // ---------------------------------------------------------------------------
 //
-// A resource-only write applies its items one at a time, and each item's
-// effect is real the moment its dispatcher returns. When the turn is stopped
-// partway, the report the agent gets (from the stop, or from a redelivery of
-// the same call) has to say exactly which items took effect. Three pieces do
-// that:
+// A write holding a resource claim applies its resource items one at a time,
+// and each item's effect is real the moment its dispatcher returns. Its file
+// items only take effect at the commit that seals them, after every
+// non-blocking resource item. When the turn is stopped partway, the report the
+// agent gets (from the stop, or from a redelivery of the same call) has to say
+// exactly which items took effect. Three pieces do that:
 //
-// - The carrier checkpoints the ledger row after every item, still behind the
-//   pending marker, so a redelivery keeps waiting rather than replaying a
-//   partial report.
+// - The carrier checkpoints the ledger row after every resource item and once
+//   its commit is sealed, still behind the pending marker, so a redelivery
+//   keeps waiting rather than replaying a partial report.
 // - An operator Stop raises the call's flag in [`WriteStops`]; the carrier
-//   checks it before each dispatch, so a write stops between items, never in
-//   the middle of one, and seals its row.
+//   checks it before each resource dispatch and before the commit, so a write
+//   stops between items, never in the middle of one, and seals its row. File
+//   items a stop lands before the commit are `not applied`.
 // - A carrier future dropped before it finalizes (the transport aborting the
 //   call) seals the row from what it last knew ([`ResourceWriteProgress`]'s
 //   `Drop`).
@@ -740,6 +776,8 @@ pub(crate) const STOPPED_KIND: &str = "stopped";
 const NOT_APPLIED: &str = "not applied: the write was stopped before this item";
 const NOT_CONFIRMED: &str =
     "not confirmed: the write was stopped while this item ran; read its target before retrying";
+const NOT_COMMITTED: &str =
+    "not applied: the write was stopped before its file changes were committed";
 
 /// The stop flags of the resource writes now applying items, by
 /// `(run_id, tool_use_id)`.
@@ -801,18 +839,36 @@ impl WriteStops {
     }
 }
 
-/// What a claimed resource write has done so far, kept in memory by its
-/// carrier and checkpointed into its ledger row after every item.
+/// How far a write holding a resource claim has got with its file items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitPhase {
+    /// File items are only interpreted against the logical snapshot; an
+    /// `applied` file item has not been committed.
+    Interpreting,
+    /// The commit that seals them is being published; whether it landed is
+    /// unknown.
+    Committing,
+    /// The commit attempt returned; `applied` and `commit` say what it did.
+    Resolved,
+}
+
+/// What a write holding a resource claim has done so far, kept in memory by
+/// its carrier and checkpointed into its ledger row after every resource item
+/// and once its commit resolves.
 pub(super) struct ResourceWriteProgress {
     db: std::sync::Arc<LocalDb>,
     call: WriteCall,
     /// Every payload item's `(target, mode)`, for the items a stop leaves.
     items: Vec<(String, String)>,
+    /// The indices of the file items, which take effect only at the commit.
+    file_items: std::collections::HashSet<usize>,
     atomic: bool,
     stops: std::sync::Arc<WriteStops>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     applied: Vec<super::types::AppliedChange>,
     failures: Vec<super::types::ChangeFailure>,
+    commit: Option<super::types::CommitReport>,
+    phase: CommitPhase,
     in_flight: Option<usize>,
     /// Whether dropping this seals the row. Cleared once the carrier
     /// finalizes the row itself or hands it to the blocking group.
@@ -827,6 +883,7 @@ impl ResourceWriteProgress {
         payload: &ChangePayload,
         atomic: bool,
     ) -> Self {
+        use crate::mcp::handlers::target::{target_family, TargetFamily};
         let stop = orch.write_stops.register(call);
         Self {
             db: orch.db.local.clone(),
@@ -841,11 +898,20 @@ impl ResourceWriteProgress {
                     )
                 })
                 .collect(),
+            file_items: payload
+                .changes
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches!(target_family(&item.target), Ok(TargetFamily::File)))
+                .map(|(index, _)| index)
+                .collect(),
             atomic,
             stops: orch.write_stops.clone(),
             stop,
             applied: Vec::new(),
             failures: Vec::new(),
+            commit: None,
+            phase: CommitPhase::Interpreting,
             in_flight: None,
             armed: true,
         }
@@ -887,14 +953,65 @@ impl ResourceWriteProgress {
         }
     }
 
+    /// The file items are about to be committed: whatever happens to this
+    /// carrier from here, whether they landed is unknown until
+    /// [`Self::resolved`].
+    pub(super) fn committing(
+        &mut self,
+        applied: &[super::types::AppliedChange],
+        failures: &[super::types::ChangeFailure],
+    ) {
+        self.applied = applied.to_vec();
+        self.failures = failures.to_vec();
+        self.in_flight = None;
+        self.phase = CommitPhase::Committing;
+    }
+
+    /// The commit attempt returned, still inside the store-lock epoch that
+    /// made it: record what it did and checkpoint the row behind its pending
+    /// marker, so a crash past this point cannot lose a landed commit.
+    pub(super) async fn resolved(
+        &mut self,
+        applied: &[super::types::AppliedChange],
+        failures: &[super::types::ChangeFailure],
+        commit: Option<super::types::CommitReport>,
+    ) {
+        self.applied = applied.to_vec();
+        self.failures = failures.to_vec();
+        self.commit = commit;
+        self.phase = CommitPhase::Resolved;
+        let partial = self.report(false);
+        if let Err(error) =
+            update_blocking_checkpoint(&self.db, &self.call, LedgerClaim::NotClaimed, &partial)
+                .await
+        {
+            log::warn!("could not checkpoint a mixed write's commit: {error}");
+        }
+    }
+
+    /// Settle the row with the carrier's final `report`. The one way a
+    /// carrier holding the claim answers for itself.
+    pub(super) async fn finish(&mut self, report: &str) {
+        finalize_report(&self.db, &self.call, report).await;
+        self.disarm();
+    }
+
     /// The report as it stands; `stopped` adds a failure for every item not
-    /// yet settled.
+    /// yet settled. A file item is listed applied only once its commit has
+    /// resolved: before that it was interpreted, never committed.
     fn report(&self, stopped: bool) -> String {
-        let partial_success = !self.applied.is_empty() && !self.failures.is_empty();
+        let committed = self.phase == CommitPhase::Resolved;
+        let applied: Vec<_> = self
+            .applied
+            .iter()
+            .filter(|change| committed || !self.file_items.contains(&change.index))
+            .cloned()
+            .collect();
+        let partial_success = !applied.is_empty() && !self.failures.is_empty();
         let report = super::empty_change_report(
-            self.applied.clone(),
+            applied,
             self.failures.clone(),
-            None,
+            self.commit.clone(),
             partial_success,
             self.atomic,
         );
@@ -903,7 +1020,14 @@ impl ResourceWriteProgress {
         };
         if stopped {
             mark_unsettled(&mut value, &self.items, |index| {
-                if Some(index) == self.in_flight {
+                if self.file_items.contains(&index) {
+                    match self.phase {
+                        CommitPhase::Interpreting => NOT_COMMITTED.to_string(),
+                        CommitPhase::Committing | CommitPhase::Resolved => {
+                            NOT_CONFIRMED.to_string()
+                        }
+                    }
+                } else if Some(index) == self.in_flight {
                     NOT_CONFIRMED.to_string()
                 } else {
                     NOT_APPLIED.to_string()
