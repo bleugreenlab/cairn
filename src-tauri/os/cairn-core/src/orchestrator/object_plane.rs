@@ -1164,6 +1164,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         state.authorize_request(&request, "executor", 1);
         assert!(state.authorizes(&coordinate(1), &request.base_commit));

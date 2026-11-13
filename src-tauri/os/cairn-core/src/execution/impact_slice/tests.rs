@@ -282,6 +282,7 @@ fn lane_with_env(
         on_group_complete: None,
         purpose: None,
         cell_groups: Default::default(),
+        publication: None,
     };
     (batch, item)
 }

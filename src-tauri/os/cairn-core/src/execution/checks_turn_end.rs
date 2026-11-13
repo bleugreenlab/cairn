@@ -2380,6 +2380,7 @@ async fn run_turn_end_checks_inner(
             // The commit's own groups: the Rust lanes it declares together run
             // in one cell, in the declared order, on one target directory.
             cell_groups,
+            publication: None,
         };
         // The last decision before the machine is asked for anything. Everything
         // since the first check took minutes, and a merge landing inside that window

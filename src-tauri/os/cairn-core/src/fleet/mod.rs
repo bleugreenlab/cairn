@@ -50,6 +50,7 @@ use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::needs_build_volume;
 use cairn_common::executor_protocol::DiskHealthStatus;
 use cairn_common::executor_protocol::MachineSample;
+pub(crate) use cairn_common::executor_protocol::PublicationCustody;
 use cairn_common::executor_protocol::SandboxCapabilityEvidence;
 use cairn_common::executor_protocol::StallInstrumentState;
 #[cfg(test)]
@@ -83,6 +84,9 @@ use cairn_common::executor_protocol::{
     PriorDecline,
 };
 use cairn_common::executor_protocol::{HomeAffinity, ScratchSyncEstimate};
+use cairn_common::executor_protocol::{
+    PublishIsolationEvidence, PublishIsolationVerdict, PUBLISH_ISOLATION_STALE_AFTER_MS,
+};
 use cairn_common::pipe_health::PipeFloorWork;
 use cairn_uri::normalize_executor_name;
 use decline_condition::{AdmissionView, PostedHold};
@@ -1153,6 +1157,10 @@ pub(crate) struct KnownMachinePlatform {
     /// What it advertises once attached; `None` for an enrolled machine that
     /// has not attached, whose toolchains are unknown until it does.
     pub toolchains: Option<Vec<String>>,
+    /// What this runner holds it to be for.
+    pub role: MachineRole,
+    /// Its publisher isolation verdict, once attached and advertising one.
+    pub publish_isolation: Option<PublishIsolationEvidence>,
 }
 
 /// The operating system and architecture a machine advertises, in the
@@ -4567,6 +4575,7 @@ impl Fleet {
                 containment: None,
                 page_call_programs: None,
                 github_credential: None,
+                publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
                 service_bounds: None,
@@ -7897,11 +7906,13 @@ impl Fleet {
             .unattached_enrolled_remotes()
             .into_iter()
             .map(|machine| KnownMachinePlatform {
+                role: self.machine_role(&machine.executor_id),
                 executor_id: machine.executor_id,
                 name: machine.name,
                 os: machine.os.to_ascii_lowercase(),
                 arch: machine.arch.to_ascii_lowercase(),
                 toolchains: None,
+                publish_isolation: None,
             })
             .collect();
         let connections = self.lock_connections();
@@ -7913,6 +7924,8 @@ impl Fleet {
                 os: capabilities.os.to_ascii_lowercase(),
                 arch: capabilities.arch.to_ascii_lowercase(),
                 toolchains: Some(capabilities.toolchains.clone()),
+                role: entry.machine_role,
+                publish_isolation: capabilities.publish_isolation.clone(),
             });
         }
         machines
@@ -16373,6 +16386,7 @@ impl Fleet {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         self.select_executor(
             &request,
@@ -16924,6 +16938,7 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         learned_estimate: None,
         scratch_sync: None,
         home_affinity: None,
+        publication: None,
     }
 }
 
@@ -17304,6 +17319,10 @@ pub(crate) struct PlacementScope<'a> {
     /// executor applies the same classification, so placement never rejects
     /// what the machine would take.
     pub(crate) pipe_floor: PipeFloorWork,
+    /// Set for a publication leg, which placement offers by role
+    /// ([`MachineRole::takes_publication_legs`]) rather than by class, and
+    /// only to a measured publisher when it carries the release secret.
+    pub(crate) publication: Option<PublicationCustody>,
 }
 
 /// The opening of every refusal caused by a project config that cannot be
@@ -17375,6 +17394,7 @@ impl<'a> PlacementScope<'a> {
                     Some(ResidencyHolder::Job { .. })
                 ),
             pipe_floor: pipe_floor_work(request),
+            publication: request.publication,
         }
     }
 
@@ -17441,22 +17461,118 @@ fn selected_link_dispatch_error(
 /// The room a model resident holds is not judged here but where the work's
 /// resolved demand is known ([`model_room_rejection`]), after every clause
 /// below, so a machine refused for it is otherwise able to take the work.
+/// The role clause of [`candidate_rejection`]: whether this machine's role
+/// lets it be offered this work at all, and, for a publication leg that
+/// carries the release secret, whether it is a measured publisher.
+///
+/// A machine that advertises publisher mode under any other role is refused
+/// everything, a pin included: its account was set up to hold the secret, and
+/// a `general` role would run agent batches there. A residency pin is exempt
+/// from the plain role refusal only, as before; the publisher requirement is
+/// never exempt, like a missing GitHub credential, since it is a fact about
+/// the machine and not about where the work already lives.
+fn role_rejection(
+    entry: &ExecutorConnectionState,
+    scope: PlacementScope<'_>,
+    pinned_here: bool,
+    now_unix_ms: u64,
+) -> Option<PlacementRejectionReason> {
+    publication_role_rejection(
+        entry.machine_role,
+        entry.advertisement.capabilities.publish_isolation.as_ref(),
+        scope.publication,
+        scope.work_class,
+        pinned_here,
+        now_unix_ms,
+    )
+}
+
+/// [`role_rejection`] over the facts it reads, so a caller asking before a
+/// request exists (the publication actor choosing a target's builders) gets
+/// placement's own answer and its own words.
+pub(crate) fn publication_role_rejection(
+    role: MachineRole,
+    publish_isolation: Option<&PublishIsolationEvidence>,
+    publication: Option<PublicationCustody>,
+    work_class: PlacementWorkClass,
+    pinned_here: bool,
+    now_unix_ms: u64,
+) -> Option<PlacementRejectionReason> {
+    if publish_isolation.is_some() && role != MachineRole::PublishOnly {
+        return Some(PlacementRejectionReason::NotPublishEligible {
+            why: format!(
+                "started as a publisher but enrolled as {}; re-enrol it with --role publishOnly",
+                role.as_str()
+            ),
+        });
+    }
+    match publication {
+        None => (!role.accepts(work_class) && !pinned_here).then_some(
+            PlacementRejectionReason::RoleExcluded {
+                role,
+                work_class,
+                publication_leg: false,
+            },
+        ),
+        Some(custody) => {
+            if !role.takes_publication_legs() && !pinned_here {
+                Some(PlacementRejectionReason::RoleExcluded {
+                    role,
+                    work_class,
+                    publication_leg: true,
+                })
+            } else if custody.publisher_required {
+                publisher_ineligibility(role, publish_isolation, now_unix_ms)
+                    .map(|why| PlacementRejectionReason::NotPublishEligible { why })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Why a machine may not hold the release secret, or `None` when it may: it
+/// is a `publishOnly` executor whose isolation probe measured PASS no longer
+/// than [`PUBLISH_ISOLATION_STALE_AFTER_MS`] ago. Unmeasured is a refusal,
+/// never a pass (tenet 1441), and that includes a publisher whose first probe
+/// has not returned.
+pub(crate) fn publisher_ineligibility(
+    role: MachineRole,
+    evidence: Option<&PublishIsolationEvidence>,
+    now_unix_ms: u64,
+) -> Option<String> {
+    if role != MachineRole::PublishOnly {
+        return Some(format!("role {}", role.as_str()));
+    }
+    let Some(evidence) = evidence else {
+        return Some("isolation unmeasured: executor not started as a publisher".into());
+    };
+    match &evidence.verdict {
+        PublishIsolationVerdict::Unmeasured { reason } => {
+            Some(format!("isolation unmeasured: {reason}"))
+        }
+        PublishIsolationVerdict::Fail { reason } => Some(format!("isolation FAIL: {reason}")),
+        PublishIsolationVerdict::Pass => {
+            let age = now_unix_ms.saturating_sub(evidence.measured_at_unix_ms);
+            (age > PUBLISH_ISOLATION_STALE_AFTER_MS)
+                .then(|| format!("isolation measured {}m ago; stale", age / 60_000))
+        }
+    }
+}
+
 fn candidate_rejection(
     entry: &ExecutorConnectionState,
     scope: PlacementScope<'_>,
     now_unix_ms: u64,
 ) -> Option<PlacementRejectionReason> {
     let pinned_here = scope.pinned_executor_id == Some(entry.identity.executor_id.as_str());
-    if !entry.machine_role.accepts(scope.work_class) && !pinned_here {
+    if let Some(reason) = role_rejection(entry, scope, pinned_here, now_unix_ms) {
         // First, so a machine that is wrong for this class says so rather than
         // reporting a drain or a stale link that could clear on its own. It
         // binds the colocated machine and an explicit selector alike; only a
         // residency pin is exempt, as for a drain, so work already resident
         // there when the role changed may finish.
-        Some(PlacementRejectionReason::RoleExcluded {
-            role: entry.machine_role,
-            work_class: scope.work_class,
-        })
+        Some(reason)
     } else if scope
         .selector
         .is_some_and(|selector| !matches_selector(entry, selector))
@@ -19033,6 +19149,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::PreparationRefused { .. } => "preparationRefused",
         PlacementRejectionReason::BuildPrerequisitesMissing { .. } => "buildPrerequisitesMissing",
         PlacementRejectionReason::GithubCredentialMissing { .. } => "githubCredentialMissing",
+        PlacementRejectionReason::NotPublishEligible { .. } => "notPublishEligible",
     };
     kind.to_string()
 }
@@ -19059,7 +19176,8 @@ fn placement_rejection_log_level(rejection: &PlacementRejection) -> log::Level {
         PlacementRejectionReason::PreparationToolchainMissing { .. }
         | PlacementRejectionReason::PreparationRefused { .. }
         | PlacementRejectionReason::BuildPrerequisitesMissing { .. }
-        | PlacementRejectionReason::GithubCredentialMissing { .. } => log::Level::Info,
+        | PlacementRejectionReason::GithubCredentialMissing { .. }
+        | PlacementRejectionReason::NotPublishEligible { .. } => log::Level::Info,
         _ => log::Level::Warn,
     }
 }
@@ -20357,9 +20475,17 @@ fn rank_candidates<'a, 'b>(
     // first for it. Like the stance it is a preference inside the hard group
     // and the preference-delay deadline: priced, never a pin (tenet 314), so a
     // service box that is away or clearly slower yields to the next machine.
+    // A publication leg likewise ranks a publisher first, which matters only
+    // for a secret-free leg: a secret-bearing one is offered to nothing else.
     let role_affinity = |candidate: &&ScoredCandidate<'a>| {
-        !(request.placement_work_class == PlacementWorkClass::Services
-            && candidate.entry.machine_role == MachineRole::ServicesOnly)
+        let suited = match request.publication {
+            Some(_) => candidate.entry.machine_role == MachineRole::PublishOnly,
+            None => {
+                request.placement_work_class == PlacementWorkClass::Services
+                    && candidate.entry.machine_role == MachineRole::ServicesOnly
+            }
+        };
+        !suited
     };
     let priority = |candidate: &&ScoredCandidate<'a>| {
         policy
@@ -26096,6 +26222,7 @@ mod tests {
             containment: None,
             page_call_programs: None,
             github_credential: None,
+            publish_isolation: None,
             machine_services: Vec::new(),
             credential_floor_service_residents: false,
             service_bounds: None,
@@ -26233,6 +26360,7 @@ mod tests {
             containment,
             page_call_programs: None,
             github_credential: None,
+            publish_isolation: None,
             machine_services: Vec::new(),
             credential_floor_service_residents: false,
             service_bounds: None,
@@ -26783,6 +26911,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         }
     }
 
@@ -27977,6 +28106,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
 
         let outcome = pool.submit_execution(&orch, request, None).await;
@@ -28055,6 +28185,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         let config = ExecutorConfig {
             project_id: "p".into(),
@@ -28738,6 +28869,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         let started = Instant::now();
         let outcome = pool
@@ -29367,6 +29499,7 @@ mod tests {
                         containment: None,
                         page_call_programs: None,
                         github_credential: None,
+                        publish_isolation: None,
                         machine_services: Vec::new(),
                         credential_floor_service_residents: false,
                         service_bounds: None,
@@ -31690,6 +31823,7 @@ mod tests {
                     containment: None,
                     page_call_programs: None,
                     github_credential: None,
+                    publish_isolation: None,
                     machine_services: Vec::new(),
                     credential_floor_service_residents: false,
                     service_bounds: None,
@@ -35810,6 +35944,7 @@ mod tests {
                 &PlacementRejectionReason::RoleExcluded {
                     role: MachineRole::InferenceOnly,
                     work_class: class,
+                    publication_leg: false,
                 },
                 "{class:?}"
             );
@@ -35856,6 +35991,7 @@ mod tests {
                 &PlacementRejectionReason::RoleExcluded {
                     role: MachineRole::ServicesOnly,
                     work_class: class,
+                    publication_leg: false,
                 },
                 "{class:?}"
             );
@@ -35877,6 +36013,178 @@ mod tests {
             place(&connections, &request).expect_err("a batch is refused"),
             "sp1 runs services only; this request is agentSessions. Its role is set by an operator on cairn://executors/sp1."
         );
+    }
+
+    fn isolation(verdict: PublishIsolationVerdict, age_ms: u64) -> PublishIsolationEvidence {
+        PublishIsolationEvidence {
+            verdict,
+            measured_at_unix_ms: NOW - age_ms,
+            lines: Vec::new(),
+        }
+    }
+
+    fn publication_leg(publisher_required: bool) -> CellRequest {
+        let mut request = spillable_request();
+        request.placement_work_class = PlacementWorkClass::ReviewChecks;
+        request.publication = Some(PublicationCustody { publisher_required });
+        request
+    }
+
+    /// A publisher takes publication legs and nothing else, however idle: an
+    /// agent batch, check lane, terminal, dev instance or service goes to its
+    /// sibling, and the record says it publishes only.
+    #[test]
+    fn a_publish_only_machine_takes_publication_legs_and_is_passed_over_for_everything_else() {
+        let connections = busy_home_and_idle_remote(MachineRole::PublishOnly);
+        for class in PlacementWorkClass::ALL {
+            let mut request = spillable_request();
+            request.placement_work_class = class;
+            let draft = place_remote_first(&connections, &request).unwrap();
+            assert_eq!(
+                chosen(&draft).executor_id,
+                COLOCATED_EXECUTOR_ID,
+                "{class:?}"
+            );
+            let reason = rejection_for(&draft, "sp1");
+            assert_eq!(
+                reason,
+                &PlacementRejectionReason::RoleExcluded {
+                    role: MachineRole::PublishOnly,
+                    work_class: class,
+                    publication_leg: false,
+                }
+            );
+            assert_eq!(
+                reason.describe(),
+                format!("publishes only; this request is {}", class.as_str())
+            );
+        }
+        let draft = place_remote_first(&connections, &publication_leg(false)).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "sp1");
+    }
+
+    /// The roles that take no publication leg refuse one by name, whatever
+    /// class it travels as; general and builds-only take a secret-free one.
+    #[test]
+    fn only_general_builds_only_and_publish_only_take_a_publication_leg() {
+        for role in [MachineRole::ServicesOnly, MachineRole::InferenceOnly] {
+            let connections = busy_home_and_idle_remote(role);
+            let draft = place_remote_first(&connections, &publication_leg(false)).unwrap();
+            assert_eq!(
+                chosen(&draft).executor_id,
+                COLOCATED_EXECUTOR_ID,
+                "{role:?}"
+            );
+            assert_eq!(
+                rejection_for(&draft, "sp1").describe(),
+                format!("runs {}; this request is publicationLeg", role.label())
+            );
+        }
+        for role in [MachineRole::General, MachineRole::BuildsOnly] {
+            let connections = busy_home_and_idle_remote(role);
+            let draft = place_remote_first(&connections, &publication_leg(false)).unwrap();
+            assert_eq!(chosen(&draft).executor_id, "sp1", "{role:?}");
+        }
+    }
+
+    /// A secret-bearing leg goes only to a publisher whose isolation measured
+    /// PASS recently. Every other answer is a refusal naming why, a pin does
+    /// not lift it, and unmeasured is never a pass.
+    #[test]
+    fn a_secret_bearing_leg_goes_only_to_a_freshly_measured_publisher() {
+        let stale = PUBLISH_ISOLATION_STALE_AFTER_MS + 60_000;
+        let cases: [(MachineRole, Option<PublishIsolationEvidence>, Option<&str>); 7] = [
+            (MachineRole::General, None, Some("role general")),
+            (MachineRole::BuildsOnly, None, Some("role buildsOnly")),
+            (
+                MachineRole::PublishOnly,
+                None,
+                Some("isolation unmeasured: executor not started as a publisher"),
+            ),
+            (
+                MachineRole::PublishOnly,
+                Some(isolation(
+                    PublishIsolationVerdict::Unmeasured {
+                        reason: "probe pending".into(),
+                    },
+                    0,
+                )),
+                Some("isolation unmeasured: probe pending"),
+            ),
+            (
+                MachineRole::PublishOnly,
+                Some(isolation(
+                    PublishIsolationVerdict::Fail {
+                        reason: "home is open".into(),
+                    },
+                    0,
+                )),
+                Some("isolation FAIL: home is open"),
+            ),
+            (
+                MachineRole::PublishOnly,
+                Some(isolation(PublishIsolationVerdict::Pass, stale)),
+                Some("stale"),
+            ),
+            (
+                MachineRole::PublishOnly,
+                Some(isolation(PublishIsolationVerdict::Pass, 4 * 60_000)),
+                None,
+            ),
+        ];
+        for (role, evidence, refused) in cases {
+            let mut connections = busy_home_and_idle_remote(role);
+            Arc::make_mut(&mut connections.get_mut("sp1").unwrap().advertisement)
+                .capabilities
+                .publish_isolation = evidence.clone();
+            let mut pinned = publication_leg(true);
+            pinned.pinned_executor_id = Some("sp1".into());
+            for request in [publication_leg(true), pinned] {
+                let reason =
+                    candidate_rejection(&connections["sp1"], PlacementScope::of(&request), NOW);
+                match refused {
+                    None => assert_eq!(reason, None, "{role:?} {evidence:?}"),
+                    Some(why) => {
+                        let Some(PlacementRejectionReason::NotPublishEligible { why: got }) =
+                            &reason
+                        else {
+                            panic!("{role:?} {evidence:?}: {reason:?}");
+                        };
+                        assert!(got.contains(why), "{got}");
+                        assert!(reason
+                            .as_ref()
+                            .unwrap()
+                            .describe()
+                            .contains("release secrets go only to publishOnly executors whose isolation measured PASS"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// An executor started as a publisher (it advertises a verdict) under any
+    /// other role is refused everything, a pin included: its account holds
+    /// the secret.
+    #[test]
+    fn a_publisher_enrolled_under_another_role_is_refused_all_work() {
+        let mut connections = busy_home_and_idle_remote(MachineRole::General);
+        Arc::make_mut(&mut connections.get_mut("sp1").unwrap().advertisement)
+            .capabilities
+            .publish_isolation = Some(isolation(PublishIsolationVerdict::Pass, 0));
+        let mut pinned = spillable_request();
+        pinned.pinned_executor_id = Some("sp1".into());
+        for request in [
+            spillable_request(),
+            publication_leg(false),
+            publication_leg(true),
+            pinned,
+        ] {
+            assert!(matches!(
+                candidate_rejection(&connections["sp1"], PlacementScope::of(&request), NOW),
+                Some(PlacementRejectionReason::NotPublishEligible { why })
+                    if why.starts_with("started as a publisher but enrolled as general")
+            ));
+        }
     }
 
     /// Rank a service resident (or `class`) among `candidates`, each at the
@@ -38482,6 +38790,7 @@ mod tests {
             work_class: PlacementWorkClass::ReviewChecks,
             compiles_rust: false,
             pipe_floor: PipeFloorWork::Process,
+            publication: None,
         }
     }
 
@@ -41252,6 +41561,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         }
     }
 

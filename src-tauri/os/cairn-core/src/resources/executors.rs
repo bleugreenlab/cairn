@@ -484,6 +484,13 @@ pub(crate) fn render_executors(
             "- GitHub: {}\n",
             github_credential_summary(capabilities, executor.captured_at_unix_ms)
         ));
+        if let Some(summary) = publish_isolation_summary(
+            executor.health.role,
+            capabilities,
+            executor.captured_at_unix_ms,
+        ) {
+            out.push_str(&format!("- Publish isolation: {summary}\n"));
+        }
         for eligibility in &executor.project_eligibility {
             if let Some(why) = ineligibility_summary(&eligibility.refusals) {
                 out.push_str(&format!(
@@ -1504,6 +1511,19 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
                 "  - Probed against: {}\n",
                 evidence.probed_repositories.join(", ")
             ));
+        }
+    }
+    if let Some(summary) =
+        publish_isolation_summary(health.role, capabilities, executor.captured_at_unix_ms)
+    {
+        out.push_str(&format!("- Publish isolation: {summary}\n"));
+        out.push_str(PUBLISH_CUSTODY_LINE);
+        for line in capabilities
+            .publish_isolation
+            .iter()
+            .flat_map(|evidence| &evidence.lines)
+        {
+            out.push_str(&format!("  - {}\n", one_line(line)));
         }
     }
     out.push_str(&render_build_prerequisites(capabilities));
@@ -6322,6 +6342,54 @@ fn github_credential_summary(
     }
 }
 
+/// Where a publisher's secret is guarded, said once under its verdict. The
+/// leg runs in an ordinary cell: its fence restricts writes, not reads (on
+/// Linux it enforces no read rule at all), so the cell does not guard
+/// `release.env`; the account does, and that is what the verdict measures.
+const PUBLISH_CUSTODY_LINE: &str = "  - Custody: the release secret lives in this account's home (~/.config/cairn-publish/release.env). A publication leg runs in an ordinary cell whose fence restricts writes, not reads, so the account boundary measured here, not the fence, is what keeps the secret\n";
+
+/// A publisher's isolation verdict, in one line: `PASS (measured 4m ago)`,
+/// `FAIL: <reason> (…)` or `unmeasured: <reason> (…)`, with why placement
+/// refuses it anyway when it does. `None` for a machine that is neither
+/// enrolled as a publisher nor advertising a verdict.
+fn publish_isolation_summary(
+    role: MachineRole,
+    capabilities: &ExecutorCapabilities,
+    captured_at_unix_ms: u64,
+) -> Option<String> {
+    use cairn_common::executor_protocol::PublishIsolationVerdict;
+    let evidence = capabilities.publish_isolation.as_ref();
+    if role != MachineRole::PublishOnly && evidence.is_none() {
+        return None;
+    }
+    let Some(evidence) = evidence else {
+        return Some("unmeasured: executor not started as a publisher".to_string());
+    };
+    let measured = age(captured_at_unix_ms.saturating_sub(evidence.measured_at_unix_ms));
+    let mut summary = match &evidence.verdict {
+        PublishIsolationVerdict::Pass => format!("PASS (measured {measured})"),
+        PublishIsolationVerdict::Fail { reason } => {
+            format!("FAIL: {} (measured {measured})", one_line(reason))
+        }
+        PublishIsolationVerdict::Unmeasured { reason } => {
+            format!("unmeasured: {} (measured {measured})", one_line(reason))
+        }
+    };
+    if role != MachineRole::PublishOnly {
+        summary.push_str(&format!(
+            "; refused all work: started as a publisher but enrolled as {}",
+            role.as_str()
+        ));
+    } else if matches!(evidence.verdict, PublishIsolationVerdict::Pass) {
+        if let Some(why) =
+            crate::fleet::publisher_ineligibility(role, Some(evidence), captured_at_unix_ms)
+        {
+            summary.push_str(&format!("; refused: {why}"));
+        }
+    }
+    Some(summary)
+}
+
 /// The fleet page's account of what each project needs of a machine beyond
 /// its toolchains: what its config declares under `requires`, and what the
 /// runner learned from a run that failed for want of a capability, with that
@@ -8930,6 +8998,7 @@ mod tests {
                         containment: None,
                         page_call_programs: None,
                         github_credential: None,
+                        publish_isolation: None,
                         machine_services: Vec::new(),
                         credential_floor_service_residents: false,
                         service_bounds: None,
@@ -9250,6 +9319,55 @@ mod tests {
             rendered.contains("- Build prerequisites: MISSING — Missing Linux self-hosted runner prerequisites on bglab-sp1: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev — Provision bglab-sp1 once with: sudo scripts/setup-self-hosted-runner-linux.sh\n"),
             "{rendered}"
         );
+    }
+
+    /// cairn/7074: a publisher's page names its isolation verdict, its age,
+    /// why placement refuses it anyway, and where the secret is guarded; a
+    /// machine that is no publisher says nothing about it.
+    #[test]
+    fn a_publisher_page_names_its_isolation_verdict_and_where_the_secret_is_guarded() {
+        use cairn_common::executor_protocol::{PublishIsolationEvidence, PublishIsolationVerdict};
+        // Later than CAPTURED_AT, so a stale verdict's age fits before it.
+        const NOW: u64 = 10_000_000_000;
+        let publisher = |verdict: Option<PublishIsolationVerdict>, age_ms: u64| {
+            let mut executor = inspection("cairn-publish", false);
+            executor.captured_at_unix_ms = NOW;
+            executor.health.role = MachineRole::PublishOnly;
+            executor.health.advertisement.capabilities.publish_isolation =
+                verdict.map(|verdict| PublishIsolationEvidence {
+                    verdict,
+                    measured_at_unix_ms: NOW - age_ms,
+                    lines: vec![
+                        "sudo: fedora user cairn-publish uid 1002: cannot escalate".into(),
+                        "verdict: fedora PASS: publisher uid 1002".into(),
+                    ],
+                });
+            render_executor(&executor)
+        };
+        let pass = publisher(Some(PublishIsolationVerdict::Pass), 4 * 60_000);
+        assert!(
+            pass.contains("- Publish isolation: PASS (measured 4m ago)\n"),
+            "{pass}"
+        );
+        assert!(pass.contains("  - Custody: the release secret lives in this account's home"));
+        assert!(pass.contains("  - verdict: fedora PASS: publisher uid 1002\n"));
+        let fail = publisher(
+            Some(PublishIsolationVerdict::Fail {
+                reason: "home /home/cairn-publish is open".into(),
+            }),
+            60_000,
+        );
+        assert!(fail.contains("- Publish isolation: FAIL: home /home/cairn-publish is open"));
+        let stale = publisher(
+            Some(PublishIsolationVerdict::Pass),
+            cairn_common::executor_protocol::PUBLISH_ISOLATION_STALE_AFTER_MS + 60_000,
+        );
+        assert!(stale.contains("; refused: isolation measured"), "{stale}");
+        let never = publisher(None, 0);
+        assert!(never
+            .contains("- Publish isolation: unmeasured: executor not started as a publisher\n"));
+        let ordinary = render_executor(&inspection("fedora", false));
+        assert!(!ordinary.contains("Publish isolation"), "{ordinary}");
     }
 
     /// cairn/5873: each machine says whether it can authenticate to GitHub, in

@@ -38,6 +38,8 @@ pub struct Publication {
     pub summary: Option<String>,
     pub created_at: i64,
     pub ended_at: Option<i64>,
+    /// The targets whose legs run live, as the commit declared at start.
+    pub live_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +66,8 @@ pub struct PublicationLeg {
     pub build_jobs: Option<Value>,
     pub log_ref: Option<String>,
     pub request_id: Option<String>,
+    /// `shadow` (uploads nothing, ever) or `live`. Fixed when laid out.
+    pub mode: String,
 }
 
 impl PublicationLeg {
@@ -88,6 +92,7 @@ pub struct NewPublication {
     pub force_targets: Vec<String>,
     pub tool: Option<String>,
     pub mode: String,
+    pub live_targets: Vec<String>,
     pub created_at: i64,
 }
 
@@ -121,7 +126,7 @@ pub struct LegUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum TargetState {
-    /// A publication's publish leg for it succeeded.
+    /// A live publish leg for it succeeded. Shadow legs never count.
     Live,
     /// A publication that would publish it has not settled.
     InFlight,
@@ -145,7 +150,7 @@ fn to_json(value: &impl Serialize) -> DbResult<String> {
     serde_json::to_string(value).map_err(json_err)
 }
 
-const PUBLICATION_COLUMNS: &str = "id,project_id,kind,\"commit\",protocol,trigger,requested_by,force_targets_json,tool,plan_json,mode,state,summary,created_at,ended_at";
+const PUBLICATION_COLUMNS: &str = "id,project_id,kind,\"commit\",protocol,trigger,requested_by,force_targets_json,tool,plan_json,mode,state,summary,created_at,ended_at,live_targets_json";
 
 fn decode_publication(row: &crate::turso::Row) -> DbResult<Publication> {
     Ok(Publication {
@@ -164,10 +169,11 @@ fn decode_publication(row: &crate::turso::Row) -> DbResult<Publication> {
         summary: row.opt_text(12)?,
         created_at: row.i64(13)?,
         ended_at: row.opt_i64(14)?,
+        live_targets: serde_json::from_str(&row.text(15)?).map_err(json_err)?,
     })
 }
 
-const LEG_COLUMNS: &str = "publication_id,target,leg,seq,builder,builder_kind,state,reason,started_at,ended_at,assets_json,artifact_location,signer_json,verifier_json,build_jobs_json,log_ref,request_id";
+const LEG_COLUMNS: &str = "publication_id,target,leg,seq,builder,builder_kind,state,reason,started_at,ended_at,assets_json,artifact_location,signer_json,verifier_json,build_jobs_json,log_ref,request_id,mode";
 
 fn decode_leg(row: &crate::turso::Row) -> DbResult<PublicationLeg> {
     Ok(PublicationLeg {
@@ -188,6 +194,7 @@ fn decode_leg(row: &crate::turso::Row) -> DbResult<PublicationLeg> {
         build_jobs: opt_json(row, 14)?,
         log_ref: row.opt_text(15)?,
         request_id: row.opt_text(16)?,
+        mode: row.text(17)?,
     })
 }
 
@@ -236,7 +243,7 @@ pub async fn start(db: &LocalDb, new: NewPublication, why_replaced: &str) -> DbR
                 .await?;
             }
             conn.execute(
-                "INSERT INTO publications (id,project_id,kind,\"commit\",trigger,requested_by,force_targets_json,tool,mode,state,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10)",
+                "INSERT INTO publications (id,project_id,kind,\"commit\",trigger,requested_by,force_targets_json,tool,mode,state,created_at,live_targets_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10,?11)",
                 params![
                     new.id.clone(),
                     new.project_id.clone(),
@@ -247,7 +254,8 @@ pub async fn start(db: &LocalDb, new: NewPublication, why_replaced: &str) -> DbR
                     to_json(&new.force_targets)?,
                     new.tool.clone(),
                     new.mode.clone(),
-                    new.created_at
+                    new.created_at,
+                    to_json(&new.live_targets)?
                 ],
             )
             .await?;
@@ -343,21 +351,24 @@ pub async fn settle(db: &LocalDb, id: &str, summary: &str, at: i64) -> DbResult<
     Ok(())
 }
 
-/// Lay out a leg as queued. Laying out an existing leg is a no-op.
+/// Lay out a leg as queued, `shadow` or `live`. Laying out an existing leg is
+/// a no-op.
 pub async fn add_leg(
     db: &LocalDb,
     publication_id: &str,
     target: &str,
     leg: &str,
     seq: i64,
+    mode: &str,
 ) -> DbResult<()> {
     db.execute(
-        "INSERT INTO publication_legs (publication_id,target,leg,seq,builder_kind,state) VALUES (?1,?2,?3,?4,'fleet','queued') ON CONFLICT DO NOTHING",
+        "INSERT INTO publication_legs (publication_id,target,leg,seq,builder_kind,state,mode) VALUES (?1,?2,?3,?4,'fleet','queued',?5) ON CONFLICT DO NOTHING",
         params![
             publication_id.to_string(),
             target.to_string(),
             leg.to_string(),
-            seq
+            seq,
+            mode.to_string()
         ],
     )
     .await?;
@@ -527,12 +538,13 @@ pub async fn recover_at_boot(db: &LocalDb, at: i64) -> DbResult<Vec<String>> {
 /// publication's publish leg for it succeeded, in flight if an unsettled
 /// publication at that protocol (or one not yet planned) still carries a leg
 /// for it, failed with the leg and reason of the newest settled failure, and
-/// none otherwise. Shadow publications never publish, so they are never live.
+/// none otherwise. Only live legs count: a shadow leg uploads nothing, even
+/// inside a live publication, so it never reads as live, in flight or failed.
 pub async fn target_state(db: &LocalDb, protocol: i64, target: &str) -> DbResult<TargetState> {
     let live = db
         .query_opt_i64(
             "SELECT 1 FROM publication_legs l JOIN publications p ON p.id=l.publication_id
-             WHERE p.kind='executor' AND p.protocol=?1 AND l.target=?2 AND l.leg='publish' AND l.state='succeeded' LIMIT 1",
+             WHERE p.kind='executor' AND p.protocol=?1 AND l.target=?2 AND l.leg='publish' AND l.mode='live' AND l.state='succeeded' LIMIT 1",
             (protocol, target.to_string()),
         )
         .await?;
@@ -543,7 +555,7 @@ pub async fn target_state(db: &LocalDb, protocol: i64, target: &str) -> DbResult
         .query_opt_i64(
             "SELECT 1 FROM publications p WHERE p.kind='executor' AND p.mode='live' AND p.state<>'settled'
                AND (p.protocol IS NULL OR (p.protocol=?1 AND EXISTS (
-                    SELECT 1 FROM publication_legs l WHERE l.publication_id=p.id AND l.target=?2 AND l.state IN ('queued','running'))))
+                    SELECT 1 FROM publication_legs l WHERE l.publication_id=p.id AND l.target=?2 AND l.mode='live' AND l.state IN ('queued','running'))))
              LIMIT 1",
             (protocol, target.to_string()),
         )
@@ -554,7 +566,7 @@ pub async fn target_state(db: &LocalDb, protocol: i64, target: &str) -> DbResult
     let failed = db
         .query_opt(
             "SELECT l.leg, l.reason FROM publication_legs l JOIN publications p ON p.id=l.publication_id
-             WHERE p.kind='executor' AND p.mode='live' AND p.protocol=?1 AND l.target=?2 AND l.state IN ('failed','refused','deferred')
+             WHERE p.kind='executor' AND l.mode='live' AND p.protocol=?1 AND l.target=?2 AND l.state IN ('failed','refused','deferred')
              ORDER BY l.ended_at DESC LIMIT 1",
             (protocol, target.to_string()),
             |row| Ok((row.text(0)?, row.opt_text(1)?.unwrap_or_default())),
@@ -601,6 +613,11 @@ mod tests {
             force_targets: vec![],
             tool: None,
             mode: mode.into(),
+            live_targets: if mode == "live" {
+                vec!["x86_64-unknown-linux-gnu".into()]
+            } else {
+                vec![]
+            },
             created_at: at,
         }
     }
@@ -648,7 +665,7 @@ mod tests {
     async fn settled_rows_are_immutable() {
         let db = migrated_test_db("publications-immutable").await;
         start(&db, new("one", 1, "live"), "").await.unwrap();
-        add_leg(&db, "one", "t", "build", 1).await.unwrap();
+        add_leg(&db, "one", "t", "build", 1, "live").await.unwrap();
         update_leg(
             &db,
             "one",
@@ -686,7 +703,7 @@ mod tests {
     async fn a_shadow_publication_never_records_an_upload() {
         let db = migrated_test_db("publications-shadow").await;
         start(&db, new("s", 1, "shadow"), "").await.unwrap();
-        add_leg(&db, "s", "t", "build", 1).await.unwrap();
+        add_leg(&db, "s", "t", "build", 1, "shadow").await.unwrap();
         let refused = update_leg(
             &db,
             "s",
@@ -719,8 +736,8 @@ mod tests {
         let db = migrated_test_db("publications-boot").await;
         start(&db, new("r", 1, "shadow"), "").await.unwrap();
         claim_next(&db, "p").await.unwrap();
-        add_leg(&db, "r", "all", "plan", 0).await.unwrap();
-        add_leg(&db, "r", "t", "build", 1).await.unwrap();
+        add_leg(&db, "r", "all", "plan", 0, "shadow").await.unwrap();
+        add_leg(&db, "r", "t", "build", 1, "shadow").await.unwrap();
         update_leg(
             &db,
             "r",
@@ -757,7 +774,7 @@ mod tests {
             TargetState::InFlight
         );
         record_plan(&db, "a", None, Some(7), None).await.unwrap();
-        add_leg(&db, "a", t, "publish", 3).await.unwrap();
+        add_leg(&db, "a", t, "publish", 3, "live").await.unwrap();
         assert_eq!(
             target_state(&db, 7, t).await.unwrap(),
             TargetState::InFlight
@@ -786,7 +803,7 @@ mod tests {
         );
         start(&db, new("b", 4, "live"), "").await.unwrap();
         record_plan(&db, "b", None, Some(7), None).await.unwrap();
-        add_leg(&db, "b", t, "publish", 3).await.unwrap();
+        add_leg(&db, "b", t, "publish", 3, "live").await.unwrap();
         update_leg(
             &db,
             "b",
@@ -803,5 +820,71 @@ mod tests {
         .unwrap();
         assert_eq!(target_state(&db, 7, t).await.unwrap(), TargetState::Live);
         assert_eq!(target_state(&db, 8, t).await.unwrap(), TargetState::None);
+    }
+
+    /// The never-uploads rule follows the leg: in a live publication a shadow
+    /// leg still refuses an artifact location and a live one records it, a
+    /// leg's mode never changes, and only a live publish reads as live.
+    #[tokio::test]
+    async fn a_shadow_leg_never_uploads_even_inside_a_live_publication() {
+        let db = migrated_test_db("publications-leg-mode").await;
+        let (live, shadow) = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin");
+        start(&db, new("m", 1, "live"), "").await.unwrap();
+        record_plan(&db, "m", None, Some(7), None).await.unwrap();
+        add_leg(&db, "m", live, "publish", 1, "live").await.unwrap();
+        add_leg(&db, "m", shadow, "publish", 2, "shadow")
+            .await
+            .unwrap();
+        let uploaded = |target: &'static str| LegUpdate {
+            state: Some("succeeded".into()),
+            ended_at: Some(2),
+            artifact_location: Some(format!("https://example.invalid/{target}")),
+            ..Default::default()
+        };
+        let refused = update_leg(&db, "m", shadow, "publish", uploaded(shadow)).await;
+        assert!(refused.unwrap_err().to_string().contains("never uploads"));
+        let flipped = db
+            .execute(
+                "UPDATE publication_legs SET mode='live' WHERE publication_id='m' AND target=?1",
+                (shadow.to_string(),),
+            )
+            .await;
+        assert!(flipped.unwrap_err().to_string().contains("immutable"));
+        update_leg(
+            &db,
+            "m",
+            shadow,
+            "publish",
+            LegUpdate {
+                state: Some("succeeded".into()),
+                ended_at: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            target_state(&db, 7, shadow).await.unwrap(),
+            TargetState::None,
+            "a shadow publish that succeeded uploaded nothing"
+        );
+        update_leg(&db, "m", live, "publish", uploaded(live))
+            .await
+            .unwrap();
+        assert_eq!(target_state(&db, 7, live).await.unwrap(), TargetState::Live);
+        let row = get(&db, "m").await.unwrap().unwrap();
+        assert_eq!(row.live_targets, [live]);
+        let legs = legs(&db, "m").await.unwrap();
+        assert_eq!(
+            legs.iter().map(|leg| leg.mode.as_str()).collect::<Vec<_>>(),
+            ["live", "shadow"]
+        );
+        let renamed = db
+            .execute(
+                "UPDATE publications SET live_targets_json='[]' WHERE id='m'",
+                (),
+            )
+            .await;
+        assert!(renamed.unwrap_err().to_string().contains("immutable"));
     }
 }

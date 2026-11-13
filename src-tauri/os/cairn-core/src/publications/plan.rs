@@ -3,7 +3,7 @@
 //! Nothing here touches the fleet, the ledger, or a clock.
 use crate::execution::checks::CheckExecutionFailure;
 use crate::execution::checks::SubstrateFailureShape;
-use crate::fleet::KnownMachinePlatform;
+use crate::fleet::{KnownMachinePlatform, PlacementWorkClass, PublicationCustody};
 use crate::mcp::handlers::run::CheckExecResult;
 use serde_json::Value;
 
@@ -67,6 +67,36 @@ pub(crate) fn target_spec(triple: &str) -> Option<TargetSpec> {
 /// Why the Windows build leg never runs on a Cairn builder yet.
 pub(crate) const WINDOWS_SIGNING_REFUSAL: &str = "the Windows executor is signed with Azure Trusted Signing through GitHub's OIDC credential (azure/login), which no Cairn builder can present; it stays with GitHub Actions until the Azure credential moves, and a Windows leg never falls back to an unsigned build";
 
+/// Why Windows cannot be a live target (`publish.liveTargets`).
+pub(crate) const WINDOWS_LIVE_REFUSAL: &str = "Windows signing needs the Azure act (cairn/7055)";
+
+/// A project's `publish.liveTargets`, checked: each a published target, none
+/// of them Windows, each once, in the published order.
+pub(crate) fn validate_live_targets(declared: &[String]) -> Result<Vec<String>, String> {
+    for triple in declared {
+        match target_spec(triple) {
+            None => {
+                return Err(format!(
+                    "publish.liveTargets names unknown target `{triple}`; expected one of {}",
+                    EXECUTOR_TARGETS.map(|spec| spec.triple).join(", ")
+                ))
+            }
+            Some(spec) if spec.os == "windows" => {
+                return Err(format!(
+                    "publish.liveTargets cannot name {triple}: {WINDOWS_LIVE_REFUSAL}"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(EXECUTOR_TARGETS
+        .iter()
+        .map(|spec| spec.triple)
+        .filter(|triple| declared.iter().any(|declared| declared == triple))
+        .map(str::to_string)
+        .collect())
+}
+
 /// The machines that could build one target, and the machines of its OS that
 /// cannot and so are steered away from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,17 +106,29 @@ pub(crate) struct Builders {
     /// Known machines on the target's OS, as `name (os/arch)`, for the reason
     /// a deferral names.
     pub same_os: Vec<String>,
+    /// Machines of the right platform that placement's role clause refuses
+    /// this leg, as `name <placement's own refusal>`.
+    pub refusals: Vec<String>,
 }
 
 /// Which known machines could build `spec`: its OS and builder architecture,
 /// and the rust toolchain once attached (an enrolled machine that has not
 /// attached counts, as placement counts it, because what it will advertise is
-/// not known until it does).
-pub(crate) fn builders_for(spec: TargetSpec, machines: &[KnownMachinePlatform]) -> Builders {
+/// not known until it does), and that placement's role clause admits for a
+/// publication leg with `custody`. A secret-bearing leg's builder must be a
+/// publisher whose isolation measured PASS by `now_unix_ms`; an unattached
+/// machine has measured nothing and never is one.
+pub(crate) fn builders_for(
+    spec: TargetSpec,
+    machines: &[KnownMachinePlatform],
+    custody: PublicationCustody,
+    now_unix_ms: u64,
+) -> Builders {
     let mut builders = Builders {
         eligible: Vec::new(),
         avoid: Vec::new(),
         same_os: Vec::new(),
+        refusals: Vec::new(),
     };
     for machine in machines.iter().filter(|machine| machine.os == spec.os) {
         builders.same_os.push(format!(
@@ -97,15 +139,31 @@ pub(crate) fn builders_for(spec: TargetSpec, machines: &[KnownMachinePlatform]) 
             .toolchains
             .as_ref()
             .is_none_or(|toolchains| toolchains.iter().any(|toolchain| toolchain == RUST));
-        if machine.arch == spec.builder_arch && has_rust {
-            builders.eligible.push(machine.executor_id.clone());
-        } else {
+        if machine.arch != spec.builder_arch || !has_rust {
             builders.avoid.push(machine.executor_id.clone());
+            continue;
+        }
+        match crate::fleet::publication_role_rejection(
+            machine.role,
+            machine.publish_isolation.as_ref(),
+            Some(custody),
+            PlacementWorkClass::ReviewChecks,
+            false,
+            now_unix_ms,
+        ) {
+            None => builders.eligible.push(machine.executor_id.clone()),
+            Some(refusal) => {
+                builders
+                    .refusals
+                    .push(format!("{} {}", machine.name, refusal.describe()));
+                builders.avoid.push(machine.executor_id.clone());
+            }
         }
     }
     builders.avoid.sort();
     builders.avoid.dedup();
     builders.same_os.sort();
+    builders.refusals.sort();
     builders
 }
 
@@ -117,6 +175,17 @@ pub(crate) fn deferred_no_builder(triple: &str, why: &str) -> String {
 /// The deferral a target with no eligible builder gets, naming what was
 /// wanted and what the fleet has instead.
 pub(crate) fn no_builder_reason(spec: TargetSpec, builders: &Builders) -> String {
+    if !builders.refusals.is_empty() {
+        return deferred_no_builder(
+            spec.triple,
+            &format!(
+                "no {}/{} machine with the {RUST} toolchain may take this leg: {}",
+                spec.os,
+                spec.builder_arch,
+                builders.refusals.join("; ")
+            ),
+        );
+    }
     let wanted = format!(
         "no machine the fleet knows of is {}/{} with the {RUST} toolchain",
         spec.os, spec.builder_arch
@@ -133,12 +202,30 @@ pub(crate) fn no_builder_reason(spec: TargetSpec, builders: &Builders) -> String
     deferred_no_builder(spec.triple, &format!("{wanted}; {have}"))
 }
 
-/// The targets the plan leg is told have a builder (`--eligible-targets`).
-pub(crate) fn eligible_targets_csv(machines: &[KnownMachinePlatform]) -> String {
+/// What a target's legs need of placement: a live target's build carries the
+/// release secret, a shadow target's carries nothing.
+pub(crate) fn custody_for(live: bool) -> PublicationCustody {
+    PublicationCustody {
+        publisher_required: live,
+    }
+}
+
+/// The targets the plan leg is told have a builder (`--eligible-targets`): a
+/// live target's builder must be a measured publisher.
+pub(crate) fn eligible_targets_csv(
+    machines: &[KnownMachinePlatform],
+    live_targets: &[String],
+    now_unix_ms: u64,
+) -> String {
     EXECUTOR_TARGETS
         .iter()
         .filter(|spec| spec.os != "windows")
-        .filter(|spec| !builders_for(**spec, machines).eligible.is_empty())
+        .filter(|spec| {
+            let live = live_targets.iter().any(|live| live == spec.triple);
+            !builders_for(**spec, machines, custody_for(live), now_unix_ms)
+                .eligible
+                .is_empty()
+        })
         .map(|spec| spec.triple)
         .collect::<Vec<_>>()
         .join(",")
@@ -185,11 +272,65 @@ pub(crate) fn build_command(publication: &str, target: &str, commit: &str) -> St
     )
 }
 
+/// A live target's one batch on its publisher: build, manifest, then publish,
+/// in one cell so the bytes never leave the account that holds the secret.
+/// Each step prints its own result line; the progress recorder settles the
+/// build row at the manifest's and the publish row from the batch's end.
+pub(crate) fn live_build_command(publication: &str, target: &str, commit: &str) -> String {
+    let common =
+        format!("--target {target} --publication {publication} --out \"$out\" --commit {commit}");
+    format!(
+        "{} && bun scripts/publish-leg.ts publish {common}",
+        build_command(publication, target, commit)
+    )
+}
+
+/// The combine leg: merge the live per-target manifests into the combined one,
+/// whichever system finishes last; a no-op once it is current.
+pub(crate) fn combine_command(publication: &str, commit: &str) -> String {
+    let out = out_dir(publication, "combine");
+    format!(
+        "out={out}; mkdir -p \"$out\" && bun scripts/publish-leg.ts combine --publication {publication} --out \"$out\" --commit {commit}"
+    )
+}
+
+/// The verify after combine: every target and the combined manifest, live.
+///
+/// `expect_sha256` is the combined manifest the combine leg uploaded: the leg
+/// waits until the public URL serves exactly those bytes, so a previous
+/// combined manifest still served there after the replacement is never
+/// verified in its place.
+pub(crate) fn combined_verify_command(
+    publication: &str,
+    commit: &str,
+    expect_sha256: &str,
+) -> String {
+    let out = out_dir(publication, ALL_TARGETS);
+    format!(
+        "out={out}; mkdir -p \"$out\" && bun scripts/publish-leg.ts verify --combined --publication {publication} --out \"$out\" --commit {commit} --after-publish --expect-sha256 {expect_sha256}"
+    )
+}
+
 /// The verify leg: once the live per-target manifest names this commit, the
 /// published bytes verify; until then it defers.
-pub(crate) fn verify_command(publication: &str, target: &str, commit: &str) -> String {
+///
+/// After Cairn's own publish (`after_publish`), the fact is one the leg just
+/// made true and only the release's download URLs lag behind it, so the leg
+/// waits out that lag before deferring: a deferred row is final, and no later
+/// plan would place this verify again.
+pub(crate) fn verify_command(
+    publication: &str,
+    target: &str,
+    commit: &str,
+    after_publish: bool,
+) -> String {
+    let after = if after_publish {
+        " --after-publish"
+    } else {
+        ""
+    };
     format!(
-        "{} && bun scripts/publish-leg.ts verify --target {target} --publication {publication} --out \"$out\" --commit {commit} --plan \"$out/plan.json\"",
+        "{} && bun scripts/publish-leg.ts verify --target {target} --publication {publication} --out \"$out\" --commit {commit} --plan \"$out/plan.json\"{after}",
         with_plan_file(publication, target)
     )
 }
@@ -234,6 +375,11 @@ pub(crate) fn planned_targets(plan: &Value) -> Vec<PlannedTarget> {
             })
         })
         .collect()
+}
+
+/// Whether the plan read the combined manifest as live, when it said.
+pub(crate) fn combined_live(plan: &Value) -> Option<bool> {
+    plan["combinedLive"].as_bool()
 }
 
 /// What a leg's ending means for its row.
@@ -369,6 +515,8 @@ mod tests {
             os: os.into(),
             arch: arch.into(),
             toolchains: toolchains.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            role: crate::fleet::MachineRole::General,
+            publish_isolation: None,
         }
     }
 
@@ -392,24 +540,100 @@ mod tests {
             machine("bbs", "linux", "x86_64", None),
             machine("mac", "macos", "aarch64", Some(&["rust"])),
         ];
-        let arm = builders_for(target_spec("aarch64-unknown-linux-gnu").unwrap(), &fleet);
+        let shadow = custody_for(false);
+        let arm = builders_for(
+            target_spec("aarch64-unknown-linux-gnu").unwrap(),
+            &fleet,
+            shadow,
+            0,
+        );
         assert_eq!(arm.eligible, ["fedora", "bbs"]);
         assert_eq!(arm.avoid, ["bare", "bginf-sp1"]);
-        let mac = builders_for(target_spec("aarch64-apple-darwin").unwrap(), &fleet);
+        let mac = builders_for(
+            target_spec("aarch64-apple-darwin").unwrap(),
+            &fleet,
+            shadow,
+            0,
+        );
         assert_eq!(mac.eligible, ["mac"]);
         assert!(mac.avoid.is_empty());
         assert_eq!(
-            eligible_targets_csv(&fleet),
+            eligible_targets_csv(&fleet, &[], 0),
             "aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu"
         );
+        assert_eq!(
+            eligible_targets_csv(&fleet, &["x86_64-unknown-linux-gnu".into()], 0),
+            "aarch64-apple-darwin,aarch64-unknown-linux-gnu",
+            "a live target needs a publisher, and this fleet has none"
+        );
+    }
+
+    /// A live target's builder is a measured publisher, and a fleet without
+    /// one defers the target in placement's own words.
+    #[test]
+    fn a_live_target_is_built_only_by_a_measured_publisher() {
+        use cairn_common::executor_protocol::{PublishIsolationEvidence, PublishIsolationVerdict};
+        let now = 10_000_000_000;
+        let mut publisher = machine("cairn-publish", "linux", "x86_64", Some(&["rust"]));
+        publisher.role = crate::fleet::MachineRole::PublishOnly;
+        let fleet = [
+            machine("fedora", "linux", "x86_64", Some(&["rust"])),
+            publisher.clone(),
+        ];
+        let spec = target_spec("x86_64-unknown-linux-gnu").unwrap();
+        let unmeasured = builders_for(spec, &fleet, custody_for(true), now);
+        assert!(unmeasured.eligible.is_empty());
+        let reason = no_builder_reason(spec, &unmeasured);
+        assert!(
+            reason.contains("fedora is not a publisher executor (role general)")
+                && reason
+                    .contains("cairn-publish is not a publisher executor (isolation unmeasured"),
+            "{reason}"
+        );
+        publisher.publish_isolation = Some(PublishIsolationEvidence {
+            verdict: PublishIsolationVerdict::Pass,
+            measured_at_unix_ms: now - 60_000,
+            lines: Vec::new(),
+        });
+        let fleet = [
+            machine("fedora", "linux", "x86_64", Some(&["rust"])),
+            publisher,
+        ];
+        let measured = builders_for(spec, &fleet, custody_for(true), now);
+        assert_eq!(measured.eligible, ["cairn-publish"]);
+        assert_eq!(measured.avoid, ["fedora"]);
+        assert_eq!(
+            builders_for(spec, &fleet, custody_for(false), now).eligible,
+            ["fedora", "cairn-publish"],
+            "a shadow build may go to either"
+        );
+    }
+
+    #[test]
+    fn live_targets_refuse_windows_and_unknown_triples() {
+        assert_eq!(
+            validate_live_targets(&[
+                "x86_64-unknown-linux-gnu".into(),
+                "aarch64-unknown-linux-gnu".into(),
+                "x86_64-unknown-linux-gnu".into(),
+            ]),
+            Ok(vec![
+                "aarch64-unknown-linux-gnu".to_string(),
+                "x86_64-unknown-linux-gnu".to_string()
+            ])
+        );
+        let windows = validate_live_targets(&["x86_64-pc-windows-msvc".into()]).unwrap_err();
+        assert!(windows.contains("cairn/7055"), "{windows}");
+        let unknown = validate_live_targets(&["mips-unknown-linux-gnu".into()]).unwrap_err();
+        assert!(unknown.contains("unknown target"), "{unknown}");
     }
 
     #[test]
     fn a_fleet_without_an_x86_64_linux_builder_defers_both_linux_targets_by_name() {
         let fleet = [machine("bginf-sp1", "linux", "aarch64", Some(&["rust"]))];
-        assert_eq!(eligible_targets_csv(&fleet), "");
+        assert_eq!(eligible_targets_csv(&fleet, &[], 0), "");
         let spec = target_spec("x86_64-unknown-linux-gnu").unwrap();
-        let reason = no_builder_reason(spec, &builders_for(spec, &fleet));
+        let reason = no_builder_reason(spec, &builders_for(spec, &fleet, custody_for(false), 0));
         assert!(
             reason.starts_with("deferred: no eligible builder for x86_64-unknown-linux-gnu: "),
             "{reason}"
@@ -433,10 +657,22 @@ mod tests {
             build.contains("publish-leg.ts manifest"),
             "the manifest is assembled in the build's cell"
         );
+        let live = live_build_command("p1", "x86_64-unknown-linux-gnu", &commit);
+        assert_eq!(
+            CellCommandClass::classify(&live),
+            CellCommandClass::ReleaseBuild,
+            "the publisher's build-and-publish batch is counted compile-class"
+        );
+        assert!(live.ends_with(&format!(
+            "publish-leg.ts publish --target x86_64-unknown-linux-gnu --publication p1 --out \"$out\" --commit {commit}"
+        )));
         for other in [
-            verify_command("p1", "x86_64-unknown-linux-gnu", &commit),
+            verify_command("p1", "x86_64-unknown-linux-gnu", &commit, false),
+            verify_command("p1", "x86_64-unknown-linux-gnu", &commit, true),
             plan_command("p1", "", &[]),
             tool_verify_command("codex"),
+            combine_command("p1", &commit),
+            combined_verify_command("p1", &commit, &"e".repeat(64)),
         ] {
             assert_eq!(
                 CellCommandClass::classify(&other),

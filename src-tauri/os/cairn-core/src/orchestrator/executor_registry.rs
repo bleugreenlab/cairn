@@ -184,6 +184,7 @@ mod tests {
                 containment: None,
                 page_call_programs: None,
                 github_credential: None,
+                publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
                 service_bounds: None,

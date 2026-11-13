@@ -157,10 +157,9 @@ pub const AUDITED_TRIGGERS: &[AuditedTrigger] = &[
     trigger("publications_settled_immutable", "publications", IMMUTABLE),
     trigger("publications_identity_immutable", "publications", IMMUTABLE),
     trigger("publication_legs_terminal_immutable", "publication_legs", IMMUTABLE),
-    trigger("publication_legs_shadow_never_uploads_insert", "publication_legs",
-        "probes the leg's publication by its id primary key for its mode; refuses with RAISE"),
-    trigger("publication_legs_shadow_never_uploads_update", "publication_legs",
-        "probes the leg's publication by its id primary key for its mode; refuses with RAISE"),
+    trigger("publication_legs_mode_immutable", "publication_legs", IMMUTABLE),
+    trigger("publication_legs_shadow_never_uploads_insert", "publication_legs", ROW_CHECK),
+    trigger("publication_legs_shadow_never_uploads_update", "publication_legs", ROW_CHECK),
     trigger(
         "main_incident_evidence_immutable",
         "main_incident_evidence",

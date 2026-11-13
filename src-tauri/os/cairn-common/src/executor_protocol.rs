@@ -3889,13 +3889,21 @@ pub enum MachineRole {
     /// Service residents only: never a batch class, a check lane, a dev
     /// instance or an inference deployment.
     ServicesOnly,
+    /// Publication legs only: the account that holds the release secret
+    /// (cairn/7074). Never a batch class, a check lane, a dev instance, a
+    /// service or an inference deployment, so nothing but a publication leg
+    /// runs where the secret can be read. Fixed at enrolment: a role patch to
+    /// or from this value is refused, since patching a publisher to `general`
+    /// would run agent batches in the account that holds the secret.
+    PublishOnly,
 }
 
 impl MachineRole {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::BuildsOnly,
         Self::General,
         Self::InferenceOnly,
+        Self::PublishOnly,
         Self::ServicesOnly,
     ];
 
@@ -3906,6 +3914,7 @@ impl MachineRole {
             Self::General => "general",
             Self::InferenceOnly => "inferenceOnly",
             Self::ServicesOnly => "servicesOnly",
+            Self::PublishOnly => "publishOnly",
         }
     }
 
@@ -3916,6 +3925,7 @@ impl MachineRole {
             Self::General => "general",
             Self::InferenceOnly => "inference only",
             Self::ServicesOnly => "services only",
+            Self::PublishOnly => "publishes only",
         }
     }
 
@@ -3964,6 +3974,27 @@ impl MachineRole {
                 | PlacementWorkClass::AgentSessions
                 | PlacementWorkClass::DevInstances => false,
             },
+            // A publication leg travels as a check batch, so it is not a
+            // class here: placement admits it on a publisher through
+            // `takes_publication_legs` instead.
+            Self::PublishOnly => match class {
+                PlacementWorkClass::ReviewChecks
+                | PlacementWorkClass::WriteChecks
+                | PlacementWorkClass::AgentSessions
+                | PlacementWorkClass::DevInstances
+                | PlacementWorkClass::Services => false,
+            },
+        }
+    }
+
+    /// Whether placement may offer a publication leg to a machine with this
+    /// role. A publication leg is a runner-side placement fact (it travels as
+    /// a `reviewChecks` batch), so like inference deployments it is answered
+    /// here rather than by a class in [`MachineRole::accepts`].
+    pub fn takes_publication_legs(self) -> bool {
+        match self {
+            Self::General | Self::BuildsOnly | Self::PublishOnly => true,
+            Self::InferenceOnly | Self::ServicesOnly => false,
         }
     }
 
@@ -3973,13 +4004,17 @@ impl MachineRole {
     pub fn runs_inference_deployments(self) -> bool {
         match self {
             Self::General | Self::InferenceOnly => true,
-            Self::BuildsOnly | Self::ServicesOnly => false,
+            Self::BuildsOnly | Self::ServicesOnly | Self::PublishOnly => false,
         }
     }
 
     /// What this role accepts of today's classes, in words: "accepts every
-    /// batch class", "accepts none of today's batch classes", or the list.
+    /// batch class", "accepts none of today's batch classes", "accepts
+    /// publication legs only", or the list.
     pub fn describe_accepted(self) -> String {
+        if self == Self::PublishOnly {
+            return "accepts publication legs only".to_string();
+        }
         let accepted: Vec<&str> = PlacementWorkClass::ALL
             .into_iter()
             .filter(|class| self.accepts(*class))
@@ -8303,6 +8338,25 @@ pub struct LearnedResourceEstimate {
 /// added and that constructor missed; nothing crosses the boundary that did
 /// not before. What a runner gets wrong talking to an older executor: nothing;
 /// no frame changes and an adopted tree never carried a census.
+///
+/// cairn/7074 does not move the number. [`MachineRole::PublishOnly`] is a
+/// runner-only role like every other: no frame, advertisement or executor
+/// config carries it, and the executor is never told it. A publication leg is
+/// a runner-side placement fact, not a class: it still travels as a
+/// `reviewChecks` batch, so the class on the wire is unchanged and an older
+/// executor decodes every request exactly as before.
+/// [`PlacementRejectionReason::NotPublishEligible`] and the defaulted
+/// `publicationLeg` on [`PlacementRejectionReason::RoleExcluded`] are produced
+/// and rendered on the runner only; no executor decodes a placement rejection.
+/// [`ExecutorCapabilities`] gains a defaulted `publishIsolation`
+/// ([`PublishIsolationEvidence`]), which an older executor never sends and the
+/// runner reads as unmeasured: unmeasured refuses only a secret-bearing
+/// publication leg, and no such leg exists until a project lists live targets,
+/// so an older executor is placed exactly as before. An older runner ignores
+/// the key. [`ResidentExecutorConfig`] gains a defaulted `publisher`, written
+/// only by a new `--role publishOnly` enrolment, whose executor is installed
+/// at this build; an existing config never carries it. What a runner gets
+/// wrong talking to an older executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -9668,6 +9722,12 @@ pub struct ExecutorCapabilities {
     /// predates the probe, which reads as unmeasured and gates nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_credential: Option<GithubCredentialEvidence>,
+    /// Whether this executor, started as a publisher (`publisher` in its
+    /// config), measured its own account isolated enough to hold the release
+    /// secret. Advertised only by a publisher; absent reads as unmeasured,
+    /// which refuses a secret-bearing publication leg and gates nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_isolation: Option<PublishIsolationEvidence>,
     /// Each machine-service artifact the runner's selection named, as this
     /// executor holds it. Absent from an executor that predates machine
     /// services, which the runner reads as nothing installed.
@@ -9817,6 +9877,33 @@ impl GithubCredentialEvidence {
             _ => None,
         }
     }
+}
+
+/// What a publisher executor's isolation probe measured: `scripts/check-runner-isolation.sh
+/// --publisher`, run as the publisher account, over its own uid, its home,
+/// temp and build paths, its secrets file, and every account on the host that
+/// could reach them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishIsolationEvidence {
+    pub verdict: PublishIsolationVerdict,
+    pub measured_at_unix_ms: u64,
+    /// The probe's report lines, its verdict line last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PublishIsolationVerdict {
+    /// No other account can reach what the publisher holds, and it cannot
+    /// become root. The only verdict a secret-bearing leg is placed on.
+    Pass,
+    /// The probe found a way in.
+    Fail { reason: String },
+    /// The probe could not tell (it has not run yet, it could not run, or the
+    /// platform has no probe). Refuses like a failure.
+    Unmeasured { reason: String },
 }
 
 /// One program a page-call probe ran under the page-call policy.
@@ -11078,7 +11165,30 @@ pub struct CellRequest {
     /// placement. Runner-side only for the same reason as [`Self::scratch_sync`].
     #[serde(skip)]
     pub home_affinity: Option<HomeAffinity>,
+    /// Set when this request is a publication leg, with what custody it
+    /// needs. Runner-side only for the same reason as [`Self::scratch_sync`]:
+    /// the leg still travels as a `reviewChecks` batch, and placement alone
+    /// reads this to offer it to the roles that take publication legs.
+    #[serde(skip)]
+    pub publication: Option<PublicationCustody>,
 }
+
+/// What placement must know about a publication leg (cairn/7074): it is one,
+/// and whether it carries the release secret. A secret-bearing leg goes only
+/// to a `publishOnly` executor whose isolation measured PASS within
+/// [`PUBLISH_ISOLATION_STALE_AFTER_MS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationCustody {
+    pub publisher_required: bool,
+}
+
+/// How often a publisher executor re-measures its isolation: the tool
+/// refresh cadence every attached executor already runs on.
+pub const PUBLISH_ISOLATION_REFRESH_MS: u64 = 30 * 60 * 1000;
+
+/// How old a PASS may be and still place a secret-bearing leg: three missed
+/// refreshes, so one slow or skipped probe does not refuse a publication.
+pub const PUBLISH_ISOLATION_STALE_AFTER_MS: u64 = 3 * PUBLISH_ISOLATION_REFRESH_MS;
 
 /// The milliseconds a node scratch sync is predicted to take per machine:
 /// the bytes that machine is missing over its measured sync throughput. An
@@ -11387,6 +11497,12 @@ pub struct ResidentExecutorConfig {
     /// where an autostart entry carries no environment at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cairn_home: Option<std::path::PathBuf>,
+    /// This executor runs as a publisher account (`--role publishOnly` at
+    /// enrolment): it measures its own isolation at attach and advertises the
+    /// verdict. Written only for a publisher, so every other config, and every
+    /// older executor's, never carries the key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub publisher: bool,
 }
 
 impl ResidentExecutorConfig {
@@ -14358,6 +14474,7 @@ pub struct ProcessTreeAdoption {
 }
 
 /// What a [`ExecutorMessage::ProcessTreeAdoptionRequest`] asks for.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum ProcessTreeAdoptionChange {
@@ -21511,10 +21628,22 @@ pub enum PlacementRejectionReason {
     /// An operator gave this machine a role that does not accept this class of
     /// work. Permanent until an operator changes the role, so it is reported
     /// ahead of anything that could clear on its own, a drain included.
+    ///
+    /// `publication_leg` marks a publication leg refused by a role that takes
+    /// none (`inferenceOnly`, `servicesOnly`): such a leg travels as a
+    /// `reviewChecks` batch, so its class alone would misname it.
     RoleExcluded {
         role: MachineRole,
         work_class: PlacementWorkClass,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        publication_leg: bool,
     },
+    /// A publication leg that carries the release secret, offered to a
+    /// machine that may not hold it: one whose role is not `publishOnly`, or
+    /// a publisher whose isolation probe has not measured PASS recently.
+    /// Unmeasured is a refusal, never a pass. Holds for pinned work too, like
+    /// a missing GitHub credential: it is a fact about the machine.
+    NotPublishEligible { why: String },
     /// The requester excluded this machine because work it carries already
     /// failed on the machine's current environment: a check that spent its
     /// retry budget here, or an execution environment this machine refused to
@@ -21766,10 +21895,23 @@ impl PlacementRejectionReason {
                 "{}: the volume this machine keeps its cells on is not mounted; it takes no work that needs a cell until it returns",
                 build_volume_absent_detail(path)
             ),
-            Self::RoleExcluded { role, work_class } => format!(
-                "runs {}; this request is {}",
-                role.label(),
-                work_class.as_str()
+            Self::RoleExcluded {
+                role,
+                work_class,
+                publication_leg,
+            } => {
+                let kind = if *publication_leg {
+                    "publicationLeg"
+                } else {
+                    work_class.as_str()
+                };
+                match role {
+                    MachineRole::PublishOnly => format!("publishes only; this request is {kind}"),
+                    role => format!("runs {}; this request is {kind}", role.label()),
+                }
+            }
+            Self::NotPublishEligible { why } => format!(
+                "is not a publisher executor ({why}); release secrets go only to publishOnly executors whose isolation measured PASS"
             ),
             Self::AvoidedInfrastructure => {
                 "excluded for this request: work it carries already failed on this machine's current environment (a check spent its retry budget here, or this machine refused to provision its execution environment)"
@@ -26030,15 +26172,16 @@ mod tests {
         );
     }
 
-    /// The four spellings are the ones every surface takes, and an omitted
+    /// The five spellings are the ones every surface takes, and an omitted
     /// role is general so no existing machine changes behaviour.
     #[test]
-    fn machine_role_round_trips_its_four_spellings_and_defaults_to_general() {
+    fn machine_role_round_trips_its_five_spellings_and_defaults_to_general() {
         assert_eq!(MachineRole::default(), MachineRole::General);
         for (role, spelling) in [
             (MachineRole::BuildsOnly, "buildsOnly"),
             (MachineRole::General, "general"),
             (MachineRole::InferenceOnly, "inferenceOnly"),
+            (MachineRole::PublishOnly, "publishOnly"),
             (MachineRole::ServicesOnly, "servicesOnly"),
         ] {
             assert_eq!(
@@ -26054,8 +26197,8 @@ mod tests {
         }
         let error = MachineRole::parse("inference-only").unwrap_err();
         assert!(
-            error.contains("buildsOnly, general, inferenceOnly, servicesOnly"),
-            "a bad role names the four it could have been: {error}"
+            error.contains("buildsOnly, general, inferenceOnly, publishOnly, servicesOnly"),
+            "a bad role names the five it could have been: {error}"
         );
     }
 
@@ -26068,6 +26211,7 @@ mod tests {
             assert!(MachineRole::General.accepts(class), "{class:?}");
             assert!(MachineRole::BuildsOnly.accepts(class), "{class:?}");
             assert!(!MachineRole::InferenceOnly.accepts(class), "{class:?}");
+            assert!(!MachineRole::PublishOnly.accepts(class), "{class:?}");
             assert_eq!(
                 MachineRole::ServicesOnly.accepts(class),
                 class == PlacementWorkClass::Services,
@@ -26100,6 +26244,19 @@ mod tests {
             PlacementWorkClass::ALL.to_vec()
         );
         assert!(MachineRole::General.refused_classes().is_empty());
+        assert_eq!(
+            MachineRole::PublishOnly.describe_accepted(),
+            "accepts publication legs only"
+        );
+        for (role, takes) in [
+            (MachineRole::BuildsOnly, true),
+            (MachineRole::General, true),
+            (MachineRole::InferenceOnly, false),
+            (MachineRole::PublishOnly, true),
+            (MachineRole::ServicesOnly, false),
+        ] {
+            assert_eq!(role.takes_publication_legs(), takes, "{role:?}");
+        }
     }
 
     /// Deployments are the one kind of work outside the class table, so their
@@ -26110,6 +26267,7 @@ mod tests {
             (MachineRole::BuildsOnly, false),
             (MachineRole::General, true),
             (MachineRole::InferenceOnly, true),
+            (MachineRole::PublishOnly, false),
             (MachineRole::ServicesOnly, false),
         ] {
             assert_eq!(role.runs_inference_deployments(), runs, "{role:?}");
@@ -26122,15 +26280,35 @@ mod tests {
             PlacementRejectionReason::RoleExcluded {
                 role: MachineRole::InferenceOnly,
                 work_class: PlacementWorkClass::AgentSessions,
+                publication_leg: false,
             }
             .describe(),
             "runs inference only; this request is agentSessions"
+        );
+        assert_eq!(
+            PlacementRejectionReason::RoleExcluded {
+                role: MachineRole::PublishOnly,
+                work_class: PlacementWorkClass::AgentSessions,
+                publication_leg: false,
+            }
+            .describe(),
+            "publishes only; this request is agentSessions"
+        );
+        assert_eq!(
+            PlacementRejectionReason::RoleExcluded {
+                role: MachineRole::ServicesOnly,
+                work_class: PlacementWorkClass::ReviewChecks,
+                publication_leg: true,
+            }
+            .describe(),
+            "runs services only; this request is publicationLeg"
         );
         for class in MachineRole::ServicesOnly.refused_classes() {
             assert_eq!(
                 PlacementRejectionReason::RoleExcluded {
                     role: MachineRole::ServicesOnly,
                     work_class: class,
+                    publication_leg: false,
                 }
                 .describe(),
                 format!("runs services only; this request is {}", class.as_str())
@@ -26141,6 +26319,55 @@ mod tests {
                 serde_json::to_value(class).unwrap(),
                 serde_json::json!(class.as_str()),
                 "as_str is the wire spelling"
+            );
+        }
+    }
+
+    /// The publisher's verdict is additive: an executor that predates it, or
+    /// is not a publisher, sends no key and reads as unmeasured; the shape a
+    /// publisher sends is pinned.
+    #[test]
+    fn publish_isolation_evidence_is_defaulted_and_its_shape_is_pinned() {
+        let mut capabilities = serde_json::to_value(sample_advertisement().capabilities).unwrap();
+        assert!(capabilities.get("publishIsolation").is_none());
+        capabilities
+            .as_object_mut()
+            .unwrap()
+            .remove("publishIsolation");
+        let decoded: ExecutorCapabilities = serde_json::from_value(capabilities).unwrap();
+        assert_eq!(decoded.publish_isolation, None);
+        for (verdict, json) in [
+            (
+                PublishIsolationVerdict::Pass,
+                serde_json::json!({"kind": "pass"}),
+            ),
+            (
+                PublishIsolationVerdict::Fail {
+                    reason: "home open".into(),
+                },
+                serde_json::json!({"kind": "fail", "reason": "home open"}),
+            ),
+            (
+                PublishIsolationVerdict::Unmeasured {
+                    reason: "probe pending".into(),
+                },
+                serde_json::json!({"kind": "unmeasured", "reason": "probe pending"}),
+            ),
+        ] {
+            let evidence = PublishIsolationEvidence {
+                verdict,
+                measured_at_unix_ms: 7,
+                lines: vec!["verdict: fedora PASS: x".into()],
+            };
+            let golden = serde_json::json!({
+                "verdict": json,
+                "measuredAtUnixMs": 7,
+                "lines": ["verdict: fedora PASS: x"],
+            });
+            assert_eq!(serde_json::to_value(&evidence).unwrap(), golden);
+            assert_eq!(
+                serde_json::from_value::<PublishIsolationEvidence>(golden).unwrap(),
+                evidence
             );
         }
     }
@@ -26362,6 +26589,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         }
     }
 
@@ -26425,6 +26653,7 @@ mod tests {
                 build_prerequisites: None,
                 page_call_programs: None,
                 github_credential: None,
+                publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
                 service_bounds: None,

@@ -2930,6 +2930,7 @@ pub(crate) async fn execute_check_contract(
                         on_group_complete: None,
                         purpose,
                         cell_groups: Default::default(),
+                        publication: None,
                     },
                 )
                 .await?;
@@ -4247,6 +4248,7 @@ pub(crate) async fn execute_job_verdict(
             on_group_complete: None,
             purpose: None,
             cell_groups: Default::default(),
+            publication: None,
         },
     )
     .await?;
@@ -4392,6 +4394,7 @@ pub(crate) async fn plan_infra_scopes(
                 work_class: inputs.work_class,
                 compiles_rust: placement.compiles_rust,
                 pipe_floor: cairn_common::pipe_health::PipeFloorWork::Process,
+                publication: None,
             };
             let environments: Vec<(String, String)> = orch
                 .fleet
@@ -4463,6 +4466,7 @@ pub(crate) fn review_placement_occupancy(
         work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
         compiles_rust: placement.compiles_rust,
         pipe_floor: cairn_common::pipe_health::PipeFloorWork::Process,
+        publication: None,
     })
 }
 
@@ -4675,6 +4679,7 @@ impl CheckPatience {
             compiles_rust:
                 crate::execution::wire::batch_command_class(&batch.items).compiles_rust(),
             pipe_floor: cairn_common::pipe_health::PipeFloorWork::Process,
+            publication: None,
         }))
     }
 }
@@ -6458,6 +6463,9 @@ pub(crate) struct PlannedCheckBatchRequest {
     /// run beside it. Absent for one-off work, which asks its question once and
     /// is in competition with nothing.
     pub purpose: Option<crate::fleet::purpose::PurposeKey>,
+    /// Set for a publication leg: placement offers it by role, and only to a
+    /// measured publisher when it carries the release secret.
+    pub publication: Option<crate::fleet::PublicationCustody>,
 }
 
 pub(crate) struct PlannedCheckBatchOutcome {
@@ -9741,6 +9749,7 @@ async fn run_write_checks_after_seal_inner(
                         on_group_complete: None,
                         purpose: None,
                         cell_groups: Default::default(),
+                        publication: None,
                     },
                 )
                 .await
@@ -9985,6 +9994,7 @@ async fn submit_write_check_batch_for(
                         on_group_complete: None,
                         purpose: None,
                         cell_groups: Default::default(),
+                        publication: None,
                     },
                 )
             })
@@ -15003,6 +15013,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         let emitted = crate::execution::wire::durable_check_request(|wait_horizon_unix_ms| {
             let mut request = request();
@@ -16213,6 +16224,7 @@ mod tests {
             on_group_complete: None,
             purpose: None,
             cell_groups: Default::default(),
+            publication: None,
         };
 
         let results = crate::execution::impact_slice::run_lanes(
@@ -28558,6 +28570,7 @@ test result: FAILED. 9 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out";
             status_board: None,
             on_group_complete: None,
             purpose: None,
+            publication: None,
         };
         let spawned_env = |batch: &PlannedCheckBatchRequest| {
             crate::execution::wire::build_check_batch_wire(
@@ -28957,6 +28970,7 @@ mod executor_base_content_tests {
             on_group_complete: None,
             purpose: None,
             cell_groups: Default::default(),
+            publication: None,
         };
         crate::execution::wire::build_check_batch_wire(
             &request,

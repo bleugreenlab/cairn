@@ -117,7 +117,7 @@ pub(super) async fn dispatch(
     );
     if dry_run {
         return Ok(Some(format!(
-            "Would start a shadow publication in {project_key}"
+            "Would start a publication in {project_key} (live for the targets its commit lists in publish.liveTargets, shadow for the rest)"
         )));
     }
     let started = publications::start(orch, &project_id, start)

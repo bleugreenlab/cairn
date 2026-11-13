@@ -10,7 +10,7 @@ use cairn_uri::{
     build_project_publication_leg_log_uri, build_project_publication_uri, build_project_publish_uri,
 };
 
-const NOTICE: &str = "Private to this install. Every publication is a shadow in this phase: its build legs leave evidence (asset hashes, a manifest-shape comparison with the live release) and never upload. Append {action:\"start\"} to start one.";
+const NOTICE: &str = "Private to this install. A target its commit lists in publish.liveTargets is live: built and uploaded in one batch on a publishOnly executor whose isolation measured PASS, then verified. Every other target is a shadow: its build leg leaves evidence (asset hashes, a manifest-shape comparison with the live release) and never uploads. Each leg says which it is. Append {action:\"start\"} to start one.";
 
 fn page_bounds(params: &[QueryParam]) -> Result<(usize, usize), String> {
     let mut offset = None;
@@ -161,10 +161,11 @@ pub(crate) fn render_publication(
     legs: &[PublicationLeg],
 ) -> String {
     let mut out = format!(
-        "# Publication {}\n\n{NOTICE}\n\n- kind: {}\n- mode: {}\n- trigger: {}\n- requested by: {}\n- state: {}\n- commit: {}\n- protocol: {}\n- forced targets: {}\n- started: {}\n- ended: {}\n- summary: {}\n\n",
+        "# Publication {}\n\n{NOTICE}\n\n- kind: {}\n- mode: {}\n- live targets: {}\n- trigger: {}\n- requested by: {}\n- state: {}\n- commit: {}\n- protocol: {}\n- forced targets: {}\n- started: {}\n- ended: {}\n- summary: {}\n\n",
         row.id,
         row.kind,
         row.mode,
+        if row.live_targets.is_empty() { "-".into() } else { row.live_targets.join(", ") },
         row.trigger,
         row.requested_by.as_deref().unwrap_or("-"),
         row.state,
@@ -175,16 +176,17 @@ pub(crate) fn render_publication(
         when(row.ended_at),
         row.summary.as_deref().unwrap_or("-"),
     );
-    out.push_str("| target | leg | builder | builder kind | state | reason | started | ended | assets (sha256) | location | signer | verifier | build jobs | log |\n");
-    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    out.push_str("| target | leg | mode | builder | builder kind | state | reason | started | ended | assets (sha256) | location | signer | verifier | build jobs | log |\n");
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for leg in legs {
         let log = leg.log_ref.clone().unwrap_or_else(|| {
             build_project_publication_leg_log_uri(project, &row.id, &leg.target, &leg.leg)
         });
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             cell(&leg.target),
             leg.leg,
+            leg.mode,
             cell(leg.builder.as_deref().unwrap_or("")),
             leg.builder_kind,
             leg.state,
@@ -371,6 +373,7 @@ mod tests {
             summary: Some("done".into()),
             created_at: 1_794_493_559_000,
             ended_at: Some(1_794_493_659_000),
+            live_targets: vec![],
         };
         let leg = PublicationLeg {
             publication_id: "pub-1".into(),
@@ -392,6 +395,7 @@ mod tests {
             signer: None,
             verifier: Some(json!({"check": "manifest-shape", "result": "pass"})),
             build_jobs: Some(json!({"jobs": 8})),
+            mode: "shadow".into(),
             log_ref: None,
             request_id: None,
         };
@@ -412,7 +416,8 @@ mod tests {
         ] {
             assert!(table_row.contains(expected), "{expected}: {table_row}");
         }
-        assert_eq!(table_row.matches(" | ").count(), 13, "fourteen columns");
+        assert_eq!(table_row.matches(" | ").count(), 14, "fifteen columns");
+        assert!(table_row.starts_with("| x86_64-unknown-linux-gnu | build | shadow |"));
         assert!(rendered.contains("protocol: v171") && rendered.contains("## Plan document"));
     }
 }

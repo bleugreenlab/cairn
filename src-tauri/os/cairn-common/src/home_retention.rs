@@ -447,6 +447,14 @@ pub const HOME_RETENTION: &[HomeEntry] = &[
         },
     ),
     dir(
+        "publications",
+        "cairn-core publication leg logs",
+        "devops",
+        Undecided {
+            issue: "cairn://p/cairn/7152",
+        },
+    ),
+    dir(
         "check-slices",
         "cairn-core impact slices",
         "devops",

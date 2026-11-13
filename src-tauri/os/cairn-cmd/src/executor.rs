@@ -710,6 +710,20 @@ mod tests {
                 .get("role"),
             Some(&json!("servicesOnly"))
         );
+        let cli = Cli::try_parse_from([
+            "cairn",
+            "add",
+            "cairn-publish@fedora",
+            "--role",
+            "publishOnly",
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(add_request(cli.command).unwrap())
+                .unwrap()
+                .get("role"),
+            Some(&json!("publishOnly"))
+        );
     }
 
     #[test]

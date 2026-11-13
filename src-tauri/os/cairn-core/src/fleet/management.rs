@@ -1888,7 +1888,8 @@ impl DrainOutcome {
 /// rule rather than a setting on the machine, so it needs no live link and the
 /// machine is not told. The settings write comes first and the fleet's cache is
 /// re-adopted from what was written, so placement never enforces a role the
-/// settings file does not hold. A failed write changes nothing.
+/// settings file does not hold. A failed write changes nothing. A change to or
+/// from `publishOnly` is refused: that role is fixed at enrolment.
 pub fn set_machine_role(
     orch: &Orchestrator,
     reference: &str,
@@ -1896,7 +1897,7 @@ pub fn set_machine_role(
 ) -> Result<RoleOutcome, String> {
     let executor_id = resolve_executor_reference(orch, reference)?;
     mutate_fleet(orch, |config| {
-        config.set_machine_role(&executor_id, role);
+        config.change_machine_role(&executor_id, role)?;
         Ok(())
     })?;
     Ok(RoleOutcome {
@@ -3239,6 +3240,7 @@ mod tests {
                 containment: None,
                 page_call_programs: None,
                 github_credential: None,
+                publish_isolation: None,
                 machine_services: Vec::new(),
                 credential_floor_service_residents: false,
                 service_bounds: None,
@@ -4523,6 +4525,49 @@ mod tests {
         let mut renamed = override_of("/opt/probe");
         renamed.machine = "lab-2".to_string();
         assert!(!approval.covers(&machine_service_request(&orch, &renamed)));
+    }
+
+    /// The patch path the executors resource and the Settings page share:
+    /// a machine never becomes, or stops being, a publisher by a patch.
+    #[tokio::test]
+    async fn publish_only_is_never_patched_in_or_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        let refused = set_machine_role(
+            &orch,
+            crate::fleet::LOCAL_EXECUTOR_NAME,
+            crate::fleet::MachineRole::PublishOnly,
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("publishOnly is fixed at enrolment"),
+            "{refused}"
+        );
+        mutate_fleet(&orch, |config| {
+            config.set_machine_role(
+                crate::fleet::COLOCATED_EXECUTOR_ID,
+                crate::fleet::MachineRole::PublishOnly,
+            );
+            Ok(())
+        })
+        .unwrap();
+        let refused = set_machine_role(
+            &orch,
+            crate::fleet::LOCAL_EXECUTOR_NAME,
+            crate::fleet::MachineRole::General,
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("publishOnly is fixed at enrolment"),
+            "{refused}"
+        );
+        assert_eq!(
+            crate::config::settings::load_fleet(&orch.config_dir)
+                .machine_role(crate::fleet::COLOCATED_EXECUTOR_ID),
+            crate::fleet::MachineRole::PublishOnly
+        );
     }
 
     #[tokio::test]

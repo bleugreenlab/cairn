@@ -11,6 +11,9 @@ pub const INTERACTIVE_PLACEMENT_PROFILE: &str = "interactive";
 pub const LOW_POWER_PLACEMENT_PROFILE: &str = "low-power";
 pub const MAX_PREFERENCE_DELAY_SECONDS: u64 = 60 * 60;
 
+/// The refusal for any role change to or from `publishOnly` after enrolment.
+pub const PUBLISH_ONLY_IS_FIXED: &str = "publishOnly is fixed at enrolment: remove the machine and enrol its publisher account with --role publishOnly";
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PlacementStance {
@@ -1027,6 +1030,27 @@ impl FleetConfig {
         }
     }
 
+    /// Change a machine's role after enrolment: an operator's patch, the
+    /// Settings page, or a re-enrolment naming a role. Refuses a change to or
+    /// from `publishOnly`, which is fixed at enrolment: a publisher's account
+    /// holds the release secret, so making it `general` would run agent
+    /// batches where the secret can be read, and making an ordinary account a
+    /// publisher would offer it a secret it was never set up to hold. Returns
+    /// whether the stored state changed.
+    pub fn change_machine_role(
+        &mut self,
+        executor_id: &str,
+        role: MachineRole,
+    ) -> Result<bool, String> {
+        let current = self.machine_role(executor_id);
+        if current != role
+            && (current == MachineRole::PublishOnly || role == MachineRole::PublishOnly)
+        {
+            return Err(PUBLISH_ONLY_IS_FIXED.to_string());
+        }
+        Ok(self.set_machine_role(executor_id, role))
+    }
+
     /// Take `roles` as this config's roles, keeping only those for machines it
     /// declares, so a write that removes a machine also drops its role.
     pub fn carry_machine_roles(&mut self, roles: BTreeMap<String, MachineRole>) {
@@ -1421,6 +1445,38 @@ mod tests {
             config.machine_role(COLOCATED_EXECUTOR_ID),
             MachineRole::BuildsOnly,
             "only the forgotten machine loses its facts"
+        );
+    }
+
+    #[test]
+    fn publish_only_is_fixed_at_enrolment_in_both_directions() {
+        let mut config = FleetConfig::default();
+        config.set_machine_role("publisher", MachineRole::PublishOnly);
+        for role in MachineRole::ALL
+            .into_iter()
+            .filter(|role| *role != MachineRole::PublishOnly)
+        {
+            assert_eq!(
+                config.change_machine_role("publisher", role),
+                Err(PUBLISH_ONLY_IS_FIXED.to_string()),
+                "{role:?}"
+            );
+            assert_eq!(
+                config.change_machine_role("dev", role).map(|_| ()),
+                Ok(()),
+                "{role:?}"
+            );
+            assert_eq!(
+                config.change_machine_role("dev", MachineRole::PublishOnly),
+                Err(PUBLISH_ONLY_IS_FIXED.to_string()),
+                "{role:?}"
+            );
+        }
+        assert_eq!(config.machine_role("publisher"), MachineRole::PublishOnly);
+        assert_eq!(
+            config.change_machine_role("publisher", MachineRole::PublishOnly),
+            Ok(false),
+            "naming the role it holds is no change"
         );
     }
 

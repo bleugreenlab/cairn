@@ -189,6 +189,7 @@ pub(crate) fn build_check_batch_wire(
         learned_estimate: None,
         scratch_sync: None,
         home_affinity: None,
+        publication: batch.publication,
     });
     let items = batch
         .items
@@ -274,6 +275,7 @@ pub(crate) fn build_review_check_request(input: ReviewCheckWireInput) -> CellReq
         learned_estimate: None,
         scratch_sync: None,
         home_affinity: None,
+        publication: None,
     })
 }
 

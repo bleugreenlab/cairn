@@ -752,6 +752,32 @@ fn default_deny_read_in(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(test)]
+mod publisher_custody_tests {
+    use super::*;
+
+    /// A publisher's publication leg reads `~/.config/cairn-publish/release.env`
+    /// from inside an ordinary cell (cairn/7074): the batch policy names no
+    /// path at or above it, and the constructor takes no role, so the policy a
+    /// publisher's cell gets is the one every cell gets and no dev cell's fence
+    /// is widened for it. The account boundary, measured by the publisher
+    /// probe, is what keeps the secret, not this policy.
+    #[test]
+    fn a_cell_policy_names_nothing_over_the_publisher_secret() {
+        let home = Path::new("/home/cairn-publish");
+        let secret = home.join(".config/cairn-publish/release.env");
+        let policy = SandboxPolicy::for_run(Path::new("/w"), &[], default_deny_read_in(home));
+        assert!(
+            policy
+                .deny_read
+                .iter()
+                .all(|denied| !secret.starts_with(denied)),
+            "{:?}",
+            policy.deny_read
+        );
+    }
+}
+
 /// Whether OS-level sandboxing is available on this platform/host at runtime.
 ///
 /// macOS: `sandbox-exec` is always present. Linux: requires a landlock-capable

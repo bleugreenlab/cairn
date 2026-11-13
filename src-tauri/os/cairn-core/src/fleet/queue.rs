@@ -2283,6 +2283,7 @@ impl super::Fleet {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         let (entry_id, receiver) = self
             .queue
@@ -2360,6 +2361,7 @@ impl super::Fleet {
                         learned_estimate: None,
                         scratch_sync: None,
                         home_affinity: None,
+                        publication: None,
                     },
                     admission_kind: super::CellAdmissionKind::Command,
                     interactive: true,
@@ -2688,6 +2690,7 @@ pub(super) mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         }
     }
 

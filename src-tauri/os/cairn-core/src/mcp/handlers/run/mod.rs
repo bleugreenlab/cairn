@@ -3007,6 +3007,7 @@ pub(crate) mod slot_publication_tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         };
         let target = RunnerPublicationTarget {
             project_id: "project".into(),
@@ -6868,6 +6869,7 @@ async fn prepare_and_run_batch(
                 learned_estimate: None,
                 scratch_sync: None,
                 home_affinity: None,
+                publication: None,
             };
             // Where the scratch is warm is placement affinity: each candidate
             // is priced by how long bringing it current there would take.
@@ -13073,6 +13075,7 @@ mod tests {
             learned_estimate: None,
             scratch_sync: None,
             home_affinity: None,
+            publication: None,
         }
     }
 

@@ -2098,6 +2098,8 @@ async fn reconcile_jj_downstream(
             base_branch.to_string(),
             crate::execution::checks_main::Trigger::Merge,
         );
+        // A merged commit that lists live publish targets is published.
+        crate::publications::note_base_advance(orch, &merged_job.project_id);
         // The code map projects the base tree, so this merge is exactly what
         // makes the stored one describe a tree that is no longer the base.
         // A service runs its package as it stands at the base tip, so this
@@ -2303,6 +2305,7 @@ pub(crate) async fn reconcile_default_advance(
         default_branch.to_string(),
         crate::execution::checks_main::Trigger::Merge,
     );
+    crate::publications::note_base_advance(orch, project_id);
     // Same reasoning as the Cairn-merge path: an advance the webhook observed
     // moves the base the code map projects, whether or not Cairn drove it.
     crate::projects::codemap::note_base_advance(orch, &db, project_id, &repo_path, default_branch)

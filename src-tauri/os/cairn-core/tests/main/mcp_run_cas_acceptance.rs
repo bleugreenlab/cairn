@@ -463,6 +463,7 @@ fn request_at(
         learned_estimate: None,
         scratch_sync: None,
         home_affinity: None,
+        publication: None,
     }
 }
 

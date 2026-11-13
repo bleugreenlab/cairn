@@ -125,6 +125,26 @@ pub struct ProjectSettingsFile {
     /// verdict means. See docs/checks.md, "Cell groups".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_groups: Option<BTreeMap<String, Vec<String>>>,
+    /// How the executor distribution is published: which targets Cairn's
+    /// publication actor builds and uploads itself rather than leaving to
+    /// GitHub Actions. See docs/releases.md, "Publish as placement".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishSettings>,
+}
+
+/// The `publish` section of `.cairn/config.yaml`.
+///
+/// Unknown keys are refused: a misspelled `liveTargets` would otherwise leave
+/// every target in shadow while the project believed it had cut one over.
+/// The triples are checked against the published targets by the publication
+/// actor, which owns that list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublishSettings {
+    /// Targets whose build, upload and verify legs run live on a publisher
+    /// executor. Every other target stays a shadow leg, or GitHub's.
+    #[serde(default)]
+    pub live_targets: Vec<String>,
 }
 
 /// The `checkBudgets` section of `.cairn/config.yaml`.
@@ -455,6 +475,8 @@ struct LegacyProjectSettingsFile {
     check_budgets: Option<CheckBudgets>,
     #[serde(default)]
     cell_groups: Option<BTreeMap<String, Vec<String>>>,
+    #[serde(default)]
+    publish: Option<PublishSettings>,
 }
 
 /// Legacy terminal command with persistent field
@@ -768,6 +790,7 @@ fn parse_project_settings_under(
         requires: legacy.requires,
         check_budgets: legacy.check_budgets,
         cell_groups: legacy.cell_groups,
+        publish: legacy.publish,
     };
 
     if let Some(policy) = &mut settings.contextual_packages {
@@ -1228,6 +1251,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "pinBumps",
     "checkBudgets",
     "cellGroups",
+    "publish",
     // Legacy keys the load-path migration strips.
     "ciCommands",
     "copyFiles",
@@ -1835,6 +1859,20 @@ mod tests {
             serde_yaml::from_str::<ProjectSettingsFile>("scratch:\n  ceilingMB: 2048\n").is_err(),
             "a misspelled ceiling must be refused, not silently ignored"
         );
+    }
+
+    #[test]
+    fn publish_parses_strictly() {
+        let (parsed, _) =
+            parse_project_settings("publish:\n  liveTargets: [x86_64-unknown-linux-gnu]\n")
+                .unwrap();
+        assert_eq!(
+            parsed.publish.unwrap().live_targets,
+            ["x86_64-unknown-linux-gnu"]
+        );
+        assert!(parse_project_settings("publish:\n  liveTarget: []\n").is_err());
+        let (absent, _) = parse_project_settings("checks: {}\n").unwrap();
+        assert_eq!(absent.publish, None);
     }
 
     #[test]
