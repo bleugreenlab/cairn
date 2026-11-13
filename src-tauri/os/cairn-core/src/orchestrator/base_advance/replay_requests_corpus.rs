@@ -240,13 +240,6 @@ async fn open_session(r: &Replay) -> Option<ConflictSession> {
     load_active_session(&r.db, BRANCH).await.unwrap()
 }
 
-fn resolved_against(session: &ConflictSession, path: &str) -> Option<String> {
-    session
-        .resolution_basis
-        .get(path)
-        .map(|side| side.theirs.clone())
-}
-
 fn carries(r: &Replay, commit: &str) -> bool {
     crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, commit)
 }
@@ -291,22 +284,6 @@ async fn same_spot_resolution(bin: &str, name: &str) -> (Replay, String, String)
         "resolve against D1",
     );
     (r, d1, resolved)
-}
-
-/// The refusal shape scenario 1 requires when D2 appends at the spot the
-/// agent resolved: the branch is untouched, D2 is not in its ancestry, and the
-/// fresh session against D2 still knows the tip was resolved against D1.
-async fn assert_refused_with_fresh_session(r: &Replay, d1: &str, d2: &str, tip: &str) {
-    assert_eq!(
-        branch_tip(r),
-        tip,
-        "a refused replay leaves the branch untouched"
-    );
-    assert!(!carries(r, d2), "no tree landed on D2");
-    let session = open_session(r).await.expect("a fresh session against D2");
-    assert_eq!(session.theirs.as_deref(), Some(d2));
-    assert_eq!(session.ours.as_deref(), Some(tip));
-    assert_eq!(resolved_against(&session, LIST).as_deref(), Some(d1));
 }
 
 macro_rules! jj_or_skip {

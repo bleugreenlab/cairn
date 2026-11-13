@@ -711,7 +711,6 @@ struct RecoveryRow {
     slug: String,
     command: String,
     title: Option<String>,
-    residency_holder: Option<String>,
     executor_selector: Option<String>,
     created_by_run_id: Option<String>,
     restart_policy: RestartPolicy,
@@ -757,7 +756,7 @@ async fn restart_terminal_process(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT job_id, project_id, slug, command, title, residency_holder, id, executor_selector,
+                        "SELECT job_id, project_id, slug, command, title, id, executor_selector,
                                 created_by_run_id, restart_policy, session_id, status, process_generation
                  FROM job_terminals
                  WHERE slug = ?2 AND ((residency_holder = ?1 AND residency_incarnation_id = ?3 AND cell_epoch = ?4)
@@ -778,14 +777,13 @@ async fn restart_terminal_process(
                     slug: row.text(2)?,
                     command: row.text(3)?,
                     title: row.opt_text(4)?,
-                    residency_holder: row.opt_text(5)?,
-                    id: row.text(6)?,
-                    executor_selector: row.opt_text(7)?,
-                    created_by_run_id: row.opt_text(8)?,
-                    restart_policy: RestartPolicy::from_row(row.opt_text(9)?.as_deref()),
-                    session_id: row.text(10)?,
-                    status: row.text(11)?,
-                    process_generation: row.opt_i64(12)?.map(|generation| generation as u64),
+                    id: row.text(5)?,
+                    executor_selector: row.opt_text(6)?,
+                    created_by_run_id: row.opt_text(7)?,
+                    restart_policy: RestartPolicy::from_row(row.opt_text(8)?.as_deref()),
+                    session_id: row.text(9)?,
+                    status: row.text(10)?,
+                    process_generation: row.opt_i64(11)?.map(|generation| generation as u64),
                 })
             })
         })
@@ -8577,6 +8575,106 @@ mod terminal_finalize_tests {
                 "{slug}: the clock stays at the loss"
             );
         }
+    }
+
+    /// A pass that read a recovering row settles that row or nothing: when a
+    /// concurrent restart has already replaced it with a new row under the same
+    /// slug, the pinned settle leaves the replacement running and bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pinned_settle_never_touches_the_replacement_under_its_slug() {
+        let db = crate::storage::migrated_test_db("term_settle_replacement.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug,
+                     residency_holder, residency_incarnation_id, cell_epoch, process_generation)
+                 VALUES ('t-new', 'j', 's-new', 'sleep 100', 'running', 2, 'swap', 'job:j', 'inc', 8, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let owner = TerminalOwner::Job { job_id: "j".into() };
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "swap");
+
+        let settled = settle_terminal_as_lost(
+            &orch,
+            &owner,
+            "swap",
+            &uri,
+            "lost: the replaced row",
+            Some("t-old"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!settled, "the row the pass read is gone");
+        let replacement = recovery_state(&orch.db.local, "swap").await;
+        assert_eq!(replacement.status, "running");
+        assert_eq!(replacement.session_id, "s-new");
+        assert_eq!(replacement.exit_reason, None);
+        assert_eq!(replacement.exited_at, None);
+        assert_eq!(replacement.residency_holder.as_deref(), Some("job:j"));
+    }
+
+    /// Settling is once: a second settle of a row already settled, by either
+    /// pinned entry point, answers false and leaves its reason and its stopped
+    /// clock as the first settle wrote them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_settle_is_a_no_op() {
+        let db = crate::storage::migrated_test_db("term_settle_twice.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug,
+                     residency_holder, residency_incarnation_id, cell_epoch, process_generation, lost_at)
+                 VALUES ('t-once', 'j', 's-once', 'sleep 100', 'recovering', 2, 'once', 'job:j', 'inc', 7, 1, 5)",
+                (),
+            )
+            .await
+            .unwrap();
+        let owner = TerminalOwner::Job { job_id: "j".into() };
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "once");
+
+        assert!(settle_terminal_as_lost(
+            &orch,
+            &owner,
+            "once",
+            &uri,
+            "lost: first",
+            Some("t-once"),
+            None
+        )
+        .await
+        .unwrap());
+        let first = recovery_state(&orch.db.local, "once").await;
+        assert_eq!(first.status, "exited");
+        assert_eq!(first.exit_reason.as_deref(), Some("lost: first"));
+        assert_eq!(first.exited_at, Some(5));
+        assert_eq!(first.residency_holder, None);
+
+        assert!(!settle_terminal_as_lost(
+            &orch,
+            &owner,
+            "once",
+            &uri,
+            "lost: second",
+            Some("t-once"),
+            None
+        )
+        .await
+        .unwrap());
+        assert!(!settle_recovering_terminal(&orch, "t-once", "lost: third")
+            .await
+            .unwrap());
+        let after = recovery_state(&orch.db.local, "once").await;
+        assert_eq!(after.status, "exited");
+        assert_eq!(after.exit_reason.as_deref(), Some("lost: first"));
+        assert_eq!(after.exited_at, Some(5));
     }
 
     #[test]
