@@ -213,6 +213,9 @@ pub(crate) struct ParkedWaits {
     /// Whether an escalated message may end these waits: every active call is a
     /// parked `waitFor`, and at least one of them is still pending.
     pub(crate) supersedable: bool,
+    /// What a reader should know about when a call resolves at the latest, such
+    /// as the deadline of a recovering terminal a wait is parked on.
+    pub(crate) notes: Vec<String>,
 }
 
 /// The active (pending or resolving) suspensions a parked turn holds.
@@ -263,12 +266,22 @@ pub(crate) async fn parked_waits_of_turn(
         })
         .await
         .map_err(|error| error.to_string())?;
+    let mut notes = Vec::new();
+    for (record, _, _) in &waits {
+        if let Some(note) =
+            super::owned_wait::terminal_wait_recovery_note(db, &record.job_id, &record.condition)
+                .await
+        {
+            notes.push(note);
+        }
+    }
     Ok(ParkedWaits {
         labels: waits
             .iter()
             .map(|(record, _, _)| record.condition.label())
             .collect(),
         supersedable: timed_waits_only(&waits),
+        notes,
     })
 }
 
@@ -382,6 +395,91 @@ async fn claim_timed_waits(
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+/// The terminal a cycling notice is about: its canonical URI when the owner's
+/// home resolved, and always its owning job and slug.
+pub(crate) struct CyclingTerminal<'a> {
+    pub(crate) uri: Option<&'a str>,
+    pub(crate) job_id: &'a str,
+    pub(crate) slug: &'a str,
+}
+
+impl CyclingTerminal<'_> {
+    /// Whether a parked condition waits on this terminal.
+    fn is_waited_on_by(&self, waiting_job: &str, condition: &Condition) -> bool {
+        let Condition::Terminal {
+            uri, slug, owner, ..
+        } = condition
+        else {
+            return false;
+        };
+        if self.uri.is_some_and(|cycling| cycling == uri) {
+            return true;
+        }
+        slug == self.slug
+            && match owner {
+                Some(super::terminal_ref::TerminalOwner::Job { job_id }) => job_id == self.job_id,
+                Some(super::terminal_ref::TerminalOwner::Project { .. }) => false,
+                None => waiting_job == self.job_id,
+            }
+    }
+}
+
+/// End `job_id`'s parked `waitFor` on a terminal whose machine is about to
+/// restart, so the owner reads the notice while it can still act on it.
+///
+/// A notice about the terminal is evidence about the wait itself, so ending
+/// the wait loses nothing: the agent resumes with `result` as the wait's own
+/// answer and can wait again. The rule [`supersede_timed_waits`] keeps holds
+/// here too: a turn that also has a `run` batch or an MCP continuation in
+/// flight is never resumed early, and the notice then reaches it as a message.
+/// The claim is the same atomic `pending -> resolving` write, so a wait
+/// already resolved (by an earlier notice, or by the terminal itself) is never
+/// touched again.
+///
+/// Returns the labels of the calls this ended.
+pub(crate) async fn supersede_terminal_waits(
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    job_id: &str,
+    terminal: &CyclingTerminal<'_>,
+    result: &str,
+) -> Result<Vec<String>, String> {
+    let waiting = {
+        let job_id = job_id.to_string();
+        db.query_all(
+            "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at FROM agent_waits WHERE job_id=?1 AND state='pending' AND kind='terminal' ORDER BY created_at, id",
+            params![job_id],
+            record_from_row,
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    let mut turns: Vec<String> = Vec::new();
+    for record in waiting {
+        if terminal.is_waited_on_by(&record.job_id, &record.condition)
+            && !turns.contains(&record.turn_id)
+        {
+            turns.push(record.turn_id);
+        }
+    }
+    let mut labels = Vec::new();
+    for turn_id in turns {
+        let Some(records) = claim_timed_waits(db, job_id, &turn_id, result).await? else {
+            continue;
+        };
+        labels.extend(records.iter().map(|record| record.condition.label()));
+        let (orch, db, result) = (orch.clone(), db.clone(), result.to_string());
+        tokio::spawn(async move {
+            // In order, so every sibling but the last stands down and the
+            // last one out drives the turn's single resume.
+            for record in records {
+                drive_resolution(&orch, &db, &record, &result, true).await;
+            }
+        });
+    }
+    Ok(labels)
 }
 
 /// The inverse of [`relinquish_to_inner_wait`], for an inner wait that was
@@ -9118,7 +9216,8 @@ mod tests {
             hold,
             Hold::Wait {
                 labels: vec!["waitFor: duration".into()],
-                supersedable: true
+                supersedable: true,
+                notes: Vec::new(),
             }
         );
         let said = hold.render();
@@ -9148,7 +9247,8 @@ mod tests {
             nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap(),
             NudgeOutcome::Held(Hold::Wait {
                 labels: vec!["run: cargo test".into()],
-                supersedable: false
+                supersedable: false,
+                notes: Vec::new(),
             })
         );
         assert_eq!(wait_state(&orch).await, "pending");
@@ -9173,7 +9273,8 @@ mod tests {
             hold,
             Hold::Wait {
                 labels: vec!["waitFor: duration".into(), "run: cargo test".into()],
-                supersedable: false
+                supersedable: false,
+                notes: Vec::new(),
             }
         );
         assert!(hold.render().contains("`run: cargo test`"));

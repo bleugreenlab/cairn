@@ -63,6 +63,20 @@ pub(super) async fn dispatch(
                 }
                 None => None,
             };
+            let restart_policy = match payload.get("restart") {
+                Some(value) => {
+                    let raw = value.as_str().ok_or_else(|| {
+                        build_failure(
+                            index,
+                            item,
+                            "payload.restart must be a string: \"auto\" or \"never\"",
+                        )
+                    })?;
+                    terminal::RestartPolicy::parse(raw.trim())
+                        .map_err(|error| build_failure(index, item, error))?
+                }
+                None => terminal::RestartPolicy::default(),
+            };
             let own_selector = match payload.get("executor") {
                 Some(value) => Some(
                     crate::fleet::residency::parse_resident_selector(value)
@@ -136,7 +150,13 @@ pub(super) async fn dispatch(
                     Some(_) => " (node default)",
                     None => "",
                 };
-                format!("Would start terminal {slug}{placement}{source}: {command}{wake_suffix}")
+                let policy = match restart_policy {
+                    terminal::RestartPolicy::Never => " (restart: never)",
+                    terminal::RestartPolicy::Auto => "",
+                };
+                format!(
+                    "Would start terminal {slug}{placement}{source}{policy}: {command}{wake_suffix}"
+                )
             } else {
                 crate::fleet::placement_default::resident_outcome(
                     node_default.as_ref(),
@@ -148,6 +168,7 @@ pub(super) async fn dispatch(
                         wake,
                         request.run_id.as_deref(),
                         selector.as_ref(),
+                        restart_policy,
                     )
                     .await,
                 )

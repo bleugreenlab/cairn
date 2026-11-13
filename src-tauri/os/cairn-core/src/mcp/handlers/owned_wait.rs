@@ -39,6 +39,61 @@ pub(crate) const WAIT_ALREADY_ARMED: &str = "This wait is already armed for this
 pub(crate) const WAIT_SUSPENDED_MARKER: &str =
     "Wait suspended; the same run call will resume when its condition fires.";
 
+/// The sentence a terminal wait adds when the terminal it waits on is
+/// recovering, to its suspension reply and its hold. It is true because
+/// settling a recovering terminal as lost resolves every wait on it, `output`
+/// as well as `exit`. The transcript's hand-off recognition
+/// (`suspensionHandoff.ts`) anchors this exact shape after
+/// [`WAIT_SUSPENDED_MARKER`], so a change here changes that pattern too.
+pub(crate) fn recovering_terminal_wait_note(slug: &str, settles_at_unix: i64) -> String {
+    format!(
+        "Terminal {slug} is recovering; {}, and this wait resolves then at the latest.",
+        crate::terminal_host::recovery_deadline_clause(settles_at_unix)
+    )
+}
+
+/// [`recovering_terminal_wait_note`] for a parked condition, when it is a
+/// terminal wait whose terminal is recovering now.
+pub(crate) async fn terminal_wait_recovery_note(
+    db: &LocalDb,
+    job_id: &str,
+    condition: &Condition,
+) -> Option<String> {
+    let settles_at =
+        crate::terminal_host::terminal_recovery_settles_at(chrono::Utc::now().timestamp())?;
+    terminal_wait_recovery_note_at(db, job_id, condition, settles_at).await
+}
+
+async fn terminal_wait_recovery_note_at(
+    db: &LocalDb,
+    job_id: &str,
+    condition: &Condition,
+    settles_at: i64,
+) -> Option<String> {
+    let Condition::Terminal { slug, owner, .. } = condition else {
+        return None;
+    };
+    let owner = owner.clone().unwrap_or_else(|| TerminalOwner::Job {
+        job_id: job_id.to_string(),
+    });
+    let row = super::terminal::lookup_terminal_for_wake(db, &owner, slug)
+        .await
+        .ok()??;
+    if row.status != "recovering" {
+        return None;
+    }
+    Some(recovering_terminal_wait_note(slug, settles_at))
+}
+
+/// The suspension reply: the hand-off marker, and for a terminal that is
+/// recovering, when the wait resolves at the latest.
+fn suspension_reply(note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{WAIT_SUSPENDED_MARKER} {note}"),
+        None => WAIT_SUSPENDED_MARKER.into(),
+    }
+}
+
 /// What a wait is told when nothing in its turn's transcript is the call it came
 /// from. Correlation is the only identity an MCP-hosted agent has, so this is a
 /// dead end for the suspension rather than a degraded mode.
@@ -175,6 +230,7 @@ pub(crate) async fn handle_owned_wait(
                 Ok(handoff) => handoff,
                 Err(error) => return error,
             };
+            let note = terminal_wait_recovery_note(&db, &record.job_id, &record.condition).await;
             let (owned_orch, owned_db, owned_record) = (orch.clone(), db.clone(), record.clone());
             tokio::spawn(async move {
                 if !handoff.parked().await {
@@ -201,7 +257,7 @@ pub(crate) async fn handle_owned_wait(
                 )
                 .await;
             });
-            WAIT_SUSPENDED_MARKER.into()
+            suspension_reply(note.as_deref())
         }
     }
 }
@@ -671,6 +727,75 @@ async fn terminal(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod recovering_terminal_note_tests {
+    use super::*;
+
+    /// cairn/7082 required 1: a wait armed on a recovering terminal, on its exit
+    /// or its output, is told in its suspension reply when it resolves at the
+    /// latest. A terminal that is not recovering adds nothing.
+    #[tokio::test]
+    async fn a_wait_on_a_recovering_terminal_names_when_it_resolves_at_the_latest() {
+        let db = crate::storage::migrated_test_db("owned-wait-recovering-note.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
+             INSERT INTO jobs (id,project_id,status,created_at,updated_at) VALUES ('job-1','p','running',1,1);
+             INSERT INTO job_terminals (id,job_id,session_id,command,status,created_at,slug)
+               VALUES ('t','job-1','s','./prove','recovering',1,'proof2');",
+        )
+        .await
+        .unwrap();
+        // 21:20 UTC on some day.
+        let settles_at = 1_790_000_000 - (1_790_000_000 % 86_400) + 21 * 3600 + 20 * 60;
+        let condition = |on, phrase: Option<&str>| Condition::Terminal {
+            uri: "cairn://p/prj/1/1/builder/terminal/proof2".into(),
+            slug: "proof2".into(),
+            owner: None,
+            on,
+            phrase: phrase.map(ToOwned::to_owned),
+        };
+        for wait in [
+            condition(TerminalWaitEvent::Exit, None),
+            condition(TerminalWaitEvent::Output, Some("PROVED")),
+        ] {
+            let note = terminal_wait_recovery_note_at(&db, "job-1", &wait, settles_at).await;
+            assert_eq!(
+                suspension_reply(note.as_deref()),
+                "Wait suspended; the same run call will resume when its condition fires. \
+                 Terminal proof2 is recovering; settles as lost at 21:20 UTC unless the executor \
+                 re-advertises it, and this wait resolves then at the latest."
+            );
+            assert_eq!(
+                wait.label(),
+                format!(
+                    "waitFor: terminal proof2 {}",
+                    match wait {
+                        Condition::Terminal {
+                            on: TerminalWaitEvent::Exit,
+                            ..
+                        } => "exit",
+                        _ => "output",
+                    }
+                ),
+                "the label itself is unchanged"
+            );
+        }
+
+        db.execute("UPDATE job_terminals SET status = 'running'", ())
+            .await
+            .unwrap();
+        let note = terminal_wait_recovery_note_at(
+            &db,
+            "job-1",
+            &condition(TerminalWaitEvent::Exit, None),
+            settles_at,
+        )
+        .await;
+        assert_eq!(suspension_reply(note.as_deref()), WAIT_SUSPENDED_MARKER);
+    }
 }
 
 #[cfg(test)]

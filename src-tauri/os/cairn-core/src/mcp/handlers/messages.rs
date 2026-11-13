@@ -1162,6 +1162,7 @@ mod reply_tests {
                 Some(Ok(NudgeOutcome::Held(Hold::Wait {
                     labels: vec!["waitFor: duration".into()],
                     supersedable: true,
+                    notes: Vec::new(),
                 }))),
                 "It has not started a turn: it is parked on its own `waitFor: duration`",
             ),

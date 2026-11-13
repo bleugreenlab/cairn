@@ -260,9 +260,14 @@ fn notice_text(notice: &OwnerNotice, uri: Option<&str>) -> (String, Option<Strin
                 count => format!(", once the {count} commands running there finish"),
             };
             let at = describe_clock(restart_no_earlier_than_unix_ms);
+            let options = if terminal {
+                " Before then you can checkpoint or hand off its work, or stop it yourself (delete the terminal) so the restart does not cut it mid-step."
+            } else {
+                ""
+            };
             (
                 format!(
-                    "{machine}, where your {noun}{link} runs, restarts to install executor build {} no earlier than {at}{commands}. The restart ends your {noun}; {after}.",
+                    "{machine}, where your {noun}{link} runs, restarts to install executor build {} no earlier than {at}{commands}. The restart ends your {noun}; {after}.{options}",
                     notice.build_id
                 ),
                 terminal.then(|| {
@@ -286,11 +291,31 @@ fn notice_text(notice: &OwnerNotice, uri: Option<&str>) -> (String, Option<Strin
     }
 }
 
+/// What a `waitFor` parked on a terminal answers when its machine's restart is
+/// announced or begins: the notice itself, as a sentence the agent reads as
+/// news rather than as its wait failing.
+fn terminal_wait_cycling_result(notice: &OwnerNotice, slug: &str, message: &str) -> String {
+    match notice.kind {
+        NoticeKind::Announced {
+            restart_no_earlier_than_unix_ms,
+            ..
+        } => format!(
+            "Your wait on terminal `{slug}` returned early so you can act before its machine restarts: {message} The terminal is still running until then, and you can wait on it again with the same waitFor. (outcome: terminal_cycling; restartNoEarlierThan: {})",
+            describe_clock(restart_no_earlier_than_unix_ms)
+        ),
+        NoticeKind::Ending => format!(
+            "Your wait on terminal `{slug}` returned because its machine is restarting now: {message} (outcome: terminal_restarting_now)"
+        ),
+    }
+}
+
 /// Tell one resident's owner what the update means for it: into the
-/// terminal's own transcript when it is live, and as one message to the
-/// owner's latest run, idempotent per turn, resident and notice, so a pass
-/// that repeats a notice never tells the owner twice. Never steering: the
-/// owner reads it at its next boundary.
+/// terminal's own transcript when it is live, by ending a `waitFor` the owner
+/// is parked on for that terminal (the wait answers with the notice), and as
+/// one message to the owner's latest run, idempotent per turn, resident and
+/// notice, so a pass that repeats a notice never tells the owner twice. The
+/// message is a `steer`: an owner mid-turn reads it at its next tool boundary,
+/// and an idle one wakes for it, because the window it describes is short.
 pub(crate) async fn deliver_owner_notice(
     orch: &Orchestrator,
     notice: &OwnerNotice,
@@ -329,6 +354,38 @@ pub(crate) async fn deliver_owner_notice(
         );
         return ResidentNotice::OwnerNotFound;
     };
+    if let (Some(ResidentProcessKind::Terminal { slug }), Some(job_id)) = (
+        notice.resident.address.kind.as_ref(),
+        owner.job_id.as_deref(),
+    ) {
+        let result = terminal_wait_cycling_result(notice, slug, &message);
+        let terminal = crate::mcp::handlers::durable_suspend::CyclingTerminal {
+            uri: owner.uri.as_deref(),
+            job_id,
+            slug,
+        };
+        match crate::mcp::handlers::durable_suspend::supersede_terminal_waits(
+            orch,
+            &orch.db.local,
+            job_id,
+            &terminal,
+            &result,
+        )
+        .await
+        {
+            Ok(ended) if !ended.is_empty() => log::info!(
+                "self-update: ended {}'s parked {} so it reads the notice for {} now",
+                job_id,
+                ended.join(", "),
+                notice.resident.label
+            ),
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "self-update: could not end the waits parked on {}; the notice is still queued: {error}",
+                notice.resident.label
+            ),
+        }
+    }
     let key = format!(
         "self-update:{}:{}:{}",
         notice.operation_id,
@@ -344,7 +401,7 @@ pub(crate) async fn deliver_owner_notice(
             &queue_orch,
             &run,
             &message,
-            DeliveryUrgency::Queue,
+            DeliveryUrgency::Steer,
             &key,
         )
     })
@@ -590,7 +647,7 @@ mod tests {
         assert_eq!(
             message,
             format!(
-                "fedora, where your terminal `lab` (cairn://p/proj/1/1/builder/terminal/lab) runs, restarts to install executor build build-new no earlier than {}, once the 2 commands running there finish. The restart ends your terminal `lab`; Cairn does not start it again: restart it once fedora is back if you still need it.",
+                "fedora, where your terminal `lab` (cairn://p/proj/1/1/builder/terminal/lab) runs, restarts to install executor build build-new no earlier than {}, once the 2 commands running there finish. The restart ends your terminal `lab`; Cairn does not start it again: restart it once fedora is back if you still need it. Before then you can checkpoint or hand off its work, or stop it yourself (delete the terminal) so the restart does not cut it mid-step.",
                 describe_clock(at)
             )
         );
@@ -618,6 +675,204 @@ mod tests {
         );
         assert!(!message.contains("does not start"), "{message}");
         assert!(transcript.is_none(), "a REPL has no terminal transcript");
+    }
+
+    /// An owner and its terminal `lab`, with nothing parked yet.
+    async fn owner_with_a_terminal(
+        name: &str,
+    ) -> (Orchestrator, std::sync::Arc<crate::storage::LocalDb>) {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap().keep();
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-1','default','Test Project','proj','/tmp/test-repo',1,1);
+             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('thread-1','proj-1','general','active','none',1,1);
+             INSERT INTO jobs (id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+               VALUES ('job-thread','thread-1','proj-1','thread','thread','idle',1,1);
+             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('run-1','proj-1','job-thread','live',1,1);
+             INSERT INTO sessions (id, job_id, backend, status, created_at, updated_at)
+               VALUES ('sess-1','job-thread','claude','open',1,1);
+             INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES ('turn-1','sess-1','run-1','job-thread',1,'yielded',1,1);
+             INSERT INTO job_terminals (id, job_id, session_id, command, status, created_at, slug, residency_holder)
+               VALUES ('t-1','job-thread','terminal:lab','./prove','running',1,'lab','job:job-thread');",
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(temp.join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            temp,
+        )
+        .build();
+        (orch, db)
+    }
+
+    /// Park the owner on `waitFor: terminal lab output` (or, with `batch`, a
+    /// run batch beside it) as wait row `id`.
+    async fn park(db: &crate::storage::LocalDb, id: &str, batch: Option<&str>) {
+        use crate::mcp::handlers::durable_suspend::Condition;
+        let condition = Condition::Terminal {
+            uri: "cairn://p/proj/thread/terminal/lab".into(),
+            slug: "lab".into(),
+            owner: Some(crate::mcp::handlers::terminal_ref::TerminalOwner::Job {
+                job_id: "job-thread".into(),
+            }),
+            on: crate::mcp::handlers::run::TerminalWaitEvent::Output,
+            phrase: Some("PROVED".into()),
+        };
+        let insert = |id: String, json: String, kind: &'static str| async move {
+            db.execute(
+                "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,kind,state,created_at)
+                 VALUES(?1,'job-thread','run-1','sess-1','turn-1',?1,?2,?3,'pending',1)",
+                cairn_db::turso::params![id, json, kind],
+            )
+            .await
+            .unwrap();
+        };
+        insert(
+            id.to_string(),
+            serde_json::to_string(&condition).unwrap(),
+            condition.kind(),
+        )
+        .await;
+        if let Some(batch) = batch {
+            insert(
+                batch.to_string(),
+                r#"{"kind":"run_batch","request_id":"req","commits":false,"label":"cargo test"}"#
+                    .into(),
+                "run_batch",
+            )
+            .await;
+        }
+    }
+
+    async fn wait_row(db: &crate::storage::LocalDb, id: &str) -> (String, Option<String>) {
+        db.query_one(
+            "SELECT state, resolution_json FROM agent_waits WHERE id = ?1",
+            cairn_db::turso::params![id.to_string()],
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn announced_at(at: u64) -> OwnerNotice {
+        notice_for(
+            NoticeKind::Announced {
+                restart_no_earlier_than_unix_ms: at,
+                commands_in_flight: 0,
+            },
+            ResidentProcessKind::Terminal { slug: "lab".into() },
+        )
+    }
+
+    /// cairn/7082 required 4. An owner parked on a terminal's output cannot
+    /// read a message, so the 5-minute notice ends the wait itself: the wait
+    /// answers with the notice, the restart time and what the owner can do,
+    /// before any restart is directed. A later Ending notice leaves that
+    /// answered wait alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cycling_notice_ends_the_owners_parked_terminal_wait_with_the_notice() {
+        let (orch, db) = owner_with_a_terminal("self-update-ends-wait").await;
+        park(&db, "wait-1", None).await;
+        let at = 1_800_000_000_000 + 5 * 60_000;
+
+        assert_eq!(
+            deliver_owner_notice(&orch, &announced_at(at), 7).await,
+            ResidentNotice::Told { at_unix_ms: 7 }
+        );
+        let (state, answer) = wait_row(&db, "wait-1").await;
+        assert_ne!(state, "pending", "the wait is ended, not left parked");
+        let answer = answer.unwrap();
+        assert!(
+            answer.starts_with("Your wait on terminal `lab` returned early"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains(&describe_clock(at)),
+            "names the restart time: {answer}"
+        );
+        assert!(
+            answer.contains(
+                "checkpoint or hand off its work, or stop it yourself (delete the terminal)"
+            ),
+            "names what the owner can do: {answer}"
+        );
+        assert!(answer.contains("outcome: terminal_cycling"), "{answer}");
+        for refusal in ["interrupt", "cancel", "declin", "reject", "denied"] {
+            assert!(!answer.to_ascii_lowercase().contains(refusal), "{answer}");
+        }
+
+        let ending = notice_for(
+            NoticeKind::Ending,
+            ResidentProcessKind::Terminal { slug: "lab".into() },
+        );
+        deliver_owner_notice(&orch, &ending, 8).await;
+        assert_eq!(
+            wait_row(&db, "wait-1").await.1.as_deref(),
+            Some(answer.as_str()),
+            "an answered wait is never answered again"
+        );
+
+        let urgency: Option<String> = db
+            .query_one(
+                "SELECT urgency FROM messages WHERE id = ?1",
+                cairn_db::turso::params![crate::messages::delivery::system_direct_once_message_id(
+                    &format!(
+                        "self-update:turn-1:{}:announced",
+                        announced_at(at).resident.key
+                    )
+                )],
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(urgency.as_deref(), Some("steer"));
+    }
+
+    /// A wait armed after the 5-minute notice is ended by the Ending one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ending_notice_ends_a_wait_armed_after_the_announcement() {
+        let (orch, db) = owner_with_a_terminal("self-update-ending-wait").await;
+        deliver_owner_notice(&orch, &announced_at(1_800_000_300_000), 7).await;
+        park(&db, "wait-late", None).await;
+
+        let ending = notice_for(
+            NoticeKind::Ending,
+            ResidentProcessKind::Terminal { slug: "lab".into() },
+        );
+        deliver_owner_notice(&orch, &ending, 8).await;
+        let (state, answer) = wait_row(&db, "wait-late").await;
+        assert_ne!(state, "pending");
+        let answer = answer.unwrap();
+        assert!(answer.contains("is restarting now"), "{answer}");
+        assert!(
+            answer.contains("outcome: terminal_restarting_now"),
+            "{answer}"
+        );
+    }
+
+    /// A turn with a run batch in flight is never resumed early: the notice
+    /// reaches it as a message, and its waits stay parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cycling_notice_never_resumes_a_turn_with_work_in_flight() {
+        let (orch, db) = owner_with_a_terminal("self-update-work-in-flight").await;
+        park(&db, "wait-1", Some("batch-1")).await;
+
+        assert_eq!(
+            deliver_owner_notice(&orch, &announced_at(1_800_000_300_000), 7).await,
+            ResidentNotice::Told { at_unix_ms: 7 }
+        );
+        assert_eq!(wait_row(&db, "wait-1").await.0, "pending");
+        assert_eq!(wait_row(&db, "batch-1").await.0, "pending");
     }
 
     /// One notice reaches the owner's run once however many passes repeat it,
@@ -677,7 +932,7 @@ mod tests {
             let db = db.clone();
             async move {
                 db.query_one(
-                    "SELECT COUNT(*) FROM messages WHERE id = ?1 AND recipient_run_id = 'run-1'",
+                    "SELECT COUNT(*) FROM message_recipients WHERE message_id = ?1 AND recipient_run_id = 'run-1'",
                     cairn_db::turso::params![id.as_str()],
                     |row| row.i64(0),
                 )

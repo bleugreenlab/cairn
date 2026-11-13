@@ -459,6 +459,19 @@ impl ResidentRelays {
     pub(crate) fn len(&self) -> usize {
         self.contexts.len()
     }
+
+    /// The relay this runner holds for the process at `process_key`, if any.
+    #[cfg(test)]
+    pub(crate) fn relay_of_process(
+        &self,
+        holder: &ResidencyHolder,
+        process_key: &str,
+    ) -> Option<ResidentRelayId> {
+        self.contexts
+            .iter()
+            .find(|(_, context)| context.holder == *holder && context.process_key == process_key)
+            .map(|(relay_id, _)| relay_id.clone())
+    }
 }
 
 /// Who a new relay context will authorize.

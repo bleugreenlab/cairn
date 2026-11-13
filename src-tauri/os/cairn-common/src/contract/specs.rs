@@ -154,6 +154,13 @@ pub(crate) const PLACEMENT_DEFAULT_EXECUTOR: KeySpec = KeySpec::new(
     KeyType::Object,
     "this home's placement default: {name} for one machine as cairn://executors lists it, or {os} for any machine on that platform, optionally with requiredToolchains (the selector run takes); null clears it. Its own run batches, terminals and REPLs created without an `executor` go there, the result says `(node default)`, and a machine that cannot serve refuses the work by name. A call-level `executor` overrides it; sub-agent tasks and check lanes never inherit it",
 );
+/// Whether recovery may run a terminal's command again (cairn/7082). Chosen at
+/// creation only; there is no patch.
+pub(crate) const TERMINAL_RESTART: KeySpec = KeySpec::new(
+    "restart",
+    KeyType::Str,
+    "\"auto\" (default) starts the command again after an involuntary stop (its executor or the runner went away); \"never\" never runs it again, for a command that drives external state a replay would spoil: a process still running is taken back up and never stopped, and one that is gone ends with its output kept",
+);
 pub(crate) const WAKE: KeySpec = KeySpec::new(
     "wake",
     KeyType::Str,

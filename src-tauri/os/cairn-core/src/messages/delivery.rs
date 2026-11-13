@@ -441,6 +441,9 @@ pub enum Hold {
         labels: Vec<String>,
         /// Whether an escalated message would end these waits now.
         supersedable: bool,
+        /// When a call resolves at the latest, where something says (a
+        /// recovering terminal's deadline); each is a full sentence.
+        notes: Vec<String>,
     },
     /// Waiting on its own sub-agent tasks, or on a dependency when none is open.
     Tasks { pending: i64 },
@@ -473,13 +476,16 @@ impl Hold {
             Hold::Wait {
                 labels,
                 supersedable: true,
+                notes,
             } => format!(
-                "it is parked on its own {}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true ends the wait and wakes it now",
-                Self::calls(labels)
+                "it is parked on its own {}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true ends the wait and wakes it now{}",
+                Self::calls(labels),
+                Self::notes(notes)
             ),
-            Hold::Wait { labels, .. } => format!(
-                "it is parked on its own {}, which is work in flight; it reads this when that call resolves or the operator resumes it",
-                Self::calls(labels)
+            Hold::Wait { labels, notes, .. } => format!(
+                "it is parked on its own {}, which is work in flight; it reads this when that call resolves or the operator resumes it{}",
+                Self::calls(labels),
+                Self::notes(notes)
             ),
             Hold::Tasks { pending } if *pending > 0 => format!(
                 "it is waiting on {pending} sub-agent task{} of its own; it reads this when they return or the operator resumes it",
@@ -605,6 +611,11 @@ impl Hold {
     fn time(unix_seconds: i64) -> String {
         crate::clock::stamp(unix_seconds).unwrap_or_else(|| unix_seconds.to_string())
     }
+
+    /// Notes follow the clause as sentences of their own.
+    fn notes(notes: &[String]) -> String {
+        notes.iter().map(|note| format!(". {note}")).collect()
+    }
 }
 
 /// What holds this job from taking a turn, or `None` when nothing of its own
@@ -629,6 +640,7 @@ pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
             Hold::Wait {
                 labels: waits.labels,
                 supersedable: waits.supersedable,
+                notes: waits.notes,
             }
         }
         TurnYieldReason::DependencyWait => Hold::Tasks {

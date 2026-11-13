@@ -11,9 +11,7 @@ use cairn_common::executor_protocol::{
 };
 use cairn_db::turso::params;
 use cairn_session::terminals::clear_unadvertised_exited_terminal_lease_bindings;
-pub use cairn_session::terminals::{
-    mark_terminal_recovering, resolve_missing_terminal_lease, TerminalRecovery,
-};
+pub use cairn_session::terminals::{mark_terminal_recovering, TerminalRecovery};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -48,48 +46,61 @@ pub async fn prepare_terminal_recovery(orch: &Orchestrator) -> Result<u64, Strin
         .keys()
         .cloned()
         .collect();
-    let updated = orch.db.local.write(|conn| {
-        let sessions = sessions.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT id, session_id, residency_holder FROM job_terminals
+    let updated = orch
+        .db
+        .local
+        .write(|conn| {
+            let sessions = sessions.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, session_id, residency_holder FROM job_terminals
                      WHERE status IN ('running', 'recovering')",
-                    (),
-                )
-                .await?;
-            let mut local_orphans = Vec::new();
-            let mut resident_orphans = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let id = row.text(0)?;
-                if !sessions.contains(&row.text(1)?) {
-                    if row.opt_text(2)?.is_some() {
-                        resident_orphans.push(id);
-                    } else {
-                        local_orphans.push(id);
+                        (),
+                    )
+                    .await?;
+                let mut local_orphans = Vec::new();
+                let mut resident_orphans = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let id = row.text(0)?;
+                    if !sessions.contains(&row.text(1)?) {
+                        if row.opt_text(2)?.is_some() {
+                            resident_orphans.push(id);
+                        } else {
+                            local_orphans.push(id);
+                        }
                     }
                 }
-            }
-            drop(rows);
-            let mut updated = 0;
-            let now = chrono::Utc::now().timestamp();
-            for id in local_orphans {
-                updated += conn.execute(
-                    "UPDATE job_terminals
+                drop(rows);
+                let mut updated = 0;
+                let now = chrono::Utc::now().timestamp();
+                for id in local_orphans {
+                    updated += conn
+                        .execute(
+                            "UPDATE job_terminals
                      SET status = 'exited', exited_at = COALESCE(exited_at, ?2)
                      WHERE id = ?1 AND status IN ('running', 'recovering')",
+                            params![id.as_str(), now],
+                        )
+                        .await?;
+                }
+                // The moment of loss is stamped as this boot. It is an upper bound:
+                // the old runner stopped heartbeating earlier, and reconciliation
+                // lowers it to the residency's last heartbeat once an executor
+                // advertises the environment. One that never does keeps this
+                // bound, and the terminal's clock stays frozen here either way.
+                for id in resident_orphans {
+                    updated += conn.execute(
+                    "UPDATE job_terminals SET status = 'recovering', lost_at = COALESCE(lost_at, ?2)
+                     WHERE id = ?1 AND status = 'running'",
                     params![id.as_str(), now],
                 ).await?;
-            }
-            for id in resident_orphans {
-                updated += conn.execute(
-                    "UPDATE job_terminals SET status = 'recovering' WHERE id = ?1 AND status = 'running'",
-                    (id.as_str(),),
-                ).await?;
-            }
-            Ok(updated)
+                }
+                Ok(updated)
+            })
         })
-    }).await.map_err(|error| error.to_string())?;
+        .await
+        .map_err(|error| error.to_string())?;
     if updated > 0 {
         emit_terminal_change(orch, "update");
     }
@@ -106,6 +117,7 @@ struct RecoverableTerminal {
     incarnation_id: String,
     cell_epoch: u64,
     transition_started_at: Option<i64>,
+    process_generation: u64,
 }
 
 async fn recoverable_terminals(db: &LocalDb) -> DbResult<Vec<RecoverableTerminal>> {
@@ -113,7 +125,8 @@ async fn recoverable_terminals(db: &LocalDb) -> DbResult<Vec<RecoverableTerminal
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, session_id, status, residency_holder, residency_incarnation_id, cell_epoch, exited_at
+                    "SELECT id, session_id, status, residency_holder, residency_incarnation_id, cell_epoch, exited_at,
+                            process_generation
              FROM job_terminals
              WHERE status IN ('recovering', 'closing') AND residency_holder IS NOT NULL",
                     (),
@@ -129,6 +142,7 @@ async fn recoverable_terminals(db: &LocalDb) -> DbResult<Vec<RecoverableTerminal
                     incarnation_id: row.text(4)?,
                     cell_epoch: row.i64(5)? as u64,
                     transition_started_at: row.opt_i64(6)?,
+                    process_generation: row.opt_i64(7)?.unwrap_or(0) as u64,
                 });
             }
             Ok(terminals)
@@ -162,45 +176,89 @@ async fn delete_closing_terminal(db: &LocalDb, terminal: &RecoverableTerminal) -
 }
 
 /// Reconcile durable recovery/close intents against the fleet's complete
-/// advertised fence. Missing owners remain fenced until the full recovery grace.
-async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String> {
+/// advertised fence. A recovering terminal whose exact fence an executor
+/// advertises is started again (or, under `restart: never`, re-adopted or
+/// settled). One whose fence can provably never match again settles at once.
+/// Every other waits out the owner-recovery window, because an executor that
+/// has not re-advertised yet may still bring the process back.
+pub(crate) async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String> {
+    reconcile_terminal_lifecycle_with(orch, terminal_owner_recovery_window_elapsed()).await
+}
+
+fn owner_recovery_window_reason() -> String {
+    format!(
+        "lost: no executor re-advertised this terminal's environment within the {}-minute owner-recovery window after the runner restarted",
+        terminal_owner_recovery_duration().as_secs() / 60
+    )
+}
+
+pub(crate) async fn reconcile_terminal_lifecycle_with(
+    orch: &Orchestrator,
+    window_elapsed: bool,
+) -> Result<u64, String> {
     let rows = recoverable_terminals(&orch.db.local)
         .await
         .map_err(|error| error.to_string())?;
     let snapshot = orch.fleet.snapshot();
     let mut changed = 0;
     for row in rows {
-        let fence = snapshot.cells.iter().find_map(|cell| {
+        let advertised = snapshot.cells.iter().find_map(|cell| {
             let residency = cell.residency.as_ref()?;
             (residency.holder.storage_key() == row.residency_holder
                 && residency.incarnation_id == row.incarnation_id
                 && cell.cell_epoch == row.cell_epoch)
-                .then(|| ResidencyFence {
-                    holder: residency.holder.clone(),
-                    incarnation_id: row.incarnation_id.clone(),
-                    cell_epoch: row.cell_epoch,
+                .then(|| {
+                    (
+                        ResidencyFence {
+                            holder: residency.holder.clone(),
+                            incarnation_id: row.incarnation_id.clone(),
+                            cell_epoch: row.cell_epoch,
+                        },
+                        residency.last_heartbeat_unix_ms,
+                    )
                 })
         });
+        let fence = advertised.as_ref().map(|(fence, _)| fence.clone());
         if row.status == "recovering" {
-            if let Some(fence) = fence {
-                match crate::mcp::handlers::terminal::restart_residency_terminals(orch, fence).await
+            if let Some((fence, last_heartbeat_unix_ms)) = advertised {
+                lower_lost_at_to_heartbeat(&orch.db.local, &row.id, last_heartbeat_unix_ms)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match crate::mcp::handlers::terminal::restart_residency_terminals(
+                    orch,
+                    fence,
+                    window_elapsed,
+                )
+                .await
                 {
                     Ok(_) => changed += 1,
                     Err(error) => {
                         tracing::warn!(terminal_id = %row.id, %error, "terminal recovery retry failed")
                     }
                 }
-            } else if terminal_owner_recovery_window_elapsed()
-                && resolve_missing_terminal_lease(
-                    &orch.db.local,
-                    &row.residency_holder,
-                    &row.incarnation_id,
-                    row.cell_epoch,
-                )
+                continue;
+            }
+            let reason = if window_elapsed {
+                Some(owner_recovery_window_reason())
+            } else {
+                superseded_fence_loss(orch, &row, &snapshot.cells)
+                    .await
+                    .map(|loss| loss.reason())
+            };
+            let Some(reason) = reason else {
+                continue;
+            };
+            match crate::mcp::handlers::terminal::settle_recovering_terminal(orch, &row.id, &reason)
                 .await
-                .map_err(|error| error.to_string())?
             {
-                changed += 1;
+                Ok(true) => {
+                    changed += 1;
+                    tracing::info!(terminal_id = %row.id, %reason, "settled a recovering terminal as lost");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(terminal_id = %row.id, %error, "could not settle a recovering terminal")
+                }
             }
         } else if let Some(_fence) = fence {
             match crate::mcp::handlers::terminal::release_terminal_by_session(orch, &row.session_id)
@@ -235,8 +293,76 @@ async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String
     Ok(changed)
 }
 
+/// Lower a recovering row's moment of loss to the residency's last heartbeat,
+/// which is the last renewal the old runner sent and so when Cairn really lost
+/// sight of the process. Never raises it.
+async fn lower_lost_at_to_heartbeat(
+    db: &LocalDb,
+    terminal_id: &str,
+    last_heartbeat_unix_ms: u64,
+) -> DbResult<()> {
+    if last_heartbeat_unix_ms == 0 {
+        return Ok(());
+    }
+    let heartbeat = (last_heartbeat_unix_ms / 1000) as i64;
+    db.execute(
+        "UPDATE job_terminals SET lost_at = ?2
+         WHERE id = ?1 AND status = 'recovering' AND (lost_at IS NULL OR lost_at > ?2)",
+        params![terminal_id.to_string(), heartbeat],
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Whether a recovering terminal's fence can provably never match again: its
+/// holder is advertised under a newer epoch of the same incarnation, or under
+/// another incarnation altogether, and the executor confirms it by refusing
+/// the terminal's own fence. Nothing else counts. A process merely absent, a
+/// lease nothing advertises, or an executor that has not re-advertised yet all
+/// keep the full window, because an unanswered question is not a verdict.
+async fn superseded_fence_loss(
+    orch: &Orchestrator,
+    row: &RecoverableTerminal,
+    cells: &[PersistentCellState],
+) -> Option<ProcessLoss> {
+    let binding = ResidentTerminalBinding {
+        id: row.id.clone(),
+        session_id: row.session_id.clone(),
+        holder: row.residency_holder.clone(),
+        incarnation_id: row.incarnation_id.clone(),
+        cell_epoch: row.cell_epoch,
+        process_generation: row.process_generation,
+    };
+    let suspected = match judge_terminal_process(&binding, cells, true) {
+        TerminalLiveness::Lost(
+            loss @ (ProcessLoss::EpochAdvanced { .. } | ProcessLoss::EnvironmentReplaced { .. }),
+        ) => loss,
+        _ => return None,
+    };
+    let holder = ResidencyHolder::parse_storage_key(&row.residency_holder)?;
+    let answer = orch
+        .fleet
+        .operate_residency(
+            orch,
+            ResidencyOperation::Renew {
+                fence: ResidencyFence {
+                    holder,
+                    incarnation_id: row.incarnation_id.clone(),
+                    cell_epoch: row.cell_epoch,
+                },
+            },
+        )
+        .await;
+    match confirm_suspected_loss(&binding, &suspected, &answer)? {
+        loss @ (ProcessLoss::EpochAdvanced { .. } | ProcessLoss::EnvironmentReplaced { .. }) => {
+            Some(loss)
+        }
+        _ => None,
+    }
+}
+
 pub fn schedule_terminal_lifecycle_recovery(orch: Orchestrator) {
-    TERMINAL_OWNER_RECOVERY_STARTED.get_or_init(Instant::now);
+    start_owner_recovery_clock();
     tokio::spawn(async move {
         let mut liveness = ProcessLossWatch::default();
         loop {
@@ -799,39 +925,57 @@ mod tests {
         );
     }
 
+    /// The moment of loss is stamped once: a second delivery of the same death
+    /// does not move the clock.
     #[tokio::test]
-    async fn missing_lease_resolution_is_fenced_and_idempotent() {
-        let db = seeded_lease_db("terminal-host-missing-lease.db").await;
-        db.execute_script("UPDATE job_terminals SET status = 'recovering' WHERE id = 'running';")
-            .await
-            .unwrap();
-        assert!(
-            !resolve_missing_terminal_lease(&db, "lease-running", "old-incarnation", 2)
-                .await
-                .unwrap()
-        );
-        assert!(
-            resolve_missing_terminal_lease(&db, "lease-running", "inc-running", 2)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !resolve_missing_terminal_lease(&db, "lease-running", "inc-running", 2)
-                .await
-                .unwrap()
-        );
-
-        let (status, residency_holder, exited_at): (String, Option<String>, Option<i64>) = db
-            .query_one(
-                "SELECT status, residency_holder, exited_at FROM job_terminals WHERE id = 'running'",
+    async fn fencing_into_recovery_stamps_the_moment_of_loss_once() {
+        let db = Arc::new(seeded_lease_db("terminal-host-lost-at.db").await);
+        let lost_at = |db: Arc<LocalDb>| async move {
+            db.query_one(
+                "SELECT lost_at FROM job_terminals WHERE id = 'running'",
                 (),
-                |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_i64(2)?)),
+                |row| row.opt_i64(0),
             )
             .await
+            .unwrap()
+        };
+        assert_eq!(lost_at(db.clone()).await, None);
+        mark_terminal_recovering(db.clone(), "s-running".into())
+            .await
             .unwrap();
-        assert_eq!(status, "exited");
-        assert_eq!(residency_holder, None);
-        assert!(exited_at.is_some());
+        let first = lost_at(db.clone()).await.expect("recovery stamps lost_at");
+        db.execute(
+            "UPDATE job_terminals SET lost_at = 5 WHERE id = 'running'",
+            (),
+        )
+        .await
+        .unwrap();
+        mark_terminal_recovering(db.clone(), "s-running".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            lost_at(db.clone()).await,
+            Some(5),
+            "a second delivery never moves it"
+        );
+        assert!(first > 5);
+
+        // An advertised heartbeat only ever lowers it.
+        lower_lost_at_to_heartbeat(&db, "running", 9_000)
+            .await
+            .unwrap();
+        assert_eq!(lost_at(db.clone()).await, Some(5));
+        lower_lost_at_to_heartbeat(&db, "running", 3_000)
+            .await
+            .unwrap();
+        assert_eq!(lost_at(db.clone()).await, Some(3));
+    }
+
+    #[test]
+    fn the_settle_deadline_is_the_window_end_or_now_once_it_has_passed() {
+        let started = 1_800_000_000;
+        assert_eq!(recovery_settles_at(started, started + 60), started + 600);
+        assert_eq!(recovery_settles_at(started, started + 900), started + 900);
     }
 
     /// The transition that makes recovery reachable at all. Before this, a
@@ -957,9 +1101,43 @@ mod tests {
 pub(crate) const TERMINAL_HEARTBEAT_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub(crate) const TERMINAL_RECLAIM_GRACE_MS: u64 = 5 * 60 * 1000;
 static TERMINAL_OWNER_RECOVERY_STARTED: OnceLock<Instant> = OnceLock::new();
+/// The same start as [`TERMINAL_OWNER_RECOVERY_STARTED`], on the wall clock,
+/// so the moment the window closes can be shown to a reader.
+static TERMINAL_OWNER_RECOVERY_STARTED_UNIX: OnceLock<i64> = OnceLock::new();
+
+/// Start the owner-recovery clock, once per process, on both clocks together.
+fn start_owner_recovery_clock() -> Instant {
+    let started = *TERMINAL_OWNER_RECOVERY_STARTED.get_or_init(Instant::now);
+    TERMINAL_OWNER_RECOVERY_STARTED_UNIX.get_or_init(|| chrono::Utc::now().timestamp());
+    started
+}
 
 fn terminal_owner_recovery_duration() -> Duration {
     Duration::from_millis(TERMINAL_HEARTBEAT_TIMEOUT_MS + TERMINAL_RECLAIM_GRACE_MS)
+}
+
+/// When a terminal recovering now settles as lost if no executor re-advertises
+/// it, in Unix seconds; `None` before the recovery clock has started.
+pub(crate) fn terminal_recovery_settles_at(now_unix: i64) -> Option<i64> {
+    TERMINAL_OWNER_RECOVERY_STARTED_UNIX
+        .get()
+        .map(|started| recovery_settles_at(*started, now_unix))
+}
+
+/// What a reader is told about a recovering terminal's deadline, in the banner
+/// and in a `waitFor` on it alike.
+pub(crate) fn recovery_deadline_clause(settles_at_unix: i64) -> String {
+    format!(
+        "settles as lost at {} unless the executor re-advertises it",
+        cairn_common::executor_protocol::describe_clock((settles_at_unix.max(0) as u64) * 1000)
+    )
+}
+
+/// The window closes a fixed time after this runner started. A terminal that
+/// enters recovery after it has closed settles on the next reconcile pass,
+/// which is now for a reader's purposes.
+fn recovery_settles_at(started_unix: i64, now_unix: i64) -> i64 {
+    (started_unix + terminal_owner_recovery_duration().as_secs() as i64).max(now_unix)
 }
 
 fn owner_recovery_window_elapsed(started: Instant, now: Instant) -> bool {
@@ -976,7 +1154,7 @@ pub(crate) fn terminal_owner_recovery_window_elapsed() -> bool {
 /// restart. Cleanup waits the full heartbeat plus reclaim window regardless of
 /// when the terminal process itself exited.
 pub fn schedule_exited_terminal_lease_recovery(orch: Orchestrator) {
-    let started = *TERMINAL_OWNER_RECOVERY_STARTED.get_or_init(Instant::now);
+    let started = start_owner_recovery_clock();
     tokio::spawn(async move {
         let deadline = started + terminal_owner_recovery_duration();
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
@@ -1024,6 +1202,8 @@ pub struct JobTerminal {
     residency_incarnation_id: Option<String>,
     cell_epoch: Option<u64>,
     process_generation: Option<u64>,
+    lost_at: Option<i64>,
+    restart_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1070,13 +1250,16 @@ fn terminal_from_row(row: &cairn_db::turso::Row) -> DbResult<JobTerminal> {
         residency_incarnation_id: row.opt_text(14)?,
         cell_epoch: row.opt_i64(15)?.map(|value| value as u64),
         process_generation: row.opt_i64(16)?.map(|value| value as u64),
+        lost_at: row.opt_i64(17)?,
+        restart_policy: row.text(18)?,
     })
 }
 
 const TERMINAL_SELECT: &str = "
     SELECT id, job_id, project_id, run_id, session_id, command, title,
            description, status, exit_code, created_at, exited_at, slug,
-           residency_holder, residency_incarnation_id, cell_epoch, process_generation
+           residency_holder, residency_incarnation_id, cell_epoch, process_generation,
+           lost_at, restart_policy
     FROM job_terminals
 ";
 

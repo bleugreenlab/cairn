@@ -33,11 +33,6 @@ pub struct PtyDataPayload {
     pub data: String,
 }
 
-/// Re-drive durable terminal-exit subscriptions whose terminal has already
-/// settled or disappeared. Normal PTY finalization routes immediately, but a
-/// runner restart can lose that edge while both the terminal row and subscription
-/// survive independently. Resolve by canonical resource identity: project
-/// terminals belong to a project row but are subscribed by the creating job.
 fn reconciled_terminal_tail(row: Option<&TerminalWakeRow>) -> Option<&str> {
     match row {
         Some(row) => row.output_tail.as_deref(),
@@ -45,6 +40,71 @@ fn reconciled_terminal_tail(row: Option<&TerminalWakeRow>) -> Option<&str> {
     }
 }
 
+/// How long a terminal ran, as its exit wake and a read state it: to its exit,
+/// or, for a terminal Cairn lost and has not settled, to the moment of loss.
+/// The clock never runs on through a recovery window.
+pub(crate) fn terminal_runtime_secs(
+    created_at: i64,
+    exited_at: Option<i64>,
+    lost_at: Option<i64>,
+    now: i64,
+) -> i64 {
+    (exited_at.or(lost_at).unwrap_or(now) - created_at).max(0)
+}
+
+/// Route the exit wake owed to the terminal at canonical `uri` if it has settled
+/// or disappeared. Returns whether a wake was routed; a live terminal (running,
+/// recovering, closing) owes nothing yet.
+///
+/// Resolution is by canonical resource identity: project terminals belong to a
+/// project row but are subscribed by the creating job. Delivery is exactly once
+/// because the router consumes a one-shot subscription on delivery, so a later
+/// reconcile of the same URI finds nothing to match.
+pub(crate) async fn reconcile_terminal_exit_wake(
+    orch: &Orchestrator,
+    uri: &str,
+) -> Result<bool, String> {
+    let Some(resource) = cairn_uri::parse_uri(uri) else {
+        return Ok(false);
+    };
+    let slug = match &resource {
+        CairnResource::NodeTerminal { slug, .. }
+        | CairnResource::TaskTerminal { slug, .. }
+        | CairnResource::ProjectTerminal { slug, .. } => slug.clone(),
+        _ => return Ok(false),
+    };
+    let row = match resolve_terminal_resource_target(&orch.db.local, &resource).await {
+        Ok(target) => lookup_terminal_for_wake_target(&orch.db.local, &target)
+            .await
+            .map_err(|error| error.to_string())?,
+        // A deleted job/project is also a definitively absent terminal.
+        Err(_) => None,
+    };
+    if row.as_ref().is_some_and(|row| row.status != "exited") {
+        return Ok(false);
+    }
+
+    let runtime_secs = row.as_ref().and_then(|row| {
+        row.exited_at
+            .map(|exited| terminal_runtime_secs(row.created_at, Some(exited), row.lost_at, 0))
+    });
+    crate::orchestrator::wakes::route_terminal_exit_async(
+        orch,
+        &slug,
+        uri,
+        row.as_ref().and_then(|row| row.exit_code),
+        runtime_secs,
+        reconciled_terminal_tail(row.as_ref()),
+        row.as_ref().and_then(|row| row.exit_reason.as_deref()),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Re-drive durable terminal-exit subscriptions whose terminal has already
+/// settled or disappeared. Normal PTY finalization routes immediately, but a
+/// runner restart can lose that edge while both the terminal row and subscription
+/// survive independently.
 pub(crate) async fn reconcile_exited_terminal_wakes(orch: &Orchestrator) -> Result<usize, String> {
     let uris = orch
         .db
@@ -73,43 +133,68 @@ pub(crate) async fn reconcile_exited_terminal_wakes(orch: &Orchestrator) -> Resu
 
     let mut routed = 0;
     for uri in uris {
-        let Some(resource) = cairn_uri::parse_uri(&uri) else {
-            continue;
-        };
-        let slug = match &resource {
-            CairnResource::NodeTerminal { slug, .. }
-            | CairnResource::TaskTerminal { slug, .. }
-            | CairnResource::ProjectTerminal { slug, .. } => slug.clone(),
-            _ => continue,
-        };
-        let row = match resolve_terminal_resource_target(&orch.db.local, &resource).await {
-            Ok(target) => lookup_terminal_for_wake_target(&orch.db.local, &target)
-                .await
-                .map_err(|error| error.to_string())?,
-            // A deleted job/project is also a definitively absent terminal.
-            Err(_) => None,
-        };
-        if row.as_ref().is_some_and(|row| row.status != "exited") {
-            continue;
+        if reconcile_terminal_exit_wake(orch, &uri).await? {
+            routed += 1;
         }
-
-        let runtime_secs = row
-            .as_ref()
-            .and_then(|row| row.exited_at.map(|exited| (exited - row.created_at).max(0)));
-        crate::orchestrator::wakes::route_terminal_exit_async(
-            orch,
-            &slug,
-            &uri,
-            row.as_ref().and_then(|row| row.exit_code),
-            runtime_secs,
-            reconciled_terminal_tail(row.as_ref()),
-            row.as_ref().and_then(|row| row.exit_reason.as_deref()),
-        )
-        .await?;
-        routed += 1;
     }
 
     Ok(routed)
+}
+
+/// Whether recovery may run a terminal's command again after an involuntary
+/// stop. Chosen at creation, written on the row, and carried to the row a
+/// recovery restart re-mints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RestartPolicy {
+    /// Recovery starts the command again (the #2802 rule).
+    #[default]
+    Auto,
+    /// Recovery never runs the command again: for a command that drives
+    /// external state a replay would spoil. A process that is still running is
+    /// re-adopted, never stopped; one that is gone settles with its output kept.
+    Never,
+}
+
+impl RestartPolicy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Never => "never",
+        }
+    }
+
+    /// The policy a create payload names, refusing anything else with both
+    /// accepted values.
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "never" => Ok(Self::Never),
+            other => Err(format!(
+                "payload.restart must be \"auto\" (start the command again after an involuntary stop; the default) or \"never\" (never run it again), not {other:?}"
+            )),
+        }
+    }
+
+    /// The policy a row states. An unrecognised value reads as the default,
+    /// which is what every row older than the column already is.
+    pub(crate) fn from_row(value: Option<&str>) -> Self {
+        match value {
+            Some("never") => Self::Never,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// The one predicate every restart entry asks: does recovery run this
+/// terminal's command again when it was lost?
+pub(crate) fn terminal_restarts_on_loss(policy: RestartPolicy) -> bool {
+    matches!(policy, RestartPolicy::Auto)
+}
+
+/// Why a `restart: never` terminal ended, as its exit reason, banner, exit wake
+/// and `waitFor` all state it.
+fn not_restarted_by_policy_reason(cause: &str) -> String {
+    format!("not restarted by its own policy (restart: never): {cause}")
 }
 
 /// How a terminal's PTY runs the command it was created with.
@@ -374,32 +459,88 @@ fn note_terminal_restart(
     announce_in_terminal(orch, session_id, &notice);
 }
 
-/// End a terminal recovery could not start again, saying why.
+/// End a terminal recovery could not start again, saying why, and deliver the
+/// exit wake its subscriber is owed.
 ///
-/// The reason goes on the row, so a read of the terminal, its exit wake, and a
-/// `waitFor` on its exit all carry it. Nothing is released here: whatever
-/// environment the terminal was bound to belongs to its owner.
-async fn settle_refused_recovery(
+/// The terminal is named by its owner and slug rather than a row id, because a
+/// restart that failed may have done so before or after it replaced the row: the
+/// unique `(scope, slug)` index means whichever row holds the slug now is the
+/// terminal. The reason goes on that row, so a read of the terminal, its exit
+/// wake, and a `waitFor` on its exit all carry it. Nothing is released here:
+/// whatever environment the terminal was bound to belongs to its owner.
+async fn settle_unrecoverable_terminal(
     orch: &Orchestrator,
-    terminal_id: &str,
+    owner: &TerminalOwner,
+    slug: &str,
+    terminal_uri: &str,
     reason: &str,
 ) -> Result<(), String> {
-    let terminal_id = terminal_id.to_string();
+    settle_terminal_as_lost(orch, owner, slug, terminal_uri, reason, None, None)
+        .await
+        .map(|_| ())
+}
+
+/// The one writer that settles a terminal Cairn lost: a failed recovery
+/// restart, a recovery window that elapsed, a fence that can never match again,
+/// and a `restart: never` terminal whose process is gone all end here.
+///
+/// The run clock stays where the loss stopped it (`exited_at` takes `lost_at`
+/// before now), and the row's residency binding is cleared, since no restart
+/// will start anything into it. `expected_row`, when given, confines the write
+/// to that row while it is still live, so a pass that read a recovering row
+/// cannot settle the replacement a concurrent restart minted under the same
+/// slug. `output_tail` keeps a live transcript's last output on the row.
+///
+/// Returns whether this call settled the row.
+async fn settle_terminal_as_lost(
+    orch: &Orchestrator,
+    owner: &TerminalOwner,
+    slug: &str,
+    terminal_uri: &str,
+    reason: &str,
+    expected_row: Option<&str>,
+    output_tail: Option<String>,
+) -> Result<bool, String> {
+    let owner = owner.clone();
+    let slug = slug.to_string();
     let reason = reason.to_string();
+    let expected_row = expected_row.map(ToOwned::to_owned);
     let settled = orch
         .db
         .local
         .write(|conn| {
-            let terminal_id = terminal_id.clone();
+            let owner = owner.clone();
+            let slug = slug.clone();
             let reason = reason.clone();
+            let expected_row = expected_row.clone();
+            let output_tail = output_tail.clone();
             Box::pin(async move {
+                let (scope, scope_id) = match &owner {
+                    TerminalOwner::Job { job_id } => ("job_id = ?1", job_id.as_str()),
+                    TerminalOwner::Project { project_id } => {
+                        ("project_id = ?1 AND job_id IS NULL", project_id.as_str())
+                    }
+                };
                 let now = chrono::Utc::now().timestamp();
                 Ok(conn
                     .execute(
-                        "UPDATE job_terminals
-                         SET status = 'exited', exited_at = COALESCE(exited_at, ?3), exit_reason = ?2
-                         WHERE id = ?1 AND status != 'closing'",
-                        params![terminal_id.as_str(), reason.as_str(), now],
+                        format!(
+                            "UPDATE job_terminals
+                             SET status = 'exited', exited_at = COALESCE(exited_at, lost_at, ?4),
+                                 exit_reason = ?3, output_tail = COALESCE(?6, output_tail),
+                                 residency_holder = NULL, residency_incarnation_id = NULL,
+                                 cell_epoch = NULL, process_generation = NULL
+                             WHERE {scope} AND slug = ?2 AND status != 'closing'
+                               AND (?5 IS NULL OR (id = ?5 AND status IN ('running', 'recovering')))"
+                        ),
+                        params![
+                            scope_id,
+                            slug.as_str(),
+                            reason.as_str(),
+                            now,
+                            expected_row.as_deref(),
+                            output_tail.as_deref()
+                        ],
                     )
                     .await?
                     > 0)
@@ -412,16 +553,68 @@ async fn settle_refused_recovery(
             "db-change",
             serde_json::json!({"table": "job_terminals", "action": "update"}),
         );
-        reconcile_exited_terminal_wakes(orch).await?;
     }
-    Ok(())
+    reconcile_terminal_exit_wake(orch, terminal_uri).await?;
+    Ok(settled)
+}
+
+/// Settle the recovering terminal row `terminal_id` as lost, for `reason`.
+/// The lifecycle reconciler knows a row, not an owner, so this resolves the
+/// owner, slug and URI the settlement writer is keyed on.
+pub(crate) async fn settle_recovering_terminal(
+    orch: &Orchestrator,
+    terminal_id: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let row = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT job_id, project_id, slug FROM job_terminals
+             WHERE id = ?1 AND status = 'recovering'",
+            params![terminal_id.to_string()],
+            |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.text(2)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((job_id, project_id, slug)) = row else {
+        return Ok(false);
+    };
+    let (owner, resource) = match (job_id, project_id) {
+        (Some(job_id), _) => (
+            TerminalOwner::Job {
+                job_id: job_id.clone(),
+            },
+            terminal_resource_for_job(&orch.db.local, &job_id, slug.clone()).await,
+        ),
+        (None, Some(project_id)) => (
+            TerminalOwner::Project {
+                project_id: project_id.clone(),
+            },
+            terminal_resource_for_project(&orch.db.local, &project_id, slug.clone()).await,
+        ),
+        (None, None) => return Err("terminal row names neither a job nor a project".into()),
+    };
+    // An owner that no longer resolves still has a row that must stop claiming
+    // to recover; it settles with no URI to route a wake to.
+    let uri = resource
+        .map(|resource| resource.to_uri())
+        .unwrap_or_default();
+    settle_terminal_as_lost(orch, &owner, &slug, &uri, reason, Some(terminal_id), None).await
 }
 
 /// Restart every terminal an execution environment still owes a shell, which is
 /// what durable recovery asks for after an executor generation is lost.
+///
+/// One terminal that cannot be answered never stops its siblings: each is
+/// restarted, re-adopted or settled on its own, and the first failure is
+/// reported once all have been tried. `window_elapsed` says whether the
+/// owner-recovery window has closed, which is when a terminal whose environment
+/// no executor holds may be given a fresh one.
 pub async fn restart_residency_terminals(
     orch: &Orchestrator,
     fence: ResidencyFence,
+    window_elapsed: bool,
 ) -> Result<String, String> {
     let residency_holder = fence.holder.storage_key().clone();
     let restartable_processes: std::collections::HashSet<String> = orch
@@ -452,10 +645,21 @@ pub async fn restart_residency_terminals(
         ));
     }
     let mut sessions = Vec::with_capacity(slugs.len());
+    let mut first_error = None;
     for slug in slugs {
-        sessions.push(restart_terminal_process(orch, fence.clone(), &slug).await?);
+        match restart_terminal_process(orch, fence.clone(), &slug, window_elapsed).await {
+            Ok(Some(session)) => sessions.push(session),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%slug, %error, "terminal recovery could not answer one terminal; its siblings continue");
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(sessions.join(","))
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(sessions.join(",")),
+    }
 }
 
 async fn terminal_slugs_for_lease(
@@ -499,11 +703,46 @@ async fn terminal_slugs_for_lease(
     .map_err(|error| error.to_string())
 }
 
+/// The terminal row a recovery restart reads.
+struct RecoveryRow {
+    id: String,
+    job_id: Option<String>,
+    project_id: Option<String>,
+    slug: String,
+    command: String,
+    title: Option<String>,
+    residency_holder: Option<String>,
+    executor_selector: Option<String>,
+    created_by_run_id: Option<String>,
+    restart_policy: RestartPolicy,
+    session_id: String,
+    status: String,
+    process_generation: Option<u64>,
+}
+
+impl RecoveryRow {
+    fn owner(&self) -> Result<TerminalOwner, String> {
+        match (&self.job_id, &self.project_id) {
+            (Some(job_id), _) => Ok(TerminalOwner::Job {
+                job_id: job_id.clone(),
+            }),
+            (None, Some(project_id)) => Ok(TerminalOwner::Project {
+                project_id: project_id.clone(),
+            }),
+            (None, None) => Err("terminal row names neither a job nor a project".into()),
+        }
+    }
+}
+
+/// Start a lost terminal again, or, for a `restart: never` terminal, answer
+/// its loss without running its command. Returns the session now running the
+/// terminal when this call started or re-adopted one.
 async fn restart_terminal_process(
     orch: &Orchestrator,
     fence: ResidencyFence,
     slug: &str,
-) -> Result<String, String> {
+    window_elapsed: bool,
+) -> Result<Option<String>, String> {
     let residency_holder = fence.holder.storage_key().clone();
     let incarnation_id = fence.incarnation_id.clone();
     let cell_epoch = fence.cell_epoch;
@@ -518,7 +757,8 @@ async fn restart_terminal_process(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT job_id, project_id, slug, command, title, residency_holder, id, executor_selector, created_by_run_id
+                        "SELECT job_id, project_id, slug, command, title, residency_holder, id, executor_selector,
+                                created_by_run_id, restart_policy, session_id, status, process_generation
                  FROM job_terminals
                  WHERE slug = ?2 AND ((residency_holder = ?1 AND residency_incarnation_id = ?3 AND cell_epoch = ?4)
                     OR (status = 'exited'
@@ -532,69 +772,73 @@ async fn restart_terminal_process(
                         "No terminal row is bound to lease {residency_holder}"
                     ))
                 })?;
-                Ok((
-                    row.opt_text(0)?,
-                    row.opt_text(1)?,
-                    row.text(2)?,
-                    row.text(3)?,
-                    row.opt_text(4)?,
-                    row.opt_text(5)?,
-                    row.text(6)?,
-                    row.opt_text(7)?,
-                    row.opt_text(8)?,
-                ))
+                Ok(RecoveryRow {
+                    job_id: row.opt_text(0)?,
+                    project_id: row.opt_text(1)?,
+                    slug: row.text(2)?,
+                    command: row.text(3)?,
+                    title: row.opt_text(4)?,
+                    residency_holder: row.opt_text(5)?,
+                    id: row.text(6)?,
+                    executor_selector: row.opt_text(7)?,
+                    created_by_run_id: row.opt_text(8)?,
+                    restart_policy: RestartPolicy::from_row(row.opt_text(9)?.as_deref()),
+                    session_id: row.text(10)?,
+                    status: row.text(11)?,
+                    process_generation: row.opt_i64(12)?.map(|generation| generation as u64),
+                })
             })
         })
         .await
         .map_err(|error| error.to_string())?;
-    let terminal_id = row.6.clone();
-    // The executor the terminal was created with is part of it for as long as
-    // it lives: a restart places with it, and the row it re-mints keeps it.
-    let selector = match crate::fleet::residency::resident_selector_from_row(row.7.as_deref()) {
-        Ok(selector) => selector,
-        Err(error) => {
-            let reason = format!(
-                "recovery refused: terminal `{slug}` was not started again because {error}. Nothing was started."
-            );
-            settle_refused_recovery(orch, &terminal_id, &reason).await?;
-            return Err(reason);
+    let terminal_id = row.id.clone();
+    let owner = row.owner()?;
+    let resource = match &owner {
+        TerminalOwner::Job { job_id } => {
+            terminal_resource_for_job(&orch.db.local, job_id, row.slug.clone()).await?
         }
-    };
-
-    let resource = if let Some(job_id) = row.0.as_deref() {
-        terminal_resource_for_job(&orch.db.local, job_id, row.2.clone()).await?
-    } else {
-        terminal_resource_for_project(
-            &orch.db.local,
-            row.1
-                .as_deref()
-                .ok_or("project terminal row has no project")?,
-            row.2.clone(),
-        )
-        .await?
+        TerminalOwner::Project { project_id } => {
+            terminal_resource_for_project(&orch.db.local, project_id, row.slug.clone()).await?
+        }
     };
     // The terminal's own URI is what a restart is recorded against: it outlives
     // the session id a restart replaces.
     let terminal_uri = resource.to_uri();
+    // The executor the terminal was created with is part of it for as long as
+    // it lives: a restart places with it, and the row it re-mints keeps it.
+    let selector = match crate::fleet::residency::resident_selector_from_row(
+        row.executor_selector.as_deref(),
+    ) {
+        Ok(selector) => selector,
+        Err(error) => {
+            let reason = format!(
+                    "recovery refused: terminal `{slug}` was not started again because {error}. Nothing was started."
+                );
+            settle_unrecoverable_terminal(orch, &owner, &slug, &terminal_uri, &reason).await?;
+            return Err(reason);
+        }
+    };
+
     let mut target = resolve_terminal_resource_target(&orch.db.local, &resource)
         .await
         .map_err(|error| error.to_string())?;
     target.selector = selector;
-    target.created_by_run_id = row.8.clone();
+    target.created_by_run_id = row.created_by_run_id.clone();
     target.replaces = Some(terminal_id.clone());
+    target.restart_policy = row.restart_policy;
     // This is the fenced recovery of the row that already owns the slug, not a
     // competing create. New terminal creation performs the live-slug admission
     // check before it reaches this path.
     // Carrying the title forward is what keeps a restart honest: the re-inserted
     // row must make the same statement about itself as the one it replaces, or
     // the next recovery reclassifies an operator's terminal as a one-shot.
-    let title = row.4.clone();
+    let title = row.title.clone();
     // A shell-input terminal's command was typed into a shell the operator owns,
     // so a restart hands them a fresh prompt instead of replaying it; a
     // lifetime-process terminal *is* its command and restarts as that command.
     let command = match TerminalCommandMode::for_persisted_row(title.as_deref()) {
         TerminalCommandMode::ShellInput => String::new(),
-        TerminalCommandMode::LifetimeProcess => row.3.clone(),
+        TerminalCommandMode::LifetimeProcess => row.command.clone(),
     };
     let cell = orch.fleet.snapshot().cells.into_iter().find(|cell| {
         cell.cell_epoch == fence.cell_epoch
@@ -603,32 +847,46 @@ async fn restart_terminal_process(
             })
     });
     let Some(cell) = cell else {
-        if !crate::terminal_host::terminal_owner_recovery_window_elapsed() {
+        if !window_elapsed {
             return Err(
                 "terminal lease fence is stale while its executor may still reclaim it".into(),
             );
         }
-        if row.5.is_some() {
-            crate::terminal_host::resolve_missing_terminal_lease(
-                &orch.db.local,
-                &fence.holder.storage_key(),
-                &fence.incarnation_id,
-                fence.cell_epoch,
+        // Acquiring a fresh environment would run the command again, which a
+        // `restart: never` terminal forbids; nothing is left running to adopt.
+        if !terminal_restarts_on_loss(row.restart_policy) {
+            let reason = not_restarted_by_policy_reason(
+                "no executor took its environment back up within the owner-recovery window",
+            );
+            settle_terminal_as_lost(
+                orch,
+                &owner,
+                &slug,
+                &terminal_uri,
+                &reason,
+                Some(&terminal_id),
+                None,
             )
-            .await
-            .map_err(|error| error.to_string())?;
+            .await?;
+            return Ok(None);
         }
+        // The row keeps its binding until the replacement's insert removes it
+        // by id (`target.replaces`), so a terminal whose re-materialisation
+        // fails before that is still recovery's on the next pass, and a
+        // sibling on the same fence is still found by it.
         // The environment is acquired again, by the rule the create used: on a
-        // machine its selector accepts, or not at all. The row is no longer
-        // recovery's by now, so a terminal that cannot come back where it was
-        // created to run ends here with the refusal as its reason, rather than
-        // starting somewhere else or ending without saying why.
+        // machine its selector accepts, or not at all. A terminal that cannot
+        // come back where it was created to run ends here with the refusal as
+        // its reason, rather than starting somewhere else or ending without
+        // saying why.
         let (target, landing) = match materialize_terminal_lease(orch, target).await {
             Ok(placed) => placed,
             Err(refusal) => {
-                settle_refused_recovery(
+                settle_unrecoverable_terminal(
                     orch,
-                    &terminal_id,
+                    &owner,
+                    &slug,
+                    &terminal_uri,
                     &format!("recovery refused: {refusal}"),
                 )
                 .await?;
@@ -657,7 +915,7 @@ async fn restart_terminal_process(
             &session_id,
             landing.rehomed_from.as_deref(),
         );
-        return Ok(session_id);
+        return Ok(Some(session_id));
     };
     let lease = cell
         .residency
@@ -678,6 +936,11 @@ async fn restart_terminal_process(
         }
     }
     target.cwd = cell.path;
+    if !terminal_restarts_on_loss(row.restart_policy) {
+        target.lease = Some(fence.clone());
+        return recover_without_restart(orch, resource, target, fence, &row, &owner, &terminal_uri)
+            .await;
+    }
     // Reconnecting to (or reclaiming) an existing lease can find a checkout the
     // bookmark advanced past while the executor was disconnected. Refresh to the
     // current tip before spawning so the terminal never reports running against
@@ -704,7 +967,182 @@ async fn restart_terminal_process(
     )
     .await?;
     note_terminal_restart(orch, &terminal_uri, &session_id, None);
-    Ok(session_id)
+    Ok(Some(session_id))
+}
+
+/// What the executor holding a `restart: never` terminal's environment says,
+/// asked under the terminal's own fence, about the terminal's process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurvivingProcess {
+    /// Still running, at this generation: re-adopt it.
+    Alive { generation: u64 },
+    /// Gone: the cell no longer runs it, or the fence can never match again.
+    Gone,
+    /// The executor did not answer in a way that says either.
+    Unknown,
+}
+
+fn judge_surviving_process(
+    answer: &ResidencyResult,
+    session_id: &str,
+    process_generation: Option<u64>,
+) -> SurvivingProcess {
+    match answer {
+        ResidencyResult::State { cell } => match cell.occupancy.processes.get(session_id) {
+            Some(process)
+                if matches!(
+                    process.status,
+                    ResidentProcessStatus::Starting | ResidentProcessStatus::Running { .. }
+                ) && process_generation.is_none_or(|bound| bound == process.generation) =>
+            {
+                SurvivingProcess::Alive {
+                    generation: process.generation,
+                }
+            }
+            _ => SurvivingProcess::Gone,
+        },
+        ResidencyResult::Failed {
+            kind:
+                cairn_common::executor_protocol::ResidencyFailureKind::StaleEpoch
+                | cairn_common::executor_protocol::ResidencyFailureKind::NotFound,
+            ..
+        } => SurvivingProcess::Gone,
+        _ => SurvivingProcess::Unknown,
+    }
+}
+
+/// Answer the loss of a `restart: never` terminal without running its command.
+///
+/// The policy forbids a replay, never a survivor: a process the executor proves
+/// still running is re-adopted under its own session and fence and keeps
+/// running, and only a process proven gone settles the terminal, through the
+/// one settlement writer, with the policy as its reason and its last output
+/// kept. An unanswered probe is not a verdict, so the terminal waits for the
+/// next pass.
+async fn recover_without_restart(
+    orch: &Orchestrator,
+    resource: CairnResource,
+    target: TerminalResourceTarget,
+    fence: ResidencyFence,
+    row: &RecoveryRow,
+    owner: &TerminalOwner,
+    terminal_uri: &str,
+) -> Result<Option<String>, String> {
+    let answer = orch
+        .fleet
+        .operate_residency(
+            orch,
+            ResidencyOperation::Renew {
+                fence: fence.clone(),
+            },
+        )
+        .await;
+    let observed_here = orch
+        .pty_state
+        .sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(&row.session_id))
+        .unwrap_or(false);
+    match judge_surviving_process(&answer, &row.session_id, row.process_generation) {
+        // This runner never lost it: nothing to recover.
+        SurvivingProcess::Alive { .. } if observed_here => Ok(None),
+        SurvivingProcess::Alive { generation } => {
+            readopt_terminal_process(orch, resource, target, fence, row, generation).await
+        }
+        SurvivingProcess::Gone => {
+            let cause = if row.status == "recovering" && !observed_here {
+                "the runner restarted"
+            } else {
+                "its executor went away"
+            };
+            let reason = not_restarted_by_policy_reason(cause);
+            if observed_here && row.status == "running" {
+                // A live transcript: the ordinary finalizer keeps its tail and
+                // says in it where and why the terminal stopped.
+                settle_lost_terminal(orch, &row.session_id, None, &reason).await?;
+            } else {
+                settle_terminal_as_lost(
+                    orch,
+                    owner,
+                    &row.slug,
+                    terminal_uri,
+                    &reason,
+                    Some(&row.id),
+                    None,
+                )
+                .await?;
+            }
+            Ok(None)
+        }
+        SurvivingProcess::Unknown => {
+            tracing::info!(
+                terminal = %terminal_uri, result = ?answer,
+                "a restart: never terminal's executor did not say whether its process survives; asking again next pass"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Re-adoption restores everything the runner holds for the process except its
+/// callback relay. Every resident is relayed, colocated ones included, and
+/// relay contexts are not persisted, so a re-adopted process keeps running but
+/// its Cairn calls are refused until it is started again (cairn/5689 persists
+/// them).
+const READOPTED_NOTICE: &str =
+    "\r\nCairn lost sight of this terminal and found its process still running, \
+so it took it back up as it was. It was not started again (restart: never). Cairn commands \
+run inside it are refused until it is started again, because its callback relay did not \
+survive the runner restart (cairn/5689).\r\n";
+
+/// Take back a `restart: never` terminal whose process its executor kept
+/// running while this runner could not observe it: the row returns to
+/// `running` under the same session, and the runner-side session, heartbeat
+/// and event handler a spawn would install are installed for the process that
+/// is already there. Nothing is started and nothing is stopped.
+async fn readopt_terminal_process(
+    orch: &Orchestrator,
+    resource: CairnResource,
+    target: TerminalResourceTarget,
+    fence: ResidencyFence,
+    row: &RecoveryRow,
+    generation: u64,
+) -> Result<Option<String>, String> {
+    let session_id = row.session_id.clone();
+    let readopted = orch
+        .db
+        .local
+        .execute(
+            "UPDATE job_terminals
+             SET status = 'running', lost_at = NULL, process_generation = ?3
+             WHERE id = ?1 AND session_id = ?2 AND status = 'recovering'",
+            params![row.id.clone(), session_id.clone(), generation as i64],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if readopted == 0 {
+        return Ok(None);
+    }
+    ensure_lifetime_subscription(orch);
+    let parts = TerminalSessionParts::new(&target, &fence, &session_id, generation);
+    insert_terminal_session(orch, &session_id, &parts)?;
+    spawn_terminal_heartbeat(orch, &session_id, &fence);
+    install_terminal_event_handler(
+        orch,
+        &resource,
+        &target,
+        &session_id,
+        &fence,
+        &parts,
+        &row.command,
+    )
+    .await?;
+    announce_in_terminal(orch, &session_id, READOPTED_NOTICE);
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "job_terminals", "action": "update"}),
+    );
+    Ok(Some(session_id))
 }
 
 pub(crate) async fn release_terminal_by_session(
@@ -1573,6 +2011,9 @@ struct TerminalResourceTarget {
     /// because its process died with the runner. A create replaces only exited
     /// rows of its slug and leaves this `None`.
     replaces: Option<String>,
+    /// Whether recovery may run the command again, written on the row and
+    /// carried by a restart to the row it re-mints.
+    restart_policy: RestartPolicy,
 }
 
 async fn resolve_terminal_resource_target(
@@ -1646,6 +2087,7 @@ async fn resolve_terminal_resource_target(
                         selector: None,
                         created_by_run_id: None,
                         replaces: None,
+                        restart_policy: RestartPolicy::Auto,
                     })
                 }
                 CairnResource::TaskTerminal {
@@ -1714,6 +2156,7 @@ async fn resolve_terminal_resource_target(
                         selector: None,
                         created_by_run_id: None,
                         replaces: None,
+                        restart_policy: RestartPolicy::Auto,
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
@@ -1740,6 +2183,7 @@ async fn resolve_terminal_resource_target(
                         selector: None,
                         created_by_run_id: None,
                         replaces: None,
+                        restart_policy: RestartPolicy::Auto,
                     })
                 }
                 _ => Err(crate::storage::DbError::Row(
@@ -1801,6 +2245,7 @@ async fn insert_terminal_resource(
     let selector = crate::fleet::residency::persisted_resident_selector(target.selector.as_ref());
     let created_by_run_id = target.created_by_run_id.clone();
     let replaces = target.replaces.clone();
+    let restart_policy = target.restart_policy.as_str();
 
     db.write(|conn| {
         let created_by_run_id = created_by_run_id.clone();
@@ -1860,9 +2305,9 @@ async fn insert_terminal_resource(
                     id, job_id, project_id, run_id, session_id, command, title,
                     description, status, exit_code, created_at, exited_at, slug,
                     residency_holder, residency_incarnation_id, cell_epoch, executor_selector,
-                    created_by_run_id
+                    created_by_run_id, restart_policy
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', NULL, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', NULL, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 ",
                 params![
                     id.as_str(),
@@ -1884,6 +2329,7 @@ async fn insert_terminal_resource(
                     lease.as_ref().map(|fence| fence.cell_epoch as i64),
                     selector.as_deref(),
                     created_by_run_id.as_deref(),
+                    restart_policy,
                 ],
             )
             .await?;
@@ -2003,6 +2449,9 @@ pub(crate) struct TerminalWakeRow {
     /// Why the terminal ended, when its exit code cannot say: set only for a
     /// terminal Cairn settled after proving its process gone.
     pub exit_reason: Option<String>,
+    /// When Cairn lost sight of the terminal's process, if it is or was in
+    /// recovery: where its run clock stops.
+    pub lost_at: Option<i64>,
 }
 
 /// Look up the terminal one owner holds under `slug`, for a wake subscription or
@@ -2023,7 +2472,7 @@ pub(crate) async fn lookup_terminal_for_wake(
                 TerminalOwner::Job { job_id } => {
                     conn.query(
                         "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                                exit_reason
+                                exit_reason, lost_at
                          FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
                         params![job_id.as_str(), slug.as_str()],
                     )
@@ -2032,7 +2481,7 @@ pub(crate) async fn lookup_terminal_for_wake(
                 TerminalOwner::Project { project_id } => {
                     conn.query(
                         "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                                exit_reason
+                                exit_reason, lost_at
                          FROM job_terminals
                          WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 LIMIT 1",
                         params![project_id.as_str(), slug.as_str()],
@@ -2072,7 +2521,7 @@ async fn lookup_terminal_for_wake_by_session_id(
             let mut rows = conn
                 .query(
                     "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                            exit_reason
+                            exit_reason, lost_at
                      FROM job_terminals WHERE session_id = ?1 LIMIT 1",
                     params![session_id.as_str()],
                 )
@@ -2097,6 +2546,7 @@ async fn terminal_wake_row_from_rows(
         output_tail: row.opt_text(4)?,
         session_id: row.opt_text(5)?,
         exit_reason: row.opt_text(6)?,
+        lost_at: row.opt_i64(7)?,
     }))
 }
 
@@ -2146,9 +2596,9 @@ pub(crate) async fn subscribe_terminal_exit_wake_once(
         .filter(|row| row.status == "exited")
         .or_else(|| row.filter(|row| row.status == "exited"));
     if let Some(exit_row) = exited {
-        let runtime_secs = exit_row
-            .exited_at
-            .map(|exited| (exited - exit_row.created_at).max(0));
+        let runtime_secs = exit_row.exited_at.map(|exited| {
+            terminal_runtime_secs(exit_row.created_at, Some(exited), exit_row.lost_at, 0)
+        });
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
             slug,
@@ -2211,9 +2661,9 @@ pub(crate) async fn subscribe_terminal_output_wake_once(
         .filter(|row| row.status == "exited")
         .or_else(|| row.filter(|row| row.status == "exited"));
     if let Some(exit_row) = exited {
-        let runtime_secs = exit_row
-            .exited_at
-            .map(|exited| (exited - exit_row.created_at).max(0));
+        let runtime_secs = exit_row.exited_at.map(|exited| {
+            terminal_runtime_secs(exit_row.created_at, Some(exited), exit_row.lost_at, 0)
+        });
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
             slug,
@@ -2807,12 +3257,14 @@ pub(crate) async fn create_terminal_from_resource(
     wake: Option<TerminalWakeSpec>,
     caller_run_id: Option<&str>,
     selector: Option<&ExecutorSelector>,
+    restart_policy: RestartPolicy,
 ) -> Result<String, String> {
     let mut target = resolve_terminal_resource_target(&orch.db.local, resource)
         .await
         .map_err(|e| e.to_string())?;
     target.selector = selector.cloned();
     target.created_by_run_id = caller_run_id.map(ToOwned::to_owned);
+    target.restart_policy = restart_policy;
     let subscriber_job_id =
         match (&wake, target.job_id.as_deref()) {
             (Some(_), Some(job_id)) => Some(job_id.to_string()),
@@ -2965,114 +3417,106 @@ fn resource_slug(resource: &CairnResource) -> String {
     }
 }
 
-/// `title` is the operator-facing title, present iff this is an interactive
-/// terminal. It is persisted with the row this spawn inserts, and read back by
-/// [`TerminalCommandMode::for_persisted_row`] here and in recovery, so the
-/// spawn's shape and the row's account of itself are one decision.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn spawn_terminal_session(
-    orch: &Orchestrator,
-    resource: CairnResource,
-    target: TerminalResourceTarget,
-    command: String,
-    description: Option<String>,
-    title: Option<String>,
-    shell: Option<String>,
-    size: ResidentPtySize,
-) -> Result<String, String> {
-    let command_mode = TerminalCommandMode::for_persisted_row(title.as_deref());
-    let fence = target
-        .lease
-        .clone()
-        .ok_or("terminal directory has no residency")?;
-    if !orch
+/// Route every resident process event to the lifetime handler registered for
+/// its process, installed once per runner.
+fn ensure_lifetime_subscription(orch: &Orchestrator) {
+    if orch
         .pty_state
         .lifetime_subscription_installed
         .swap(true, Ordering::SeqCst)
     {
-        let state = orch.pty_state.clone();
-        orch.fleet
-            .subscribe_resident_process_events(move |event| {
-                let handler = state.lifetime_handlers.lock().ok().and_then(|handlers| {
-                    handlers
-                        .get(&(
-                            event.holder.storage_key().clone(),
-                            event.process_key.clone(),
-                        ))
-                        .cloned()
-                });
-                if let Some(handler) = handler {
-                    handler(event);
-                }
-            })
-            .detach();
+        return;
     }
+    let state = orch.pty_state.clone();
+    orch.fleet
+        .subscribe_resident_process_events(move |event| {
+            let handler = state.lifetime_handlers.lock().ok().and_then(|handlers| {
+                handlers
+                    .get(&(
+                        event.holder.storage_key().clone(),
+                        event.process_key.clone(),
+                    ))
+                    .cloned()
+            });
+            if let Some(handler) = handler {
+                handler(event);
+            }
+        })
+        .detach();
+}
 
-    let session_id = ids::mint_session_id().into_string();
-    let output_buffer = Arc::new(Mutex::new(VecDeque::new()));
-    let last_output_at = Arc::new(Mutex::new(SystemTime::now()));
-    let output_watchers = Arc::new(Mutex::new(Vec::new()));
-    let terminal_log =
-        Arc::new(Mutex::new(target.job_id.as_deref().and_then(|job| {
-            crate::scratch::TerminalLog::open(job, &target.slug)
-        })));
-    let session = Arc::new(Mutex::new(PtySession {
-        master: None,
-        writer: None,
-        lease: Some(crate::services::LeaseTerminalBinding {
-            fence: fence.clone(),
-            process_key: session_id.clone(),
-            process_generation: 0,
-        }),
-        child: Box::new(crate::services::RemoteTerminalChild),
-        output_buffer: Some(output_buffer.clone()),
-        is_agent_spawned: true,
-        last_output_at: Some(last_output_at.clone()),
-        command_state: None,
-        output_watchers: Some(output_watchers.clone()),
-        output_log: Some(terminal_log.clone()),
-    }));
-    let session_insert = orch
-        .pty_state
+/// The runner-side half of a terminal: the session a read or a write reaches,
+/// and the transcript its output streams into. A spawn builds it for a process
+/// it is about to start; a re-adoption builds it for one an executor kept
+/// running while this runner was away.
+struct TerminalSessionParts {
+    session: Arc<Mutex<PtySession>>,
+    output_buffer: Arc<Mutex<VecDeque<u8>>>,
+    last_output_at: Arc<Mutex<SystemTime>>,
+    output_watchers: Arc<Mutex<Vec<crate::services::TerminalOutputWatcher>>>,
+    terminal_log: Arc<Mutex<Option<crate::scratch::TerminalLog>>>,
+}
+
+impl TerminalSessionParts {
+    fn new(
+        target: &TerminalResourceTarget,
+        fence: &ResidencyFence,
+        session_id: &str,
+        process_generation: u64,
+    ) -> Self {
+        let output_buffer = Arc::new(Mutex::new(VecDeque::new()));
+        let last_output_at = Arc::new(Mutex::new(SystemTime::now()));
+        let output_watchers = Arc::new(Mutex::new(Vec::new()));
+        let terminal_log =
+            Arc::new(Mutex::new(target.job_id.as_deref().and_then(|job| {
+                crate::scratch::TerminalLog::open(job, &target.slug)
+            })));
+        let session = Arc::new(Mutex::new(PtySession {
+            master: None,
+            writer: None,
+            lease: Some(crate::services::LeaseTerminalBinding {
+                fence: fence.clone(),
+                process_key: session_id.to_string(),
+                process_generation,
+            }),
+            child: Box::new(crate::services::RemoteTerminalChild),
+            output_buffer: Some(output_buffer.clone()),
+            is_agent_spawned: true,
+            last_output_at: Some(last_output_at.clone()),
+            command_state: None,
+            output_watchers: Some(output_watchers.clone()),
+            output_log: Some(terminal_log.clone()),
+        }));
+        Self {
+            session,
+            output_buffer,
+            last_output_at,
+            output_watchers,
+            terminal_log,
+        }
+    }
+}
+
+fn insert_terminal_session(
+    orch: &Orchestrator,
+    session_id: &str,
+    parts: &TerminalSessionParts,
+) -> Result<(), String> {
+    orch.pty_state
         .sessions
         .lock()
         .map(|mut sessions| {
-            sessions.insert(session_id.clone(), session.clone());
+            sessions.insert(session_id.to_string(), parts.session.clone());
         })
-        .map_err(|error| error.to_string());
-    if let Err(error) = session_insert {
-        rollback_terminal_creation(orch, &session_id, &fence).await;
-        return Err(error);
-    }
+        .map_err(|error| error.to_string())
+}
 
-    // Retire any durable exit subscription belonging to a previous incarnation
-    // before replacing its exited row. Otherwise slug reuse would attach the old
-    // one-shot wake to this new process.
-    if let Err(error) = reconcile_exited_terminal_wakes(orch).await {
-        rollback_terminal_creation(orch, &session_id, &fence).await;
-        return Err(format!(
-            "Could not reconcile previous terminal wake: {error}"
-        ));
-    }
-
-    // The durable binding must predate handler registration and StartProcess.
-    // An executor may emit Exited before StartProcess returns; the finalizer
-    // therefore needs a running row to transition before any event can arrive.
-    if let Err(error) = insert_terminal_resource(
-        &orch.db.local,
-        &target,
-        &session_id,
-        &command,
-        title.as_deref(),
-        description.as_deref(),
-    )
-    .await
-    {
-        rollback_terminal_creation(orch, &session_id, &fence).await;
-        return Err(format!("Database error: {error}"));
-    }
+/// Renew the terminal's residency for as long as this runner holds its
+/// session under the same fence. Without it the executor reaps the residency,
+/// and the process with it, once the heartbeat timeout runs out.
+fn spawn_terminal_heartbeat(orch: &Orchestrator, session_id: &str, fence: &ResidencyFence) {
     let heartbeat_orch = orch.clone();
-    let heartbeat_session = session_id.clone();
+    let heartbeat_session = session_id.to_string();
     let heartbeat_fence = fence.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -3109,12 +3553,26 @@ async fn spawn_terminal_session(
             }
         }
     });
+}
 
+/// Register the handler that turns the terminal process's events into its
+/// transcript, its output wakes, and its end: recovery for an involuntary
+/// death its restart policy allows, finalization for every other.
+#[allow(clippy::too_many_lines)]
+async fn install_terminal_event_handler(
+    orch: &Orchestrator,
+    resource: &CairnResource,
+    target: &TerminalResourceTarget,
+    session_id: &str,
+    fence: &ResidencyFence,
+    parts: &TerminalSessionParts,
+    command: &str,
+) -> Result<(), String> {
     let detail_uri = resource.to_uri();
     if let Ok(persisted) =
         crate::orchestrator::wakes::list_terminal_output_watchers(&orch.db.local, &detail_uri).await
     {
-        if let Ok(mut watchers) = output_watchers.lock() {
+        if let Ok(mut watchers) = parts.output_watchers.lock() {
             for (subscription_id, job_id, phrase, terminal_uri) in persisted {
                 watchers.push(crate::services::TerminalOutputWatcher {
                     subscription_id,
@@ -3127,17 +3585,18 @@ async fn spawn_terminal_session(
         }
     }
     let event_orch = orch.clone();
-    let event_sid = session_id.clone();
+    let event_sid = session_id.to_string();
     let event_fence = fence.clone();
-    let event_session = session.clone();
-    let event_buffer = output_buffer.clone();
-    let event_last = last_output_at.clone();
-    let event_watchers = output_watchers.clone();
-    let event_log = terminal_log.clone();
-    let event_command = command.clone();
+    let event_session = parts.session.clone();
+    let event_buffer = parts.output_buffer.clone();
+    let event_last = parts.last_output_at.clone();
+    let event_watchers = parts.output_watchers.clone();
+    let event_log = parts.terminal_log.clone();
+    let event_command = command.to_string();
     let event_job = target.job_id.clone();
-    let event_process_ref = resource_slug(&resource);
+    let event_process_ref = resource_slug(resource);
     let event_uri = detail_uri.clone();
+    let event_policy = target.restart_policy;
     let handler = Arc::new(move |event: ResidentProcessEvent| {
         if event.incarnation_id != event_fence.incarnation_id
             || event.cell_epoch != event_fence.cell_epoch
@@ -3184,13 +3643,15 @@ async fn spawn_terminal_session(
                 // involuntary death is handed back to recovery rather than
                 // finalized: `reconcile_terminal_lifecycle` starts it again as
                 // soon as an executor advertises the environment holding it.
-                // The one death recovery does not answer is its own — a
-                // terminal that dies inside the settle window after Cairn
-                // started it has shown it cannot stay up, and starting it again
-                // would only loop — so that one settles as an ordinary exit and
-                // stays stopped, saying so where it stopped.
-                let should_recover =
-                    terminal_should_recover(&event_orch.pty_state, executor_lost, &event_uri);
+                // Two involuntary deaths are not recovery's: a terminal whose
+                // own policy says never to run it again, and a restart that did
+                // not hold — a terminal that dies inside the settle window
+                // after Cairn started it has shown it cannot stay up, and
+                // starting it again would only loop. Both settle as an exit and
+                // stay stopped, saying so where they stopped.
+                let declined_by_policy = executor_lost && !terminal_restarts_on_loss(event_policy);
+                let should_recover = !declined_by_policy
+                    && terminal_should_recover(&event_orch.pty_state, executor_lost, &event_uri);
                 let fence = should_recover.then(|| {
                     block_on_background_db(crate::terminal_host::mark_terminal_recovering(
                         event_orch.db.local.clone(),
@@ -3204,9 +3665,7 @@ async fn spawn_terminal_session(
                          rather than releasing what a later recovery would need"
                     );
                 }
-                // The restart that did not hold is the only reason to refuse an
-                // involuntary death, so it is the only one that may say so.
-                let restart_did_not_hold = executor_lost && !should_recover;
+                let restart_did_not_hold = executor_lost && !should_recover && !declined_by_policy;
                 match exit_disposition(should_recover, fence) {
                     // Another delivery of this same death already answered it,
                     // or the answer could not be recorded. Say nothing, finalize
@@ -3243,6 +3702,17 @@ async fn spawn_terminal_session(
                     }
                     ExitDisposition::Finalize => {}
                 }
+                let policy_reason = declined_by_policy
+                    .then(|| not_restarted_by_policy_reason("its executor went away"));
+                if let Some(reason) = policy_reason.as_deref() {
+                    emit_terminal_data(
+                        &*event_orch.services.emitter,
+                        &event_sid,
+                        &format!("\r\nCairn ended this terminal: {reason}.\r\n"),
+                        &event_buffer,
+                        &event_log,
+                    );
+                }
                 if restart_did_not_hold {
                     emit_terminal_data(
                         &*event_orch.services.emitter,
@@ -3265,7 +3735,7 @@ async fn spawn_terminal_session(
                     event_job.clone(),
                     &event_process_ref,
                     &event_uri,
-                    None,
+                    policy_reason.as_deref(),
                 );
                 let release_orch = event_orch.clone();
                 let release_binding = crate::services::LeaseTerminalBinding {
@@ -3284,18 +3754,86 @@ async fn spawn_terminal_session(
             _ => {}
         }
     });
-    let handler_insert = orch
-        .pty_state
+    orch.pty_state
         .lifetime_handlers
         .lock()
         .map(|mut handlers| {
             handlers.insert(
-                (fence.holder.storage_key().clone(), session_id.clone()),
+                (fence.holder.storage_key().clone(), session_id.to_string()),
                 handler,
             );
         })
-        .map_err(|error| error.to_string());
-    if let Err(error) = handler_insert {
+        .map_err(|error| error.to_string())
+}
+
+/// `title` is the operator-facing title, present iff this is an interactive
+/// terminal. It is persisted with the row this spawn inserts, and read back by
+/// [`TerminalCommandMode::for_persisted_row`] here and in recovery, so the
+/// spawn's shape and the row's account of itself are one decision.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn spawn_terminal_session(
+    orch: &Orchestrator,
+    resource: CairnResource,
+    target: TerminalResourceTarget,
+    command: String,
+    description: Option<String>,
+    title: Option<String>,
+    shell: Option<String>,
+    size: ResidentPtySize,
+) -> Result<String, String> {
+    let command_mode = TerminalCommandMode::for_persisted_row(title.as_deref());
+    let fence = target
+        .lease
+        .clone()
+        .ok_or("terminal directory has no residency")?;
+    ensure_lifetime_subscription(orch);
+
+    let session_id = ids::mint_session_id().into_string();
+    let parts = TerminalSessionParts::new(&target, &fence, &session_id, 0);
+    let session = parts.session.clone();
+    if let Err(error) = insert_terminal_session(orch, &session_id, &parts) {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(error);
+    }
+
+    // Retire any durable exit subscription belonging to a previous incarnation
+    // before replacing its exited row. Otherwise slug reuse would attach the old
+    // one-shot wake to this new process.
+    if let Err(error) = reconcile_exited_terminal_wakes(orch).await {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(format!(
+            "Could not reconcile previous terminal wake: {error}"
+        ));
+    }
+
+    // The durable binding must predate handler registration and StartProcess.
+    // An executor may emit Exited before StartProcess returns; the finalizer
+    // therefore needs a running row to transition before any event can arrive.
+    if let Err(error) = insert_terminal_resource(
+        &orch.db.local,
+        &target,
+        &session_id,
+        &command,
+        title.as_deref(),
+        description.as_deref(),
+    )
+    .await
+    {
+        rollback_terminal_creation(orch, &session_id, &fence).await;
+        return Err(format!("Database error: {error}"));
+    }
+    spawn_terminal_heartbeat(orch, &session_id, &fence);
+    if let Err(error) = install_terminal_event_handler(
+        orch,
+        &resource,
+        &target,
+        &session_id,
+        &fence,
+        &parts,
+        &command,
+    )
+    .await
+    {
         rollback_terminal_creation(orch, &session_id, &fence).await;
         return Err(error);
     }
@@ -3957,6 +4495,7 @@ pub(crate) async fn spawn_job_terminal_for_test(
         selector: None,
         created_by_run_id: None,
         replaces: None,
+        restart_policy: RestartPolicy::Auto,
     };
     spawn_terminal_session(
         orch,
@@ -4038,6 +4577,7 @@ mod terminal_finalize_tests {
             selector: None,
             created_by_run_id: None,
             replaces: None,
+            restart_policy: RestartPolicy::Auto,
         }
     }
 
@@ -4675,6 +5215,7 @@ mod terminal_finalize_tests {
                 selector: None,
                 created_by_run_id: None,
                 replaces: None,
+                restart_policy: RestartPolicy::Auto,
             },
             fence,
         )
@@ -6153,7 +6694,7 @@ mod terminal_finalize_tests {
         crate::terminal_host::prepare_terminal_recovery(&orch)
             .await
             .unwrap();
-        restart_terminal_process(&orch, fence, "direct")
+        restart_terminal_process(&orch, fence, "direct", false)
             .await
             .expect("recovery restarts the terminal");
 
@@ -6215,6 +6756,7 @@ mod terminal_finalize_tests {
             None,
             Some("run-creator"),
             None,
+            RestartPolicy::Auto,
         )
         .await
         .expect("creating an agent terminal should succeed");
@@ -6237,7 +6779,7 @@ mod terminal_finalize_tests {
         crate::terminal_host::prepare_terminal_recovery(&orch)
             .await
             .unwrap();
-        restart_terminal_process(&orch, fence, "direct")
+        restart_terminal_process(&orch, fence, "direct", false)
             .await
             .expect("recovery restarts the terminal");
 
@@ -6293,6 +6835,7 @@ mod terminal_finalize_tests {
             None,
             None,
             Some(&selector),
+            RestartPolicy::Auto,
         )
         .await
         .expect("a create naming the platform its environment is on starts");
@@ -6306,7 +6849,7 @@ mod terminal_finalize_tests {
         crate::terminal_host::prepare_terminal_recovery(&orch)
             .await
             .unwrap();
-        restart_terminal_process(&orch, fence, "direct")
+        restart_terminal_process(&orch, fence, "direct", false)
             .await
             .expect("recovery restarts the terminal");
         assert_eq!(
@@ -6643,6 +7186,7 @@ mod terminal_finalize_tests {
             output_tail: None,
             session_id: Some("silent".to_string()),
             exit_reason: None,
+            lost_at: None,
         };
         assert_eq!(reconciled_terminal_tail(Some(&silent_exit)), None);
         assert_eq!(
@@ -7523,6 +8067,532 @@ mod terminal_finalize_tests {
             exit_reason(&orch.db.local, &session_id).await.as_deref(),
             Some("process lost: no executor holds this terminal's environment any more")
         );
+    }
+
+    /// A terminal row as recovery tests read it.
+    #[derive(Debug)]
+    struct RecoveryState {
+        status: String,
+        session_id: String,
+        exit_reason: Option<String>,
+        residency_holder: Option<String>,
+        exited_at: Option<i64>,
+        lost_at: Option<i64>,
+        restart_policy: String,
+    }
+
+    async fn recovery_state(db: &LocalDb, slug: &str) -> RecoveryState {
+        db.query_one(
+            "SELECT status, session_id, exit_reason, residency_holder, exited_at, lost_at, restart_policy
+             FROM job_terminals WHERE job_id = 'j' AND slug = ?1",
+            params![slug.to_string()],
+            |row| {
+                Ok(RecoveryState {
+                    status: row.text(0)?,
+                    session_id: row.text(1)?,
+                    exit_reason: row.opt_text(2)?,
+                    residency_holder: row.opt_text(3)?,
+                    exited_at: row.opt_i64(4)?,
+                    lost_at: row.opt_i64(5)?,
+                    restart_policy: row.text(6)?,
+                })
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The runner restarts: the new process holds no session, no handler and no
+    /// resident relay context, and startup fences every executor-backed
+    /// terminal into recovery.
+    async fn restart_the_runner(orch: &Orchestrator) {
+        orch.pty_state.sessions.lock().unwrap().clear();
+        orch.pty_state.lifetime_handlers.lock().unwrap().clear();
+        *orch.fleet.resident_relays() = Default::default();
+        crate::terminal_host::prepare_terminal_recovery(orch)
+            .await
+            .unwrap();
+    }
+
+    fn terminal_wait(
+        orch: &Orchestrator,
+        slug: &str,
+        on: crate::mcp::handlers::run::TerminalWaitEvent,
+        phrase: Option<&str>,
+    ) -> tokio::task::JoinHandle<Result<String, String>> {
+        tokio::spawn(crate::mcp::handlers::owned_wait::trigger(
+            orch.clone(),
+            orch.db.local.clone(),
+            crate::mcp::handlers::durable_suspend::Record {
+                id: format!("wait-{slug}-{on:?}"),
+                job_id: "j".into(),
+                run_id: "run-1".into(),
+                session_id: "session-1".into(),
+                turn_id: "turn-1".into(),
+                tool_use_id: format!("tool-{on:?}"),
+                condition: crate::mcp::handlers::durable_suspend::Condition::Terminal {
+                    uri: cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", slug),
+                    slug: slug.into(),
+                    owner: None,
+                    on,
+                    phrase: phrase.map(ToOwned::to_owned),
+                },
+                deadline: None,
+                created: chrono::Utc::now().timestamp_millis(),
+            },
+        ))
+    }
+
+    async fn resolved_wait(
+        wait: tokio::task::JoinHandle<Result<String, String>>,
+    ) -> serde_json::Value {
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("the wait resolves once the terminal settles")
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&resolved).unwrap()
+    }
+
+    /// cairn/7082 required 2. After a runner restart the terminal's executor
+    /// comes back having re-adopted its environment under the next epoch, so
+    /// the terminal's fence can never match again. The row settles on the next
+    /// reconcile instead of waiting out the window, through the one settlement
+    /// writer: the clock stays where it was lost, the fence is cleared, and a
+    /// wait on its exit or on its output resolves naming the loss.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovering_terminal_whose_holder_re_epoched_settles_at_once_and_releases_its_waits()
+    {
+        let db = crate::storage::migrated_test_db("term_recovering_re_epoched.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("proof2");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        spawn_node_terminal(&orch, target, "./prove --world shared").await;
+        executor.post();
+
+        restart_the_runner(&orch).await;
+        let recovering = recovery_state(&orch.db.local, "proof2").await;
+        assert_eq!(recovering.status, "recovering");
+        let lost_at = recovering
+            .lost_at
+            .expect("entering recovery stamps the moment of loss");
+
+        use crate::mcp::handlers::run::TerminalWaitEvent;
+        let on_exit = terminal_wait(&orch, "proof2", TerminalWaitEvent::Exit, None);
+        let on_output = terminal_wait(&orch, "proof2", TerminalWaitEvent::Output, Some("PROVED"));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!on_exit.is_finished() && !on_output.is_finished());
+
+        // The executor restarted too: same incarnation, next epoch.
+        executor.mutate(|cell| {
+            cell.cell_epoch += 1;
+            cell.residency.as_mut().unwrap().phase = ResidencyPhase::AwaitingReclaim;
+        });
+        executor.post();
+
+        assert_eq!(
+            crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
+                .await
+                .unwrap(),
+            1,
+            "a fence that can never match again settles inside the window"
+        );
+        let settled = recovery_state(&orch.db.local, "proof2").await;
+        assert_eq!(settled.status, "exited");
+        let reason = settled.exit_reason.unwrap();
+        assert!(
+            reason.starts_with("process lost:") && reason.contains("epoch 7 became 8"),
+            "{reason}"
+        );
+        assert_eq!(settled.residency_holder, None, "the fence is cleared");
+        assert_eq!(
+            settled.exited_at,
+            Some(lost_at),
+            "the clock stays frozen at the loss"
+        );
+
+        let exit = resolved_wait(on_exit).await;
+        assert_eq!(exit["outcome"], "exited");
+        assert!(exit["exitReason"]
+            .as_str()
+            .unwrap()
+            .contains("epoch 7 became 8"));
+        let output = resolved_wait(on_output).await;
+        assert_eq!(output["outcome"], "terminal_exited");
+        assert!(output["exitReason"]
+            .as_str()
+            .unwrap()
+            .contains("epoch 7 became 8"));
+    }
+
+    /// An executor that has not re-advertised yet may still bring the process
+    /// back, so the terminal keeps the whole window, and settles once it closes
+    /// with a reason that says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovering_terminal_nobody_re_advertised_keeps_the_window_then_settles() {
+        let db = crate::storage::migrated_test_db("term_recovering_window.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("regate");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        spawn_node_terminal(&orch, target, "bun run gate").await;
+        executor.post();
+
+        restart_the_runner(&orch).await;
+        assert!(orch
+            .fleet
+            .disconnect_advertised_executor("colocated", executor.generation));
+        let lost_at = recovery_state(&orch.db.local, "regate").await.lost_at;
+
+        for _ in 0..3 {
+            assert_eq!(
+                crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            recovery_state(&orch.db.local, "regate").await.status,
+            "recovering"
+        );
+
+        assert_eq!(
+            crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, true)
+                .await
+                .unwrap(),
+            1
+        );
+        let settled = recovery_state(&orch.db.local, "regate").await;
+        assert_eq!(settled.status, "exited");
+        assert_eq!(
+            settled.exit_reason.as_deref(),
+            Some(
+                "lost: no executor re-advertised this terminal's environment within the 10-minute owner-recovery window after the runner restarted"
+            )
+        );
+        assert_eq!(settled.exited_at, lost_at);
+        assert_eq!(settled.residency_holder, None);
+    }
+
+    /// cairn/7082 required 3. Two terminals share one environment when the
+    /// runner restarts: `auto` is started again, as before; `restart: never`,
+    /// whose process did not survive, is not, and settles with its policy as
+    /// the reason and its last output still readable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_never_terminal_whose_process_is_gone_settles_while_its_auto_sibling_restarts() {
+        let db = crate::storage::migrated_test_db("term_never_gone.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (watch, fence) = test_terminal_target("watch-7082");
+        let (mut proof, _) = test_terminal_target("proof-7082");
+        proof.restart_policy = RestartPolicy::Never;
+        // Cleared before the spawn opens its append handle: unlinking an open
+        // log afterwards would leave its writes on a file nothing can read.
+        let log_path = crate::scratch::terminal_log_path("j", "proof-7082");
+        let _ = std::fs::remove_file(&log_path);
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let watch_session = spawn_node_terminal(&orch, watch, "bun test --watch").await;
+        let proof_session = spawn_node_terminal(&orch, proof, "./prove --world shared").await;
+        executor.post();
+        assert_eq!(
+            recovery_state(&orch.db.local, "proof-7082")
+                .await
+                .restart_policy,
+            "never"
+        );
+        assert!(announce_in_terminal(
+            &orch,
+            &proof_session,
+            "round 3 of 5 proved\r\n"
+        ));
+
+        restart_the_runner(&orch).await;
+        // The proof's process did not survive while the runner was away.
+        executor.mutate(|cell| {
+            cell.occupancy.processes.remove(&proof_session);
+        });
+        executor.post();
+
+        restart_residency_terminals(&orch, fence, false)
+            .await
+            .expect("recovery answers both terminals");
+
+        let proof = recovery_state(&orch.db.local, "proof-7082").await;
+        assert_eq!(proof.status, "exited");
+        assert_eq!(
+            proof.exit_reason.as_deref(),
+            Some("not restarted by its own policy (restart: never): the runner restarted")
+        );
+        assert_eq!(
+            proof.session_id, proof_session,
+            "nothing was started for it"
+        );
+        let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            logged.contains("round 3 of 5 proved"),
+            "its last output is kept: {logged:?}"
+        );
+        let _ = std::fs::remove_file(&log_path);
+
+        let watch = recovery_state(&orch.db.local, "watch-7082").await;
+        assert_eq!(watch.status, "running");
+        assert_ne!(
+            watch.session_id, watch_session,
+            "the auto terminal was started again"
+        );
+        assert_eq!(watch.restart_policy, "auto", "a restart keeps the policy");
+        let processes = executor.cell.lock().unwrap().occupancy.processes.clone();
+        assert!(!processes.contains_key(&proof_session));
+        assert_eq!(
+            processes
+                .keys()
+                .filter(|key| **key != watch_session)
+                .count(),
+            1,
+            "only the auto terminal's restart started a process: {:?}",
+            processes.keys()
+        );
+    }
+
+    /// `never` forbids a replay, never a survivor. A `restart: never` terminal
+    /// whose executor kept its process running while the runner was away is
+    /// taken back up as it was, under its own session, and nothing is started
+    /// or stopped. When that executor later goes away under it, the terminal
+    /// is finalized with its policy as the reason rather than fenced into
+    /// recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_never_terminal_that_survived_is_re_adopted_and_an_executor_loss_then_ends_it() {
+        let db = crate::storage::migrated_test_db("term_never_alive.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (mut proof, fence) = test_terminal_target("proof");
+        proof.restart_policy = RestartPolicy::Never;
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, proof, "./prove --world shared").await;
+        executor.post();
+
+        restart_the_runner(&orch).await;
+        assert_eq!(
+            recovery_state(&orch.db.local, "proof").await.status,
+            "recovering"
+        );
+        assert_eq!(
+            crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let adopted = recovery_state(&orch.db.local, "proof").await;
+        assert_eq!(adopted.status, "running");
+        assert_eq!(
+            adopted.session_id, session_id,
+            "the same process, not a new one"
+        );
+        assert_eq!(adopted.lost_at, None, "its process never stopped");
+        assert!(orch
+            .pty_state
+            .sessions
+            .lock()
+            .unwrap()
+            .contains_key(&session_id));
+        let processes = executor.cell.lock().unwrap().occupancy.processes.clone();
+        assert_eq!(
+            processes.len(),
+            1,
+            "nothing was started: {:?}",
+            processes.keys()
+        );
+        assert!(matches!(
+            processes[&session_id].status,
+            ResidentProcessStatus::Running { .. }
+        ));
+
+        // The executor goes away under it.
+        orch.fleet.handle_executor_message(
+            "colocated",
+            executor.generation,
+            ExecutorMessage::ResidentProcessEvent {
+                event: ResidentProcessEvent {
+                    holder: fence.holder.clone(),
+                    incarnation_id: fence.incarnation_id.clone(),
+                    cell_epoch: fence.cell_epoch,
+                    process_key: session_id.clone(),
+                    process_generation: processes[&session_id].generation,
+                    event: ResidentProcessEventKind::State {
+                        status: ResidentProcessStatus::Exited {
+                            finished_at_unix_ms: 2,
+                            exit_code: None,
+                            restartable: true,
+                            executor_lost: true,
+                        },
+                    },
+                },
+            },
+        );
+        let mut ended = recovery_state(&orch.db.local, "proof").await;
+        for _ in 0..50 {
+            if ended.status == "exited" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ended = recovery_state(&orch.db.local, "proof").await;
+        }
+        assert_eq!(
+            ended.status, "exited",
+            "finalized, not fenced into recovery"
+        );
+        assert_eq!(
+            ended.exit_reason.as_deref(),
+            Some("not restarted by its own policy (restart: never): its executor went away")
+        );
+    }
+
+    /// The limit re-adoption ships with, by execution's ruling on cairn/7082:
+    /// a fresh runner holds no relay context for a process it did not start, so
+    /// the executor's re-announcement of the survivor's relay is ignored and
+    /// every Cairn call from it is refused as unknown. The process still runs
+    /// and Cairn still owns it. cairn/5689 persists relay contexts; when it
+    /// lands, this call is authorized and this test is flipped to say so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_adopted_terminals_callbacks_are_refused_until_relay_contexts_persist() {
+        let db = crate::storage::migrated_test_db("term_never_relay.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (mut proof, fence) = test_terminal_target("proof");
+        proof.restart_policy = RestartPolicy::Never;
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, proof, "./prove --world shared").await;
+        executor.post();
+        let relay_id = orch
+            .fleet
+            .resident_relays()
+            .relay_of_process(&fence.holder, &session_id)
+            .expect("a started terminal is relayed");
+        let generation = executor.cell.lock().unwrap().occupancy.processes[&session_id].generation;
+
+        restart_the_runner(&orch).await;
+        // The executor's next link re-announces the relay it still serves.
+        orch.fleet.resident_relays().reattach(
+            "colocated",
+            executor.generation,
+            &[cairn_common::executor_protocol::RelayIdentity::Resident {
+                relay_id: relay_id.clone(),
+                holder: fence.holder.clone(),
+                process_key: session_id.clone(),
+                process_generation: generation,
+            }],
+        );
+        crate::terminal_host::reconcile_terminal_lifecycle_with(&orch, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery_state(&orch.db.local, "proof").await.status,
+            "running",
+            "the survivor is re-adopted"
+        );
+
+        let mut request = crate::mcp::types::McpCallbackRequest {
+            cwd: "/".into(),
+            tool: "read_batch".into(),
+            payload: serde_json::json!({"paths": ["cairn:~"]}),
+            ..Default::default()
+        };
+        let refusal = crate::fleet::resident_relay::authorize_resident_relay(
+            &orch,
+            "colocated",
+            executor.generation,
+            &crate::fleet::resident_relay::ResidentRelayCall {
+                relay_id: &relay_id,
+                holder: &fence.holder,
+                process_key: &session_id,
+                process_generation: generation,
+                authorization: &cairn_common::executor_protocol::RelayAuthorization(
+                    "Bearer whatever-it-was-started-with".into(),
+                ),
+            },
+            &mut request,
+        )
+        .expect_err("cairn/5689 has not landed: the survivor's relay is unknown");
+        assert!(refusal.starts_with("unknown resident relay"), "{refusal}");
+    }
+
+    /// Review finding on PR #5278. Two terminals share a fence whose cell no
+    /// executor holds once the window has closed. Recovery answers each on its
+    /// own: the first terminal's refused re-materialisation neither stops the
+    /// second nor strips its binding, so both settle with the refusal and no
+    /// row is left recovering where nothing will ever look at it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_rematerialisation_never_strands_its_sibling() {
+        let db = crate::storage::migrated_test_db("term_rematerialise_siblings.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let selector =
+            crate::fleet::residency::persisted_resident_selector(Some(&ExecutorSelector {
+                name: Some("nowhere-7082".into()),
+                ..ExecutorSelector::default()
+            }));
+        for (id, slug, created_at) in [("t-a", "alpha", 1), ("t-b", "beta", 2)] {
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug,
+                         residency_holder, residency_incarnation_id, cell_epoch, process_generation,
+                         executor_selector, lost_at)
+                     VALUES (?1, 'j', ?1, 'sleep 100', 'recovering', ?3, ?2, 'job:j', 'inc', 7, 1, ?4, 5)",
+                    params![id, slug, created_at, selector.clone()],
+                )
+                .await
+                .unwrap();
+        }
+        let fence = ResidencyFence {
+            holder: ResidencyHolder::Job { job_id: "j".into() },
+            incarnation_id: "inc".into(),
+            cell_epoch: 7,
+        };
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            restart_residency_terminals(&orch, fence, true),
+        )
+        .await
+        .expect("recovery answers rather than waiting on a machine that is not there");
+        assert!(answered.is_err(), "the refusal is reported");
+
+        for slug in ["alpha", "beta"] {
+            let state = recovery_state(&orch.db.local, slug).await;
+            assert_eq!(state.status, "exited", "{slug}: {state:?}");
+            assert!(
+                state
+                    .exit_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("recovery refused:")),
+                "{slug}: {state:?}"
+            );
+            assert_eq!(
+                state.exited_at,
+                Some(5),
+                "{slug}: the clock stays at the loss"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_policy_is_auto_or_never_and_nothing_else() {
+        assert_eq!(RestartPolicy::parse("auto"), Ok(RestartPolicy::Auto));
+        assert_eq!(RestartPolicy::parse("never"), Ok(RestartPolicy::Never));
+        assert_eq!(RestartPolicy::default(), RestartPolicy::Auto);
+        let refusal = RestartPolicy::parse("forever").unwrap_err();
+        assert!(
+            refusal.contains("\"auto\"")
+                && refusal.contains("\"never\"")
+                && refusal.contains("forever"),
+            "{refusal}"
+        );
+        assert!(terminal_restarts_on_loss(RestartPolicy::Auto));
+        assert!(!terminal_restarts_on_loss(RestartPolicy::Never));
     }
 
     /// What a self-update restart leaves of a running terminal, which the

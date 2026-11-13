@@ -758,9 +758,21 @@ pub async fn latest_push_fingerprint(
     .await
 }
 
-/// All undelivered pushes for a recipient, oldest first. The general drain
-/// primitive; wake/boundary filtering for specific drain sites is a caller
-/// concern (see [`pending_at_boundary`] for the per-boundary view).
+/// The order pending pushes drain in: what interrupts, then a direct message
+/// sent at `steer`, then everything else, each oldest first. A push row's wake
+/// level folds `steer` and `queue` into one value, so a direct's own urgency is
+/// read from its message. Without this a steer, which is the sender saying "read
+/// this first", landed behind every older queued push at the next resume.
+const PENDING_DRAIN_ORDER: &str = "ORDER BY CASE
+                         WHEN p.wake = 'interrupt' THEN 0
+                         WHEN p.key LIKE 'direct:%' AND (SELECT m.urgency FROM messages m
+                              WHERE m.id = substr(p.key, 8)) = 'steer' THEN 1
+                         ELSE 2 END,
+                       p.created_at ASC, p.id ASC";
+
+/// All undelivered pushes for a recipient, in [`PENDING_DRAIN_ORDER`]. The
+/// general drain primitive; wake/boundary filtering for specific drain sites is
+/// a caller concern (see [`pending_at_boundary`] for the per-boundary view).
 pub async fn list_pending(db: &LocalDb, recipient: &str) -> DbResult<Vec<Push>> {
     let recipient = recipient.to_string();
     db.read(|conn| {
@@ -768,10 +780,12 @@ pub async fn list_pending(db: &LocalDb, recipient: &str) -> DbResult<Vec<Push>> 
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id
-                     FROM attention_pushes
-                     WHERE recipient=?1 AND delivered_event_id IS NULL AND retired_at IS NULL
-                     ORDER BY created_at ASC, id ASC",
+                    format!(
+                        "SELECT p.id, p.recipient, p.content_ref, p.wake, p.boundary, p.key, p.created_at, p.delivered_event_id
+                     FROM attention_pushes p
+                     WHERE p.recipient=?1 AND p.delivered_event_id IS NULL AND p.retired_at IS NULL
+                     {PENDING_DRAIN_ORDER}"
+                    ),
                     params![recipient.as_str()],
                 )
                 .await?;
@@ -800,11 +814,13 @@ pub async fn pending_at_boundary(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id
-                     FROM attention_pushes
-                     WHERE recipient=?1 AND delivered_event_id IS NULL AND retired_at IS NULL
-                       AND boundary=?2
-                     ORDER BY created_at ASC, id ASC",
+                    format!(
+                        "SELECT p.id, p.recipient, p.content_ref, p.wake, p.boundary, p.key, p.created_at, p.delivered_event_id
+                     FROM attention_pushes p
+                     WHERE p.recipient=?1 AND p.delivered_event_id IS NULL AND p.retired_at IS NULL
+                       AND p.boundary=?2
+                     {PENDING_DRAIN_ORDER}"
+                    ),
                     params![recipient.as_str(), boundary.as_str()],
                 )
                 .await?;
@@ -3137,6 +3153,45 @@ mod tests {
         assert_eq!(w2, Wake::Wake);
         let pending = list_pending(&db, "watcher").await.unwrap();
         assert_eq!(pending.len(), 2, "both unread directs remain queued");
+    }
+
+    /// A direct sent at `steer` drains ahead of older queued pushes, so the
+    /// sender's "read this first" leads the next resume. The push row's wake
+    /// level folds steer and queue together; the message keeps the difference.
+    #[tokio::test]
+    async fn a_steer_direct_drains_ahead_of_older_queued_pushes() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO messages(id, channel_type, sender_name, content, created_at, urgency)
+              VALUES('m-queue','direct','system','older, queued',100,'queue');
+            INSERT INTO messages(id, channel_type, sender_name, content, created_at, urgency)
+              VALUES('m-steer','direct','system','newer, steer',300,'steer');
+            INSERT INTO attention_pushes(id, recipient, content_ref, wake, boundary, key, created_at)
+              VALUES('queued','watcher','r','wake','event','direct:m-queue',100);
+            INSERT INTO attention_pushes(id, recipient, content_ref, wake, boundary, key, created_at)
+              VALUES('issue','watcher','r','wake','event','k-issue',200);
+            INSERT INTO attention_pushes(id, recipient, content_ref, wake, boundary, key, created_at)
+              VALUES('steered','watcher','r','wake','event','direct:m-steer',300);
+            ",
+        )
+        .await
+        .unwrap();
+
+        let order = |pending: Vec<Push>| pending.into_iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(
+            order(list_pending(&db, "watcher").await.unwrap()),
+            vec!["steered", "queued", "issue"]
+        );
+        assert_eq!(
+            order(
+                pending_at_boundary(&db, "watcher", Boundary::Event)
+                    .await
+                    .unwrap()
+            ),
+            vec!["steered", "queued", "issue"]
+        );
     }
 
     #[tokio::test]

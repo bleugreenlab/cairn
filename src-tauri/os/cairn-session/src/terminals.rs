@@ -28,6 +28,9 @@ pub enum TerminalRecovery {
 /// Fence a terminal whose executor went away into recovery, which is what makes
 /// the host lifecycle reconciliation start it again once an executor advertises
 /// the environment holding it.
+///
+/// The moment of loss is stamped once (`lost_at`): it is where the terminal's
+/// run clock stops, so a second delivery of the same death never moves it.
 pub async fn mark_terminal_recovering(
     db: Arc<LocalDb>,
     session_id: String,
@@ -35,11 +38,12 @@ pub async fn mark_terminal_recovering(
     db.write(|conn| {
         let session_id = session_id.clone();
         Box::pin(async move {
+            let now = chrono::Utc::now().timestamp();
             if conn
                 .execute(
-                    "UPDATE job_terminals SET status = 'recovering'
+                    "UPDATE job_terminals SET status = 'recovering', lost_at = COALESCE(lost_at, ?2)
                      WHERE session_id = ?1 AND status = 'running'",
-                    params![session_id.as_str()],
+                    params![session_id.as_str(), now],
                 )
                 .await?
                 > 0
@@ -61,44 +65,6 @@ pub async fn mark_terminal_recovering(
                 Some("recovering") => TerminalRecovery::AlreadyRecovering,
                 _ => TerminalRecovery::NotRecoverable,
             })
-        })
-    })
-    .await
-}
-
-/// Resolve a lease incarnation that the executor fleet permanently reports as
-/// missing. The fence predicates prevent an old refresh response from clearing a
-/// replacement incarnation acquired concurrently.
-pub async fn resolve_missing_terminal_lease(
-    db: &LocalDb,
-    residency_holder: &str,
-    incarnation_id: &str,
-    cell_epoch: u64,
-) -> DbResult<bool> {
-    let residency_holder = residency_holder.to_string();
-    let incarnation_id = incarnation_id.to_string();
-    db.write(|conn| {
-        let residency_holder = residency_holder.clone();
-        let incarnation_id = incarnation_id.clone();
-        Box::pin(async move {
-            let now = chrono::Utc::now().timestamp();
-            let updated = conn
-                .execute(
-                    "UPDATE job_terminals
-                     SET status = 'exited', exited_at = COALESCE(exited_at, ?4),
-                         residency_holder = NULL, residency_incarnation_id = NULL, cell_epoch = NULL,
-                         process_generation = NULL
-                     WHERE status = 'recovering' AND residency_holder = ?1
-                       AND residency_incarnation_id = ?2 AND cell_epoch = ?3",
-                    params![
-                        residency_holder.as_str(),
-                        incarnation_id.as_str(),
-                        cell_epoch as i64,
-                        now
-                    ],
-                )
-                .await?;
-            Ok(updated > 0)
         })
     })
     .await

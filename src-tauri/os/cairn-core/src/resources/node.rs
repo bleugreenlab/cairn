@@ -4810,6 +4810,7 @@ mod hold_header_tests {
         let wait = Hold::Wait {
             labels: vec!["waitFor: duration".into()],
             supersedable: true,
+            notes: Vec::new(),
         };
         let header = render_job_summary_header("builder", "running", None, None, Some(&wait));
         assert!(

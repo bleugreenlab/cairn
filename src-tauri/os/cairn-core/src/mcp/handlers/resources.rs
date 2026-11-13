@@ -47,6 +47,14 @@ pub struct TerminalReadResult {
     /// output (or the live session is gone).
     #[serde(default)]
     idle_secs: Option<i64>,
+    /// For a recovering terminal: when it settles as lost unless an executor
+    /// re-advertises it (Unix seconds).
+    #[serde(default, rename = "settlesAt", skip_serializing_if = "Option::is_none")]
+    settles_at: Option<i64>,
+    /// When Cairn lost sight of the terminal's process (Unix seconds), where
+    /// its run clock stops.
+    #[serde(default, rename = "lostAt", skip_serializing_if = "Option::is_none")]
+    lost_at: Option<i64>,
 }
 
 /// Explain why a database cannot be addressed beneath an execution node.
@@ -172,9 +180,20 @@ pub(crate) async fn handle_read_resource(
         log_path.as_deref(),
     );
 
-    let runtime_secs = {
-        let end = info.exited_at.unwrap_or_else(unix_now);
-        Some((end - info.created_at).max(0))
+    let now = unix_now();
+    let runtime_secs = Some(crate::mcp::handlers::terminal::terminal_runtime_secs(
+        info.created_at,
+        info.exited_at,
+        info.lost_at,
+        now,
+    ));
+    let settles_at = (info.status == "recovering")
+        .then(|| crate::terminal_host::terminal_recovery_settles_at(now))
+        .flatten();
+    let lifecycle = BannerLifecycle {
+        lost_at: info.lost_at,
+        settles_at,
+        restart_never: info.restart_policy == "never",
     };
 
     let machine = (info.status == "running")
@@ -190,6 +209,7 @@ pub(crate) async fn handle_read_resource(
         total_bytes,
         log_path.as_deref(),
         machine.as_deref(),
+        &lifecycle,
     );
     let mut body = format!("{banner}\n\n{output}");
 
@@ -206,6 +226,8 @@ pub(crate) async fn handle_read_resource(
         total_bytes,
         runtime_secs,
         idle_secs,
+        settles_at,
+        lost_at: info.lost_at,
     })
     .unwrap_or_else(|_| "{}".to_string())
 }
@@ -258,6 +280,8 @@ fn terminal_error_json(message: String) -> String {
         total_bytes: 0,
         runtime_secs: None,
         idle_secs: None,
+        settles_at: None,
+        lost_at: None,
     })
     .unwrap_or_else(|_| "{}".to_string())
 }
@@ -269,10 +293,26 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// What a banner says about a terminal's place in recovery.
+#[derive(Debug, Default)]
+struct BannerLifecycle {
+    /// When Cairn lost sight of the process (Unix seconds).
+    lost_at: Option<i64>,
+    /// When a recovering terminal settles as lost (Unix seconds).
+    settles_at: Option<i64>,
+    /// The terminal carries `restart: never`. The default is not shown.
+    restart_never: bool,
+}
+
+fn describe_unix_clock(unix_secs: i64) -> String {
+    cairn_common::executor_protocol::describe_clock((unix_secs.max(0) as u64) * 1000)
+}
+
 /// Human-readable status banner shown as the first line of a terminal read.
 /// Distinguishes "running but quiet" (running + age of last output) from "dead"
 /// (exited + code, or the reason Cairn recorded when no code exists) so a
-/// polling agent has something actionable.
+/// polling agent has something actionable. A recovering terminal names the
+/// moment it settles, and its clock stops where Cairn lost it.
 #[allow(clippy::too_many_arguments)]
 fn format_status_banner(
     slug: &str,
@@ -284,9 +324,29 @@ fn format_status_banner(
     total_bytes: usize,
     log_path: Option<&std::path::Path>,
     machine: Option<&str>,
+    lifecycle: &BannerLifecycle,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if status == "running" {
+    let ran = |runtime: i64| match lifecycle.lost_at {
+        Some(lost_at) => format!(
+            "ran {} until lost at {}",
+            fmt_duration(runtime),
+            describe_unix_clock(lost_at)
+        ),
+        None => format!("ran {}", fmt_duration(runtime)),
+    };
+    if status == "recovering" {
+        parts.push(match lifecycle.settles_at {
+            Some(settles_at) => format!(
+                "recovering; {}",
+                crate::terminal_host::recovery_deadline_clause(settles_at)
+            ),
+            None => "recovering".to_string(),
+        });
+        if let Some(rt) = runtime_secs {
+            parts.push(ran(rt));
+        }
+    } else if status == "running" {
         parts.push(match machine {
             Some(machine) => format!("running on {machine}"),
             None => "running".to_string(),
@@ -308,8 +368,11 @@ fn format_status_banner(
             parts.push(reason.to_string());
         }
         if let Some(rt) = runtime_secs {
-            parts.push(format!("ran {}", fmt_duration(rt)));
+            parts.push(ran(rt));
         }
+    }
+    if lifecycle.restart_never {
+        parts.push("restart: never".to_string());
     }
     // Surface the persisted log path only when the file actually exists, so a
     // non-teed terminal (project terminal, or a desktop node terminal) never
@@ -360,6 +423,8 @@ struct TerminalInfo {
     /// agent terminal. `None` for a project terminal (no log file).
     job_id: Option<String>,
     exit_reason: Option<String>,
+    lost_at: Option<i64>,
+    restart_policy: String,
 }
 
 async fn lookup_terminal_info(
@@ -384,7 +449,8 @@ async fn lookup_terminal_info(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail, jt.job_id, jt.exit_reason
+                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail, jt.job_id, jt.exit_reason,
+                               jt.lost_at, jt.restart_policy
                         FROM job_terminals jt
                         JOIN projects p ON jt.project_id = p.id
                         WHERE p.key = ?1
@@ -420,7 +486,8 @@ async fn lookup_terminal_info(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail, job_id, exit_reason
+                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail, job_id, exit_reason,
+                               lost_at, restart_policy
                         FROM job_terminals
                         WHERE job_id = ?1 AND slug = ?2
                         LIMIT 1
@@ -441,6 +508,8 @@ async fn lookup_terminal_info(
                     output_tail: row.opt_text(5)?,
                     job_id: row.opt_text(6)?,
                     exit_reason: row.opt_text(7)?,
+                    lost_at: row.opt_i64(8)?,
+                    restart_policy: row.text(9)?,
                 })
             })
             .transpose()
@@ -1133,13 +1202,24 @@ mod tests {
             1024,
             None,
             None,
+            &BannerLifecycle::default(),
         );
         assert!(running_quiet.contains("running"));
         assert!(running_quiet.contains("elapsed"));
         assert!(running_quiet.contains("last output"));
 
-        let running_no_output =
-            format_status_banner("ci", "running", None, None, Some(5), None, 0, None, None);
+        let running_no_output = format_status_banner(
+            "ci",
+            "running",
+            None,
+            None,
+            Some(5),
+            None,
+            0,
+            None,
+            None,
+            &BannerLifecycle::default(),
+        );
         assert!(running_no_output.contains("no output yet"));
 
         let exited = format_status_banner(
@@ -1152,6 +1232,7 @@ mod tests {
             2048,
             None,
             None,
+            &BannerLifecycle::default(),
         );
         assert!(exited.contains("exited code 0"));
         assert!(exited.contains("ran"));
@@ -1170,6 +1251,7 @@ mod tests {
             0,
             None,
             Some("bgsrv-mac"),
+            &BannerLifecycle::default(),
         );
         assert!(
             banner.starts_with("[terminal lab: running on bgsrv-mac,"),
@@ -1191,6 +1273,7 @@ mod tests {
             512,
             None,
             None,
+            &BannerLifecycle::default(),
         );
         assert!(lost.contains("exited"), "{lost}");
         assert!(
@@ -1214,6 +1297,7 @@ mod tests {
             1,
             Some(&existing),
             None,
+            &BannerLifecycle::default(),
         );
         assert!(
             with_log.contains(&format!("log: {}", existing.display())),
@@ -1231,8 +1315,104 @@ mod tests {
             1,
             Some(&missing),
             None,
+            &BannerLifecycle::default(),
         );
         assert!(!without_log.contains("log:"), "{without_log}");
+    }
+
+    /// A recovering terminal names when it settles, and its clock stops where
+    /// Cairn lost it: reading it twice, minutes apart, shows the same `ran`.
+    #[test]
+    fn a_recovering_terminal_names_its_deadline_and_its_clock_stays_frozen() {
+        // 21:08:00 and 21:20:15 UTC on some day.
+        let lost_at = 1_790_000_000 - (1_790_000_000 % 86_400) + 21 * 3600 + 8 * 60;
+        let settles_at = lost_at + 12 * 60 + 15;
+        let created_at = lost_at - (60 * 60 + 49 * 60);
+        let lifecycle = BannerLifecycle {
+            lost_at: Some(lost_at),
+            settles_at: Some(settles_at),
+            restart_never: false,
+        };
+        let read_at = |now: i64| {
+            format_status_banner(
+                "proof2",
+                "recovering",
+                None,
+                None,
+                Some(crate::mcp::handlers::terminal::terminal_runtime_secs(
+                    created_at,
+                    None,
+                    Some(lost_at),
+                    now,
+                )),
+                None,
+                512,
+                None,
+                None,
+                &lifecycle,
+            )
+        };
+        let first = read_at(lost_at + 60);
+        assert_eq!(
+            first,
+            "[terminal proof2: recovering; settles as lost at 21:20 UTC unless the executor re-advertises it, ran 1h49m until lost at 21:08 UTC]"
+        );
+        assert_eq!(read_at(lost_at + 600), first, "the clock does not climb");
+
+        // Settled through the one writer, `exited_at` took `lost_at`, so the
+        // run time it states is the same one.
+        let settled = format_status_banner(
+            "proof2",
+            "exited",
+            None,
+            Some("lost: no executor re-advertised this terminal's environment"),
+            Some(crate::mcp::handlers::terminal::terminal_runtime_secs(
+                created_at,
+                Some(lost_at),
+                Some(lost_at),
+                lost_at + 3600,
+            )),
+            None,
+            512,
+            None,
+            None,
+            &BannerLifecycle {
+                lost_at: Some(lost_at),
+                settles_at: None,
+                restart_never: false,
+            },
+        );
+        assert!(
+            settled.contains("ran 1h49m until lost at 21:08 UTC"),
+            "{settled}"
+        );
+    }
+
+    #[test]
+    fn only_a_never_terminal_states_its_restart_policy() {
+        let banner = |restart_never| {
+            format_status_banner(
+                "proof2",
+                "running",
+                None,
+                None,
+                Some(5),
+                None,
+                0,
+                None,
+                None,
+                &BannerLifecycle {
+                    restart_never,
+                    ..BannerLifecycle::default()
+                },
+            )
+        };
+        assert!(
+            banner(true).contains(", restart: never"),
+            "{}",
+            banner(true)
+        );
+        assert!(!banner(false).contains("restart"), "{}", banner(false));
     }
 
     #[tokio::test]
