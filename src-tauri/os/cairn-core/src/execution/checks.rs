@@ -4419,7 +4419,7 @@ pub(crate) async fn plan_infra_scopes(
                     &placement.verdict_platforms,
                 ),
                 fleet: Some(crate::execution::cache::infra_fleet_scope(
-                    &orch.fleet.capability_identity(scope),
+                    &orch.fleet.capability_identity(scope, &repair_epochs),
                 )),
                 fleet_blind: orch
                     .fleet
@@ -5204,14 +5204,17 @@ enum CapacityRetry {
 /// request would spend the machine twice for an answer it already has. A
 /// structural refusal (no matching machine, a toolchain fault, a draining host),
 /// a cancellation, a storage failure, and anything that happened after the
-/// command ran are all re-presented unchanged, so none of them retry.
+/// command ran are all re-presented unchanged, so none of them retry. A terminal
+/// placement refusal also surfaces, even if its cause is transient: placement
+/// has already exhausted that wait. The next commit or changed placement fact
+/// may re-arm the lane, but this ask must not restart the expired wait.
 fn capacity_retry_decision(outcome: &PlannedCheckBatchOutcome) -> CapacityRetry {
     let wholly_capacity = !outcome.results.is_empty()
         && outcome.results.values().all(|result| {
             matches!(
                 result,
                 Err(CheckExecutionFailure::Substrate(failure))
-                    if matches!(
+                    if !failure.placement_refused && matches!(
                         failure.shape(),
                         SubstrateFailureShape::Capacity
                             | SubstrateFailureShape::EnvironmentRetired
@@ -6846,7 +6849,16 @@ fn no_start(reason: &cairn_common::executor_protocol::CellUnavailableReason) -> 
             AdmissionRejectionReason::RequestTooLarge => Shape::NoMachine,
         }),
         CellUnavailableReason::ExecutorUnavailable => Substrate(Shape::MachineUnreachable),
-        CellUnavailableReason::NoMatchingExecutor => Substrate(Shape::NoMachine),
+        CellUnavailableReason::NoMatchingExecutor { rejected } => {
+            if rejected
+                .iter()
+                .any(|machine| transient_placement_refusal(&machine.reason))
+            {
+                Substrate(Shape::Capacity)
+            } else {
+                Substrate(Shape::NoMachine)
+            }
+        }
         // The pinned machine can never hold the work's measured memory: the
         // pin, not the fleet, is what left no machine to run it on.
         CellUnavailableReason::HomeCannotHold { .. } => Substrate(Shape::NoMachine),
@@ -6893,9 +6905,9 @@ fn infra_repair_domain(
 ) -> InfraRepairDomain {
     if let Some(shape) = substrate {
         return match shape {
-            // No commit and no machine repair satisfies a selector nothing in
-            // the fleet matches, or a fleet draining itself out from under the
-            // work. Only the capability set changing fixes either.
+            // Structural placement gaps stay fleet-scoped: a commit cannot
+            // repair them. Capability changes and an eligible machine's
+            // declared repair move this scope.
             // An unmounted build volume is the same kind of fact: the machine
             // is fine and the head is fine, and the fleet's shape is what
             // changes when the volume returns.
@@ -6905,8 +6917,8 @@ fn infra_repair_domain(
             // Fleet too, but under an identity that names the blind machines
             // (`Fleet::capability_identity`), so the counter it is charged to
             // exists only while they stay blind and their recovery is the
-            // fleet change that lifts it. Inside its grace it is charged to
-            // nothing at all (see `name_measurement_blind_refusal`).
+            // fleet change that lifts it. Retained for historical stored rows;
+            // new typed telemetry refusals are Capacity in the Head domain.
             SubstrateFailureShape::MeasurementBlind => InfraRepairDomain::Fleet,
             // Cell races, lost links, capacity, storage, cancellation:
             // conditions local to one attempt at one head, which must stay
@@ -6951,67 +6963,62 @@ fn infra_repair_domain(
     InfraRepairDomain::Head
 }
 
-/// How long a measurement-blind refusal is taken for the window it usually is
-/// before the deaths it causes count toward a fleet suppression.
-///
-/// A machine whose telemetry goes stale is nearly always reporting again
-/// within minutes: fedora's six wedges on 10-30/31 all cleared unaided, and
-/// the longest observed stall (cairn/5600) lasted under twenty. A death inside
-/// this bound is recorded and named, and moves no counter; past it, the
-/// condition has stopped looking like a window, and its deaths count — under
-/// an identity that still lifts the moment the telemetry is fresh again.
-pub(crate) const TRANSIENT_REFUSAL_GRACE_MS: u64 = 10 * 60 * 1_000;
-
-/// A no-machine refusal re-read against the eligible machines that were
-/// measurement-blind when it came back, returning the failure as it should be
-/// named and whether it is still inside [`TRANSIENT_REFUSAL_GRACE_MS`].
-///
-/// One refusal reason (`NoMatchingExecutor`) covers two populations: a fleet
-/// with nothing that matches, and matching machines placement could not
-/// measure. Only the second has an eligible machine that is blind, so that is
-/// the test. The youngest blindness decides the grace: while any blind machine
-/// could plausibly report again, the refusal is a window. A reading missing
-/// outright carries no instant to measure from and is taken as past it, so a
-/// machine that never reports is still bounded.
-fn name_measurement_blind_refusal(
-    failure: SubstrateFailure,
-    blind: &[crate::fleet::MeasurementBlindness],
-) -> (SubstrateFailure, bool) {
-    if failure.shape() != SubstrateFailureShape::NoMachine || blind.is_empty() {
-        return (failure, false);
+/// Whether a placement refusal can change without changing this check or the
+/// fleet's structural capabilities. Read the immutable refusal, never a later
+/// telemetry sample: a recovered machine cannot rewrite why an attempt died.
+fn transient_placement_refusal(
+    reason: &cairn_common::executor_protocol::PlacementRejectionReason,
+) -> bool {
+    use cairn_common::executor_protocol::PlacementRejectionReason as Reason;
+    match reason {
+        Reason::ConnectionClosed
+        | Reason::ConnectionStale { .. }
+        | Reason::RunnerNotListening { .. }
+        | Reason::Reconnecting { .. }
+        | Reason::TelemetryGap { .. }
+        | Reason::TelemetryStale { .. }
+        | Reason::InsufficientMemory { .. }
+        | Reason::InsufficientVolume { .. }
+        | Reason::ProcessDeferred(_)
+        | Reason::OutrankedBy { .. }
+        | Reason::NestedSandboxCapableElsewhere { .. }
+        | Reason::UpdatePending { .. }
+        | Reason::ModelResident { .. }
+        | Reason::PipeDegraded { .. }
+        | Reason::Held { .. }
+        | Reason::ProvisioningTurn { .. }
+        | Reason::CadenceTurn { .. } => true,
+        Reason::Declined { reason, .. } => {
+            use cairn_common::executor_protocol::DeclineReason;
+            match reason {
+                DeclineReason::Capacity
+                | DeclineReason::Pressure
+                | DeclineReason::ProjectProvisioning
+                | DeclineReason::Disk
+                | DeclineReason::Unknown => true,
+                DeclineReason::Constraint | DeclineReason::BuildVolumeAbsent => false,
+            }
+        }
+        Reason::SelectorMismatch { .. }
+        | Reason::PinMismatch { .. }
+        | Reason::ProjectUnavailable { .. }
+        | Reason::NotColocated
+        | Reason::RepositoryNotTransferable { .. }
+        | Reason::ExceedsMemoryCeiling { .. }
+        | Reason::MemoryKillExcluded { .. }
+        | Reason::ProcessTooLarge(_)
+        | Reason::UntrustedVerdictPlatform { .. }
+        | Reason::Drained
+        | Reason::BuildVolumeAbsent { .. }
+        | Reason::RoleExcluded { .. }
+        | Reason::NotPublishEligible { .. }
+        | Reason::AvoidedInfrastructure
+        | Reason::PreparationToolchainMissing { .. }
+        | Reason::GithubCredentialMissing { .. }
+        | Reason::PreparationRefused { .. }
+        | Reason::BuildPrerequisitesMissing { .. }
+        | Reason::AbsenceExpired { .. } => false,
     }
-    let within_grace = blind.iter().any(|machine| {
-        machine
-            .blind_for_ms
-            .is_some_and(|blind_for_ms| blind_for_ms < TRANSIENT_REFUSAL_GRACE_MS)
-    });
-    let machines = blind
-        .iter()
-        .map(|machine| format!("{} ({})", machine.name, machine.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let grace_minutes = TRANSIENT_REFUSAL_GRACE_MS / 60_000;
-    let counted = if within_grace {
-        format!(
-            "inside the {grace_minutes}-minute grace for a blind window, so this death counts toward no suppression"
-        )
-    } else {
-        format!(
-            "blind past the {grace_minutes}-minute grace, so this death counts toward a fleet suppression that lifts when the telemetry is fresh again"
-        )
-    };
-    let diagnostic = format!(
-        "measurement-blind: {machines}; {counted}.\n{}",
-        failure.diagnostic
-    );
-    (
-        SubstrateFailure {
-            shape: SubstrateFailureShape::MeasurementBlind,
-            diagnostic,
-            ..failure
-        },
-        within_grace,
-    )
 }
 
 /// What an elapsed acquisition deadline actually says happened.
@@ -7150,6 +7157,9 @@ const CAPACITY_ATTRIBUTION_CHARS: usize = 120;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubstrateFailure {
     shape: SubstrateFailureShape,
+    /// Placement has already exhausted its wait and answered the request.
+    /// Retryable on a new placement fact, not by restarting the same wait.
+    placement_refused: bool,
     diagnostic: String,
     build_service_implicated: bool,
     /// What the batch was waiting ON, when Cairn's own placement records say.
@@ -7176,6 +7186,7 @@ impl SubstrateFailure {
     pub(crate) fn new(shape: SubstrateFailureShape, diagnostic: impl Into<String>) -> Self {
         Self {
             shape,
+            placement_refused: false,
             diagnostic: diagnostic.into(),
             build_service_implicated: false,
             waited_on: None,
@@ -12430,29 +12441,7 @@ where
                     other => other,
                 };
 
-                // A no-machine refusal is named by what the matching machines
-                // said, read now, while the refusal is still the fleet's
-                // current answer.
-                let mut transient_within_grace = false;
-                let exec_outcome = match exec_outcome {
-                    Err(CheckExecutionFailure::Substrate(failure))
-                        if failure.shape() == SubstrateFailureShape::NoMachine =>
-                    {
-                        let eligible: Vec<String> = infra_scopes
-                            .environments
-                            .iter()
-                            .map(|(executor_id, _)| executor_id.clone())
-                            .collect();
-                        let blind = diagnostic_orch
-                            .map(|orch| orch.fleet.measurement_blindness(&eligible))
-                            .unwrap_or_default();
-                        let (failure, within_grace) =
-                            name_measurement_blind_refusal(failure, &blind);
-                        transient_within_grace = within_grace;
-                        Err(CheckExecutionFailure::Substrate(failure))
-                    }
-                    other => other,
-                };
+                let transient_within_grace = false;
 
                 let (
                     exit_code,
@@ -14286,7 +14275,18 @@ fn outcome_result(
                 // A silent claim's diagnostic already names the machine, the
                 // silence, and what the machine said last; a `Debug` rendering
                 // of the reason would only repeat it less readably.
-                let diagnostic = if matches!(
+                let diagnostic = if let cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor { rejected } = &reason {
+                    let transient = rejected.iter()
+                        .filter(|machine| transient_placement_refusal(&machine.reason))
+                        .map(|machine| format!("{} ({})", machine.executor_name, machine.reason.describe()))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if transient.is_empty() {
+                        format!("NoMatchingExecutor: {diagnostic}")
+                    } else {
+                        format!("This check will be retried: temporarily unavailable machines: {transient}.\n{diagnostic}")
+                    }
+                } else if matches!(
                     reason,
                     cairn_common::executor_protocol::CellUnavailableReason::ClaimedAttemptSilent { .. }
                 ) {
@@ -14294,7 +14294,12 @@ fn outcome_result(
                 } else {
                     format!("{reason:?}: {diagnostic}")
                 };
-                Err(CheckExecutionFailure::substrate(shape, diagnostic))
+                let mut failure = SubstrateFailure::new(shape, diagnostic);
+                failure.placement_refused = matches!(
+                    reason,
+                    cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor { .. }
+                );
+                Err(CheckExecutionFailure::Substrate(failure))
             }
         },
         CellOutcome::StorageFailure {
@@ -14828,92 +14833,111 @@ mod tests {
         assert_eq!(super::infra_repair_domain(None, None), Domain::Head);
     }
 
-    /// cairn/5671. "Nothing in the fleet matches" and "the matching machine
-    /// could not be measured" arrive as one refusal reason and were told as one
-    /// sentence. The second is a window that clears on its own, so it is named
-    /// as itself and, while young, charged to nothing.
     #[test]
-    fn a_brake_blind_refusal_is_named_transient_and_given_its_grace() {
-        use super::{
-            name_measurement_blind_refusal, SubstrateFailure, SubstrateFailureShape as Shape,
-            TRANSIENT_REFUSAL_GRACE_MS,
+    fn no_matching_executor_classifies_immutable_refusals() {
+        use super::{infra_repair_domain, SubstrateFailureShape as Shape};
+        use crate::execution::cache::InfraRepairDomain as Domain;
+        use cairn_common::executor_protocol::{
+            CellUnavailableReason, DeclineReason, MachineMeasurement, MachineRole,
+            PlacementRefusal, PlacementRejectionReason as Reason, PlacementWorkClass,
         };
-        use crate::fleet::MeasurementBlindness;
-        let refusal = || {
-            SubstrateFailure::new(
-                Shape::NoMachine,
-                "NoMatchingExecutor: no executor could take this spillEligible request: \
-                 bgsrv-ub (drained by an operator; refusing new work); \
-                 fedora (cpu was measured 108276ms ago, past the 90000ms bound).",
+
+        let structural = vec![
+            Reason::Drained,
+            Reason::SelectorMismatch {
+                requested: "os windows".into(),
+            },
+            Reason::AbsenceExpired {
+                absent_since_unix_ms: 1,
+            },
+            Reason::RoleExcluded {
+                role: MachineRole::InferenceOnly,
+                work_class: PlacementWorkClass::ReviewChecks,
+                publication_leg: false,
+            },
+            Reason::BuildPrerequisitesMissing {
+                project_id: "project".into(),
+                script: "build-prerequisites".into(),
+                detail: "MISSING helper".into(),
+            },
+        ];
+        let classify = |reasons: Vec<Reason>| {
+            let rejected = reasons
+                .into_iter()
+                .enumerate()
+                .map(|(i, reason)| PlacementRefusal {
+                    executor_id: format!("machine-{i}"),
+                    executor_name: format!("machine-{i}"),
+                    reason,
+                })
+                .collect();
+            super::check_result_from_cell_outcome(
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::NoMatchingExecutor { rejected },
+                    diagnostic: "all machines refused".into(),
+                },
+                &crate::fleet::CellAccount::default(),
+                None,
             )
+            .unwrap_err()
         };
-        let fedora = |blind_for_ms| MeasurementBlindness {
-            executor_id: "fedora".into(),
-            name: "fedora".into(),
-            reason: "cpu was measured 108276ms ago, past the 90000ms bound".into(),
-            blind_for_ms,
+        let CheckExecutionFailure::Substrate(failure) = classify(structural.clone()) else {
+            panic!("expected substrate refusal");
         };
-
-        let (named, within_grace) =
-            name_measurement_blind_refusal(refusal(), &[fedora(Some(18_276))]);
-        assert_eq!(named.shape(), Shape::MeasurementBlind);
-        assert!(within_grace, "eighteen seconds blind is a window");
-        let message = named.agent_message();
-        assert!(
-            message.starts_with(Shape::MeasurementBlind.lead()),
-            "{message}"
-        );
-        assert!(
-            !message.contains(Shape::NoMachine.lead()),
-            "a blind machine is not a fleet with nothing that matches: {message}"
-        );
-        assert!(
-            named.diagnostic().starts_with(
-                "measurement-blind: fedora (cpu was measured 108276ms ago, past the 90000ms bound)"
-            ),
-            "{}",
-            named.diagnostic()
-        );
-        assert!(named.diagnostic().contains("counts toward no suppression"));
-        assert!(
-            named
-                .diagnostic()
-                .contains("bgsrv-ub (drained by an operator"),
-            "the fleet's own account of every machine survives"
-        );
-
-        let (outlived, within_grace) =
-            name_measurement_blind_refusal(refusal(), &[fedora(Some(TRANSIENT_REFUSAL_GRACE_MS))]);
-        assert_eq!(outlived.shape(), Shape::MeasurementBlind);
-        assert!(!within_grace, "past the grace, its deaths count");
-        assert!(outlived
-            .diagnostic()
-            .contains("lifts when the telemetry is fresh"));
-
-        let (_, within_grace) = name_measurement_blind_refusal(refusal(), &[fedora(None)]);
-        assert!(
-            !within_grace,
-            "a reading missing outright has no instant to measure from, so it stays bounded"
-        );
-
-        let (structural, within_grace) = name_measurement_blind_refusal(refusal(), &[]);
+        assert_eq!(failure.shape(), Shape::NoMachine);
         assert_eq!(
-            structural.shape(),
-            Shape::NoMachine,
-            "with no blind eligible machine, nothing matches: that is the structural gap"
+            infra_repair_domain(Some(failure.shape()), None),
+            Domain::Fleet
         );
-        assert!(!within_grace);
 
-        let (capacity, within_grace) = name_measurement_blind_refusal(
-            SubstrateFailure::new(Shape::Capacity, "busy"),
-            &[fedora(Some(1))],
-        );
-        assert_eq!(
-            capacity.shape(),
-            Shape::Capacity,
-            "only a no-machine refusal is re-read"
-        );
-        assert!(!within_grace);
+        for reason in [
+            Reason::TelemetryStale {
+                measurement: MachineMeasurement::Cpu,
+                age_ms: 108_276,
+                stale_after_ms: 90_000,
+            },
+            Reason::TelemetryGap {
+                measurement: MachineMeasurement::Cpu,
+                gap: cairn_common::executor_protocol::MeasurementGap::NotSampled,
+            },
+            Reason::UpdatePending {
+                returns_by_unix_ms: Some(123_000),
+            },
+            Reason::ProvisioningTurn {
+                project_id: "project".into(),
+                ahead_request_id: "earlier".into(),
+                ahead_waiting_since_unix_ms: 1,
+            },
+            Reason::Declined {
+                reason: DeclineReason::Pressure,
+                detail: Some("CPU pressure".into()),
+                declined_at_unix_ms: 1,
+            },
+            Reason::Reconnecting {
+                returns_by_unix_ms: 123_000,
+            },
+        ] {
+            let description = reason.describe();
+            let mut reasons = structural.clone();
+            reasons.push(reason);
+            let CheckExecutionFailure::Substrate(failure) = classify(reasons) else {
+                panic!("expected substrate refusal");
+            };
+            assert_eq!(failure.shape(), Shape::Capacity, "{description}");
+            assert_eq!(
+                infra_repair_domain(Some(failure.shape()), None),
+                Domain::Head
+            );
+            let message = failure.agent_message();
+            assert!(message.contains(&description), "{message}");
+            assert!(message.contains("retried"), "{message}");
+            assert!(!message.contains(Shape::NoMachine.lead()), "{message}");
+            assert_eq!(
+                capacity_retry_decision(&PlannedCheckBatchOutcome::failed(vec![0], failure)),
+                CapacityRetry::Surface,
+                "a terminal placement refusal must not restart its bounded wait"
+            );
+        }
     }
 
     /// A fleet suppression says what lifts it, and the two populations get
@@ -20944,7 +20968,9 @@ cairn-common = { path = "../cairn-common" }
             Spawn,
             Preparation,
             ExecutorUnavailable,
-            NoMatchingExecutor,
+            NoMatchingExecutor {
+                rejected: Vec::new(),
+            },
             ObjectInfrastructure(ObjectInfrastructureStage::FetchInterrupted),
             ObjectInfrastructure(ObjectInfrastructureStage::IntegrityFailure),
             ObjectInfrastructure(ObjectInfrastructureStage::IncompleteClosure),
@@ -21315,7 +21341,7 @@ cairn-common = { path = "../cairn-common" }
             | CellUnavailableReason::PreparationCommandNotFound { .. }
             | CellUnavailableReason::SlotUnhealthy
             | CellUnavailableReason::ExecutorUnavailable
-            | CellUnavailableReason::NoMatchingExecutor
+            | CellUnavailableReason::NoMatchingExecutor { .. }
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_)
             | CellUnavailableReason::HomeCannotHold { .. }
@@ -21402,7 +21428,9 @@ cairn-common = { path = "../cairn-common" }
                 SubstrateFailureShape::MachineUnreachable,
             ),
             (
-                CellUnavailableReason::NoMatchingExecutor,
+                CellUnavailableReason::NoMatchingExecutor {
+                    rejected: Vec::new(),
+                },
                 SubstrateFailureShape::NoMachine,
             ),
             (
@@ -22214,7 +22242,8 @@ cairn-common = { path = "../cairn-common" }
         use cairn_common::executor_protocol::CellUnavailableReason::*;
         // The specimen from the transcript that opened CAIRN-3219.
         let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/cairn/.authority/slot-366/scratch: Directory not empty";
-        let outcomes = vec![
+        let outcomes =
+            vec![
             CellOutcome::StorageFailure {
                 request_id: "request".to_string(),
                 attempt_id: "attempt".to_string(),
@@ -22251,7 +22280,7 @@ cairn-common = { path = "../cairn-common" }
                 diagnostic: "executor lost the slot before publication".to_string(),
             },
             CellOutcome::Unavailable {
-                reason: NoMatchingExecutor,
+                reason: NoMatchingExecutor { rejected: Vec::new() },
                 diagnostic: "no executor advertises toolchain matlab".to_string(),
             },
             CellOutcome::Unavailable {

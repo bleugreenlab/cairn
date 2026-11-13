@@ -775,15 +775,6 @@ impl Rollout {
         }
     }
 
-    /// The machines directed to install the build and awaited on their
-    /// return, as `(executor id, public name)`.
-    pub(crate) fn directed(&self) -> Vec<(String, String)> {
-        self.turns()
-            .filter(|(_, turn)| matches!(turn.phase, TurnPhase::Directed { .. }))
-            .map(|(_, turn)| (turn.executor_id.clone(), turn.name.clone()))
-            .collect()
-    }
-
     fn turns(&self) -> impl Iterator<Item = (Slot, &Turn)> {
         [(Slot::Head, &self.head), (Slot::Drain, &self.drain)]
             .into_iter()

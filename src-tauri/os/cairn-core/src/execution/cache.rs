@@ -694,7 +694,9 @@ pub(crate) fn infra_env_scope(digest: &str) -> String {
 
 /// The capability set a check's selector can reach across the whole fleet. It
 /// moves when a machine that changes the answer to "is there anywhere to run
-/// this at all?" attaches, detaches, or changes what it advertises.
+/// this at all?" attaches, detaches, changes what it advertises, recovers its
+/// telemetry, or is declared repaired. Repair epochs belong only to the
+/// eligible machines, so an unrelated machine's repair re-arms nothing.
 pub(crate) fn infra_fleet_scope(digest: &str) -> String {
     format!("{INFRA_FLEET_SCOPE_PREFIX}{digest}")
 }
@@ -1962,8 +1964,7 @@ pub struct CheckResultCacheWrite {
     pub verdict_platform: Option<String>,
     pub verdict_arch: Option<String>,
     pub verdict_environment_hash: Option<String>,
-    /// An infrastructure death whose cause clears on its own and has not yet
-    /// outlived [`crate::execution::checks::TRANSIENT_REFUSAL_GRACE_MS`]: the
+    /// A historical measurement-blind death recorded inside its grace: the
     /// row is recorded, so the death is visible and its head is remembered,
     /// but no counter moves. `false` for every verdict and every other death.
     pub transient_within_grace: bool,
@@ -4816,7 +4817,7 @@ pub(crate) mod tests {
         record_fresh_check_observation(db.clone(), collided).unwrap();
     }
 
-    async fn cache_db() -> Arc<LocalDb> {
+    pub(crate) async fn cache_db() -> Arc<LocalDb> {
         let db = crate::storage::migrated_test_db("check-result-cache-test.db").await;
         db.execute_script(
             "
@@ -5079,7 +5080,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn fleet_scopes(commit: &str, digest: &str) -> InfraScopes {
+    pub(crate) fn fleet_scopes(commit: &str, digest: &str) -> InfraScopes {
         InfraScopes {
             head: infra_suppression_scope("job-test", commit),
             fleet: Some(infra_fleet_scope(digest)),
@@ -5108,7 +5109,7 @@ pub(crate) mod tests {
     /// against the fleet `digest`, the way the run path writes it: reserve,
     /// then store under the fleet scope at that head's own tree. Returns
     /// whether the reservation let it run.
-    fn die_against_fleet(
+    pub(crate) fn die_against_fleet(
         db: &Arc<LocalDb>,
         check_name: &str,
         input_hash: &str,

@@ -39,8 +39,8 @@ struct ConfigureRequest {
     /// override are not.
     #[serde(alias = "machine_services")]
     machine_services: Option<management::MachineServiceChanges>,
-    /// Declare this machine repaired, re-arming every check its old environment
-    /// had infrastructure-suppressed. For a repair the executor's own attach
+    /// Declare this machine repaired, re-arming checks suppressed on its old
+    /// environment or a fleet capability scope that includes this machine. For a repair the executor's own attach
     /// probes can see, restarting it does the same thing; this is for the ones
     /// they cannot — a cleared cache, a replaced helper, a fixed permission.
     repaired: Option<bool>,
@@ -455,7 +455,7 @@ pub(super) async fn dispatch(
                 }
                 if request.repaired == Some(true) {
                     planned.push(format!(
-                        "declare {name} repaired, re-arming every check suppressed on its environment and forgetting the out-of-memory kills held against it"
+                        "declare {name} repaired, re-arming every check suppressed on its environment or a fleet scope that includes it and forgetting the out-of-memory kills held against it"
                     ));
                 }
                 if let Some(build_root) = &request.build_root {
@@ -528,7 +528,7 @@ pub(super) async fn dispatch(
                             .await
                             .map_err(|error| build_failure(index, item, error))?;
                     applied.push(format!(
-                        "declared repaired (repair {epoch}) — every check infrastructure-suppressed on this machine's environment runs again, it is eligible again for projects it had failed to prepare, and the out-of-memory kills it held against {suites} suite(s) and their commands are forgotten; a MISSING build-prerequisite verdict still stands until the machine re-attaches"
+                        "declared repaired (repair {epoch}) — every check infrastructure-suppressed on this machine's environment or a fleet scope that includes it runs again, it is eligible again for projects it had failed to prepare, and the out-of-memory kills it held against {suites} suite(s) and their commands are forgotten; a MISSING build-prerequisite verdict still stands until the machine re-attaches"
                     ));
                 }
                 // Renaming last: it moves the address the other controls were

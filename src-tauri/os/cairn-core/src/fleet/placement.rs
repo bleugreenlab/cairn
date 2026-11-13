@@ -255,7 +255,7 @@ pub(crate) fn classify_unavailable(
         // No executor matches the request's selector: a machine name, platform,
         // or toolchain nothing in the fleet provides. Time does not add one, and
         // no link coming back changes what an executor will advertise.
-        CellUnavailableReason::NoMatchingExecutor => PlacementVerdict::Structural,
+        CellUnavailableReason::NoMatchingExecutor { .. } => PlacementVerdict::Structural,
         // The home can never hold this work's measured memory, which is a fact
         // about the machine's size rather than its load: waiting on it waits
         // for nothing. Another machine can, and the caller is told which.
@@ -419,7 +419,7 @@ mod tests {
             | CellUnavailableReason::PreparationCommandNotFound { .. }
             | CellUnavailableReason::SlotUnhealthy
             | CellUnavailableReason::ExecutorUnavailable
-            | CellUnavailableReason::NoMatchingExecutor
+            | CellUnavailableReason::NoMatchingExecutor { .. }
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_)
             | CellUnavailableReason::HomeCannotHold { .. }
@@ -452,7 +452,9 @@ mod tests {
                 exit_code: 127,
             },
             CellUnavailableReason::ExecutorUnavailable,
-            CellUnavailableReason::NoMatchingExecutor,
+            CellUnavailableReason::NoMatchingExecutor {
+                rejected: Vec::new(),
+            },
             CellUnavailableReason::ObjectInfrastructure(
                 ObjectInfrastructureStage::FetchInterrupted,
             ),
@@ -528,7 +530,9 @@ mod tests {
         // a link: no restart changes what an executor advertises.
         assert_eq!(
             classify_unavailable(
-                &CellUnavailableReason::NoMatchingExecutor,
+                &CellUnavailableReason::NoMatchingExecutor {
+                    rejected: Vec::new()
+                },
                 LinkRestoration::Restoring
             ),
             PlacementVerdict::Structural

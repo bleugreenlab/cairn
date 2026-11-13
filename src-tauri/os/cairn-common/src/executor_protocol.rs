@@ -8357,6 +8357,12 @@ pub struct LearnedResourceEstimate {
 /// only by a new `--role publishOnly` enrolment, whose executor is installed
 /// at this build; an existing config never carries it. What a runner gets
 /// wrong talking to an older executor: nothing.
+/// cairn/5602 does not move the number. NoMatchingExecutor now carries the
+/// runner's immutable placement refusals, including enrolled machines awaiting
+/// reconnection or past their absence bound. These outcomes and placement
+/// rejections are runner-composed evidence; an older executor is sent the same
+/// requests and its admission replies are interpreted unchanged. No older peer
+/// gets anything wrong: no new refusal is requested from or sent to it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -9355,8 +9361,13 @@ impl ExecutorSelector {
                 self.required_toolchains.join(", ")
             ));
         }
-        if self.requires_macos_nested_sandbox_write {
-            parts.push("measured macOS nested Seatbelt write capability".into());
+        if self.requires_macos_nested_sandbox_write
+            && self
+                .os
+                .as_deref()
+                .is_none_or(|os| os.eq_ignore_ascii_case("macos"))
+        {
+            parts.push("measured nested Seatbelt write capability on macOS only".into());
         }
         if let Some(containment) = &self.containment {
             parts.push(containment.describe());
@@ -13028,8 +13039,13 @@ impl ExecutorSubstrateEvidence {
     }
 }
 
+/// `remote = "Self"` turns the derives into inherent `serialize`/`deserialize`
+/// functions, so the trait impls below wrap this one definition instead of a
+/// mirror of it. Decoding also accepts the bare `"noMatchingExecutor"` string
+/// written before that variant carried its refusals: outcomes persisted then
+/// (adopted runs' `outcome_json`) must still read back.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Self", rename_all = "camelCase")]
 pub enum CellUnavailableReason {
     Deadline {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -13065,7 +13081,12 @@ pub enum CellUnavailableReason {
     /// again; this one names a fault the next attempt cannot meet.
     SlotUnhealthy,
     ExecutorUnavailable,
-    NoMatchingExecutor,
+    /// The immutable per-machine account of the refusal, so consumers do not
+    /// mistake temporary unavailability for a structural capability gap.
+    NoMatchingExecutor {
+        #[serde(default)]
+        rejected: Vec<PlacementRefusal>,
+    },
     AdmissionRejected {
         reason: AdmissionRejectionReason,
     },
@@ -13129,6 +13150,39 @@ pub enum CellUnavailableReason {
     BuildVolumeLost {
         path: String,
     },
+}
+
+impl Serialize for CellUnavailableReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CellUnavailableReason::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CellUnavailableReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        enum Legacy {
+            NoMatchingExecutor,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Encoded {
+            Current(
+                #[serde(deserialize_with = "CellUnavailableReason::deserialize")]
+                CellUnavailableReason,
+            ),
+            Legacy(Legacy),
+        }
+        Ok(match Encoded::deserialize(deserializer)? {
+            Encoded::Current(reason) => reason,
+            Encoded::Legacy(Legacy::NoMatchingExecutor) => {
+                CellUnavailableReason::NoMatchingExecutor {
+                    rejected: Vec::new(),
+                }
+            }
+        })
+    }
 }
 
 /// What the machine holding a claimed attempt says about it, read by the runner
@@ -19179,6 +19233,12 @@ fn split_account(account: String) -> (String, Option<String>) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrolledRemote {
+    /// First observed link absence, adjusted for runner sleep by its link clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence_since_unix_ms: Option<u64>,
+    /// The rollout's expected return for a detached machine it is updating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_returns_by_unix_ms: Option<u64>,
     #[serde(default)]
     pub drain_state: ExecutorDrainState,
     /// The identity a placement pin names, which is not the display name below.
@@ -20728,6 +20788,26 @@ pub struct DrainBlocker {
     pub admission_effect: ExecutorDrainAdmissionEffect,
 }
 
+/// The part of a placement rejection that decides a terminal refusal's repair
+/// domain. Predictions and drain bookkeeping stay in the placement decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementRefusal {
+    pub executor_name: String,
+    pub executor_id: String,
+    pub reason: PlacementRejectionReason,
+}
+
+impl From<&PlacementRejection> for PlacementRefusal {
+    fn from(rejection: &PlacementRejection) -> Self {
+        Self {
+            executor_name: rejection.executor_name.clone(),
+            executor_id: rejection.executor_id.clone(),
+            reason: rejection.reason.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacementRejection {
@@ -21471,6 +21551,10 @@ pub fn describe_gib(bytes: u64) -> String {
     rename_all_fields = "camelCase"
 )]
 pub enum PlacementRejectionReason {
+    /// An enrolled machine is away within the runner's link-absence grace.
+    Reconnecting { returns_by_unix_ms: u64 },
+    /// An enrolled machine did not return within its link or update grace.
+    AbsenceExpired { absent_since_unix_ms: u64 },
     /// The link to this machine is gone.
     ConnectionClosed,
     /// The transport remains attached, but no message has crossed it within the
@@ -21767,6 +21851,14 @@ impl PlacementRejectionReason {
     /// A single line an operator can act on, for the readable surfaces.
     pub fn describe(&self) -> String {
         match self {
+            Self::Reconnecting { returns_by_unix_ms } => format!(
+                "absent: reconnecting; waiting for its return by {}",
+                describe_clock(*returns_by_unix_ms)
+            ),
+            Self::AbsenceExpired { absent_since_unix_ms } => format!(
+                "absent since {}; its bounded return grace has expired",
+                describe_clock(*absent_since_unix_ms)
+            ),
             Self::ConnectionClosed => "connection closed".into(),
             Self::ConnectionStale {
                 silence_ms,
@@ -24377,6 +24469,83 @@ mod tests {
     }
 
     #[test]
+    fn no_matching_executor_preserves_typed_refusal_reasons() {
+        let reason = CellUnavailableReason::NoMatchingExecutor {
+            rejected: vec![
+                PlacementRefusal {
+                    executor_id: "builder".into(),
+                    executor_name: "builder".into(),
+                    reason: PlacementRejectionReason::TelemetryStale {
+                        measurement: MachineMeasurement::Cpu,
+                        age_ms: 100_000,
+                        stale_after_ms: 90_000,
+                    },
+                },
+                PlacementRefusal {
+                    executor_id: "drained".into(),
+                    executor_name: "drained".into(),
+                    reason: PlacementRejectionReason::Drained,
+                },
+            ],
+        };
+        let value = serde_json::to_value(&reason).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CellUnavailableReason>(value).unwrap(),
+            reason
+        );
+    }
+
+    /// An outcome persisted before `NoMatchingExecutor` carried its refusals
+    /// stored the reason as a bare string; it still decodes, as a refusal
+    /// with no per-machine account, and every other reason is unchanged.
+    #[test]
+    fn a_legacy_unit_no_matching_executor_outcome_still_decodes() {
+        let stored = r#"{"status":"unavailable","reason":"noMatchingExecutor","diagnostic":"no executor advertises toolchain matlab"}"#;
+        let CellOutcome::Unavailable { reason, diagnostic } =
+            serde_json::from_str::<CellOutcome>(stored).unwrap()
+        else {
+            panic!("a stored unavailable outcome decodes as one");
+        };
+        assert_eq!(
+            reason,
+            CellUnavailableReason::NoMatchingExecutor {
+                rejected: Vec::new()
+            }
+        );
+        assert_eq!(diagnostic, "no executor advertises toolchain matlab");
+
+        let current = CellUnavailableReason::NoMatchingExecutor {
+            rejected: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::json!({"noMatchingExecutor": {"rejected": []}}),
+            "new outcomes are written in the typed form only"
+        );
+        for (encoded, expected) in [
+            (r#""provisioning""#, CellUnavailableReason::Provisioning),
+            (
+                r#"{"buildVolumeAbsent":{"path":"/cells"}}"#,
+                CellUnavailableReason::BuildVolumeAbsent {
+                    path: "/cells".into(),
+                },
+            ),
+            (
+                r#"{"noMatchingExecutor":{}}"#,
+                CellUnavailableReason::NoMatchingExecutor {
+                    rejected: Vec::new(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<CellUnavailableReason>(encoded).unwrap(),
+                expected
+            );
+        }
+        assert!(serde_json::from_str::<CellUnavailableReason>(r#""nonsense""#).is_err());
+    }
+
+    #[test]
     fn memory_diagnostic_evidence_and_controls_round_trip_without_changing_absence() {
         let attach = MemoryDiagnosticAttach {
             run_id: "registered".into(),
@@ -26946,6 +27115,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selector_wording_limits_seatbelt_to_macos() {
+        let mut selector = ExecutorSelector {
+            requires_macos_nested_sandbox_write: true,
+            os: Some("linux".into()),
+            ..ExecutorSelector::default()
+        };
+        assert_eq!(selector.describe(), "os linux");
+        selector.os = None;
+        assert!(selector.describe().contains("on macOS only"));
+        selector.os = Some("macos".into());
+        assert!(selector.describe().contains("on macOS only"));
+    }
+
     /// Probe evidence is additive, not a wire boundary. An executor built before
     /// it existed omits the key, and that has to decode as "this peer cannot
     /// explain itself" rather than failing the whole advertisement — the entire
@@ -27994,6 +28177,8 @@ mod tests {
                     role: Default::default(),
                     stranded: None,
                     unreturned_update: None,
+                    absence_since_unix_ms: None,
+                    update_returns_by_unix_ms: None,
                 },
                 EnrolledRemote {
                     drain_state: Default::default(),
@@ -28019,6 +28204,8 @@ mod tests {
                     role: Default::default(),
                     stranded: None,
                     unreturned_update: None,
+                    absence_since_unix_ms: None,
+                    update_returns_by_unix_ms: None,
                 },
                 EnrolledRemote {
                     drain_state: Default::default(),
@@ -28037,6 +28224,8 @@ mod tests {
                     role: Default::default(),
                     stranded: None,
                     unreturned_update: None,
+                    absence_since_unix_ms: None,
+                    update_returns_by_unix_ms: None,
                 },
             ],
             compile_cache: Some(CompileCacheHealth {
@@ -28740,6 +28929,8 @@ mod tests {
                 role: Default::default(),
                 stranded: None,
                 unreturned_update: None,
+                absence_since_unix_ms: None,
+                update_returns_by_unix_ms: None,
             }],
             status: SubstrateHealthStatus::Degraded,
             warming_up: false,

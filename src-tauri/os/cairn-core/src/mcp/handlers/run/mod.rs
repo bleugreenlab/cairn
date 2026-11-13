@@ -10985,7 +10985,9 @@ mod refusal_under_default_tests {
             cleared: None,
         };
         let drained = CellOutcome::Unavailable {
-            reason: cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor,
+            reason: cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor {
+                rejected: Vec::new(),
+            },
             diagnostic: "bbs is drained by an operator, so the runner is refusing new work there"
                 .into(),
         };
@@ -11983,7 +11985,10 @@ mod tests {
         assert!(failed.contains("Ran on **bgsrv-ub** (linux)."), "{failed}");
         let refused = settled_failure_text(
             &CellOutcome::Unavailable {
-                reason: cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor,
+                reason:
+                    cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor {
+                        rejected: Vec::new(),
+                    },
                 diagnostic: "no executor named fedora is enrolled".into(),
             },
             None,

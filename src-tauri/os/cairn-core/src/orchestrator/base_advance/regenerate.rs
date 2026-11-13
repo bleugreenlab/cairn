@@ -1767,6 +1767,7 @@ async fn run_in_fleet(orch: &Orchestrator, job: &RegenerationJob) -> BatchOutcom
             status_board: None,
             on_group_complete: None,
             purpose: None,
+            publication: None,
         },
     )
     .await;

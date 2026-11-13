@@ -10430,6 +10430,8 @@ mod tests {
             role: Default::default(),
             stranded: None,
             unreturned_update: None,
+            absence_since_unix_ms: None,
+            update_returns_by_unix_ms: None,
         }
     }
 

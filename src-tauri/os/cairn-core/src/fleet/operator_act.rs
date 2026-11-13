@@ -31,6 +31,7 @@ pub(super) fn operator_act_request(act: &OperatorAct) -> CellRequest {
             absolute_path: act.repository().to_string(),
         },
         base_commit: frozen.commit.clone(),
+        publication: None,
         command_class: CellCommandClass::classify(&frozen.command),
         placement_work_class: PlacementWorkClass::AgentSessions,
         command: frozen.command.clone(),
