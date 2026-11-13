@@ -8274,6 +8274,13 @@ pub struct LearnedResourceEstimate {
 /// metadata in `fleet/mod.rs` now names `build_job_processes: None`, which an
 /// adopted tree never measured. What a runner gets wrong talking to an older
 /// executor: nothing.
+///
+/// cairn/7099 does not move the number. Both peers now write link frames
+/// through `encode_executor_message`, and the runner reads them through
+/// `decode_executor_message`; both call the same derives as before, and the
+/// runner's tag-first decode of snapshot frames moved here unchanged. No byte
+/// on the wire changes. What a runner gets wrong talking to an older
+/// executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -23899,6 +23906,88 @@ pub enum RunnerCallbackResult {
     Failed { diagnostic: String },
 }
 
+// The executor link's text codec. Both peers write link frames, and the runner
+// reads them, through these functions rather than through `serde_json` at each
+// call site: release builds share no generic instances across crates, so a
+// `from_str::<ExecutorMessage>` in another crate compiles the whole message
+// decoder again there (about 1.3M lines of LLVM IR in cairn-transport). Being
+// non-generic and never inlined, each is compiled once, here. The wire shape is
+// the derives on the types; nothing here changes it. The executor reads with the
+// plain derive instead: it never receives a snapshot frame, and the direct
+// snapshot decode would add a second copy of those deserializers to its binary.
+
+#[derive(Deserialize)]
+struct ExecutorMessageTag {
+    #[serde(rename = "type")]
+    message_type: String,
+}
+
+#[derive(Deserialize)]
+struct SnapshotUpdatedFrame {
+    snapshot: FleetSnapshot,
+    health: ExecutorSubstrateReport,
+}
+
+#[derive(Deserialize)]
+struct SnapshotResponseFrame {
+    correlation_id: String,
+    snapshot: FleetSnapshot,
+    health: ExecutorSubstrateReport,
+}
+
+/// The `type` tag of an executor-link frame, read without decoding the rest.
+#[inline(never)]
+pub fn executor_message_type(text: &str) -> Result<String, serde_json::Error> {
+    serde_json::from_str::<ExecutorMessageTag>(text).map(|tag| tag.message_type)
+}
+
+/// Decode one executor-link frame.
+///
+/// `ExecutorMessage` is internally tagged. Serde must otherwise materialize a
+/// `Content` tree for the complete frame before it can choose the enum variant.
+/// Fleet snapshots can contain every physical process identity on a busy host,
+/// so that temporary tree multiplies both allocations and peak RSS. Reading the
+/// small tag first and decoding the two large variants directly keeps memory
+/// proportional to the final snapshot while preserving the established wire
+/// shape for every message.
+#[inline(never)]
+pub fn decode_executor_message(text: &str) -> Result<ExecutorMessage, serde_json::Error> {
+    decode_executor_message_tagged(text, &executor_message_type(text)?)
+}
+
+/// [`decode_executor_message`] for a caller that has already read the frame's
+/// tag with [`executor_message_type`].
+#[inline(never)]
+pub fn decode_executor_message_tagged(
+    text: &str,
+    message_type: &str,
+) -> Result<ExecutorMessage, serde_json::Error> {
+    match message_type {
+        "snapshotUpdated" => {
+            let frame = serde_json::from_str::<SnapshotUpdatedFrame>(text)?;
+            Ok(ExecutorMessage::SnapshotUpdated {
+                snapshot: frame.snapshot,
+                health: frame.health,
+            })
+        }
+        "snapshotResponse" => {
+            let frame = serde_json::from_str::<SnapshotResponseFrame>(text)?;
+            Ok(ExecutorMessage::SnapshotResponse {
+                correlation_id: frame.correlation_id,
+                snapshot: frame.snapshot,
+                health: frame.health,
+            })
+        }
+        _ => serde_json::from_str(text),
+    }
+}
+
+/// Encode one executor-link frame.
+#[inline(never)]
+pub fn encode_executor_message(message: &ExecutorMessage) -> Result<String, serde_json::Error> {
+    serde_json::to_string(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -24699,13 +24788,14 @@ mod tests {
         assert_eq!(shared.granted_units, 1);
     }
 
-    #[test]
-    fn every_message_variant_round_trips() {
+    /// One or more frames of every `ExecutorMessage` variant;
+    /// [`message_variant_ordinal`] is what keeps it complete.
+    fn every_message_variant() -> Vec<ExecutorMessage> {
         let request = sample_request();
         let outcome = sample_outcome();
         let snapshot = FleetSnapshot::default();
         let advertisement = sample_advertisement();
-        let messages = vec![
+        vec![
             ExecutorMessage::Hello {
                 protocol_version: EXECUTOR_PROTOCOL_VERSION,
                 advertisement: advertisement.clone(),
@@ -25141,12 +25231,202 @@ mod tests {
             ExecutorMessage::InfrastructureDiagnostic {
                 diagnostic: "lost".into(),
             },
-        ];
+            ExecutorMessage::WaitingRequests {
+                request_ids: vec!["r1".into(), "r2".into()],
+            },
+            ExecutorMessage::WaitingRequests {
+                request_ids: Vec::new(),
+            },
+            ExecutorMessage::UpdateDirected {
+                manifest_url: EXECUTOR_ARTIFACT_MANIFEST_PATH.into(),
+                build_id: "content-v2:build".into(),
+            },
+            ExecutorMessage::MemoryDiagnosticRequest {
+                correlation_id: "detach".into(),
+                expected_generation: 7,
+                attach: None,
+            },
+            ExecutorMessage::MemoryDiagnosticResponse {
+                correlation_id: "detach".into(),
+                result: Err("not registered".into()),
+            },
+            ExecutorMessage::ProcessTreeAdoptionRequest {
+                correlation_id: "release".into(),
+                expected_generation: 3,
+                change: ProcessTreeAdoptionChange::Release {
+                    key: "rebuild:attempt".into(),
+                },
+            },
+            ExecutorMessage::ProcessTreeAdoptionResponse {
+                correlation_id: "refused".into(),
+                result: Err("no live process 42".into()),
+            },
+            ExecutorMessage::ResultAck {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+            },
+            ExecutorMessage::ReauthorizeTransfers {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+            },
+            ExecutorMessage::TransfersReauthorized {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+                transfers: Vec::new(),
+            },
+            ExecutorMessage::DeleteNodeScratch {
+                scratch_id: "scratch".into(),
+            },
+            ExecutorMessage::NodeScratchDeleted {
+                scratch_id: "scratch".into(),
+            },
+        ]
+    }
+
+    /// Every variant, by position. No wildcard arm, so a new variant does not
+    /// compile here until it is counted, and `every_message_variant` is held
+    /// to it by the tests below.
+    const MESSAGE_VARIANTS: usize = 56;
+    fn message_variant_ordinal(message: &ExecutorMessage) -> usize {
+        use ExecutorMessage::*;
+        match message {
+            Hello { .. } => 0,
+            Ready { .. } => 1,
+            ObjectChannelUpdated { .. } => 2,
+            EnrollmentCredentialUpdated { .. } => 3,
+            EnrollmentCredentialAccepted { .. } => 4,
+            EnrollmentRejected { .. } => 5,
+            Heartbeat { .. } => 6,
+            MachineSampled { .. } => 7,
+            WaitingRequests { .. } => 8,
+            AdvertisementUpdated { .. } => 9,
+            WarmRootsChanged { .. } => 10,
+            WarmRootsRequest { .. } => 11,
+            ListenerUpdated { .. } => 12,
+            ListenerAccepted { .. } => 13,
+            ProtocolIncompatible { .. } => 14,
+            UpdateDirected { .. } => 15,
+            MemoryDiagnosticRequest { .. } => 16,
+            MemoryDiagnosticResponse { .. } => 17,
+            RuntimePolicyRequest { .. } => 18,
+            RuntimePolicyResponse { .. } => 19,
+            DrainModeRequest { .. } => 20,
+            DrainModeResponse { .. } => 21,
+            ProcessTreeAdoptionRequest { .. } => 22,
+            ProcessTreeAdoptionResponse { .. } => 23,
+            Offer { .. } => 24,
+            Claim { .. } => 25,
+            Decline { .. } => 26,
+            Granted { .. } => 27,
+            Lost { .. } => 28,
+            Result { .. } => 29,
+            ResultAck { .. } => 30,
+            ReauthorizeTransfers { .. } => 31,
+            TransfersReauthorized { .. } => 32,
+            CellOutput { .. } => 33,
+            Cancel { .. } => 34,
+            CancelJob { .. } => 35,
+            DeleteNodeScratch { .. } => 36,
+            NodeScratchDeleted { .. } => 37,
+            DeploymentCommand { .. } => 38,
+            DeploymentReport { .. } => 39,
+            ResidencyRequest { .. } => 40,
+            ResidencyResponse { .. } => 41,
+            ResidentProcessEvent { .. } => 42,
+            MaterializationReadRequest { .. } => 43,
+            MaterializationReadResponse { .. } => 44,
+            SnapshotRequest { .. } => 45,
+            SnapshotResponse { .. } => 46,
+            SnapshotUpdated { .. } => 47,
+            Shutdown { .. } => 48,
+            CallbackRequest { .. } => 49,
+            CallbackResponse { .. } => 50,
+            McpRelayRequest { .. } => 51,
+            McpRelayResponse { .. } => 52,
+            ResidentRelayRequest { .. } => 53,
+            RelayReattach { .. } => 54,
+            InfrastructureDiagnostic { .. } => 55,
+        }
+    }
+
+    #[test]
+    fn every_message_variant_round_trips() {
+        let messages = every_message_variant();
+        let covered: std::collections::BTreeSet<usize> =
+            messages.iter().map(message_variant_ordinal).collect();
+        let missing: Vec<usize> = (0..MESSAGE_VARIANTS)
+            .filter(|ordinal| !covered.contains(ordinal))
+            .collect();
+        assert!(missing.is_empty(), "variants without a frame: {missing:?}");
         for message in messages {
             let json = serde_json::to_string(&message).unwrap();
             assert_eq!(
                 serde_json::from_str::<ExecutorMessage>(&json).unwrap(),
                 message
+            );
+        }
+    }
+
+    /// The link codec writes exactly what the derive writes and reads every
+    /// variant exactly as the derived decoder does, including the two snapshot
+    /// frames it decodes directly.
+    #[test]
+    fn link_codec_decodes_every_frame_as_the_derived_decoder_does() {
+        for message in every_message_variant() {
+            let wire = encode_executor_message(&message).unwrap();
+            assert_eq!(wire, serde_json::to_string(&message).unwrap());
+            let plain = serde_json::from_str::<ExecutorMessage>(&wire).unwrap();
+            assert_eq!(decode_executor_message(&wire).unwrap(), plain);
+            assert_eq!(
+                decode_executor_message_tagged(&wire, &executor_message_type(&wire).unwrap())
+                    .unwrap(),
+                plain
+            );
+            assert_eq!(plain, message);
+        }
+    }
+
+    /// An unreadable frame fails through the codec in the same error class as
+    /// through the derived decoder: the runner's refusal of a mixed-version peer
+    /// and its drop of one bad frame both read that class.
+    #[test]
+    fn link_codec_fails_unreadable_frames_as_the_derived_decoder_does() {
+        let snapshot = serde_json::to_string(&ExecutorMessage::SnapshotUpdated {
+            snapshot: FleetSnapshot::default(),
+            health: ExecutorSubstrateReport::default(),
+        })
+        .unwrap();
+        let response = serde_json::to_string(&ExecutorMessage::SnapshotResponse {
+            correlation_id: "snapshot-1".into(),
+            snapshot: FleetSnapshot::default(),
+            health: ExecutorSubstrateReport::default(),
+        })
+        .unwrap();
+        let ordinary = serde_json::to_string(&ExecutorMessage::ResultAck {
+            request_id: "r".into(),
+            attempt_id: "a".into(),
+        })
+        .unwrap();
+        let frames = [
+            r#"{"type":"noSuchFrame","correlation_id":"x"}"#.to_string(),
+            r#"{"correlation_id":"x"}"#.to_string(),
+            r#"{"type":5}"#.to_string(),
+            r#"{"type":"snapshotUpdated","snapshot":5}"#.to_string(),
+            r#"{"type":"snapshotResponse","snapshot":{},"health":{}}"#.to_string(),
+            snapshot[..snapshot.len() / 2].to_string(),
+            response[..response.len() - 1].to_string(),
+            ordinary[..ordinary.len() / 2].to_string(),
+            "not json".to_string(),
+            String::new(),
+        ];
+        for frame in frames {
+            let plain = serde_json::from_str::<ExecutorMessage>(&frame)
+                .expect_err("the derived decoder refuses the frame");
+            let codec = decode_executor_message(&frame).expect_err("the codec refuses the frame");
+            assert_eq!(
+                codec.classify(),
+                plain.classify(),
+                "frame {frame:?}: {codec} vs {plain}"
             );
         }
     }
