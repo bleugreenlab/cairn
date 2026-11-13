@@ -464,6 +464,7 @@ mod tests {
             ("claude-opus-4-7", "claude-opus-4.7"),
             ("claude-sonnet-4-6", "claude-sonnet-4.6"),
             ("claude-fable-5-1", "claude-fable-5.1"),
+            ("claude-fable-5-2", "claude-fable-5.2"),
             ("claude-haiku-4-5-20251001", "claude-haiku-4.5"),
             ("claude-opus-4-20250514", "claude-opus-4"),
             ("claude-opus-4-1-20250805", "claude-opus-4.1"),

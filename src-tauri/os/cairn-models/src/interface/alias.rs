@@ -232,6 +232,17 @@ mod tests {
     }
 
     #[test]
+    fn fable_identifies_as_each_generation_the_cli_has_run_it_as() {
+        for (reported, canonical) in [
+            ("claude-fable-5-1", "claude-fable-5.1"),
+            ("claude-fable-5-2", "claude-fable-5.2"),
+        ] {
+            let resolution = observation("fable", reported, OBSERVED);
+            assert_eq!(resolution.canonical_at(OBSERVED), Some(canonical));
+        }
+    }
+
+    #[test]
     fn unrecognized_or_forged_targets_never_identify_an_alias() {
         for reported in [
             "claude-opus-99-7",

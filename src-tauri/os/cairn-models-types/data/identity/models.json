@@ -30,6 +30,7 @@
     {"id": "claude-2", "maker": "anthropic"},
     {"id": "claude-fable-5", "maker": "anthropic"},
     {"id": "claude-fable-5.1", "maker": "anthropic"},
+    {"id": "claude-fable-5.2", "maker": "anthropic"},
     {"id": "claude-haiku-3", "maker": "anthropic"},
     {"id": "claude-haiku-3.5", "maker": "anthropic"},
     {"id": "claude-haiku-4.5", "maker": "anthropic"},

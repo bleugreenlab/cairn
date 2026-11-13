@@ -57,7 +57,7 @@
 use cairn_models_types::identity;
 
 /// Date the price table was last reviewed against public list prices.
-pub(crate) const PRICE_SOURCE_DATE: &str = "2026-11-07";
+pub(crate) const PRICE_SOURCE_DATE: &str = "2026-11-12";
 
 /// Prompt length (input + cache reads + cache writes) above which a request
 /// is billed at a model's [`ModelPrice::above_long_prompt`] tier. A prompt of
@@ -203,6 +203,7 @@ impl ModelPrice {
 // Claude list prices: https://platform.claude.com/docs/en/about-claude/pricing
 const FABLE: ModelPrice = ModelPrice::new(10.0, 1.0, 12.50, 50.0); // Fable 5
 const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 0.25, 12.50, 50.0);
+const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 0.20, 10.0, 40.0);
 const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 0.20, 5.0, 20.0);
 const OPUS_4_5: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 25.0); // Opus 4.5 to 5
 const OPUS_LEGACY: ModelPrice = ModelPrice::new(15.0, 1.50, 18.75, 75.0); // Opus 4 / 4.1
@@ -236,7 +237,7 @@ pub(crate) const ALIAS_GENERATIONS: [(&str, &str); 4] = [
     ("haiku", "claude-haiku-5-5"),
     ("sonnet", "claude-sonnet-5-5"),
     ("opus", "claude-opus-5-5"),
-    ("fable", "claude-fable-5-1"),
+    ("fable", "claude-fable-5-2"),
 ];
 
 // Historical fallback corrections, reviewed 2026-11-07:
@@ -258,6 +259,7 @@ const GPT_6_1_TERRA: ModelPrice = ModelPrice::new(1.0, 0.05, 1.25, 5.0);
 const PRICES: &[(&str, ModelPrice)] = &[
     ("claude-fable-5", FABLE),
     ("claude-fable-5.1", FABLE_5_1),
+    ("claude-fable-5.2", FABLE_5_2),
     ("claude-opus-5.5", OPUS_5_5),
     ("claude-opus-4.5", OPUS_4_5),
     ("claude-opus-4.6", OPUS_4_5),
@@ -400,7 +402,12 @@ mod tests {
 
     #[test]
     fn bare_aliases_price_as_the_generation_the_cli_resolves_them_to() {
-        assert_eq!(price_for("claude", Some("fable")), Some(FABLE_5_1));
+        assert_eq!(price_for("claude", Some("fable")), Some(FABLE_5_2));
+        assert_eq!(
+            price_for("claude", Some("claude-fable-5-2")),
+            Some(FABLE_5_2)
+        );
+        // The previous generation keeps its own price when named explicitly.
         assert_eq!(
             price_for("claude", Some("claude-fable-5-1")),
             Some(FABLE_5_1)
@@ -588,7 +595,7 @@ mod tests {
         for (backend, model, expected) in [
             ("claude", "opus", Some(OPUS_5_5)),
             ("claude", "haiku", Some(HAIKU_5_5)),
-            ("claude", "fable", Some(FABLE_5_1)),
+            ("claude", "fable", Some(FABLE_5_2)),
             ("claude", "sonnet", Some(SONNET_5_5)),
             ("codex", "gpt-5.6-sol", Some(GPT_5_6_SOL)),
             ("codex", "gpt-6-astra", Some(GPT_6_ASTRA)),
@@ -622,6 +629,7 @@ mod tests {
             ("claude-3-5-haiku-20241022", (0.80, 0.08, 1.0, 4.0)),
             ("gpt-6.1-terra", (1.0, 0.05, 1.25, 5.0)),
             ("gpt-5.3-codex", (1.75, 0.175, 1.75, 14.0)),
+            ("claude-fable-5-2", (8.0, 0.20, 10.0, 40.0)),
             ("claude-fable-5-1", (10.0, 0.25, 12.50, 50.0)),
             ("claude-fable-5", (10.0, 1.0, 12.50, 50.0)),
             ("claude-opus-5-5", (4.0, 0.20, 5.0, 20.0)),

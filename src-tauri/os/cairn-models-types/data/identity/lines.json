@@ -1,7 +1,7 @@
 {
   "notes": "Each line lists the releases of one product, oldest first. A newer release of a line is taken to be at least as capable as an older one, so the benchmarks place the releases of a line only in this order (benchmarks.rs); that is an assumption imposed on the data, not something the benchmarks measured. Variants that differ in size, tier or specialization (-mini, -flash, -pro, -codex) are lines of their own, every release of a line has one maker, and a release whose place in the order is not certain (a preview, a dated snapshot of uncertain lineage) is left out.",
   "lines": {
-    "claude-fable": ["claude-fable-5", "claude-fable-5.1"],
+    "claude-fable": ["claude-fable-5", "claude-fable-5.1", "claude-fable-5.2"],
     "claude-haiku": ["claude-haiku-3", "claude-haiku-3.5", "claude-haiku-4.5"],
     "claude-opus": ["claude-opus-3", "claude-opus-4", "claude-opus-4.1", "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-opus-5", "claude-opus-5.5"],
     "claude-sonnet": ["claude-sonnet-3", "claude-sonnet-3.5-20240620", "claude-sonnet-3.5-v2", "claude-sonnet-3.7", "claude-sonnet-4", "claude-sonnet-4.5", "claude-sonnet-4.6", "claude-sonnet-5"],
