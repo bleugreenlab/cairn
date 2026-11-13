@@ -826,6 +826,7 @@ impl IMessageProvider {
                 "reply_to_guid",
             ],
         );
+        let message_guid = string_at(&value, &["guid"]);
         Ok(Some((
             rowid,
             match bound_guid {
@@ -834,11 +835,13 @@ impl IMessageProvider {
                     bound_guid,
                     sender,
                     text,
+                    message_guid,
                 },
                 None => InboundEvent::Bare {
                     conversation: format!("imessage:{sender}"),
                     sender,
                     text,
+                    message_guid,
                 },
             },
         )))
@@ -1029,27 +1032,37 @@ impl IMessageProvider {
             .await
     }
 
+    /// Sends through the IMCore bridge (`send-rich`) when it is ready and the
+    /// text has formatting or replies to `reply_to`, a message guid; otherwise
+    /// as plain `send`, which can neither format nor reply.
     async fn send_rendered(
         &self,
         conversation: &str,
         rendered: &RenderedText,
+        reply_to: Option<&str>,
     ) -> Result<SentIds, String> {
-        if !rendered.formats.is_empty() && self.rich_text_ready.load(Ordering::Acquire) {
+        let wants_rich = !rendered.formats.is_empty() || reply_to.is_some();
+        if wants_rich && self.rich_text_ready.load(Ordering::Acquire) {
             if let Some(chat) = self.resolve_chat(conversation).await {
-                let output = self
-                    .executor
-                    .run(vec![
-                        "send-rich".into(),
-                        "--json".into(),
-                        "--chat".into(),
-                        chat.guid,
-                        "--text".into(),
-                        rendered.text.clone(),
+                let mut args = vec![
+                    "send-rich".into(),
+                    "--json".into(),
+                    "--chat".into(),
+                    chat.guid,
+                    "--text".into(),
+                    rendered.text.clone(),
+                ];
+                if !rendered.formats.is_empty() {
+                    args.extend([
                         "--format".into(),
                         serde_json::to_string(&rendered.formats)
                             .map_err(|error| error.to_string())?,
-                    ])
-                    .await?;
+                    ]);
+                }
+                if let Some(guid) = reply_to {
+                    args.extend(["--reply-to".into(), guid.into()]);
+                }
+                let output = self.executor.run(args).await?;
                 return self
                     .sent_ids_or_history(conversation, &rendered.text, &output.stdout)
                     .await;
@@ -1098,6 +1111,8 @@ impl ChannelProvider for IMessageProvider {
             open_options: ready,
             edit_in_place: ready,
             max_text_len: None,
+            // Only the IMCore bridge's `send-rich --reply-to` replies natively.
+            native_reply: self.rich_text_ready.load(Ordering::Acquire),
         }
     }
 
@@ -1165,7 +1180,12 @@ impl ChannelProvider for IMessageProvider {
                 }
             }
         }
-        self.send_rendered(&message.conversation, &rendered).await
+        self.send_rendered(
+            &message.conversation,
+            &rendered,
+            message.reply_to.as_deref(),
+        )
+        .await
     }
 
     fn subscribe(&self) -> mpsc::Receiver<InboundEvent> {
@@ -1661,6 +1681,7 @@ mod tests {
             conversation: "+15551234567".into(),
             initiated_by: crate::channels::OutboundInitiator::CairnPush,
             context_header: "[cairn-3373 · builder]".into(),
+            reply_to: None,
             ask: OutboundAsk::Question {
                 prompt_id: "p".into(),
                 question_index: 0,
@@ -1756,6 +1777,54 @@ mod tests {
         assert!(calls[1]
             .windows(2)
             .any(|pair| { pair == ["--text", "Bold and inline_code\n\n- cairn://p/cairn/3550"] }));
+    }
+
+    /// A reply goes through the bridge with `--reply-to`, even for plain text,
+    /// and the provider says it replies natively only while the bridge is ready.
+    #[tokio::test]
+    async fn a_reply_rides_send_rich_with_its_original_guid() {
+        let fake = Arc::new(FakeExecutor::new([
+            status_with(|_| {}).as_str(),
+            REAL_CHATS,
+            r#"{"guid":"reply-guid"}"#,
+        ]));
+        let provider = IMessageProvider::new(fake.clone(), vec![]);
+        assert!(!provider.capabilities().native_reply);
+        provider.refresh_health().await;
+        assert!(provider.capabilities().native_reply);
+        let mut message = message();
+        message.context_header.clear();
+        message.ask = OutboundAsk::Notify {
+            text: "plain text".into(),
+        };
+        message.reply_to = Some("ORIGINAL-GUID".into());
+
+        provider.send(&message).await.unwrap();
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls[2][0], "send-rich");
+        assert!(calls[2]
+            .windows(2)
+            .any(|pair| pair == ["--reply-to", "ORIGINAL-GUID"]));
+        assert!(!calls[2].iter().any(|arg| arg == "--format"));
+    }
+
+    #[tokio::test]
+    async fn an_inbound_message_carries_its_own_guid() {
+        let provider = IMessageProvider::new(
+            Arc::new(FakeExecutor::new(Vec::<String>::new())),
+            vec!["+15551234567".into()],
+        );
+        let (_, event) = provider
+            .ingest_watch_line(
+                r#"{"rowid":7,"guid":"IN-GUID","sender":"+15551234567","text":"hello"}"#,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&event, InboundEvent::Bare { message_guid: Some(guid), .. } if guid == "IN-GUID"),
+            "{event:?}"
+        );
     }
 
     #[tokio::test]

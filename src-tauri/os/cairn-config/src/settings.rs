@@ -2099,7 +2099,15 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
         // Zero clears the ceiling, returning the lane to measured memory alone.
         current.private_dedicated_process_capacity = (value > 0).then_some(value);
     }
-    if let Some(value) = input.channels {
+    if let Some(mut value) = input.channels {
+        // `purpose` has one writer, the operator's `cairn://channels` patch
+        // (`set_purpose`). A general save carries the settings panel's whole
+        // `channels` snapshot, so without this a purpose set after the panel
+        // loaded would be restored to the stale value by the next toggle.
+        value.app.purpose = current.channels.app.purpose.take();
+        value.imessage.purpose = current.channels.imessage.purpose.take();
+        value.telegram.purpose = current.channels.telegram.purpose.take();
+        value.discord.purpose = current.channels.discord.purpose.take();
         current.channels = value;
     }
 }
@@ -3010,6 +3018,40 @@ buildServices:
             load_settings_file(dir).unwrap().log_level,
             Some(LogLevel::Verbose)
         );
+    }
+
+    #[test]
+    fn channel_purposes_survive_a_general_save_of_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = test_settings();
+        settings.channels.discord.purpose = Some("ops pages".into());
+        settings.channels.telegram.purpose = Some("urgent: my phone".into());
+        settings.channels.app.purpose = Some("everything else".into());
+        save_settings(dir.path(), &settings).unwrap();
+
+        // The panel's snapshot predates every purpose: one stale, the rest absent.
+        let mut snapshot = test_settings().channels;
+        snapshot.discord.enabled = true;
+        snapshot.discord.purpose = Some("stale".into());
+        update_settings(
+            dir.path(),
+            UpdateSettings {
+                channels: Some(snapshot),
+                ..UpdateSettings::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+
+        let channels = load_settings(dir.path()).channels;
+        assert!(channels.discord.enabled, "the toggle itself still lands");
+        assert_eq!(channels.discord.purpose.as_deref(), Some("ops pages"));
+        assert_eq!(
+            channels.telegram.purpose.as_deref(),
+            Some("urgent: my phone")
+        );
+        assert_eq!(channels.app.purpose.as_deref(), Some("everything else"));
+        assert_eq!(channels.imessage.purpose, None);
     }
 
     #[test]

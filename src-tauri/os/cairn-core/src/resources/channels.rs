@@ -15,6 +15,7 @@ use crate::{
 use cairn_common::query::QueryParam;
 use cairn_uri::{parse_uri, CairnResource};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// The provider runtime state that is fully up.
 const RUNTIME_UP: &str = "bridgeUp";
@@ -213,6 +214,7 @@ fn row_for_status(
     detail: Option<String>,
     last_error: Option<String>,
     failed_count: i64,
+    title: Option<&str>,
 ) -> ConversationRow {
     let deliverability = if state == RUNTIME_UP {
         if last_error.is_some() {
@@ -228,7 +230,13 @@ fn row_for_status(
     let conversation = address.to_string();
     let provider = address.provider();
     ConversationRow {
-        label: label::conversation_label(provider, &conversation, Some(binding), Some(&target)),
+        label: label::conversation_label(
+            provider,
+            &conversation,
+            Some(binding),
+            Some(&target),
+            title,
+        ),
         uri: label::conversation_uri(provider, &conversation, Some(binding), Some(&target)),
         binding: binding.to_string(),
         address: conversation,
@@ -265,8 +273,14 @@ pub async fn configured_conversations(orch: &Orchestrator) -> Vec<ConversationRo
         Ok(bindings) => bindings,
         Err(_) => return vec![],
     };
+    let titles = if channels.telegram.enabled {
+        conversation_titles(&bindings, ConversationProvider::Telegram).await
+    } else {
+        HashMap::new()
+    };
     conversation_rows(
         bindings,
+        &titles,
         |provider| match provider {
             ConversationProvider::IMessage => channels.imessage.enabled,
             ConversationProvider::Telegram => channels.telegram.enabled,
@@ -285,12 +299,42 @@ pub async fn configured_conversations(orch: &Orchestrator) -> Vec<ConversationRo
     .await
 }
 
+/// The provider's own title for each distinct conversation `provider` is bound
+/// to, keyed by address: one lookup per chat, each cached by `titles`.
+async fn conversation_titles(
+    bindings: &[ledger::ActiveBinding],
+    provider: ConversationProvider,
+) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    let mut asked = std::collections::HashSet::new();
+    for binding in bindings
+        .iter()
+        .filter(|binding| binding.provider == provider.id())
+    {
+        let Ok(address) = binding.conversation.parse::<ConversationAddress>() else {
+            continue;
+        };
+        let conversation = address.to_string();
+        if is_placeholder(&address) || !asked.insert(conversation.clone()) {
+            continue;
+        }
+        if let Some(title) =
+            crate::channels::titles::conversation_title(provider, &conversation).await
+        {
+            titles.insert(conversation, title);
+        }
+    }
+    titles
+}
+
 /// Project active bindings onto conversation rows. A provider's status depends
 /// only on the provider, and reading it costs several database queries, so it is
 /// looked up once per enabled provider and shared by all of that provider's
 /// rows -- Discord alone carries a structural binding per issue thread.
+/// `titles` holds the provider's own name for a conversation, by address.
 async fn conversation_rows<Status, StatusFuture>(
     bindings: Vec<ledger::ActiveBinding>,
+    titles: &HashMap<String, String>,
     enabled: impl Fn(ConversationProvider) -> bool,
     mut status_of: Status,
 ) -> Vec<ConversationRow>
@@ -320,16 +364,20 @@ where
         };
         let ambient = binding.binding_kind == BindingKind::Ambient.as_str();
         match binding.conversation.parse::<ConversationAddress>() {
-            Ok(address) => rows.push(row_for_status(
-                address,
-                binding.target_uri,
-                binding.message_classes,
-                &binding.binding_kind,
-                status.state,
-                status.detail,
-                status.last_send_error,
-                status.failed_count,
-            )),
+            Ok(address) => {
+                let title = titles.get(&address.to_string()).map(String::as_str);
+                rows.push(row_for_status(
+                    address,
+                    binding.target_uri,
+                    binding.message_classes,
+                    &binding.binding_kind,
+                    status.state,
+                    status.detail,
+                    status.last_send_error,
+                    status.failed_count,
+                    title,
+                ))
+            }
             Err(error) => rows.push(ConversationRow {
                 address: binding.conversation,
                 label: format!("invalid configuration · {}", provider.display_name()),
@@ -932,12 +980,13 @@ fn channels_target(target: &str) -> Result<(CairnResource, Vec<QueryParam>), Str
                 CairnResource::Channels
                     | CairnResource::ChannelsProvider { .. }
                     | CairnResource::ChannelsConversation { .. }
+                    | CairnResource::ChannelsAmbientFeedback
                     | CairnResource::Operator
                     | CairnResource::OperatorMessage { .. }
             )
         })
         .ok_or_else(|| {
-            format!("{target} is not a channels resource; the operator's channels door reads and writes cairn://channels and the conversations under it, and cairn://operator and its messages")
+            format!("{target} is not a channels resource; the operator's channels door reads and writes cairn://channels, the conversations under it, the ambient routing labels, and cairn://operator and its messages")
         })?;
     Ok((resource, split.params))
 }
@@ -957,6 +1006,7 @@ pub async fn operator_read(orch: &Orchestrator, target: &str) -> Result<String, 
         CairnResource::ChannelsConversation { provider, path } => {
             render_conversation(orch, &request, &provider, &path, &params).await
         }
+        CairnResource::ChannelsAmbientFeedback => render_ambient_feedback(orch, &params).await,
         CairnResource::Operator => {
             crate::resources::operator::render_operator(orch, &request, &params).await
         }
@@ -1177,6 +1227,14 @@ impl ReachedConversation {
     }
 }
 
+/// A resolved conversation's label, carrying the provider's own title for it.
+async fn titled_label(resolved: &label::ResolvedConversation) -> String {
+    let title =
+        crate::channels::titles::conversation_title(resolved.provider, &resolved.conversation)
+            .await;
+    resolved.label(title.as_deref())
+}
+
 /// Resolve a conversation URI and refuse it unless `reader` reaches it.
 pub async fn reach_conversation(
     orch: &Orchestrator,
@@ -1204,14 +1262,14 @@ pub async fn reach_conversation(
     if bound.is_empty() {
         return Err(format!(
             "{} ({uri}) has no active binding on an enabled provider, so no agent reaches it; read {} for the conversations you can reach.",
-            resolved.label(),
+            titled_label(&resolved).await,
             label::provider_uri(provider)
         ));
     }
     if rows.is_empty() {
         return Err(format!(
             "{} ({uri}) is not a conversation {} can reach. A thread reaches its own channel, conversations bound to it with agent text, and its project's #ambient; an issue node reaches its issue's channel and its project's #ambient. Read {} for the conversations you can reach.",
-            resolved.label(),
+            titled_label(&resolved).await,
             reader.describe(),
             label::provider_uri(provider)
         ));
@@ -1451,10 +1509,12 @@ async fn conversation_view(
     let row = reached.row();
     let status = runtime_status(orch, provider.id()).await;
     let binding = resolved.primary();
+    let heading = match row {
+        Some(row) => row.label.clone(),
+        None => titled_label(resolved).await,
+    };
     let mut out = format!(
-        "# {}\n\n{uri}\naddress: {conversation} · binding: {} · target: {}\nhealth: {}\n{}\n",
-        row.map(|row| row.label.clone())
-            .unwrap_or_else(|| resolved.label()),
+        "# {heading}\n\n{uri}\naddress: {conversation} · binding: {} · target: {}\nhealth: {}\n{}\n",
         binding
             .map(|binding| binding.binding_kind.as_str())
             .unwrap_or("none"),
@@ -1463,7 +1523,10 @@ async fn conversation_view(
             .unwrap_or("none"),
         health_line(status.state, status.detail.as_deref()),
         match row {
-            Some(row) if row.sendable() => format!("send (agent_text): {}", send_example(&uri)),
+            Some(row) if row.sendable() => format!(
+                "send (agent_text): {}; to reply to a message, add replyTo with its `in` or `out` id below",
+                send_example(&uri)
+            ),
             Some(row) => format!(
                 "send: not available; {}",
                 row.send_refusal().unwrap_or_default()
@@ -1529,8 +1592,16 @@ async fn conversation_view(
                 }
             }
             ledger::MessageDirection::Out => {
+                let reply = match (&message.reply_to, &message.reply_to_guid) {
+                    (Some(to), Some(_)) => format!(" · reply to {to}"),
+                    (Some(to), None) => format!(
+                        " · reply to {to} (sent plainly; {} has no native reply)",
+                        provider.display_name()
+                    ),
+                    (None, _) => String::new(),
+                };
                 out.push_str(&format!(
-                    "\n- out {} · {} · {} · {}\n{}\n  {}\n",
+                    "\n- out {} · {} · {} · {}{reply}\n{}\n  {}\n",
                     message.id,
                     at_ms(message.at),
                     outbound_sender(message),
@@ -1744,6 +1815,7 @@ mod tests {
             detail.map(str::to_string),
             last_error.map(str::to_string),
             i64::from(last_error.is_some()),
+            None,
         )
     }
 
@@ -1952,6 +2024,7 @@ mod tests {
             None,
             last_error,
             undelivered.failed,
+            None,
         ))
         .unwrap();
         assert_eq!(rendered["deliverability"], "ready", "{rendered}");
@@ -2157,6 +2230,7 @@ mod tests {
 
         let rows = conversation_rows(
             ledger::list_active_bindings(&db).await.unwrap(),
+            &HashMap::new(),
             |_| true,
             |_| async {
                 ProviderRowStatus {
@@ -2292,7 +2366,7 @@ mod tests {
         let per_binding = started.elapsed();
 
         let started = Instant::now();
-        let rows = conversation_rows(bindings, |_| true, status_of).await;
+        let rows = conversation_rows(bindings, &HashMap::new(), |_| true, status_of).await;
         let per_provider = started.elapsed();
         assert_eq!(rows.len(), 871);
 
@@ -2312,6 +2386,7 @@ mod tests {
             None,
             None,
             0,
+            None,
         )
     }
 
@@ -2375,6 +2450,57 @@ mod tests {
 
     const MESSAGES_ALL_AGENT: i64 = MESSAGE_CLASSES_ALL | MESSAGE_CLASS_AGENT_TEXT;
     const MESSAGES_CLASSES_ALL_ONLY: i64 = MESSAGE_CLASSES_ALL;
+
+    /// A Telegram chat is listed by the title its running provider gives it,
+    /// fetched when read rather than stored on the binding.
+    #[tokio::test]
+    async fn a_telegram_chat_is_listed_by_its_title() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, SearchIndex};
+        use std::sync::Arc;
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
+        assert!(ledger::bind_target(
+            &local,
+            "telegram",
+            "telegram:42",
+            "cairn://p/prj/general",
+            BindingKind::Follow,
+            MESSAGES_ALL_AGENT,
+            1,
+            0
+        )
+        .await
+        .unwrap());
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(
+            crate::config::settings::get_settings_path(&config_dir),
+            "channels:\n  telegram:\n    enabled: true\n    chatId: '42'\n",
+        )
+        .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build();
+
+        let _runtime = crate::channels::register_test_runtime(
+            "telegram",
+            crate::channels::titles::tests::TitledProvider::new(Some("Ops")),
+        );
+        let listing = operator_read(&orch, "cairn://channels/telegram")
+            .await
+            .unwrap();
+        assert!(listing.contains("Ops · Telegram"), "{listing}");
+        assert!(!listing.contains("operator chat"), "{listing}");
+    }
 
     /// A project `prj` with a `channels` thread, Discord enabled, its ambient
     /// channel `discord:1/9`, and `#channels` at `discord:1/2`.
@@ -2585,6 +2711,7 @@ mod tests {
                 target_uri: Some(target.into()),
                 binding_kind: Some("ambient".into()),
                 addressed_by: addressed_by.map(str::to_string),
+                message_guid: None,
             },
         )
         .await
@@ -2594,6 +2721,59 @@ mod tests {
     /// The two messages of the night this resource was built for, read back off
     /// the ledger: unaddressed text a route acknowledged three minutes later,
     /// and text addressed by a channel mention to the thread it names.
+    #[tokio::test]
+    async fn a_reply_shows_what_it_replied_to_and_whether_natively() {
+        let _runtime = crate::channels::register_test_runtime(
+            "discord",
+            crate::channels::titles::tests::TitledProvider::replying(true),
+        );
+        let orch = conversation_orchestrator().await;
+        let db = &orch.db.local;
+        inbound(db, "in-1", "yo", "cairn://p/prj", None, 1).await;
+        for (id, guid) in [("out-native", Some("9:50")), ("out-plain", None)] {
+            let binding_ref =
+                crate::channels::agent_message::binding_ref(id, "cairn://p/prj/channels");
+            assert!(ledger::insert_reply_intent(
+                db,
+                &ledger::NewOutbound {
+                    id,
+                    channel: "discord",
+                    kind: "message",
+                    binding_ref: &binding_ref,
+                    conversation: "discord:1/9",
+                    job_id: None,
+                    rendered_text: "answer",
+                    rendering: "text",
+                    created_at: 2,
+                },
+                ledger::OutboundReply { to: "in-1", guid },
+            )
+            .await
+            .unwrap());
+        }
+        let rendered = view(&orch, &["prj"], &[]).await;
+        let line = |id: &str| {
+            rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("- out {id} ")))
+                .unwrap_or_else(|| panic!("{id}: {rendered}"))
+                .to_string()
+        };
+        assert!(
+            line("out-native").ends_with(" · reply to in-1"),
+            "{rendered}"
+        );
+        assert!(
+            line("out-plain")
+                .ends_with(" · reply to in-1 (sent plainly; Discord has no native reply)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("add replyTo with its `in` or `out` id below"),
+            "{rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn a_conversation_shows_what_the_router_did_with_each_message() {
         let orch = conversation_orchestrator().await;

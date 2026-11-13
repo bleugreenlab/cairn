@@ -12,6 +12,7 @@ use crate::orchestrator::OrchestratorBuilder;
 use crate::resources::mutations::dispatch_resource_change;
 use crate::services::testing::TestServicesBuilder;
 use crate::storage::{LogDedupe, NewFact, NewRouteFiring, SearchIndex};
+use cairn_common::protocol::DispatchOrigin;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -108,6 +109,7 @@ async fn fact(orch: &Orchestrator, n: i64, at: i64, state: &str, binding_kind: &
             target_uri: Some("cairn://p/cairn".into()),
             binding_kind: Some(binding_kind.into()),
             addressed_by: None,
+            message_guid: None,
         },
     )
     .await
@@ -245,7 +247,7 @@ async fn row(orch: &Orchestrator, event: i64, recipient: Option<&str>) -> Ambien
         .unwrap_or_else(|| panic!("a row for event {event} and {recipient:?}"))
 }
 
-fn request(run_id: Option<&str>) -> McpCallbackRequest {
+fn request(run_id: Option<&str>, origin: Option<DispatchOrigin>) -> McpCallbackRequest {
     McpCallbackRequest {
         answer_bound_ms: None,
         thread_id: None,
@@ -254,13 +256,23 @@ fn request(run_id: Option<&str>) -> McpCallbackRequest {
         tool: "change".to_string(),
         payload: json!({}),
         tool_use_id: None,
-        origin: None,
+        origin,
     }
 }
 
+/// A label written by `run_id`'s agent.
 async fn write(
     orch: &Orchestrator,
     run_id: Option<&str>,
+    payload: Value,
+) -> Result<String, String> {
+    write_as(orch, run_id, None, payload).await
+}
+
+async fn write_as(
+    orch: &Orchestrator,
+    run_id: Option<&str>,
+    origin: Option<DispatchOrigin>,
     payload: Value,
 ) -> Result<String, String> {
     let item = ChangeItem {
@@ -268,15 +280,24 @@ async fn write(
         mode: ChangeMode::Append,
         payload: Some(payload),
     };
-    dispatch_resource_change(orch, &request(run_id), 0, &item, false)
+    dispatch_resource_change(orch, &request(run_id, origin), 0, &item, false)
         .await
         .map(|applied| applied.summary)
         .map_err(|failure| failure.error)
 }
 
 async fn refusal(orch: &Orchestrator, run_id: Option<&str>, payload: Value) -> String {
+    refusal_as(orch, run_id, None, payload).await
+}
+
+async fn refusal_as(
+    orch: &Orchestrator,
+    run_id: Option<&str>,
+    origin: Option<DispatchOrigin>,
+    payload: Value,
+) -> String {
     let before = rows(orch).await;
-    let error = write(orch, run_id, payload).await.unwrap_err();
+    let error = write_as(orch, run_id, origin, payload).await.unwrap_err();
     assert_eq!(
         rows(orch).await,
         before,
@@ -578,12 +599,56 @@ async fn only_a_chartered_thread_or_the_operator_labels() {
         "{error}"
     );
 
-    // The operator labels the refused side under its installation principal.
-    write(&orch, None, payload).await.unwrap();
+    // A run-less write without the operator's stamp speaks for nobody, whether
+    // it carries no origin or only the machine credential's.
+    for origin in [None, Some(DispatchOrigin::UnverifiedLocal)] {
+        let error = refusal_as(&orch, None, origin.clone(), payload.clone()).await;
+        assert!(
+            error.contains("speaks for no run and carries no operator credential, so it cannot label an ambient routing"),
+            "{origin:?}: {error}"
+        );
+    }
+
+    // The verified desktop operator, through the channels door, labels the
+    // refused side under its installation principal.
+    crate::resources::channels::operator_write(
+        &orch,
+        "cairn://channels/ambient/feedback",
+        ChangeMode::Append,
+        Some(payload),
+    )
+    .await
+    .unwrap();
     let labelled = row(&orch, id, None).await;
     assert_eq!(labelled.verdict.as_deref(), Some("reroute"));
     let principal: Value = serde_json::from_str(labelled.labelled_by.as_deref().unwrap()).unwrap();
     assert_eq!(principal["kind"], "machine", "{principal}");
+}
+
+/// The operator's labelling branch is reached through the desktop channels
+/// door, which both reads the label set and writes a label.
+#[tokio::test]
+async fn the_operator_labels_through_the_channels_door() {
+    let orch = orchestrator().await;
+    let id = routed(&orch, 1, T0, "refused", &[("devops", 0.2)]).await;
+    crate::resources::channels::operator_write(
+        &orch,
+        "cairn://channels/ambient/feedback",
+        ChangeMode::Append,
+        Some(json!({"event": event(id), "verdict": "reroute", "to": DOCS})),
+    )
+    .await
+    .unwrap();
+    let labelled = row(&orch, id, None).await;
+    assert_eq!(labelled.verdict.as_deref(), Some("reroute"));
+    let principal: Value = serde_json::from_str(labelled.labelled_by.as_deref().unwrap()).unwrap();
+    assert_eq!(principal["kind"], "machine", "{principal}");
+
+    let read =
+        crate::resources::channels::operator_read(&orch, "cairn://channels/ambient/feedback")
+            .await
+            .unwrap();
+    assert!(read.contains(&event(id)), "{read}");
 }
 
 #[tokio::test]
@@ -694,10 +759,11 @@ async fn a_non_recipients_reroute_lands_on_the_refused_side_and_delivers_nothing
 async fn a_label_written_before_its_firings_are_read_is_filled_by_the_sweep() {
     let orch = orchestrator().await;
     let id = fact(&orch, 1, T0, route_state::DONE, "ambient").await;
-    write(
+    crate::resources::channels::operator_write(
         &orch,
-        None,
-        json!({"event": event(id), "verdict": "reroute", "to": DOCS}),
+        "cairn://channels/ambient/feedback",
+        ChangeMode::Append,
+        Some(json!({"event": event(id), "verdict": "reroute", "to": DOCS})),
     )
     .await
     .unwrap();
@@ -778,6 +844,7 @@ async fn engagement_is_judged_once_at_the_horizon_from_citations_and_sends() {
         DOCS,
         None,
         "on it",
+        None,
     )
     .await
     .unwrap();

@@ -673,8 +673,9 @@ pub(crate) enum Labeller {
         uri: String,
         project_key: String,
     },
-    /// A run-less write, attributed to this installation's machine principal
-    /// exactly as an operator-created issue is.
+    /// The verified desktop operator, through the channels door, attributed to
+    /// this installation's machine principal exactly as an operator-created
+    /// issue is.
     Operator {
         principal_json: String,
     },
@@ -696,19 +697,28 @@ impl Labeller {
     }
 }
 
-/// The labeller of a feedback write, from the request's authenticated run
-/// alone. A write with a run must come from a thread itself; one without is
-/// the operator's.
+/// A feedback write that speaks for no run and carries no operator credential:
+/// nothing proves who sent it, so it labels nothing.
+const RUN_LESS_LABEL_REFUSAL: &str = "Refused: this request speaks for no run and carries no operator credential, so it cannot label an ambient routing. A chartered thread labels its own routings; the operator labels them from the desktop.";
+
+/// The labeller of a feedback write. The verified desktop operator (the
+/// channels door's stamp) labels as the operator; otherwise the write must
+/// carry an authenticated run whose home is a chartered thread. A run-less
+/// write without the operator's stamp, including one from a process holding
+/// only the machine credential, is refused rather than trusted.
 pub(crate) async fn labeller(
     orch: &Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
 ) -> Result<Labeller, String> {
-    if request.run_id.is_none() {
+    if request.is_desktop_operator() {
         let origin = crate::routes::installation_machine_origin(orch)?;
         return Ok(Labeller::Operator {
             principal_json: serde_json::to_string(&origin.author)
                 .map_err(|error| error.to_string())?,
         });
+    }
+    if request.run_id.as_deref().is_none_or(str::is_empty) || request.is_unverified_local() {
+        return Err(RUN_LESS_LABEL_REFUSAL.to_string());
     }
     let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
         .await

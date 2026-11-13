@@ -19,9 +19,9 @@ use std::{
 use teloxide::{
     prelude::*,
     types::{
-        BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardButtonKind,
-        InlineKeyboardMarkup, MaybeInaccessibleMessage, Message, MessageId, ParseMode, Update,
-        UpdateKind, UserId,
+        BotCommand, CallbackQuery, ChatFullInfo, InlineKeyboardButton, InlineKeyboardButtonKind,
+        InlineKeyboardMarkup, MaybeInaccessibleMessage, Message, MessageId, ParseMode,
+        ReplyParameters, Update, UpdateKind, UserId,
     },
     update_listeners::AsUpdateStream,
 };
@@ -302,6 +302,7 @@ impl ChannelProvider for TelegramProvider {
             open_options: true,
             edit_in_place: true,
             max_text_len: Some(TELEGRAM_TEXT_LIMIT),
+            native_reply: true,
         }
     }
     /// The header shares Telegram's budget and Markdown changes the visible
@@ -310,9 +311,23 @@ impl ChannelProvider for TelegramProvider {
     fn notify_overflow(&self, context_header: &str, body: &str) -> usize {
         notify_overflow(context_header, body)
     }
+    async fn conversation_title(&self, conversation: &str) -> Result<Option<String>, String> {
+        let chat = self.configured_chat(conversation)?;
+        self.bot
+            .get_chat(chat)
+            .await
+            .map(|info| chat_title(&info))
+            .map_err(|error| format!("could not read the Telegram chat: {error}"))
+    }
+
     async fn send(&self, message: &OutboundMessage) -> Result<SentIds, String> {
         let rendered = render_ask(&message.context_header, &message.ask);
         let chat = self.configured_chat(&message.conversation)?;
+        let reply_to = message
+            .reply_to
+            .as_deref()
+            .map(|guid| parse_message(guid, self.chat_id))
+            .transpose()?;
         let sent = retry_on_entity_parse_error(|formatted| {
             let request = self
                 .bot
@@ -325,6 +340,13 @@ impl ChannelProvider for TelegramProvider {
                     },
                 )
                 .reply_markup(rendered.keyboard.clone());
+            // A deleted original still sends, as a plain message.
+            let request = match reply_to {
+                Some(id) => {
+                    request.reply_parameters(ReplyParameters::new(id).allow_sending_without_reply())
+                }
+                None => request,
+            };
             async move {
                 if formatted {
                     request.parse_mode(ParseMode::Html).await
@@ -741,17 +763,20 @@ fn map_message(
     }
     let sender = from.id.0.to_string();
     let text = message.text()?.to_owned();
+    let message_guid = Some(scoped_message_id(chat_id, message.id));
     match message.reply_to_message() {
         Some(reply) => Some(InboundEvent::Reply {
             conversation: format!("telegram:{chat_id}"),
             bound_guid: scoped_message_id(chat_id, reply.id),
             sender,
             text,
+            message_guid,
         }),
         None => Some(InboundEvent::Bare {
             conversation: format!("telegram:{chat_id}"),
             sender,
             text,
+            message_guid,
         }),
     }
 }
@@ -808,6 +833,23 @@ fn parse_chat(value: &str) -> Result<ChatId, String> {
         .map(ChatId)
         .map_err(|_| format!("invalid Telegram chat id: {value}"))
 }
+/// A group, supergroup or channel by its title; a private chat by the other
+/// party's name. Never the username, which is an address rather than a name.
+fn chat_title(info: &ChatFullInfo) -> Option<String> {
+    if info.is_private() {
+        let name = [info.first_name(), info.last_name()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!name.is_empty()).then_some(name)
+    } else {
+        info.title().map(str::to_string)
+    }
+}
+
 fn scoped_message_id(chat_id: ChatId, message_id: MessageId) -> String {
     format!("{}:{}", chat_id.0, message_id.0)
 }
@@ -1011,6 +1053,93 @@ mod tests {
         (Bot::new("123:test").set_api_url(url), requests_rx)
     }
 
+    fn provider_on(bot: Bot, chat: i64) -> TelegramProvider {
+        let (tx, rx) = mpsc::channel(1);
+        TelegramProvider {
+            bot,
+            chat_id: ChatId(chat),
+            allowed_users: HashSet::new(),
+            tx,
+            rx: Mutex::new(Some(rx)),
+            active: AtomicBool::new(false),
+            started_at: AtomicI64::new(0),
+            last_update_at: AtomicI64::new(0),
+            last_error: Mutex::new(None),
+        }
+    }
+
+    /// A reply names its original in `reply_parameters`, allowed to send
+    /// without it; a reply into another chat is refused before any request.
+    #[tokio::test]
+    async fn a_reply_sends_reply_parameters_for_its_original() {
+        let sent = r#"{"ok":true,"result":{"message_id":16,"date":1,"chat":{"id":42,"type":"private"},"text":"hi"}}"#;
+        let (bot, requests) = mock_bot_sequence(vec![sent]).await;
+        let provider = provider_on(bot, 42);
+        let message = |reply_to: &str| OutboundMessage {
+            intent_id: "o-1".into(),
+            conversation: "telegram:42".into(),
+            initiated_by: super::super::OutboundInitiator::Agent,
+            ask: OutboundAsk::Notify { text: "hi".into() },
+            context_header: String::new(),
+            reply_to: Some(reply_to.into()),
+        };
+        let ids = provider.send(&message("42:15")).await.unwrap();
+        assert_eq!(ids.primary_guid, "42:16");
+        let requests = requests.await.unwrap();
+        let body = requests[0].split("\r\n\r\n").nth(1).unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["reply_parameters"]["message_id"], 15, "{body}");
+        assert_eq!(
+            body["reply_parameters"]["allow_sending_without_reply"], true,
+            "{body}"
+        );
+        assert!(provider.send(&message("7:15")).await.is_err());
+    }
+
+    /// A group is named by its title and a private chat by the other party's
+    /// name, never by a username; any other chat is refused before a request.
+    #[tokio::test]
+    async fn a_chat_title_is_its_title_or_the_other_partys_name() {
+        const GIFTS: &str = r#""accepted_gift_types":{"unlimited_gifts":false,"limited_gifts":false,"unique_gifts":false,"premium_subscription":false}"#;
+        let group: &'static str = Box::leak(
+            format!(r#"{{"ok":true,"result":{{"id":-100123,"type":"supergroup","title":"Ops","max_reaction_count":11,{GIFTS}}}}}"#)
+                .into_boxed_str(),
+        );
+        let private: &'static str = Box::leak(
+            format!(r#"{{"ok":true,"result":{{"id":42,"type":"private","first_name":"Ada","last_name":"Lovelace","username":"ada_l","max_reaction_count":11,{GIFTS}}}}}"#)
+                .into_boxed_str(),
+        );
+
+        let (bot, requests) = mock_bot_sequence(vec![group]).await;
+        let provider = provider_on(bot, -100123);
+        assert_eq!(
+            provider
+                .conversation_title("telegram:-100123")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Ops")
+        );
+        let requests = requests.await.unwrap();
+        assert!(
+            requests[0].to_ascii_lowercase().contains("/getchat"),
+            "{}",
+            requests[0]
+        );
+        assert!(provider.conversation_title("telegram:7").await.is_err());
+
+        let (bot, _requests) = mock_bot_sequence(vec![private]).await;
+        let provider = provider_on(bot, 42);
+        assert_eq!(
+            provider
+                .conversation_title("telegram:42")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Ada Lovelace")
+        );
+    }
+
     #[tokio::test]
     async fn expired_inline_ask_clears_keyboard_and_sends_receipt_when_stop_poll_fails() {
         let telegram_message = r#"{"message_id":15,"date":1,"chat":{"id":42,"type":"private"}}"#;
@@ -1123,7 +1252,21 @@ mod tests {
             Some(InboundEvent::Bare {
                 conversation: "telegram:99".into(),
                 sender: "7".into(),
-                text: "hello".into()
+                text: "hello".into(),
+                message_guid: Some("99:10".into()),
+            })
+        );
+        let reply = update(
+            json!({"update_id":5,"message":{"message_id":12,"date":1,"chat":{"id":99,"type":"private"},"from":{"id":7,"is_bot":false,"first_name":"Op"},"text":"re","reply_to_message":{"message_id":10,"date":1,"chat":{"id":99,"type":"private"},"text":"hello"}}}),
+        );
+        assert_eq!(
+            map_update(&reply, ChatId(99), &allowed),
+            Some(InboundEvent::Reply {
+                conversation: "telegram:99".into(),
+                bound_guid: "99:10".into(),
+                sender: "7".into(),
+                text: "re".into(),
+                message_guid: Some("99:12".into()),
             })
         );
         let denied = update(

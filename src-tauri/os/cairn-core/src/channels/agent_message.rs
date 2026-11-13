@@ -73,7 +73,9 @@ pub fn context_header(sender_home: &str) -> String {
 }
 
 /// Record a pending `message` intent for an admitted send and hand it to the
-/// provider's router. Returns the intent id.
+/// provider's router. Returns the intent id. `reply` records what the message
+/// answers; the router sends it as a native reply when it carries a provider
+/// id.
 ///
 /// The row is the durable boundary: if the router is not running to receive the
 /// hand-off, the intent stays `pending` and the router's next sweep delivers it.
@@ -83,6 +85,7 @@ pub async fn enqueue(
     sender_home: &str,
     job_id: Option<&str>,
     content: &str,
+    reply: Option<ledger::OutboundReply<'_>>,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     let binding_ref = binding_ref(&id, sender_home);
@@ -91,21 +94,21 @@ pub async fn enqueue(
         text: content.to_string(),
     });
     let provider = address.provider().id();
-    let inserted = ledger::insert_intent(
-        ledger,
-        &ledger::NewOutbound {
-            id: &id,
-            channel: provider,
-            kind: KIND,
-            binding_ref: &binding_ref,
-            conversation: &conversation,
-            job_id,
-            rendered_text: &rendered,
-            rendering: "text",
-            created_at: chrono::Utc::now().timestamp_millis(),
-        },
-    )
-    .await?;
+    let intent = ledger::NewOutbound {
+        id: &id,
+        channel: provider,
+        kind: KIND,
+        binding_ref: &binding_ref,
+        conversation: &conversation,
+        job_id,
+        rendered_text: &rendered,
+        rendering: "text",
+        created_at: chrono::Utc::now().timestamp_millis(),
+    };
+    let inserted = match reply {
+        Some(reply) => ledger::insert_reply_intent(ledger, &intent, reply).await?,
+        None => ledger::insert_intent(ledger, &intent).await?,
+    };
     if !inserted {
         return Err(format!(
             "agent message {id} collided with an existing channel_outbound intent"

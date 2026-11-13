@@ -94,7 +94,7 @@ pub(crate) const CHANNELS_CONVERSATION_CONTRACT: ResourceContract = ResourceCont
     kind: ResourceKind::ChannelsConversation,
     uri_template: "cairn://channels/{provider}/{conversation}",
     name: "Channel conversation",
-    description: "One conversation the reader can reach: a header (label, provider address, binding, target, provider health, the send affordance) and then its messages oldest first, inbound and outbound interleaved, each with its Cairn id. An inbound message shows its sender, text, the address it opened with, and what the router did: delivered to a target, logged for routes (with each route firing, its outcome, and the acknowledgement it sent), or rejected with a reason. An outbound message shows its sender (a thread, a route, or Cairn), kind, text, and delivery state: pending, deferred for operator presence, sent, failed with its attempt count and next retry, resolved, or expired. A Discord conversation is cairn://channels/discord/PROJECT (the project's #ambient) or cairn://channels/discord/PROJECT/THREAD_OR_ISSUE; Telegram's is cairn://channels/telegram/CHAT_ID and iMessage's cairn://channels/imessage/HANDLE. Append {content} to send plain text under the sender's attribution; a reply to it routes back to the sending thread, or to the sending node's issue.",
+    description: "One conversation the reader can reach: a header (label, provider address, binding, target, provider health, the send affordance) and then its messages oldest first, inbound and outbound interleaved, each with its Cairn id. An inbound message shows its sender, text, the address it opened with, and what the router did: delivered to a target, logged for routes (with each route firing, its outcome, and the acknowledgement it sent), or rejected with a reason. An outbound message shows its sender (a thread, a route, or Cairn), kind, text, and delivery state: pending, deferred for operator presence, sent, failed with its attempt count and next retry, resolved, or expired. A Discord conversation is cairn://channels/discord/PROJECT (the project's #ambient) or cairn://channels/discord/PROJECT/THREAD_OR_ISSUE; Telegram's is cairn://channels/telegram/CHAT_ID and iMessage's cairn://channels/imessage/HANDLE. Append {content, replyTo?} to send plain text under the sender's attribution; replyTo is a Cairn message id this view shows and sends a native reply where the provider has one (an outbound line then reads `reply to ID`, and `sent plainly` when the provider has none). A reply to the sent message routes back to the sending thread, or to the sending node's issue.",
     read_projections: &[
         ProjectionSpec { key: "since", values: "epoch seconds; messages at or after" },
         ProjectionSpec { key: "limit", values: "N newest messages (default 50, max 500)" },
@@ -105,7 +105,7 @@ pub(crate) const CHANNELS_CONVERSATION_CONTRACT: ResourceContract = ResourceCont
     mutations: &[MutationSpec {
         mode: ChangeMode::Append,
         required: &[CHANNEL_MESSAGE_CONTENT],
-        optional: &[],
+        optional: &[CHANNEL_MESSAGE_REPLY_TO],
         label: "send a message to this conversation",
         example: "write({changes:[{target:\"cairn://channels/discord/PROJECT/THREAD\",mode:\"append\",payload:{content:\"...\"}}]})",
     }],

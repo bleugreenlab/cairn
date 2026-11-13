@@ -785,6 +785,44 @@ fn runtime_slot() -> &'static Mutex<HashMap<&'static str, Arc<dyn ChannelProvide
     CHANNEL_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether a send on `provider_id` can reply natively now: the running
+/// provider's own answer, or, with none running, whether the provider ever can
+/// without a bridge to prove (Discord and Telegram always; iMessage only
+/// through its IMCore bridge, which an absent runtime has not shown).
+pub fn native_reply(provider_id: &str) -> bool {
+    let runtime = runtime_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(provider_id)
+        .cloned();
+    match runtime {
+        Some(runtime) => runtime.capabilities().native_reply,
+        None => matches!(provider_id, "discord" | "telegram"),
+    }
+}
+
+/// Registers `runtime` as `provider`'s running channel until the guard drops.
+#[cfg(test)]
+pub(crate) fn register_test_runtime(
+    provider: &'static str,
+    runtime: Arc<dyn ChannelProvider>,
+) -> impl Drop {
+    struct Registered(&'static str);
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            runtime_slot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(self.0);
+        }
+    }
+    runtime_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(provider, runtime);
+    Registered(provider)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum OperatorPresenceMode {
@@ -1240,6 +1278,7 @@ pub mod ledger;
 pub mod operator_message;
 pub mod router;
 pub mod state_card;
+pub mod titles;
 
 pub use cairn_channels::{
     address, commands, conversation_capabilities, discord, render_text_floor, telegram, AskOption,

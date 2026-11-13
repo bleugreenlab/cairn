@@ -2,7 +2,7 @@ use cairn_db::turso::{params, Row};
 
 use crate::storage::{DbResult, LocalDb, RowExt};
 
-const OUTBOUND_COLUMNS: &str = "id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, options_json, status, provider_guid, caption_guid, created_at, sent_at, resolved_at, last_error, attempts, next_attempt_at, last_attempt_at";
+const OUTBOUND_COLUMNS: &str = "id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, options_json, status, provider_guid, caption_guid, created_at, sent_at, resolved_at, last_error, attempts, next_attempt_at, last_attempt_at, reply_to, reply_to_guid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewOutbound<'a> {
@@ -1224,6 +1224,10 @@ pub struct OutboundRecord {
     pub attempts: i64,
     pub next_attempt_at: Option<i64>,
     pub last_attempt_at: Option<i64>,
+    /// The Cairn message id this replies to.
+    pub reply_to: Option<String>,
+    /// The provider id it references natively; `None` when sent plainly.
+    pub reply_to_guid: Option<String>,
 }
 
 impl OutboundRecord {
@@ -1248,6 +1252,8 @@ impl OutboundRecord {
             attempts: row.i64(16)?,
             next_attempt_at: row.opt_i64(17)?,
             last_attempt_at: row.opt_i64(18)?,
+            reply_to: row.opt_text(19)?,
+            reply_to_guid: row.opt_text(20)?,
         })
     }
 }
@@ -1258,12 +1264,40 @@ pub async fn insert_intent(db: &LocalDb, intent: &NewOutbound<'_>) -> Result<boo
     insert_intent_with_status(db, intent, "pending").await
 }
 
+/// What an outbound replies to: a Cairn message id in the same conversation,
+/// and the provider id the send references natively (`None` when the provider
+/// has no native reply and it goes out plainly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundReply<'a> {
+    pub to: &'a str,
+    pub guid: Option<&'a str>,
+}
+
+/// [`insert_intent`] for a send that replies to an earlier message, recording
+/// both reply columns in the same insert.
+pub async fn insert_reply_intent(
+    db: &LocalDb,
+    intent: &NewOutbound<'_>,
+    reply: OutboundReply<'_>,
+) -> Result<bool, String> {
+    write_intent(db, intent, "pending", Some(reply)).await
+}
+
 /// Insert a delivery intent either as owed work (`pending`) or as a gate sealed
 /// at a genuine session boundary (`expired`).
 pub async fn insert_intent_with_status(
     db: &LocalDb,
     intent: &NewOutbound<'_>,
     status: &str,
+) -> Result<bool, String> {
+    write_intent(db, intent, status, None).await
+}
+
+async fn write_intent(
+    db: &LocalDb,
+    intent: &NewOutbound<'_>,
+    status: &str,
+    reply: Option<OutboundReply<'_>>,
 ) -> Result<bool, String> {
     if !matches!(status, "pending" | "expired") {
         return Err(format!(
@@ -1283,8 +1317,8 @@ pub async fn insert_intent_with_status(
         created_at: intent.created_at,
     };
     db.execute(
-        "INSERT OR IGNORE INTO channel_outbound (id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?9 = 'expired' THEN ?10 END)",
-        params![intent.id, intent.channel, intent.kind, binding_ref, intent.conversation, intent.job_id, intent.rendered_text, intent.rendering, status, intent.created_at],
+        "INSERT OR IGNORE INTO channel_outbound (id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at, resolved_at, reply_to, reply_to_guid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?9 = 'expired' THEN ?10 END, ?11, ?12)",
+        params![intent.id, intent.channel, intent.kind, binding_ref, intent.conversation, intent.job_id, intent.rendered_text, intent.rendering, status, intent.created_at, reply.map(|reply| reply.to), reply.and_then(|reply| reply.guid)],
     )
     .await
     .map(|changed| changed == 1)
@@ -1712,9 +1746,12 @@ pub struct InboundRecord {
     /// opened with (`@channels`, `<#123>`), space-separated, which the router
     /// consumed before delivering the rest.
     pub addressed_by: Option<String>,
+    /// The message's own provider id, which a native reply to it references.
+    /// (`provider_guid` is the id of the message this one replied to.)
+    pub message_guid: Option<String>,
 }
 
-const INBOUND_COLUMNS: &str = "id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at, conversation, target_uri, binding_kind, addressed_by";
+const INBOUND_COLUMNS: &str = "id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at, conversation, target_uri, binding_kind, addressed_by, message_guid";
 
 impl InboundRecord {
     fn from_row(row: &Row) -> DbResult<Self> {
@@ -1731,15 +1768,68 @@ impl InboundRecord {
             target_uri: row.opt_text(9)?,
             binding_kind: row.opt_text(10)?,
             addressed_by: row.opt_text(11)?,
+            message_guid: row.opt_text(12)?,
         })
     }
 }
 
 pub async fn insert_inbound(db: &LocalDb, record: &InboundRecord) -> Result<bool, String> {
     db.execute(
-        format!("INSERT OR IGNORE INTO channel_inbound ({INBOUND_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
-        params![record.id.clone(), record.channel.clone(), record.provider_guid.clone(), record.sender.clone(), record.text.clone(), record.received_at, record.rejection_reason.clone(), record.acknowledged_at, record.conversation.clone(), record.target_uri.clone(), record.binding_kind.clone(), record.addressed_by.clone()],
+        format!("INSERT OR IGNORE INTO channel_inbound ({INBOUND_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
+        params![record.id.clone(), record.channel.clone(), record.provider_guid.clone(), record.sender.clone(), record.text.clone(), record.received_at, record.rejection_reason.clone(), record.acknowledged_at, record.conversation.clone(), record.target_uri.clone(), record.binding_kind.clone(), record.addressed_by.clone(), record.message_guid.clone()],
     ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
+}
+
+/// A message a send may reply to, found by its Cairn id within one
+/// conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyTarget {
+    /// An inbound message, with its own provider id when it was recorded.
+    Inbound { message_guid: Option<String> },
+    /// An outbound message, with the provider id its send produced, if sent.
+    Outbound {
+        provider_guid: Option<String>,
+        status: String,
+    },
+}
+
+/// The message `id` names among `conversation`'s rows on `provider`, inbound
+/// or outbound, or `None`. An id in any other conversation is `None` too, so a
+/// caller learns nothing about rows it does not reach.
+pub async fn reply_target(
+    db: &LocalDb,
+    provider: &str,
+    conversation: &str,
+    id: &str,
+) -> Result<Option<ReplyTarget>, String> {
+    let inbound = db
+        .query_opt(
+            "SELECT message_guid FROM channel_inbound WHERE id = ?1 AND channel = ?2 AND conversation = ?3",
+            params![id.to_string(), provider.to_string(), conversation.to_string()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(message_guid) = inbound {
+        return Ok(Some(ReplyTarget::Inbound { message_guid }));
+    }
+    db.query_opt(
+        "SELECT provider_guid, status FROM channel_outbound WHERE id = ?1 AND channel = ?2 AND conversation IN (?3, ?4)",
+        params![
+            id.to_string(),
+            provider.to_string(),
+            conversation.to_string(),
+            bare_alias(conversation).to_string()
+        ],
+        |row| {
+            Ok(ReplyTarget::Outbound {
+                provider_guid: row.opt_text(0)?,
+                status: row.text(1)?,
+            })
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// One inbound row by id, admitted or not.
@@ -1799,6 +1889,11 @@ pub struct ConversationMessage {
     pub sent_at: Option<i64>,
     pub resolved_at: Option<i64>,
     pub job_id: Option<String>,
+    /// Outbound only: the Cairn message id it replied to.
+    pub reply_to: Option<String>,
+    /// Outbound only: the provider id it referenced natively; `None` with a
+    /// `reply_to` means it was sent plainly.
+    pub reply_to_guid: Option<String>,
 }
 
 /// Which directions a conversation read takes.
@@ -1820,7 +1915,7 @@ impl DirectionFilter {
 }
 
 /// An outbound row projected onto [`ConversationMessage`]'s columns.
-const OUTBOUND_MESSAGE_COLUMNS: &str = "'out', id, created_at, kind, rendered_text, status, binding_ref, NULL, last_error, attempts, next_attempt_at, sent_at, resolved_at, job_id";
+const OUTBOUND_MESSAGE_COLUMNS: &str = "'out', id, created_at, kind, rendered_text, status, binding_ref, NULL, last_error, attempts, next_attempt_at, sent_at, resolved_at, job_id, reply_to, reply_to_guid";
 
 fn conversation_message(row: &Row) -> DbResult<ConversationMessage> {
     Ok(ConversationMessage {
@@ -1842,6 +1937,8 @@ fn conversation_message(row: &Row) -> DbResult<ConversationMessage> {
         sent_at: row.opt_i64(11)?,
         resolved_at: row.opt_i64(12)?,
         job_id: row.opt_text(13)?,
+        reply_to: row.opt_text(14)?,
+        reply_to_guid: row.opt_text(15)?,
     })
 }
 
@@ -1870,12 +1967,14 @@ pub async fn conversation_messages(
         .query_all(
             format!(
                 "SELECT direction, id, at, sender, text, state, reference, binding_kind, detail,
-                        attempts, next_attempt_at, sent_at, resolved_at, job_id
+                        attempts, next_attempt_at, sent_at, resolved_at, job_id,
+                        reply_to, reply_to_guid
                    FROM (
                      SELECT 'in' AS direction, id, received_at AS at, sender, text,
                             rejection_reason AS state, target_uri AS reference, binding_kind,
                             addressed_by AS detail, NULL AS attempts, NULL AS next_attempt_at,
-                            NULL AS sent_at, NULL AS resolved_at, NULL AS job_id
+                            NULL AS sent_at, NULL AS resolved_at, NULL AS job_id,
+                            NULL AS reply_to, NULL AS reply_to_guid
                        FROM channel_inbound
                       WHERE channel = ?6 AND conversation = ?1 AND received_at >= ?3
                         AND ?4 IN ('in', 'all')
@@ -3362,6 +3461,7 @@ mod tests {
             target_uri: None,
             binding_kind: None,
             addressed_by: None,
+            message_guid: None,
         };
         assert!(insert_inbound(&db, &inbound).await.unwrap());
         let mut duplicate = inbound.clone();

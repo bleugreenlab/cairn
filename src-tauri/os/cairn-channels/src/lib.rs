@@ -78,6 +78,10 @@ pub struct ChannelCapabilities {
     pub open_options: bool,
     pub edit_in_place: bool,
     pub max_text_len: Option<usize>,
+    /// Whether a send can reply natively to an earlier message
+    /// ([`OutboundMessage::reply_to`]); without it a reply goes out plainly.
+    #[serde(default)]
+    pub native_reply: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +116,11 @@ pub struct OutboundMessage {
     pub initiated_by: OutboundInitiator,
     pub ask: OutboundAsk,
     pub context_header: String,
+    /// The provider message id (as [`SentIds::primary_guid`] or an inbound
+    /// event's `message_guid` carries it) this send replies to natively. A
+    /// provider without [`ChannelCapabilities::native_reply`] ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,17 +152,25 @@ pub enum InboundEvent {
         bound_guid: String,
         sender: String,
         text: String,
+        /// The message's own provider id, scoped as [`SentIds::primary_guid`]
+        /// is; what a later reply to it references.
+        #[serde(default)]
+        message_guid: Option<String>,
     },
     Bare {
         conversation: String,
         sender: String,
         text: String,
+        #[serde(default)]
+        message_guid: Option<String>,
     },
     /// Recording-only input from a sender rejected at the provider boundary.
     Rejected {
         conversation: String,
         sender: String,
         text: String,
+        #[serde(default)]
+        message_guid: Option<String>,
     },
 }
 
@@ -209,6 +226,12 @@ pub trait ChannelProvider: Send + Sync {
     /// service placement is never evidence of operator presence.
     async fn operator_presence(&self) -> OperatorPresence {
         OperatorPresence::Away
+    }
+    /// The name the provider itself gives `conversation` (a group's title, the
+    /// other party's name in a private chat), or `None` when it gives none.
+    /// Never an address: a username or handle is not a name.
+    async fn conversation_title(&self, _conversation: &str) -> Result<Option<String>, String> {
+        Ok(None)
     }
     async fn cleanup_question(&self, _message: &ResolvedQuestionMessage) -> Result<(), String> {
         Ok(())

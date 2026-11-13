@@ -301,6 +301,19 @@ enum FreeTextFallback {
     Never,
 }
 
+tokio::task_local! {
+    /// The provider id of the inbound message [`ChannelRouter::handle_inbound`]
+    /// is handling. Every `channel_inbound` row written while handling it is
+    /// that message, so each records it as `message_guid` without the id being
+    /// threaded through every resolution step in between.
+    static INBOUND_MESSAGE_GUID: Option<String>;
+}
+
+/// The provider id of the inbound message being handled, if it carried one.
+fn inbound_message_guid() -> Option<String> {
+    INBOUND_MESSAGE_GUID.try_with(Clone::clone).ok().flatten()
+}
+
 /// One admitted inbound message, as its `channel_inbound` row and its
 /// `channel_message` fact record it.
 struct AdmittedMessage<'a> {
@@ -1012,6 +1025,9 @@ struct Gate {
     /// When a live agent watcher was told about this ask, if one holds it.
     /// Stamped once per gate-source snapshot by [`stamp_agent_holders`].
     held_since: Option<i64>,
+    /// The provider message id a send natively replies to: an agent message's
+    /// `reply_to_guid`, carried onto every attempt including retries.
+    reply_to: Option<String>,
 }
 
 /// The shortest interval between two recomputations of one gate source while
@@ -1411,6 +1427,7 @@ impl ChannelRouter {
                 target_uri: None,
                 ask_key: None,
                 held_since: None,
+                reply_to: None,
             },
             presence,
             now,
@@ -1693,6 +1710,7 @@ impl ChannelRouter {
                 target_uri: None,
                 ask_key: None,
                 held_since: None,
+                reply_to: None,
             };
             let conversation = gate
                 .conversation
@@ -1808,6 +1826,7 @@ impl ChannelRouter {
             target_uri: None,
             ask_key: None,
             held_since: None,
+            reply_to: record.reply_to_guid,
         };
         // An agent gate is not presence aware, so `deliver_or_defer` never
         // consults the presence passed here: the message is never deferred into
@@ -2238,6 +2257,7 @@ impl ChannelRouter {
                     })
                     .collect(),
             },
+            reply_to: None,
         };
         let Some(id) = claim_gate_for_provider(
             &self.claims,
@@ -2621,6 +2641,7 @@ impl ChannelRouter {
                 target_uri: Some(message.target_uri.clone()),
                 binding_kind: Some(binding_kind.into()),
                 addressed_by: message.addressed_by.clone(),
+                message_guid: inbound_message_guid(),
             },
         )
         .await
@@ -2674,11 +2695,13 @@ impl ChannelRouter {
             Some(BindingKind::Ambient) => cairn_uri::build_project_uri(&message.project_key),
             _ => message.target_uri.clone(),
         };
+        let title = super::titles::conversation_title(provider, message.conversation).await;
         let conversation_label = super::label::conversation_label(
             provider,
             message.conversation,
             binding_kind,
             Some(&binding_target),
+            title.as_deref(),
         );
         let record_ref = super::label::conversation_uri(
             provider,
@@ -2844,8 +2867,13 @@ impl ChannelRouter {
         let provider = super::ConversationProvider::Discord;
         let project_uri = cairn_uri::build_project_uri(&cairn_uri::canonical_project(project));
         let ambient = Some(BindingKind::Ambient.as_str());
-        let label =
-            super::label::conversation_label(provider, conversation, ambient, Some(&project_uri));
+        let label = super::label::conversation_label(
+            provider,
+            conversation,
+            ambient,
+            Some(&project_uri),
+            None,
+        );
         let delivered = match super::label::conversation_uri(
             provider,
             conversation,
@@ -3909,6 +3937,7 @@ impl ChannelRouter {
             initiated_by: gate.initiated_by,
             ask: gate.ask,
             context_header: gate.context,
+            reply_to: gate.reply_to,
         };
         match self.provider.send(&message).await {
             Ok(sent) => {
@@ -3969,6 +3998,18 @@ impl ChannelRouter {
     }
 
     pub async fn handle_inbound(&self, event: InboundEvent) -> Result<(), String> {
+        let message_guid = match &event {
+            InboundEvent::Reply { message_guid, .. }
+            | InboundEvent::Bare { message_guid, .. }
+            | InboundEvent::Rejected { message_guid, .. } => message_guid.clone(),
+            InboundEvent::Selection { .. } | InboundEvent::Selections { .. } => None,
+        };
+        INBOUND_MESSAGE_GUID
+            .scope(message_guid, self.handle_inbound_event(event))
+            .await
+    }
+
+    async fn handle_inbound_event(&self, event: InboundEvent) -> Result<(), String> {
         let conversation = match &event {
             InboundEvent::Selection { conversation, .. }
             | InboundEvent::Selections { conversation, .. }
@@ -4688,6 +4729,7 @@ impl ChannelRouter {
                 target_uri: None,
                 binding_kind: None,
                 addressed_by: None,
+                message_guid: inbound_message_guid(),
             },
         )
         .await?;
@@ -4722,6 +4764,7 @@ impl ChannelRouter {
                 target_uri: None,
                 binding_kind: None,
                 addressed_by: None,
+                message_guid: inbound_message_guid(),
             },
         )
         .await?;
@@ -4746,6 +4789,7 @@ impl ChannelRouter {
                 initiated_by: OutboundInitiator::OperatorInbound,
                 ask: OutboundAsk::Notify { text: text.into() },
                 context_header: "[Cairn]".into(),
+                reply_to: None,
             })
             .await
             .map(|_| ())
@@ -4934,6 +4978,7 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
                                 })
                                 .collect(),
                         },
+                        reply_to: None,
                     });
                 }
             }
@@ -5020,6 +5065,7 @@ async fn load_permissions(db: &LocalDb) -> Result<Vec<Gate>, String> {
                         request_id: id,
                         summary,
                     },
+                    reply_to: None,
                 });
             }
             Ok(gates)
@@ -5316,6 +5362,7 @@ async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
             ask: OutboundAsk::Notify {
                 text: review_notice(&project, number, &title, &row.content_ref),
             },
+            reply_to: None,
         });
     }
     Ok(result)
@@ -5995,6 +6042,7 @@ mod tests {
             ask: OutboundAsk::Notify {
                 text: "routed".into(),
             },
+            reply_to: None,
         };
         assert!(!held_ask.held_by_agent());
 
@@ -7082,6 +7130,7 @@ mod tests {
                 open_options: false,
                 edit_in_place: false,
                 max_text_len: None,
+                native_reply: false,
             }
         }
 
@@ -7124,6 +7173,7 @@ mod tests {
                 open_options: false,
                 edit_in_place: false,
                 max_text_len: None,
+                native_reply: false,
             }
         }
 
@@ -7765,6 +7815,7 @@ mod tests {
                 bound_guid: "stale-messages-reply-guid".into(),
                 sender: "+15551234567".into(),
                 text: "Threads".into(),
+                message_guid: None,
             })
             .await
             .unwrap();
@@ -7819,6 +7870,7 @@ mod tests {
                 open_options: false,
                 edit_in_place: false,
                 max_text_len: None,
+                native_reply: false,
             }
         }
 
@@ -7934,6 +7986,7 @@ mod tests {
                 bound_guid: "poll-1".into(),
                 sender: "+15551234567".into(),
                 text: "1".into(),
+                message_guid: None,
             })
             .await
             .unwrap();
@@ -7953,6 +8006,7 @@ mod tests {
                 bound_guid: "poll-1".into(),
                 sender: "+15551234567".into(),
                 text: "1".into(),
+                message_guid: None,
             })
             .await
             .unwrap();
@@ -8052,6 +8106,7 @@ mod tests {
                 bound_guid: "stream-guid".into(),
                 sender: "+15551234567".into(),
                 text: "unfollow".into(),
+                message_guid: None,
             })
             .await
             .unwrap();
@@ -8327,7 +8382,7 @@ mod tests {
 
     #[tokio::test]
     async fn capability_rejection_notice_returns_to_the_arriving_discord_conversation() {
-        let (orch, _db) = route_test_orchestrator("channel-router-discord-bounded-notice.db").await;
+        let (orch, db) = route_test_orchestrator("channel-router-discord-bounded-notice.db").await;
         let provider = Arc::new(RecordingPollProvider::new());
         let router = ChannelRouter::new_for_provider(
             orch,
@@ -8347,9 +8402,16 @@ mod tests {
                 conversation: "discord:42/7".into(),
                 sender: "discord-user-snowflake".into(),
                 text: "route this".into(),
+                message_guid: Some("7:100".into()),
             })
             .await
             .unwrap();
+
+        // The refused row keeps the message's own id, which a reply references.
+        let rows = ledger::list_inbound(&db, "discord", 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_guid.as_deref(), Some("7:100"));
+        assert_eq!(rows[0].provider_guid, None);
 
         let deliveries = provider.deliveries.lock().unwrap();
         assert_eq!(deliveries.len(), 1);
@@ -8389,12 +8451,14 @@ mod tests {
                 conversation: "discord:42/7".into(),
                 sender: "operator".into(),
                 text: "loose input".into(),
+                message_guid: None,
             },
             InboundEvent::Reply {
                 conversation: "discord:42/8".into(),
                 bound_guid: "stale-guid".into(),
                 sender: "operator".into(),
                 text: "stale reply".into(),
+                message_guid: None,
             },
             InboundEvent::Selection {
                 conversation: "discord:42/9".into(),
@@ -9593,6 +9657,7 @@ mod tests {
             target_uri: None,
             ask_key: None,
             held_since: None,
+            reply_to: None,
         };
 
         assert!(!router
@@ -9654,9 +9719,99 @@ mod tests {
 
     async fn enqueue_agent_message(db: &LocalDb, conversation: &str, home: &str) -> String {
         let address: crate::channels::ConversationAddress = conversation.parse().unwrap();
-        agent_message::enqueue(db, &address, home, Some("j-sender"), "hello from Cairn")
-            .await
-            .unwrap()
+        agent_message::enqueue(
+            db,
+            &address,
+            home,
+            Some("j-sender"),
+            "hello from Cairn",
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Fails its first send, then sends; records every attempt's reply target.
+    #[derive(Default)]
+    struct ReplyRecordingProvider {
+        attempts: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelProvider for ReplyRecordingProvider {
+        fn capabilities(&self) -> crate::channels::ChannelCapabilities {
+            crate::channels::ChannelCapabilities {
+                native_reply: true,
+                ..Default::default()
+            }
+        }
+
+        async fn send(
+            &self,
+            message: &OutboundMessage,
+        ) -> Result<crate::channels::SentIds, String> {
+            let mut attempts = self.attempts.lock().unwrap();
+            attempts.push(message.reply_to.clone());
+            if attempts.len() == 1 {
+                return Err("bridge send failed".into());
+            }
+            Ok(crate::channels::SentIds {
+                primary_guid: "2:9".into(),
+                caption_guid: None,
+            })
+        }
+
+        fn subscribe(&self) -> tokio::sync::mpsc::Receiver<InboundEvent> {
+            tokio::sync::mpsc::channel(1).1
+        }
+
+        fn health(&self) -> crate::channels::ChannelHealth {
+            crate::channels::ChannelHealth::Ready
+        }
+    }
+
+    /// A reply's provider reference reaches the provider on the first attempt
+    /// and again on the retry, read back from the row each time.
+    #[tokio::test]
+    async fn a_reply_reaches_the_provider_on_first_delivery_and_on_retry() {
+        let (orch, db) = route_test_orchestrator("agent-message-reply.db").await;
+        let provider = Arc::new(ReplyRecordingProvider::default());
+        let router = agent_message_router(orch, provider.clone(), "discord");
+        let address: crate::channels::ConversationAddress = "discord:1/2".parse().unwrap();
+        let id = agent_message::enqueue(
+            &db,
+            &address,
+            "cairn://p/cairn/general",
+            Some("j-sender"),
+            "replying",
+            Some(ledger::OutboundReply {
+                to: "in-1",
+                guid: Some("2:5"),
+            }),
+        )
+        .await
+        .unwrap();
+        let record = ledger::get_by_id(&db, &id).await.unwrap().unwrap();
+        assert_eq!(record.reply_to.as_deref(), Some("in-1"));
+        assert_eq!(record.reply_to_guid.as_deref(), Some("2:5"));
+
+        router.deliver_pending_agent_messages().await.unwrap();
+        db.execute(
+            "UPDATE channel_outbound SET next_attempt_at = 0 WHERE id = ?1",
+            (id.clone(),),
+        )
+        .await
+        .unwrap();
+        router.deliver_pending_agent_messages().await.unwrap();
+
+        assert_eq!(
+            *provider.attempts.lock().unwrap(),
+            [Some("2:5".to_string()), Some("2:5".to_string())]
+        );
+        assert_eq!(
+            ledger::get_by_id(&db, &id).await.unwrap().unwrap().status,
+            "sent"
+        );
     }
 
     #[tokio::test]
@@ -10011,6 +10166,7 @@ mod tests {
                 conversation: "operator".into(),
                 sender: "operator".into(),
                 text: "unrelated news".into(),
+                message_guid: None,
             })
             .await
         {
@@ -10031,6 +10187,7 @@ mod tests {
                 conversation: "operator".into(),
                 sender: "operator".into(),
                 text: "1".into(),
+                message_guid: None,
             })
             .await;
         let notices = provider.deliveries.lock().unwrap().clone();
@@ -10412,6 +10569,7 @@ mod tests {
             target_uri: None,
             ask_key: None,
             held_since: Some(1),
+            reply_to: None,
         };
         assert!(!gate(agent_message::KIND).held_by_agent());
         assert!(!gate("route").held_by_agent());
@@ -10689,6 +10847,7 @@ mod tests {
                 open_options: false,
                 edit_in_place: false,
                 max_text_len: None,
+                native_reply: false,
             }
         }
 
@@ -11007,6 +11166,7 @@ mod tests {
                 bound_guid: "permission-poll".into(),
                 sender: "+15551234567".into(),
                 text: "2".into(),
+                message_guid: None,
             })
         );
 
@@ -11282,6 +11442,8 @@ mod tests {
             attempts: 0,
             next_attempt_at: None,
             last_attempt_at: None,
+            reply_to: None,
+            reply_to_guid: None,
         };
         assert_eq!(question_answer(&record, "2"), "New");
         assert_eq!(
@@ -11316,6 +11478,7 @@ mod tests {
             ask: OutboundAsk::Notify {
                 text: String::new(),
             },
+            reply_to: None,
         };
         assert!(review.is_presence_aware());
 
@@ -11345,6 +11508,7 @@ mod tests {
             ask: OutboundAsk::Notify {
                 text: "subscribed update".into(),
             },
+            reply_to: None,
         };
 
         assert!(subscription.is_presence_aware());
@@ -11377,6 +11541,7 @@ mod tests {
                 text: "Which path?".into(),
                 options: Vec::new(),
             },
+            reply_to: None,
         };
         let mut deferred = HashMap::from([(
             gate.binding_ref.clone(),
@@ -11933,6 +12098,7 @@ mod tests {
             conversation: conversation.into(),
             sender: "operator".into(),
             text: text.into(),
+            message_guid: None,
         }
     }
 
@@ -11942,6 +12108,7 @@ mod tests {
             bound_guid: guid.into(),
             sender: "operator".into(),
             text: text.into(),
+            message_guid: None,
         }
     }
 
@@ -12398,6 +12565,7 @@ mod tests {
                     conversation: format!("imessage:{raw}"),
                     sender: raw.into(),
                     text: text.into(),
+                    message_guid: None,
                 })
                 .await
                 .unwrap();
@@ -12618,6 +12786,8 @@ mod tests {
             attempts: 0,
             next_attempt_at: None,
             last_attempt_at: None,
+            reply_to: None,
+            reply_to_guid: None,
         };
 
         assert_eq!(

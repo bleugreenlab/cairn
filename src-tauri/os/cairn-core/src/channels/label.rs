@@ -80,7 +80,8 @@ fn is_placeholder(provider: ConversationProvider, conversation: &str) -> bool {
 }
 
 /// The human name of a conversation: `#channels · cairn · Discord`,
-/// `#ambient · cairn · Discord`, `operator chat · Telegram`,
+/// `#ambient · cairn · Discord`, `Ops · Telegram` (the chat's own `title`,
+/// fetched by `titles`) or `operator chat · Telegram` without one,
 /// `+15551234567 · iMessage`. A follow placeholder, which stands for the follow
 /// stream rather than a destination, reads `follow stream · {provider}`.
 pub fn conversation_label(
@@ -88,6 +89,7 @@ pub fn conversation_label(
     conversation: &str,
     binding_kind: Option<&str>,
     target: Option<&str>,
+    title: Option<&str>,
 ) -> String {
     let display = provider.display_name();
     if is_placeholder(provider, conversation) {
@@ -104,7 +106,10 @@ pub fn conversation_label(
                 None => format!("unbound channel · {display}"),
             }
         }
-        ConversationProvider::Telegram => format!("operator chat · {display}"),
+        ConversationProvider::Telegram => match title {
+            Some(title) => format!("{title} · {display}"),
+            None => format!("operator chat · {display}"),
+        },
         ConversationProvider::IMessage => {
             let handle = conversation
                 .strip_prefix("imessage:")
@@ -193,13 +198,16 @@ impl ResolvedConversation {
             .or_else(|| self.bindings.first())
     }
 
-    pub fn label(&self) -> String {
+    /// The conversation's label, with the provider's own `title` for it when
+    /// the caller fetched one.
+    pub fn label(&self, title: Option<&str>) -> String {
         let binding = self.primary();
         conversation_label(
             self.provider,
             &self.conversation,
             binding.map(|binding| binding.binding_kind.as_str()),
             binding.map(|binding| binding.target_uri.as_str()),
+            title,
         )
     }
 }
@@ -287,7 +295,8 @@ mod tests {
                 discord,
                 "discord:1/9",
                 Some("ambient"),
-                Some("cairn://p/cairn")
+                Some("cairn://p/cairn"),
+                None
             ),
             "#ambient · cairn · Discord"
         );
@@ -296,7 +305,8 @@ mod tests {
                 discord,
                 "discord:1/2",
                 Some("structural"),
-                Some("cairn://p/cairn/channels")
+                Some("cairn://p/cairn/channels"),
+                None
             ),
             "#channels · cairn · Discord"
         );
@@ -305,12 +315,13 @@ mod tests {
                 discord,
                 "discord:1/3",
                 Some("structural"),
-                Some("cairn://p/cairn/6772")
+                Some("cairn://p/cairn/6772"),
+                None
             ),
             "#6772 · cairn · Discord"
         );
         assert_eq!(
-            conversation_label(discord, "discord:1/4", None, None),
+            conversation_label(discord, "discord:1/4", None, None, None),
             "unbound channel · Discord"
         );
         assert_eq!(
@@ -318,6 +329,7 @@ mod tests {
                 ConversationProvider::Telegram,
                 "telegram:42",
                 Some("follow"),
+                None,
                 None
             ),
             "operator chat · Telegram"
@@ -325,9 +337,20 @@ mod tests {
         assert_eq!(
             conversation_label(
                 ConversationProvider::Telegram,
+                "telegram:42",
+                Some("follow"),
+                None,
+                Some("Ops")
+            ),
+            "Ops · Telegram"
+        );
+        assert_eq!(
+            conversation_label(
+                ConversationProvider::Telegram,
                 "telegram:0",
                 Some("follow"),
-                None
+                None,
+                Some("Ops")
             ),
             "follow stream · Telegram"
         );
@@ -335,6 +358,7 @@ mod tests {
             conversation_label(
                 ConversationProvider::IMessage,
                 "imessage:+15551234567",
+                None,
                 None,
                 None
             ),
@@ -432,7 +456,7 @@ mod tests {
         };
         let ambient = resolve(&["cairn"]).await.unwrap();
         assert_eq!(ambient.conversation, "discord:1/9");
-        assert_eq!(ambient.label(), "#ambient · cairn · Discord");
+        assert_eq!(ambient.label(None), "#ambient · cairn · Discord");
         assert_eq!(
             resolve(&["cairn", "channels"]).await.unwrap().conversation,
             "discord:1/2"

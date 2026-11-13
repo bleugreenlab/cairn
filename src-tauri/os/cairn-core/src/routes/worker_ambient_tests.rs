@@ -192,6 +192,7 @@ async fn seed(orch: &Orchestrator, inbound: &Inbound<'_>) -> i64 {
             target_uri: Some(target.clone()),
             binding_kind: Some(inbound.binding_kind.into()),
             addressed_by: None,
+            message_guid: None,
         },
     )
     .await

@@ -60,8 +60,9 @@ pub(super) async fn dispatch(
 
 /// A thread or the operator labelling an ambient routing. Refusals come in a
 /// fixed order, each a sentence naming its reason: the payload's shape, then
-/// the labeller (a chartered thread, never a task or node; or a run-less
-/// operator write), then the event, then the re-route target.
+/// the labeller (a chartered thread, never a task or node; or the verified
+/// desktop operator through the channels door), then the event, then the
+/// re-route target.
 async fn label(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -81,13 +82,63 @@ async fn label(
         .map_err(|error| build_failure(index, item, error))
 }
 
-/// An agent sending free text to the conversation its target URI names.
+/// The message a send's `replyTo` names, resolved within the conversation the
+/// sender already reached: its Cairn id, and the provider id a native reply
+/// references (`None` when the provider has no native reply). Every refusal
+/// names what to do instead.
+async fn reply_target<'a>(
+    orch: &Orchestrator,
+    address: &crate::channels::ConversationAddress,
+    label: &str,
+    uri: &str,
+    id: &'a str,
+) -> Result<(&'a str, Option<String>), String> {
+    use crate::channels::ledger::{self, ReplyTarget};
+    let provider = address.provider();
+    let target =
+        ledger::reply_target(&orch.db.local, provider.id(), &address.to_string(), id).await?;
+    let guid = match target {
+        None => {
+            return Err(format!(
+                "replyTo '{id}' is not a message in {label} ({uri}); reply to an `in` or `out` id that conversation's view shows."
+            ))
+        }
+        Some(ReplyTarget::Outbound {
+            provider_guid: None,
+            status,
+        }) => {
+            return Err(format!(
+                "message {id} has not been delivered yet ({status}), so there is nothing to reply to; read {uri} and reply once it reads sent."
+            ))
+        }
+        Some(ReplyTarget::Inbound { message_guid: None }) => {
+            return Err(format!(
+                "message {id} was recorded before Cairn kept provider message ids, so {} cannot reply to it natively; send without replyTo.",
+                provider.display_name()
+            ))
+        }
+        Some(ReplyTarget::Inbound {
+            message_guid: Some(guid),
+        })
+        | Some(ReplyTarget::Outbound {
+            provider_guid: Some(guid),
+            ..
+        }) => guid,
+    };
+    Ok((
+        id,
+        crate::channels::native_reply(provider.id()).then_some(guid),
+    ))
+}
+
+/// An agent sending free text to the conversation its target URI names,
+/// optionally as a reply (`replyTo`) to a message that conversation shows.
 ///
 /// Every refusal happens before the intent is ledgered, in a fixed order: the
 /// payload shape, then that the sender is a live agent node (attribution comes
 /// from the authenticated run, never the payload), then that the sender reaches
 /// the conversation, then that it is sendable, then the provider's length
-/// limit. A successful write reports the enqueue and never claims delivery:
+/// limit, then the reply target. A successful write reports the enqueue and never claims delivery:
 /// the router sends it, and a failure lands on the `channel_outbound` row, which
 /// the conversation's resource shows.
 async fn send(
@@ -101,6 +152,17 @@ async fn send(
 ) -> ResourceMutationResult<String> {
     let payload = append_payload(index, item)?;
     let content = required_text(index, item, payload, "content")?;
+    let reply_to = match payload.get("replyTo") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(id)) if !id.trim().is_empty() => Some(id.trim()),
+        Some(_) => {
+            return Err(build_failure(
+                index,
+                item,
+                "payload.replyTo must be a message id string: an `in` or `out` id the conversation's view shows".to_string(),
+            ))
+        }
+    };
     let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
         .await
         .map_err(|error| {
@@ -125,6 +187,22 @@ async fn send(
         .map_err(|error| build_failure(index, item, error))?;
     let label = &admitted.row.label;
     let uri = &reached.uri;
+    let reply = match reply_to {
+        Some(id) => Some(
+            reply_target(orch, &admitted.address, label, uri, id)
+                .await
+                .map_err(|error| build_failure(index, item, error))?,
+        ),
+        None => None,
+    };
+    let replying = match &reply {
+        Some((id, Some(_))) => format!(", replying to {id}"),
+        Some((id, None)) => format!(
+            ", replying to {id}. {} cannot reply natively, so this is sent as a plain message",
+            admitted.address.provider().display_name()
+        ),
+        None => String::new(),
+    };
     let warning = admitted
         .row
         .last_error
@@ -138,7 +216,7 @@ async fn send(
 
     if dry_run {
         return Ok(format!(
-            "Would send a message to {label} ({uri}) as {}.{warning}",
+            "Would send a message to {label} ({uri}) as {}{replying}.{warning}",
             agent.home
         ));
     }
@@ -148,11 +226,17 @@ async fn send(
         &agent.home,
         Some(&agent.job_id),
         content,
+        reply
+            .as_ref()
+            .map(|(to, guid)| crate::channels::ledger::OutboundReply {
+                to,
+                guid: guid.as_deref(),
+            }),
     )
     .await
     .map_err(|error| build_failure(index, item, error))?;
     Ok(format!(
-        "Queued message {id} to {label} (pending); read {uri} to see it sent, or why it failed.{warning}"
+        "Queued message {id} to {label} (pending){replying}; read {uri} to see it sent, or why it failed.{warning}"
     ))
 }
 
@@ -470,6 +554,193 @@ mod tests {
                 .all(|path| path.ends_with("resources/channels.rs")),
             "{found:#?}"
         );
+    }
+
+    /// `general`'s channel with a running Discord runtime (replying natively
+    /// or not) and its messages: `in-1` (with its own provider id), `in-old`
+    /// (recorded before ids were kept), `out-pending` (unsent) and `out-sent`
+    /// in `discord:1/2`, and `in-other` in `#other`.
+    async fn reply_fixture(native_reply: bool) -> (Orchestrator, impl Drop) {
+        use crate::channels::ledger;
+        let orch = orchestrator().await;
+        let db = &orch.db.local;
+        for (id, conversation, guid) in [
+            ("in-1", "discord:1/2", Some("2:50")),
+            ("in-old", "discord:1/2", None),
+            ("in-other", "discord:1/3", Some("3:70")),
+        ] {
+            assert!(ledger::insert_inbound(
+                db,
+                &ledger::InboundRecord {
+                    id: id.into(),
+                    channel: "discord".into(),
+                    provider_guid: None,
+                    sender: "1234".into(),
+                    text: "hi".into(),
+                    received_at: 1,
+                    rejection_reason: None,
+                    acknowledged_at: None,
+                    conversation: Some(conversation.into()),
+                    target_uri: Some("cairn://p/prj/general".into()),
+                    binding_kind: Some("structural".into()),
+                    addressed_by: None,
+                    message_guid: guid.map(str::to_string),
+                },
+            )
+            .await
+            .unwrap());
+        }
+        for id in ["out-pending", "out-sent"] {
+            assert!(ledger::insert_intent(
+                db,
+                &ledger::NewOutbound {
+                    id,
+                    channel: "discord",
+                    kind: "message",
+                    binding_ref: &format!("message:{id}:cairn://p/prj/general"),
+                    conversation: "discord:1/2",
+                    job_id: None,
+                    rendered_text: "earlier",
+                    rendering: "text",
+                    created_at: 1,
+                },
+            )
+            .await
+            .unwrap());
+        }
+        db.execute(
+            "UPDATE channel_outbound SET status = 'sent', provider_guid = '2:60', sent_at = 2 WHERE id = 'out-sent'",
+            (),
+        )
+        .await
+        .unwrap();
+        let runtime = crate::channels::register_test_runtime(
+            "discord",
+            crate::channels::titles::tests::TitledProvider::replying(native_reply),
+        );
+        (orch, runtime)
+    }
+
+    fn reply(reply_to: serde_json::Value) -> ChangeItem {
+        ChangeItem {
+            target: "cairn://channels/discord/prj/general".into(),
+            mode: ChangeMode::Append,
+            payload: Some(serde_json::json!({ "content": "answer", "replyTo": reply_to })),
+        }
+    }
+
+    /// `(reply_to, reply_to_guid)` of the one agent message `answer` queued.
+    async fn queued_reply(orch: &Orchestrator) -> (Option<String>, Option<String>) {
+        orch.db
+            .local
+            .query_opt(
+                "SELECT reply_to, reply_to_guid FROM channel_outbound WHERE rendered_text = 'answer'",
+                (),
+                |row| {
+                    use crate::storage::RowExt;
+                    Ok((row.opt_text(0)?, row.opt_text(1)?))
+                },
+            )
+            .await
+            .unwrap()
+            .expect("one reply was queued")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(channel_runtime)]
+    async fn a_reply_to_a_message_the_view_shows_records_its_native_reference() {
+        for (target, guid) in [("in-1", "2:50"), ("out-sent", "2:60")] {
+            let (orch, _runtime) = reply_fixture(true).await;
+            let applied = dispatch_resource_change(
+                &orch,
+                &request(Some("r-live")),
+                0,
+                &reply(serde_json::json!(target)),
+                false,
+            )
+            .await
+            .unwrap()
+            .summary;
+            assert!(
+                applied.contains(&format!("replying to {target};")),
+                "{applied}"
+            );
+            assert_eq!(
+                queued_reply(&orch).await,
+                (Some(target.to_string()), Some(guid.to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(channel_runtime)]
+    async fn a_reply_without_native_support_is_sent_plainly_and_says_so() {
+        let (orch, _runtime) = reply_fixture(false).await;
+        let applied = dispatch_resource_change(
+            &orch,
+            &request(Some("r-live")),
+            0,
+            &reply(serde_json::json!("in-1")),
+            false,
+        )
+        .await
+        .unwrap()
+        .summary;
+        assert!(
+            applied.contains("Discord cannot reply natively, so this is sent as a plain message"),
+            "{applied}"
+        );
+        assert_eq!(queued_reply(&orch).await, (Some("in-1".to_string()), None));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(channel_runtime)]
+    async fn a_reply_to_nothing_this_conversation_can_answer_is_refused_by_name() {
+        let (orch, _runtime) = reply_fixture(true).await;
+        let cases = [
+            (
+                serde_json::json!("nope"),
+                "replyTo 'nope' is not a message in #general · prj · Discord (cairn://channels/discord/prj/general)",
+            ),
+            (
+                serde_json::json!("in-other"),
+                "replyTo 'in-other' is not a message in #general · prj · Discord",
+            ),
+            (
+                serde_json::json!("out-pending"),
+                "message out-pending has not been delivered yet (pending), so there is nothing to reply to",
+            ),
+            (
+                serde_json::json!("in-old"),
+                "message in-old was recorded before Cairn kept provider message ids, so Discord cannot reply to it natively",
+            ),
+            (
+                serde_json::json!(7),
+                "payload.replyTo must be a message id string",
+            ),
+        ];
+        let count = || async {
+            orch.db
+                .local
+                .query_opt_i64("SELECT COUNT(*) FROM channel_outbound", ())
+                .await
+                .unwrap()
+        };
+        let before = count().await;
+        for (reply_to, expected) in cases {
+            let error = dispatch_resource_change(
+                &orch,
+                &request(Some("r-live")),
+                0,
+                &reply(reply_to.clone()),
+                false,
+            )
+            .await
+            .unwrap_err()
+            .error;
+            assert!(error.contains(expected), "{reply_to}: {error}");
+            assert_eq!(count().await, before, "{reply_to} ledgered nothing");
+        }
     }
 
     /// A thread reaches its own channel and its project's ambient channel; it

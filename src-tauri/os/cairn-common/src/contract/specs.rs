@@ -56,6 +56,11 @@ pub(crate) const CHANNEL_MESSAGE_CONTENT: KeySpec = KeySpec::new(
     KeyType::Str,
     "plain text, at most the provider's message limit",
 );
+pub(crate) const CHANNEL_MESSAGE_REPLY_TO: KeySpec = KeySpec::new(
+    "replyTo",
+    KeyType::Str,
+    "the id of an `in` or `out` message this conversation's view shows; sent as a native reply where the provider has one",
+);
 /// Node/task direct messages only. A project or issue channel append ignores
 /// this key, so declaring it there would advertise a promise that surface does
 /// not keep.

@@ -10,7 +10,7 @@ use serenity::{
         ButtonStyle, Channel, ChannelId, ChannelType, Context, CreateActionRow, CreateButton,
         CreateChannel, CreateInteractionResponse, CreateMessage, CreateThread, EditMessage,
         EditThread, EventHandler, GatewayIntents, GetMessages, GuildId, Interaction, Message,
-        MessageId, Permissions, Ready, ShardManager, UserId,
+        MessageId, MessageReference, Permissions, Ready, ShardManager, UserId,
     },
     client::ClientBuilder,
     http::{Http, HttpBuilder},
@@ -519,20 +519,21 @@ impl ChannelProvider for DiscordProvider {
             open_options: true,
             edit_in_place: true,
             max_text_len: Some(2000),
+            native_reply: true,
         }
     }
 
     async fn send(&self, message: &OutboundMessage) -> Result<SentIds, String> {
         let rendered = render_ask(&message.context_header, &message.ask);
         let channel = self.conversation_channel(&message.conversation)?;
+        let reply_to = message
+            .reply_to
+            .as_deref()
+            .map(|guid| parse_message(guid, channel))
+            .transpose()?;
         ensure_channel_sendable(self, channel.get()).await?;
         let sent = channel
-            .send_message(
-                &self.http,
-                CreateMessage::new()
-                    .content(rendered.text)
-                    .components(rendered.components),
-            )
+            .send_message(&self.http, create_message(rendered, channel, reply_to))
             .await
             .map_err(|error| {
                 self.record_failure(format!("could not send Discord message: {error}"))
@@ -732,6 +733,23 @@ struct RenderedAsk {
     components: Vec<CreateActionRow>,
 }
 
+/// The create-message body for a rendered ask, as a native reply to `reply_to`
+/// when one is given. A deleted original still sends, as a plain message.
+fn create_message(
+    rendered: RenderedAsk,
+    channel: ChannelId,
+    reply_to: Option<MessageId>,
+) -> CreateMessage {
+    let message = CreateMessage::new()
+        .content(rendered.text)
+        .components(rendered.components);
+    match reply_to {
+        Some(id) => message
+            .reference_message(MessageReference::from((channel, id)).fail_if_not_exists(false)),
+        None => message,
+    }
+}
+
 fn render_ask(header: &str, ask: &OutboundAsk) -> RenderedAsk {
     let (body, buttons) = match ask {
         OutboundAsk::Question {
@@ -883,11 +901,13 @@ fn map_message(
     let conversation = format!("discord:{guild_id}/{channel_id}");
     let sender = message.author.id.to_string();
     let text = message.content.clone();
+    let message_guid = Some(scoped_message_id(channel_id, message.id));
     if !allowed.contains(&message.author.id) {
         return Some(InboundEvent::Rejected {
             conversation,
             sender,
             text,
+            message_guid,
         });
     }
     match message.referenced_message.as_ref() {
@@ -896,11 +916,13 @@ fn map_message(
             bound_guid: scoped_message_id(channel_id, reply.id),
             sender,
             text,
+            message_guid,
         }),
         None => Some(InboundEvent::Bare {
             conversation,
             sender,
             text,
+            message_guid,
         }),
     }
 }
@@ -920,6 +942,7 @@ fn map_component(
             conversation,
             sender: component.user.id.to_string(),
             text: "Rejected Discord button interaction".into(),
+            message_guid: None,
         });
     }
     let (option_id, option_text) = component_option(&component.data.custom_id, &component.message)?;
@@ -1232,6 +1255,30 @@ mod tests {
         assert!(rendered.chars().count() <= 2000);
     }
 
+    /// A reply carries Discord's message reference, set not to fail when the
+    /// original is gone; a plain send carries none.
+    #[test]
+    fn a_reply_references_its_original_in_the_create_message_body() {
+        let notify = OutboundAsk::Notify { text: "hi".into() };
+        let channel = ChannelId::new(2);
+        let reply = serde_json::to_value(create_message(
+            render_ask("", &notify),
+            channel,
+            Some(parse_message("2:3", channel).unwrap()),
+        ))
+        .unwrap();
+        assert_eq!(reply["message_reference"]["message_id"], "3", "{reply}");
+        assert_eq!(reply["message_reference"]["channel_id"], "2", "{reply}");
+        assert_eq!(
+            reply["message_reference"]["fail_if_not_exists"], false,
+            "{reply}"
+        );
+        let plain =
+            serde_json::to_value(create_message(render_ask("", &notify), channel, None)).unwrap();
+        assert!(plain.get("message_reference").is_none(), "{plain}");
+        assert!(parse_message("9:3", channel).is_err());
+    }
+
     #[test]
     fn resolved_question_edit_shows_the_answer_and_removes_buttons() {
         let edit = serde_json::to_value(resolved_question_edit(&ResolvedQuestionMessage {
@@ -1262,7 +1309,8 @@ mod tests {
             Some(InboundEvent::Bare {
                 conversation: "discord:1/99".into(),
                 sender: "7".into(),
-                text: "hello".into()
+                text: "hello".into(),
+                message_guid: Some("99:10".into()),
             })
         );
         assert_eq!(
@@ -1271,6 +1319,24 @@ mod tests {
                 conversation: "discord:1/99".into(),
                 sender: "8".into(),
                 text: "ignored".into(),
+                message_guid: Some("99:10".into()),
+            })
+        );
+        let mut reply = serde_json::to_value(message(7, 99, "re")).unwrap();
+        reply["id"] = "11".into();
+        reply["referenced_message"] = serde_json::to_value(message(7, 99, "hello")).unwrap();
+        assert_eq!(
+            map_message(
+                &serde_json::from_value(reply).unwrap(),
+                GuildId::new(1),
+                &allowed
+            ),
+            Some(InboundEvent::Reply {
+                conversation: "discord:1/99".into(),
+                bound_guid: "99:10".into(),
+                sender: "7".into(),
+                text: "re".into(),
+                message_guid: Some("99:11".into()),
             })
         );
         assert_eq!(map_message(&bare, GuildId::new(2), &allowed), None);
