@@ -47,7 +47,7 @@ mod integration_tests {
             .unwrap();
         let local = crate::storage::migrated_test_db("wake-condition-integration.db").await;
         local
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES('p','w','P','P','/tmp',1,1);

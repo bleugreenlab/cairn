@@ -286,7 +286,7 @@ mod tests {
     async fn fixture(name: &str) -> (LocalDb, String) {
         let db = crate::storage::migrated_test_db(name).await;
         let thread_id = format!("thread-{name}").replace('.', "-");
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
              VALUES ('p','default','P','p','/tmp/p',1,1);
              INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at)

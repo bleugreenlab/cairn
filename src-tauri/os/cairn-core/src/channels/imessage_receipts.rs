@@ -156,7 +156,7 @@ mod tests {
         let other = "11111111-2222-3333-4444-555555555555";
         let inbound = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
         let unasked = "99999999-8888-7777-6666-555555555555";
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO message (guid, is_from_me, date_read) VALUES
                ('{GUID}', 1, 784000000000000000),
                ('{other}', 1, 0),

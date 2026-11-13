@@ -21,7 +21,7 @@ async fn seed_node(
     let execution_id = format!("exec-{project_key}-{exec_seq}");
     let job_id = format!("job-{project_key}-{node_segment}");
     local_db
-        .execute_script(&format!(
+        .execute_script(format!(
             "\
             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)\
              VALUES ('{issue_id}', '{project_id}', {issue_number}, 'Memory issue', 'active', 1, 1);\
@@ -212,7 +212,7 @@ async fn append_role_memory_scopes_by_agent_role_not_node_name() {
 
     // The recipe node segment is `agent-1`, but it runs the `builder` role.
     local_db
-        .execute_script(&format!(
+        .execute_script(format!(
             "\
             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)\
              VALUES ('issue-ROLE', '{project_id}', 1, 'Memory issue', 'active', 1, 1);\

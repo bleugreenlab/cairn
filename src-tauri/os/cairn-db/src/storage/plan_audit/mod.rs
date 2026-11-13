@@ -525,15 +525,12 @@ fn mix(hash: u64, word: u64) -> u64 {
 fn text_hash(text: &str) -> u64 {
     let bytes = text.as_bytes();
     let mut hash = bytes.len() as u64;
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        hash = mix(
-            hash,
-            u64::from_le_bytes(word.try_into().unwrap_or_default()),
-        );
+    let (words, remainder) = bytes.as_chunks::<8>();
+    for word in words {
+        hash = mix(hash, u64::from_le_bytes(*word));
     }
     let mut tail = [0u8; 8];
-    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    tail[..remainder.len()].copy_from_slice(remainder);
     mix(hash, u64::from_le_bytes(tail))
 }
 

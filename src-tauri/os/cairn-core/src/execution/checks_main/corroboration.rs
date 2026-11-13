@@ -477,11 +477,21 @@ mod tests {
             Decision::Corroborated(red.clone())
         );
         assert_eq!(
-            decide(HoldReason::HostCondition, &row, &[red.clone()], 10 * HOUR),
+            decide(
+                HoldReason::HostCondition,
+                &row,
+                std::slice::from_ref(&red),
+                10 * HOUR
+            ),
             Decision::Corroborated(red)
         );
         assert_eq!(
-            decide(HoldReason::Duration, &row, &[green.clone()], 10 * HOUR),
+            decide(
+                HoldReason::Duration,
+                &row,
+                std::slice::from_ref(&green),
+                10 * HOUR
+            ),
             Decision::Released(Release::GreenElsewhere(green))
         );
     }
@@ -492,7 +502,12 @@ mod tests {
         // A rerun of the same tree on the same host is not a second host.
         let rerun = seen("rerun", "fedora-id", "c1", 11 * HOUR, false);
         assert_eq!(
-            decide(HoldReason::Duration, &row, &[rerun.clone()], 11 * HOUR),
+            decide(
+                HoldReason::Duration,
+                &row,
+                std::slice::from_ref(&rerun),
+                11 * HOUR
+            ),
             Decision::Held {
                 until_ms: 16 * HOUR
             }
@@ -508,7 +523,12 @@ mod tests {
             Decision::Uncorroborated(WaitEnded::NextSameHostRow(again.clone()))
         );
         assert_eq!(
-            decide(HoldReason::HostCondition, &row, &[again.clone()], 12 * HOUR),
+            decide(
+                HoldReason::HostCondition,
+                &row,
+                std::slice::from_ref(&again),
+                12 * HOUR
+            ),
             Decision::Released(Release::HostCondition(WaitEnded::NextSameHostRow(again)))
         );
     }
@@ -520,7 +540,12 @@ mod tests {
         let newer_green = seen("green", "sp2-id", "c2", 11 * HOUR, true);
         let newer_red = seen("red", "sp2-id", "c3", 12 * HOUR, false);
         assert_eq!(
-            decide(HoldReason::Duration, &row, &[older_red.clone()], 11 * HOUR),
+            decide(
+                HoldReason::Duration,
+                &row,
+                std::slice::from_ref(&older_red),
+                11 * HOUR
+            ),
             Decision::Held {
                 until_ms: 16 * HOUR
             }
@@ -535,7 +560,12 @@ mod tests {
             Decision::Released(Release::GreenLater(newer_green))
         );
         assert_eq!(
-            decide(HoldReason::Duration, &row, &[newer_red.clone()], 12 * HOUR),
+            decide(
+                HoldReason::Duration,
+                &row,
+                std::slice::from_ref(&newer_red),
+                12 * HOUR
+            ),
             Decision::Released(Release::Superseded(newer_red))
         );
     }

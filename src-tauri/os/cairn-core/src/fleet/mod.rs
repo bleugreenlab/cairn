@@ -22005,6 +22005,7 @@ fn adopted_release_metadata(
         containment: None,
         stop: None,
         test_phase: None,
+        build_job_processes: None,
     }
 }
 

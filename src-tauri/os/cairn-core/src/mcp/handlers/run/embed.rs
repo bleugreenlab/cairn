@@ -370,8 +370,10 @@ mod tests {
             .to_string()
             + ")";
         let data = bytes[offset..]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         (shape, data)
     }

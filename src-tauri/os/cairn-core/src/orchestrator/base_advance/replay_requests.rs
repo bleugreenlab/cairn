@@ -368,7 +368,7 @@ async fn replay(
                         &planned.plan.carry.expected_pre_tip,
                     )
                     .await
-                    .map_err(&with_preamble)?,
+                    .map_err(with_preamble)?,
                 );
             }
             Some(planned)
@@ -376,7 +376,7 @@ async fn replay(
             if marker.is_none() {
                 let (base_branch, live, head) = literal_coordinates(db, &project.id, &store, ask)
                     .await
-                    .map_err(&with_preamble)?;
+                    .map_err(with_preamble)?;
                 // Accepted at the base the preparer will judge it against: an
                 // open session's base still ahead of the branch, else the
                 // live base. Its following round is then its own row.
@@ -386,7 +386,7 @@ async fn replay(
                 marker = Some(
                     accept(db, &project.id, &store, ask, &base_branch, &base, &head)
                         .await
-                        .map_err(&with_preamble)?,
+                        .map_err(with_preamble)?,
                 );
             }
             None
@@ -909,16 +909,16 @@ async fn serve_in(
         // would wake it before the next start.
         loop {
             match serve_one(orch, db, &request, budget).await {
-                Served::Served => served += 1,
-                Served::Held => {
+                ServeOutcome::Served => served += 1,
+                ServeOutcome::Held => {
                     held += 1;
                     break;
                 }
-                Served::Closed => {
+                ServeOutcome::Closed => {
                     closed += 1;
                     break;
                 }
-                Served::Skipped => break,
+                ServeOutcome::Skipped => break,
             }
             match conflict_session::load_pending_replay_request(
                 db,
@@ -937,7 +937,7 @@ async fn serve_in(
     (served, closed, held)
 }
 
-enum Served {
+enum ServeOutcome {
     Served,
     Held,
     Closed,
@@ -959,7 +959,7 @@ async fn serve_one(
     db: &LocalDb,
     request: &PendingReplayRequest,
     budget: Duration,
-) -> Served {
+) -> ServeOutcome {
     // From here the request's live owner is known: every close tells it,
     // once, through the one path.
     let close_noted = |kind: &'static str, reason: String, owner: String| async move {
@@ -977,14 +977,14 @@ async fn serve_one(
                 &format!("no live job owns `{}` any more", request.bookmark),
             )
             .await;
-            return Served::Closed;
+            return ServeOutcome::Closed;
         }
         Err(error) => {
             log::warn!(
                 "explicit replay recovery: owner of `{}`: {error}",
                 request.bookmark
             );
-            return Served::Skipped;
+            return ServeOutcome::Skipped;
         }
     };
     let store = Path::new(&request.store_path);
@@ -997,7 +997,7 @@ async fn serve_one(
                 owner,
             )
             .await;
-            return Served::Closed;
+            return ServeOutcome::Closed;
         }
     };
     if request.requested_tip.as_deref() != Some(head.as_str()) {
@@ -1011,7 +1011,7 @@ async fn serve_one(
                 .unwrap_or("an unrecorded tip")
         );
         close_noted("superseded", reason, owner).await;
-        return Served::Closed;
+        return ServeOutcome::Closed;
     }
     // A following round is worded against the base its parent landed.
     let landed_base = match request.parent_request_id.as_deref() {
@@ -1048,11 +1048,11 @@ async fn serve_one(
         }
     );
     match conflict_session::replay_request_state(db, request).await {
-        Ok(conflict_session::ReplayRequestState::Pending) => Served::Held,
-        Ok(_) => Served::Served,
+        Ok(conflict_session::ReplayRequestState::Pending) => ServeOutcome::Held,
+        Ok(_) => ServeOutcome::Served,
         Err(error) => {
             log::warn!("replay request `{}` state: {error}", request.id);
-            Served::Skipped
+            ServeOutcome::Skipped
         }
     }
 }

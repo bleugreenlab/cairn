@@ -1059,7 +1059,7 @@ pub(crate) enum SlotPublicationError {
     /// publication: the upload was installed, so its staging copy is spent.
     Held {
         consume_receipt: bool,
-        held: held::HeldDelta,
+        held: Box<held::HeldDelta>,
     },
     /// The branch moved while the batch ran and its changes conflict with what
     /// moved onto it. The delta is kept under a stranded ref.
@@ -1681,7 +1681,7 @@ async fn hold_slot_delta(
     drop(available);
     SlotPublicationError::Held {
         consume_receipt,
-        held,
+        held: Box::new(held),
     }
 }
 
@@ -3580,7 +3580,7 @@ pub(crate) mod slot_publication_tests {
         drop(guard);
 
         let held = match landed {
-            Err(SlotPublicationError::Held { held, .. }) => held,
+            Err(SlotPublicationError::Held { held, .. }) => *held,
             other => panic!("an unreserved landing is held, got {other:?}"),
         };
         assert_eq!(
@@ -4159,7 +4159,7 @@ pub(crate) mod slot_publication_tests {
         )
         .await
         {
-            Err(SlotPublicationError::Held { held, .. }) => held,
+            Err(SlotPublicationError::Held { held, .. }) => *held,
             other => panic!("expected the delta to be held, got {other:?}"),
         }
     }
@@ -4813,7 +4813,7 @@ pub(crate) mod slot_publication_tests {
         )
         .await;
         let held = match landed {
-            Err(SlotPublicationError::Held { held, .. }) => held,
+            Err(SlotPublicationError::Held { held, .. }) => *held,
             other => panic!("a batch in flight at landing holds it, got {other:?}"),
         };
         assert!(
@@ -4862,7 +4862,7 @@ pub(crate) mod slot_publication_tests {
             Err(SlotPublicationError::Held {
                 consume_receipt,
                 held,
-            }) => (consume_receipt, held),
+            }) => (consume_receipt, *held),
             other => panic!("expected the delta to be held, got {other:?}"),
         };
         assert!(

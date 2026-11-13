@@ -137,7 +137,7 @@ pub fn store_codex_sign_in(
         SignInTarget::New | SignInTarget::NewOrMatching => project_id,
     };
     let held = store
-        .held_oauth_account(ApiProvider::OpenAI, project_id.as_deref(), &same_login)
+        .held_oauth_account(ApiProvider::OpenAI, project_id.as_deref(), same_login)
         .map(|account| account.id.clone());
     target
         .admits(held.as_deref())

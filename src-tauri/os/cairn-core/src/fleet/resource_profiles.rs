@@ -150,7 +150,11 @@ async fn record_contention(
     finished: u64,
     multiplier_millis: u64,
 ) -> Result<(), String> {
-    for key in [context.executor_class.clone(), "*".into()] {
+    // Borrowed, not consumed: an array's by-value iterator held across these
+    // awaits nests deep enough in 1.99's std that proving the transport's
+    // invoke future Send overflows the trait-recursion limit (E0275).
+    for key in [context.executor_class.as_str(), "*"].iter() {
+        let key = key.to_string();
         let load = load.clone();
         db.write(move |conn| {
             let key = key.clone();

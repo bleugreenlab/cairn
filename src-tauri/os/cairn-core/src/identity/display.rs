@@ -162,7 +162,7 @@ mod tests {
 
     async fn seeded_db(name: &str) -> LocalDb {
         let db = crate::storage::migrated_test_db(name).await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO anon_device(device_id, created_at, updated_at) VALUES('{LOCAL}', 1, 1);
              INSERT INTO executor_enrollments(device_kind, enrolled_endpoint_id, device_id,
                  runner_device_id, credential_hash, enrolled_at, updated_at, expires_at,
@@ -208,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn the_local_presence_name_outranks_an_enrollment_name() {
         let db = crate::storage::migrated_test_db("principal-aliases-precedence.db").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO anon_device(device_id, created_at, updated_at) VALUES('{LOCAL}', 1, 1);
              INSERT INTO executor_enrollments(device_kind, enrolled_endpoint_id, device_id,
                  runner_device_id, credential_hash, enrolled_at, updated_at, expires_at,

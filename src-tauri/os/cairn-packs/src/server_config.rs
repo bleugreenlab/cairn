@@ -492,11 +492,11 @@ impl McpServerConfig {
         let map = |s: &str| expand_with(s, resolve);
         McpServerConfig {
             transport: self.transport.clone(),
-            command: self.command.as_deref().map(&map),
+            command: self.command.as_deref().map(map),
             args: self.args.iter().map(|a| map(a)).collect(),
             env: self.env.iter().map(|(k, v)| (k.clone(), map(v))).collect(),
-            cwd: self.cwd.as_deref().map(&map),
-            url: self.url.as_deref().map(&map),
+            cwd: self.cwd.as_deref().map(map),
+            url: self.url.as_deref().map(map),
             headers: self
                 .headers
                 .iter()

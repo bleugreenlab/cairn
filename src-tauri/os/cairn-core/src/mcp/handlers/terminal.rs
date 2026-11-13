@@ -3247,27 +3247,33 @@ pub(crate) enum TerminalWakeSubscriptionOutcome {
     OutputPersisted,
 }
 
+/// Who asked for a terminal and where and how it runs: what creation records
+/// on the target beyond the resource it names.
+pub(crate) struct TerminalPlacement<'a> {
+    pub(crate) caller_run_id: Option<&'a str>,
+    pub(crate) selector: Option<&'a ExecutorSelector>,
+    pub(crate) restart_policy: RestartPolicy,
+}
+
 pub(crate) async fn create_terminal_from_resource(
     orch: &Orchestrator,
     resource: &CairnResource,
     command: &str,
     description: Option<&str>,
     wake: Option<TerminalWakeSpec>,
-    caller_run_id: Option<&str>,
-    selector: Option<&ExecutorSelector>,
-    restart_policy: RestartPolicy,
+    placement: TerminalPlacement<'_>,
 ) -> Result<String, String> {
     let mut target = resolve_terminal_resource_target(&orch.db.local, resource)
         .await
         .map_err(|e| e.to_string())?;
-    target.selector = selector.cloned();
-    target.created_by_run_id = caller_run_id.map(ToOwned::to_owned);
-    target.restart_policy = restart_policy;
+    target.selector = placement.selector.cloned();
+    target.created_by_run_id = placement.caller_run_id.map(ToOwned::to_owned);
+    target.restart_policy = placement.restart_policy;
     let subscriber_job_id =
         match (&wake, target.job_id.as_deref()) {
             (Some(_), Some(job_id)) => Some(job_id.to_string()),
             (Some(_), None) => {
-                let run_id = caller_run_id.ok_or_else(|| {
+                let run_id = placement.caller_run_id.ok_or_else(|| {
                     "payload.wake requires an agent caller when creating a project terminal"
                         .to_string()
                 })?;
@@ -6752,9 +6758,11 @@ mod terminal_finalize_tests {
             "sleep 100",
             None,
             None,
-            Some("run-creator"),
-            None,
-            RestartPolicy::Auto,
+            TerminalPlacement {
+                caller_run_id: Some("run-creator"),
+                selector: None,
+                restart_policy: RestartPolicy::Auto,
+            },
         )
         .await
         .expect("creating an agent terminal should succeed");
@@ -6831,9 +6839,11 @@ mod terminal_finalize_tests {
             "sleep 100",
             None,
             None,
-            None,
-            Some(&selector),
-            RestartPolicy::Auto,
+            TerminalPlacement {
+                caller_run_id: None,
+                selector: Some(&selector),
+                restart_policy: RestartPolicy::Auto,
+            },
         )
         .await
         .expect("a create naming the platform its environment is on starts");
@@ -9241,7 +9251,7 @@ mod terminal_finalize_tests {
         orch.db
             .local
             .execute(
-                &format!(
+                format!(
                     "UPDATE job_terminals SET status='recovering' WHERE session_id='{session_id}'"
                 ),
                 (),

@@ -414,7 +414,7 @@ fn parents(r: &Replay, revision: &str) -> Vec<String> {
 }
 
 async fn count(r: &Replay, sql: &str) -> i64 {
-    r.db.query_text(&format!("SELECT CAST(({sql}) AS TEXT)"), ())
+    r.db.query_text(format!("SELECT CAST(({sql}) AS TEXT)"), ())
         .await
         .unwrap()
         .unwrap()

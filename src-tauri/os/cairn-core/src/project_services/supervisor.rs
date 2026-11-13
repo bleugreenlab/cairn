@@ -3111,7 +3111,7 @@ async fn send_call(
         id: id.clone(),
         method: request.method.clone(),
         params: request.params.clone(),
-        caller: request.caller.clone(),
+        caller: Box::new(request.caller.clone()),
         authority: Some(CallAuthority {
             run_id: run_id.clone(),
             token,

@@ -217,13 +217,16 @@ pub(crate) mod tests {
     use crate::models::UpdateSettings;
     use crate::orchestrator::models::ModelRuntime;
 
+    /// What one clip asked for: model, text, format and voice-style instructions.
+    type Asked = (String, String, String, Option<String>);
+
     /// An `audio/speech` server that answers every clip with the same chunks,
     /// each after `hold`, and records the model, text, format and voice-style
     /// instructions it was asked for.
     pub(crate) struct Voicebox {
         chunks: Vec<Vec<u8>>,
         hold: Duration,
-        pub(crate) asked: Mutex<Vec<(String, String, String, Option<String>)>>,
+        pub(crate) asked: Mutex<Vec<Asked>>,
         cancelled: Arc<AtomicBool>,
     }
 

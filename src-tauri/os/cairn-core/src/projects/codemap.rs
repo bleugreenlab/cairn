@@ -135,27 +135,20 @@ fn join_churn(tree: TreeProjection, churn: &HashMap<String, (i64, i64)>) -> Code
 /// One `codemap_cache` row as the read path sees it.
 pub(crate) struct CachedCodeMap {
     pub base_commit_sha: String,
-    pub computed_at: i64,
     /// Set when the project's base moved past this row. A stale row still
     /// serves — a map of the previous base answers better than nothing while the
     /// recompute runs — but it serves flagged.
     pub stale: bool,
-    pub file_count: i64,
-    pub edge_count: i64,
     pub codemap_json: String,
 }
 
-const CACHE_COLUMNS: &str =
-    "base_commit_sha, computed_at, invalidated_at, file_count, edge_count, codemap_json";
+const CACHE_COLUMNS: &str = "base_commit_sha, invalidated_at, codemap_json";
 
 fn row_to_cached(row: &cairn_db::turso::Row) -> cairn_db::storage::DbResult<CachedCodeMap> {
     Ok(CachedCodeMap {
         base_commit_sha: row.text(0)?,
-        computed_at: row.i64(1)?,
-        stale: row.opt_i64(2)?.is_some(),
-        file_count: row.i64(3)?,
-        edge_count: row.i64(4)?,
-        codemap_json: row.text(5)?,
+        stale: row.opt_i64(1)?.is_some(),
+        codemap_json: row.text(2)?,
     })
 }
 
@@ -687,8 +680,6 @@ mod tests {
 
         let cached = load_at_commit(&db, "p-map", "aaa").await.unwrap().unwrap();
         assert!(!cached.stale);
-        assert_eq!(cached.file_count, 2);
-        assert_eq!(cached.edge_count, 1);
         assert_eq!(
             serde_json::from_str::<TreeProjection>(&cached.codemap_json).unwrap(),
             map_at("aaa")
@@ -708,7 +699,10 @@ mod tests {
         assert!(cached.stale);
         // Still serving: a map of the previous base beats a blank surface while
         // the recompute runs.
-        assert_eq!(cached.file_count, 2);
+        assert_eq!(
+            serde_json::from_str::<TreeProjection>(&cached.codemap_json).unwrap(),
+            map_at("aaa")
+        );
         // Nothing left to invalidate on a second pass, so a storm of advances
         // does not keep rewriting rows.
         assert_eq!(invalidate(&db, "p-map").await.unwrap(), 0);

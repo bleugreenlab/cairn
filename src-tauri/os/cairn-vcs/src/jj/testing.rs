@@ -278,7 +278,7 @@ fn unique_commit_timestamp() -> String {
         .as_secs() as i64;
     let next = |last: i64| last.max(now - 1) + 1;
     let secs = next(
-        LAST.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
+        LAST.try_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
             .unwrap(),
     );
     // Civil date from days since the epoch (Howard Hinnant's algorithm).

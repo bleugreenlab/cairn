@@ -549,7 +549,7 @@ mod tests {
             owning_db_for_session(&dbs, "sess-1").await,
             owning_db_for_parent_tool_use(&dbs, "tool-use-1").await,
         ] {
-            let error = result.err().expect("a failed probe must not resolve");
+            let error = result.expect_err("a failed probe must not resolve");
             assert!(
                 matches!(error, CairnError::Storage(_)),
                 "expected the probe's storage error, got {error:?}"

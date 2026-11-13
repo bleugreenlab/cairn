@@ -117,8 +117,7 @@ fn asking_origin(request: &OperatorRequest) -> Option<&str> {
 /// call; an unreadable project costs the line, never the request.
 async fn attach_headlines(orch: &Orchestrator, requests: &mut [OperatorRequest]) {
     use std::collections::HashMap;
-    let mut indexes: HashMap<String, Option<(String, HashMap<String, headlines::HeadlineAbout>)>> =
-        HashMap::new();
+    let mut indexes: HashMap<String, Option<HeadlineIndex>> = HashMap::new();
     for request in requests.iter_mut() {
         let Some(origin) = asking_origin(request).map(str::to_string) else {
             continue;
@@ -137,14 +136,14 @@ async fn attach_headlines(orch: &Orchestrator, requests: &mut [OperatorRequest])
     }
 }
 
-/// One project's live headlines by `ref`, read from the database that owns it.
-async fn headline_index(
-    orch: &Orchestrator,
-    key: &str,
-) -> Option<(
+/// A project's canonical key and its live headlines by `ref`.
+type HeadlineIndex = (
     String,
     std::collections::HashMap<String, headlines::HeadlineAbout>,
-)> {
+);
+
+/// One project's live headlines by `ref`, read from the database that owns it.
+async fn headline_index(orch: &Orchestrator, key: &str) -> Option<HeadlineIndex> {
     for db in orch.db.all_dbs().await {
         let found = db
             .query_all(

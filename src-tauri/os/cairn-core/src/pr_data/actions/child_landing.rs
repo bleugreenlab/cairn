@@ -277,7 +277,7 @@ async fn rewrite_evidence(
         .map_err(|error| refuse(format!("the project's database is unavailable: {error}")))?;
     if crate::orchestrator::base_advance::preparation::live_branch_owner(&db, project, target)
         .await
-        .map_err(&refuse)?
+        .map_err(refuse)?
         .is_none()
     {
         return Err(refuse(format!(
@@ -292,7 +292,7 @@ async fn rewrite_evidence(
         target,
     )
     .await
-    .map_err(&refuse)?;
+    .map_err(refuse)?;
     Ok(claims
         .into_iter()
         .map(

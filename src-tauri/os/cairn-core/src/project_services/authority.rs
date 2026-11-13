@@ -227,7 +227,7 @@ pub(crate) struct ServiceRuns {
     /// Every batch each live delegated run started, so the call's logs name
     /// the code it ran: its request id, and the refusal it settled with when
     /// it never ran.
-    started: RwLock<HashMap<String, Vec<(String, Option<String>)>>>,
+    started: RwLock<HashMap<String, Vec<StartedBatch>>>,
     /// Runs whose call has begun ending. A batch that reaches `hold_batch`
     /// after this is not held but refused, so the gap between `stop_batches`
     /// and `remove` cannot leak a batch that runs to its own timeout.
@@ -244,9 +244,16 @@ pub(crate) trait BatchStop: Send + Sync {
     fn stop(&self, orch: &Orchestrator);
 }
 
+/// A batch a delegated run started: its request id, and the refusal it settled
+/// with when it never ran.
+type StartedBatch = (String, Option<String>);
+
+/// One in-flight batch: its request id and the way to stop it.
+type HeldBatch = (String, std::sync::Arc<dyn BatchStop>);
+
 /// The in-flight batches of each live delegated run, by request id.
 #[derive(Default)]
-struct HeldBatches(HashMap<String, Vec<(String, std::sync::Arc<dyn BatchStop>)>>);
+struct HeldBatches(HashMap<String, Vec<HeldBatch>>);
 
 impl std::fmt::Debug for HeldBatches {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -166,9 +166,11 @@ pub(super) async fn dispatch(
                         command,
                         description,
                         wake,
-                        request.run_id.as_deref(),
-                        selector.as_ref(),
-                        restart_policy,
+                        terminal::TerminalPlacement {
+                            caller_run_id: request.run_id.as_deref(),
+                            selector: selector.as_ref(),
+                            restart_policy,
+                        },
                     )
                     .await,
                 )

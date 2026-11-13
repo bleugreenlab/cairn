@@ -231,7 +231,7 @@ mod tests {
         if team {
             let team_db =
                 Arc::new(crate::storage::migrated_test_db("team-attention-team.db").await);
-            team_db.execute_script(&format!(
+            team_db.execute_script(format!(
                 "INSERT INTO teams(id,name,sync_url,replica_path,created_at) VALUES('{TEAM_ID}','Team','http://sync','/tmp/team.db',1);
                  INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
                  INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Project','proj','/tmp/repo',1,1);

@@ -359,7 +359,7 @@ pub fn toolchain_identity() -> &'static str {
     let mut held = IDENTITY
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *held.get_or_insert_with(|| Box::leak(probe_host_identity().into_boxed_str()))
+    held.get_or_insert_with(|| Box::leak(probe_host_identity().into_boxed_str()))
 }
 
 /// [`keyed_identity`] of [`toolchain_identity`]: what every key and environment

@@ -36,7 +36,7 @@ const BETA: &str = "run-beta";
 #[derive(Debug)]
 enum Outcome {
     /// No grant covers it: the write handler raises this card and moves nothing.
-    Card(AuthorityRequest),
+    Card(Box<AuthorityRequest>),
     Done(String),
     Refused(String),
 }
@@ -44,7 +44,7 @@ enum Outcome {
 impl Outcome {
     fn card(self) -> AuthorityRequest {
         match self {
-            Outcome::Card(request) => request,
+            Outcome::Card(request) => *request,
             other => panic!("expected a card, got {other:?}"),
         }
     }
@@ -94,7 +94,7 @@ async fn attempt(w: &World, run: Option<&str>, target: &str, payload: Value) -> 
                     .await
                     .unwrap();
                 if !decision.is_allowed() {
-                    return Outcome::Card(authority);
+                    return Outcome::Card(Box::new(authority));
                 }
             }
         }

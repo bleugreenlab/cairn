@@ -1482,9 +1482,9 @@ async fn land_if_unchanged(
     // The bind commit lands on the source bookmark, which the fold reads.
     let source_head = if prospect.binds {
         let bound = bind_prepared(store, merge_context, &prospect.prepared, &prospect.rules)
-            .map_err(&rollback)?;
+            .map_err(rollback)?;
         let tree = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head)
-            .map_err(&rollback)?;
+            .map_err(rollback)?;
         if tree != prospect.merge.tree_hash {
             log::warn!(
                 "landing: binding `{}` again produced tree {tree}, not the judged {}; judging again",
@@ -1512,7 +1512,7 @@ async fn land_if_unchanged(
     let fold = super::merge_metrics::time(super::merge_metrics::Phase::Fold);
     let commit = fold_validated_default(orch, merge_context, method, exact, &guard, reservation)
         .await
-        .map_err(&rollback)?;
+        .map_err(rollback)?;
     drop(fold);
     if merge_context.mr.is_local {
         // Only the two bookmarks move. The fold rewrote the source's commits
@@ -1557,7 +1557,7 @@ async fn land_if_unchanged(
     // prepared target and source until origin accepts it.
     let repo_path = merge_context.mr.repo_path.as_str();
     let set_aside = super::merge_metrics::time(super::merge_metrics::Phase::SetAside);
-    pin_landing(repo_path, journal.attempt_id, &commit).map_err(&rollback)?;
+    pin_landing(repo_path, journal.attempt_id, &commit).map_err(rollback)?;
     if let Err(error) = guard.undo_own_operations(&store.jj, &operation) {
         unpin_landing(repo_path, journal.attempt_id);
         return Err(format!(

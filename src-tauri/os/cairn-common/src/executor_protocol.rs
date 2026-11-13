@@ -8266,6 +8266,14 @@ pub struct LearnedResourceEstimate {
 /// bound reads back as assumed, which it was, and it reports no census, so
 /// the runner learns nothing from it. An older runner ignores the census and
 /// the reserve's source and sends no learned figure.
+///
+/// cairn/7084 does not move the number. Under the Rust 1.99.1 pin,
+/// `ProcessTreeAdoptionChange::Adopt` boxes its `ProcessTreeAdoption`, and the
+/// executor's CLI-refresh failure boxes the artifact it names; serde writes a
+/// box as its contents, so no frame changes shape. The macOS-only adopted-tree
+/// metadata in `fleet/mod.rs` now names `build_job_processes: None`, which an
+/// adopted tree never measured. What a runner gets wrong talking to an older
+/// executor: nothing.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -14166,7 +14174,7 @@ pub struct ProcessTreeAdoption {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum ProcessTreeAdoptionChange {
-    Adopt { adoption: ProcessTreeAdoption },
+    Adopt { adoption: Box<ProcessTreeAdoption> },
     Release { key: String },
 }
 
@@ -24038,7 +24046,7 @@ mod tests {
                 correlation_id: "adopt".into(),
                 expected_generation: 3,
                 change: ProcessTreeAdoptionChange::Adopt {
-                    adoption: adoption.clone(),
+                    adoption: Box::new(adoption.clone()),
                 },
             },
             ExecutorMessage::ProcessTreeAdoptionRequest {

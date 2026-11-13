@@ -164,6 +164,54 @@ fn renamed_home(home_uri: &str, item: &ChangeItem) -> Option<RenamedHome> {
     })
 }
 
+impl HomeTargets {
+    /// Why this item cannot be dispatched at all, if it cannot.
+    ///
+    /// `applied` is the batch's progress so far, which is what answers whether a
+    /// rename an item resolved through actually landed.
+    pub(super) fn blocked(&self, index: usize, applied: &[AppliedChange]) -> Option<String> {
+        match self.origins.get(index)?.as_ref()? {
+            Origin::Unresolved { shorthand, error } => Some(format!(
+                "`{shorthand}` names the calling run's home, which could not be resolved: {error}"
+            )),
+            Origin::Resolved {
+                shorthand,
+                resolved,
+                via_rename: Some(rename),
+            } => {
+                let landed = applied.iter().any(|change| change.index == rename.index);
+                (!landed).then(|| {
+                    format!(
+                        "item {index}'s `{shorthand}` resolves through item {}'s rename of this \
+                         run's thread to '{}', which did not apply — so `{resolved}` names \
+                         nothing. Nothing was written for this item; re-send it once the rename \
+                         lands.",
+                        rename.index, rename.new_name
+                    )
+                })
+            }
+            Origin::Resolved { .. } => None,
+        }
+    }
+
+    /// Restate a failure in terms of what the caller wrote.
+    ///
+    /// A home-derived item fails against a canonical URI the caller never typed,
+    /// and a bare `Thread 'executor' not found in cairn` then describes a lookup
+    /// rather than a cause. Naming the bridge — shorthand to canonical — is what
+    /// makes the rejection traceable back to the target as written.
+    pub(super) fn annotate(&self, index: usize, error: String) -> String {
+        match self.origins.get(index).and_then(Option::as_ref) {
+            Some(Origin::Resolved {
+                shorthand,
+                resolved,
+                ..
+            }) => format!("{error} (`{shorthand}` resolved to `{resolved}`)"),
+            _ => error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,53 +318,5 @@ mod tests {
             ),
         )
         .is_none());
-    }
-}
-
-impl HomeTargets {
-    /// Why this item cannot be dispatched at all, if it cannot.
-    ///
-    /// `applied` is the batch's progress so far, which is what answers whether a
-    /// rename an item resolved through actually landed.
-    pub(super) fn blocked(&self, index: usize, applied: &[AppliedChange]) -> Option<String> {
-        match self.origins.get(index)?.as_ref()? {
-            Origin::Unresolved { shorthand, error } => Some(format!(
-                "`{shorthand}` names the calling run's home, which could not be resolved: {error}"
-            )),
-            Origin::Resolved {
-                shorthand,
-                resolved,
-                via_rename: Some(rename),
-            } => {
-                let landed = applied.iter().any(|change| change.index == rename.index);
-                (!landed).then(|| {
-                    format!(
-                        "item {index}'s `{shorthand}` resolves through item {}'s rename of this \
-                         run's thread to '{}', which did not apply — so `{resolved}` names \
-                         nothing. Nothing was written for this item; re-send it once the rename \
-                         lands.",
-                        rename.index, rename.new_name
-                    )
-                })
-            }
-            Origin::Resolved { .. } => None,
-        }
-    }
-
-    /// Restate a failure in terms of what the caller wrote.
-    ///
-    /// A home-derived item fails against a canonical URI the caller never typed,
-    /// and a bare `Thread 'executor' not found in cairn` then describes a lookup
-    /// rather than a cause. Naming the bridge — shorthand to canonical — is what
-    /// makes the rejection traceable back to the target as written.
-    pub(super) fn annotate(&self, index: usize, error: String) -> String {
-        match self.origins.get(index).and_then(Option::as_ref) {
-            Some(Origin::Resolved {
-                shorthand,
-                resolved,
-                ..
-            }) => format!("{error} (`{shorthand}` resolved to `{resolved}`)"),
-            _ => error,
-        }
     }
 }

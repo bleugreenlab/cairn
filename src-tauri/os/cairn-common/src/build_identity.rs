@@ -28,15 +28,14 @@ pub fn executable_build_id(path: &Path) -> Result<String, String> {
             .map_err(|error| format!("read executable {}: {error}", path.display()))?;
         remaining -= read as u64;
         let bytes = &buffer[..read];
-        let mut words = bytes.chunks_exact(8);
-        for chunk in &mut words {
-            let word = u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
+        let (words, tail) = bytes.as_chunks::<8>();
+        for chunk in words {
+            let word = u64::from_le_bytes(*chunk);
             first = (first ^ word).wrapping_mul(0x100000001b3);
             first ^= first.rotate_right(29);
             second = (second ^ word.rotate_left(31) ^ first).wrapping_mul(0x9e3779b185ebca87);
             second ^= second.rotate_right(33);
         }
-        let tail = words.remainder();
         if !tail.is_empty() {
             let mut padded = [0_u8; 8];
             padded[..tail.len()].copy_from_slice(tail);

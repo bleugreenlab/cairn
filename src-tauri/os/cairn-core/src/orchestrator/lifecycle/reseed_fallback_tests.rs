@@ -41,7 +41,7 @@ async fn seed_crashed_run(
     exit_reason: Option<&str>,
 ) {
     let exit_reason = exit_reason.map_or("NULL".to_string(), |reason| format!("'{reason}'"));
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-reseed','W',1,1);
          INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
            VALUES ('p-reseed','w-reseed','Project','prj','/tmp/prj',1,1);

@@ -20,7 +20,7 @@ use cairn_core::messages::queued::{enqueue_idempotent, DeliveryUrgency};
 use cairn_db::turso::params;
 
 async fn seed_thread_session(db: &LocalDb, status: &str) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
            VALUES ('proj-1','default','Test Project','PROJ','/tmp/test-repo',1,1);
          INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
@@ -257,7 +257,7 @@ async fn a_push_queued_before_closure_survives_dormancy_and_delivers_after_reope
 
 async fn count(db: &LocalDb, predicate: &str) -> i64 {
     db.query_one(
-        &format!("SELECT COUNT(*) FROM attention_pushes WHERE {predicate}"),
+        format!("SELECT COUNT(*) FROM attention_pushes WHERE {predicate}"),
         (),
         |row| row.i64(0),
     )

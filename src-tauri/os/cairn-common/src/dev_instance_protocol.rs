@@ -169,7 +169,7 @@ pub enum DevInstanceLaunchFailure {
     AdmissionRefused {
         diagnostic: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<CellUnavailableReason>,
+        reason: Option<Box<CellUnavailableReason>>,
     },
     MaterializationPublication {
         diagnostic: String,
@@ -240,7 +240,7 @@ impl DevInstanceLaunchFailure {
             },
             Some(CellOutcome::Unavailable { reason, diagnostic }) => Self::AdmissionRefused {
                 diagnostic,
-                reason: Some(reason),
+                reason: Some(Box::new(reason)),
             },
             Some(CellOutcome::FailedAfterExecution { diagnostic, .. }) => {
                 Self::MaterializationPublication { diagnostic }
@@ -372,9 +372,9 @@ mod tests {
         failures.extend([
             DevInstanceLaunchFailure::AdmissionRefused {
                 diagnostic: "full".into(),
-                reason: Some(CellUnavailableReason::AdmissionRejected {
+                reason: Some(Box::new(CellUnavailableReason::AdmissionRejected {
                     reason: AdmissionRejectionReason::QueueFull,
-                }),
+                })),
             },
             DevInstanceLaunchFailure::MaterializationStorage {
                 diagnostic: "disk full".into(),
@@ -510,11 +510,14 @@ mod tests {
                 Some(unavailable)
             ),
             DevInstanceLaunchFailure::AdmissionRefused {
-                reason: Some(CellUnavailableReason::AdmissionRejected {
-                    reason: AdmissionRejectionReason::Draining
-                }),
+                reason: Some(reason),
                 ..
-            }
+            } if matches!(
+                *reason,
+                CellUnavailableReason::AdmissionRejected {
+                    reason: AdmissionRejectionReason::Draining
+                }
+            )
         ));
     }
 

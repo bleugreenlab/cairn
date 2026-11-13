@@ -226,6 +226,10 @@ fn a_plan_gated_format_refusal_names_the_format_and_the_plan() {
 
 /// A one-connection stream-input server: records the handshake, then hands
 /// the socket to `script`.
+#[allow(
+    clippy::result_large_err,
+    reason = "tungstenite's handshake Callback fixes the closure's Err to its own ErrorResponse"
+)]
 fn serve<F>(script: F) -> (String, mpsc::Receiver<(String, Option<String>)>)
 where
     F: FnOnce(&mut tungstenite::WebSocket<std::net::TcpStream>) + Send + 'static,

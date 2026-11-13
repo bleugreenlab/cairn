@@ -457,7 +457,7 @@ mod tests {
         ]});
         let output = format!("noise\n{PLAN_RESULT_MARKER}{plan}\n");
         let documents = marked_documents(&output, PLAN_RESULT_MARKER);
-        assert_eq!(documents, [plan.clone()]);
+        assert_eq!(documents, std::slice::from_ref(&plan));
         let targets = planned_targets(&documents[0]);
         assert_eq!(
             targets

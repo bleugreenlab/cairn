@@ -105,7 +105,7 @@ pub(crate) enum RunnerFrame {
         id: String,
         method: String,
         params: Value,
-        caller: CallerFrame,
+        caller: Box<CallerFrame>,
         #[serde(skip_serializing_if = "Option::is_none")]
         authority: Option<CallAuthority>,
         /// Unix milliseconds.
@@ -322,7 +322,7 @@ mod tests {
             id: "c-1".into(),
             method: "echo".into(),
             params: json!({"hi": 1}),
-            caller: CallerFrame {
+            caller: Box::new(CallerFrame {
                 kind: CallerKind::Agent,
                 acting_for: "cairn://p/cairn/12/1/builder".into(),
                 agent: Some(PrincipalRef::Agent {
@@ -331,7 +331,7 @@ mod tests {
                 }),
                 viewer: None,
                 instrument: None,
-            },
+            }),
             authority: None,
             deadline_ms: 42,
         };

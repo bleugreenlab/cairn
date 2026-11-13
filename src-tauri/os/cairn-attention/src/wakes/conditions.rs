@@ -508,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn unmute_resets_the_persisted_edge() {
         let (db, condition) = fixture().await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "UPDATE wake_conditions SET last_outcome = 'matched' WHERE id = '{}'",
             condition.id
         ))
@@ -540,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn stale_quiet_evaluation_cannot_overwrite_a_newer_fired_edge() {
         let (db, condition) = fixture().await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "UPDATE wake_conditions SET last_outcome = 'matched', last_fired_at = 2 WHERE id = '{}'",
             condition.id
         ))

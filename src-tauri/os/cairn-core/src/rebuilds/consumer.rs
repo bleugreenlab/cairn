@@ -1425,7 +1425,9 @@ impl RebuildConsumer {
             .change(
                 orch,
                 generation,
-                ProcessTreeAdoptionChange::Adopt { adoption },
+                ProcessTreeAdoptionChange::Adopt {
+                    adoption: Box::new(adoption),
+                },
             )
             .await
         {
