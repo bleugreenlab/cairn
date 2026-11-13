@@ -8266,7 +8266,6 @@ pub struct LearnedResourceEstimate {
 /// bound reads back as assumed, which it was, and it reports no census, so
 /// the runner learns nothing from it. An older runner ignores the census and
 /// the reserve's source and sends no learned figure.
-///
 /// cairn/7084 does not move the number. Under the Rust 1.99.1 pin,
 /// `ProcessTreeAdoptionChange::Adopt` boxes its `ProcessTreeAdoption`, and the
 /// executor's CLI-refresh failure boxes the artifact it names; serde writes a
@@ -8288,6 +8287,16 @@ pub struct LearnedResourceEstimate {
 /// `allow` fence. No frame, variant or field changes, and the runner appends
 /// its request offer itself. What a runner gets wrong talking to an older
 /// executor: nothing; the refusal it relays still reads the older sentence.
+///
+/// cairn/6263 does not move the number. A command's memory charge is priced
+/// at the build jobs it is granted, from the `buildJobMemory` cairn/5685
+/// already sends, and admission prices a request at the width it would be
+/// granted; `ProcessMisfit` gains an optional `boundBytes` and
+/// `ReservationRationale` an optional `buildJobsPrice`, each defaulted and
+/// skipped when absent. No frame changes shape. What a runner gets wrong
+/// talking to an older executor: nothing; that executor charges the whole
+/// figure it always has, which only admits less. An older runner ignores
+/// `boundBytes` and renders the misfit by the machine's total.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10448,6 +10457,30 @@ pub struct BuildJobMemoryEvidence {
     pub samples: u32,
 }
 
+impl BuildJobMemoryEvidence {
+    /// What this work holds at `jobs` build jobs: its largest job, and the
+    /// typical job for each further one. The one model both the jobs a
+    /// command is granted and the memory it is charged are read from, so a
+    /// grant's charge never exceeds the memory it was sized to fit.
+    ///
+    /// No headroom is added: each figure is already a rise-only high-water
+    /// mark of one process at its own peak, and a compile's jobs rarely peak
+    /// together, so the sum is itself an upper estimate of the tree.
+    pub fn bytes_at(&self, jobs: u32) -> u64 {
+        let further = u64::from(jobs.max(1) - 1);
+        self.largest_bytes
+            .saturating_add(further.saturating_mul(self.typical_bytes))
+    }
+
+    /// The most build jobs whose [`Self::bytes_at`] fits in `bytes`, never
+    /// below one: a machine that cannot hold the largest job beside nothing
+    /// is the single-process fit's question, not the width's.
+    pub fn jobs_within(&self, bytes: u64) -> u32 {
+        let further = bytes.saturating_sub(self.largest_bytes) / self.typical_bytes.max(1);
+        u32::try_from(further).unwrap_or(u32::MAX).saturating_add(1)
+    }
+}
+
 /// A suite's test phase as measured on one machine: rise-only high-water
 /// marks of its lane's process tree from the moment nextest started its tests
 /// until a compile began again.
@@ -10502,6 +10535,52 @@ impl ResourceReservation {
     /// memory: its reservation, or its measured peak where that is larger.
     pub fn memory_charge_bytes(&self) -> u64 {
         self.memory_bytes.max(self.measured_peak_bytes.unwrap_or(0))
+    }
+
+    /// What this work is charged compiling at `jobs` build jobs, from its build
+    /// jobs as measured on this machine ([`BuildJobMemoryEvidence::bytes_at`]),
+    /// or `None` where none were measured here, which keeps
+    /// [`Self::memory_charge_bytes`].
+    ///
+    /// A process tree's peak grows with the width the run that measured it was
+    /// granted, so a whole-suite peak taken at 32 jobs charged a lane granted
+    /// four as if it ran 32 (cairn/6263). Per-process figures do not depend on
+    /// the width, so they price any width. A learned reservation is this
+    /// machine's own measured tree, which no width it grants exceeds, so the
+    /// charge is never above it; any other reservation is a prior, and the
+    /// measured jobs replace it. A declared reservation is the caller's own
+    /// statement and stands.
+    pub fn compile_charge_bytes(&self, jobs: u32) -> Option<u64> {
+        let at_width = self.build_job_memory?.bytes_at(jobs);
+        match self.source {
+            ResourceReservationSource::Learned => Some(at_width.min(self.memory_charge_bytes())),
+            ResourceReservationSource::Unmeasured => Some(at_width),
+            ResourceReservationSource::Declared => None,
+        }
+    }
+
+    /// The build jobs this work is priced at when it is admitted: `cpu_width`,
+    /// held to the jobs `memory_left` (available memory less what admitted
+    /// work owes) holds at its measured job sizes, so a lane that cannot run
+    /// wide is admitted narrow rather than refused at a width another machine
+    /// granted. `None` without build jobs measured on this machine, which
+    /// prices the work whole.
+    ///
+    /// The executor passes its elastic width; the runner, which cannot see
+    /// how the bulk budget is split, passes no width limit, so its forecast
+    /// is never narrower than the executor's answer and never refuses a
+    /// machine the executor would admit.
+    pub fn admission_build_jobs(&self, cpu_width: u32, memory_left: Option<u64>) -> Option<u32> {
+        let evidence = self.build_job_memory?;
+        let cpu_width = cpu_width.max(1);
+        Some(memory_left.map_or(cpu_width, |left| cpu_width.min(evidence.jobs_within(left))))
+    }
+
+    /// [`Self::compile_charge_bytes`] at `jobs` where the width is known,
+    /// else the whole charge.
+    pub fn memory_charge_at(&self, jobs: Option<u32>) -> u64 {
+        jobs.and_then(|jobs| self.compile_charge_bytes(jobs))
+            .unwrap_or_else(|| self.memory_charge_bytes())
     }
 
     /// What a lane of this work is charged once its test phase has been
@@ -10643,24 +10722,112 @@ mod lane_charge_tests {
         );
         assert_eq!(lane_memory_charge(&lane(), None, eight), (31 * GIB, None));
     }
+
+    /// The rust-tests lane above as this machine measured it: a 31 GiB tree,
+    /// a 20 GiB largest job (cairn-core's test rustc), 1 GiB typical ones.
+    fn measured_jobs(source: ResourceReservationSource) -> ResourceReservation {
+        ResourceReservation {
+            source,
+            build_job_memory: Some(BuildJobMemoryEvidence {
+                largest_bytes: 20 * GIB,
+                typical_bytes: GIB,
+                samples: 3,
+            }),
+            ..lane()
+        }
+    }
+
+    #[test]
+    fn a_compile_is_charged_at_the_build_jobs_it_was_granted() {
+        let learned = measured_jobs(ResourceReservationSource::Learned);
+        let compiling = Some(LanePhase::Compile);
+        let jobs = |jobs| Some(BuildJobs::new(jobs, None));
+        // Four jobs: the largest, and three typical beside it.
+        assert_eq!(
+            lane_memory_charge(&learned, compiling, jobs(4)),
+            (23 * GIB, Some(ChargedPhase::Compile))
+        );
+        assert_eq!(
+            lane_memory_charge(&learned, None, jobs(4)),
+            (23 * GIB, None),
+            "a command that is not a phased lane is priced at its width too"
+        );
+        assert_eq!(
+            lane_memory_charge(&learned, compiling, jobs(32)).0,
+            31 * GIB,
+            "a learned tree is the most any width granted here holds"
+        );
+        assert_eq!(
+            lane_memory_charge(&learned, compiling, None).0,
+            31 * GIB,
+            "an unknown width keeps the whole charge"
+        );
+        assert_eq!(
+            lane_memory_charge(&lane(), compiling, jobs(4)).0,
+            31 * GIB,
+            "no build jobs measured here keeps the whole charge, fail-closed"
+        );
+        // A prior is not a measurement of the tree, so the measured jobs
+        // replace it in both directions.
+        let prior = measured_jobs(ResourceReservationSource::Unmeasured);
+        assert_eq!(lane_memory_charge(&prior, compiling, jobs(4)).0, 23 * GIB);
+        assert_eq!(lane_memory_charge(&prior, compiling, jobs(32)).0, 51 * GIB);
+        // A caller's stated reservation stands.
+        let declared = measured_jobs(ResourceReservationSource::Declared);
+        assert_eq!(
+            lane_memory_charge(&declared, compiling, jobs(4)).0,
+            31 * GIB
+        );
+        // The test phase is priced by its own evidence, as before.
+        let testing = Some(LanePhase::Test {
+            since_unix_ms: 0,
+            tests: 1_000,
+        });
+        assert_eq!(lane_memory_charge(&learned, testing, jobs(8)).0, 5 * GIB);
+    }
+
+    #[test]
+    fn the_jobs_a_share_holds_are_the_widest_whose_charge_fits_it() {
+        let evidence = BuildJobMemoryEvidence {
+            largest_bytes: 20 * GIB,
+            typical_bytes: 3 * GIB / 2,
+            samples: 1,
+        };
+        for jobs in 1..64 {
+            assert_eq!(evidence.jobs_within(evidence.bytes_at(jobs)), jobs);
+            if jobs > 1 {
+                assert_eq!(evidence.jobs_within(evidence.bytes_at(jobs) - 1), jobs - 1);
+            }
+        }
+        assert_eq!(evidence.jobs_within(0), 1, "never zero jobs");
+        assert_eq!(evidence.bytes_at(0), 20 * GIB, "zero jobs is read as one");
+        let bound = MemoryJobBound::learned(41 * GIB, 1, evidence, 1);
+        assert_eq!(bound.jobs, 15);
+        assert!(evidence.bytes_at(bound.jobs) <= 41 * GIB);
+    }
 }
 
 /// What admission charges a running command against memory, and the phase
 /// that charge belongs to (`None` for a command that is not a phased lane).
 ///
-/// A lane in its test phase is charged the learned test-phase figure at the
-/// tests it can run at once: the smaller of the test threads it was granted
-/// and the tests it started. Anything short of that evidence keeps the
-/// whole-suite charge.
+/// One function over the three things a charge depends on: the phase, the
+/// width the command was granted, and its measured per-process peaks. A
+/// command compiling (or not a phased lane) is charged at the build jobs it
+/// was granted ([`ResourceReservation::compile_charge_bytes`]), so a lane
+/// held narrow on a small machine is priced narrow. A lane in its test phase
+/// is charged the learned test-phase figure at the tests it can run at once:
+/// the smaller of the test threads it was granted and the tests it started.
+/// Anything short of that evidence keeps the whole-suite charge.
 pub fn lane_memory_charge(
     reservation: &ResourceReservation,
     phase: Option<LanePhase>,
     build_jobs: Option<BuildJobs>,
 ) -> (u64, Option<ChargedPhase>) {
     let whole = reservation.memory_charge_bytes();
+    let compiling = reservation.memory_charge_at(build_jobs.map(|jobs| jobs.jobs));
     match phase {
-        None => (whole, None),
-        Some(LanePhase::Compile) => (whole, Some(ChargedPhase::Compile)),
+        None => (compiling, None),
+        Some(LanePhase::Compile) => (compiling, Some(ChargedPhase::Compile)),
         Some(LanePhase::Test {
             since_unix_ms,
             tests,
@@ -11777,7 +11944,9 @@ impl MemoryJobBound {
 
     /// The jobs the command's share of the available memory holds at its
     /// learned job sizes: its largest job, then as many typical ones as fit
-    /// beside it, `1 + (share - largest) / typical`.
+    /// beside it, `1 + (share - largest) / typical`
+    /// ([`BuildJobMemoryEvidence::jobs_within`]), the same model its memory
+    /// is charged by.
     ///
     /// The jobs a past run used do not enter: both figures are single
     /// processes' peaks, so a run held to one job teaches the same sizes as
@@ -11789,9 +11958,7 @@ impl MemoryJobBound {
         sharers: u32,
     ) -> Self {
         let sharers = sharers.max(1);
-        let share = available_bytes / u64::from(sharers);
-        let further = share.saturating_sub(evidence.largest_bytes) / evidence.typical_bytes.max(1);
-        let jobs = u32::try_from(further).unwrap_or(u32::MAX).saturating_add(1);
+        let jobs = evidence.jobs_within(available_bytes / u64::from(sharers));
         Self {
             jobs,
             available_bytes,
@@ -19426,6 +19593,26 @@ pub struct ReservationRationale {
     /// victim floors the memory reservation whatever the profile says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_kill: Option<MemoryKill>,
+    /// The build jobs an unmeasured reservation was priced at on this
+    /// machine, when its suite's per-process figures set the memory number
+    /// rather than a prior or another machine's process tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_jobs_price: Option<BuildJobsPrice>,
+}
+
+/// A reservation priced at the width a machine grants: its largest build job
+/// and the typical one for each further job ([`BuildJobMemoryEvidence`]), at
+/// the jobs the machine's CPU width and memory cap allow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildJobsPrice {
+    pub jobs: u32,
+    pub largest_bytes: u64,
+    pub typical_bytes: u64,
+    /// The machine context (`device:executor`) the figures were measured in,
+    /// or `None` for this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_on: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -20549,6 +20736,13 @@ pub struct ProcessMisfit {
     /// capacity is the reservation cap instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub standing_bytes: Option<u64>,
+    /// The memory bound the executor's service unit enforces
+    /// ([`ServiceBounds::memory_max_bytes`]), when that, rather than the
+    /// machine's total less its standing use, is what one process can have:
+    /// the kernel kills a cell's process at the bound whatever the machine
+    /// holds free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_bytes: Option<u64>,
     /// Kills of this suite on this machine at this total while it ran alone
     /// there, under the machine's current admission, when the count rather
     /// than the size decided the misfit.
@@ -20674,14 +20868,19 @@ impl ProcessMisfit {
             self.measured_here,
             &self.basis,
         );
-        let capacity = match self.standing_bytes {
-            Some(standing) => format!(
+        let capacity = match (self.bound_bytes, self.standing_bytes) {
+            (Some(bound), _) => format!(
+                "this machine can give one process {} (its executor's memory bound, on a {} machine)",
+                describe_gib(bound),
+                describe_gib(self.total_bytes)
+            ),
+            (None, Some(standing)) => format!(
                 "this machine can give one process {} ({} total, {} standing)",
                 describe_gib(self.capacity_bytes),
                 describe_gib(self.total_bytes),
                 describe_gib(standing)
             ),
-            None => format!(
+            (None, None) => format!(
                 "this machine can give one process {} ({} total; its standing use is unmeasured, so this is its reservation cap)",
                 describe_gib(self.capacity_bytes),
                 describe_gib(self.total_bytes)
@@ -26062,6 +26261,7 @@ mod tests {
                     headroom_percent: 25,
                     fallback: None,
                     memory_kill: None,
+                    build_jobs_price: None,
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,

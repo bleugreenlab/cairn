@@ -17954,6 +17954,7 @@ fn process_fit(
         entry.health.machine.memory.value()?.total_bytes,
         entry.health.memory_record.standing_bytes,
         entry.advertisement.capabilities.memory_budget_bytes,
+        executor_memory_bound(entry),
         &format!(
             "{}:{}",
             entry.identity.device_id, entry.identity.executor_id
@@ -17979,6 +17980,7 @@ fn judge_process_evidence(
     total_bytes: u64,
     standing_bytes: Option<u64>,
     memory_budget_bytes: Option<u64>,
+    bound_bytes: Option<u64>,
     here: &str,
     kernel_kills: bool,
 ) -> Option<ProcessFit> {
@@ -17989,6 +17991,7 @@ fn judge_process_evidence(
             total_bytes,
             standing_bytes,
             memory_budget_bytes,
+            bound_bytes,
             here,
         )
     };
@@ -18017,9 +18020,16 @@ fn judge_process_fit(
     total_bytes: u64,
     standing_bytes: Option<u64>,
     memory_budget_bytes: Option<u64>,
+    bound_bytes: Option<u64>,
     here: &str,
 ) -> Option<cairn_common::executor_protocol::ProcessMisfit> {
-    let capacity_bytes = single_process_capacity(total_bytes, standing_bytes, memory_budget_bytes);
+    let unbounded = single_process_capacity(total_bytes, standing_bytes, memory_budget_bytes, None);
+    let capacity_bytes = single_process_capacity(
+        total_bytes,
+        standing_bytes,
+        memory_budget_bytes,
+        bound_bytes,
+    );
     let too_large = demand.peak_bytes > 0 && demand.demand_bytes() > capacity_bytes;
     let killed_out = demand.kills_here.as_ref().filter(|kills| {
         kills.alone >= KILLS_THAT_END_FIT
@@ -18043,6 +18053,7 @@ fn judge_process_fit(
         capacity_bytes,
         total_bytes,
         standing_bytes,
+        bound_bytes: bound_bytes.filter(|bound| *bound < unbounded),
         kills_here: (!too_large)
             .then_some(killed_out)
             .flatten()
@@ -18056,17 +18067,34 @@ fn judge_process_fit(
 }
 
 /// What a machine can give one process: its total less its standing use,
-/// or, from an executor that posts no standing use, its reservation cap.
+/// or, from an executor that posts no standing use, its reservation cap; and
+/// never more than the memory bound its executor's service unit enforces,
+/// past which the kernel kills a cell's process whatever the machine has
+/// free (cairn/6994). A 15.4 GiB machine whose executor is bound at 11.25 GiB
+/// cannot finish a 21.6 GiB rustc, and saying 13 GiB would admit one that
+/// cannot fit there and is killed.
 fn single_process_capacity(
     total_bytes: u64,
     standing_bytes: Option<u64>,
     memory_budget_bytes: Option<u64>,
+    bound_bytes: Option<u64>,
 ) -> u64 {
-    match (standing_bytes, memory_budget_bytes) {
+    let room = match (standing_bytes, memory_budget_bytes) {
         (Some(standing), _) => total_bytes.saturating_sub(standing),
         (None, Some(budget)) => resource_profiles::memory_reservation_cap(budget),
         (None, None) => total_bytes,
-    }
+    };
+    bound_bytes.map_or(room, |bound| room.min(bound))
+}
+
+/// The memory bound a connected machine's executor unit enforces, when it
+/// reported one.
+fn executor_memory_bound(entry: &ExecutorConnectionState) -> Option<u64> {
+    entry
+        .advertisement
+        .capabilities
+        .service_bounds
+        .and_then(|bounds| bounds.memory_max_bytes)
 }
 
 /// [`single_process_capacity`] for a connected machine, `None` while its
@@ -18076,6 +18104,7 @@ fn entry_process_capacity(entry: &ExecutorConnectionState) -> Option<u64> {
         entry.health.machine.memory.value()?.total_bytes,
         entry.health.memory_record.standing_bytes,
         entry.advertisement.capabilities.memory_budget_bytes,
+        executor_memory_bound(entry),
     ))
 }
 
@@ -18429,12 +18458,14 @@ mod process_fit_tests {
             unmeasured_compile: false,
             test_phase: None,
             build_job_memory: None,
+            build_jobs_elsewhere: None,
         };
         match judge_process_evidence(
             &evidence,
             total_bytes,
             standing_bytes,
             memory_budget_bytes,
+            None,
             here,
             true,
         )? {
@@ -18547,11 +18578,12 @@ mod process_fit_tests {
             unmeasured_compile: false,
             test_phase: None,
             build_job_memory: None,
+            build_jobs_elsewhere: None,
         };
         let budget = Some(24 * GIB / 100 * 85);
         for kernel_kills in [false, true] {
             let Some(ProcessFit::Waived(waiver)) =
-                judge_process_evidence(&evidence, 24 * GIB, None, budget, here, kernel_kills)
+                judge_process_evidence(&evidence, 24 * GIB, None, budget, None, here, kernel_kills)
             else {
                 panic!("an unnamed peak never refuses (kernel kills: {kernel_kills})");
             };
@@ -18581,12 +18613,14 @@ mod process_fit_tests {
             unmeasured_compile: false,
             test_phase: None,
             build_job_memory: None,
+            build_jobs_elsewhere: None,
         };
         let judge = |kernel_kills| {
             judge_process_evidence(
                 &evidence,
                 13 * GIB,
                 Some(2 * GIB),
+                None,
                 None,
                 "m-device:m",
                 kernel_kills,
@@ -18622,9 +18656,18 @@ mod process_fit_tests {
             unmeasured_compile: false,
             test_phase: None,
             build_job_memory: None,
+            build_jobs_elsewhere: None,
         };
         assert_eq!(
-            judge_process_evidence(&evidence, 13 * GIB, Some(GIB), None, "m-device:m", true),
+            judge_process_evidence(
+                &evidence,
+                13 * GIB,
+                Some(GIB),
+                None,
+                None,
+                "m-device:m",
+                true
+            ),
             None
         );
     }
@@ -18711,7 +18754,7 @@ mod process_fit_tests {
         .await;
         let evidence = evidence_on_ub(db, &id).await;
         let Some(ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(misfit))) =
-            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
+            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, None, UB, true)
         else {
             panic!("a borrowed measurement refuses like one taken here: {evidence:?}");
         };
@@ -18721,10 +18764,83 @@ mod process_fit_tests {
             "{text}"
         );
         assert_eq!(
-            judge_process_evidence(&evidence, 62 * GIB, Some(4 * GIB), None, "bbs:bbs", true),
+            judge_process_evidence(
+                &evidence,
+                62 * GIB,
+                Some(4 * GIB),
+                None,
+                None,
+                "bbs:bbs",
+                true
+            ),
             None,
             "a 62 GiB machine holds it"
         );
+    }
+
+    /// cairn/6263 on bgsrv-ub2 (15.4 GiB, 2 GiB standing, executor bound at
+    /// 11.25 GiB by cairn/6994): a rustc measured at 10 GiB needs ~12.5 GiB,
+    /// which the machine's total less its standing use would give it, but the
+    /// kernel kills a cell's process at the bound. Refused by the bound, by
+    /// name; an unbounded machine of the same size still takes it.
+    #[test]
+    fn the_executors_memory_bound_is_what_one_process_can_have() {
+        const UB2_TOTAL: u64 = 154 * GIB / 10;
+        const UB2_BOUND: u64 = 45 * GIB / 4;
+        let evidence = resource_profiles::ProcessEvidence {
+            demand: Some(resource_profiles::ProcessDemand {
+                peak_bytes: 10 * GIB,
+                name: Some("rustc".into()),
+                suite: Some("rust-tests".into()),
+                measured_on: Some("bginf-sp1-device:bginf-sp1".into()),
+                kills_here: None,
+                basis: cairn_common::executor_protocol::ProcessDemandBasis::ThisPlatform,
+            }),
+            ..resource_profiles::ProcessEvidence::default()
+        };
+        let judge = |bound| {
+            judge_process_evidence(
+                &evidence,
+                UB2_TOTAL,
+                Some(2 * GIB),
+                None,
+                bound,
+                "bgsrv-ub2-device:bgsrv-ub2",
+                true,
+            )
+        };
+        assert_eq!(judge(None), None, "13.4 GiB of room holds 12.5 GiB");
+        let Some(ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(misfit))) =
+            judge(Some(UB2_BOUND))
+        else {
+            panic!("the bound refuses it");
+        };
+        assert_eq!(misfit.capacity_bytes, UB2_BOUND);
+        assert_eq!(misfit.bound_bytes, Some(UB2_BOUND));
+        let text = misfit.describe();
+        assert!(
+            text.contains("needs one process of ~12.5 GiB (rustc, suite rust-tests, 10.0 GiB measured on bginf-sp1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(its executor's memory bound, on a 15.4 GiB machine)"),
+            "{text}"
+        );
+        // A bound above what the machine can give names nothing.
+        let Some(ProcessFit::Refused(PlacementRejectionReason::ProcessTooLarge(roomier))) =
+            judge_process_evidence(
+                &evidence,
+                12 * GIB,
+                Some(2 * GIB),
+                None,
+                Some(UB2_BOUND),
+                "m-device:m",
+                true,
+            )
+        else {
+            panic!("10 GiB of room refuses 12.5 GiB");
+        };
+        assert_eq!(roomier.bound_bytes, None);
     }
 
     /// cairn/6312 pin (b): nothing of the identity was measured anywhere,
@@ -18745,7 +18861,7 @@ mod process_fit_tests {
         .await;
         let evidence = evidence_on_ub(db, &workspace_compile("workspace-compile:cold")).await;
         let Some(ProcessFit::Deferred(misfit)) =
-            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
+            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, None, UB, true)
         else {
             panic!("a class prior defers: {evidence:?}");
         };
@@ -18756,12 +18872,20 @@ mod process_fit_tests {
         );
         assert!(text.starts_with("deferred: "), "{text}");
         assert_eq!(
-            judge_process_evidence(&evidence, 62 * GIB, Some(4 * GIB), None, "bbs:bbs", true),
+            judge_process_evidence(
+                &evidence,
+                62 * GIB,
+                Some(4 * GIB),
+                None,
+                None,
+                "bbs:bbs",
+                true
+            ),
             None
         );
         assert!(
             matches!(
-                judge_process_evidence(&evidence, 10 * GIB, None, None, UB, false),
+                judge_process_evidence(&evidence, 10 * GIB, None, None, None, UB, false),
                 Some(ProcessFit::Waived(_))
             ),
             "a platform with no memory killer prices a prior as it prices a measurement"
@@ -18805,7 +18929,7 @@ mod process_fit_tests {
             Some((2, UB_TOTAL))
         );
         let Some(ProcessFit::Refused(reason)) =
-            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, UB, true)
+            judge_process_evidence(&evidence, UB_TOTAL, Some(UB_STANDING), None, None, UB, true)
         else {
             panic!("refused where it was killed");
         };
@@ -21066,6 +21190,7 @@ fn unresolved_rationale(stated: &ResourceReservation) -> ReservationRationale {
         headroom_percent: 0,
         fallback: Some(ReservationFallback::CallerDeclared),
         memory_kill: None,
+        build_jobs_price: None,
     }
 }
 
@@ -21361,6 +21486,7 @@ impl ReservationPlan {
         // observation, fell back because belowConfidenceFloor" (CAIRN-3345):
         // the learning it named cannot produce a concurrency number at all.
         let prior = resource_profiles::cold_start_prior(self.command_class, capabilities);
+        let class_prior = prior.clone();
         let mut resolved = if self.batch_identities.is_empty() {
             resource_profiles::resolve_reservation(
                 self.db.clone(),
@@ -21409,6 +21535,12 @@ impl ReservationPlan {
         }
         resolved.process_evidence = self.process_evidence(&context).await;
         resolved.charge_measured_peak();
+        // The widest grant this machine's executor can make, which its
+        // memory cap may hold narrower still.
+        let cpu_width = capabilities
+            .concurrency_capacity
+            .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX));
+        resolved.price_at_width(cpu_width, &class_prior, capabilities.memory_budget_bytes);
         resolved
     }
 
@@ -44640,6 +44772,7 @@ mod tests {
                 13_000_000_000,
                 Some(GIB),
                 Some(11_042_782_208),
+                None,
                 &context.executor_class,
                 true,
             ),

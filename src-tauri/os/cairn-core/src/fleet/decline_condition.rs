@@ -399,15 +399,22 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
     // the offer carries to it.
     let disk_write_stalled = StallInstrument::DiskWrite.holds_class(request.command_class)
         && health.host.stall(StallInstrument::DiskWrite).state == StallInstrumentState::Pressured;
-    // The charge, as the executor floors it: the larger of the reservation and
-    // the measured peak, the figure owed memory holds the work at once admitted.
-    let floor = admission_memory_floor(request.resource_reservation.memory_charge_bytes());
     let owed = owed_memory_bytes(machine);
     let available = health
         .machine
         .memory
         .value()
         .map(|memory| memory.available_bytes);
+    // The charge, as the executor floors it: the figure owed memory holds the
+    // work at once admitted, at the build jobs the memory left can hold. The
+    // executor's elastic width can only narrow that further, so this never
+    // refuses a machine its executor would admit.
+    let reservation = &request.resource_reservation;
+    let jobs = reservation.admission_build_jobs(
+        u32::MAX,
+        available.map(|available| available.saturating_sub(owed)),
+    );
+    let floor = admission_memory_floor(reservation.memory_charge_at(jobs));
     let memory_short = available.is_some_and(|available| memory_short(available, owed, floor));
     (cpu_pressured || memory_stalled || disk_write_stalled || memory_short).then(|| Reading {
         condition: PostedCondition::Pressure {

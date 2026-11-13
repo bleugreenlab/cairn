@@ -1,7 +1,7 @@
 use super::{ResourceReservation, ResourceReservationSource};
 use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
-    BuildJobMemoryEvidence, BuildJobProcesses, CellCommandClass, CellExecutionMeta,
+    BuildJobMemoryEvidence, BuildJobProcesses, BuildJobsPrice, CellCommandClass, CellExecutionMeta,
     CommandResourceIdentity, CommandStop, ContentionEstimate, ContentionEvidence,
     ContentionFallback, CrowdedKills, DurationEstimate, DurationEvidence, DurationFallback,
     ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
@@ -382,6 +382,93 @@ impl ResolvedResourceProfile {
         self.reservation.test_phase = self.process_evidence.test_phase;
         self.reservation.build_job_memory = self.process_evidence.build_job_memory;
     }
+
+    /// Price an unmeasured reservation at the build jobs this machine would
+    /// grant: `cpu_width`, held to the jobs its reservation cap holds, at the
+    /// suite's per-process figures measured here or, failing that, on another
+    /// machine ([`ProcessEvidence::pricing_build_jobs`]).
+    ///
+    /// A process tree's peak grows with the width the machine that measured
+    /// it granted, so the median of other machines' trees priced a whole-suite
+    /// lane measured at 32 jobs on fedora at 86 GiB on a 20-core Spark, the
+    /// Spark's whole cap, for a lane that peaked near 15 GiB there
+    /// (cairn/6263). One process's peak does not depend on the width, so the
+    /// largest and typical job price any machine at its own width. This
+    /// replaces a borrowed tree and a class prior alike, raising the class
+    /// prior where the jobs say more, and never lowers a floor an
+    /// out-of-memory kill here set. A learned reservation is this machine's
+    /// own tree and is left to the executor, which prices it at the jobs it
+    /// grants; a declared one stands. Without per-process figures anywhere,
+    /// the reservation is left as it was resolved.
+    pub(super) fn price_at_width(
+        &mut self,
+        cpu_width: u32,
+        class_prior: &ResourceReservation,
+        memory_budget_bytes: Option<u64>,
+    ) {
+        if self.reservation.source != ResourceReservationSource::Unmeasured {
+            return;
+        }
+        let Some(pricing) = self.process_evidence.pricing_build_jobs() else {
+            return;
+        };
+        let cap = memory_budget_bytes.map(memory_reservation_cap);
+        let jobs = cap.map_or(cpu_width.max(1), |cap| {
+            cpu_width.max(1).min(pricing.evidence.jobs_within(cap))
+        });
+        let mut memory = pricing
+            .evidence
+            .bytes_at(jobs)
+            .max(class_prior.memory_bytes);
+        if let Some(kill) = &self.rationale.memory_kill {
+            memory = memory.max(kill_floor(kill));
+        }
+        self.reservation.memory_bytes = cap.map_or(memory, |cap| memory.min(cap));
+        self.rationale.build_jobs_price = Some(BuildJobsPrice {
+            jobs,
+            largest_bytes: pricing.evidence.largest_bytes,
+            typical_bytes: pricing.evidence.typical_bytes,
+            measured_on: pricing.measured_on,
+        });
+    }
+}
+
+/// A suite's build-job figures as they price a machine: measured in this
+/// machine context (`measured_on` is `None`), or in another (`device:executor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PricingJobs {
+    pub evidence: BuildJobMemoryEvidence,
+    pub measured_on: Option<String>,
+    /// Whether the machine that measured them is of this platform.
+    pub same_platform: bool,
+}
+
+impl PricingJobs {
+    /// One price for two items of a batch: the larger of each figure, from
+    /// whichever measured the larger job.
+    fn max(left: Self, right: Self) -> Self {
+        let evidence = BuildJobMemoryEvidence {
+            largest_bytes: left
+                .evidence
+                .largest_bytes
+                .max(right.evidence.largest_bytes),
+            typical_bytes: left
+                .evidence
+                .typical_bytes
+                .max(right.evidence.typical_bytes),
+            samples: left.evidence.samples.min(right.evidence.samples),
+        };
+        let same_platform = left.same_platform && right.same_platform;
+        let larger = match right.evidence.largest_bytes > left.evidence.largest_bytes {
+            true => right,
+            false => left,
+        };
+        Self {
+            evidence,
+            measured_on: larger.measured_on,
+            same_platform,
+        }
+    }
 }
 
 /// The larger of this machine's own tree peak and the measured largest
@@ -609,22 +696,52 @@ pub(super) struct ProcessEvidence {
     /// reason as the test phase; an unmeasured one leaves the executor on its
     /// assumed reserve.
     pub build_job_memory: Option<BuildJobMemoryEvidence>,
+    /// Where no build job of the suite was measured here, its build jobs as
+    /// another machine measured them, preferring one of this platform and
+    /// then the largest job. They price this machine's reservation at its own
+    /// width ([`ResolvedResourceProfile::price_at_width`]) and never size the
+    /// jobs its executor grants, which only this machine's own figures do.
+    pub build_jobs_elsewhere: Option<PricingJobs>,
 }
 
 impl ProcessEvidence {
+    /// The build-job figures that price this work here: this machine's own,
+    /// else another's.
+    pub(super) fn pricing_build_jobs(&self) -> Option<PricingJobs> {
+        match self.build_job_memory {
+            Some(evidence) => Some(PricingJobs {
+                evidence,
+                measured_on: None,
+                same_platform: true,
+            }),
+            None => self.build_jobs_elsewhere.clone(),
+        }
+    }
+
     /// A batch's evidence: the heaviest item on each side. Its test phase and
     /// its build jobs stand only where both sides measured them, because the
-    /// one figure must cover whichever item is running.
+    /// one figure must cover whichever item is running; its price likewise
+    /// stands only where both items have one, from wherever each was measured.
     pub(super) fn max(left: Self, right: Self) -> Self {
+        let build_job_memory = match (left.build_job_memory, right.build_job_memory) {
+            (Some(left), Some(right)) => Some(BuildJobMemoryEvidence {
+                largest_bytes: left.largest_bytes.max(right.largest_bytes),
+                typical_bytes: left.typical_bytes.max(right.typical_bytes),
+                samples: left.samples.min(right.samples),
+            }),
+            _ => None,
+        };
+        let build_jobs_elsewhere = match (
+            build_job_memory,
+            left.pricing_build_jobs(),
+            right.pricing_build_jobs(),
+        ) {
+            (None, Some(left), Some(right)) => Some(PricingJobs::max(left, right)),
+            _ => None,
+        };
         Self {
-            build_job_memory: match (left.build_job_memory, right.build_job_memory) {
-                (Some(left), Some(right)) => Some(BuildJobMemoryEvidence {
-                    largest_bytes: left.largest_bytes.max(right.largest_bytes),
-                    typical_bytes: left.typical_bytes.max(right.typical_bytes),
-                    samples: left.samples.min(right.samples),
-                }),
-                _ => None,
-            },
+            build_job_memory,
+            build_jobs_elsewhere,
             demand: ProcessDemand::max(left.demand, right.demand),
             unattributed: ProcessDemand::max(left.unattributed, right.unattributed),
             unmeasured_compile: left.unmeasured_compile || right.unmeasured_compile,
@@ -793,7 +910,10 @@ pub(super) async fn resolve_process_demand(
         unattributed,
         unmeasured_compile,
         test_phase: suite.as_ref().and_then(|suite| suite.test_phase),
-        build_job_memory: suite.and_then(|suite| suite.build_job_memory),
+        build_job_memory: suite.as_ref().and_then(|suite| suite.build_job_memory),
+        build_jobs_elsewhere: suite
+            .filter(|suite| suite.build_job_memory.is_none())
+            .and_then(|suite| suite.build_jobs_elsewhere),
     }
 }
 
@@ -824,6 +944,9 @@ struct SuiteEvidence {
     test_phase: Option<TestPhaseEvidence>,
     /// Its build jobs in this machine context.
     build_job_memory: Option<BuildJobMemoryEvidence>,
+    /// Its build jobs in another machine context: of this platform first,
+    /// then the largest job.
+    build_jobs_elsewhere: Option<PricingJobs>,
 }
 
 /// The identity's evidence on this platform, and its largest single process
@@ -933,6 +1056,7 @@ async fn load_suite_evidence(
                 elsewhere: None,
                 test_phase: None,
                 build_job_memory: None,
+                build_jobs_elsewhere: None,
             };
             let mut any = false;
             while let Some(row) = rows.next().await? {
@@ -940,6 +1064,28 @@ async fn load_suite_evidence(
                 let executor_class = row.get::<String>(0)?;
                 let os = row.get::<String>(5)?;
                 let arch = row.get::<String>(6)?;
+                let jobs = match (row.get::<Option<i64>>(14)?, row.get::<Option<i64>>(15)?) {
+                    (Some(largest), Some(typical)) => Some(BuildJobMemoryEvidence {
+                        largest_bytes: largest.max(0) as u64,
+                        typical_bytes: typical.max(0) as u64,
+                        samples: u32::try_from(row.get::<i64>(16)?.max(0)).unwrap_or(u32::MAX),
+                    }),
+                    _ => None,
+                };
+                if let Some(jobs) = jobs.filter(|_| executor_class != context.executor_class) {
+                    let same_platform = os == context.os && arch == context.arch;
+                    let better = evidence.build_jobs_elsewhere.as_ref().is_none_or(|held| {
+                        (same_platform, jobs.largest_bytes)
+                            > (held.same_platform, held.evidence.largest_bytes)
+                    });
+                    if better {
+                        evidence.build_jobs_elsewhere = Some(PricingJobs {
+                            evidence: jobs,
+                            measured_on: Some(executor_class.clone()),
+                            same_platform,
+                        });
+                    }
+                }
                 if os != context.os || arch != context.arch {
                     let peak = row.get::<Option<i64>>(1)?.map(|value| value as u64);
                     if let (Some(peak), Some(name)) = (peak, row.get::<Option<String>>(2)?) {
@@ -981,16 +1127,7 @@ async fn load_suite_evidence(
                             bytes_per_concurrent_test: per_test.max(0) as u64,
                         });
                     }
-                    let largest = row.get::<Option<i64>>(14)?;
-                    let typical = row.get::<Option<i64>>(15)?;
-                    let samples = row.get::<i64>(16)?;
-                    if let (Some(largest), Some(typical)) = (largest, typical) {
-                        evidence.build_job_memory = Some(BuildJobMemoryEvidence {
-                            largest_bytes: largest.max(0) as u64,
-                            typical_bytes: typical.max(0) as u64,
-                            samples: u32::try_from(samples.max(0)).unwrap_or(u32::MAX),
-                        });
-                    }
+                    evidence.build_job_memory = jobs;
                 }
             }
             Ok(any.then_some(evidence))
@@ -1730,6 +1867,7 @@ pub(super) fn declared_rationale(
         headroom_percent: HEADROOM_PERCENT,
         fallback: Some(ReservationFallback::CallerDeclared),
         memory_kill: None,
+        build_jobs_price: None,
     }
 }
 
@@ -1787,6 +1925,7 @@ fn profile_rationale(
         headroom_percent: HEADROOM_PERCENT,
         fallback,
         memory_kill: profile.and_then(|profile| profile.memory_kill),
+        build_jobs_price: None,
     }
 }
 
@@ -2751,6 +2890,122 @@ mod process_peak_tests {
             }),
             ..oom_killed_for_test(GIB, None, 0, finished_at_unix_ms)
         }
+    }
+
+    /// cairn/6263's specimen: a whole-suite rust-tests lane measured on 32-core
+    /// fedora, borrowed by a 20-core Spark that never ran it. The borrowed
+    /// tree priced it at the Spark's whole 77.6 GiB cap; its build jobs as
+    /// fedora measured them (a 12 GiB largest, 1 GiB typical) price it at the
+    /// Spark's own width, 12 + 19 x 1 = 31 GiB, and the record says so.
+    #[tokio::test]
+    async fn a_borrowed_lane_is_priced_at_the_width_the_borrowing_machine_grants() {
+        let db = Arc::new(crate::storage::migrated_test_db("price-at-width.db").await);
+        let suite = suite_key(
+            "cairn",
+            Some(&identity("rust-tests-a")),
+            CellCommandClass::CargoTest,
+        );
+        observe_suite(
+            db.clone(),
+            suite.as_deref(),
+            &context("fedora:fedora"),
+            &CellExecutionMeta {
+                build_job_processes: Some(BuildJobProcesses {
+                    processes: 40,
+                    largest_bytes: 12 * GIB,
+                    typical_bytes: GIB,
+                }),
+                ..completed(12 * GIB, 1)
+            },
+            CompletionKind::Succeeded,
+            MachineAdmission::default(),
+        )
+        .await;
+        let spark = ProfileContext {
+            arch: "aarch64".into(),
+            ..context("bginf-sp1:bginf-sp1")
+        };
+        let evidence = resolve_process_demand(
+            db,
+            None,
+            suite.as_deref(),
+            CellCommandClass::CargoTest,
+            &spark,
+        )
+        .await;
+        assert_eq!(
+            evidence.build_job_memory, None,
+            "fedora's jobs never size the Spark's grant"
+        );
+        // The Spark's budget, whose reservation cap is the 77.6 GiB the
+        // borrowed tree filled.
+        let budget = 77_600 * (GIB / 1000) / 3 * 4;
+        let class_prior = ResourceReservation {
+            memory_bytes: 2 * GIB,
+            ..ResourceReservation::default()
+        };
+        let resolved = |source, memory_bytes| ResolvedResourceProfile {
+            reservation: ResourceReservation {
+                memory_bytes,
+                source,
+                ..ResourceReservation::default()
+            },
+            learned_estimate: None,
+            rationale: profile_rationale(
+                None,
+                &spark,
+                &class_prior,
+                None,
+                Some(ReservationFallback::FleetPrior),
+            ),
+            duration: unmeasured_duration(
+                CellCommandClass::CargoTest,
+                &spark,
+                None,
+                ExecutionWarmth::default(),
+                DurationFallback::NoCommandIdentity,
+            ),
+            item_durations: Vec::new(),
+            memory_fit: MemoryFit::Unknown,
+            process_evidence: evidence.clone(),
+        };
+        let borrowed_tree = memory_reservation_cap(budget);
+        let mut priced = resolved(ResourceReservationSource::Unmeasured, borrowed_tree);
+        priced.price_at_width(20, &class_prior, Some(budget));
+        assert_eq!(priced.reservation.memory_bytes, 31 * GIB);
+        assert_eq!(
+            priced.rationale.build_jobs_price,
+            Some(BuildJobsPrice {
+                jobs: 20,
+                largest_bytes: 12 * GIB,
+                typical_bytes: GIB,
+                measured_on: Some("fedora:fedora".into()),
+            })
+        );
+        // A cap too small for the width holds the jobs to what it holds.
+        let mut capped = resolved(ResourceReservationSource::Unmeasured, 2 * GIB);
+        capped.price_at_width(20, &class_prior, Some(20 * GIB));
+        assert_eq!(capped.reservation.memory_bytes, 15 * GIB);
+        assert_eq!(capped.rationale.build_jobs_price.unwrap().jobs, 4);
+        // This machine's own tree is the executor's to price at its grant.
+        let mut learned = resolved(ResourceReservationSource::Learned, 40 * GIB);
+        learned.price_at_width(20, &class_prior, Some(budget));
+        assert_eq!(learned.reservation.memory_bytes, 40 * GIB);
+        assert_eq!(learned.rationale.build_jobs_price, None);
+        // A kill here floors the price.
+        let mut killed = resolved(ResourceReservationSource::Unmeasured, 40 * GIB);
+        killed.rationale.memory_kill = Some(MemoryKill {
+            victim_resident_bytes: 35 * GIB,
+            killed_at_unix_ms: 1,
+            alone_on_machine_bytes: None,
+        });
+        killed.price_at_width(20, &class_prior, Some(budget));
+        assert_eq!(killed.reservation.memory_bytes, 35 * GIB);
+        // Without build jobs measured anywhere the borrowed figure stands.
+        let mut blind = resolved(ResourceReservationSource::Unmeasured, borrowed_tree);
+        blind.process_evidence = ProcessEvidence::default();
+        blind.price_at_width(20, &class_prior, Some(budget));
+        assert_eq!(blind.reservation.memory_bytes, borrowed_tree);
     }
 
     /// A run's build-job census teaches its suite, on that machine only, the

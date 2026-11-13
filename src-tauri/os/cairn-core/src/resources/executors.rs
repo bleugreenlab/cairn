@@ -4107,8 +4107,25 @@ fn describe_rationale(rationale: &ReservationRationale) -> String {
             )
         })
         .unwrap_or_default();
+    let priced = rationale
+        .build_jobs_price
+        .as_ref()
+        .map(|price| {
+            let source = price
+                .measured_on
+                .as_deref()
+                .map_or_else(|| "measured here".to_string(), |on| format!("measured on {on}"));
+            format!(
+                "; memory priced at {} build jobs: the largest job at {} and {} more at {} each, {source}",
+                price.jobs,
+                bytes(price.largest_bytes),
+                price.jobs.saturating_sub(1),
+                bytes(price.typical_bytes),
+            )
+        })
+        .unwrap_or_default();
     let learned = format!(
-        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}{killed}",
+        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}{killed}{priced}",
         rationale.profile_context,
         rationale.headroom_percent,
         bytes(rationale.prior.memory_bytes)
@@ -4138,7 +4155,30 @@ mod rationale_tests {
             fallback: (sample_count < MIN_CONFIDENT_RESERVATION_SAMPLES)
                 .then_some(ReservationFallback::BelowConfidenceFloor),
             memory_kill: None,
+            build_jobs_price: None,
         }
+    }
+
+    /// cairn/6263: a reservation priced at the width the machine grants says
+    /// so, with the figures and where they were measured, instead of reading
+    /// as a bare fleet prior.
+    #[test]
+    fn a_width_priced_reservation_names_its_jobs_and_their_source() {
+        let mut priced = rationale(0, None);
+        priced.fallback = Some(ReservationFallback::FleetPrior);
+        priced.build_jobs_price = Some(cairn_common::executor_protocol::BuildJobsPrice {
+            jobs: 20,
+            largest_bytes: 12 << 30,
+            typical_bytes: 1 << 30,
+            measured_on: Some("fedora:fedora".into()),
+        });
+        let rendered = describe_rationale(&priced);
+        assert!(
+            rendered.ends_with(
+                "; memory priced at 20 build jobs: the largest job at 12.0 GiB and 19 more at 1.0 GiB each, measured on fedora:fedora"
+            ),
+            "{rendered}"
+        );
     }
 
     /// The specimen this rendering exists for: a whole-machine concurrency charge
@@ -12506,6 +12546,7 @@ mod tests {
                     headroom_percent: 25,
                     fallback: None,
                     memory_kill: None,
+                    build_jobs_price: None,
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,
