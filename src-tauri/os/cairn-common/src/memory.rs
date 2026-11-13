@@ -217,9 +217,9 @@ struct CgroupMemoryBound {
     max: u64,
     /// `memory.current` of the cgroup that set it.
     current: u64,
-    /// Its `memory.stat` `inactive_file`: cache the kernel reclaims first,
-    /// before it would kill anything inside the cgroup.
-    inactive_file: u64,
+    /// Its active and inactive file cache plus reclaimable slab, excluding
+    /// shmem: tmpfs cannot be reclaimed without swap.
+    reclaimable: u64,
 }
 
 /// Walk from the cgroup `/proc/self/cgroup` names up to `root`, and take the
@@ -245,26 +245,34 @@ fn cgroup_memory_bound(
         })
         .min_by_key(|(max, _)| *max)?;
     let current = read(dir, "memory.current")?.trim().parse::<u64>().ok()?;
-    let inactive_file = read(dir, "memory.stat")
-        .and_then(|stat| {
-            stat.lines().find_map(|line| {
-                let (key, value) = line.split_once(' ')?;
-                (key == "inactive_file").then(|| value.trim().parse::<u64>().ok())?
-            })
+    let reclaimable = read(dir, "memory.stat")
+        .map(|stat| {
+            ["inactive_file", "active_file", "slab_reclaimable"]
+                .into_iter()
+                .map(|key| {
+                    stat.lines()
+                        .find_map(|line| {
+                            let mut fields = line.split_whitespace();
+                            (fields.next()? == key).then(|| fields.next()?.parse::<u64>().ok())?
+                        })
+                        .unwrap_or(0)
+                })
+                .fold(0_u64, u64::saturating_add)
         })
         .unwrap_or(0);
     Some(CgroupMemoryBound {
         max,
         current,
-        inactive_file,
+        reclaimable,
     })
 }
 
 /// `memory` narrowed by `bound` when the bound is tighter: the limit is the
 /// total, and what is left under it caps what is available. What is left is
 /// counted against the working set rather than everything charged, since the
-/// kernel reclaims inactive file cache inside the cgroup before it kills
-/// anything there.
+/// kernel can reclaim active and inactive file cache and reclaimable slab
+/// inside the cgroup before it kills anything there. The `file` stat is not
+/// used: it includes shmem, which cannot be reclaimed without swap.
 #[cfg(any(target_os = "linux", test))]
 fn within_bound(
     memory: Option<SystemMemory>,
@@ -274,7 +282,7 @@ fn within_bound(
     let Some(bound) = bound else {
         return memory;
     };
-    let working_set = bound.current.saturating_sub(bound.inactive_file);
+    let working_set = bound.current.saturating_sub(bound.reclaimable);
     let under_bound = bound.max.saturating_sub(working_set);
     Some(SystemMemory {
         total: bound.max,
@@ -334,7 +342,7 @@ mod tests {
                     ("memory.current", "2147483648\n"),
                     (
                         "memory.stat",
-                        "anon 1073741824\nfile 1073741824\ninactive_file 536870912\n",
+                        "anon 1073741824\nfile 1073741824\ninactive_file 536870912\nactive_file 268435456\nslab_reclaimable 134217728\n",
                     ),
                 ],
             ),
@@ -344,7 +352,7 @@ mod tests {
             Some(CgroupMemoryBound {
                 max: 12_079_595_520,
                 current: 2 * GIB,
-                inactive_file: GIB / 2,
+                reclaimable: GIB / 2 + GIB / 4 + GIB / 8,
             })
         );
     }
@@ -373,7 +381,7 @@ mod tests {
             Some(CgroupMemoryBound {
                 max: 4 * GIB,
                 current: GIB,
-                inactive_file: 0,
+                reclaimable: 0,
             })
         );
         // A container whose namespace roots it at its own cgroup.
@@ -387,26 +395,29 @@ mod tests {
         );
     }
 
-    /// bgsrv-ub2's shape: most of what is charged to the unit is cache the
+    /// Most of what is charged to the unit is cache the
     /// kernel would reclaim before killing, so it is not counted as used.
     #[test]
     fn cache_under_the_bound_is_still_available() {
         let bound = CgroupMemoryBound {
-            max: 11 * GIB + GIB / 4,
-            current: 10 * GIB,
-            inactive_file: 9 * GIB + GIB / 2,
+            max: 113_279_762_432,
+            current: 97_462_493_184,
+            reclaimable: 39_349_149_696 + 54_198_435_840 + 8_540_297_736,
         };
         let host = SystemMemory {
-            total: 15 * GIB,
-            available: 12 * GIB,
+            total: 130_700_000_000,
+            available: 123_500_000_000,
         };
         assert_eq!(
             within_bound(Some(host), Some(bound)),
             Some(SystemMemory {
-                total: 11 * GIB + GIB / 4,
-                available: 11 * GIB + GIB / 4 - GIB / 2,
+                total: bound.max,
+                available: bound.max,
             })
         );
+        let available = within_bound(Some(host), Some(bound)).unwrap().available;
+        assert!(available > 100 * GIB);
+        assert!(available > 672 * GIB / 10);
         // The host's own shortage still caps it.
         let starved = SystemMemory {
             available: GIB,
@@ -418,10 +429,48 @@ mod tests {
         );
         // A limit no tighter than the machine bounds nothing.
         let loose = CgroupMemoryBound {
-            max: 64 * GIB,
+            max: 256 * GIB,
             ..bound
         };
         assert_eq!(within_bound(Some(host), Some(loose)), Some(host));
+    }
+
+    #[test]
+    fn shmem_stays_used_and_unreadable_cache_keys_count_as_zero() {
+        for (stat, reclaimable) in [
+            (
+                "file 8589934592\nshmem 7516192768\ninactive_file 536870912\nactive_file 536870912\nslab_reclaimable 268435456\n",
+                GIB + GIB / 4,
+            ),
+            ("file 8589934592\nshmem 7516192768\n", 0),
+            (
+                "inactive_file invalid\nactive_file 536870912\nslab_reclaimable -1\n",
+                GIB / 2,
+            ),
+            ("inactive_file 536870912\nactive_file invalid\nslab_reclaimable\n", GIB / 2),
+            ("slab_reclaimable 268435456\n", GIB / 4),
+            ("inactive_file 18446744073709551616\n", 0),
+        ] {
+            let root = tree(&[(
+                "",
+                &[
+                    ("memory.max", "12884901888\n"),
+                    ("memory.current", "9663676416\n"),
+                    ("memory.stat", stat),
+                ],
+            )]);
+            let bound = cgroup_memory_bound(root.path(), "0::/\n").unwrap();
+            assert_eq!(bound.reclaimable, reclaimable, "{stat}");
+            let host = SystemMemory {
+                total: 16 * GIB,
+                available: 15 * GIB,
+            };
+            assert_eq!(
+                within_bound(Some(host), Some(bound)).unwrap().available,
+                3 * GIB + reclaimable,
+                "{stat}"
+            );
+        }
     }
 
     #[test]
