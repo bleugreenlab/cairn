@@ -459,37 +459,25 @@ fn note_terminal_restart(
     announce_in_terminal(orch, session_id, &notice);
 }
 
-/// End a terminal recovery could not start again, saying why, and deliver the
-/// exit wake its subscriber is owed.
-///
-/// The terminal is named by its owner and slug rather than a row id, because a
-/// restart that failed may have done so before or after it replaced the row: the
-/// unique `(scope, slug)` index means whichever row holds the slug now is the
-/// terminal. The reason goes on that row, so a read of the terminal, its exit
-/// wake, and a `waitFor` on its exit all carry it. Nothing is released here:
-/// whatever environment the terminal was bound to belongs to its owner.
-async fn settle_unrecoverable_terminal(
-    orch: &Orchestrator,
-    owner: &TerminalOwner,
-    slug: &str,
-    terminal_uri: &str,
-    reason: &str,
-) -> Result<(), String> {
-    settle_terminal_as_lost(orch, owner, slug, terminal_uri, reason, None, None)
-        .await
-        .map(|_| ())
-}
-
-/// The one writer that settles a terminal Cairn lost: a failed recovery
+/// The one writer that settles a terminal Cairn lost: a refused recovery
 /// restart, a recovery window that elapsed, a fence that can never match again,
-/// and a `restart: never` terminal whose process is gone all end here.
+/// and a `restart: never` terminal whose process is gone all end here, and the
+/// exit wake its subscriber is owed is delivered.
 ///
-/// The run clock stays where the loss stopped it (`exited_at` takes `lost_at`
-/// before now), and the row's residency binding is cleared, since no restart
-/// will start anything into it. `expected_row`, when given, confines the write
-/// to that row while it is still live, so a pass that read a recovering row
+/// The reason goes on the row, so a read of the terminal, its exit wake, and a
+/// `waitFor` on its exit all carry it. The run clock stays where the loss
+/// stopped it (`exited_at` keeps an earlier exit, then takes `lost_at` before
+/// now), and the row's residency binding is cleared, since no restart will
+/// start anything into it. Nothing is released here: whatever environment the
+/// terminal was bound to belongs to its owner.
+///
+/// The write is confined to `expected_row`, the row the caller read, so a pass
 /// cannot settle the replacement a concurrent restart minted under the same
-/// slug. `output_tail` keeps a live transcript's last output on the row.
+/// slug. That row is settled while recovery still owns it: live, or exited by
+/// the ordinary finalizer (which leaves the binding) and still bound to its
+/// fence. Settling clears the binding, so a settled row is never selected or
+/// rewritten again, and an exited row nobody binds keeps the reason it ended
+/// with. `output_tail` keeps a live transcript's last output on the row.
 ///
 /// Returns whether this call settled the row.
 async fn settle_terminal_as_lost(
@@ -498,13 +486,13 @@ async fn settle_terminal_as_lost(
     slug: &str,
     terminal_uri: &str,
     reason: &str,
-    expected_row: Option<&str>,
+    expected_row: &str,
     output_tail: Option<String>,
 ) -> Result<bool, String> {
     let owner = owner.clone();
     let slug = slug.to_string();
     let reason = reason.to_string();
-    let expected_row = expected_row.map(ToOwned::to_owned);
+    let expected_row = expected_row.to_string();
     let settled = orch
         .db
         .local
@@ -530,15 +518,16 @@ async fn settle_terminal_as_lost(
                                  exit_reason = ?3, output_tail = COALESCE(?6, output_tail),
                                  residency_holder = NULL, residency_incarnation_id = NULL,
                                  cell_epoch = NULL, process_generation = NULL
-                             WHERE {scope} AND slug = ?2 AND status != 'closing'
-                               AND (?5 IS NULL OR (id = ?5 AND status IN ('running', 'recovering')))"
+                             WHERE {scope} AND slug = ?2 AND id = ?5
+                               AND (status IN ('running', 'recovering')
+                                    OR (status = 'exited' AND residency_holder IS NOT NULL))"
                         ),
                         params![
                             scope_id,
                             slug.as_str(),
                             reason.as_str(),
                             now,
-                            expected_row.as_deref(),
+                            expected_row.as_str(),
                             output_tail.as_deref()
                         ],
                     )
@@ -600,7 +589,7 @@ pub(crate) async fn settle_recovering_terminal(
     let uri = resource
         .map(|resource| resource.to_uri())
         .unwrap_or_default();
-    settle_terminal_as_lost(orch, &owner, &slug, &uri, reason, Some(terminal_id), None).await
+    settle_terminal_as_lost(orch, &owner, &slug, &uri, reason, terminal_id, None).await
 }
 
 /// Restart every terminal an execution environment still owes a shell, which is
@@ -812,7 +801,16 @@ async fn restart_terminal_process(
             let reason = format!(
                     "recovery refused: terminal `{slug}` was not started again because {error}. Nothing was started."
                 );
-            settle_unrecoverable_terminal(orch, &owner, &slug, &terminal_uri, &reason).await?;
+            settle_terminal_as_lost(
+                orch,
+                &owner,
+                &slug,
+                &terminal_uri,
+                &reason,
+                &terminal_id,
+                None,
+            )
+            .await?;
             return Err(reason);
         }
     };
@@ -862,7 +860,7 @@ async fn restart_terminal_process(
                 &slug,
                 &terminal_uri,
                 &reason,
-                Some(&terminal_id),
+                &terminal_id,
                 None,
             )
             .await?;
@@ -880,12 +878,14 @@ async fn restart_terminal_process(
         let (target, landing) = match materialize_terminal_lease(orch, target).await {
             Ok(placed) => placed,
             Err(refusal) => {
-                settle_unrecoverable_terminal(
+                settle_terminal_as_lost(
                     orch,
                     &owner,
                     &slug,
                     &terminal_uri,
                     &format!("recovery refused: {refusal}"),
+                    &terminal_id,
+                    None,
                 )
                 .await?;
                 return Err(refusal);
@@ -1065,7 +1065,7 @@ async fn recover_without_restart(
                     &row.slug,
                     terminal_uri,
                     &reason,
-                    Some(&row.id),
+                    &row.id,
                     None,
                 )
                 .await?;
@@ -3255,6 +3255,7 @@ pub(crate) struct TerminalPlacement<'a> {
     pub(crate) restart_policy: RestartPolicy,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_terminal_from_resource(
     orch: &Orchestrator,
     resource: &CairnResource,
@@ -8614,7 +8615,7 @@ mod terminal_finalize_tests {
             "swap",
             &uri,
             "lost: the replaced row",
-            Some("t-old"),
+            "t-old",
             None,
         )
         .await
@@ -8656,7 +8657,7 @@ mod terminal_finalize_tests {
             "once",
             &uri,
             "lost: first",
-            Some("t-once"),
+            "t-once",
             None
         )
         .await
@@ -8673,7 +8674,7 @@ mod terminal_finalize_tests {
             "once",
             &uri,
             "lost: second",
-            Some("t-once"),
+            "t-once",
             None
         )
         .await
@@ -8685,6 +8686,119 @@ mod terminal_finalize_tests {
         assert_eq!(after.status, "exited");
         assert_eq!(after.exit_reason.as_deref(), Some("lost: first"));
         assert_eq!(after.exited_at, Some(5));
+    }
+
+    /// The ordinary finalizer ends a terminal but leaves it bound to its fence,
+    /// and recovery reads such a row when its executor reports the process
+    /// restartable. When that restart is refused, the refusal is the row's
+    /// reason and the binding is cleared, once: the next pass no longer selects
+    /// the row, so it is never refused, or rewritten, again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_restart_of_an_exited_bound_terminal_settles_it_once() {
+        let db = crate::storage::migrated_test_db("term_refused_exited_bound.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug,
+                     residency_holder, residency_incarnation_id, cell_epoch, process_generation,
+                     executor_selector, exit_reason, exited_at)
+                 VALUES ('t-done', 'j', 's-done', 'sleep 100', 'exited', 2, 'done', 'job:j', 'inc', 7, 1,
+                         '{not json', 'exited with code 1', 9)",
+                (),
+            )
+            .await
+            .unwrap();
+        let fence = ResidencyFence {
+            holder: ResidencyHolder::Job { job_id: "j".into() },
+            incarnation_id: "inc".into(),
+            cell_epoch: 7,
+        };
+        let restartable = std::collections::HashSet::from(["s-done".to_string()]);
+        assert_eq!(
+            terminal_slugs_for_lease(&orch.db.local, &fence, &restartable)
+                .await
+                .unwrap(),
+            vec!["done".to_string()],
+            "recovery selects the exited row while it is bound"
+        );
+
+        let refusal = restart_terminal_process(&orch, fence.clone(), "done", true)
+            .await
+            .unwrap_err();
+        assert!(refusal.starts_with("recovery refused:"), "{refusal}");
+        let settled = recovery_state(&orch.db.local, "done").await;
+        assert_eq!(settled.status, "exited");
+        assert_eq!(settled.exit_reason.as_deref(), Some(refusal.as_str()));
+        assert_eq!(settled.residency_holder, None);
+        assert_eq!(settled.exited_at, Some(9), "the clock stays at the exit");
+
+        assert!(
+            terminal_slugs_for_lease(&orch.db.local, &fence, &restartable)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the next pass does not select the settled row"
+        );
+        assert!(restart_terminal_process(&orch, fence, "done", true)
+            .await
+            .is_err());
+        let after = recovery_state(&orch.db.local, "done").await;
+        assert_eq!(after.exit_reason, settled.exit_reason);
+        assert_eq!(after.exited_at, Some(9));
+    }
+
+    /// An exited row no fence binds is no longer recovery's: no settle path
+    /// selects it, and it keeps the reason it ended with.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exited_unbound_terminal_keeps_its_reason_on_every_settle_path() {
+        let db = crate::storage::migrated_test_db("term_settle_exited_unbound.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug,
+                     executor_selector, exit_reason, exited_at, lost_at)
+                 VALUES ('t-ended', 'j', 's-ended', 'sleep 100', 'exited', 2, 'ended',
+                         '{not json', 'exited with code 0', 9, 5)",
+                (),
+            )
+            .await
+            .unwrap();
+        let owner = TerminalOwner::Job { job_id: "j".into() };
+        let uri = cairn_uri::build_node_terminal_uri("p", 7, 2, "builder", "ended");
+        let fence = ResidencyFence {
+            holder: ResidencyHolder::Job { job_id: "j".into() },
+            incarnation_id: "inc".into(),
+            cell_epoch: 7,
+        };
+
+        assert!(!settle_terminal_as_lost(
+            &orch,
+            &owner,
+            "ended",
+            &uri,
+            "lost: rewritten",
+            "t-ended",
+            None
+        )
+        .await
+        .unwrap());
+        assert!(
+            !settle_recovering_terminal(&orch, "t-ended", "lost: rewritten")
+                .await
+                .unwrap()
+        );
+        assert!(restart_terminal_process(&orch, fence, "ended", true)
+            .await
+            .is_err());
+
+        let after = recovery_state(&orch.db.local, "ended").await;
+        assert_eq!(after.status, "exited");
+        assert_eq!(after.exit_reason.as_deref(), Some("exited with code 0"));
+        assert_eq!(after.exited_at, Some(9));
     }
 
     #[test]
