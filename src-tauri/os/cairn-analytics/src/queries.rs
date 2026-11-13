@@ -57,42 +57,82 @@ const BILLABLE_TOTAL: &str = "COALESCE(e.input_tokens, 0)
             + COALESCE(e.cache_read_tokens, 0)
             + COALESCE(e.output_tokens, 0)";
 
-/// Where an event's model comes from, in precedence order: the job's selected
-/// model (`jobs.model`, the launch fact), else the model its stored selection
-/// chose, else the model the provider reported serving the event
-/// (`events.reported_model`). Selected beats reported, the effective-model
-/// rule the context meter applies too: a router pick such as
-/// `~deepseek/deepseek-flash-latest` is the operator's model whatever concrete
-/// model served it. `COALESCE` stops at its first non-NULL argument, so the
-/// selection is parsed only for a job with no model; the `CASE` guard is there
-/// because Turso's JSON functions raise on malformed JSON instead of yielding
-/// NULL, and only `CASE` short-circuits.
-const MODEL_SOURCE: &str = "COALESCE(NULLIF(j.model, ''),
+/// The model an event's job selected: its launch fact (`jobs.model`), else the
+/// model its stored selection chose, else NULL. `COALESCE` stops at its first
+/// non-NULL argument, so the selection is parsed only for a job with no model;
+/// the `CASE` guard is there because Turso's JSON functions raise on malformed
+/// JSON instead of yielding NULL, and only `CASE` short-circuits.
+const SELECTED_MODEL: &str = "COALESCE(NULLIF(j.model, ''),
         CASE WHEN json_valid(j.selection)
-            THEN NULLIF(json_extract(j.selection, '$.chosen.model'), '') END,
-        e.reported_model)";
+            THEN NULLIF(json_extract(j.selection, '$.chosen.model'), '') END)";
 
-/// The canonical `token_rollup.model` key: one key per model, whichever writer
-/// named it. [`MODEL_SOURCE`] is folded onto its Claude alias when it names
-/// that alias in any spelling: a differently cased alias (`Opus`), the
-/// 1M-context variant (`opus[1m]`), or the concrete id of the generation the
-/// alias is priced as ([`ALIAS_GENERATIONS`]: `claude-opus-5-5`, with or
-/// without a date stamp or `[1m]`). Any other generation is a different model
-/// at a different price and keys under its own id (`claude-sonnet-4-5`), as
-/// does every non-Claude model. A model nothing names stays NULL (the chart's
-/// `unknown`). Readers derive a display name from the key.
+/// The SQL list of every spelling a selection names a bare Claude alias by,
+/// lowercased: `'haiku', 'haiku[1m]', 'sonnet', ...`.
+fn alias_spellings() -> String {
+    ALIAS_GENERATIONS
+        .iter()
+        .map(|(alias, _)| format!("'{alias}', '{alias}[1m]'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The stored `token_rollup.model` key: the model an event ran on, fixed when
+/// the event is stored and true forever after.
+///
+/// A job that selected a concrete model keys by it whatever the provider
+/// reported, the effective-model rule the context meter applies too: a router
+/// pick such as `~deepseek/deepseek-flash-latest` is the operator's model
+/// whatever served it. A job that selected a bare Claude alias in any spelling
+/// (`fable`, `Opus`, `opus[1m]`) keys by the model the provider reported
+/// serving the event (`events.reported_model`, `claude-fable-5-1`), because
+/// which generation an alias runs is the CLI's choice and moves between
+/// releases; only an event with no report keys as the lowercased alias. A job
+/// that selected nothing keys by the report. A model nothing names stays NULL
+/// (the chart's `unknown`).
+///
+/// The key never depends on which generation an alias means today, so moving
+/// an alias never makes a stored key wrong. Merging the current generation's
+/// id with its alias is a read-time concern ([`model_read_key`]).
 fn model_key_expr() -> String {
+    let arms: String = ALIAS_GENERATIONS
+        .iter()
+        .map(|(alias, _)| {
+            format!(
+                "WHEN LOWER({SELECTED_MODEL}) IN ('{alias}', '{alias}[1m]')
+                    THEN COALESCE(e.reported_model, '{alias}')\n"
+            )
+        })
+        .collect();
+    format!("(CASE {arms} ELSE COALESCE({SELECTED_MODEL}, e.reported_model) END)")
+}
+
+/// The model a reader groups and prices the stored key `key` under: one key
+/// per model, whichever way the usage named it. A key naming the generation a
+/// Claude alias is priced as ([`ALIAS_GENERATIONS`]: `claude-opus-5-5`, with
+/// `[1m]` or a date stamp) reads as that alias, so usage the provider reported
+/// and usage with no report are one `opus` legend entry. Every other key reads
+/// as itself: an older generation is another model at another price.
+///
+/// The fold only merges keys that cost the same, because an alias is priced as
+/// exactly its current generation. Applied at read time, it follows an alias
+/// move without re-pricing anything already stored: after `fable` moves to
+/// 5.2, a `claude-fable-5-1` key stops reading as `fable` and keeps 5.1's price.
+pub(crate) fn model_read_key(key: &str) -> String {
     let arms: String = ALIAS_GENERATIONS
         .iter()
         .map(|(alias, concrete)| {
             format!(
-                "WHEN LOWER({MODEL_SOURCE}) IN
-                        ('{alias}', '{alias}[1m]', '{concrete}', '{concrete}[1m]')
-                    OR LOWER({MODEL_SOURCE}) LIKE '{concrete}-%' THEN '{alias}'\n"
+                "WHEN LOWER({key}) IN ('{concrete}', '{concrete}[1m]')
+                    OR LOWER({key}) LIKE '{concrete}-________' THEN '{alias}'\n"
             )
         })
         .collect();
-    format!("(CASE {arms} ELSE {MODEL_SOURCE} END)")
+    format!("(CASE {arms} ELSE {key} END)")
+}
+
+/// [`model_read_key`] over the rollup alias `tr`.
+fn rollup_model() -> String {
+    model_read_key("tr.model")
 }
 
 /// The `events.reported_model` value for an event about to be stored: the
@@ -254,9 +294,9 @@ fn scope_range_params_doubled(scope: &Scope, range: &TimeRange) -> Vec<Value> {
 /// backend/agent/account dimensions. The account (`events.account_id`, frozen
 /// on the event when it was stored) is appended only when present, so a row
 /// of events stored before the column existed keeps its original id and stays
-/// unattributed. The model dimension is the canonical key
-/// ([`model_key_expr`]), so it can differ between a run's events only when the
-/// job names no model and the events report different ones. The `long_*`
+/// unattributed. The model dimension is the stored key ([`model_key_expr`]),
+/// so it can differ between a run's events only when the job names no model or
+/// an alias and the events report different ones. The `long_*`
 /// measures repeat the four components over only the billable events whose own
 /// prompt is long, which is what lets pricing bill each request at its
 /// prompt-length tier after summing.
@@ -390,26 +430,32 @@ pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<()> {
     .await
 }
 
-/// Runs whose job names no model of its own (no launch fact and no stored
-/// selection), so their events key by the model the provider reported.
-const MODEL_LESS_RUNS_SQL: &str = "SELECT r.id
-    FROM runs r
-    LEFT JOIN sessions s ON s.id = r.session_id
-    JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
-    WHERE NULLIF(j.model, '') IS NULL AND j.selection IS NULL";
+/// Runs whose events key by the model the provider reported
+/// ([`model_key_expr`]): their job selected no model, or a bare Claude alias.
+fn report_keyed_runs_sql() -> String {
+    format!(
+        "SELECT r.id
+        FROM runs r
+        LEFT JOIN sessions s ON s.id = r.session_id
+        JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+        WHERE {SELECTED_MODEL} IS NULL OR LOWER({SELECTED_MODEL}) IN ({spellings})",
+        spellings = alias_spellings(),
+    )
+}
 
 /// Events read per page by [`backfill_reported_models`]: a long thread run has
 /// thousands of turns, and each row carries its whole body.
 const REPORTED_MODEL_PAGE: i64 = 200;
 
-/// Fill `events.reported_model` on the billable events of model-less jobs'
-/// runs that were stored before the column existed, so the fold that follows
-/// can attribute them. An archived event's `data` is only an envelope, so each
-/// page is read through `reconstruct_events`. A one-time pass inside the
-/// historical backfill: live events get the column from the insert seam.
+/// Fill `events.reported_model` on the billable events of report-keyed runs
+/// ([`report_keyed_runs_sql`]) that were stored before the column existed, so
+/// the fold that follows keys them by the generation that served them. An
+/// archived event's `data` is only an envelope, so each page is read through
+/// `reconstruct_events`. A one-time pass inside the historical backfill: live
+/// events get the column from the insert seam.
 pub(crate) async fn backfill_reported_models(db: &LocalDb) -> DbResult<()> {
     let runs = db
-        .query_all(MODEL_LESS_RUNS_SQL, (), |row| row.text(0))
+        .query_all(report_keyed_runs_sql(), (), |row| row.text(0))
         .await?;
     let page_sql = format!(
         "SELECT {cols} FROM events
@@ -672,7 +718,7 @@ token_events AS (
         e.created_at AS ts,
         COALESCE(r.project_id, j.project_id) AS project_id,
         j.id AS job_id,
-        {model_key} AS model,
+        {model_read} AS model,
         j.node_name AS node_name,
         j.agent_config_id AS agent_config_id,
         LOWER(COALESCE(s.backend, 'claude')) AS backend,
@@ -712,6 +758,7 @@ token_events AS (
 )",
         long = long_prompt_predicate(),
         model_key = model_key_expr(),
+        model_read = model_read_key(&model_key_expr()),
     )
 }
 
@@ -871,7 +918,7 @@ pub(crate) async fn tokens_per_loc(
                    SUM(tr.billable_tokens) AS billable,
                    {usage},
                    {unmetered_usage},
-                   MAX(tr.model) AS model,
+                   MAX({model}) AS model,
                    MAX(tr.node_name) AS node_name,
                    MAX(tr.backend) AS backend
             FROM token_rollup tr
@@ -924,6 +971,7 @@ pub(crate) async fn tokens_per_loc(
         unmetered_usage = unmetered_usage_select("tr"),
         usage_cols = usage_select(|_, alias| format!("jt.{alias}")),
         unmetered_usage_cols = unmetered_usage_columns("jt"),
+        model = rollup_model(),
     );
     db.query_all(sql, scope_range_params(scope, range), loc_row)
         .await
@@ -1049,24 +1097,24 @@ pub(crate) async fn cost_components(
     let sql = format!(
         "WITH tok AS (
             SELECT {bucket_expr} AS bucket_start,
-                   tr.model AS model,
+                   {model} AS model,
                    tr.backend AS backend,
                    {usage},
                    {unmetered_usage},
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND {filter}
-            GROUP BY {bucket_expr}, tr.model, tr.backend
+            GROUP BY {bucket_expr}, {model}, tr.backend
         ),
         cost AS (
             SELECT {bucket_expr} AS bucket_start,
-                   tr.model AS model,
+                   {model} AS model,
                    tr.backend AS backend,
                    SUM(tr.exact_cost) AS exact_cost,
                    SUM(tr.exact_cost_count) AS exact_count
             FROM token_rollup tr
             WHERE tr.exact_cost_count > 0 AND {cost_filter}
-            GROUP BY {bucket_expr}, tr.model, tr.backend
+            GROUP BY {bucket_expr}, {model}, tr.backend
         )
         SELECT tok.bucket_start,
                tok.model,
@@ -1084,6 +1132,7 @@ pub(crate) async fn cost_components(
         ORDER BY tok.bucket_start",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        model = rollup_model(),
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
         unmetered_usage = unmetered_usage_select("tr"),
@@ -1127,7 +1176,7 @@ pub(crate) async fn cost_components_by_job(
     let bucket_expr = bucket.bucket_expr("tr.bucket_start");
     let sql = format!(
         "SELECT {bucket_expr} AS bucket_start,
-                tr.model,
+                {model},
                 tr.backend,
                 tr.job_id,
                 {usage},
@@ -1136,9 +1185,10 @@ pub(crate) async fn cost_components_by_job(
                 SUM(CASE WHEN tr.exact_cost_count > 0 THEN tr.exact_cost ELSE 0.0 END)
          FROM token_rollup tr
          WHERE (tr.token_event_count > 0 OR tr.exact_cost_count > 0) AND {filter}
-         GROUP BY {bucket_expr}, tr.model, tr.backend, tr.job_id
+         GROUP BY {bucket_expr}, {model}, tr.backend, tr.job_id
          ORDER BY 1",
         filter = ROLLUP_SCOPE_RANGE,
+        model = rollup_model(),
         usage = unmetered_usage_select("tr"),
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
@@ -1218,7 +1268,7 @@ pub(crate) async fn cost_components_live(
            AND cost.backend = tok.backend
         ORDER BY tok.bucket_start",
         cte = token_events_cte(),
-        model_key = model_key_expr(),
+        model_key = model_read_key(&model_key_expr()),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
@@ -1280,7 +1330,7 @@ pub(crate) async fn provider_model_components(
 ) -> DbResult<Vec<ProviderModelComponentRow>> {
     let sql = format!(
         "WITH tok AS (
-            SELECT tr.model AS model,
+            SELECT {model} AS model,
                    tr.backend AS backend,
                    {usage},
                    {unmetered_usage},
@@ -1288,16 +1338,16 @@ pub(crate) async fn provider_model_components(
                    COUNT(DISTINCT tr.run_id) AS runs
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND tr.backend = ?7 AND {filter}
-            GROUP BY tr.model, tr.backend
+            GROUP BY {model}, tr.backend
         ),
         cost AS (
-            SELECT tr.model AS model,
+            SELECT {model} AS model,
                    tr.backend AS backend,
                    SUM(tr.exact_cost) AS exact_cost,
                    SUM(tr.exact_cost_count) AS exact_count
             FROM token_rollup tr
             WHERE tr.exact_cost_count > 0 AND tr.backend = ?7 AND {cost_filter}
-            GROUP BY tr.model, tr.backend
+            GROUP BY {model}, tr.backend
         )
         SELECT tok.model,
                {usage_cols},
@@ -1312,6 +1362,7 @@ pub(crate) async fn provider_model_components(
            AND cost.backend = tok.backend",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        model = rollup_model(),
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
         unmetered_usage = unmetered_usage_select("tr"),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
@@ -1376,7 +1427,7 @@ pub(crate) async fn provider_model_components_live(
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
            AND cost.backend = tok.backend",
         cte = token_events_cte(),
-        model_key = model_key_expr(),
+        model_key = model_read_key(&model_key_expr()),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
@@ -1438,7 +1489,7 @@ pub(crate) async fn economics_granular(
     // has no exact cost, before aggregation across model, role, and backend.
     let sql = format!(
         "WITH tok AS (
-            SELECT tr.model AS model,
+            SELECT {model} AS model,
                    tr.agent_config_id AS agent_config_id,
                    tr.backend AS backend,
                    {usage},
@@ -1448,17 +1499,17 @@ pub(crate) async fn economics_granular(
                    COUNT(DISTINCT tr.run_id) AS runs
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND {filter}
-            GROUP BY tr.model, tr.agent_config_id, tr.backend
+            GROUP BY {model}, tr.agent_config_id, tr.backend
         ),
         cost AS (
-            SELECT tr.model AS model,
+            SELECT {model} AS model,
                    tr.agent_config_id AS agent_config_id,
                    tr.backend AS backend,
                    SUM(tr.exact_cost) AS exact_cost,
                    SUM(tr.exact_cost_count) AS exact_count
             FROM token_rollup tr
             WHERE tr.exact_cost_count > 0 AND {cost_filter}
-            GROUP BY tr.model, tr.agent_config_id, tr.backend
+            GROUP BY {model}, tr.agent_config_id, tr.backend
         )
         SELECT tok.model,
                tok.agent_config_id,
@@ -1477,6 +1528,7 @@ pub(crate) async fn economics_granular(
            AND cost.backend = tok.backend",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        model = rollup_model(),
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
         unmetered_usage = unmetered_usage_select("tr"),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
@@ -1552,7 +1604,7 @@ pub(crate) async fn economics_granular_live(
            AND IFNULL(cost.agent_config_id, '') = IFNULL(tok.agent_config_id, '')
            AND cost.backend = tok.backend",
         cte = token_events_cte(),
-        model_key = model_key_expr(),
+        model_key = model_read_key(&model_key_expr()),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
@@ -2350,22 +2402,22 @@ pub(crate) async fn cost_by_project(
     let sql = format!(
         "WITH tok AS (
             SELECT tr.project_id AS project_id,
-                   tr.model AS model,
+                   {model} AS model,
                    tr.backend AS backend,
                    {unmetered_usage},
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND tr.project_id IS NOT NULL AND {filter}
-            GROUP BY tr.project_id, tr.model, tr.backend
+            GROUP BY tr.project_id, {model}, tr.backend
         ),
         cost AS (
             SELECT tr.project_id AS project_id,
-                   tr.model AS model,
+                   {model} AS model,
                    tr.backend AS backend,
                    SUM(tr.exact_cost) AS exact_cost
             FROM token_rollup tr
             WHERE tr.exact_cost_count > 0 AND tr.project_id IS NOT NULL AND {cost_filter}
-            GROUP BY tr.project_id, tr.model, tr.backend
+            GROUP BY tr.project_id, {model}, tr.backend
         )
         SELECT tok.project_id,
                COALESCE(p.name, tok.project_id) AS project_name,
@@ -2383,6 +2435,7 @@ pub(crate) async fn cost_by_project(
         ORDER BY tok.project_id",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        model = rollup_model(),
         unmetered_usage = unmetered_usage_select("tr"),
         unmetered_usage_cols = unmetered_usage_columns("tok"),
     );
@@ -2517,7 +2570,7 @@ fn merged_pr_ctes() -> String {
     format!(
         "job_tokens AS (
         SELECT tr.job_id AS job_id,
-               MAX(tr.model) AS model,
+               MAX({model}) AS model,
                MAX(tr.agent_config_id) AS agent_config_id,
                MAX(tr.backend) AS backend,
                {unmetered_usage},
@@ -2532,6 +2585,7 @@ fn merged_pr_ctes() -> String {
         SELECT job_id, SUM(COALESCE(additions, 0) + COALESCE(deletions, 0)) AS lines
         FROM file_changes GROUP BY job_id
     )",
+        model = rollup_model(),
         unmetered_usage = unmetered_usage_select("tr"),
     )
 }

@@ -3,10 +3,11 @@
 //! Prices are public list prices as of [`PRICE_SOURCE_DATE`] and drift over
 //! time, so treat this table as an estimate. Pricing is an exact table keyed
 //! by canonical model id from `cairn_models_types::identity`. Stored model
-//! names resolve through those identity tables, never by substring. A Claude
-//! CLI alias is priced as the generation [`ALIAS_GENERATIONS`] names; an
-//! executor on an older CLI can run it on an older, dearer model, which this
-//! underprices. A model with no canonical id, or no price row, is unpriced.
+//! names resolve through those identity tables, never by substring. Usage
+//! launched under a Claude CLI alias is keyed by the generation the provider
+//! reported serving it, so it is priced as that generation; only usage with no
+//! report is priced as the generation [`ALIAS_GENERATIONS`] names. A model
+//! with no canonical id, or no price row, is unpriced.
 //!
 //! GPT tiers are OpenAI's Standard-processing list prices from
 //! <https://developers.openai.com/api/docs/pricing>. A temporary promotion is
@@ -227,12 +228,18 @@ const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 0.50, 5.0, 30.0);
 const GPT_5_4: ModelPrice = ModelPrice::new(2.50, 0.25, 2.50, 15.0);
 const GPT_5_4_MINI: ModelPrice = ModelPrice::new(0.75, 0.075, 0.75, 4.50);
 
-/// The concrete Claude API id each bare alias is priced as, resolved through
-/// the identity table so the id costs exactly what the alias does. The
-/// `token_rollup` model key folds this generation onto its alias (`claude-opus-5-5` keys as `opus`) and leaves
-/// every other generation under its own id, so keying never moves usage
-/// between price tiers. When an alias moves to a new generation, update this
-/// row with the tier boundary and re-fold.
+/// The concrete Claude API id each bare alias currently runs, resolved through
+/// the identity table so the id costs exactly what the alias does.
+///
+/// It is read only at read time, in two places. A `token_rollup` row keyed by
+/// the bare alias is usage whose provider reported no model, and is priced as
+/// this generation; usage that reported a model is keyed by that generation's
+/// own id ([`crate::queries`]' `model_key_expr`). And readers fold this
+/// generation's id onto its alias (`claude-opus-5-5` reads as `opus`), so one
+/// model is one legend entry; the fold merges only keys that cost the same.
+/// When the CLI moves an alias to a new generation, change this row and
+/// nothing else: stored usage keeps the generation that served it, so no
+/// re-fold or migration is needed.
 pub(crate) const ALIAS_GENERATIONS: [(&str, &str); 4] = [
     ("haiku", "claude-haiku-5-5"),
     ("sonnet", "claude-sonnet-5-5"),

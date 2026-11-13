@@ -2527,9 +2527,14 @@ fn claude_message(model: &str) -> String {
     format!(r#"{{"eventType":"assistant","raw":{{"message":{{"model":"{model}"}}}}}}"#)
 }
 
+/// `(model, billable_tokens)` per model as the readers group the rollup: each
+/// stored key through [`queries::model_read_key`].
 async fn rollup_models(db: &LocalDb) -> Vec<(Option<String>, i64)> {
     db.query_all(
-        "SELECT model, SUM(billable_tokens) FROM token_rollup GROUP BY model ORDER BY model",
+        format!(
+            "SELECT {key}, SUM(billable_tokens) FROM token_rollup GROUP BY {key} ORDER BY 1",
+            key = queries::model_read_key("model")
+        ),
         (),
         |row| Ok((row.opt_text(0)?, row.i64(1)?)),
     )
@@ -2588,6 +2593,76 @@ async fn split_model_labels_roll_up_under_one_key() {
             .unwrap();
     assert!(points.iter().all(|p| p.model == "opus"), "{points:?}");
     assert_eq!(points.iter().map(|p| p.billable_tokens).sum::<i64>(), 150);
+}
+
+/// A launch that named the `fable` alias keeps the generation each event
+/// reported, whatever `fable` means now. With the alias on 5.2, events that
+/// reported 5.1 store, read and price as 5.1; an event with no report prices
+/// as the alias's current generation; and the current generation's own id
+/// reads as `fable` beside it, so the legend has one entry per generation.
+#[tokio::test]
+async fn alias_launches_price_by_the_generation_the_provider_reported() {
+    let (_, current) = pricing::ALIAS_GENERATIONS
+        .iter()
+        .find(|(alias, _)| *alias == "fable")
+        .unwrap();
+    assert_ne!(*current, "claude-fable-5-1", "fable has moved past 5.1");
+    let db = cost_db().await;
+    seed_job(&db, "f", "'fable'", "NULL").await;
+    let data = claude_message("claude-fable-5-1");
+    seam_insert(&db, assistant("f1", "f", 1, 100, 1_000, &data)).await;
+    seam_insert(
+        &db,
+        assistant("f2", "f", 2, 110, 2_000, &claude_message(current)),
+    )
+    .await;
+    seam_insert(&db, assistant("f3", "f", 3, 120, 4_000, "{}")).await;
+
+    // The stored key names no current generation, so an alias move leaves it true.
+    let stored = db
+        .query_all("SELECT model FROM token_rollup ORDER BY model", (), |row| {
+            row.text(0)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, ["claude-fable-5-1", current, "fable"]);
+    assert_eq!(
+        rollup_models(&db).await,
+        vec![
+            (Some("claude-fable-5-1".to_string()), 1_000),
+            (Some("fable".to_string()), 6_000),
+        ]
+    );
+
+    let points =
+        tokens_by_model_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+    let legend: Vec<(&str, i64)> = points
+        .iter()
+        .map(|p| (p.model.as_str(), p.billable_tokens))
+        .collect();
+    assert_eq!(legend, [("claude-fable-5-1", 1_000), ("fable", 6_000)]);
+
+    let price = |model: &str, input: i64| {
+        let usage = pricing::TieredUsage {
+            all: pricing::Components {
+                input,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        pricing::cost_usd("claude", Some(model), &usage)
+    };
+    assert!(price("claude-fable-5-1", 1_000) > price("fable", 1_000));
+    let expected = price("claude-fable-5-1", 1_000) + price("fable", 6_000);
+    let total: f64 = cost_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.cost_usd)
+        .sum();
+    assert!((total - expected).abs() < 1e-12, "{total} vs {expected}");
 }
 
 /// `(account_id, billable_tokens)` per rollup account.
@@ -3226,10 +3301,25 @@ async fn effective_cost_reports_an_unpriced_account_and_leaves_it_out_of_what_wa
 /// envelope in `data`, so the backfill reads them reconstructed. A sub-agent's
 /// event is not a billed turn and gets no column. The archived event is an
 /// older Sonnet, so it keeps its own key (and price) rather than `sonnet`'s.
+/// A job launched on the `fable` alias is attributed the same way, so its
+/// archived 5.1 turn keeps 5.1 rather than the alias's current generation.
 #[tokio::test]
-async fn historical_backfill_attributes_model_less_runs_including_archived_events() {
+async fn historical_backfill_attributes_report_keyed_runs_including_archived_events() {
     let db = cost_db().await;
     seed_job(&db, "old", "NULL", "NULL").await;
+    seed_job(&db, "fab", "'fable'", "NULL").await;
+    let fable_blob =
+        cairn_db::storage::events::compress(claude_message("claude-fable-5-1").as_bytes()).unwrap();
+    db.execute(
+        "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+             parent_tool_use_id, created_at, input_tokens, storage_mode, data_blob, codec)
+         VALUES ('fab-arch', 'run-fab', 'sess-fab', 1, 100, 'assistant',
+             '{\"archived\":\"zstd\",\"eventType\":\"assistant\",\"toolUseId\":null}',
+             NULL, 100, 11, 'zstd', ?1, 'zstd_v1')",
+        (fable_blob,),
+    )
+    .await
+    .unwrap();
     let archived_body = claude_message("claude-sonnet-4-5-20250929");
     let blob = cairn_db::storage::events::compress(archived_body.as_bytes()).unwrap();
     db.execute(
@@ -3273,9 +3363,19 @@ async fn historical_backfill_attributes_model_less_runs_including_archived_event
             ("child".to_string(), None),
         ]
     );
+    let fable_reported = db
+        .query_one(
+            "SELECT reported_model FROM events WHERE id = 'fab-arch'",
+            (),
+            |row| row.opt_text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fable_reported.as_deref(), Some("claude-fable-5-1"));
     assert_eq!(
         rollup_models(&db).await,
         vec![
+            (Some("claude-fable-5-1".to_string()), 11),
             (Some("claude-sonnet-4-5-20250929".to_string()), 3),
             (Some("opus".to_string()), 5),
         ]
