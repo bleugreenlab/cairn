@@ -40,6 +40,9 @@ pub(crate) mod preparation;
 mod publication_tests;
 #[cfg(test)]
 mod recovery_tests;
+pub(crate) mod regenerate;
+#[cfg(test)]
+mod regenerate_tests;
 pub(crate) mod replay_cost;
 mod replay_requests;
 pub(crate) mod retirement;
@@ -791,17 +794,24 @@ struct StructuralMergePlan {
 }
 
 /// Read immutable sides and prove candidate content without writer exclusion.
+/// `regenerated` names paths settled by declared regeneration instead, which
+/// the plan leaves alone.
 fn prepare_structural_merge(
     jj: &crate::jj::JjEnv,
     store: &Path,
     diagnostic: &crate::jj::ConflictDiagnostic,
     baseline: &ReplayBaseline,
     rules: &crate::orchestrator::landing::MergeRules,
+    regenerated: &dyn Fn(&str) -> bool,
 ) -> Result<Option<StructuralMergePlan>, String> {
     if diagnostic.condition == crate::jj::ConflictCondition::BaseDrift {
         return Ok(None);
     }
-    let paths = diagnostic.conflicting_paths();
+    let paths: Vec<String> = diagnostic
+        .conflicting_paths()
+        .into_iter()
+        .filter(|path| !regenerated(path))
+        .collect();
     if paths.is_empty() || paths.iter().any(|path| rules.kind_for(path).is_none()) {
         return Ok(None);
     }
@@ -5453,6 +5463,7 @@ mod real_store_collision_tests {
                 &diagnostic,
                 &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
                 &crate::orchestrator::landing::merge_rules_at(&fx.jj, &fx.store, "main"),
+                &|_| false,
             )
             .unwrap()
             .expect("the declared list merge settles it");
@@ -5531,6 +5542,7 @@ mod real_store_collision_tests {
             &diagnostic,
             &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
             &crate::orchestrator::landing::merge_rules_at(&fx.jj, &fx.store, "main"),
+            &|_| false,
         )
         .unwrap()
         .is_none());

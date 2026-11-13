@@ -61,6 +61,9 @@ enum RebaseAction<'a> {
     /// The bounded managed retry of a recovery fence's targeted repair
     /// (`orchestrator/branch_recovery.rs`), brought forward.
     Repair,
+    /// Run the branch's newest declared regeneration again at its head
+    /// (`orchestrator/base_advance/regenerate.rs`).
+    Regenerate,
     DismissAcceptance(Dismissal<'a>),
 }
 
@@ -105,15 +108,27 @@ fn parse_rebase_action(payload: &serde_json::Value) -> Result<RebaseAction<'_>, 
     if action == "dismiss-acceptance" {
         return parse_dismissal(payload).map(RebaseAction::DismissAcceptance);
     }
-    if !matches!(action, "replay" | "fast-forward-from-origin" | "repair") {
+    if !matches!(
+        action,
+        "replay" | "fast-forward-from-origin" | "repair" | "regenerate"
+    ) {
         return Err(format!(
-            "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got '{action}'"
+            "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'regenerate', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got '{action}'"
         ));
     }
     if let Some(key) = present_key(payload, &DISMISSAL_KEYS) {
         return Err(format!(
             "payload.{key} applies only to action:'dismiss-acceptance'"
         ));
+    }
+    if action == "regenerate" {
+        if let Some(key) = present_key(payload, &REPLAY_AND_FAST_FORWARD_KEYS) {
+            return Err(format!(
+                "payload.{key} does not apply to action:'regenerate', which only runs the \
+                 branch's declared regeneration again at its head"
+            ));
+        }
+        return Ok(RebaseAction::Regenerate);
     }
     if action == "repair" {
         // A repair retries the fence's recorded repair and nothing else.
@@ -1097,6 +1112,27 @@ pub(super) async fn dispatch(
                         .await
                         .map_err(|error| build_failure(index, item, error))?
                 }
+                RebaseAction::Regenerate if dry_run => {
+                    format!("Would run `{branch}`'s declared regeneration again at its head")
+                }
+                RebaseAction::Regenerate => {
+                    let project_id = rows.project_id().ok_or_else(|| {
+                        build_failure(index, item, "this node's project is unknown".to_string())
+                    })?;
+                    let store = rows
+                        .store_path(orch)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                    crate::orchestrator::base_advance::regenerate::redispatch(
+                        orch,
+                        db.clone(),
+                        project_id,
+                        &store,
+                        &branch,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+                }
                 RebaseAction::Repair if dry_run => {
                     format!("Would retry the targeted recovery repair of `{branch}` now")
                 }
@@ -1632,7 +1668,7 @@ mod tests {
             RebaseAction::FastForwardFromOrigin { base: true }
         );
         for (payload, expected) in [
-            (serde_json::json!({"action": "undo"}), "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got 'undo'"),
+            (serde_json::json!({"action": "undo"}), "payload.action must be 'replay', 'fast-forward-from-origin', 'repair', 'regenerate', 'rebuild', 'catch-up-mode', 'mark-reviewed' or 'dismiss-acceptance', got 'undo'"),
             (serde_json::json!({"action": "replay", "branch": "base"}), "payload.branch applies only to fast-forward-from-origin"),
             (serde_json::json!({"action": "replay", "resolution": "ours"}), "payload.resolution must be 'take-committed-tip' when provided"),
             (serde_json::json!({"action": "replay", "cancel_holding_batch": "yes"}), "payload.cancel_holding_batch is true or false"),
@@ -1645,6 +1681,23 @@ mod tests {
         )
         .unwrap_err()
         .contains("a plain replay drops nothing"));
+    }
+
+    #[test]
+    fn a_regenerate_carries_no_other_action_key() {
+        assert_eq!(
+            parse_rebase_action(&serde_json::json!({"action": "regenerate"})).unwrap(),
+            RebaseAction::Regenerate
+        );
+        let error = parse_rebase_action(&serde_json::json!({
+            "action": "regenerate",
+            "fingerprint": "fp",
+        }))
+        .unwrap_err();
+        assert!(
+            error.contains("does not apply to action:'regenerate'"),
+            "{error}"
+        );
     }
 
     #[test]

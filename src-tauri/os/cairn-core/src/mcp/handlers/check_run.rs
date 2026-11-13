@@ -104,6 +104,16 @@ enum ManualCheckObservation {
         base_commit: String,
         paths: Vec<String>,
     },
+    /// The branch conflicts with its base only in declared regenerable
+    /// paths: its owner's replay takes the branch's bytes and regenerates
+    /// them, so no verdict is owed at this head.
+    RegenerationPending {
+        branch: String,
+        head: String,
+        base_branch: String,
+        base_commit: String,
+        paths: Vec<String>,
+    },
     Failed {
         error: String,
     },
@@ -125,6 +135,7 @@ fn is_settled(observation: &ManualCheckObservation) -> bool {
         ManualCheckObservation::Complete { .. }
             | ManualCheckObservation::Failed { .. }
             | ManualCheckObservation::ConflictsWithBase { .. }
+            | ManualCheckObservation::RegenerationPending { .. }
     )
 }
 
@@ -308,6 +319,15 @@ fn observation_from_error(
     if let ManualCheckError::Capture(RevisionCaptureError::Preparation { refusal, .. }) = &error {
         if let PreparationRefusal::Conflict(conflict) = &**refusal {
             return ManualCheckObservation::ConflictsWithBase {
+                branch: conflict.branch.clone(),
+                head: conflict.head.clone(),
+                base_branch: conflict.base_branch.clone(),
+                base_commit: conflict.base_commit.clone(),
+                paths: conflict.paths.clone(),
+            };
+        }
+        if let PreparationRefusal::RegenerationPending(conflict) = &**refusal {
+            return ManualCheckObservation::RegenerationPending {
                 branch: conflict.branch.clone(),
                 head: conflict.head.clone(),
                 base_branch: conflict.base_branch.clone(),

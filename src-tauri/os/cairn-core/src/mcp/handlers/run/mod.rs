@@ -648,6 +648,51 @@ pub(crate) async fn publish_and_seal_slot_delta(
     message: &str,
     author: Option<&PublicationIdentity>,
 ) -> Result<Option<PublishedSlotDelta>, String> {
+    publish_and_seal_slot_delta_within(
+        orch, store_dir, request, delta, branch, message, author, None,
+    )
+    .await
+}
+
+/// The paths a delta changes that `admits` does not accept.
+fn delta_paths_outside(
+    repository: &Path,
+    delta: &crate::fleet::MutationDelta,
+    admits: &(dyn Fn(&str) -> bool + Send + Sync),
+) -> Result<Vec<String>, String> {
+    let names = git_output(
+        repository,
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            &delta.base_commit,
+            &delta.delta_commit,
+        ],
+        "list the delta's changed paths",
+    )?;
+    Ok(names
+        .lines()
+        .filter(|path| !path.is_empty() && !admits(path))
+        .map(str::to_string)
+        .collect())
+}
+
+/// [`publish_and_seal_slot_delta`] for a delta that may change only the paths
+/// `admits` accepts. One that changes any other is discarded unlanded, naming
+/// them: what a command was allowed to rewrite is the whole of what it may
+/// publish.
+#[allow(clippy::too_many_arguments)] // The publication's coordinates, plus its one restriction.
+pub(crate) async fn publish_and_seal_slot_delta_within(
+    orch: &Orchestrator,
+    store_dir: &Path,
+    request: &CellRequest,
+    delta: &crate::fleet::MutationDelta,
+    branch: &str,
+    message: &str,
+    author: Option<&PublicationIdentity>,
+    admits: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+) -> Result<Option<PublishedSlotDelta>, String> {
     let repository = request
         .repository
         .colocated_path()
@@ -672,6 +717,29 @@ pub(crate) async fn publish_and_seal_slot_delta(
     // Taken before the barrier consumes the slot: the upload is installed by
     // now, so it is finalized whether the fix lands, is superseded, or fails.
     let consume_receipt = prepared.available.consume_receipt;
+    if let Some(admits) = admits {
+        let refused = match delta_paths_outside(&target.repository, delta, admits) {
+            Ok(outside) if outside.is_empty() => None,
+            Ok(outside) => Some(format!(
+                "the command changed paths outside its declared globs: {}; nothing was \
+                 published",
+                outside.join(", ")
+            )),
+            Err(error) => Some(format!(
+                "the delta's changed paths could not be read ({error}); nothing was published"
+            )),
+        };
+        if let Some(refused) = refused {
+            // Dropping the slot releases its pin: the delta is discarded.
+            drop(prepared);
+            if consume_receipt {
+                if let Err(error) = finalize_delta_receipt(orch, &target, delta).await {
+                    log::warn!("refused delta upload was not finalized: {error}");
+                }
+            }
+            return Err(refused);
+        }
+    }
     let (_, landed) = delta_barrier(
         orch,
         Some(store_dir),
@@ -15881,5 +15949,64 @@ mod ran_against_line_tests {
             "ran against main, cell 3 (warm: 0 files / 0 crates)"
         );
         assert_eq!(ran_against_line("main", None), "ran against main");
+    }
+}
+
+#[cfg(test)]
+mod delta_restriction_tests {
+    use super::delta_paths_outside;
+
+    /// What a regeneration may publish is what its rule's globs admit; every
+    /// other path its delta changes is named, additions and deletions alike.
+    #[test]
+    fn a_delta_names_every_changed_path_its_restriction_refuses() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let write = |path: &str, text: &str| {
+            let path = repo.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "tests@cairn.local"]);
+        git(&["config", "user.name", "Cairn tests"]);
+        write("gen/out", "old\n");
+        write("src/a", "a\n");
+        write("src/gone", "gone\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        write("gen/out", "new\n");
+        write("gen/added", "added\n");
+        write("src/a", "a changed\n");
+        std::fs::remove_file(repo.path().join("src/gone")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "regenerated"]);
+        let delta = crate::fleet::MutationDelta {
+            base_commit: base,
+            delta_commit: git(&["rev-parse", "HEAD"]),
+            upload_receipt: None,
+        };
+        let admits = |path: &str| path.starts_with("gen/");
+        assert_eq!(
+            delta_paths_outside(repo.path(), &delta, &admits).unwrap(),
+            ["src/a", "src/gone"]
+        );
+        let everything = |_: &str| true;
+        assert!(delta_paths_outside(repo.path(), &delta, &everything)
+            .unwrap()
+            .is_empty());
     }
 }

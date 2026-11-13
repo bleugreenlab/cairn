@@ -688,17 +688,50 @@ async fn merge_pr_for_job_measured(
         &merge_context.source_branch,
         &merge_context.target_branch,
     );
-    let barrier = crate::mcp::handlers::run::held::pr_commit_barrier(
-        orch,
-        &merge_context.project_id,
-        &merge_context.source_branch,
-    )
-    .await;
+    use crate::orchestrator::base_advance::regenerate;
+    let (project_id, source) = (&merge_context.project_id, &merge_context.source_branch);
+    let barrier =
+        crate::mcp::handlers::run::held::pr_commit_barrier(orch, project_id, source).await;
     barrier.refuse_merge()?;
-    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution, precondition, gates)
-        .await
-        .map(|reply| barrier.prefix(reply))
-        .map_err(|error| barrier.prefix(error))
+    // A regeneration holding the source settles before the landing reserves
+    // anything: its own commit needs the reservation the landing would hold.
+    // A merge waits on it and is told why; it is never refused for it.
+    let mut gates = Some(gates);
+    let (result, waited) = regenerate::land_after_regenerations(&db, project_id, source, || {
+        let timer = gates
+            .take()
+            .unwrap_or_else(|| super::merge_metrics::time(super::merge_metrics::Phase::Gates));
+        // Erased so its `Send` proof is settled here once: nested inside the
+        // regeneration wait unboxed, the landing future overflows the trait
+        // solver's recursion limit (E0275) in every binary that spawns it.
+        let landing: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
+        > = Box::pin(merge_pr_for_job_past_barrier(
+            orch,
+            job_id,
+            merge_method.clone(),
+            attribution.clone(),
+            precondition,
+            timer,
+        ));
+        landing
+    })
+    .await?;
+    let stale = regenerate::stale_lines(orch, &db, project_id, source).await;
+    let annotate = |text: String| {
+        let mut out = waited.join("\n");
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&text);
+        for line in &stale {
+            out.push_str(&format!("\n\n⚠️ {line}"));
+        }
+        out
+    };
+    result
+        .map(|reply| barrier.prefix(annotate(reply)))
+        .map_err(|error| barrier.prefix(annotate(error)))
 }
 
 async fn merge_pr_for_job_past_barrier(

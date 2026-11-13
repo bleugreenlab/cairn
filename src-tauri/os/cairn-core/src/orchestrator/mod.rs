@@ -3859,6 +3859,12 @@ impl Orchestrator {
                     recovered = true;
                     let recovery = orch.clone();
                     tokio::spawn(async move {
+                        // Regenerations the previous process left holding
+                        // branches, before the replays those holds deferred.
+                        crate::orchestrator::base_advance::regenerate::recover_after_restart(
+                            &recovery,
+                        )
+                        .await;
                         crate::orchestrator::base_advance::serve_pending_replay_requests(
                             &recovery, None,
                         )

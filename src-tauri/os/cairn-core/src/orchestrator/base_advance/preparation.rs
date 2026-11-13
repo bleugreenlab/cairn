@@ -467,6 +467,10 @@ pub(crate) enum BusyReason {
         holder: Option<String>,
     },
     RunBatch(String),
+    /// A placed batch is regenerating declared outputs this branch carries
+    /// stale ([`super::regenerate`]); the text names the paths and the batch.
+    /// A merge waits on it rather than being refused.
+    Regenerating(String),
     /// The legacy sweep may still own this coordinate's intent row.
     LegacyIntent {
         intent_id: String,
@@ -536,6 +540,10 @@ pub(crate) enum PreparationRefusal {
     /// The branch conflicts with its base. Boxed: it is by far the largest
     /// refusal, and every preparation result carries the refusal's size.
     Conflict(Box<BaseConflict>),
+    /// A check or run capture met a conflict only declared regeneration
+    /// settles. Captures never install, so the owner's preparation was asked
+    /// for instead; the branch is unchanged by this one.
+    RegenerationPending(Box<BaseConflict>),
     BaseConflicted {
         base_branch: String,
         base: String,
@@ -594,6 +602,7 @@ impl PreparationRefusal {
             Self::Busy(_) => "busy",
             Self::Cooldown { .. } => "cooldown",
             Self::Conflict(_) => "conflicts with base",
+            Self::RegenerationPending(_) => "regeneration pending",
             Self::BaseConflicted { .. } => "base conflicted",
             Self::HeldByParentConflict(_) => "held by parent conflict",
             Self::TimedOut { .. } => "timed out",
@@ -636,6 +645,22 @@ impl std::fmt::Display for PreparationRefusal {
             Self::Busy(BusyReason::RunBatch(batch)) => write!(
                 f,
                 "{batch} may still commit to this branch, so it is not rewritten under it"
+            ),
+            Self::Busy(BusyReason::Regenerating(hold)) => write!(f, "{hold}"),
+            Self::RegenerationPending(conflict) => write!(
+                f,
+                "`{}` is waiting on regeneration of {} after base `{}` advanced to {}; its \
+                 owner's replay takes the branch's bytes and regenerates them, and this capture \
+                 left the branch unchanged",
+                conflict.branch,
+                conflict
+                    .paths
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                conflict.base_branch,
+                conflict.base_commit
             ),
             Self::Busy(BusyReason::LegacyIntent { intent_id, status }) => write!(
                 f,
@@ -893,13 +918,13 @@ async fn prepare_in(context: &Context<'_>) -> Result<PreparedBranch, Preparation
         context.initialize_store().await?;
     }
     let mut last = String::from("no attempt completed");
-    let mut declared: Option<Arc<crate::jj::DeclaredMergeEdits>> = None;
-    let mut declared_tried = false;
+    let mut settlement = Settlement::default();
+    let mut settle_tried = false;
     let (mut attempt, mut races) = (0, 0);
     while races < PREPARATION_ATTEMPTS {
         // A round that stopped only to reserve is not an attempt: the next
         // round reuses its number.
-        let outcome = match context.attempt(attempt + 1, declared.clone()).await {
+        let outcome = match context.attempt(attempt + 1, settlement.clone()).await {
             // The attempt stopped before mutating, its guards released, so
             // reserving now never happens under the store lock.
             Err(PreparationRefusal::Busy(BusyReason::ReservationRequired))
@@ -927,14 +952,14 @@ async fn prepare_in(context: &Context<'_>) -> Result<PreparedBranch, Preparation
                 last = why;
                 // A plan proven at the old coordinate proves nothing at a new
                 // one; the next conflict may prove a fresh one.
-                declared = None;
-                declared_tried = false;
+                settlement = Settlement::default();
+                settle_tried = false;
             }
-            Attempt::Declared(edits) if !declared_tried => {
-                declared = Some(Arc::new(edits));
-                declared_tried = true;
+            Attempt::Settle(proposed) if !settle_tried => {
+                settlement = proposed;
+                settle_tried = true;
             }
-            Attempt::Declared(_) => {
+            Attempt::Settle(_) => {
                 return Err(PreparationRefusal::Repository(
                     "a declared merge plan was proposed twice at one coordinate".to_string(),
                 ));
@@ -1838,12 +1863,43 @@ enum DeclaredOutcome {
     TimedOut,
 }
 
+/// The base's declared regenerable outputs, pinned to the base they were
+/// read at.
+struct RegenerablePlan {
+    base: String,
+    rules: crate::orchestrator::landing::RegenerateRules,
+}
+
+/// What the base's declarations settle of a conflict, carried into a
+/// recompute from a fresh capture: proven structural merges, and the paths
+/// the engine may take the branch's side of.
+#[derive(Clone, Default)]
+struct Settlement {
+    declared: Option<Arc<crate::jj::DeclaredMergeEdits>>,
+    regenerable: Option<Arc<RegenerablePlan>>,
+}
+
+impl Settlement {
+    fn applied(&self) -> bool {
+        self.declared.is_some() || self.regenerable.is_some()
+    }
+}
+
+/// What the base's declarations make of a conflict.
+enum SettleOutcome {
+    Settle(Settlement),
+    /// A capture's conflict that only declared regeneration settles.
+    Pending,
+    None,
+    TimedOut,
+}
+
 enum Attempt {
     Prepared(Box<PreparedBranch>),
     Raced(String),
-    /// The conflict is settled by the base's declared merge rules; recompute
-    /// from a fresh capture with these pinned edits.
-    Declared(crate::jj::DeclaredMergeEdits),
+    /// The conflict is settled by the base's declarations; recompute from a
+    /// fresh capture with this settlement pinned.
+    Settle(Settlement),
 }
 
 struct Context<'a> {
@@ -2208,7 +2264,7 @@ impl Context<'_> {
     async fn attempt(
         &self,
         attempt: u32,
-        declared: Option<Arc<crate::jj::DeclaredMergeEdits>>,
+        settlement: Settlement,
     ) -> Result<Attempt, PreparationRefusal> {
         let request = self.request;
         let branch = request.branch.as_str();
@@ -2442,7 +2498,7 @@ impl Context<'_> {
                     relationship,
                     snapshot,
                     recovered_export,
-                    declared,
+                    settlement,
                     merge_mode,
                 )
                 .await;
@@ -2453,7 +2509,7 @@ impl Context<'_> {
             relationship,
             snapshot,
             recovered_export,
-            declared,
+            settlement,
             merge_mode,
         )
         .await
@@ -2467,12 +2523,13 @@ impl Context<'_> {
         relationship: BaseRelationship,
         snapshot: crate::jj::BranchAdvanceSnapshot,
         recovered_export: PreparedExport,
-        declared: Option<Arc<crate::jj::DeclaredMergeEdits>>,
+        settlement: Settlement,
         merge_mode: bool,
     ) -> Result<Attempt, PreparationRefusal> {
         let request = self.request;
         let branch = request.branch.as_str();
         let coordinate = snapshot.coordinate().clone();
+        let declared = settlement.declared.clone();
         // The branch would move from here on: before any cached conflict, a
         // session, a wake or compute, a parent mid-conflict holds it.
         self.refuse_parent_conflict(&relationship).await?;
@@ -2519,7 +2576,15 @@ impl Context<'_> {
                 )));
             }
         }
-        let declared_applied = declared.is_some();
+        if let Some(plan) = &settlement.regenerable {
+            if plan.base != coordinate.base {
+                return Ok(Attempt::Raced(format!(
+                    "the regenerable paths were read at base {}, but the base is at {}",
+                    plan.base, coordinate.base
+                )));
+            }
+        }
+        let settlement_applied = settlement.applied();
         if let Some(carry) = &request.carry {
             if carry.expected_pre_tip != coordinate.head {
                 return Err(PreparationRefusal::Moved {
@@ -2582,6 +2647,15 @@ impl Context<'_> {
         let budget = within_deadline(request, request.compute_budget);
         let probe = crate::jj::ReplayCostProbe::default();
         let snapshot = snapshot.with_cost_probe(probe.clone());
+        let snapshot = match &settlement.regenerable {
+            Some(plan) => {
+                let plan = plan.clone();
+                snapshot.with_regenerable_paths(crate::jj::RegenerablePaths::new(move |path| {
+                    plan.rules.covers(path)
+                }))
+            }
+            None => snapshot,
+        };
         self.with_cost(|cost| {
             cost.phases.capture_ms = cost
                 .attempt_started
@@ -2709,15 +2783,40 @@ impl Context<'_> {
             Err(crate::jj::AdvanceComputeError::Conflict(diagnostic)) => {
                 let diagnostic = *diagnostic;
                 let mut assess_basis = true;
-                if !merge_mode && !declared_applied {
-                    match self.declared_plan(&coordinate, &diagnostic).await? {
-                        DeclaredOutcome::Plan(edits) => return Ok(Attempt::Declared(edits)),
+                if !settlement_applied {
+                    match self
+                        .settle_conflict(&coordinate, &diagnostic, merge_mode)
+                        .await?
+                    {
+                        SettleOutcome::Settle(settlement) => {
+                            return Ok(Attempt::Settle(settlement))
+                        }
+                        SettleOutcome::Pending => {
+                            super::regenerate::request_owner_preparation(
+                                self.orch,
+                                &request.project_id,
+                                branch,
+                                &coordinate.base,
+                            );
+                            return Err(PreparationRefusal::RegenerationPending(Box::new(
+                                BaseConflict {
+                                    branch: branch.to_string(),
+                                    head: coordinate.head.clone(),
+                                    base_branch: coordinate.base_branch.clone(),
+                                    base_commit: coordinate.base.clone(),
+                                    paths: diagnostic.conflicting_paths(),
+                                    record: ConflictRecord::CheckEvidence {
+                                        intent_id: String::new(),
+                                    },
+                                },
+                            )));
+                        }
                         // The plan only saves the owner a resolution; failing to
                         // prove one in time leaves an ordinary conflict, never a
                         // stranded commit. The session-basis assessment would
                         // re-read the basis this probe just ran out of time on,
                         // so the reopened session keeps the earlier basis.
-                        DeclaredOutcome::TimedOut => {
+                        SettleOutcome::TimedOut => {
                             log::warn!(
                                 "declared merge plan for `{branch}` timed out at {}:{}; \
                                  recording the conflict with the earlier resolution basis",
@@ -2726,7 +2825,7 @@ impl Context<'_> {
                             );
                             assess_basis = false;
                         }
-                        DeclaredOutcome::None => {}
+                        SettleOutcome::None => {}
                     }
                 }
                 let conflict = self
@@ -2796,12 +2895,21 @@ impl Context<'_> {
                 "the branch catch-up mode changed during computation".to_string(),
             ));
         }
+        // A taken side is marked before the install that carries it, so the
+        // branch never holds stale outputs without the row that holds it.
+        let regenerations = self
+            .record_regenerations(&candidate, &settlement, &coordinate)
+            .await?;
         // The journal row is written before the local install, so an install
         // that lands and a crash before it is recorded still leaves a row the
         // next preparation settles from the literal head.
-        let acceptance = self
-            .record_pending_acceptance(&candidate, &inherited)
-            .await?;
+        let acceptance = match self.record_pending_acceptance(&candidate, &inherited).await {
+            Ok(acceptance) => acceptance,
+            Err(refusal) => {
+                super::regenerate::abandon(self.db, &request.project_id, &regenerations).await;
+                return Err(refusal);
+            }
+        };
         let jj = self.jj.clone();
         let (guard, local) = under_guard(guard, "install prepared branch", move || {
             crate::jj::install_branch_advance_local(&jj, candidate)
@@ -2811,6 +2919,7 @@ impl Context<'_> {
             Ok(local) => local,
             Err(crate::jj::AdvanceInstallError::CoordinatesChanged) => {
                 self.abandon_acceptance(&acceptance).await;
+                super::regenerate::abandon(self.db, &request.project_id, &regenerations).await;
                 return Ok(Attempt::Raced(format!(
                     "`{branch}` or `{}` moved during computation",
                     coordinate.base_branch
@@ -2818,17 +2927,25 @@ impl Context<'_> {
             }
             Err(crate::jj::AdvanceInstallError::Expired) => {
                 self.abandon_acceptance(&acceptance).await;
+                super::regenerate::abandon(self.db, &request.project_id, &regenerations).await;
                 drop(guard);
                 return self
                     .timed_out(&relationship, &coordinate, TimeoutPhase::InstallExpiry)
                     .await;
             }
             // Whether the install committed is unknown: the row stays pending
-            // and the next preparation settles it from the literal head.
+            // and the next preparation settles it from the literal head. A
+            // regeneration row is dropped: one that holds a branch nothing
+            // will dispatch for would hold it forever, and the declared
+            // output's own lane still says whether it is fresh.
             Err(crate::jj::AdvanceInstallError::Repository(error)) => {
+                super::regenerate::abandon(self.db, &request.project_id, &regenerations).await;
                 return Err(PreparationRefusal::Repository(error));
             }
         };
+        if !regenerations.is_empty() {
+            super::regenerate::set_installed_head(self.db, &regenerations, &local.head).await;
+        }
         // From here the install is accepted: nothing below may turn it into a
         // refusal. Bookkeeping that fails is reported on the coordinate.
         self.with_cost(|cost| {
@@ -2926,6 +3043,16 @@ impl Context<'_> {
 
         self.after_install(&jobs, &relationship, &installed, &mut warnings)
             .await;
+        if let Some(hold) = self
+            .dispatch_regenerations(&regenerations, &mut warnings)
+            .await
+        {
+            // An owner's merge never lands outputs it just took stale: it
+            // waits on their regeneration, which this install dispatched.
+            if request.purpose == PreparationPurpose::OwnerMerge {
+                return Err(PreparationRefusal::Busy(BusyReason::Regenerating(hold)));
+            }
+        }
         Ok(Attempt::Prepared(Box::new(PreparedBranch {
             project_id: request.project_id.clone(),
             store: self.store.clone(),
@@ -2942,6 +3069,94 @@ impl Context<'_> {
             session: None,
             warnings,
         })))
+    }
+
+    /// Mark each rule's taken paths of `candidate` stale, under the install
+    /// guard and before the install. Nothing when the candidate took none.
+    async fn record_regenerations(
+        &self,
+        candidate: &crate::jj::BranchAdvanceCandidate,
+        settlement: &Settlement,
+        coordinate: &crate::jj::AdvanceCoordinate,
+    ) -> Result<Vec<i64>, PreparationRefusal> {
+        let stale = candidate.stale_regenerable();
+        if stale.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(plan) = &settlement.regenerable else {
+            return Err(PreparationRefusal::Repository(
+                "the replay took regenerable paths no declaration covers".to_string(),
+            ));
+        };
+        let Some(grouped) = plan
+            .rules
+            .group(stale.iter().map(|taken| taken.path.as_str()))
+        else {
+            return Err(PreparationRefusal::Repository(
+                "the replay took a path outside the declared regenerable globs".to_string(),
+            ));
+        };
+        let rules: Vec<_> = grouped
+            .into_iter()
+            .map(|(rule, paths)| {
+                let taken: Vec<super::regenerate::StalePath> = stale
+                    .iter()
+                    .filter(|taken| paths.contains(&taken.path))
+                    .map(|taken| super::regenerate::StalePath {
+                        path: taken.path.clone(),
+                        blob: taken.blob.clone(),
+                    })
+                    .collect();
+                (rule, taken)
+            })
+            .collect();
+        super::regenerate::record_install(
+            self.db,
+            &self.request.project_id,
+            &self.store,
+            &self.request.branch,
+            &rules,
+            &candidate.head(),
+            &coordinate.base,
+        )
+        .await
+        .map_err(PreparationRefusal::Repository)
+    }
+
+    /// Start the regeneration of each row an accepted install marked, and say
+    /// so on the result. Returns what the first row now is, for an owner's
+    /// merge, which must not land the head this install left whether or not
+    /// the row has already settled. Never waits on a batch.
+    async fn dispatch_regenerations(
+        &self,
+        ids: &[i64],
+        warnings: &mut Vec<String>,
+    ) -> Option<String> {
+        if ids.is_empty() {
+            return None;
+        }
+        super::regenerate::dispatch(
+            self.orch,
+            self.shared_db.clone(),
+            &self.request.project_id,
+            ids,
+        );
+        let mut first = None;
+        for id in ids {
+            if let Ok(Some(row)) = super::regenerate::load(self.db, *id).await {
+                let now = if row.holds() {
+                    row.hold_text()
+                } else {
+                    format!("its regeneration already settled ({})", row.state)
+                };
+                warnings.push(format!(
+                    "{} carry the branch's bytes and are stale until regenerated: {now}",
+                    row.globs()
+                ));
+                first.get_or_insert(now);
+            }
+        }
+        first
     }
 
     /// Lock-free follow-up of an accepted install, each step bounded: refresh
@@ -3479,9 +3694,25 @@ impl Context<'_> {
         )
         .await
         {
+            Ok(None) => {}
+            Ok(Some(batch)) => {
+                return Err(PreparationRefusal::Busy(BusyReason::RunBatch(
+                    batch.describe(),
+                )))
+            }
+            Err(error) => return Err(PreparationRefusal::Repository(error)),
+        }
+        match super::regenerate::holding_except(
+            self.db,
+            &request.project_id,
+            &request.branch,
+            exempt,
+        )
+        .await
+        {
             Ok(None) => Ok(()),
-            Ok(Some(batch)) => Err(PreparationRefusal::Busy(BusyReason::RunBatch(
-                batch.describe(),
+            Ok(Some(row)) => Err(PreparationRefusal::Busy(BusyReason::Regenerating(
+                row.hold_text(),
             ))),
             Err(error) => Err(PreparationRefusal::Repository(error)),
         }
@@ -4290,13 +4521,116 @@ impl Context<'_> {
         })
     }
 
+    /// What the base's declarations make of `diagnostic`'s conflict: the
+    /// paths it declares regenerable, and a proven structural merge of every
+    /// other conflicting path. Only a content conflict is settled this way; a
+    /// result that does not parse or carries conflict scaffolding stays one.
+    /// A capture never takes a side, so for a check or run a conflict that
+    /// regeneration would settle is pending on its owner instead.
+    async fn settle_conflict(
+        &self,
+        coordinate: &crate::jj::AdvanceCoordinate,
+        diagnostic: &crate::jj::ConflictDiagnostic,
+        merge_mode: bool,
+    ) -> Result<SettleOutcome, PreparationRefusal> {
+        let paths = diagnostic.conflicting_paths();
+        let plain_conflict = diagnostic.condition == crate::jj::ConflictCondition::ContentConflict
+            && diagnostic.validation.is_none()
+            && diagnostic.scaffolding.is_none();
+        let regenerable = if plain_conflict && !paths.is_empty() {
+            self.regenerate_rules_at(coordinate)
+                .await
+                .filter(|rules| paths.iter().any(|path| rules.covers(path)))
+                .map(|rules| {
+                    Arc::new(RegenerablePlan {
+                        base: coordinate.base.clone(),
+                        rules,
+                    })
+                })
+        } else {
+            None
+        };
+        let actionable = self.request.purpose.actionable();
+        if let Some(plan) = &regenerable {
+            if paths.iter().all(|path| plan.rules.covers(path)) {
+                return Ok(if actionable {
+                    SettleOutcome::Settle(Settlement {
+                        declared: None,
+                        regenerable,
+                    })
+                } else {
+                    SettleOutcome::Pending
+                });
+            }
+        }
+        if merge_mode {
+            return Ok(SettleOutcome::None);
+        }
+        Ok(
+            match self
+                .declared_plan(coordinate, diagnostic, regenerable.clone())
+                .await?
+            {
+                DeclaredOutcome::Plan(_) if regenerable.is_some() && !actionable => {
+                    SettleOutcome::Pending
+                }
+                DeclaredOutcome::Plan(edits) => SettleOutcome::Settle(Settlement {
+                    declared: Some(Arc::new(edits)),
+                    regenerable,
+                }),
+                DeclaredOutcome::TimedOut => SettleOutcome::TimedOut,
+                DeclaredOutcome::None => SettleOutcome::None,
+            },
+        )
+    }
+
+    /// The regenerable outputs declared at the captured base, read off-lock
+    /// at the captured operation; `None` when it declares none or cannot be
+    /// read in what is left of the budget, which leaves the conflict standing.
+    async fn regenerate_rules_at(
+        &self,
+        coordinate: &crate::jj::AdvanceCoordinate,
+    ) -> Option<crate::orchestrator::landing::RegenerateRules> {
+        let budget = within_deadline(self.request, self.request.compute_budget);
+        let jj = self
+            .jj
+            .at_operation(&coordinate.operation)
+            .with_operation_budget(budget);
+        let (store, base) = (self.store.clone(), coordinate.base.clone());
+        let read = tokio::task::spawn_blocking(move || {
+            crate::orchestrator::landing::RegenerateRules::from_settings(
+                &crate::orchestrator::landing::landing_settings_at(&jj, &store, &base),
+            )
+        });
+        match tokio::time::timeout(budget, read).await {
+            Ok(Ok(rules)) if !rules.is_empty() => Some(rules),
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => {
+                log::warn!(
+                    "reading the regenerable paths at {}: {error}",
+                    coordinate.base
+                );
+                None
+            }
+            Err(_) => {
+                log::warn!(
+                    "reading the regenerable paths at {} exceeded the budget",
+                    coordinate.base
+                );
+                None
+            }
+        }
+    }
+
     /// The base's declared element-wise merges, proven off-lock from the
     /// pinned sides of `diagnostic`: the same proof the locked replay used. A
-    /// plan exists only when every conflicting path is declared and proven.
+    /// plan exists only when every conflicting path is declared and proven,
+    /// those `regenerable` covers aside.
     async fn declared_plan(
         &self,
         coordinate: &crate::jj::AdvanceCoordinate,
         diagnostic: &crate::jj::ConflictDiagnostic,
+        regenerable: Option<Arc<RegenerablePlan>>,
     ) -> Result<DeclaredOutcome, PreparationRefusal> {
         use crate::orchestrator::conflict_session::{bounded_store_assessment, AssessmentScope};
         // An unreadable session must not silently drop the basis the plan
@@ -4333,7 +4667,19 @@ impl Context<'_> {
                     super::replay_baseline_at(jj, &store, &branch, session.as_ref(), &head, &base)?
                         .unwrap_or_else(|| super::ReplayBaseline::fork_only(&fork));
                 let rules = crate::orchestrator::landing::merge_rules_at(jj, &store, &base);
-                super::prepare_structural_merge(jj, &store, &diagnostic_owned, &baseline, &rules)
+                let regenerated = |path: &str| {
+                    regenerable
+                        .as_ref()
+                        .is_some_and(|plan| plan.rules.covers(path))
+                };
+                super::prepare_structural_merge(
+                    jj,
+                    &store,
+                    &diagnostic_owned,
+                    &baseline,
+                    &rules,
+                    &regenerated,
+                )
             },
         )
         .await;

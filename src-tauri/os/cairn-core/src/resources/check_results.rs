@@ -227,6 +227,36 @@ fn render_request_observation(project: &str, handle: &str, value: &serde_json::V
             }
             lines.push("- No test verdict: branch preparation conflicted with its base.".into());
         }
+        "regenerationPending" => {
+            let paths = value["paths"]
+                .as_array()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str())
+                        .map(|path| format!("`{path}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            lines.push(format!("- State: waiting on regeneration of {paths}"));
+            for (label, key) in [
+                ("Branch", "branch"),
+                ("Head", "head"),
+                ("Base branch", "baseBranch"),
+                ("Base commit", "baseCommit"),
+            ] {
+                if let Some(value) = text(&value[key]) {
+                    lines.push(format!("- {label}: {value}"));
+                }
+            }
+            lines.push(
+                "- No test verdict: the branch conflicts with its base only in declared \
+                 regenerable paths. Its owner's replay takes the branch's bytes and regenerates \
+                 them; check again once that settles (cairn:~/rebase shows it)."
+                    .into(),
+            );
+        }
         "failed" => {
             lines.push("- State: failed".into());
             lines.push(format!(

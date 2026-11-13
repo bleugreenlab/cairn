@@ -106,10 +106,19 @@ pub struct BranchAdvanceSnapshot {
     base_ref: BaseRef,
     dependent_bookmarks: Option<HashSet<String>>,
     cost: Option<ReplayCostProbe>,
+    regenerable: Option<RegenerablePaths>,
     _lease: super::object_lease::ObjectLease,
 }
 
 impl BranchAdvanceSnapshot {
+    /// Let computation from this snapshot settle a conflict whose every path
+    /// `paths` covers by taking the branch's side of each (see
+    /// [`RegenerablePaths`]). Without it every conflict refuses.
+    pub fn with_regenerable_paths(mut self, paths: RegenerablePaths) -> Self {
+        self.regenerable = Some(paths);
+        self
+    }
+
     /// Report what computation from this snapshot costs into `probe`, phase by
     /// phase as it runs, so a computation that runs out of budget still leaves
     /// how far it got.
@@ -455,6 +464,7 @@ fn capture_replay_typed(
         },
         dependent_bookmarks: None,
         cost: None,
+        regenerable: None,
         _lease: lease,
     })
 }
@@ -466,12 +476,20 @@ pub struct BranchAdvanceCandidate {
     head: Commit,
     healing: super::AncestryHeal,
     dropped_commit_ids: Vec<String>,
+    stale_regenerable: Vec<StaleRegenerable>,
     expires_at: Instant,
 }
 
 impl BranchAdvanceCandidate {
     pub fn coordinate(&self) -> &AdvanceCoordinate {
         self.snapshot.coordinate()
+    }
+
+    /// The regenerable paths this candidate carries with the branch's bytes
+    /// in place of a conflict, each stale until it is regenerated. Empty for
+    /// a candidate that settled no conflict that way.
+    pub fn stale_regenerable(&self) -> &[StaleRegenerable] {
+        &self.stale_regenerable
     }
 
     pub fn head(&self) -> String {
@@ -880,6 +898,110 @@ pub struct DeclaredMergeEdits {
     pub edits: Vec<(String, String)>,
 }
 
+/// The paths a destination declares regenerable: committed outputs a command
+/// derives from sources, whose bytes no line merge can settle. The host reads
+/// the declaration at the destination and hands only this predicate down, so
+/// the engine decides nothing about commands or configuration.
+///
+/// A conflict whose EVERY path this covers settles by taking the branch's side
+/// of each; one path outside it leaves the whole conflict standing.
+#[derive(Clone)]
+pub struct RegenerablePaths(Arc<dyn Fn(&str) -> bool + Send + Sync>);
+
+impl RegenerablePaths {
+    pub fn new(covers: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(covers))
+    }
+
+    pub fn covers(&self, path: &str) -> bool {
+        (self.0)(path)
+    }
+}
+
+impl std::fmt::Debug for RegenerablePaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RegenerablePaths(..)")
+    }
+}
+
+/// One regenerable path a candidate carries with the branch's bytes in place
+/// of a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRegenerable {
+    pub path: String,
+    /// The branch's blob that was taken; `None` when the branch deleted the
+    /// path. A later head holding a different blob was changed by someone, so
+    /// a regeneration computed for this one no longer applies.
+    pub blob: Option<String>,
+}
+
+/// The trailer a catch-up merge that took regenerable paths carries, so the
+/// stale fact is in history as well as on the branch's record.
+pub const STALE_REGENERATION_TRAILER: &str = "Stale (regeneration pending):";
+
+/// When `regenerable` covers every conflicted path of `tree`, the tree with
+/// each of them set to `ours`' value, and what was taken. `None` when nothing
+/// is declared, nothing conflicts, or any conflict falls outside the
+/// declaration: that conflict stands exactly as it would have.
+async fn take_regenerable_side(
+    regenerable: Option<&RegenerablePaths>,
+    tree: &jj_lib::merged_tree::MergedTree,
+    ours: &Commit,
+    deadline: &Deadline,
+) -> Result<Option<(jj_lib::merged_tree::MergedTree, Vec<StaleRegenerable>)>, AdvanceComputeError> {
+    let Some(regenerable) = regenerable else {
+        return Ok(None);
+    };
+    let mut paths = Vec::new();
+    for (path, value) in tree.conflicts() {
+        deadline.check()?;
+        value.map_err(compute_error)?;
+        let path = path.as_internal_file_string().to_string();
+        if !regenerable.covers(&path) {
+            return Ok(None);
+        }
+        paths.push(path);
+    }
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = MergedTreeBuilder::new(tree.clone());
+    let mut taken = Vec::with_capacity(paths.len());
+    for path in paths {
+        deadline.check()?;
+        let repo_path = RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+        let value = ours
+            .tree()
+            .path_value(&repo_path)
+            .await
+            .map_err(compute_error)?;
+        let blob = match value.as_resolved() {
+            Some(Some(TreeValue::File { id, .. })) => Some(id.hex()),
+            Some(None) => None,
+            Some(Some(_)) => {
+                return Err(compute_error(format!(
+                    "regenerable path `{path}` is not a file on the branch"
+                )))
+            }
+            None => {
+                return Err(compute_error(format!(
+                    "regenerable path `{path}` is itself conflicted on the branch"
+                )))
+            }
+        };
+        builder.set_or_remove(repo_path, value);
+        taken.push(StaleRegenerable { path, blob });
+    }
+    let tree = builder.write_tree().await.map_err(compute_error)?;
+    deadline.check()?;
+    if tree.has_conflict() {
+        return Err(compute_error(
+            "taking the branch's side of every regenerable path left a conflict",
+        ));
+    }
+    Ok(Some((tree, taken)))
+}
+
 /// Compute a branch-local replay without publishing any operation or bookmark.
 ///
 /// Run on a blocking worker and await that worker before releasing its lifetime.
@@ -959,6 +1081,7 @@ pub(super) fn compute_branch_merge_with_message(
         },
     )
     .map_err(compute_error)??;
+    let (head, stale_regenerable) = head;
     deadline.check()?;
     snapshot.note(|observed| observed.phase = Some(ComputePhase::Done));
     Ok(BranchAdvanceCandidate {
@@ -969,6 +1092,7 @@ pub(super) fn compute_branch_merge_with_message(
         },
         head,
         dropped_commit_ids: Vec::new(),
+        stale_regenerable,
         expires_at: deadline.0,
     })
 }
@@ -980,7 +1104,7 @@ async fn compute_merge_candidate(
     resolution: Option<&super::ResolutionCarry>,
     message: &str,
     deadline: &Deadline,
-) -> Result<Commit, AdvanceComputeError> {
+) -> Result<(Commit, Vec<StaleRegenerable>), AdvanceComputeError> {
     deadline.check()?;
     snapshot.note(|observed| observed.phase = Some(ComputePhase::Merge));
     let repo = &snapshot.repo;
@@ -1022,6 +1146,7 @@ async fn compute_merge_candidate(
         .map_err(compute_error)?;
     deadline.check()?;
     let mut overlapping = Vec::new();
+    let mut stale = Vec::new();
     let candidate = if already_current {
         ours.clone()
     } else if fast_forward {
@@ -1071,8 +1196,25 @@ async fn compute_merge_candidate(
                 tree.set_or_remove(path, value);
             }
         }
-        let tree = tree.write_tree().await.map_err(compute_error)?;
+        let mut tree = tree.write_tree().await.map_err(compute_error)?;
         deadline.check()?;
+        let mut message = message.to_string();
+        if let Some((taken, paths)) =
+            take_regenerable_side(snapshot.regenerable.as_ref(), &tree, &ours, deadline).await?
+        {
+            message = format!(
+                "{}\n\n{STALE_REGENERATION_TRAILER} {}",
+                message.trim_end(),
+                paths
+                    .iter()
+                    .map(|stale| stale.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            overlapping.retain(|path| !paths.iter().any(|stale| stale.path == *path));
+            tree = taken;
+            stale = paths;
+        }
         let commit = tx
             .repo_mut()
             .new_commit(vec![ours.id().clone(), base.id().clone()], tree)
@@ -1128,7 +1270,7 @@ async fn compute_merge_candidate(
         return Err(AdvanceComputeError::Conflict(Box::new(refusal)));
     }
     deadline.check()?;
-    Ok(candidate)
+    Ok((candidate, stale))
 }
 
 const SQUASH_RECEIPT_LIMIT: usize = 4096;
@@ -1249,6 +1391,7 @@ pub(super) fn compute_branch_squash(
             },
             head,
             dropped_commit_ids: Vec::new(),
+            stale_regenerable: Vec::new(),
             expires_at: deadline.0,
         },
         collapsed,
@@ -1291,31 +1434,33 @@ fn compute_with_recovery(
     } else {
         jj.with_operation_budget(deadline.0.saturating_duration_since(Instant::now()))
     };
-    let (head, healing, dropped_commit_ids) = super::packed_refs::with_packed_refs_patience_for(
-        &patience,
-        super::PackedRefs::JjStore(&snapshot.store),
-        "compute detached replay",
-        || {
-            let result = futures::executor::block_on(compute_candidate(
-                jj, &snapshot, resolution, declared, &deadline,
-            ));
-            match result {
-                Err(AdvanceComputeError::Repository(error))
-                    if super::packed_refs_lock_error(&error) =>
-                {
-                    Err(error)
+    let (head, healing, dropped_commit_ids, stale_regenerable) =
+        super::packed_refs::with_packed_refs_patience_for(
+            &patience,
+            super::PackedRefs::JjStore(&snapshot.store),
+            "compute detached replay",
+            || {
+                let result = futures::executor::block_on(compute_candidate(
+                    jj, &snapshot, resolution, declared, &deadline,
+                ));
+                match result {
+                    Err(AdvanceComputeError::Repository(error))
+                        if super::packed_refs_lock_error(&error) =>
+                    {
+                        Err(error)
+                    }
+                    other => Ok(other),
                 }
-                other => Ok(other),
-            }
-        },
-    )
-    .map_err(compute_error)??;
+            },
+        )
+        .map_err(compute_error)??;
     deadline.check()?;
     Ok(BranchAdvanceCandidate {
         snapshot,
         head,
         healing,
         dropped_commit_ids,
+        stale_regenerable,
         expires_at: deadline.0,
     })
 }
@@ -2435,7 +2580,15 @@ async fn compute_candidate(
     resolution: Option<&super::ResolutionCarry>,
     declared: Option<&DeclaredMergeEdits>,
     deadline: &Deadline,
-) -> Result<(Commit, super::AncestryHeal, Vec<String>), AdvanceComputeError> {
+) -> Result<
+    (
+        Commit,
+        super::AncestryHeal,
+        Vec<String>,
+        Vec<StaleRegenerable>,
+    ),
+    AdvanceComputeError,
+> {
     deadline.check()?;
     snapshot.note(|observed| observed.phase = Some(ComputePhase::Scope));
     let repo = &snapshot.repo;
@@ -2719,10 +2872,47 @@ async fn compute_candidate(
     }
     if candidate.has_conflict() {
         if let Some(plan) = declared {
-            let paths = conflict_paths(&candidate)?;
+            // Regenerable paths are settled by taking a side below, never by
+            // a declared merge, so the plan covers exactly the rest.
+            let paths: Vec<String> = conflict_paths(&candidate)?
+                .into_iter()
+                .filter(|path| {
+                    !snapshot
+                        .regenerable
+                        .as_ref()
+                        .is_some_and(|regenerable| regenerable.covers(path))
+                })
+                .collect();
             candidate =
                 apply_declared_edits(transaction.repo_mut(), &candidate, plan, &paths, deadline)
                     .await?;
+        }
+    }
+    let mut stale = Vec::new();
+    if candidate.has_conflict() {
+        if let Some((tree, taken)) = take_regenerable_side(
+            snapshot.regenerable.as_ref(),
+            &candidate.tree(),
+            &ours,
+            deadline,
+        )
+        .await?
+        {
+            candidate = transaction
+                .repo_mut()
+                .rewrite_commit(&candidate)
+                .set_predecessors(rewrite_predecessors(&candidate, deadline)?)
+                .set_tree(tree)
+                .detach()
+                .write_hidden()
+                .await
+                .map_err(compute_error)?;
+            transaction
+                .repo_mut()
+                .add_head(&candidate)
+                .await
+                .map_err(compute_error)?;
+            stale = taken;
         }
     }
     if candidate.has_conflict() {
@@ -2743,6 +2933,7 @@ async fn compute_candidate(
             .into_iter()
             .map(|(_, path)| path)
             .filter(|path| own.iter().any(|(_, own)| own == path))
+            .filter(|path| !stale.iter().any(|taken| taken.path == *path))
             .collect();
     }
     let mut failures =
@@ -2831,7 +3022,7 @@ async fn compute_candidate(
     validate_removed_claims(transaction.repo(), &head, &dropped_commit_ids, deadline)?;
     deadline.check()?;
     snapshot.note(|observed| observed.phase = Some(ComputePhase::Done));
-    Ok((head, healing, dropped_commit_ids))
+    Ok((head, healing, dropped_commit_ids, stale))
 }
 
 /// A successful local installation, with export failure kept distinct from
@@ -3901,6 +4092,106 @@ mod tests {
             ),
             "sealed during export"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_conflict_wholly_inside_regenerable_paths_takes_the_branch_side() {
+        let Some(bin) = jj_bin() else { return };
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        init_project(project.path());
+        let write = |path: &str, text: &str| {
+            let path = project.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("gen/out", "derived from nothing\n");
+        write("src/shared", "shared\n");
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "ancestor"]);
+        git(project.path(), &["checkout", "-qb", "feature"]);
+        write("src/b", "b\n");
+        write("gen/out", "derived from b\n");
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "owner regenerates"]);
+        git(project.path(), &["checkout", "-qb", "feature-shared"]);
+        write("src/shared", "owner's shared\n");
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "owner edits shared"]);
+        git(project.path(), &["checkout", "-q", "main"]);
+        write("src/a", "a\n");
+        write("gen/out", "derived from a\n");
+        write("src/shared", "main's shared\n");
+        git(project.path(), &["add", "-A"]);
+        git(project.path(), &["commit", "-qm", "incoming regenerates"]);
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("store");
+        ensure_project_store(&jj, &store, project.path()).unwrap();
+        let regenerable = || RegenerablePaths::new(|path| path.starts_with("gen/"));
+        let capture = |branch: &str| {
+            capture_branch_advance(&store, branch, "main")
+                .unwrap()
+                .with_regenerable_paths(regenerable())
+        };
+        let show = |commit: &str, path: &str| {
+            git_stdout(project.path(), &["show", &format!("{commit}:{path}")])
+        };
+        let before = operation_id(&jj, &store).unwrap();
+
+        // Undeclared, the same replay is an ordinary conflict.
+        let undeclared = capture_branch_advance(&store, "feature", "main").unwrap();
+        let Err(AdvanceComputeError::Conflict(diagnostic)) =
+            compute_branch_advance(&jj, undeclared, None, Duration::from_secs(30))
+        else {
+            panic!("an undeclared regenerable conflict is a conflict")
+        };
+        assert_eq!(diagnostic.conflicting_paths(), ["gen/out"]);
+
+        let candidate =
+            compute_branch_advance(&jj, capture("feature"), None, Duration::from_secs(30))
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(show(&candidate.head(), "gen/out"), "derived from b");
+        assert_eq!(show(&candidate.head(), "src/a"), "a");
+        assert_eq!(show(&candidate.head(), "src/b"), "b");
+        let [stale] = candidate.stale_regenerable() else {
+            panic!("one stale path: {:?}", candidate.stale_regenerable())
+        };
+        assert_eq!(stale.path, "gen/out");
+        assert_eq!(
+            stale.blob.as_deref(),
+            Some(git_stdout(project.path(), &["rev-parse", "feature:gen/out"]).as_str())
+        );
+
+        let merged =
+            compute_branch_merge_advance(&jj, capture("feature"), None, Duration::from_secs(30))
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(show(&merged.head(), "gen/out"), "derived from b");
+        assert_eq!(merged.stale_regenerable().len(), 1);
+        let message = git_stdout(
+            project.path(),
+            &["log", "-1", "--format=%B", &merged.head()],
+        );
+        assert!(
+            message.ends_with(&format!("{STALE_REGENERATION_TRAILER} gen/out")),
+            "{message}"
+        );
+
+        // One conflict outside the declaration leaves the whole conflict.
+        for compute in [compute_branch_advance, compute_branch_merge_advance] {
+            let Err(AdvanceComputeError::Conflict(diagnostic)) = compute(
+                &jj,
+                capture("feature-shared"),
+                None,
+                Duration::from_secs(30),
+            ) else {
+                panic!("a conflict outside the globs stands")
+            };
+            let mut paths = diagnostic.conflicting_paths();
+            paths.sort();
+            assert_eq!(paths, ["gen/out", "src/shared"]);
+        }
+        assert_eq!(operation_id(&jj, &store).unwrap(), before);
     }
 
     #[test]
@@ -5161,6 +5452,7 @@ mod tests {
             head,
             healing: Default::default(),
             dropped_commit_ids: Vec::new(),
+            stale_regenerable: Vec::new(),
             expires_at: Instant::now() + std::time::Duration::from_secs(60),
         }
     }

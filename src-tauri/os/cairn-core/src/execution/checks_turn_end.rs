@@ -3042,11 +3042,25 @@ pub(crate) async fn render_turn_end_checks_section(
             "\n### Systematic checks\n\n{header}\n\nCurrent lanes could not be read.\n"
         ));
     };
-    format_checks_section_under(
+    let mut section = format_checks_section_under(
         Some(&header),
         &statuses,
         crate::execution::checks_status::WaveCadence::of(orch, job_id),
-    )
+    )?;
+    // A red lane over declared outputs a replay left stale says so: the
+    // regeneration failed, and the lane is red for that reason.
+    let failed: Vec<String> = statuses
+        .iter()
+        .filter(|lane| lane.state == crate::execution::checks_status::NodeCheckState::Failed)
+        .map(|lane| lane.name.clone())
+        .collect();
+    for line in
+        crate::orchestrator::base_advance::regenerate::failed_lane_lines(orch, job_id, &failed)
+            .await
+    {
+        section.push_str(&format!("\n⚠️ {line}\n"));
+    }
+    Some(section)
 }
 
 fn now_unix_ms() -> u64 {

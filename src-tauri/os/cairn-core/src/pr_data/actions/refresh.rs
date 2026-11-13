@@ -1456,6 +1456,20 @@ pub async fn render_live_pr_section(
             out.push_str(&warning);
             out.push('\n');
         }
+        // Declared outputs a replay left stale: the hold while they
+        // regenerate, or the named fact once regenerating them failed.
+        if let Some(note) = crate::orchestrator::base_advance::regenerate::pull_request_note(
+            orch,
+            &db,
+            &mr_context.project_id,
+            src,
+        )
+        .await
+        {
+            out.push('\n');
+            out.push_str(&note);
+            out.push('\n');
+        }
     }
     if source_conflict.tip_conflicted() {
         // A conflicted TIP inflates the diff GitHub reports; flag it so the

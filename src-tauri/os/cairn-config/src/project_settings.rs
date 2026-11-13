@@ -235,6 +235,60 @@ pub struct LandingSettings {
     /// Paths whose conflicts the store settles structurally, first match wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge: Vec<LandingMergeRule>,
+    /// Committed outputs a command derives from sources. A replay whose every
+    /// conflict falls inside these globs lands taking the branch's bytes, marks
+    /// them stale, and regenerates them in a placed batch; first match wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regenerate: Vec<LandingRegenerateRule>,
+}
+
+/// One declared regenerable output (`landing.regenerate`): the globs it covers,
+/// the command that rewrites them from the branch's sources, and the command
+/// that proves the result fresh. Every field but the placement and timeout is
+/// required, and a rule missing one fails the whole file: a rule that quietly
+/// dropped out would turn a conflict into a stale landing nobody regenerates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LandingRegenerateRule {
+    /// Repo-relative globs (`*` stays within a path segment, `**` crosses
+    /// them).
+    pub paths: Vec<String>,
+    /// Rewrites the covered paths in the branch's checkout.
+    pub regenerate: String,
+    /// Exits zero only when the covered paths are fresh for the checkout.
+    pub check: String,
+    /// Where the regeneration may run: the toolchains it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<cairn_common::executor_protocol::ExecutorSelector>,
+    /// Seconds each of the two commands may run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    /// The project check whose pass at a head proves these outputs fresh
+    /// there. Only it clears a failed regeneration: a check whose `impact`
+    /// merely includes the paths reads them as inputs and proves nothing about
+    /// them. Without one, only a regeneration that succeeds clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+}
+
+impl LandingRegenerateRule {
+    /// What the deserializer cannot say: a rule covers something and names
+    /// both of its commands.
+    fn validate(&self) -> Result<(), String> {
+        if self.paths.iter().all(|path| path.trim().is_empty()) {
+            return Err("a regenerate rule names the `paths` it covers".into());
+        }
+        if self.regenerate.trim().is_empty() {
+            return Err("a regenerate rule names its `regenerate` command".into());
+        }
+        if self.check.trim().is_empty() {
+            return Err("a regenerate rule names its `check` command".into());
+        }
+        if self.timeout == Some(0) {
+            return Err("a regenerate rule's `timeout` is a positive number of seconds".into());
+        }
+        Ok(())
+    }
 }
 
 /// One declared sequential identifier: a binding rule and where it applies.
@@ -721,6 +775,13 @@ fn parse_project_settings_under(
     }
     validate_cell_groups(&settings)
         .map_err(|error| format!("Failed to parse project config file: {error}"))?;
+    if let Some(landing) = &settings.landing {
+        for (index, rule) in landing.regenerate.iter().enumerate() {
+            rule.validate().map_err(|error| {
+                format!("Failed to parse project config file: landing.regenerate[{index}]: {error}")
+            })?;
+        }
+    }
 
     Ok((settings, needs_migration))
 }
@@ -2163,6 +2224,53 @@ checks:
             settings.checks.unwrap().get("frontend").unwrap().when,
             CheckWhen::Review
         );
+    }
+
+    #[test]
+    fn a_regenerate_rule_parses_whole_or_fails_the_file() {
+        let declared = r#"
+landing:
+  regenerate:
+  - paths:
+    - packages/ui/src/uri-wasm/**
+    regenerate: bun run build:uri-wasm
+    check: bun run build:uri-wasm --check
+    executor:
+      requiredToolchains: [bun, rust]
+    timeout: 900
+    lane: uri-wasm
+"#;
+        let (settings, _) = parse_project_settings(declared).unwrap();
+        let landing = landing_from(&settings);
+        assert_eq!(
+            landing.regenerate,
+            vec![LandingRegenerateRule {
+                paths: vec!["packages/ui/src/uri-wasm/**".into()],
+                regenerate: "bun run build:uri-wasm".into(),
+                check: "bun run build:uri-wasm --check".into(),
+                executor: Some(cairn_common::executor_protocol::ExecutorSelector {
+                    required_toolchains: vec!["bun".into(), "rust".into()],
+                    ..Default::default()
+                }),
+                timeout: Some(900),
+                lane: Some("uri-wasm".into()),
+            }]
+        );
+
+        let without_check =
+            "landing:\n  regenerate:\n  - paths: [gen/**]\n    regenerate: make gen\n";
+        let error = parse_project_settings(without_check).expect_err("`check` is required");
+        assert!(error.contains("check"), "{error}");
+
+        let blank_check =
+            "landing:\n  regenerate:\n  - paths: [gen/**]\n    regenerate: make gen\n    check: ' '\n";
+        let error = parse_project_settings(blank_check).expect_err("a blank `check` is refused");
+        assert!(error.contains("landing.regenerate[0]"), "{error}");
+
+        let no_paths =
+            "landing:\n  regenerate:\n  - paths: []\n    regenerate: make gen\n    check: make check\n";
+        let error = parse_project_settings(no_paths).expect_err("a rule covers something");
+        assert!(error.contains("paths"), "{error}");
     }
 
     /// A fixture modelled on this repository's `.cairn/config.yaml`, not the

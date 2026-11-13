@@ -222,8 +222,23 @@ pub(crate) async fn read_node_rebase(
     // One decision of whether the recorded evidence refuses a fresh replay,
     // and every replay recommendation below follows it.
     let (cost_section, blocked) = replay_cost_section(orch, &db, &rows, &view, &branch).await;
+    let regeneration_section = match rows.project_id() {
+        Some(project_id) => {
+            match crate::orchestrator::base_advance::regenerate::latest(&db, project_id, &branch)
+                .await
+            {
+                Ok(Some(row)) => crate::orchestrator::base_advance::regenerate::page_section(&row),
+                Ok(None) => String::new(),
+                Err(error) => format!(
+                    "\n## Regenerable outputs\n\nWhether this branch carries stale declared \
+                     outputs is unknown: {error}.\n\n"
+                ),
+            }
+        }
+        None => String::new(),
+    };
     let request_section = format!(
-        "{}{cost_section}",
+        "{}{cost_section}{regeneration_section}",
         explicit_request_section(orch, &db, &rows.job_id, &branch).await,
     );
     let session = match load_active_session(&db, &branch).await {

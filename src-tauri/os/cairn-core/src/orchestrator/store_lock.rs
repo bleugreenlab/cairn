@@ -1688,6 +1688,9 @@ pub(crate) enum BranchAdmissionRefusal {
     JournalUnreadable { branch: String, error: String },
     /// A run batch on the branch may still commit to it.
     InFlightBatch { branch: String, batch: String },
+    /// A placed batch is regenerating declared outputs the branch carries
+    /// stale; `hold` names the paths and the batch.
+    Regenerating { branch: String, hold: String },
     /// The in-flight run batches could not be read: fail closed.
     BatchUnreadable { branch: String, error: String },
 }
@@ -1727,6 +1730,10 @@ impl std::fmt::Display for BranchAdmissionRefusal {
                 "`{branch}` was not moved and nothing was published: {batch} may still commit \
                  to this branch"
             ),
+            Self::Regenerating { branch, hold } => write!(
+                f,
+                "`{branch}` was not moved and nothing was published: {hold}"
+            ),
             Self::BatchUnreadable { branch, error } => write!(
                 f,
                 "`{branch}` was not moved: its in-flight run batches could not be read \
@@ -1755,6 +1762,9 @@ impl From<BranchAdmissionRefusal> for PreparationRefusal {
             }),
             BranchAdmissionRefusal::InFlightBatch { batch, .. } => {
                 Self::Busy(BusyReason::RunBatch(batch))
+            }
+            BranchAdmissionRefusal::Regenerating { hold, .. } => {
+                Self::Busy(BusyReason::Regenerating(hold))
             }
             other @ (BranchAdmissionRefusal::Unreserved { .. }
             | BranchAdmissionRefusal::JournalUnreadable { .. }
@@ -1812,6 +1822,27 @@ impl JjStoreGuard {
                 return Err(BranchAdmissionRefusal::InFlightBatch {
                     branch: branch.to_string(),
                     batch: held.describe(),
+                })
+            }
+            Err(error) => {
+                return Err(BranchAdmissionRefusal::BatchUnreadable {
+                    branch: branch.to_string(),
+                    error,
+                })
+            }
+        }
+        // A regeneration holds the branch the same way, its own sealed result
+        // the single exemption.
+        match crate::orchestrator::base_advance::regenerate::holding_except(
+            db, project_id, branch, exempt,
+        )
+        .await
+        {
+            Ok(None) => {}
+            Ok(Some(row)) => {
+                return Err(BranchAdmissionRefusal::Regenerating {
+                    branch: branch.to_string(),
+                    hold: row.hold_text(),
                 })
             }
             Err(error) => {

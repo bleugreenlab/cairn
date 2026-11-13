@@ -544,7 +544,9 @@ async fn replay(
                             tip: Some(head.clone()),
                         }),
                     },
-                    PreparationRefusal::Busy(BusyReason::RunBatch(_)) => Settle::Held,
+                    PreparationRefusal::Busy(
+                        BusyReason::RunBatch(_) | BusyReason::Regenerating(_),
+                    ) => Settle::Held,
                     _ => Settle::Closed {
                         kind: "not_attempted",
                     },

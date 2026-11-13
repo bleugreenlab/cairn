@@ -14,7 +14,8 @@ use std::path::Path;
 use globset::{GlobBuilder, GlobMatcher};
 
 use crate::config::project_settings::{
-    landing_from, parse_project_settings, IdentifierRule, LandingMergeKind, LandingSettings,
+    landing_from, parse_project_settings, IdentifierRule, LandingMergeKind, LandingRegenerateRule,
+    LandingSettings,
 };
 
 const CONFIG_PATH: &str = ".cairn/config.yaml";
@@ -37,29 +38,10 @@ impl MergeRules {
         let rules = settings
             .merge
             .iter()
-            .map(|rule| {
-                let globs = rule
-                    .paths
-                    .iter()
-                    .filter_map(|pattern| {
-                        GlobBuilder::new(pattern)
-                            .literal_separator(true)
-                            .build()
-                            .map_err(|error| {
-                                log::warn!(
-                                    "landing: ignoring merge path `{pattern}`, which is not a \
-                                     glob: {error}"
-                                );
-                            })
-                            .ok()
-                            .map(|glob| glob.compile_matcher())
-                    })
-                    .collect();
-                CompiledRule {
-                    globs,
-                    kind: rule.merge_kind(),
-                    anchor: rule.anchor.clone(),
-                }
+            .map(|rule| CompiledRule {
+                globs: compile_globs(&rule.paths, "merge"),
+                kind: rule.merge_kind(),
+                anchor: rule.anchor.clone(),
             })
             .collect();
         Self { rules }
@@ -120,6 +102,85 @@ impl MergeRules {
         };
         (holds(theirs) && holds(ours)).then_some(merged)
     }
+}
+
+fn compile_globs(patterns: &[String], what: &str) -> Vec<GlobMatcher> {
+    patterns
+        .iter()
+        .filter_map(|pattern| {
+            GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|error| {
+                    log::warn!(
+                        "landing: ignoring {what} path `{pattern}`, which is not a glob: {error}"
+                    );
+                })
+                .ok()
+                .map(|glob| glob.compile_matcher())
+        })
+        .collect()
+}
+
+/// The declared regenerable outputs (`landing.regenerate`), compiled for
+/// matching. A path belongs to the first rule naming it. A pattern that is not
+/// a glob covers nothing, which can only leave a conflict standing.
+#[derive(Default)]
+pub(crate) struct RegenerateRules {
+    rules: Vec<(Vec<GlobMatcher>, LandingRegenerateRule)>,
+}
+
+impl RegenerateRules {
+    pub(crate) fn from_settings(settings: &LandingSettings) -> Self {
+        Self {
+            rules: settings
+                .regenerate
+                .iter()
+                .map(|rule| (compile_globs(&rule.paths, "regenerate"), rule.clone()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    fn rule_index(&self, path: &str) -> Option<usize> {
+        self.rules
+            .iter()
+            .position(|(globs, _)| globs.iter().any(|glob| glob.is_match(path)))
+    }
+
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        self.rule_index(path).is_some()
+    }
+
+    /// `paths` grouped under the rule each belongs to, in declaration order;
+    /// `None` when any path belongs to no rule.
+    pub(crate) fn group<'p>(
+        &self,
+        paths: impl IntoIterator<Item = &'p str>,
+    ) -> Option<Vec<(&LandingRegenerateRule, Vec<String>)>> {
+        let mut grouped: Vec<Vec<String>> = vec![Vec::new(); self.rules.len()];
+        for path in paths {
+            grouped[self.rule_index(path)?].push(path.to_string());
+        }
+        Some(
+            self.rules
+                .iter()
+                .zip(grouped)
+                .filter(|(_, paths)| !paths.is_empty())
+                .map(|((_, rule), paths)| (rule, paths))
+                .collect(),
+        )
+    }
+}
+
+/// Whether `path` matches one of `globs`, compiled the way the rules are.
+pub(crate) fn path_matches(globs: &[String], path: &str) -> bool {
+    compile_globs(globs, "regenerate")
+        .iter()
+        .any(|glob| glob.is_match(path))
 }
 
 /// The `landing` section at `rev` in the store. A missing, unreadable, or
@@ -235,6 +296,64 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn regenerate_rules_group_paths_by_their_first_rule_and_refuse_strays() {
+        let rule = |paths: &[&str], command: &str| LandingRegenerateRule {
+            paths: paths.iter().map(|path| path.to_string()).collect(),
+            regenerate: command.into(),
+            check: format!("{command} --check"),
+            executor: None,
+            timeout: None,
+            lane: None,
+        };
+        let rules = RegenerateRules::from_settings(&LandingSettings {
+            regenerate: vec![
+                rule(&["packages/ui/src/uri-wasm/**"], "wasm"),
+                rule(&["packages/**", "Cargo.lock"], "other"),
+            ],
+            ..LandingSettings::default()
+        });
+        let grouped = rules
+            .group([
+                "packages/ui/src/uri-wasm/build.json",
+                "Cargo.lock",
+                "packages/ui/src/uri-wasm/cairn_uri_bg.wasm",
+            ])
+            .unwrap();
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0.regenerate, "wasm");
+        assert_eq!(
+            grouped[0].1,
+            [
+                "packages/ui/src/uri-wasm/build.json",
+                "packages/ui/src/uri-wasm/cairn_uri_bg.wasm"
+            ]
+        );
+        assert_eq!(grouped[1].1, ["Cargo.lock"]);
+        assert!(rules.group(["Cargo.lock", "src/lib.rs"]).is_none());
+        assert!(!rules.covers("lockfile/Cargo.lock"), "globs are anchored");
+    }
+
+    #[test]
+    fn this_repository_declares_the_uri_wasm_pair_regenerable() {
+        let (settings, _) =
+            parse_project_settings(include_str!("../../../../../../.cairn/config.yaml")).unwrap();
+        let rules = RegenerateRules::from_settings(&landing_from(&settings));
+        let grouped = rules
+            .group([
+                "packages/ui/src/uri-wasm/build.json",
+                "packages/ui/src/uri-wasm/cairn_uri_bg.wasm",
+            ])
+            .expect("the pair is declared");
+        let [(rule, _)] = grouped.as_slice() else {
+            panic!("one rule covers the pair")
+        };
+        assert_eq!(rule.regenerate, "bun run build:uri-wasm");
+        assert_eq!(rule.check, "bun run build:uri-wasm --check");
+        assert_eq!(rule.lane.as_deref(), Some("uri-wasm"));
+        assert!(!rules.covers("src-tauri/os/cairn-uri/src/lib.rs"));
     }
 
     #[test]

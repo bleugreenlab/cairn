@@ -8297,6 +8297,12 @@ pub struct LearnedResourceEstimate {
 /// talking to an older executor: nothing; that executor charges the whole
 /// figure it always has, which only admits less. An older runner ignores
 /// `boundBytes` and renders the misfit by the machine's total.
+///
+/// cairn/7110 does not move the number. The runner's macOS adopted-tree
+/// metadata now names `buildJobProcesses` as absent, the field cairn/5685
+/// added and that constructor missed; nothing crosses the boundary that did
+/// not before. What a runner gets wrong talking to an older executor: nothing;
+/// no frame changes and an adopted tree never carried a census.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
