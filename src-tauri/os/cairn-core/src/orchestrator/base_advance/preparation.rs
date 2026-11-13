@@ -90,7 +90,7 @@ use crate::messages::delivery::{latest_run_for_job, queue_system_direct_once};
 use crate::messages::queued::DeliveryUrgency;
 use crate::orchestrator::conflict_session::{
     close_open_sessions_for_branch, load_active_session, record_conflict_session,
-    record_marker_state, supersede_stale_sessions, IncomingIdentity,
+    record_marker_state, supersede_stale_sessions, ConflictSession, IncomingIdentity,
 };
 use crate::orchestrator::{JjStoreGuard, Orchestrator, StoreLockClass};
 use crate::storage::{LocalDb, RowExt};
@@ -185,10 +185,14 @@ pub(crate) struct PreparationRequest {
     pub(crate) explicit_replay: bool,
     /// The exact base commit `carry` was planned onto.
     pub(crate) carry_base: Option<String>,
-    /// A merge-mode committed resolution is merged with the exact destination
-    /// of its session, not a newer base it has not resolved yet. Only the
-    /// explicit resolution path sets this; the next demand catches up again.
-    pub(crate) merge_destination: Option<String>,
+    /// Prepare onto this exact commit of the base's history instead of the
+    /// base's live target, in either catch-up mode: a committed resolution
+    /// lands on the session base it resolves, never a newer base it has not
+    /// seen. Only an owner's commit may set it, and a commit that is not in
+    /// the live base's history is refused at capture. An owner's commit with
+    /// an open session behind the live base is pinned to that session's base
+    /// even without it (see [`Context::pin_session_base`]).
+    pub(crate) exact_destination: Option<String>,
     /// A reservation the caller already holds (a landing reserving source and
     /// target). It must cover this branch, and preparation never re-acquires.
     /// Without one, preparation reserves the branch itself before any store
@@ -242,7 +246,7 @@ impl PreparationRequest {
             capturing_review_of: None,
             explicit_replay: false,
             carry_base: None,
-            merge_destination: None,
+            exact_destination: None,
             reservation: None,
             write_replay: None,
             deadline: None,
@@ -325,6 +329,10 @@ pub(crate) struct PreparedBranch {
     pub(crate) tree: String,
     pub(crate) relationship: BaseRelationship,
     pub(crate) base_commit: String,
+    /// `base_commit` is an open session's recorded base, deliberately behind
+    /// the live base: revalidation then compares only the branch, since a
+    /// newer base does not change what this coordinate was prepared against.
+    pub(crate) pinned_base: bool,
     pub(crate) advanced: bool,
     pub(crate) export: PreparedExport,
     pub(crate) attempts: u32,
@@ -428,7 +436,10 @@ impl PreparedBranch {
         }
         // A direct target is its own base: the writer's own publications
         // legitimately advance both, and the head check above covers it.
-        if !self.relationship.is_direct_target(&self.branch) && base != self.base_commit {
+        if !self.relationship.is_direct_target(&self.branch)
+            && !self.pinned_base
+            && base != self.base_commit
+        {
             return Err(PreparationRefusal::Moved {
                 what: format!(
                     "base `{}` moved from {} to {base}",
@@ -852,6 +863,7 @@ async fn prepare_branch_unobserved(
         repo_path,
         request: &request,
         owned: std::sync::Mutex::new(request.reservation.clone()),
+        pinned: std::sync::Mutex::new(None),
         recorded: std::sync::atomic::AtomicBool::new(false),
         fenced_here: std::sync::Mutex::new(None),
         started: std::time::Instant::now(),
@@ -1846,6 +1858,9 @@ struct Context<'a> {
     /// The reservation this preparation holds: inherited, or taken by
     /// [`Context::ensure_reserved`]. Released when preparation returns.
     owned: std::sync::Mutex<Option<Arc<crate::orchestrator::BranchReservation>>>,
+    /// The exact base commit the current attempt captured against instead of
+    /// the live base, if any: the request's own or an open session's.
+    pinned: std::sync::Mutex<Option<String>>,
     /// Set once a recovery this preparation took was recorded, or failed to
     /// be, so its notices are delivered after every guard is released.
     recorded: std::sync::atomic::AtomicBool,
@@ -2204,6 +2219,7 @@ impl Context<'_> {
             }
         });
 
+        *self.pinned.lock().unwrap() = request.exact_destination.clone();
         // Phase 1: snapshot under the writer lock.
         let guard = self.lock("snapshot").await?;
         self.refuse_published(&guard).await?;
@@ -2229,6 +2245,9 @@ impl Context<'_> {
             return self.direct_target(guard, relationship, attempt).await;
         }
         let (guard, snapshot) = self.capture(guard, &relationship).await?;
+        let (guard, snapshot) = self
+            .pin_session_base(guard, &relationship, snapshot)
+            .await?;
         let coordinate = snapshot.coordinate().clone();
         if let Some(expected) = &request.expected_head {
             if *expected != coordinate.head {
@@ -2311,6 +2330,7 @@ impl Context<'_> {
                 store: self.store.clone(),
                 branch: branch.to_string(),
                 head_before: coordinate.head.clone(),
+                pinned_base: self.is_pinned(&coordinate.base),
                 head_after: coordinate.head,
                 tree,
                 relationship,
@@ -2403,6 +2423,7 @@ impl Context<'_> {
                     store: self.store.clone(),
                     branch: branch.to_string(),
                     head_before: coordinate.head.clone(),
+                    pinned_base: self.is_pinned(&coordinate.base),
                     head_after: coordinate.head,
                     tree,
                     relationship,
@@ -2732,6 +2753,7 @@ impl Context<'_> {
                 store: self.store.clone(),
                 branch: branch.to_string(),
                 head_before: coordinate.head.clone(),
+                pinned_base: self.is_pinned(&coordinate.base),
                 head_after: coordinate.head,
                 tree,
                 relationship,
@@ -2912,6 +2934,7 @@ impl Context<'_> {
             head_after: installed.head.clone(),
             tree: installed.tree.clone(),
             relationship,
+            pinned_base: self.is_pinned(&installed.coordinate.base),
             base_commit: installed.coordinate.base.clone(),
             advanced: true,
             export,
@@ -3073,6 +3096,7 @@ impl Context<'_> {
             tree,
             relationship,
             base_commit: head,
+            pinned_base: false,
             advanced: false,
             export: PreparedExport::NotNeeded,
             attempts: attempt,
@@ -3165,6 +3189,111 @@ impl Context<'_> {
         Ok((guard, descends.then_some(bound)))
     }
 
+    /// Whether this attempt captured against `base` as an exact commit rather
+    /// than the base's live target.
+    fn is_pinned(&self, base: &str) -> bool {
+        self.pinned.lock().unwrap().as_deref() == Some(base)
+    }
+
+    /// The open session's recorded base, when it is still this branch's next
+    /// catch-up step: recorded for this project, store and base, an ancestor
+    /// of the live base, and not yet in the branch's ancestry. A commit the
+    /// store no longer knows (a rewritten base) is no step at all, and the
+    /// branch is judged against the live base as before.
+    async fn session_base_ahead(
+        &self,
+        coordinate: &crate::jj::AdvanceCoordinate,
+    ) -> Result<Option<ConflictSession>, PreparationRefusal> {
+        let Some(session) = load_active_session(self.db, &self.request.branch)
+            .await
+            .map_err(PreparationRefusal::Repository)?
+        else {
+            return Ok(None);
+        };
+        if session.project_id != self.request.project_id
+            || session.store_path != self.store.to_string_lossy()
+            || session.target_branch != coordinate.base_branch
+            || session.destination_commit == coordinate.base
+        {
+            return Ok(None);
+        }
+        let recorded = session.destination_commit.as_str();
+        let on_base = cairn_vcs::history::contains(&self.store, recorded, &coordinate.base).await;
+        let landed = cairn_vcs::history::contains(&self.store, recorded, &coordinate.head).await;
+        match (on_base, landed) {
+            (Ok(true), Ok(false)) => Ok(Some(session)),
+            (Ok(_), Ok(_)) => Ok(None),
+            (Err(error), _) | (_, Err(error)) => {
+                log::warn!(
+                    "branch preparation of `{}`: whether session base {recorded} is still ahead \
+                     could not be read ({error}); preparing against the live base",
+                    self.request.branch
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// An open conflict session's recorded base X is the branch's next
+    /// catch-up step until it lands, so an owner's commit is judged against X
+    /// even after the base moved on. A resolution then binds the session at X
+    /// (or lands on X), and a conflict refreshes that same `(base, X)` session
+    /// instead of recording one against the newer base and superseding the
+    /// resolution's own. The newer base's commits are a later round.
+    ///
+    /// A landing (`OwnerMerge`) still needs the live base, so with an older
+    /// session open it is refused naming that session and records nothing:
+    /// at most one session is open per branch, the oldest that has not
+    /// landed. Checks and runs judge the live base untouched.
+    async fn pin_session_base(
+        &self,
+        guard: JjStoreGuard,
+        relationship: &BaseRelationship,
+        snapshot: crate::jj::BranchAdvanceSnapshot,
+    ) -> Result<(JjStoreGuard, crate::jj::BranchAdvanceSnapshot), PreparationRefusal> {
+        let request = self.request;
+        if request.exact_destination.is_some() || !request.purpose.actionable() {
+            return Ok((guard, snapshot));
+        }
+        let coordinate = snapshot.coordinate().clone();
+        let Some(session) = self.session_base_ahead(&coordinate).await? else {
+            return Ok((guard, snapshot));
+        };
+        let recorded = session.destination_commit.clone();
+        if request.purpose == PreparationPurpose::OwnerMerge {
+            drop(snapshot);
+            drop(guard);
+            return Err(PreparationRefusal::Conflict(Box::new(BaseConflict {
+                branch: request.branch.clone(),
+                head: coordinate.head,
+                base_branch: coordinate.base_branch,
+                base_commit: recorded,
+                paths: session
+                    .conflicting()
+                    .map(|file| file.path.clone())
+                    .collect(),
+                record: ConflictRecord::Session {
+                    intent_id: session.intent_id,
+                    reopened: false,
+                },
+            })));
+        }
+        drop(snapshot);
+        log::info!(
+            "branch preparation of `{}`: judged against its open session's base {recorded}, \
+             not `{}` at {}",
+            request.branch,
+            coordinate.base_branch,
+            coordinate.base
+        );
+        *self.pinned.lock().unwrap() = Some(recorded);
+        let (guard, captured) = self
+            .capture_once(guard, &request.branch, &relationship.base_branch)
+            .await?;
+        let snapshot = captured.map_err(|error| capture_refusal(error, &self.store))?;
+        Ok((guard, snapshot))
+    }
+
     /// An owner's ordinary commit on a merge-mode branch whose catch-up could
     /// not be installed: published on the branch's own head under its open
     /// conflict session, with the catch-up merge left pending.
@@ -3235,6 +3364,7 @@ impl Context<'_> {
             tree,
             relationship: relationship.clone(),
             base_commit: coordinate.base.clone(),
+            pinned_base: self.is_pinned(&coordinate.base),
             advanced: false,
             export,
             attempts: attempt,
@@ -3746,22 +3876,12 @@ impl Context<'_> {
         ),
         PreparationRefusal,
     > {
-        let destination = self.request.merge_destination.clone();
-        if destination.is_some()
-            && (!self.request.explicit_replay
-                || self.request.carry.is_none()
-                || crate::orchestrator::catch_up::mode_for(
-                    self.db,
-                    &self.request.project_id,
-                    &self.store,
-                    branch,
-                )
-                .await
-                .map_err(PreparationRefusal::Repository)?
-                .is_none())
-        {
+        let destination = self.pinned.lock().unwrap().clone();
+        // Only an owner's commit catches up onto a session's recorded base; a
+        // check, a run or a landing judges the live base.
+        if destination.is_some() && self.request.purpose != PreparationPurpose::OwnerCommit {
             return Err(PreparationRefusal::Repository(
-                "an exact merge destination requires an explicit merge-mode resolution".to_string(),
+                "an exact destination is only for an owner's commit".to_string(),
             ));
         }
         let (store, branch, base) = (self.store.clone(), branch.to_string(), base.to_string());
@@ -3770,7 +3890,7 @@ impl Context<'_> {
             "capture branch and base",
             move || match destination {
                 Some(destination) => {
-                    crate::jj::capture_branch_merge_resolution(&store, &branch, &destination)
+                    crate::jj::capture_branch_onto(&store, &branch, &base, &destination)
                 }
                 None => crate::jj::capture_branch_advance(&store, &branch, &base),
             },
@@ -4324,6 +4444,14 @@ impl Context<'_> {
         assess_basis: bool,
     ) -> Result<Attempt, PreparationRefusal> {
         let branch = self.request.branch.as_str();
+        // What still conflicts is the answer; what the session records is that
+        // plus every path the carry placed, so the next request carries them
+        // again instead of conflicting on them.
+        let paths = diagnostic.conflicting_paths();
+        let diagnostic = match self.request.carry.as_deref() {
+            Some(carry) => with_carried_paths(diagnostic, carry),
+            None => diagnostic,
+        };
         // An owner's session inherits a basis; assess it before the lock,
         // bounded, so no expensive read runs under the store guard.
         let (open, basis) = if self.request.purpose.actionable() {
@@ -4353,7 +4481,6 @@ impl Context<'_> {
             .outcome_intent(&coordinate.base_branch, &coordinate.base)
             .await?;
         let fingerprint = diagnostic.fingerprint();
-        let paths = diagnostic.conflicting_paths();
         if crate::orchestrator::catch_up::mode_for(
             self.db,
             &self.request.project_id,
@@ -4387,8 +4514,19 @@ impl Context<'_> {
                     "the open conflict session changed while its basis was assessed".to_string(),
                 ));
             }
+            // The same conflict, unless this attempt found a path the open
+            // session does not list yet.
             let already_open = open.as_ref().is_some_and(|session| {
-                session.intent_id == intent_id && session.fingerprint() == fingerprint
+                let listed: std::collections::BTreeSet<&str> = session
+                    .conflicting()
+                    .map(|file| file.path.as_str())
+                    .collect();
+                session.intent_id == intent_id
+                    && session.fingerprint() == fingerprint
+                    && diagnostic
+                        .conflicting_paths()
+                        .iter()
+                        .all(|path| listed.contains(path.as_str()))
             });
             persist_reconcile_item(
                 self.db,
@@ -4654,15 +4792,16 @@ impl Context<'_> {
         if !current.same_base(relationship) {
             return Ok(Some(relationship_change(relationship, &current)));
         }
-        let observed =
-            if self.request.merge_destination.as_deref() == Some(coordinate.base.as_str()) {
-                cairn_vcs::resolve_coordinate(&self.store, &coordinate.branch)
-                    .await
-                    .map(|head| (head, coordinate.base.clone()))
-                    .map_err(|error| PreparationRefusal::Repository(error.to_string()))
-            } else {
-                literal_coordinates(&self.store, &coordinate.branch, &coordinate.base_branch).await
-            };
+        // A pinned coordinate is against one commit, which never moves: only
+        // the branch can.
+        let observed = if self.is_pinned(&coordinate.base) {
+            cairn_vcs::resolve_coordinate(&self.store, &coordinate.branch)
+                .await
+                .map(|head| (head, coordinate.base.clone()))
+                .map_err(|error| PreparationRefusal::Repository(error.to_string()))
+        } else {
+            literal_coordinates(&self.store, &coordinate.branch, &coordinate.base_branch).await
+        };
         match observed {
             Ok((head, base)) if head == coordinate.head && base == coordinate.base => Ok(None),
             Ok((head, base)) => Ok(Some(format!(
@@ -5173,8 +5312,43 @@ fn capture_refusal(error: crate::jj::AdvanceCaptureError, store: &Path) -> Prepa
                 reason: "it does not resolve to a single commit".to_string(),
             }
         }
+        crate::jj::AdvanceCaptureError::DestinationOffBase {
+            destination,
+            base_branch,
+        } => PreparationRefusal::Unresolved {
+            coordinate: destination,
+            reason: format!("it is no longer in `{base_branch}`'s history"),
+        },
         crate::jj::AdvanceCaptureError::Repository(error) => PreparationRefusal::Repository(error),
     }
+}
+
+/// `diagnostic` with every path `carry` placed recorded as conflicting.
+///
+/// A carried attempt that still conflicts reports only the residual paths,
+/// because the carried ones merged. Recording only those would make the next
+/// request carry only the residue, so the paths this attempt carried would
+/// conflict again, and the session's list would oscillate between the two
+/// sets without ever landing.
+fn with_carried_paths(
+    mut diagnostic: crate::jj::ConflictDiagnostic,
+    carry: &crate::jj::ResolutionCarry,
+) -> crate::jj::ConflictDiagnostic {
+    for (path, _) in &carry.paths {
+        match diagnostic
+            .incoming
+            .iter_mut()
+            .find(|file| &file.path == path)
+        {
+            Some(file) => file.classification = crate::jj::IncomingClassification::Conflicting,
+            None => diagnostic.incoming.push(crate::jj::IncomingFile {
+                path: path.clone(),
+                status: "C".to_string(),
+                classification: crate::jj::IncomingClassification::Conflicting,
+            }),
+        }
+    }
+    diagnostic
 }
 
 fn keep(warnings: &mut Vec<String>, what: &str, result: Result<(), String>) {

@@ -83,6 +83,19 @@ pub struct AdvanceCoordinate {
     pub operation: String,
 }
 
+/// How a snapshot's base was named, and so how installation re-checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseRef {
+    /// The base branch's local bookmark target.
+    Bookmark,
+    /// Any revision symbol the store resolves.
+    Symbol,
+    /// One exact commit on the base branch's history. `base_branch` keeps the
+    /// relationship's name; a commit never moves, so only the branch is
+    /// compared again.
+    Exact,
+}
+
 /// An immutable repository snapshot, kept alive independently of bookmark
 /// movement. Core must separately validate its declared integration relationship
 /// under the canonical store lock before installing any computation from it.
@@ -90,7 +103,7 @@ pub struct BranchAdvanceSnapshot {
     store: PathBuf,
     repo: Arc<ReadonlyRepo>,
     coordinate: AdvanceCoordinate,
-    local_base: bool,
+    base_ref: BaseRef,
     dependent_bookmarks: Option<HashSet<String>>,
     cost: Option<ReplayCostProbe>,
     _lease: super::object_lease::ObjectLease,
@@ -249,12 +262,12 @@ impl BranchAdvanceSnapshot {
     fn matches_repo(&self, current: &ReadonlyRepo) -> bool {
         let expected = &self.coordinate;
         normal_target(current, &expected.branch).is_ok_and(|id| id.hex() == expected.head)
-            && if self.local_base {
-                normal_target(current, &expected.base_branch)
-                    .is_ok_and(|id| id.hex() == expected.base)
-            } else {
-                crate::resolve_symbol_at(current, &expected.base_branch)
-                    .is_ok_and(|id| id.hex() == expected.base)
+            && match self.base_ref {
+                BaseRef::Bookmark => normal_target(current, &expected.base_branch)
+                    .is_ok_and(|id| id.hex() == expected.base),
+                BaseRef::Symbol => crate::resolve_symbol_at(current, &expected.base_branch)
+                    .is_ok_and(|id| id.hex() == expected.base),
+                BaseRef::Exact => true,
             }
     }
 
@@ -267,8 +280,17 @@ impl BranchAdvanceSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdvanceCaptureError {
     Busy(String),
-    UnsettledOperations { heads: usize },
-    UnresolvedCoordinate { name: String },
+    UnsettledOperations {
+        heads: usize,
+    },
+    UnresolvedCoordinate {
+        name: String,
+    },
+    /// An exact destination that is not in the base branch's history.
+    DestinationOffBase {
+        destination: String,
+        base_branch: String,
+    },
     Repository(String),
 }
 
@@ -278,6 +300,7 @@ impl std::fmt::Display for AdvanceCaptureError {
             Self::Busy(reason) | Self::Repository(reason) => f.write_str(reason),
             Self::UnsettledOperations { heads } => write!(f, "the store has {heads} operation heads; literal inspection requires one settled operation"),
             Self::UnresolvedCoordinate { name } => write!(f, "advance coordinate `{name}` is missing or conflicted"),
+            Self::DestinationOffBase { destination, base_branch } => write!(f, "`{destination}` is no longer in `{base_branch}`'s history"),
         }
     }
 }
@@ -307,26 +330,52 @@ pub fn capture_branch_advance(
     capture_replay_typed(store, branch, base_branch, true)
 }
 
-/// Capture an explicit merge resolution against an immutable session destination.
-/// The host still validates the declared relationship under its store guard.
-/// Only the source bookmark is mutable here: later movement of the relationship's
-/// live base must not retarget an authorized resolution against an older base.
-pub fn capture_branch_merge_resolution(
+/// Capture a branch against `destination`, one exact commit of `base_branch`'s
+/// history, instead of the base's live target: an open conflict session's
+/// recorded base, which stays the branch's next catch-up step until it lands.
+///
+/// The coordinate keeps `base_branch` as its base name, so every outcome is
+/// keyed by the relationship (`main` at `destination`), never by a commit
+/// standing in for a branch name. Only the source bookmark is mutable here:
+/// later movement of the live base does not retarget the capture. The
+/// destination must be a full commit id (symbols and abbreviations are
+/// refused even when they resolve) and an ancestor of, or equal to, the base's
+/// local target.
+pub fn capture_branch_onto(
     store: &Path,
     branch: &str,
+    base_branch: &str,
     destination: &str,
 ) -> Result<BranchAdvanceSnapshot, AdvanceCaptureError> {
-    let unresolved = || AdvanceCaptureError::UnresolvedCoordinate {
-        name: destination.into(),
+    let unresolved = |name: &str| AdvanceCaptureError::UnresolvedCoordinate { name: name.into() };
+    let Some(destination_id) = CommitId::try_from_hex(destination) else {
+        return Err(unresolved(destination));
     };
-    if branch.is_empty() || CommitId::try_from_hex(destination).is_none() {
-        return Err(unresolved());
+    if branch.is_empty() || base_branch.is_empty() || branch == base_branch {
+        return Err(unresolved(if branch.is_empty() {
+            branch
+        } else {
+            base_branch
+        }));
     }
-    let snapshot = capture_replay_typed(store, branch, destination, false)?;
-    // Reject symbols and abbreviations even when they happen to resolve.
+    let mut snapshot = capture_replay_typed(store, branch, destination, false)?;
     if destination != snapshot.coordinate.base {
-        return Err(unresolved());
+        return Err(unresolved(destination));
     }
+    let live = normal_target(&snapshot.repo, base_branch).map_err(|_| unresolved(base_branch))?;
+    let on_base = snapshot
+        .repo
+        .index()
+        .is_ancestor(&destination_id, &live)
+        .map_err(|error| AdvanceCaptureError::Repository(error.to_string()))?;
+    if !on_base {
+        return Err(AdvanceCaptureError::DestinationOffBase {
+            destination: destination.to_string(),
+            base_branch: base_branch.to_string(),
+        });
+    }
+    snapshot.coordinate.base_branch = base_branch.to_string();
+    snapshot.base_ref = BaseRef::Exact;
     Ok(snapshot)
 }
 
@@ -399,7 +448,11 @@ fn capture_replay_typed(
         store: store.to_path_buf(),
         repo,
         coordinate,
-        local_base,
+        base_ref: if local_base {
+            BaseRef::Bookmark
+        } else {
+            BaseRef::Symbol
+        },
         dependent_bookmarks: None,
         cost: None,
         _lease: lease,

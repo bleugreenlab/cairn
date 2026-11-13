@@ -373,8 +373,17 @@ fn render_request_section(
     let at = crate::clock::stamp(request.requested_at)
         .map(|stamp| format!(", recorded {stamp}"))
         .unwrap_or_default();
+    // A following round is shown beside the landing that opened it, so its
+    // verdict reads as the increment's, never as the resolution's.
+    let opened = match &request.opened_by {
+        Some((parent, landed)) => format!(
+            "Request `{parent}` **landed** on `{landed}`; increment onto `{}`: ",
+            request.destination_commit
+        ),
+        None => String::new(),
+    };
     let accepted = format!(
-        "Request `{}`{at}, accepted at `{}` onto `{}` at `{}`,",
+        "{opened}Request `{}`{at}, accepted at `{}` onto `{}` at `{}`,",
         request.id,
         request
             .requested_tip
@@ -411,7 +420,9 @@ fn render_request_section(
         ReplayRequestState::Served { pass, destination } => {
             let (verdict, retry) =
                 match (pass.outcome_kind.as_deref(), pass.failure_kind.as_deref()) {
-                    (Some("rebased_clean"), _) => (format!("**landed** on `{destination}`"), false),
+                    (Some("rebased_clean" | "merged_clean"), _) => {
+                        (format!("**landed** on `{destination}`"), false)
+                    }
                     (Some("silent"), _) => (
                         format!("found the branch already carrying `{destination}`"),
                         false,
@@ -1212,6 +1223,11 @@ struct LiveStanding {
     /// Deletions resolved by the requester's statement rather than by
     /// content: path, the side it covered, and the statement.
     attested: Vec<(String, String, String)>,
+    /// When the base moved past the session's recorded base: the files the
+    /// base's newer commits change that the branch also changes since its
+    /// fork from the recorded base. Possible conflicts of the following
+    /// round, not judged ones; `Err` when they could not be read in time.
+    possible_conflicts: Option<Result<Vec<String>, String>>,
 }
 
 async fn load_live_standing(
@@ -1247,6 +1263,12 @@ async fn load_live_standing(
             None => resolved_against.entry(side.theirs).or_default().push(path),
         }
     }
+    let possible_conflicts = match tip {
+        Some(tip) if base.destination != session.destination_commit => {
+            Some(possible_conflicts(jj, store, branch, session, &tip, &base.destination).await)
+        }
+        _ => None,
+    };
     Ok(LiveStanding {
         base_branch: base.base_branch,
         head: base.destination,
@@ -1254,7 +1276,54 @@ async fn load_live_standing(
         ours_in_ancestry,
         resolved_against,
         attested,
+        possible_conflicts,
     })
+}
+
+/// Two name-only diffs; a page read that cannot answer in this says so.
+const POSSIBLE_CONFLICTS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The files the base changed since the session's recorded base that the
+/// branch also changed since its fork from that base: where the following
+/// round may conflict. Bounded like every store assessment a page read makes.
+async fn possible_conflicts(
+    jj: &crate::jj::JjEnv,
+    store: &std::path::Path,
+    branch: &str,
+    session: &ConflictSession,
+    tip: &str,
+    head: &str,
+) -> Result<Vec<String>, String> {
+    let (store, recorded, tip, head) = (
+        store.to_path_buf(),
+        session.destination_commit.clone(),
+        tip.to_string(),
+        head.to_string(),
+    );
+    let scope = crate::orchestrator::conflict_session::AssessmentScope {
+        phase: "rebase page possible conflicts",
+        branch,
+        candidate_paths: 0,
+    };
+    crate::orchestrator::conflict_session::bounded_store_assessment(
+        jj,
+        POSSIBLE_CONFLICTS_BUDGET,
+        scope,
+        move |jj| {
+            let incoming = crate::jj::paths_changed(jj, &store, &recorded, &head)?;
+            if incoming.is_empty() {
+                return Ok(Vec::new());
+            }
+            let fork =
+                crate::jj::revset_commit(jj, &store, &format!("heads(::{tip} & ::{recorded})"))
+                    .ok_or_else(|| {
+                        format!("the fork of `{tip}` with `{recorded}` did not resolve")
+                    })?;
+            let own = crate::jj::paths_changed(jj, &store, &fork, &tip)?;
+            Ok(incoming.intersection(&own).cloned().collect())
+        },
+    )
+    .await
 }
 
 /// The page's statement of what is stale: the session's recorded destination
@@ -1282,12 +1351,30 @@ fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, S
     );
     if recorded != standing.head {
         out.push_str(&format!(
-            "\n⚠️ This session was recorded against `{recorded}`; `{base}` is now `{head}`; your \
+            "\nThis session was recorded against `{recorded}`; `{base}` is now `{head}`; your \
              branch's fork point is `{fork}`. The three-way coordinates below describe the \
-             recorded merge. A replay lands on `{head}`, not `{recorded}`.\n",
+             recorded merge. A take-committed-tip replay lands your resolution on `{recorded}`; \
+             `{head}`'s commits since `{recorded}` are judged in a following round.\n",
             base = standing.base_branch,
             head = standing.head,
         ));
+        match &standing.possible_conflicts {
+            Some(Ok(paths)) if !paths.is_empty() => {
+                let paths: Vec<String> = paths.iter().map(|path| format!("`{path}`")).collect();
+                out.push_str(&format!(
+                    "\nFiles `{head}`'s commits since `{recorded}` also change, which that round \
+                     may conflict on (possible conflicts, not judged yet): {}.\n",
+                    paths.join(", "),
+                    head = standing.head,
+                ));
+            }
+            Some(Err(why)) => out.push_str(&format!(
+                "\nWhich files `{head}`'s commits since `{recorded}` also change could not be read \
+                 ({why}).\n",
+                head = standing.head,
+            )),
+            _ => {}
+        }
     }
     if standing.ours_in_ancestry == Some(false) {
         out.push_str(
@@ -1312,11 +1399,10 @@ fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, S
             }
         }
         out.push_str(&format!(
-            "\nA take-committed-tip replay carries each forward onto `{head}`: a file the base has \
-             not touched since lands as you committed it, a file it changed elsewhere has those \
-             changes merged in, and a file where it changed the region you resolved is refused \
-             and shown here again.\n",
-            head = standing.head,
+            "\nA take-committed-tip replay carries each forward onto `{recorded}`: a file the base \
+             has not touched since lands as you committed it, a file it changed elsewhere has \
+             those changes merged in, and a file where it changed the region you resolved is \
+             refused and shown here again.\n",
         ));
     }
     out
@@ -2610,6 +2696,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             attested: Vec::new(),
+            possible_conflicts: (head != "a337fa4d").then(|| Ok(vec!["src/shared.rs".to_string()])),
         })
     }
 
@@ -2651,22 +2738,33 @@ mod tests {
             "{section}"
         );
         assert!(section.contains("fork point is `fork0000`"), "{section}");
+        // cairn/7095: the resolution lands on the base it was made against,
+        // and the newer commits are a later round, never the same judgement.
         assert!(
-            section.contains("A replay lands on `b5461a3b`"),
+            section.contains("replay lands your resolution on `a337fa4d`")
+                && section.contains(
+                    "`b5461a3b`'s commits since `a337fa4d` are judged in a following round"
+                ),
             "{section}"
         );
+        assert!(
+            section
+                .contains("may conflict on (possible conflicts, not judged yet): `src/shared.rs`"),
+            "{section}"
+        );
+        assert!(!section.contains("lands on `b5461a3b`"), "{section}");
         // The tip moved off `ours`, so it was resolved against this session's
         // own incoming side.
         assert!(
             section.contains("resolved against `a337fa4d`: `migrations.rs`")
-                && section.contains("carries each forward onto `b5461a3b`"),
+                && section.contains("carries each forward onto `a337fa4d`"),
             "{section}"
         );
         assert!(!section.contains("rewritten"), "{section}");
 
         let current = standing_section(&recorded_session(), &live("a337fa4d", false));
         assert!(
-            !current.contains("A replay lands on"),
+            !current.contains("following round") && !current.contains("possible conflicts"),
             "nothing stale: {current}"
         );
         assert!(
@@ -2786,6 +2884,7 @@ mod tests {
             target_branch: "main".into(),
             destination_commit: "a337fa4d".into(),
             state,
+            opened_by: None,
         }
     }
 
@@ -2865,6 +2964,40 @@ mod tests {
         assert!(
             superseded.contains("**superseded** by a newer request"),
             "{superseded}"
+        );
+
+        // cairn/7095: a following round is shown beside the landing that
+        // opened it, so a conflict there reads as the increment's.
+        let mut increment = latest(ReplayRequestState::Served {
+            pass: ReplayPass {
+                outcome_kind: Some("conflicted".into()),
+                ..ReplayPass::default()
+            },
+            destination: "b5461a3b".into(),
+        });
+        increment.destination_commit = "b5461a3b".into();
+        increment.opened_by = Some(("req-0".into(), "a337fa4d".into()));
+        let increment = render_request_section(&increment, &Ok(None));
+        assert!(
+            increment.contains(
+                "Request `req-0` **landed** on `a337fa4d`; increment onto `b5461a3b`: Request `req-1`"
+            ) && increment.contains("**still conflicts** with `b5461a3b`"),
+            "{increment}"
+        );
+
+        let merged = render_request_section(
+            &latest(ReplayRequestState::Served {
+                pass: ReplayPass {
+                    outcome_kind: Some("merged_clean".into()),
+                    ..ReplayPass::default()
+                },
+                destination: "a337fa4d".into(),
+            }),
+            &Ok(None),
+        );
+        assert!(
+            merged.contains("**landed** on `a337fa4d`") && !merged.contains("Request it again"),
+            "a merge catch-up lands like a replay: {merged}"
         );
     }
 

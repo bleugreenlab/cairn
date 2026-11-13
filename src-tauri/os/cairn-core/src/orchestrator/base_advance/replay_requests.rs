@@ -19,11 +19,21 @@
 //!   reason, and deletions that reason attests are recorded only once the
 //!   request is accepted.
 //! - The resolution carry is planned for exactly the head that proof judged and
-//!   exactly the base commit it is laid onto. The preparer refuses a capture at
-//!   any other head or base; the request then re-assesses and re-plans at the
-//!   new coordinate, a bounded number of times. Paths the carry refuses are left
-//!   to the merge, so the replay conflicts and the session is re-recorded
-//!   against the base that outran the resolution.
+//!   laid onto the session's recorded base X, in both catch-up modes, however
+//!   far the live base has moved since: a resolution of X lands on X. The
+//!   preparer captures X exactly and refuses a capture at any other head; the
+//!   request then re-assesses and re-plans at the new head, a bounded number of
+//!   times. Paths the carry refuses are left to the merge, so the replay
+//!   conflicts and the session at X is re-recorded. A conflict at X on a path
+//!   the session did not list re-records the session with it and re-plans, so
+//!   the carry ends up placing the whole inventory of merging the committed tip
+//!   with X.
+//! - Once X lands, the live base's commits since X are a following round: a
+//!   plain request onto the live base, queued as this request's child and
+//!   served within what is left of its budget (or by the recovery server). A
+//!   conflict there opens its own session, naming only what those commits
+//!   conflict on. A request is never retargeted onto a newer base and judged
+//!   there.
 //!
 //! # Budget
 //!
@@ -108,6 +118,7 @@ pub(crate) async fn request_branch_replay(
             budget: EXPLICIT_REPLAY_BUDGET,
             step_minimum: EXPLICIT_STEP_MINIMUM,
             recovered: None,
+            increment_from: None,
         },
     )
     .await
@@ -125,6 +136,9 @@ struct ExplicitReplay<'a> {
     /// checked against the branch before this attempt, and it is never
     /// re-proven at another tip: a move closes it as superseded.
     recovered: Option<PendingReplayRequest>,
+    /// For the following round of a request that landed a session's base:
+    /// that base, which the branch now carries.
+    increment_from: Option<&'a str>,
 }
 
 /// How an attempt settles the request's durable marker.
@@ -207,7 +221,7 @@ async fn replay(
         }
         text
     };
-    let session = match conflict_session::load_active_session(db, branch).await {
+    let session = match request_session(db, branch, ask.recovered.as_ref()).await {
         Ok(session) => session,
         Err(error) => return Err(refuse(error).await),
     };
@@ -266,7 +280,6 @@ async fn replay(
     };
     let with_preamble = |text: String| format!("{preamble}{text}");
     let mut caveats: Vec<String> = Vec::new();
-    let mut planned_bases: Vec<String> = Vec::new();
     let mut last_move = String::new();
     // The durable record of this accepted request: queued once the request is
     // accepted, consumed only by a verdict or an honest close.
@@ -284,7 +297,9 @@ async fn replay(
             if let Some(marker) = marker {
                 let closed = matches!(how, Settle::Closed { .. });
                 settle_marker(db, &project_id, &store, &marker, how, &answer).await;
-                if closed && recovered {
+                // A following round answered inline is part of its parent's
+                // answer; only a deferred one tells the owner separately.
+                if closed && recovered && ask.increment_from.is_none() {
                     note_owner_closed(orch, db, ask.job_id, &marker, &answer);
                 }
             }
@@ -292,12 +307,13 @@ async fn replay(
         }
     };
     for attempt in 1..=REPLAY_ATTEMPTS {
+        let mut placed: Option<std::collections::BTreeSet<String>> = None;
         let carry = if ask.take_committed_tip {
-            let Some(session) = conflict_session::load_active_session(db, branch).await? else {
+            let Some(session) = request_session(db, branch, marker.as_ref()).await? else {
                 let answer = with_preamble(format!(
-                    "The rebase session of `{branch}` closed while this request was being \
-                     prepared, so there is no conflict left for `take-committed-tip` to resolve. \
-                     Re-read cairn:~/rebase before requesting again."
+                    "The rebase session this request resolves is no longer open on `{branch}`, \
+                     so there is no conflict left for `take-committed-tip` to resolve. Re-read \
+                     cairn:~/rebase before requesting again."
                 ));
                 return Err(settle(
                     marker,
@@ -337,9 +353,7 @@ async fn replay(
                     .await);
                 }
             };
-            if planned_bases.last() != Some(&planned.base) {
-                planned_bases.push(planned.base.clone());
-            }
+            placed = Some(planned.placed.clone());
             #[cfg(test)]
             tests::after_carry_plan(&store, attempt);
             if marker.is_none() {
@@ -360,9 +374,15 @@ async fn replay(
             Some(planned)
         } else {
             if marker.is_none() {
-                let (base_branch, base, head) = literal_coordinates(db, &project.id, &store, ask)
+                let (base_branch, live, head) = literal_coordinates(db, &project.id, &store, ask)
                     .await
                     .map_err(&with_preamble)?;
+                // Accepted at the base the preparer will judge it against: an
+                // open session's base still ahead of the branch, else the
+                // live base. Its following round is then its own row.
+                let base = session_base_ahead(&store, session.as_ref(), &base_branch, &live, &head)
+                    .await
+                    .unwrap_or(live);
                 marker = Some(
                     accept(db, &project.id, &store, ask, &base_branch, &base, &head)
                         .await
@@ -413,8 +433,8 @@ async fn replay(
             if !planned.plan.refused.is_empty() {
                 carry_refusals = Some(planned.plan.describe_refusals());
             }
-            if merge_mode {
-                request.merge_destination = Some(planned.base.clone());
+            if planned.exact {
+                request.exact_destination = Some(planned.base.clone());
             }
             request.carry_base = Some(planned.base);
             request.carry = Some(Arc::new(planned.plan.carry));
@@ -439,6 +459,29 @@ async fn replay(
                         tip: Some(prepared.head_after.clone()),
                     }),
                 };
+                if prepared.advanced && prepared.pinned_base {
+                    // Settled first, so the following round is the branch's
+                    // newest request and its parent is already served.
+                    let parent = marker.clone();
+                    let mut out = preamble.clone();
+                    out.push_str(&answer);
+                    let answer = settle(marker, how, with_caveats(out, &caveats)).await;
+                    let increment = increment_round(
+                        orch,
+                        db,
+                        ask,
+                        &store,
+                        &project.id,
+                        &prepared,
+                        parent.as_ref(),
+                        &budget,
+                    )
+                    .await;
+                    return Ok(match increment {
+                        Some(increment) => format!("{answer}\n\n{increment}"),
+                        None => answer,
+                    });
+                }
                 (answer, how)
             }
             // A recovered request is never re-proven at another tip.
@@ -454,6 +497,27 @@ async fn replay(
             Err(PreparationRefusal::Moved { what }) if ask.take_committed_tip => {
                 log::info!("explicit replay of `{branch}` (attempt {attempt}) re-plans: {what}");
                 last_move = what;
+                continue;
+            }
+            // The landing at the session's base conflicted on a path the plan
+            // did not place: the session now lists it, so prove and plan again
+            // over the whole inventory rather than answering with a gap the
+            // owner's tip may already have resolved.
+            Err(PreparationRefusal::Conflict(conflict))
+                if attempt < REPLAY_ATTEMPTS
+                    && placed.as_ref().is_some_and(|placed| {
+                        conflict.paths.iter().any(|path| !placed.contains(path))
+                    }) =>
+            {
+                last_move = format!(
+                    "the merge with `{}` at {} also conflicted in {}",
+                    conflict.base_branch,
+                    conflict.base_commit,
+                    conflict.paths.join(", ")
+                );
+                log::info!(
+                    "explicit replay of `{branch}` (attempt {attempt}) re-plans: {last_move}"
+                );
                 continue;
             }
             Err(refusal) => {
@@ -485,7 +549,7 @@ async fn replay(
                         kind: "not_attempted",
                     },
                 };
-                match not_landed(branch, refusal, carry_refusals.as_deref()) {
+                match not_landed(branch, refusal, carry_refusals.as_deref(), ask) {
                     Ok(answer) => (answer, how),
                     Err(refusal) => {
                         let mut refusal = with_preamble(with_caveats(refusal, &caveats));
@@ -502,14 +566,13 @@ async fn replay(
             }
         };
         let mut out = preamble.clone();
-        out.push_str(&retarget_note(&planned_bases));
         out.push_str(&answer);
         return Ok(settle(marker, how, with_caveats(out, &caveats)).await);
     }
     let answer = with_preamble(format!(
-        "`{branch}` or its base kept moving across {REPLAY_ATTEMPTS} explicit replay attempts \
-         (last: {last_move}), so the replay was not installed and `{branch}` is unchanged. Your \
-         content resolution still stands; request the replay again once the branch is quiet."
+        "`{branch}` did not settle across {REPLAY_ATTEMPTS} explicit replay attempts (last: \
+         {last_move}), so the replay was not installed and `{branch}` is unchanged. Your content \
+         resolution still stands; request the replay again once the branch is quiet."
     ));
     Err(settle(
         marker,
@@ -578,6 +641,53 @@ async fn accept(
     .map_err(|error| {
         format!("The replay request could not be recorded, so it was not accepted: {error}")
     })
+}
+
+/// The session a request answers to: for an accepted request, the one it was
+/// accepted against, open or superseded by a newer recording (a session
+/// recorded before captures kept the base's name keys a commit-named intent,
+/// so the open session at the same base stands for it); otherwise the
+/// branch's open session.
+async fn request_session(
+    db: &LocalDb,
+    branch: &str,
+    accepted: Option<&PendingReplayRequest>,
+) -> Result<Option<ConflictSession>, String> {
+    let Some(accepted) = accepted else {
+        return conflict_session::load_active_session(db, branch).await;
+    };
+    if let Some(session) = conflict_session::load_session_for_request(db, accepted).await? {
+        return Ok(Some(session));
+    }
+    Ok(conflict_session::load_active_session(db, branch)
+        .await?
+        .filter(|session| session.destination_commit == accepted.destination_commit))
+}
+
+/// An open session's recorded base when it is still the branch's next
+/// catch-up step: on `base_branch`, behind the live base in its history, and
+/// not yet in the branch's ancestry. The same rule the preparer pins an
+/// owner's commit by, read here without the lock to choose where a request is
+/// accepted.
+async fn session_base_ahead(
+    store: &Path,
+    session: Option<&ConflictSession>,
+    base_branch: &str,
+    live: &str,
+    head: &str,
+) -> Option<String> {
+    let session = session?;
+    let recorded = session.destination_commit.as_str();
+    if session.target_branch != base_branch || recorded == live {
+        return None;
+    }
+    let on_base = cairn_vcs::history::contains(store, recorded, live)
+        .await
+        .ok()?;
+    let landed = cairn_vcs::history::contains(store, recorded, head)
+        .await
+        .ok()?;
+    (on_base && !landed).then(|| recorded.to_string())
 }
 
 /// The branch's literal head and its declared base's literal commit, read
@@ -785,112 +895,166 @@ async fn serve_in(
                 continue;
             }
         }
-        let close = |kind: &'static str, reason: String| {
-            let (id, bookmark) = (listed.id.clone(), listed.bookmark.clone());
-            async move {
-                log::info!("explicit replay recovery closed `{id}` for `{bookmark}`: {reason}");
-                if let Err(error) =
-                    conflict_session::close_replay_request(db, &id, &bookmark, kind, &reason).await
-                {
-                    log::warn!("close replay request `{id}`: {error}");
-                }
-            }
-        };
-        let request = match listed.request.clone() {
+        let mut request = match listed.request.clone() {
             Ok(request) => request,
             Err(reason) => {
-                close("malformed", reason).await;
+                close_request(db, &listed.id, &listed.bookmark, "malformed", &reason).await;
                 closed += 1;
                 continue;
             }
         };
-        // From here the request's live owner is known: every close tells it,
-        // once, through the one path.
-        let close_noted = |kind: &'static str, reason: String, owner: String| {
-            let request = request.clone();
-            let close = &close;
-            async move {
-                close(kind, reason.clone()).await;
-                note_owner_closed(orch, db, &owner, &request, &reason);
+        // A following round the served request opened is served here, under
+        // the same claim: a server spawned for it while this one holds the
+        // claim would find the branch claimed and leave it, and nothing else
+        // would wake it before the next start.
+        loop {
+            match serve_one(orch, db, &request, budget).await {
+                Served::Served => served += 1,
+                Served::Held => {
+                    held += 1;
+                    break;
+                }
+                Served::Closed => {
+                    closed += 1;
+                    break;
+                }
+                Served::Skipped => break,
             }
-        };
-        let owner = match live_branch_owner(db, &request.project_id, &request.bookmark).await {
-            Ok(Some(owner)) => owner,
-            Ok(None) => {
-                close(
-                    "no_owner",
-                    format!("no live job owns `{}` any more", request.bookmark),
-                )
-                .await;
-                closed += 1;
-                continue;
+            match conflict_session::load_pending_replay_request(
+                db,
+                Path::new(&request.store_path),
+                &request.bookmark,
+            )
+            .await
+            {
+                Ok(Some(child)) if child.parent_request_id.as_deref() == Some(&request.id) => {
+                    request = child;
+                }
+                _ => break,
             }
-            Err(error) => {
-                log::warn!(
-                    "explicit replay recovery: owner of `{}`: {error}",
-                    request.bookmark
-                );
-                continue;
-            }
-        };
-        let store = Path::new(&request.store_path);
-        let head = match cairn_vcs::resolve_coordinate(store, &request.bookmark).await {
-            Ok(head) => head,
-            Err(error) => {
-                close_noted(
-                    "superseded",
-                    format!("`{}` could not be resolved: {error}", request.bookmark),
-                    owner.clone(),
-                )
-                .await;
-                closed += 1;
-                continue;
-            }
-        };
-        if request.requested_tip.as_deref() != Some(head.as_str()) {
-            let reason = format!(
-                "`{}` moved from {} to {head} since this replay request was accepted; nothing \
-                 was replayed. Request the replay again from the branch as it is now.",
-                request.bookmark,
-                request
-                    .requested_tip
-                    .as_deref()
-                    .unwrap_or("an unrecorded tip")
-            );
-            close_noted("superseded", reason, owner.clone()).await;
-            closed += 1;
-            continue;
         }
-        let answer = replay(
-            orch,
-            db,
-            &ExplicitReplay {
-                job_id: &owner,
-                branch: &request.bookmark,
-                expected_fingerprint: None,
-                take_committed_tip: request.take_committed_tip,
-                drop_incoming_reason: request.drop_incoming_reason.as_deref(),
-                budget,
-                step_minimum: EXPLICIT_STEP_MINIMUM,
-                recovered: Some(request.clone()),
-            },
-        )
-        .await;
-        match conflict_session::replay_request_state(db, &request).await {
-            Ok(conflict_session::ReplayRequestState::Pending) => held += 1,
-            Ok(_) => served += 1,
-            Err(error) => log::warn!("replay request `{}` state: {error}", request.id),
-        }
-        log::info!(
-            "explicit replay recovery of `{}` (request `{}`): {}",
-            request.bookmark,
-            request.id,
-            match &answer {
-                Ok(answer) | Err(answer) => answer.lines().next().unwrap_or_default(),
-            }
-        );
     }
     (served, closed, held)
+}
+
+enum Served {
+    Served,
+    Held,
+    Closed,
+    Skipped,
+}
+
+async fn close_request(db: &LocalDb, id: &str, bookmark: &str, kind: &str, reason: &str) {
+    log::info!("explicit replay recovery closed `{id}` for `{bookmark}`: {reason}");
+    if let Err(error) = conflict_session::close_replay_request(db, id, bookmark, kind, reason).await
+    {
+        log::warn!("close replay request `{id}`: {error}");
+    }
+}
+
+/// Serve one recovered request under its branch's serving claim: only while
+/// its branch is still at the tip it was accepted at, for its live owner.
+async fn serve_one(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    request: &PendingReplayRequest,
+    budget: Duration,
+) -> Served {
+    // From here the request's live owner is known: every close tells it,
+    // once, through the one path.
+    let close_noted = |kind: &'static str, reason: String, owner: String| async move {
+        close_request(db, &request.id, &request.bookmark, kind, &reason).await;
+        note_owner_closed(orch, db, &owner, request, &reason);
+    };
+    let owner = match live_branch_owner(db, &request.project_id, &request.bookmark).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            close_request(
+                db,
+                &request.id,
+                &request.bookmark,
+                "no_owner",
+                &format!("no live job owns `{}` any more", request.bookmark),
+            )
+            .await;
+            return Served::Closed;
+        }
+        Err(error) => {
+            log::warn!(
+                "explicit replay recovery: owner of `{}`: {error}",
+                request.bookmark
+            );
+            return Served::Skipped;
+        }
+    };
+    let store = Path::new(&request.store_path);
+    let head = match cairn_vcs::resolve_coordinate(store, &request.bookmark).await {
+        Ok(head) => head,
+        Err(error) => {
+            close_noted(
+                "superseded",
+                format!("`{}` could not be resolved: {error}", request.bookmark),
+                owner,
+            )
+            .await;
+            return Served::Closed;
+        }
+    };
+    if request.requested_tip.as_deref() != Some(head.as_str()) {
+        let reason = format!(
+            "`{}` moved from {} to {head} since this replay request was accepted; nothing was \
+             replayed. Request the replay again from the branch as it is now.",
+            request.bookmark,
+            request
+                .requested_tip
+                .as_deref()
+                .unwrap_or("an unrecorded tip")
+        );
+        close_noted("superseded", reason, owner).await;
+        return Served::Closed;
+    }
+    // A following round is worded against the base its parent landed.
+    let landed_base = match request.parent_request_id.as_deref() {
+        Some(parent) => conflict_session::replay_request_destination(db, parent)
+            .await
+            .unwrap_or_else(|error| {
+                log::warn!("explicit replay recovery: {error}");
+                None
+            }),
+        None => None,
+    };
+    let answer = replay(
+        orch,
+        db,
+        &ExplicitReplay {
+            job_id: &owner,
+            branch: &request.bookmark,
+            expected_fingerprint: None,
+            take_committed_tip: request.take_committed_tip,
+            drop_incoming_reason: request.drop_incoming_reason.as_deref(),
+            budget,
+            step_minimum: EXPLICIT_STEP_MINIMUM,
+            recovered: Some(request.clone()),
+            increment_from: landed_base.as_deref(),
+        },
+    )
+    .await;
+    log::info!(
+        "explicit replay recovery of `{}` (request `{}`): {}",
+        request.bookmark,
+        request.id,
+        match &answer {
+            Ok(answer) | Err(answer) => answer.lines().next().unwrap_or_default(),
+        }
+    );
+    match conflict_session::replay_request_state(db, request).await {
+        Ok(conflict_session::ReplayRequestState::Pending) => Served::Held,
+        Ok(_) => Served::Served,
+        Err(error) => {
+            log::warn!("replay request `{}` state: {error}", request.id);
+            Served::Skipped
+        }
+    }
 }
 
 /// The (canonical store, branch) pairs a recovery server is serving now.
@@ -1156,6 +1320,11 @@ async fn repoint_superseded_base(
 struct PlannedCarry {
     base_branch: String,
     base: String,
+    /// `base` is the session's recorded base, captured exactly however far the
+    /// live base has moved.
+    exact: bool,
+    /// Every path the plan places or deliberately leaves to the merge.
+    placed: std::collections::BTreeSet<String>,
     plan: CarryPlan,
 }
 
@@ -1189,11 +1358,7 @@ async fn plan_take_committed_tip(
         .await
         .map_err(PlanStop::Refused)?
         .is_some();
-    let placed = if merge_mode {
-        conflict_session::ReplayScope::CatchUpMerge
-    } else {
-        conflict_session::ReplayScope::Carry
-    };
+    let placed = placed_scope(merge_mode);
     let left = budget.admit(branch, ASSESSMENT).map_err(PlanStop::Answer)?;
     let scope = AssessmentScope {
         phase: "take-committed-tip assessment",
@@ -1279,34 +1444,15 @@ async fn plan_take_committed_tip(
         }
     }
 
-    // The base the preparer will capture: the job's declared relationship,
-    // read here without the lock only to choose what to plan onto. The
-    // preparer re-reads it under the lock and refuses a carry planned onto any
-    // other base commit.
+    // The base the preparer will capture: the session's recorded base, which
+    // this resolution was made against, while it is still in the declared
+    // base's history. The relationship is read here without the lock only to
+    // choose what to plan onto; the preparer re-reads it under the lock,
+    // captures exactly this commit and refuses a carry planned onto any other.
     let relationship = load_relationship(db, project_id, branch, Some(ask.job_id), None)
         .await
         .map_err(|refusal| PlanStop::Refused(refusal.to_string()))?;
-    if merge_mode {
-        let destination = session.theirs.clone().ok_or_else(|| {
-            PlanStop::Refused(
-                "the merge conflict session has no pinned destination; re-read cairn:~/rebase"
-                    .to_string(),
-            )
-        })?;
-        let paths = session
-            .conflicting()
-            .map(|file| file.path.clone())
-            .collect::<Vec<_>>();
-        return Ok(PlannedCarry {
-            base_branch: relationship.base_branch,
-            base: destination,
-            plan: CarryPlan {
-                carry: crate::jj::ResolutionCarry::from_tip(&tip, &paths),
-                refused: Vec::new(),
-            },
-        });
-    }
-    let base = cairn_vcs::resolve_coordinate(store, &relationship.base_branch)
+    let live = cairn_vcs::resolve_coordinate(store, &relationship.base_branch)
         .await
         .map_err(|error| {
             PlanStop::Refused(format!(
@@ -1314,6 +1460,41 @@ async fn plan_take_committed_tip(
                 relationship.base_branch
             ))
         })?;
+    let recorded = session.destination_commit.clone();
+    // A session recorded before captures kept the base's name has the commit
+    // standing in for it.
+    let same_base =
+        session.target_branch == relationship.base_branch || session.target_branch == recorded;
+    let exact = same_base
+        && (recorded == live
+            || cairn_vcs::history::contains(store, &recorded, &live)
+                .await
+                .unwrap_or(false));
+    // A base rewritten under the session has no recorded commit left to land
+    // on: the resolution is judged against the live base, as it always was.
+    let base = if exact { recorded } else { live };
+    // What this plan places, and so what a conflict at the same base already
+    // accounts for: anything else is an inventory the session did not list.
+    let mut placed: std::collections::BTreeSet<String> = session
+        .replay_paths(&session.resolution_basis, placed_scope(merge_mode))
+        .into_iter()
+        .collect();
+    if merge_mode {
+        let paths = session
+            .conflicting()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        return Ok(PlannedCarry {
+            base_branch: relationship.base_branch,
+            base,
+            exact,
+            placed,
+            plan: CarryPlan {
+                carry: crate::jj::ResolutionCarry::from_tip(&tip, &paths),
+                refused: Vec::new(),
+            },
+        });
+    }
     // The plan's committed side is the tip just proven, whatever an earlier
     // request recorded. The request itself is recorded once, by its marker.
     session.replay_requested_tip = Some(tip.clone());
@@ -1346,10 +1527,126 @@ async fn plan_take_committed_tip(
             ))
         }
     })?;
+    placed.extend(plan.carry.paths.iter().map(|(path, _)| path.clone()));
+    placed.extend(plan.refused.iter().map(|(path, _)| path.clone()));
     Ok(PlannedCarry {
         base_branch: relationship.base_branch,
         base,
+        exact,
+        placed,
         plan,
+    })
+}
+
+fn placed_scope(merge_mode: bool) -> conflict_session::ReplayScope {
+    if merge_mode {
+        conflict_session::ReplayScope::CatchUpMerge
+    } else {
+        conflict_session::ReplayScope::Carry
+    }
+}
+
+/// The following round of a request that landed `landed` on its session's
+/// base X: when the live base has moved past X, its commits since X are
+/// judged as a plain request onto the live base, queued as the parent's child
+/// and served here if the parent's budget still admits it, otherwise by the
+/// recovery server for this branch. `None` when the live base is X: one round.
+#[allow(clippy::too_many_arguments)]
+async fn increment_round(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    ask: &ExplicitReplay<'_>,
+    store: &Path,
+    project_id: &str,
+    landed: &PreparedBranch,
+    parent: Option<&PendingReplayRequest>,
+    budget: &Budget,
+) -> Option<String> {
+    let branch = ask.branch;
+    let base_branch = &landed.relationship.base_branch;
+    let recorded = landed.base_commit.as_str();
+    let live = match cairn_vcs::resolve_coordinate(store, base_branch).await {
+        Ok(live) => live,
+        Err(error) => {
+            return Some(format!(
+                "Whether `{base_branch}` moved past `{recorded}` could not be read ({error}); \
+                 request a plain replay to bring `{branch}` onto it."
+            ))
+        }
+    };
+    if live == recorded {
+        return None;
+    }
+    // A child on its parent's own coordinate would replace the parent's row.
+    let Some(parent) = parent.filter(|parent| parent.destination_commit != live) else {
+        return Some(format!(
+            "`{base_branch}` is now `{live}`; request a plain replay to judge its commits since \
+             `{recorded}`."
+        ));
+    };
+    let child = match conflict_session::queue_increment_request(
+        db,
+        project_id,
+        store,
+        base_branch,
+        &live,
+        branch,
+        &landed.head_after,
+        parent,
+    )
+    .await
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Some(format!(
+                "`{base_branch}` is now `{live}`, but the round for its commits since \
+                 `{recorded}` could not be recorded ({error}); request a plain replay to judge \
+                 them."
+            ))
+        }
+    };
+    let lead = format!(
+        "`{base_branch}` is now `{live}`, so its commits since `{recorded}` are judged as a \
+         following round (request `{}`):",
+        child.id
+    );
+    let admitted = budget.admit(branch, "the following round");
+    #[cfg(test)]
+    let admitted = if tests::increment_deferred(store) {
+        Err(String::new())
+    } else {
+        admitted
+    };
+    let Ok(left) = admitted else {
+        // A recovered parent's server holds the branch's claim and drains
+        // this child itself. Otherwise the branch's own serving seam serves
+        // the newest request, this one, unless a run batch still holds it.
+        if ask.recovered.is_none() {
+            on_branch_hold_released(orch, ask.job_id);
+        }
+        return Some(format!(
+            "{lead} this request's budget is spent, so it is served next on its own; you do \
+             not need to request it. cairn:~/rebase shows its verdict."
+        ));
+    };
+    let answer = Box::pin(replay(
+        orch,
+        db,
+        &ExplicitReplay {
+            job_id: ask.job_id,
+            branch,
+            expected_fingerprint: None,
+            take_committed_tip: false,
+            drop_incoming_reason: None,
+            budget: left,
+            step_minimum: ask.step_minimum,
+            recovered: Some(child),
+            increment_from: Some(recorded),
+        },
+    ))
+    .await;
+    Some(match answer {
+        Ok(answer) | Err(answer) => format!("{lead} {answer}"),
     })
 }
 
@@ -1373,15 +1670,20 @@ async fn landed(
     merge_mode: bool,
 ) -> String {
     let base = &prepared.relationship.base_branch;
+    let on_recorded = if prepared.pinned_base {
+        " (your resolution landed on the base it was made against)"
+    } else {
+        ""
+    };
     let mut out = if prepared.advanced && merge_mode {
         format!(
-            "Merged `{base}` at `{}` into `{branch}`: `{}` → `{}`, tree `{}`. No prior branch commit was rewritten. The conflict session is closed. A clean merge is not a green build: re-run your targeted build.",
+            "Merged `{base}` at `{}` into `{branch}`{on_recorded}: `{}` → `{}`, tree `{}`. No prior branch commit was rewritten. The conflict session is closed. A clean merge is not a green build: re-run your targeted build.",
             prepared.base_commit, prepared.head_before, prepared.head_after, prepared.tree,
         )
     } else if prepared.advanced {
         format!(
-            "Replayed `{branch}` onto `{base}` at `{}`: `{}` → `{}`, tree `{}`. The rebase \
-             session is closed. A clean replay is not a green build: re-run your targeted \
+            "Replayed `{branch}` onto `{base}` at `{}`{on_recorded}: `{}` → `{}`, tree `{}`. The \
+             rebase session is closed. A clean replay is not a green build: re-run your targeted \
              build against the new base.",
             prepared.base_commit, prepared.head_before, prepared.head_after, prepared.tree
         )
@@ -1419,6 +1721,7 @@ fn not_landed(
     branch: &str,
     refusal: PreparationRefusal,
     carry_refusals: Option<&str>,
+    ask: &ExplicitReplay<'_>,
 ) -> Result<String, String> {
     match refusal {
         PreparationRefusal::Conflict(conflict) => {
@@ -1430,21 +1733,42 @@ fn not_landed(
                 record,
                 ..
             } = *conflict;
-            let mut out = format!(
-                "Explicit replay of `{branch}` at `{head}` onto `{base_branch}` at `{base_commit}` \
-                 still conflicts{}. Nothing was installed and `{branch}` is unchanged. {}",
-                if paths.is_empty() {
-                    String::new()
-                } else {
-                    format!(" in {}", paths.join(", "))
-                },
-                match record {
-                    ConflictRecord::Session { reopened: true, .. } => {
-                        "cairn:~/rebase now holds the conflict against this base."
-                    }
-                    _ => "cairn:~/rebase still holds this conflict.",
+            let listed = paths.join(", ");
+            let held = match record {
+                ConflictRecord::Session { reopened: true, .. } => {
+                    "cairn:~/rebase now holds the conflict against this base."
                 }
-            );
+                _ => "cairn:~/rebase still holds this conflict.",
+            };
+            // A stale resolution never reads as a wrong one: a following
+            // round names only what the base's newer commits conflict on, and
+            // a resolution judged at its own base names what it leaves open.
+            let mut out = if let Some(landed) = ask.increment_from {
+                format!(
+                    "Resolved against `{landed}`; `{base_branch}` is now `{base_commit}`; these \
+                     files conflict with `{base_commit}`'s new commits: {listed}. Nothing of this \
+                     round was installed. cairn:~/rebase holds that session against \
+                     `{base_commit}`."
+                )
+            } else if ask.take_committed_tip && !paths.is_empty() {
+                format!(
+                    "Explicit replay of `{branch}` at `{head}` onto `{base_branch}` at \
+                     `{base_commit}` still conflicts: your committed tip does not yet resolve \
+                     `{base_commit}` in: {listed}. Nothing was installed and `{branch}` is \
+                     unchanged. {held}"
+                )
+            } else {
+                format!(
+                    "Explicit replay of `{branch}` at `{head}` onto `{base_branch}` at \
+                     `{base_commit}` still conflicts{}. Nothing was installed and `{branch}` is \
+                     unchanged. {held}",
+                    if paths.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" in {listed}")
+                    },
+                )
+            };
             if let Some(refusals) = carry_refusals {
                 out.push_str("\n\n");
                 out.push_str(refusals);
@@ -1501,19 +1825,6 @@ fn not_landed(
         other => Err(format!(
             "Explicit replay of `{branch}` was not installed: {other}. `{branch}` is unchanged."
         )),
-    }
-}
-
-/// Named, because the page churn a mid-request base move causes reads exactly
-/// like a failed resolution otherwise.
-fn retarget_note(planned_bases: &[String]) -> String {
-    match (planned_bases.first(), planned_bases.last()) {
-        (Some(from), Some(to)) if from != to => format!(
-            "The base advanced while this replay was being prepared, from `{from}` to `{to}`, so \
-             your committed resolution was re-proven and re-planned onto the newer base. This is \
-             a race with another merge landing, not a failed resolution.\n\n"
-        ),
-        _ => String::new(),
     }
 }
 

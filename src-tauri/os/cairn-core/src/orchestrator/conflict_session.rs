@@ -239,8 +239,10 @@ pub(crate) struct ConflictSession {
     pub(crate) resolution_basis: ResolutionBasis,
     /// The tip a take-committed-tip request was assessed at.
     pub(crate) replay_requested_tip: Option<String>,
-    /// The destination that request was actually queued onto, which can be
-    /// newer than `destination_commit`.
+    /// The destination that request was queued onto. A take-committed-tip
+    /// request is queued onto this session's own `destination_commit`, the
+    /// base its resolution was made against, and is never retargeted; the
+    /// live base's newer commits are the following round it opens.
     pub(crate) replay_requested_destination: Option<String>,
 }
 
@@ -1493,6 +1495,10 @@ pub(crate) struct PendingReplayRequest {
     pub(crate) drop_incoming_reason: Option<String>,
     /// Unix seconds.
     pub(crate) requested_at: i64,
+    /// The request whose landing on its session's base opened this one, the
+    /// following round onto the live base. It carries that request's
+    /// authority. `None` for a request an agent made itself.
+    pub(crate) parent_request_id: Option<String>,
 }
 
 /// Durably record an accepted explicit replay request for `bookmark` onto
@@ -1519,6 +1525,63 @@ pub(crate) async fn queue_replay_request(
     take_committed_tip: bool,
     drop_incoming_reason: Option<&str>,
 ) -> Result<PendingReplayRequest, String> {
+    queue_request(
+        db,
+        project_id,
+        store,
+        target_branch,
+        destination,
+        bookmark,
+        tip,
+        take_committed_tip,
+        drop_incoming_reason,
+        None,
+    )
+    .await
+}
+
+/// Queue the following round of `parent`, which landed `bookmark` on its
+/// session's base `landed`: a plain request onto the live base `destination`
+/// at the tip that landing produced, carrying the parent's authority.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn queue_increment_request(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    target_branch: &str,
+    destination: &str,
+    bookmark: &str,
+    tip: &str,
+    parent: &PendingReplayRequest,
+) -> Result<PendingReplayRequest, String> {
+    queue_request(
+        db,
+        project_id,
+        store,
+        target_branch,
+        destination,
+        bookmark,
+        Some(tip),
+        false,
+        None,
+        Some(parent),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_request(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    target_branch: &str,
+    destination: &str,
+    bookmark: &str,
+    tip: Option<&str>,
+    take_committed_tip: bool,
+    drop_incoming_reason: Option<&str>,
+    parent: Option<&PendingReplayRequest>,
+) -> Result<PendingReplayRequest, String> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let fresh_intent_id = uuid::Uuid::new_v4().to_string();
     let requested_at = chrono::Utc::now().timestamp();
@@ -1527,7 +1590,14 @@ pub(crate) async fn queue_replay_request(
     } else {
         REPLAY_RESOLUTION_PLAIN
     };
-    let sources = serde_json::to_string(&[format!("replay requested for {bookmark}")])
+    let source = match parent {
+        Some(parent) => format!(
+            "increment after landing {} (request {})",
+            parent.destination_commit, parent.id
+        ),
+        None => format!("replay requested for {bookmark}"),
+    };
+    let sources = serde_json::to_string(&[source])
         .map_err(|error| format!("encode replay request source: {error}"))?;
     let mut request = PendingReplayRequest {
         id: request_id,
@@ -1541,6 +1611,7 @@ pub(crate) async fn queue_replay_request(
         take_committed_tip,
         drop_incoming_reason: drop_incoming_reason.map(str::to_string),
         requested_at,
+        parent_request_id: parent.map(|parent| parent.id.clone()),
     };
     let queued = request.clone();
     let intent_id = db
@@ -1604,10 +1675,11 @@ pub(crate) async fn queue_replay_request(
                        (intent_id, bookmark, observed_tip, status, updated_at,
                         replay_request_id, replay_resolution, replay_drop_incoming_reason,
                         replay_served_at, replay_requested_at, replay_requested_tip,
-                        replay_requested_destination)
-                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, NULL, ?4, ?3, ?8)
+                        replay_requested_destination, replay_parent_request_id)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, NULL, ?4, ?3, ?8, ?9)
                      ON CONFLICT(intent_id, bookmark) DO UPDATE SET
                        replay_request_id = excluded.replay_request_id,
+                       replay_parent_request_id = excluded.replay_parent_request_id,
                        replay_resolution = excluded.replay_resolution,
                        replay_drop_incoming_reason = excluded.replay_drop_incoming_reason,
                        replay_served_at = NULL,
@@ -1623,7 +1695,8 @@ pub(crate) async fn queue_replay_request(
                         request.id.as_str(),
                         resolution,
                         request.drop_incoming_reason.as_deref(),
-                        request.destination_commit.as_str()
+                        request.destination_commit.as_str(),
+                        request.parent_request_id.as_deref()
                     ],
                 )
                 .await?;
@@ -1643,7 +1716,8 @@ pub(crate) async fn queue_replay_request(
 
 const PENDING_REQUEST_COLUMNS: &str = "i.replay_request_id, i.intent_id, n.project_id, \
      n.store_path, n.target_branch, n.destination_commit, i.bookmark, i.replay_requested_tip, \
-     i.replay_resolution, i.replay_drop_incoming_reason, i.replay_requested_at";
+     i.replay_resolution, i.replay_drop_incoming_reason, i.replay_requested_at, \
+     i.replay_parent_request_id";
 
 /// One unserved request row, with its stored resolution not yet judged.
 fn pending_request_row(
@@ -1662,6 +1736,7 @@ fn pending_request_row(
             take_committed_tip: false,
             drop_incoming_reason: row.opt_text(9)?,
             requested_at: row.opt_i64(10)?.unwrap_or(0),
+            parent_request_id: row.opt_text(11)?,
         },
         row.opt_text(8)?,
     ))
@@ -1677,9 +1752,11 @@ fn judged_request(
 
 /// The newest unserved explicit replay request for `bookmark` in `store`.
 ///
-/// Not filtered by destination: a request retargeted onto a newer base keeps
-/// its authority. A row with a request timestamp but no request id predates
-/// typed requests and is never authority.
+/// Not filtered by destination: a request keeps its authority for the base it
+/// was recorded against and for the following round its landing opens (a
+/// child request onto the live base), and it is never retargeted onto a newer
+/// base. A row with a request timestamp but no request id predates typed
+/// requests and is never authority.
 pub(crate) async fn load_pending_replay_request(
     db: &LocalDb,
     store: &Path,
@@ -1775,6 +1852,21 @@ pub(crate) async fn list_pending_replay_requests(
         }
     }
     Ok(newest)
+}
+
+/// The base commit request `request_id` was queued onto, if it exists.
+pub(crate) async fn replay_request_destination(
+    db: &LocalDb,
+    request_id: &str,
+) -> Result<Option<String>, String> {
+    db.query_text(
+        "SELECT n.destination_commit FROM jj_reconcile_items i
+           JOIN jj_reconcile_intents n ON n.id = i.intent_id
+          WHERE i.replay_request_id = ?1 LIMIT 1",
+        (request_id.to_string(),),
+    )
+    .await
+    .map_err(|error| format!("read replay request `{request_id}`: {error}"))
 }
 
 /// The verdict frozen onto a request when it was served.
@@ -1978,6 +2070,9 @@ pub(crate) struct LatestReplayRequest {
     pub(crate) target_branch: String,
     pub(crate) destination_commit: String,
     pub(crate) state: ReplayRequestState,
+    /// For a following round: the request whose landing opened it, and the
+    /// session base that request landed on.
+    pub(crate) opened_by: Option<(String, String)>,
 }
 
 pub(crate) async fn latest_replay_request(
@@ -1994,7 +2089,11 @@ pub(crate) async fn latest_replay_request(
                     .query(
                         "SELECT i.replay_request_id, i.replay_requested_at, i.replay_served_at,
                                 i.replay_result_json, i.replay_requested_tip, n.target_branch,
-                                n.destination_commit
+                                n.destination_commit, i.replay_parent_request_id,
+                                (SELECT pn.destination_commit FROM jj_reconcile_items pi
+                                   JOIN jj_reconcile_intents pn ON pn.id = pi.intent_id
+                                  WHERE pi.replay_request_id = i.replay_parent_request_id
+                                  LIMIT 1)
                          FROM jj_reconcile_items i
                          JOIN jj_reconcile_intents n ON n.id = i.intent_id
                          WHERE i.bookmark = ?2 AND i.replay_request_id IS NOT NULL
@@ -2014,13 +2113,22 @@ pub(crate) async fn latest_replay_request(
                     row.opt_text(4)?,
                     row.text(5)?,
                     row.text(6)?,
+                    row.opt_text(7)?.zip(row.opt_text(8)?),
                 )))
             })
         })
         .await
         .map_err(|error| format!("load the latest replay request: {error}"))?;
-    let Some((id, requested_at, served_at, result, requested_tip, target_branch, destination)) =
-        row
+    let Some((
+        id,
+        requested_at,
+        served_at,
+        result,
+        requested_tip,
+        target_branch,
+        destination,
+        opened_by,
+    )) = row
     else {
         return Ok(None);
     };
@@ -2044,6 +2152,7 @@ pub(crate) async fn latest_replay_request(
         target_branch,
         destination_commit: destination,
         state,
+        opened_by,
     }))
 }
 
@@ -2098,8 +2207,12 @@ pub(crate) async fn replay_request_state(
 
 /// Supersede every other open session for this branch, so exactly one is active.
 ///
-/// A base that advances twice produces two intents; the older session's
-/// coordinates describe a merge nobody will perform again.
+/// An open session's recorded base is the branch's next catch-up step until it
+/// lands: an owner's commit is judged against it and a landing refuses while
+/// it is open (the preparer's `pin_session_base`), so a newer base never
+/// records over it. What this retires is a session whose base already landed
+/// or left the base's history, whose coordinates describe a merge nobody will
+/// perform again.
 pub(crate) async fn supersede_stale_sessions(
     db: &LocalDb,
     bookmark: &str,
@@ -2149,12 +2262,42 @@ pub(crate) async fn load_latest_session(
     load_session(db, bookmark, false).await
 }
 
+/// The session an accepted replay request was accepted against: the one on
+/// the request's own item, while it is open or was superseded by a newer
+/// recording. A request is for that session, never a newer one that replaced
+/// it, so a resolution of its base still lands there. A resolved session (its
+/// base already landed) or an item that never recorded one is `None`.
+pub(crate) async fn load_session_for_request(
+    db: &LocalDb,
+    request: &PendingReplayRequest,
+) -> Result<Option<ConflictSession>, String> {
+    let session =
+        load_session_where(db, &request.bookmark, Some(&request.intent_id), false).await?;
+    Ok(session.filter(|session| {
+        matches!(
+            session.resolution_state.as_deref(),
+            Some(state) if state == ResolutionState::Open.as_str()
+                || state == ResolutionState::Superseded.as_str()
+        )
+    }))
+}
+
 async fn load_session(
     db: &LocalDb,
     bookmark: &str,
     open_only: bool,
 ) -> Result<Option<ConflictSession>, String> {
+    load_session_where(db, bookmark, None, open_only).await
+}
+
+async fn load_session_where(
+    db: &LocalDb,
+    bookmark: &str,
+    intent_id: Option<&str>,
+    open_only: bool,
+) -> Result<Option<ConflictSession>, String> {
     let bookmark_owned = bookmark.to_string();
+    let intent_owned = intent_id.unwrap_or_default().to_string();
     let open_filter = if open_only {
         format!(
             "AND i.resolution_state = '{}'",
@@ -2163,20 +2306,26 @@ async fn load_session(
     } else {
         String::new()
     };
+    let intent_filter = if intent_id.is_some() {
+        "AND i.intent_id = ?2"
+    } else {
+        "AND ?2 = ?2"
+    };
     let sql = format!(
         "SELECT {SESSION_COLUMNS}
          FROM jj_reconcile_items i
          JOIN jj_reconcile_intents n ON n.id = i.intent_id
-         WHERE i.bookmark = ?1 {open_filter}
+         WHERE i.bookmark = ?1 {open_filter} {intent_filter}
            AND i.diagnostic_version IS NOT NULL
          ORDER BY i.updated_at DESC LIMIT 1"
     );
     let mut session = db
         .read(move |conn| {
             let bookmark = bookmark_owned.clone();
+            let intent = intent_owned.clone();
             let sql = sql.clone();
             Box::pin(async move {
-                let mut rows = conn.query(&sql, params![bookmark]).await?;
+                let mut rows = conn.query(&sql, params![bookmark, intent]).await?;
                 let Some(row) = rows.next().await? else {
                     return Ok(None);
                 };

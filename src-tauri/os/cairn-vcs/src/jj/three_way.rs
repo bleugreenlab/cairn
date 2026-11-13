@@ -1105,6 +1105,37 @@ pub fn paths_changed_between(
         .collect())
 }
 
+/// Every path whose content differs between two commits, by name.
+pub fn paths_changed(
+    jj: &JjEnv,
+    store: &Path,
+    from: &str,
+    to: &str,
+) -> Result<BTreeSet<String>, String> {
+    if from == to {
+        return Ok(BTreeSet::new());
+    }
+    let listed = jj.run(
+        store,
+        &[
+            "diff",
+            "--ignore-working-copy",
+            "--name-only",
+            "--from",
+            from,
+            "--to",
+            to,
+        ],
+        "jj diff --name-only (changed paths)",
+    )?;
+    Ok(listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Which of `commits` `head` already contains — each equal to `head` or one of
 /// its ancestors — in one jj call.
 ///

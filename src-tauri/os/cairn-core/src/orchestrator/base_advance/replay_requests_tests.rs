@@ -16,6 +16,23 @@ fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
     HOOKS.get_or_init(Default::default)
 }
 
+fn deferred_increments() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static DEFERRED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    DEFERRED.get_or_init(Default::default)
+}
+
+/// Make every following round in `store` find its parent's budget spent.
+pub(super) fn defer_increments(store: &Path) {
+    deferred_increments()
+        .lock()
+        .unwrap()
+        .insert(store.to_path_buf());
+}
+
+pub(super) fn increment_deferred(store: &Path) -> bool {
+    deferred_increments().lock().unwrap().contains(store)
+}
+
 /// Called after the carry is planned, before the preparer captures.
 pub(super) fn after_carry_plan(store: &Path, attempt: u32) {
     let mut hook = hooks().lock().unwrap().remove(store);
@@ -568,6 +585,7 @@ async fn benchmark_explicit_replay_requests() {
                     budget: Duration::from_secs(budget),
                     step_minimum: EXPLICIT_STEP_MINIMUM,
                     recovered: None,
+                    increment_from: None,
                 },
             )
             .await;
