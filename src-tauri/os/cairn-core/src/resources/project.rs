@@ -1924,6 +1924,8 @@ pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str
     }
     out.push('\n');
 
+    out.push_str(&render_declared_checks(orch, repo, &resolved_branch).await);
+
     let populate = config.populate_config();
     out.push_str("## Worktree populate\n\n");
     if populate.is_empty() {
@@ -1974,6 +1976,65 @@ pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str
     }
     out.push('\n');
 
+    out
+}
+
+/// The checks in force for new work: what the default branch's tip commit
+/// declares in its committed `.cairn/config.yaml`. Read from that tree rather
+/// than the checkout, because the commit's tree is where every check run reads
+/// them; an uncommitted checkout edit is not in force anywhere.
+async fn render_declared_checks(
+    orch: &Orchestrator,
+    repo: &std::path::Path,
+    branch: &str,
+) -> String {
+    let mut out = String::from("## Checks\n\n");
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
+    let commit = match cairn_vcs::resolve_coordinate(&store, branch).await {
+        Ok(commit) => commit,
+        Err(error) => {
+            out.push_str(&format!(
+                "Unavailable: `{branch}` did not resolve: {error}\n\n"
+            ));
+            return out;
+        }
+    };
+    let short = &commit[..commit.len().min(12)];
+    out.push_str(&format!(
+        "Read-only, as declared by `.cairn/config.yaml` at `{branch}` tip `{short}`. \
+         To change them, commit that file on a branch and merge it (docs/checks.md).\n\n"
+    ));
+    match crate::execution::checks::load_checks_contract_at_commit_detailed(repo, &commit).await {
+        Ok(loaded) => {
+            let contract = loaded.contract;
+            let mut names: Vec<_> = contract.checks.keys().collect();
+            names.sort();
+            for name in names {
+                let check = &contract.checks[name];
+                out.push_str(&format!(
+                    "- `{name}` — `{}` (when: {}, policy: {})",
+                    check.command,
+                    check.when.as_str(),
+                    check.policy.as_str()
+                ));
+                if let Some(full) = &check.full_command {
+                    out.push_str(&format!("; fullCommand `{full}`"));
+                }
+                out.push('\n');
+            }
+            for (name, unsupported) in &contract.unsupported {
+                out.push_str(&format!(
+                    "- `{name}` — not runnable by this build: {}\n",
+                    unsupported.notice
+                ));
+            }
+        }
+        Err(error) => {
+            out.push_str(&error.manual_diagnostic(short));
+            out.push_str(".\n");
+        }
+    }
+    out.push('\n');
     out
 }
 

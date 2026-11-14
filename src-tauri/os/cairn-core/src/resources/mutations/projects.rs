@@ -3,17 +3,17 @@
 //! - `cairn://projects` create registers a new project from a local git repo.
 //! - `cairn://p/PROJECT` patch renames, hides/unhides, or attaches a remote.
 //! - `cairn://p/PROJECT/settings` patch routes each field to its store:
-//!   `project-settings.yaml` (setup/terminal commands, worktree populate,
-//!   default branch, references, background-testing checks), the projects DB row
-//!   (default branch, name, hidden), and the per-project identity overrides store.
+//!   the checkout's `.cairn/config.yaml` (setup/terminal commands, worktree
+//!   populate, default branch, references), the projects DB row (default branch,
+//!   name, hidden), and the per-project identity overrides store. `checks` is
+//!   refused: see [`checks_settings_refusal`].
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::project_settings::{
-    load_project_settings_read_only, mutate_project_settings, CheckCommand, PopulateConfig,
-    ProjectSettingsFile,
+    load_project_settings_read_only, mutate_project_settings, PopulateConfig, ProjectSettingsFile,
 };
 use crate::credentials::AccountOverrides;
 use crate::mcp::types::{ChangeItem, ChangeMode};
@@ -25,7 +25,57 @@ use crate::references::ProjectReference;
 use crate::services::RealClock;
 use crate::storage::{LocalDb, RowExt};
 use cairn_uri::{parse_uri, CairnResource};
-use std::collections::HashMap;
+
+/// The declaration a `checks` refusal tells the caller to commit. Parsed by a
+/// test into the real check schema, so the shape it teaches cannot drift from
+/// what the parser accepts.
+const CHECKS_CONFIG_EXAMPLE: &str = "checks:
+  typecheck:
+    command: bunx tsc --noEmit
+    when: review
+  unit-tests:
+    command: bun test {changedFiles}
+    fullCommand: bun test
+    when: review
+";
+
+/// Check keys the refusal names beyond its example. A test round-trips each
+/// through `CheckCommand` so a renamed field fails here instead of misleading.
+const CHECK_OPTIONAL_KEYS: &[&str] = &[
+    "fullCommand",
+    "impact",
+    "scope",
+    "policy",
+    "when",
+    "timeout",
+];
+
+/// The refusal for a project-settings patch carrying `checks`.
+///
+/// Every check cadence, `cairn check run` included, reads check declarations
+/// from the tree of the commit it evaluates. A settings patch can only edit the
+/// operator checkout's uncommitted `.cairn/config.yaml`, which no branch or
+/// merge carries, so accepting it would report success for a declaration that
+/// never takes effect.
+pub(crate) fn checks_settings_refusal(payload: Option<&Value>) -> Option<String> {
+    payload?.get("checks")?;
+    Some(format!(
+        "`checks` cannot be set through project settings: checks are declared in the committed \
+         `.cairn/config.yaml` and every check run reads them from the tree of the commit it \
+         evaluates, while a settings write would only edit the operator checkout's uncommitted \
+         copy, which no branch or merge carries. To add or change checks, commit \
+         `.cairn/config.yaml` on a branch (your own, or a child issue's builder) and merge it; \
+         they take effect for commits that contain it. Example:\n\n{CHECKS_CONFIG_EXAMPLE}\n\
+         Each check needs `command` (a `{{changedFiles}}` or `{{targets}}` placeholder makes it \
+         selective); optional keys include {}. Reference: docs/checks.md. The checks the default \
+         branch declares now are listed by reading cairn://p/PROJECT/settings.",
+        CHECK_OPTIONAL_KEYS
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
 
 fn emit_db_change(orch: &Orchestrator, action: &str) {
     orch.invalidate_sidebar_active_issues();
@@ -789,13 +839,9 @@ pub(super) async fn apply_project_settings_patch(
                 .map_err(|error| format!("invalid terminalCommands: {error}"))
         })
         .transpose()?;
-    let checks = payload
-        .get("checks")
-        .map(|value| {
-            serde_json::from_value::<HashMap<String, CheckCommand>>(value.clone())
-                .map_err(|error| format!("invalid checks: {error}"))
-        })
-        .transpose()?;
+    if let Some(refusal) = checks_settings_refusal(Some(payload)) {
+        return Err(refusal);
+    }
     let populate = first_value(
         payload,
         &["materializationPopulate", "materialization_populate"],
@@ -826,9 +872,6 @@ pub(super) async fn apply_project_settings_patch(
     if terminal_commands.is_some() {
         ops.push("terminalCommands".to_string());
     }
-    if checks.is_some() {
-        ops.push("checks".to_string());
-    }
     if populate.is_some() {
         ops.push("materializationPopulate".to_string());
     }
@@ -845,9 +888,6 @@ pub(super) async fn apply_project_settings_patch(
         }
         if let Some(commands) = &terminal_commands {
             config.terminal_commands = Some(commands.clone());
-        }
-        if let Some(checks) = &checks {
-            config.checks = (!checks.is_empty()).then(|| checks.clone());
         }
         if let Some(populate) = &populate {
             config
@@ -866,7 +906,6 @@ pub(super) async fn apply_project_settings_patch(
 
     let has_file_fields = setup_commands.is_some()
         || terminal_commands.is_some()
-        || checks.is_some()
         || populate.is_some()
         || default_branch.is_some()
         || references.is_some();
@@ -893,7 +932,7 @@ pub(super) async fn apply_project_settings_patch(
 
     if ops.is_empty() {
         return Err(
-            "payload must set at least one of: setupCommands, terminalCommands, checks, materializationPopulate, defaultBranch, accountOverrides, references"
+            "payload must set at least one of: setupCommands, terminalCommands, materializationPopulate, defaultBranch, accountOverrides, references"
                 .to_string(),
         );
     }
@@ -925,6 +964,64 @@ pub(super) async fn apply_project_settings_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_patch_naming_checks_is_refused_toward_a_commit() {
+        assert_eq!(checks_settings_refusal(None), None);
+        assert_eq!(
+            checks_settings_refusal(Some(&json!({"setupCommands": ["bun install"]}))),
+            None
+        );
+        // An empty map once meant "clear all"; it is just as unreachable.
+        for checks in [json!({}), json!({"typecheck": {"command": "bunx tsc"}})] {
+            let refusal = checks_settings_refusal(Some(&json!({ "checks": checks }))).unwrap();
+            assert!(refusal.contains("commit"), "{refusal}");
+            assert!(refusal.contains(".cairn/config.yaml"), "{refusal}");
+            assert!(refusal.contains("docs/checks.md"), "{refusal}");
+            assert!(refusal.contains(CHECKS_CONFIG_EXAMPLE), "{refusal}");
+        }
+    }
+
+    /// The refusal teaches a shape; that shape must be the one the commit-tree
+    /// check parser reads.
+    #[test]
+    fn the_refusal_example_parses_as_the_committed_checks_contract() {
+        let (settings, _) =
+            crate::config::project_settings::parse_project_settings(CHECKS_CONFIG_EXAMPLE)
+                .expect("example parses");
+        let contract = crate::config::project_settings::checks_contract_from(settings)
+            .expect("example declares checks");
+        assert!(contract.unsupported.is_empty());
+        assert_eq!(contract.checks["typecheck"].command, "bunx tsc --noEmit");
+        let unit = &contract.checks["unit-tests"];
+        assert_eq!(unit.command, "bun test {changedFiles}");
+        assert_eq!(unit.full_command.as_deref(), Some("bun test"));
+    }
+
+    /// Every key the refusal names is a `CheckCommand` field: serde drops an
+    /// unknown key on the way in, so a misnamed one is missing on the way out.
+    /// Values are non-default, since defaults are skipped when serializing.
+    #[test]
+    fn every_check_key_the_refusal_names_is_a_check_command_field() {
+        let declared = json!({
+            "command": "x {changedFiles}",
+            "fullCommand": "x",
+            "impact": ["src/**"],
+            "scope": "rust:cairn-core",
+            "policy": "gate",
+            "when": "review",
+            "timeout": 60,
+        });
+        let check: crate::config::project_settings::CheckCommand =
+            serde_json::from_value(declared).unwrap();
+        let round_trip = serde_json::to_value(&check).unwrap();
+        for key in std::iter::once(&"command").chain(CHECK_OPTIONAL_KEYS) {
+            assert!(
+                round_trip.get(*key).is_some(),
+                "`{key}` is not a CheckCommand field: {round_trip}"
+            );
+        }
+    }
 
     #[test]
     fn create_crossing_path_only_for_nonempty_repo_path() {

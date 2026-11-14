@@ -1262,11 +1262,6 @@ pub(crate) const PS_REFERENCES: KeySpec = KeySpec::new(
     KeyType::Object,
     "{add[{name, git|path, description?, branch?}], remove[names], refresh[names]}",
 );
-pub(crate) const PS_CHECKS: KeySpec = KeySpec::new(
-    "checks",
-    KeyType::Object,
-    "{name: {full, select?{mode,command,targetsFrom?}, impact?[], parse?, policy?, when?, deterministic?}}; empty object clears all",
-);
 
 // --- posts ---
 pub(crate) const POST_CONTENT: KeySpec =

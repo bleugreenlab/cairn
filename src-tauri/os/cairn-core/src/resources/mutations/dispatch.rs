@@ -262,6 +262,11 @@ fn gate_resource_change(
             return Err(build_failure(index, item, refusal));
         }
     }
+    if kind == ResourceKind::ProjectSettings {
+        if let Some(refusal) = super::projects::checks_settings_refusal(item.payload.as_ref()) {
+            return Err(build_failure(index, item, refusal));
+        }
+    }
     if matches!(kind, ResourceKind::Packs | ResourceKind::Pack) {
         if let Some(key) = item.payload.as_ref().and_then(crate::library::source_key) {
             return Err(build_failure(
