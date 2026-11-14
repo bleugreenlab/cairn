@@ -399,3 +399,38 @@ async fn project_create_refuses_a_default_contradicting_the_declared_one() {
         "defaultBranch: develop\n"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn declared_checks_reads_default_tip_without_committing_local_edits() {
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let fixture = fixture().await;
+    let config = get_project_config_path(&fixture.repo);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "checks:\n  unit:\n    command: echo committed\n").unwrap();
+    git(&["add", ".cairn/config.yaml"], &fixture.repo);
+    git(&["commit", "-qm", "declare checks"], &fixture.repo);
+    let jj = crate::jj::environment_with_binary(bin, &fixture.orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &fixture.store(), &fixture.repo).unwrap();
+    let before = crate::jj::tests::git_stdout(&fixture.repo, &["rev-list", "--all", "--reflog"]);
+    let tip = crate::jj::tests::git_stdout(&fixture.repo, &["rev-parse", "main"]);
+    let local = "checks:\n  local-only:\n    command: echo uncommitted\n";
+    std::fs::write(&config, local).unwrap();
+
+    let declared = crate::projects::declared_checks(&fixture.orch, "p")
+        .await
+        .unwrap();
+    assert_eq!(declared.branch, "main");
+    assert_eq!(declared.commit, tip.trim());
+    assert_eq!(declared.checks.len(), 1);
+    assert_eq!(declared.checks["unit"].command, "echo committed");
+    assert!(!declared.checks.contains_key("local-only"));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), local);
+    assert_eq!(
+        crate::jj::tests::git_stdout(&fixture.repo, &["rev-list", "--all", "--reflog"]),
+        before,
+        "observing the committed declarations must create no commit"
+    );
+}
