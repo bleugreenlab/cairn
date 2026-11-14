@@ -767,9 +767,10 @@ pub(crate) struct CheckPhaseStatus {
     /// When the current phase began: when the batch started waiting, was
     /// claimed, or started being prepared.
     pub(crate) since_unix_ms: Option<u64>,
-    /// What holds a queued batch, in a few words (`declined by local (host
-    /// pressure: cpu 97%)`), for a line too short for the full diagnostic.
-    /// `None` when no machine has declined it.
+    /// What holds a queued batch (`declined by local (host pressure: cpu
+    /// 97%)`, or every machine of its latest placement pass with its status),
+    /// without the wait forecast the full diagnostic leads with. `None` when
+    /// no pass was recorded and no machine has declined it.
     held_by: Option<String>,
 }
 
@@ -4765,33 +4766,117 @@ fn decline_reason_words(reason: cairn_common::executor_protocol::DeclineReason) 
     }
 }
 
-/// The machines that declined a parked request, latest first, so a wait that
+/// One machine's decline in its own words, and, once the condition it posted
+/// has changed, that it is the last thing the machine said rather than what
+/// it says now.
+fn describe_decline(decline: &crate::fleet::CheckDispatchDecline) -> String {
+    let reason = decline_reason_words(decline.reason);
+    let mut words = match decline
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.is_empty())
+    {
+        Some(detail) => format!("{reason}: {detail}"),
+        None => reason.to_string(),
+    };
+    if let Some(superseded) = decline.superseded_at_unix_ms {
+        words.push_str(&format!(
+            "; its posted state changed at {}, offerable again from {}",
+            clock_utc(superseded),
+            clock_utc(decline.retry_after_unix_ms)
+        ));
+    }
+    format!("{} ({words})", decline.executor_name)
+}
+
+/// Every machine that declined a parked request, latest first, so a wait that
 /// is really a disk or pressure hold says so instead of reading as a queue.
 fn describe_declines(declines: &[crate::fleet::CheckDispatchDecline]) -> Option<String> {
-    const NAMED: usize = 3;
-    if declines.is_empty() {
-        return None;
-    }
-    let named = declines
-        .iter()
-        .take(NAMED)
-        .map(|decline| {
-            let reason = decline_reason_words(decline.reason);
-            match decline
-                .detail
-                .as_deref()
-                .filter(|detail| !detail.is_empty())
-            {
-                Some(detail) => format!("{} ({reason}: {detail})", decline.executor_name),
-                None => format!("{} ({reason})", decline.executor_name),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(match declines.len().saturating_sub(NAMED) {
-        0 => format!("declined by {named}"),
-        more => format!("declined by {named}, and {more} more"),
+    (!declines.is_empty()).then(|| {
+        let named: Vec<String> = declines.iter().map(describe_decline).collect();
+        format!("declined by {}", named.join(", "))
     })
+}
+
+/// What the latest placement pass did with every machine it named, so a wait
+/// whose machines were excluded before any offer says so instead of reading
+/// as their declines. A decline the pass does not name (its machine was not
+/// considered this time) is still told, as earlier.
+///
+/// A cadence-turn row is left to the dispatch phase's own `turn`, which tells
+/// it already.
+fn describe_placement_pass(
+    pass: &crate::fleet::CheckPlacementPass,
+    declines: &[crate::fleet::CheckDispatchDecline],
+) -> String {
+    use crate::fleet::CheckCandidateStatus;
+    use cairn_common::executor_protocol::PlacementRejectionReason;
+    let mut chosen = Vec::new();
+    let mut declined = Vec::new();
+    let mut outranked = Vec::new();
+    // One clause per distinct reason, its machines in the pass's order.
+    let mut not_offered: Vec<(String, Vec<&str>)> = Vec::new();
+    for candidate in &pass.candidates {
+        let name = candidate.executor_name.as_str();
+        match &candidate.status {
+            CheckCandidateStatus::Offered => chosen.push(format!("offered to {name}, unanswered")),
+            CheckCandidateStatus::Chosen => {
+                chosen.push(format!("chose {name}, no offer outstanding"))
+            }
+            CheckCandidateStatus::Declined(decline) => declined.push(decline.clone()),
+            CheckCandidateStatus::Outranked { by } => {
+                outranked.push(format!("{name} (outranked by {by})"))
+            }
+            CheckCandidateStatus::NotOffered(PlacementRejectionReason::CadenceTurn { .. }) => {}
+            CheckCandidateStatus::NotOffered(reason) => {
+                let why = reason.describe();
+                match not_offered.iter_mut().find(|(told, _)| *told == why) {
+                    Some((_, names)) => names.push(name),
+                    None => not_offered.push((why, vec![name])),
+                }
+            }
+        }
+    }
+    let earlier: Vec<String> = declines
+        .iter()
+        .filter(|decline| {
+            !pass
+                .candidates
+                .iter()
+                .any(|candidate| candidate.executor_name == decline.executor_name)
+        })
+        .map(describe_decline)
+        .collect();
+    let mut clauses = chosen;
+    clauses.extend(pass.candidates.iter().flat_map(|candidate| {
+        candidate
+            .unreadable_memory
+            .iter()
+            .map(|failure| format!("{}: {}", candidate.executor_name, failure.describe()))
+    }));
+    clauses.extend(describe_declines(&declined));
+    if !outranked.is_empty() {
+        clauses.push(format!("eligible, not chosen: {}", outranked.join(", ")));
+    }
+    clauses.extend(
+        not_offered
+            .into_iter()
+            .map(|(why, names)| format!("not offered to {} ({why})", names.join(", "))),
+    );
+    if !earlier.is_empty() {
+        clauses.push(format!("earlier declined by {}", earlier.join(", ")));
+    }
+    let header = format!(
+        "latest placement pass {} (request {}, attempt {})",
+        clock_utc(pass.decided_at_unix_ms),
+        pass.request_id,
+        pass.attempt_id
+    );
+    if clauses.is_empty() {
+        header
+    } else {
+        format!("{header}: {}", clauses.join("; "))
+    }
 }
 
 /// How often an outstanding pure-verdict batch re-reads where its execution
@@ -4934,6 +5019,7 @@ impl DispatchNarrator {
             CheckDispatchPhase::Placing {
                 since_unix_ms,
                 declines,
+                placement,
                 turn,
             } => {
                 if let Some(first) = self.first_forecast {
@@ -4959,10 +5045,11 @@ impl DispatchNarrator {
                 // Main's cadence turn is what holds a lane passed over behind
                 // it as surely as a decline is, and it is what the cadence
                 // lane itself waits for, so it is named beside the declines.
-                let held: Vec<String> = [describe_declines(declines), turn.clone()]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let candidates = match placement {
+                    Some(pass) => Some(describe_placement_pass(pass, declines)),
+                    None => describe_declines(declines),
+                };
+                let held: Vec<String> = [candidates, turn.clone()].into_iter().flatten().collect();
                 let held_by = (!held.is_empty()).then(|| held.join("; "));
                 if let Some(declined) = &held_by {
                     diagnostic.push_str("; ");
@@ -16013,11 +16100,14 @@ mod tests {
             phase: crate::fleet::CheckDispatchPhase::Placing {
                 since_unix_ms: PARKED_AT,
                 turn: None,
+                placement: None,
                 declines: vec![crate::fleet::CheckDispatchDecline {
                     executor_name: "local".into(),
                     reason: cairn_common::executor_protocol::DeclineReason::Pressure,
                     detail: Some("cpu 97%".into()),
                     at_unix_ms: PARKED_AT + 1_000,
+                    superseded_at_unix_ms: None,
+                    retry_after_unix_ms: PARKED_AT + 2_000,
                 }],
             },
             joined: None,
@@ -21819,6 +21909,7 @@ cairn-common = { path = "../cairn-common" }
             phase: crate::fleet::CheckDispatchPhase::Placing {
                 since_unix_ms,
                 declines: Vec::new(),
+                placement: None,
                 turn: None,
             },
             joined: None,
@@ -21967,11 +22058,14 @@ cairn-common = { path = "../cairn-common" }
             phase: crate::fleet::CheckDispatchPhase::Placing {
                 since_unix_ms: PARKED_AT,
                 turn: None,
+                placement: None,
                 declines: vec![crate::fleet::CheckDispatchDecline {
                     executor_name: "colocated".into(),
                     reason: cairn_common::executor_protocol::DeclineReason::Disk,
                     detail: Some("12 GiB free, floor 20 GiB".into()),
                     at_unix_ms: PARKED_AT + 1_000,
+                    superseded_at_unix_ms: None,
+                    retry_after_unix_ms: PARKED_AT + 2_000,
                 }],
             },
             joined: None,
@@ -21985,6 +22079,145 @@ cairn-common = { path = "../cairn-common" }
                 "; parked since 09:48:00Z; declined by colocated (low disk: 12 GiB free, floor 20 GiB)"
             ),
             "{diagnostic}"
+        );
+    }
+
+    /// Every machine of the latest pass is named with what actually happened
+    /// to it, past any count: machines the runner excluded before an offer
+    /// are not offered, never declined; a superseded decline says so; and a
+    /// decline the pass did not consider is still told.
+    #[test]
+    fn a_parked_check_names_every_machine_of_its_latest_placement_pass() {
+        use crate::fleet::{
+            CheckCandidateStatus, CheckDispatchDecline, CheckPlacementCandidate, CheckPlacementPass,
+        };
+        use cairn_common::executor_protocol::{DeclineReason, PlacementRejectionReason};
+        let mut narrator = DispatchNarrator::new(
+            GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Idle),
+            PARKED_AT,
+        );
+        let decline = |name: &str, superseded_at_unix_ms| CheckDispatchDecline {
+            executor_name: name.into(),
+            reason: DeclineReason::Pressure,
+            detail: Some("memory short".into()),
+            at_unix_ms: PARKED_AT + 1_000,
+            superseded_at_unix_ms,
+            retry_after_unix_ms: PARKED_AT + 5_000,
+        };
+        let ceiling = |estimate_bytes| {
+            CheckCandidateStatus::NotOffered(PlacementRejectionReason::ExceedsMemoryCeiling {
+                estimate_bytes,
+                ceiling_bytes: 72_215_848_550,
+                killed_here: None,
+            })
+        };
+        let candidate = |name: &str, status| CheckPlacementCandidate {
+            unreadable_memory: Vec::new(),
+            executor_name: name.into(),
+            status,
+        };
+        let pass = CheckPlacementPass {
+            request_id: "d9e55c03".into(),
+            attempt_id: "3e18a12d".into(),
+            decided_at_unix_ms: PARKED_AT + 3_000,
+            candidates: vec![
+                candidate("bginf-sp1", ceiling(73_152_409_600)),
+                candidate("bginf-sp2", ceiling(72_489_070_720)),
+                candidate(
+                    "fedora",
+                    CheckCandidateStatus::Declined(decline("fedora", None)),
+                ),
+                candidate(
+                    "bbs",
+                    CheckCandidateStatus::Declined(decline("bbs", Some(PARKED_AT + 4_000))),
+                ),
+                candidate("mac", CheckCandidateStatus::Outranked { by: "win".into() }),
+                candidate("win", CheckCandidateStatus::Offered),
+                candidate(
+                    "inf-1",
+                    CheckCandidateStatus::NotOffered(PlacementRejectionReason::Drained),
+                ),
+                candidate(
+                    "inf-2",
+                    CheckCandidateStatus::NotOffered(PlacementRejectionReason::Drained),
+                ),
+            ],
+        };
+        let dispatch = crate::fleet::CheckDispatch {
+            phase: crate::fleet::CheckDispatchPhase::Placing {
+                since_unix_ms: PARKED_AT,
+                turn: None,
+                declines: vec![
+                    decline("fedora", None),
+                    decline("bbs", Some(PARKED_AT + 4_000)),
+                    decline("gone", None),
+                ],
+                placement: Some(pass),
+            },
+            joined: None,
+        };
+        let status = narrator.render(&dispatch, PARKED_AT + 6_000);
+        let held_by = status.held_by.clone().unwrap();
+        assert_eq!(
+            held_by,
+            format!(
+                "latest placement pass 09:48:03Z (request d9e55c03, attempt 3e18a12d): \
+                 offered to win, unanswered; \
+                 declined by fedora (host pressure: memory short), \
+                 bbs (host pressure: memory short; its posted state changed at 09:48:04Z, offerable again from 09:48:05Z); \
+                 eligible, not chosen: mac (outranked by win); \
+                 not offered to bginf-sp1 ({}); \
+                 not offered to bginf-sp2 ({}); \
+                 not offered to inf-1, inf-2 (drained, refusing new work); \
+                 earlier declined by gone (host pressure: memory short)",
+                PlacementRejectionReason::ExceedsMemoryCeiling {
+                    estimate_bytes: 73_152_409_600,
+                    ceiling_bytes: 72_215_848_550,
+                    killed_here: None,
+                }
+                .describe(),
+                PlacementRejectionReason::ExceedsMemoryCeiling {
+                    estimate_bytes: 72_489_070_720,
+                    ceiling_bytes: 72_215_848_550,
+                    killed_here: None,
+                }
+                .describe(),
+            )
+        );
+        assert!(!held_by.contains("more"), "{held_by}");
+        assert!(
+            status
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("; parked since 09:48:00Z; {held_by}")),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn a_check_wait_names_unreadable_memory_evidence() {
+        let pass = crate::fleet::CheckPlacementPass {
+            request_id: "request".into(),
+            attempt_id: "attempt".into(),
+            decided_at_unix_ms: 1,
+            candidates: vec![crate::fleet::CheckPlacementCandidate {
+                executor_name: "spark".into(),
+                status: crate::fleet::CheckCandidateStatus::NotOffered(
+                    cairn_common::executor_protocol::PlacementRejectionReason::Drained,
+                ),
+                unreadable_memory: vec![cairn_common::executor_protocol::MemoryEvidenceFailure {
+                    query: "suite_evidence".into(),
+                    error_class: "schema".into(),
+                    error: "no such column: job_census_samples".into(),
+                }],
+            }],
+        };
+        let line = describe_placement_pass(&pass, &[]);
+        assert!(line.contains("not offered to spark (drained"), "{line}");
+        assert!(
+            line.contains("spark: memory evidence unreadable: suite_evidence (schema:"),
+            "{line}"
         );
     }
 

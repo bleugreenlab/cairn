@@ -29,7 +29,7 @@
 //! [`LANES_LOST_TO_GENERATION_END_SQL`] from matching a lane to a
 //! same-numbered generation of an earlier process.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{
     sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
@@ -84,10 +84,11 @@ pub enum RunnerEventKind {
     ListenerAckMismatch,
     TransportOutage,
     JournalGap,
+    MemoryEvidenceUnreadable,
 }
 
 impl RunnerEventKind {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::RunnerStarted,
         Self::RunnerHandoff,
         Self::RuntimeStall,
@@ -103,6 +104,7 @@ impl RunnerEventKind {
         Self::ListenerAckMismatch,
         Self::TransportOutage,
         Self::JournalGap,
+        Self::MemoryEvidenceUnreadable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -122,6 +124,7 @@ impl RunnerEventKind {
             Self::ListenerAckMismatch => "listener_ack_mismatch",
             Self::TransportOutage => "transport_outage",
             Self::JournalGap => "journal_gap",
+            Self::MemoryEvidenceUnreadable => "memory_evidence_unreadable",
         }
     }
 }
@@ -228,6 +231,7 @@ enum Mode {
 }
 
 struct Inner {
+    unreadable_queries: Mutex<HashSet<String>>,
     mode: Mutex<Mode>,
     shared: Arc<Shared>,
     /// When this sink, and so this runner incarnation, came into being. The
@@ -247,6 +251,7 @@ impl Default for RunnerEvents {
     fn default() -> Self {
         Self {
             inner: Arc::new(Inner {
+                unreadable_queries: Mutex::default(),
                 mode: Mutex::new(Mode::Unattached(VecDeque::new())),
                 shared: Arc::default(),
                 created_at_ms: super::unix_time_ms(),
@@ -280,6 +285,30 @@ impl Default for Retention {
 }
 
 impl RunnerEvents {
+    /// A broken query is a boot-scoped fault, not one event per placement,
+    /// identity, suite, or machine. Restarting permits one fresh announcement.
+    pub(super) fn memory_evidence_unreadable(
+        &self,
+        failure: &cairn_common::executor_protocol::MemoryEvidenceFailure,
+        executor_id: &str,
+    ) {
+        if !self
+            .inner
+            .unreadable_queries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(failure.query.clone())
+        {
+            return;
+        }
+        self.record(
+            RunnerEvent::new(RunnerEventKind::MemoryEvidenceUnreadable)
+                .executor(executor_id)
+                .cause(failure.describe())
+                .detail(json!(failure)),
+        );
+    }
+
     fn mode(&self) -> std::sync::MutexGuard<'_, Mode> {
         self.inner
             .mode
@@ -993,9 +1022,57 @@ mod tests {
                 "listener_ack_mismatch",
                 "transport_outage",
                 "journal_gap",
+                "memory_evidence_unreadable",
             ]
         );
         assert_eq!(strings.iter().collect::<HashSet<_>>().len(), strings.len());
+    }
+
+    #[test]
+    fn unreadable_memory_is_one_stored_event_per_query_per_boot() {
+        let runtime = runtime();
+        let db = test_db(&runtime, "runner_events_memory_unreadable.db");
+        for boot in ["boot-1", "boot-2"] {
+            let events = RunnerEvents::default();
+            events.attach_journal(db.clone(), boot).unwrap();
+            for query in [
+                "identity_process_peak",
+                "suite_evidence",
+                "class_prior",
+                "fleet_prior",
+            ] {
+                let failure = cairn_common::executor_protocol::MemoryEvidenceFailure {
+                    query: query.into(),
+                    error_class: "schema".into(),
+                    error: "no such column: evidence".into(),
+                };
+                for machine in ["spark-1", "spark-2", "fedora"] {
+                    events.memory_evidence_unreadable(&failure, machine);
+                    events.clone().memory_evidence_unreadable(&failure, machine);
+                }
+            }
+            assert!(events.flush(Duration::from_secs(10)));
+        }
+        let rows = stored(&runtime, &db);
+        let failures: Vec<_> = rows
+            .iter()
+            .filter(|row| row.0 == "memory_evidence_unreadable")
+            .collect();
+        assert_eq!(failures.len(), 8);
+        for query in [
+            "identity_process_peak",
+            "suite_evidence",
+            "class_prior",
+            "fleet_prior",
+        ] {
+            assert_eq!(
+                failures
+                    .iter()
+                    .filter(|row| row.3["query"] == query)
+                    .count(),
+                2
+            );
+        }
     }
 
     #[test]

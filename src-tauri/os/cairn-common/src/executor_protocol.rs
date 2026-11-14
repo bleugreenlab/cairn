@@ -8347,6 +8347,25 @@ pub struct LearnedResourceEstimate {
 /// figure it always has, which only admits less. An older runner ignores
 /// `boundBytes` and renders the misfit by the machine's total.
 ///
+/// cairn/7189 does not move the number. The executor page explains the
+/// existing advertised memory budget and runner-side single-request ceiling
+/// using existing service-bound metadata. Exposing the runner's pure ceiling
+/// helper to its resource renderer changes no frame, field, fraction or wire
+/// meaning. Existing bound metadata is decoded unchanged, with absent bounds
+/// still unknown. The shared memory-grant solver, planning-cap helper and
+/// result types are pure in-process functions over existing reservations.
+/// New executors also bound supported per-job grants by that share. Older
+/// executors retain live-memory-only narrowing and may grant a wider width;
+/// compatible executor builds must be deployed before relying on the bound.
+/// No executor frame gains a field or changes how a field is decoded. Unreadable memory evidence
+/// adds default-empty `unreadableMemory` diagnostic lists to
+/// [`ReservationRationale`] and [`PlacementRejection`], carrying
+/// [`MemoryEvidenceFailure`]. These are runner-only journal/resource records,
+/// never sent in an executor frame. Empty lists are skipped; older runners
+/// ignore these keys in newer journal rows and newer runners default them in
+/// older rows, without `deny_unknown_fields`. No executor wire meaning changes.
+/// Member-level admission and its protocol are not introduced here.
+///
 /// cairn/7110 does not move the number. The runner's macOS adopted-tree
 /// metadata now names `buildJobProcesses` as absent, the field cairn/5685
 /// added and that constructor missed; nothing crosses the boundary that did
@@ -10657,7 +10676,73 @@ impl Default for ResourceReservation {
     }
 }
 
+/// The single-request planning share of the executor's advertised memory
+/// budget. Placement and executor admission use the same ceiling; live
+/// available-minus-owed memory may narrow the grant further.
+pub fn memory_reservation_cap(memory_budget_bytes: u64) -> u64 {
+    memory_budget_bytes.saturating_mul(3) / 4
+}
+
+/// An in-process admission decision, not an executor wire message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryGrant {
+    pub jobs: Option<u32>,
+    pub charge_bytes: u64,
+}
+
+/// The minimum unclamped charge, including the caller's fixed floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryGrantShortfall {
+    pub minimum_charge_bytes: u64,
+}
+
 impl ResourceReservation {
+    /// Widest compile width whose actual charge fits, without clamping that
+    /// charge to the limit. Missing or empty process evidence keeps the whole charge;
+    /// a declared charge remains fixed. The caller supplies any non-scalable
+    /// floor (including admission headroom) independently of the process model.
+    pub fn solve_memory_grant(
+        &self,
+        max_jobs: u32,
+        limit_bytes: u64,
+        floor_bytes: u64,
+    ) -> Result<MemoryGrant, MemoryGrantShortfall> {
+        let widest = self
+            .build_job_memory
+            .filter(|evidence| {
+                evidence.largest_bytes > 0 && evidence.typical_bytes > 0 && evidence.samples > 0
+            })
+            .and_then(|_| self.admission_build_jobs(max_jobs, None));
+        let charge = |jobs| self.memory_charge_at(jobs).max(floor_bytes);
+        let minimum_charge_bytes = charge(widest.map(|_| 1));
+        // jobs_within deliberately returns at least one even when one cannot
+        // fit. Feasibility must therefore be checked against the charge itself.
+        if minimum_charge_bytes > limit_bytes {
+            return Err(MemoryGrantShortfall {
+                minimum_charge_bytes,
+            });
+        }
+        let Some(mut high) = widest else {
+            return Ok(MemoryGrant {
+                jobs: None,
+                charge_bytes: minimum_charge_bytes,
+            });
+        };
+        let mut low = 1;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if charge(Some(middle)) <= limit_bytes {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        Ok(MemoryGrant {
+            jobs: Some(low),
+            charge_bytes: charge(Some(low)),
+        })
+    }
+
     /// Concurrency demand for a command that runs its own machine-wide job
     /// server and will fan out across every core it finds.
     ///
@@ -10922,6 +11007,162 @@ mod lane_charge_tests {
             tests: 1_000,
         });
         assert_eq!(lane_memory_charge(&learned, testing, jobs(8)).0, 5 * GIB);
+    }
+
+    #[test]
+    fn memory_grant_solver_fits_widest_unclamped_charge() {
+        // Historical wide-tree totals; per-process sizes here are synthetic,
+        // not a recovered census. The 2.5 GiB typical is an assumed fixture.
+        let ceiling = memory_reservation_cap(96_287_798_067);
+        assert_eq!(ceiling, 72_215_848_550);
+        assert_eq!(memory_reservation_cap(4), 3);
+        assert_eq!(memory_reservation_cap(3), 2);
+        for tree in [73_152_409_600, 72_489_070_720] {
+            for largest in [126 * GIB / 10, 147 * GIB / 10] {
+                let reservation = ResourceReservation {
+                    memory_bytes: tree,
+                    measured_peak_bytes: Some(tree),
+                    build_job_memory: Some(BuildJobMemoryEvidence {
+                        largest_bytes: largest,
+                        typical_bytes: 5 * GIB / 2,
+                        samples: 1,
+                    }),
+                    ..measured_jobs(ResourceReservationSource::Learned)
+                };
+                let grant = reservation.solve_memory_grant(32, ceiling, 0).unwrap();
+                let jobs = grant.jobs.unwrap();
+                assert!(jobs < 32);
+                assert_eq!(grant.charge_bytes, reservation.memory_charge_at(Some(jobs)));
+                assert!(grant.charge_bytes <= ceiling);
+                assert!(reservation.memory_charge_at(Some(jobs + 1)) > ceiling);
+                assert_eq!(
+                    reservation
+                        .solve_memory_grant(32, grant.charge_bytes, 0)
+                        .unwrap(),
+                    grant
+                );
+                assert_eq!(
+                    reservation
+                        .solve_memory_grant(32, grant.charge_bytes - 1, 0)
+                        .unwrap()
+                        .jobs,
+                    Some(jobs - 1)
+                );
+                assert_eq!(
+                    reservation
+                        .solve_memory_grant(32, largest - 1, 0)
+                        .unwrap_err()
+                        .minimum_charge_bytes,
+                    largest
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_grant_solver_preserves_unknown_declared_floors_and_saturation() {
+        let fixed = ResourceReservation {
+            memory_bytes: 100,
+            ..Default::default()
+        };
+        assert_eq!(
+            fixed.solve_memory_grant(u32::MAX, 100, 0).unwrap().jobs,
+            None
+        );
+        assert_eq!(
+            fixed
+                .solve_memory_grant(1, 99, 0)
+                .unwrap_err()
+                .minimum_charge_bytes,
+            100
+        );
+        let modeled = ResourceReservation {
+            memory_bytes: 100,
+            source: ResourceReservationSource::Unmeasured,
+            build_job_memory: Some(BuildJobMemoryEvidence {
+                largest_bytes: 10,
+                typical_bytes: 5,
+                samples: 1,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            modeled.solve_memory_grant(20, 25, 25).unwrap().jobs,
+            Some(4)
+        );
+        assert_eq!(
+            modeled
+                .solve_memory_grant(20, 24, 25)
+                .unwrap_err()
+                .minimum_charge_bytes,
+            25
+        );
+        assert_eq!(modeled.solve_memory_grant(0, 10, 0).unwrap().jobs, Some(1));
+        let declared = ResourceReservation {
+            source: ResourceReservationSource::Declared,
+            ..modeled.clone()
+        };
+        assert_eq!(
+            declared
+                .solve_memory_grant(20, 99, 0)
+                .unwrap_err()
+                .minimum_charge_bytes,
+            100
+        );
+        assert_eq!(
+            declared
+                .solve_memory_grant(20, 100, 0)
+                .unwrap()
+                .charge_bytes,
+            100
+        );
+        let saturated = ResourceReservation {
+            build_job_memory: Some(BuildJobMemoryEvidence {
+                largest_bytes: u64::MAX - 1,
+                typical_bytes: u64::MAX,
+                samples: 1,
+            }),
+            ..modeled
+        };
+        assert_eq!(
+            saturated
+                .solve_memory_grant(u32::MAX, u64::MAX, 0)
+                .unwrap()
+                .jobs,
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            saturated
+                .solve_memory_grant(u32::MAX, u64::MAX - 1, 0)
+                .unwrap()
+                .jobs,
+            Some(1)
+        );
+        for (largest_bytes, typical_bytes, samples) in [(0, 5, 1), (10, 0, 1), (10, 5, 0)] {
+            let empty = ResourceReservation {
+                memory_bytes: 100,
+                build_job_memory: Some(BuildJobMemoryEvidence {
+                    largest_bytes,
+                    typical_bytes,
+                    samples,
+                }),
+                ..saturated.clone()
+            };
+            assert_eq!(
+                empty.solve_memory_grant(u32::MAX, 100, 0).unwrap(),
+                MemoryGrant {
+                    jobs: None,
+                    charge_bytes: 100
+                }
+            );
+            assert_eq!(
+                empty
+                    .solve_memory_grant(u32::MAX, 99, 0)
+                    .unwrap_err()
+                    .minimum_charge_bytes,
+                100
+            );
+        }
     }
 
     #[test]
@@ -19770,6 +20011,9 @@ pub fn with_measured_headroom(bytes: u64) -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReservationRationale {
+    /// Failed runner-side memory reads, distinct from a successful empty lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_memory: Vec<MemoryEvidenceFailure>,
     /// Concurrency the CALLER stated for this work, when it stated any.
     ///
     /// Concurrency is never learned: an observation records how many cores a
@@ -19811,6 +20055,25 @@ pub struct ReservationRationale {
     /// rather than a prior or another machine's process tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_jobs_price: Option<BuildJobsPrice>,
+}
+
+/// A failed runner-side evidence query. This is diagnostic provenance, not
+/// executor admission input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEvidenceFailure {
+    pub query: String,
+    pub error_class: String,
+    pub error: String,
+}
+
+impl MemoryEvidenceFailure {
+    pub fn describe(&self) -> String {
+        format!(
+            "memory evidence unreadable: {} ({}: {})",
+            self.query, self.error_class, self.error
+        )
+    }
 }
 
 /// A reservation priced at the width a machine grants: its largest build job
@@ -20841,6 +21104,9 @@ impl From<&PlacementRejection> for PlacementRefusal {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlacementRejection {
+    /// Runner-side evidence faults, independent of whether a prediction exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_memory: Vec<MemoryEvidenceFailure>,
     /// Every standing drain or temporary fence observed at the admission boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drain_blockers: Vec<DrainBlocker>,
@@ -26694,12 +26960,14 @@ mod tests {
                     fallback: None,
                     memory_kill: None,
                     build_jobs_price: None,
+                    unreadable_memory: Vec::new(),
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,
                 observation_reuse: ObservationReuse::UntrustedRemoteEnvironment,
             })),
             rejected: vec![PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: "local".into(),

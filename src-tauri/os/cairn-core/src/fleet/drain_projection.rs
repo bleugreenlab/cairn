@@ -382,6 +382,7 @@ impl Fleet {
                     diagnostic: diagnostic.clone(),
                 },
                 vec![PlacementRejection {
+                    unreadable_memory: Vec::new(),
                     executor_name: self
                         .executor_public_name(&selected.executor_id)
                         .unwrap_or_else(|| selected.executor_id.clone()),
@@ -644,6 +645,7 @@ mod tests {
             &request,
             &ActivePlacementPolicy::default_profile(),
             &[PlacementRejection {
+                unreadable_memory: Vec::new(),
                 executor_id: "private-executor-id".into(),
                 executor_name: "public-machine".into(),
                 reason: PlacementRejectionReason::Drained,
@@ -682,6 +684,7 @@ mod tests {
                 diagnostic: "waiting for repair".into(),
             },
             vec![PlacementRejection {
+                unreadable_memory: Vec::new(),
                 executor_id: COLOCATED_EXECUTOR_ID.into(),
                 executor_name: "local".into(),
                 reason: PlacementRejectionReason::Drained,
@@ -738,6 +741,7 @@ mod tests {
                     diagnostic: "storage repair".into(),
                 },
                 vec![PlacementRejection {
+                    unreadable_memory: Vec::new(),
                     executor_id: COLOCATED_EXECUTOR_ID.into(),
                     executor_name: "local".into(),
                     reason: PlacementRejectionReason::Drained,

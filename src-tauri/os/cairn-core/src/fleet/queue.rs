@@ -2629,6 +2629,7 @@ pub(super) mod tests {
                 None,
                 outcome,
                 vec![PlacementRejection {
+                    unreadable_memory: Vec::new(),
                     executor_id: "stable-machine".into(),
                     executor_name: "mutable-name".into(),
                     reason: PlacementRejectionReason::Drained,
@@ -3083,6 +3084,47 @@ pub(super) mod tests {
                 .is_some_and(|detail| detail.contains("943718400")),
             "an operator is owed which floor was crossed by how much, not a bare reason"
         );
+    }
+
+    /// cairn/7189: one entry, one offer, one claim. While the entry is offered
+    /// to the machine that freed first, a second machine freeing at the same
+    /// moment is refused an offer; a late claim from the machine that declined
+    /// on the same link is lost; and once one claim is granted no other claim,
+    /// repeated or stale, binds the work again.
+    #[test]
+    fn machines_freeing_together_yield_exactly_one_grant() {
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        assert!(queue.offer(&entry, "a", "a", 1, 2));
+        assert!(queue
+            .decline(&entry, "a", 1, DeclineReason::Pressure, None, None, None, 3)
+            .applied());
+
+        // A and B both post room in the same instant.
+        assert!(supersede_all(&queue, "a"));
+        assert!(queue.offer(&entry, "b", "b", 1, 4));
+        assert!(
+            !queue.offer(&entry, "a", "a", 1, 4),
+            "an offered entry is offered to no second machine"
+        );
+        assert_eq!(
+            queue.claim(&entry, "a", 1, 5),
+            ClaimVerdict::Lost,
+            "the decliner's late claim cannot win after the entry moved to B"
+        );
+        assert_eq!(queue.claim(&entry, "b", 1, 5), ClaimVerdict::Granted);
+        assert_eq!(queue.claim(&entry, "b", 1, 6), ClaimVerdict::Lost);
+        assert_eq!(queue.claim(&entry, "a", 1, 6), ClaimVerdict::Lost);
+        assert!(!queue.offer(&entry, "a", "a", 1, 2_000));
+        let grants = queue
+            .with_entry(&entry, |held| {
+                held.chain
+                    .iter()
+                    .filter(|event| matches!(event, BindingEvent::Claimed { .. }))
+                    .count()
+            })
+            .unwrap();
+        assert_eq!(grants, 1);
     }
 
     /// The chain is the placement record's account of what actually happened,

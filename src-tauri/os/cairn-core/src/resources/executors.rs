@@ -1453,6 +1453,22 @@ fn advertised_name_line(executor: &ExecutorInspection) -> String {
     )
 }
 
+fn render_planning_memory(budget: Option<u64>) -> String {
+    let value = match budget {
+        Some(budget) => format!(
+            "advertised {} bytes ({}); single-request ceiling {} bytes ({}) = 75% of advertised budget",
+            budget,
+            bytes(budget),
+            crate::fleet::memory_reservation_cap(budget),
+            bytes(crate::fleet::memory_reservation_cap(budget)),
+        ),
+        None => "unreported advertised budget; planning ceiling unknown".into(),
+    };
+    format!(
+        "- Planning memory: {value}. Advertised budget = 85% of executor-admissible memory, bounded by its unit where present, not physical host capacity. The two retained fractions give 63.75% before integer rounding. This is not current available memory minus owed claims, standing use, or single-process capacity. Optimal sizing is unmeasured.\n"
+    )
+}
+
 /// Render one machine's compact operational status.
 pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     let health = &executor.health;
@@ -1668,6 +1684,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             capabilities.service_bounds.as_ref()
         )
     ));
+    out.push_str(&render_planning_memory(capabilities.memory_budget_bytes));
     out.push_str(&format!(
         "- Memory pressure: {}\n",
         reading(
@@ -3724,24 +3741,182 @@ fn decline_reason_word(reason: DeclineReason) -> &'static str {
     }
 }
 
-pub(crate) fn render_placement(executor: &ExecutorInspection, request_id: &str) -> String {
-    let Some(decision) = executor
+/// How many journal rows one page of a historical placement lookup reads. A
+/// decision row carries the whole evidence tree (around ten kilobytes for a
+/// spill-eligible check), and a request that waited a long time leaves hundreds.
+const JOURNAL_PLACEMENT_PAGE: i64 = 32;
+
+/// What the queue journal holds for a request the runner's recent window no
+/// longer does.
+#[derive(Debug, Default)]
+pub(crate) struct JournaledPlacement {
+    /// The newest journaled decision for the request that names this machine.
+    pub(crate) found: Option<JournaledDecision>,
+    /// Decision rows for the request that did not parse. An absence is never
+    /// claimed over rows that could not be read.
+    pub(crate) unreadable: usize,
+    /// Why the journal could not be read at all.
+    pub(crate) error: Option<String>,
+}
+
+/// One decision read back from `execution_queue`, with the row it came from.
+#[derive(Debug)]
+pub(crate) struct JournaledDecision {
+    pub(crate) decision: PlacementDecision,
+    pub(crate) entry_id: String,
+    pub(crate) sequence: i64,
+    pub(crate) recorded_at_unix_ms: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournaledScoring {
+    placement_decision: PlacementDecision,
+}
+
+/// The single-decision view: the runner's recent window first, then the
+/// decision the queue journal persisted for the request.
+pub(crate) async fn read_placement(
+    db: &crate::storage::LocalDb,
+    executor: &ExecutorInspection,
+    request_id: &str,
+) -> String {
+    let in_window = executor
         .recent_placements
         .iter()
-        .find(|decision| decision.request_id == request_id)
-    else {
-        return format!(
-            "No recent placement decision for request `{request_id}` names executor `{}`. Read cairn://executors/{}?view=placements for the available request ids.\n",
-            executor.name, executor.name
-        );
+        .any(|decision| decision.request_id == request_id);
+    let journal = if in_window {
+        None
+    } else {
+        Some(journaled_placement(db, request_id, &executor.health.identity.executor_id).await)
+    };
+    render_placement(executor, request_id, journal.as_ref())
+}
+
+/// The newest decision journaled for `request_id` that names `executor_id`,
+/// under the same membership rule the recent window applies. A newer decision
+/// for the request that never named this machine does not answer for it.
+///
+/// Pages run newest first; a row journaled mid-lookup lands ahead of the
+/// cursor and can only repeat a row, never skip one.
+async fn journaled_placement(
+    db: &crate::storage::LocalDb,
+    request_id: &str,
+    executor_id: &str,
+) -> JournaledPlacement {
+    use crate::storage::RowExt;
+
+    let mut journal = JournaledPlacement::default();
+    let mut offset = 0;
+    loop {
+        let page = db
+            .query_all(
+                "SELECT entry_id, sequence, created_at, scoring_json
+                 FROM execution_queue
+                 WHERE request_id = ?1 AND scoring_json LIKE '{\"placementDecision\":%'
+                 ORDER BY created_at DESC, sequence DESC
+                 LIMIT ?2 OFFSET ?3",
+                (request_id.to_string(), JOURNAL_PLACEMENT_PAGE, offset),
+                |row| Ok((row.text(0)?, row.i64(1)?, row.i64(2)?, row.text(3)?)),
+            )
+            .await;
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                journal.error = Some(error.to_string());
+                return journal;
+            }
+        };
+        let exhausted = (page.len() as i64) < JOURNAL_PLACEMENT_PAGE;
+        for (entry_id, sequence, created_at, scoring) in page {
+            match serde_json::from_str::<JournaledScoring>(&scoring) {
+                Ok(JournaledScoring {
+                    placement_decision: decision,
+                }) if decision.request_id == request_id
+                    && decision.mentions_executor(executor_id) =>
+                {
+                    journal.found = Some(JournaledDecision {
+                        decision,
+                        entry_id,
+                        sequence,
+                        recorded_at_unix_ms: u64::try_from(created_at).unwrap_or(0),
+                    });
+                    return journal;
+                }
+                Ok(_) => {}
+                Err(_) => journal.unreadable += 1,
+            }
+        }
+        if exhausted {
+            return journal;
+        }
+        offset += JOURNAL_PLACEMENT_PAGE;
+    }
+}
+
+pub(crate) fn render_placement(
+    executor: &ExecutorInspection,
+    request_id: &str,
+    journal: Option<&JournaledPlacement>,
+) -> String {
+    let recent = executor
+        .recent_placements
+        .iter()
+        .find(|decision| decision.request_id == request_id);
+    let journaled = journal.and_then(|journal| journal.found.as_ref());
+    let Some(decision) = recent.or(journaled.map(|journaled| &journaled.decision)) else {
+        return placement_not_found(executor, request_id, journal);
     };
     let mut out = format!(
         "# Executor {} placement `{}`\n\n",
         executor.name, decision.request_id
     );
+    if let (None, Some(journaled)) = (recent, journaled) {
+        out.push_str(&format!(
+            "- From the queue journal: the runner's recent window no longer holds this decision; read from entry `{}` sequence {}, recorded {}\n",
+            journaled.entry_id,
+            journaled.sequence,
+            age(executor
+                .captured_at_unix_ms
+                .saturating_sub(journaled.recorded_at_unix_ms))
+        ));
+    }
+    if let Some(journal) = journal.filter(|journal| journal.unreadable > 0) {
+        out.push_str(&format!(
+            "- {} newer journal decision row(s) could not be decoded; this is the newest readable matching decision, not proof that no newer decision exists.\n",
+            journal.unreadable
+        ));
+    }
+    out.push_str(&format!(
+        "- Attempt `{}` of request `{}`\n",
+        decision.attempt_id, decision.request_id
+    ));
     render_placement_detail(&mut out, decision);
     out.push_str(&run_batch_line(&decision.request_id));
     out
+}
+
+fn placement_not_found(
+    executor: &ExecutorInspection,
+    request_id: &str,
+    journal: Option<&JournaledPlacement>,
+) -> String {
+    let name = &executor.name;
+    let searched = match journal {
+        None => "in the runner's recent window".to_string(),
+        Some(JournaledPlacement {
+            error: Some(error), ..
+        }) => format!("in the runner's recent window, and the queue journal could not be read ({error})"),
+        Some(JournaledPlacement { unreadable: 0, .. }) => {
+            "in the runner's recent window or the queue journal".to_string()
+        }
+        Some(JournaledPlacement { unreadable, .. }) => format!(
+            "in the runner's recent window or the queue journal; {unreadable} journaled decision row(s) for the request could not be parsed, so an older decision may exist unread"
+        ),
+    };
+    format!(
+        "No placement decision for request `{request_id}` names executor `{name}` {searched}. Read cairn://executors/{name}?view=placements for the available request ids.\n"
+    )
 }
 
 /// For a request that is a run batch this runner holds: the batch's own
@@ -3963,6 +4138,9 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
                 .map(|reliability| format!(" — Priced: {}", reliability.describe()))
                 .unwrap_or_default()
         ));
+        for failure in &rejection.unreadable_memory {
+            out.push_str(&format!("    - {}\n", failure.describe()));
+        }
         for blocker in &rejection.drain_blockers {
             out.push_str(&format!("    - Admission blocker: {}; reason: {}; generation: {}; incarnation: {}; estimate: {}\n", blocker.owner, blocker.reason, blocker.generation, blocker.incarnation.as_deref().unwrap_or("none"), blocker.estimate.as_deref().unwrap_or("not applicable")));
         }
@@ -4127,8 +4305,13 @@ fn describe_rationale(rationale: &ReservationRationale) -> String {
             )
         })
         .unwrap_or_default();
+    let unreadable = rationale
+        .unreadable_memory
+        .iter()
+        .map(|failure| format!("; {}", failure.describe()))
+        .collect::<String>();
     let learned = format!(
-        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}{killed}{priced}",
+        "memory/disk learned from {evidence}{confidence} of `{key}` on {} with {}% headroom over a {} prior{fallback}{killed}{priced}{unreadable}",
         rationale.profile_context,
         rationale.headroom_percent,
         bytes(rationale.prior.memory_bytes)
@@ -4159,7 +4342,25 @@ mod rationale_tests {
                 .then_some(ReservationFallback::BelowConfidenceFloor),
             memory_kill: None,
             build_jobs_price: None,
+            unreadable_memory: Vec::new(),
         }
+    }
+
+    #[test]
+    fn placement_rationale_names_unreadable_memory_evidence() {
+        let mut rationale = rationale(0, None);
+        rationale
+            .unreadable_memory
+            .push(cairn_common::executor_protocol::MemoryEvidenceFailure {
+                query: "fleet_prior".into(),
+                error_class: "schema".into(),
+                error: "no such column: upper_disk_delta_bytes".into(),
+            });
+        let rendered = describe_rationale(&rationale);
+        assert!(
+            rendered.contains("memory evidence unreadable: fleet_prior (schema:"),
+            "{rendered}"
+        );
     }
 
     /// cairn/6263: a reservation priced at the width the machine grants says
@@ -12602,6 +12803,14 @@ mod tests {
         let mut decision = sample_placement("batch-owned-drain", "bglab-ub");
         decision.rejected[0].reason = PlacementRejectionReason::Drained;
         decision.rejected[0].drain_blockers = owned_drain_view_fixture().blockers;
+        decision.rejected[0].unreadable_memory.push(
+            cairn_common::executor_protocol::MemoryEvidenceFailure {
+                query: "suite_evidence".into(),
+                error_class: "schema".into(),
+                error: "no such column: job_census_samples".into(),
+            },
+        );
+        assert!(decision.rejected[0].prediction.is_none());
         let mut out = String::new();
         render_placement_detail(&mut out, &decision);
         assert!(out.contains("runtime:self_update"), "{out}");
@@ -12610,6 +12819,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("batch-owned-drain"), "{out}");
+        assert!(
+            out.contains("memory evidence unreadable: suite_evidence (schema:"),
+            "{out}"
+        );
     }
 
     /// A spill-eligible decision that chose `executor_name` for `request_id`
@@ -12695,12 +12908,14 @@ mod tests {
                     fallback: None,
                     memory_kill: None,
                     build_jobs_price: None,
+                    unreadable_memory: Vec::new(),
                 },
                 sync_cost: PlacementSyncCost::Known { bytes: 12_345 },
                 object_transfer: None,
                 observation_reuse: ObservationReuse::UntrustedRemoteEnvironment,
             })),
             rejected: vec![PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: "local".into(),
@@ -12739,7 +12954,7 @@ mod tests {
             "candidate details belong to the single-decision view: {listed}"
         );
 
-        let rendered = render_placement(&executor, "check-cadence-7");
+        let rendered = render_placement(&executor, "check-cadence-7", None);
         assert!(rendered.contains("check-cadence-7"), "{rendered}");
         assert!(rendered.contains("spillEligible"), "{rendered}");
         assert!(rendered.contains("predictedEarliestVerdict"), "{rendered}");
@@ -12775,6 +12990,7 @@ mod tests {
         executor.recent_placements[0]
             .rejected
             .push(PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: "bglab-mac".into(),
@@ -12788,7 +13004,7 @@ mod tests {
                     },
                 },
             });
-        let rendered = render_placement(&executor, "check-cadence-7");
+        let rendered = render_placement(&executor, "check-cadence-7", None);
         assert!(
             rendered.contains(
                 "Passed over bglab-mac: held: disk free 1.4 GiB (floor 2.0 GiB), no sweep in flight"
@@ -12824,9 +13040,82 @@ mod tests {
 
     #[test]
     fn an_unknown_placement_request_points_back_to_the_available_list() {
-        let rendered = render_placement(&inspection("bglab-win", false), "missing");
+        let rendered = render_placement(&inspection("bglab-win", false), "missing", None);
         assert!(rendered.contains("missing"), "{rendered}");
         assert!(rendered.contains("?view=placements"), "{rendered}");
+    }
+
+    /// A decision that has aged out of the recent window is read back from the
+    /// queue journal, newest first, under the window's own membership rule: a
+    /// newer decision that never named this machine does not answer for it,
+    /// and an unparseable row is counted rather than read as absence.
+    #[tokio::test]
+    async fn a_placement_past_the_recent_window_is_read_from_the_journal() {
+        let db = crate::storage::migrated_test_db("executors_journaled_placement.db").await;
+        let executor = inspection("bglab-ub", false);
+        let mut ours = sample_placement("req-old", "bglab-ub");
+        ours.attempt_id = "attempt-1".into();
+        let mut elsewhere = sample_placement("req-old", "bglab-mac");
+        elsewhere.attempt_id = "attempt-2".into();
+        if let PlacementOutcome::Selected(selection) = &mut elsewhere.outcome {
+            selection.executor_id = "executor-other".into();
+        }
+        let decision = |decision: &PlacementDecision| {
+            serde_json::json!({ "placementDecision": decision }).to_string()
+        };
+        let rows = [
+            ("entry-1", 3_i64, CAPTURED_AT - 600_000, decision(&ours)),
+            ("entry-2", 4, CAPTURED_AT - 60_000, decision(&elsewhere)),
+            (
+                "entry-2",
+                5,
+                CAPTURED_AT - 30_000,
+                "{\"affinityKey\":\"k\"}".to_string(),
+            ),
+            (
+                "entry-2",
+                6,
+                CAPTURED_AT - 10_000,
+                "{\"placementDecision\":{}}".to_string(),
+            ),
+        ];
+        for (entry, sequence, created_at, scoring) in rows {
+            db.execute(
+                "INSERT INTO execution_queue(
+                     event_id, entry_id, sequence, runner_incarnation, request_id, attempt_id,
+                     project_id, state, constraints_json, scoring_json, horizon_unix_ms, created_at)
+                 VALUES (?1, ?2, ?3, 'runner', 'req-old', 'attempt', 'p', 'queued', '{}', ?4, 0, ?5)",
+                (
+                    format!("{entry}:{sequence}"),
+                    entry,
+                    sequence,
+                    scoring,
+                    created_at as i64,
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rendered = read_placement(&db, &executor, "req-old").await;
+        assert!(
+            rendered.contains("read from entry `entry-1` sequence 3, recorded 10m ago"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Attempt `attempt-1` of request `req-old`"),
+            "the decision that named this machine, not the newer one: {rendered}"
+        );
+
+        let mut other = inspection("bglab-win", false);
+        other.health.identity.executor_id = "executor-absent".into();
+        let refused = read_placement(&db, &other, "req-old").await;
+        assert!(
+            refused.contains(
+                "in the runner's recent window or the queue journal; 1 journaled decision row(s)"
+            ),
+            "no decision is fabricated for a machine none of them named: {refused}"
+        );
     }
 
     #[test]

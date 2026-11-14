@@ -32,14 +32,7 @@ const MIN_CONTENTION_SAMPLES: usize = 3;
 /// and measurement noise. Peaks at or above this share describe saturation.
 const MEMORY_QUARANTINE_NUMERATOR: u64 = 9;
 const MEMORY_QUARANTINE_DENOMINATOR: u64 = 10;
-const MEMORY_RESERVATION_CAP_NUMERATOR: u64 = 3;
-const MEMORY_RESERVATION_CAP_DENOMINATOR: u64 = 4;
-
-/// The most one request may reserve on a machine with this memory budget.
-pub(super) fn memory_reservation_cap(memory_budget_bytes: u64) -> u64 {
-    memory_budget_bytes.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
-        / MEMORY_RESERVATION_CAP_DENOMINATOR
-}
+pub(super) use cairn_common::executor_protocol::memory_reservation_cap;
 
 /// Whether a peak is large enough against this budget that it describes the
 /// machine's saturation rather than one command.
@@ -383,53 +376,74 @@ impl ResolvedResourceProfile {
         self.reservation.build_job_memory = self.process_evidence.build_job_memory;
     }
 
-    /// Price an unmeasured reservation at the build jobs this machine would
-    /// grant: `cpu_width`, held to the jobs its reservation cap holds, at the
-    /// suite's per-process figures measured here or, failing that, on another
-    /// machine ([`ProcessEvidence::pricing_build_jobs`]).
-    ///
-    /// A process tree's peak grows with the width the machine that measured
-    /// it granted, so the median of other machines' trees priced a whole-suite
-    /// lane measured at 32 jobs on fedora at 86 GiB on a 20-core Spark, the
-    /// Spark's whole cap, for a lane that peaked near 15 GiB there
-    /// (cairn/6263). One process's peak does not depend on the width, so the
-    /// largest and typical job price any machine at its own width. This
-    /// replaces a borrowed tree and a class prior alike, raising the class
-    /// prior where the jobs say more, and never lowers a floor an
-    /// out-of-memory kill here set. A learned reservation is this machine's
-    /// own tree and is left to the executor, which prices it at the jobs it
-    /// grants; a declared one stands. Without per-process figures anywhere,
-    /// the reservation is left as it was resolved.
+    /// Price supported per-job evidence with the same unclamped grant rule as
+    /// executor admission. Borrowed evidence prices a prior, never a local
+    /// measured tree or an executor's grant.
     pub(super) fn price_at_width(
         &mut self,
         cpu_width: u32,
         class_prior: &ResourceReservation,
         memory_budget_bytes: Option<u64>,
     ) {
-        if self.reservation.source != ResourceReservationSource::Unmeasured {
+        if self.reservation.source == ResourceReservationSource::Declared {
+            return;
+        }
+        let local = self.process_evidence.build_job_memory.is_some();
+        if self.reservation.source == ResourceReservationSource::Learned && !local {
             return;
         }
         let Some(pricing) = self.process_evidence.pricing_build_jobs() else {
             return;
         };
-        let cap = memory_budget_bytes.map(memory_reservation_cap);
-        let jobs = cap.map_or(cpu_width.max(1), |cap| {
-            cpu_width.max(1).min(pricing.evidence.jobs_within(cap))
-        });
-        let mut memory = pricing
-            .evidence
-            .bytes_at(jobs)
-            .max(class_prior.memory_bytes);
-        if let Some(kill) = &self.rationale.memory_kill {
-            memory = memory.max(kill_floor(kill));
+        let floor = self
+            .rationale
+            .memory_kill
+            .as_ref()
+            .map_or(0, kill_floor)
+            .max(
+                if self.reservation.source == ResourceReservationSource::Unmeasured {
+                    class_prior.memory_bytes
+                } else {
+                    0
+                },
+            );
+        let mut model = self.reservation.clone();
+        model.build_job_memory = Some(pricing.evidence);
+        // The existing wire has no independent non-scalable memory floor.
+        // A local model must not let admission discount a proven kill floor.
+        if local && floor > model.memory_charge_at(Some(1)) {
+            self.reservation.build_job_memory = None;
+            self.reservation.memory_bytes = self.reservation.memory_charge_bytes().max(floor);
+            self.memory_fit =
+                MemoryFit::of(Some(self.reservation.memory_bytes), memory_budget_bytes);
+            if let MemoryFit::Exceeds(ceiling) = &mut self.memory_fit {
+                ceiling.killed_here = self.rationale.memory_kill;
+            }
+            return;
         }
-        self.reservation.memory_bytes = cap.map_or(memory, |cap| memory.min(cap));
-        self.rationale.build_jobs_price = Some(BuildJobsPrice {
-            jobs,
-            largest_bytes: pricing.evidence.largest_bytes,
-            typical_bytes: pricing.evidence.typical_bytes,
-            measured_on: pricing.measured_on,
-        });
+        let limit = memory_budget_bytes.map_or(u64::MAX, memory_reservation_cap);
+        match model.solve_memory_grant(cpu_width, limit, floor) {
+            Ok(grant) => {
+                self.reservation.memory_bytes = grant.charge_bytes;
+                self.rationale.build_jobs_price = Some(BuildJobsPrice {
+                    jobs: grant.jobs.unwrap_or(cpu_width.max(1)),
+                    largest_bytes: pricing.evidence.largest_bytes,
+                    typical_bytes: pricing.evidence.typical_bytes,
+                    measured_on: pricing.measured_on,
+                });
+                if local && memory_budget_bytes.is_some() {
+                    self.memory_fit = MemoryFit::Holds;
+                }
+            }
+            Err(shortfall) => {
+                self.reservation.memory_bytes = shortfall.minimum_charge_bytes;
+                self.memory_fit =
+                    MemoryFit::of(Some(shortfall.minimum_charge_bytes), memory_budget_bytes);
+                if let MemoryFit::Exceeds(ceiling) = &mut self.memory_fit {
+                    ceiling.killed_here = self.rationale.memory_kill;
+                }
+            }
+        }
     }
 }
 
@@ -673,6 +687,7 @@ pub(super) struct SuiteKill {
 /// can be judged as one process.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ProcessEvidence {
+    pub unreadable_memory: Vec<cairn_common::executor_protocol::MemoryEvidenceFailure>,
     /// The largest single process measured: a peak the sampler named, or an
     /// out-of-memory victim, which is one process by construction. Carries
     /// this machine's kills of the suite.
@@ -739,7 +754,14 @@ impl ProcessEvidence {
             (None, Some(left), Some(right)) => Some(PricingJobs::max(left, right)),
             _ => None,
         };
+        let mut unreadable_memory = left.unreadable_memory.clone();
+        for failure in &right.unreadable_memory {
+            if !unreadable_memory.contains(failure) {
+                unreadable_memory.push(failure.clone());
+            }
+        }
         Self {
+            unreadable_memory,
             build_job_memory,
             build_jobs_elsewhere,
             demand: ProcessDemand::max(left.demand, right.demand),
@@ -829,17 +851,21 @@ pub(super) async fn resolve_process_demand(
     class: CellCommandClass,
     context: &ProfileContext,
 ) -> ProcessEvidence {
+    let mut unreadable_memory = Vec::new();
     let (own, own_elsewhere) = match identity {
-        Some(identity) => load_identity_process_peak(db.clone(), identity, context)
-            .await
-            .unwrap_or_default(),
+        Some(identity) => memory_lookup(
+            load_identity_process_peak(db.clone(), identity, context).await,
+            "identity_process_peak",
+            &mut unreadable_memory,
+        ),
         None => (ProcessEvidence::default(), None),
     };
     let suite = match suite_key {
-        Some(key) => load_suite_evidence(db.clone(), key, context)
-            .await
-            .ok()
-            .flatten(),
+        Some(key) => memory_lookup(
+            load_suite_evidence(db.clone(), key, context).await,
+            "suite_evidence",
+            &mut unreadable_memory,
+        ),
         None => None,
     };
     let class_suite =
@@ -884,10 +910,11 @@ pub(super) async fn resolve_process_demand(
     }
     if demand.is_none() && class.compiles_rust() {
         if let Some((project_id, _)) = suite_key.and_then(|key| key.split_once('/')) {
-            demand = load_class_prior(db, project_id, context)
-                .await
-                .ok()
-                .flatten();
+            demand = memory_lookup(
+                load_class_prior(db, project_id, context).await,
+                "class_prior",
+                &mut unreadable_memory,
+            );
         }
     }
     let unmeasured_compile = demand.is_none() && class.compiles_rust();
@@ -906,6 +933,7 @@ pub(super) async fn resolve_process_demand(
         (None, None) => {}
     }
     ProcessEvidence {
+        unreadable_memory,
         demand,
         unattributed,
         unmeasured_compile,
@@ -914,6 +942,33 @@ pub(super) async fn resolve_process_demand(
         build_jobs_elsewhere: suite
             .filter(|suite| suite.build_job_memory.is_none())
             .and_then(|suite| suite.build_jobs_elsewhere),
+    }
+}
+
+/// Failed reads retain their provenance without replacing successful evidence
+/// from independent sites or changing the site's conservative fallback.
+fn memory_lookup<T: Default>(
+    result: Result<T, String>,
+    query: &str,
+    failures: &mut Vec<cairn_common::executor_protocol::MemoryEvidenceFailure>,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let error_class = if lower.contains("no such column") || lower.contains("no such table")
+            {
+                "schema"
+            } else {
+                "store"
+            };
+            failures.push(cairn_common::executor_protocol::MemoryEvidenceFailure {
+                query: query.into(),
+                error_class: error_class.into(),
+                error: error.chars().take(512).collect(),
+            });
+            T::default()
+        }
     }
 }
 
@@ -1064,12 +1119,15 @@ async fn load_suite_evidence(
                 let executor_class = row.get::<String>(0)?;
                 let os = row.get::<String>(5)?;
                 let arch = row.get::<String>(6)?;
+                let samples = row.get::<i64>(16)?;
                 let jobs = match (row.get::<Option<i64>>(14)?, row.get::<Option<i64>>(15)?) {
-                    (Some(largest), Some(typical)) => Some(BuildJobMemoryEvidence {
-                        largest_bytes: largest.max(0) as u64,
-                        typical_bytes: typical.max(0) as u64,
-                        samples: u32::try_from(row.get::<i64>(16)?.max(0)).unwrap_or(u32::MAX),
-                    }),
+                    (Some(largest), Some(typical)) if largest > 0 && typical > 0 && samples > 0 => {
+                        Some(BuildJobMemoryEvidence {
+                            largest_bytes: largest as u64,
+                            typical_bytes: typical as u64,
+                            samples: u32::try_from(samples).unwrap_or(u32::MAX),
+                        })
+                    }
                     _ => None,
                 };
                 if let Some(jobs) = jobs.filter(|_| executor_class != context.executor_class) {
@@ -1868,6 +1926,7 @@ pub(super) fn declared_rationale(
         fallback: Some(ReservationFallback::CallerDeclared),
         memory_kill: None,
         build_jobs_price: None,
+        unreadable_memory: Vec::new(),
     }
 }
 
@@ -1926,6 +1985,7 @@ fn profile_rationale(
         fallback,
         memory_kill: profile.and_then(|profile| profile.memory_kill),
         build_jobs_price: None,
+        unreadable_memory: Vec::new(),
     }
 }
 
@@ -1984,9 +2044,14 @@ pub(super) async fn resolve_reservation(
                 .upper_peak_rss_bytes
                 .is_some_and(|peak| memory_peak_quarantined(peak, memory_budget_bytes))
     );
+    let mut unreadable_memory = Vec::new();
     let fleet_evidence = match cold_here {
         false => None,
-        true => load_fleet_evidence(db, identity, context).await.ok(),
+        true => memory_lookup(
+            load_fleet_evidence(db, identity, context).await.map(Some),
+            "fleet_prior",
+            &mut unreadable_memory,
+        ),
     };
     let borrowed = fleet_evidence
         .as_ref()
@@ -2004,7 +2069,9 @@ pub(super) async fn resolve_reservation(
     // below reports the number this resolution actually stood on.
     let prior = borrowed.clone().unwrap_or(prior);
     let rationale = |fallback: Option<ReservationFallback>, profile: Option<&ResourceProfile>| {
-        profile_rationale(Some(identity), context, &prior, profile, fallback)
+        let mut rationale = profile_rationale(Some(identity), context, &prior, profile, fallback);
+        rationale.unreadable_memory = unreadable_memory.clone();
+        rationale
     };
     // A borrowed prior explains the number whenever it is the number. Saying
     // only "no profile recorded" here would describe the absence and hide the
@@ -2881,6 +2948,175 @@ mod process_peak_tests {
         }
     }
 
+    #[tokio::test]
+    async fn unreadable_memory_queries_preserve_independent_evidence() {
+        let db = Arc::new(crate::storage::migrated_test_db("unreadable-memory-queries.db").await);
+        let here = context("device:executor");
+        let id = identity("unreadable");
+        let prior = ResourceReservation {
+            memory_bytes: 2 * GIB,
+            ..ResourceReservation::default()
+        };
+        let duration = DurationContext {
+            class: CellCommandClass::CargoTest,
+            warmth: ExecutionWarmth::Cold,
+            now_unix_ms: 10,
+        };
+        let empty = resolve_process_demand(
+            db.clone(),
+            Some(&id),
+            Some("cairn/rust-tests"),
+            CellCommandClass::CargoTest,
+            &here,
+        )
+        .await;
+        assert!(empty.unreadable_memory.is_empty());
+        assert!(empty.unmeasured_compile);
+
+        observe_completed(
+            db.clone(),
+            Some(&id),
+            &here,
+            &completed(8 * GIB, 1),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        record_memory_kill(
+            db.clone(),
+            &id,
+            &here,
+            MemoryKill {
+                victim_resident_bytes: 9 * GIB,
+                killed_at_unix_ms: 2,
+                alone_on_machine_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+        observe_suite(
+            db.clone(),
+            Some("cairn/rust-tests"),
+            &here,
+            &completed(12 * GIB, 1),
+            CompletionKind::Succeeded,
+            MachineAdmission::default(),
+        )
+        .await;
+
+        for (table, column, query) in [
+            (
+                "command_resource_profiles",
+                "process_peak_name",
+                "identity_process_peak",
+            ),
+            (
+                "suite_memory_evidence",
+                "job_census_samples",
+                "suite_evidence",
+            ),
+            (
+                "suite_memory_evidence",
+                "upper_process_peak_bytes",
+                "class_prior",
+            ),
+            (
+                "command_resource_profiles",
+                "upper_disk_delta_bytes",
+                "fleet_prior",
+            ),
+        ] {
+            let sql = format!("ALTER TABLE {table} RENAME COLUMN {column} TO unavailable_column");
+            db.write(move |conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    conn.execute(&sql, ()).await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+            let failures = if query == "fleet_prior" {
+                let resolved = resolve_reservation(
+                    db.clone(),
+                    Some(&id),
+                    &here,
+                    prior.clone(),
+                    Some(64 * GIB),
+                    duration,
+                )
+                .await;
+                assert_eq!(resolved.reservation.memory_bytes, prior.memory_bytes);
+                assert_eq!(
+                    resolved.reservation.source,
+                    ResourceReservationSource::Unmeasured
+                );
+                resolved.rationale.unreadable_memory
+            } else {
+                let (identity, suite) = if query == "class_prior" {
+                    (None, "cold/rust-tests")
+                } else {
+                    (Some(&id), "cairn/rust-tests")
+                };
+                let evidence = resolve_process_demand(
+                    db.clone(),
+                    identity,
+                    Some(suite),
+                    CellCommandClass::CargoTest,
+                    &here,
+                )
+                .await;
+                if query == "identity_process_peak" {
+                    assert_eq!(evidence.demand.as_ref().unwrap().peak_bytes, 12 * GIB);
+                } else if query == "suite_evidence" {
+                    assert_eq!(evidence.demand.as_ref().unwrap().peak_bytes, 9 * GIB);
+                    assert_eq!(
+                        evidence.build_job_memory, None,
+                        "unreadable census cannot discount width"
+                    );
+                    let resolved = resolve_reservation(
+                        db.clone(),
+                        Some(&id),
+                        &here,
+                        prior.clone(),
+                        Some(64 * GIB),
+                        duration,
+                    )
+                    .await;
+                    assert!(
+                        resolved.reservation.memory_bytes >= 9 * GIB,
+                        "successful kill floor remains"
+                    );
+                    assert!(resolved.rationale.memory_kill.is_some());
+                    assert!(
+                        resolved.rationale.unreadable_memory.is_empty(),
+                        "missing census columns do not fail fleet tree/disk reads"
+                    );
+                } else {
+                    assert!(evidence.unmeasured_compile);
+                    assert!(evidence.demand.is_none());
+                }
+                evidence.unreadable_memory
+            };
+            let failure = failures
+                .iter()
+                .find(|failure| failure.query == query)
+                .unwrap_or_else(|| panic!("{query} was hidden: {failures:?}"));
+            assert_eq!(failure.error_class, "schema");
+            assert!(failure.describe().contains(query));
+            assert!(failure.error.contains(column), "{failure:?}");
+            let sql = format!("ALTER TABLE {table} RENAME COLUMN unavailable_column TO {column}");
+            db.write(move |conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    conn.execute(&sql, ()).await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     fn completed(peak: u64, finished_at_unix_ms: u64) -> CellExecutionMeta {
         CellExecutionMeta {
             stop: None,
@@ -2992,6 +3228,33 @@ mod process_peak_tests {
         learned.price_at_width(20, &class_prior, Some(budget));
         assert_eq!(learned.reservation.memory_bytes, 40 * GIB);
         assert_eq!(learned.rationale.build_jobs_price, None);
+        // These are explicit solver fixtures, not recovered job censuses for
+        // the historical trees. Without a census the assertions above stand.
+        let historical_budget = 96_287_798_067;
+        let ceiling = memory_reservation_cap(historical_budget);
+        assert_eq!(ceiling, 72_215_848_550);
+        for tree in [73_152_409_600, 72_489_070_720] {
+            let mut local = resolved(ResourceReservationSource::Learned, tree);
+            local.reservation.measured_peak_bytes = Some(tree);
+            local.process_evidence.build_job_memory = Some(BuildJobMemoryEvidence {
+                largest_bytes: 14_700 * (GIB / 1000),
+                typical_bytes: 5 * GIB / 2,
+                samples: 1,
+            });
+            local.memory_fit = MemoryFit::of(Some(tree), Some(historical_budget));
+            local.charge_measured_peak();
+            local.price_at_width(32, &class_prior, Some(historical_budget));
+            assert_eq!(local.memory_fit, MemoryFit::Holds);
+            let price = local.rationale.build_jobs_price.unwrap();
+            assert_eq!(price.jobs, 22);
+            assert_eq!(
+                local.reservation.memory_bytes,
+                price.largest_bytes + 21 * price.typical_bytes
+            );
+            assert!(local.reservation.memory_bytes <= ceiling);
+            assert!(price.largest_bytes + 22 * price.typical_bytes > ceiling);
+            assert_eq!(local.reservation.source, ResourceReservationSource::Learned);
+        }
         // A kill here floors the price.
         let mut killed = resolved(ResourceReservationSource::Unmeasured, 40 * GIB);
         killed.rationale.memory_kill = Some(MemoryKill {

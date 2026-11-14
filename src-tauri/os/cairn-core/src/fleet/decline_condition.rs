@@ -410,11 +410,11 @@ fn read_pressure(request: &CellRequest, machine: PostedState<'_>) -> Option<Read
     // executor's elastic width can only narrow that further, so this never
     // refuses a machine its executor would admit.
     let reservation = &request.resource_reservation;
-    let jobs = reservation.admission_build_jobs(
-        u32::MAX,
-        available.map(|available| available.saturating_sub(owed)),
-    );
-    let floor = admission_memory_floor(reservation.memory_charge_at(jobs));
+    let limit = available.map_or(u64::MAX, |available| available.saturating_sub(owed));
+    let floor = match reservation.solve_memory_grant(u32::MAX, limit, admission_memory_floor(0)) {
+        Ok(grant) => grant.charge_bytes,
+        Err(shortfall) => shortfall.minimum_charge_bytes,
+    };
     let memory_short = available.is_some_and(|available| memory_short(available, owed, floor));
     (cpu_pressured || memory_stalled || disk_write_stalled || memory_short).then(|| Reading {
         condition: PostedCondition::Pressure {

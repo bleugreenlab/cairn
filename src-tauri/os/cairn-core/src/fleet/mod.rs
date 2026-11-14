@@ -34,6 +34,7 @@ pub(crate) mod repair;
 pub(crate) mod residency;
 pub mod resident_relay;
 mod resource_profiles;
+pub(crate) use cairn_common::executor_protocol::memory_reservation_cap;
 pub(crate) mod rollout;
 pub use rollout::ArtifactUnavailable;
 pub mod runner_events;
@@ -915,8 +916,13 @@ pub(crate) enum CheckDispatchPhase {
     /// `since_unix_ms` is when the request began waiting.
     Placing {
         since_unix_ms: u64,
-        /// The latest answer from each machine that declined it.
+        /// The latest answer from each machine that declined it, superseded
+        /// ones included.
         declines: Vec<CheckDispatchDecline>,
+        /// The latest placement pass recorded for this request, every machine
+        /// it considered with what happened to it. `None` before any pass has
+        /// been recorded.
+        placement: Option<CheckPlacementPass>,
         /// Main's cadence turn for freed room, when it bears on this request:
         /// the machines whose next freed room it takes first, when it is that
         /// lane, or the machines its latest pass waited behind that lane for.
@@ -935,6 +941,131 @@ pub(crate) struct CheckDispatchDecline {
     pub(crate) reason: DeclineReason,
     pub(crate) detail: Option<String>,
     pub(crate) at_unix_ms: u64,
+    /// When the machine's posted condition behind `reason` was seen to change.
+    /// A superseded decline is the last thing the machine said, not what it
+    /// says now.
+    pub(crate) superseded_at_unix_ms: Option<u64>,
+    /// No re-offer to this machine before this instant.
+    pub(crate) retry_after_unix_ms: u64,
+}
+
+impl CheckDispatchDecline {
+    fn from_entry(executor_name: &str, decline: &queue::EntryDecline) -> Self {
+        Self {
+            executor_name: executor_name.to_string(),
+            reason: decline.reason,
+            detail: decline.detail.clone(),
+            at_unix_ms: decline.at_unix_ms,
+            superseded_at_unix_ms: decline.superseded_at_unix_ms,
+            retry_after_unix_ms: decline.retry_after_unix_ms,
+        }
+    }
+}
+
+/// One placement pass over a queued request, projected from its
+/// [`PlacementDecision`]: a point-in-time verdict that the next pass replaces,
+/// not a promise about current capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckPlacementPass {
+    pub(crate) request_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) decided_at_unix_ms: u64,
+    /// Every machine the pass named, chosen or passed over, in its order.
+    pub(crate) candidates: Vec<CheckPlacementCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckPlacementCandidate {
+    pub(crate) unreadable_memory: Vec<cairn_common::executor_protocol::MemoryEvidenceFailure>,
+    pub(crate) executor_name: String,
+    pub(crate) status: CheckCandidateStatus,
+}
+
+/// What one pass did with one machine. Only [`Self::Declined`] is the
+/// machine's own answer; every other status is the runner's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckCandidateStatus {
+    /// The pass chose it and the offer is outstanding.
+    Offered,
+    /// The pass chose it and no offer to it stands now.
+    Chosen,
+    /// It was asked and its own admission said no.
+    Declined(CheckDispatchDecline),
+    /// Eligible, and beaten by the machine named.
+    Outranked { by: String },
+    /// Never offered by this pass, for the reason placement recorded.
+    NotOffered(PlacementRejectionReason),
+}
+
+/// The latest pass over `entry`, with each candidate's status reconciled
+/// against the queue's own binding state: the chosen machine is offered,
+/// declined since, or chosen without an outstanding offer.
+fn check_placement_pass(entry: &queue::QueueEntry) -> Option<CheckPlacementPass> {
+    let decision = entry.latest_placement()?;
+    let mut candidates = Vec::with_capacity(decision.rejected.len() + 1);
+    if let PlacementOutcome::Selected(selection) = &decision.outcome {
+        let offered = matches!(
+            &entry.state,
+            queue::EntryState::Offered { executor_id, .. } if *executor_id == selection.executor_id
+        );
+        let declined_since = entry
+            .declined
+            .get(&selection.executor_id)
+            .filter(|decline| decline.at_unix_ms >= decision.decided_at_unix_ms);
+        let status = match (offered, declined_since) {
+            (true, _) => CheckCandidateStatus::Offered,
+            (false, Some(decline)) => CheckCandidateStatus::Declined(
+                CheckDispatchDecline::from_entry(&selection.executor_name, decline),
+            ),
+            (false, None) => CheckCandidateStatus::Chosen,
+        };
+        candidates.push(CheckPlacementCandidate {
+            unreadable_memory: selection.reservation_rationale.unreadable_memory.clone(),
+            executor_name: selection.executor_name.clone(),
+            status,
+        });
+    }
+    candidates.extend(decision.rejected.iter().map(|rejection| {
+        let status = match &rejection.reason {
+            PlacementRejectionReason::Declined {
+                reason,
+                detail,
+                declined_at_unix_ms,
+            } => CheckCandidateStatus::Declined(
+                entry
+                    .declined
+                    .get(&rejection.executor_id)
+                    .map(|decline| {
+                        CheckDispatchDecline::from_entry(&rejection.executor_name, decline)
+                    })
+                    .unwrap_or_else(|| CheckDispatchDecline {
+                        executor_name: rejection.executor_name.clone(),
+                        reason: *reason,
+                        detail: detail.clone(),
+                        at_unix_ms: *declined_at_unix_ms,
+                        superseded_at_unix_ms: None,
+                        retry_after_unix_ms: *declined_at_unix_ms,
+                    }),
+            ),
+            PlacementRejectionReason::OutrankedBy { executor_name } => {
+                CheckCandidateStatus::Outranked {
+                    by: executor_name.clone(),
+                }
+            }
+            reason => CheckCandidateStatus::NotOffered(reason.clone()),
+        };
+        CheckPlacementCandidate {
+            unreadable_memory: rejection.unreadable_memory.clone(),
+            executor_name: rejection.executor_name.clone(),
+            status,
+        }
+    }));
+    Some(CheckPlacementPass {
+        request_id: decision.request_id.clone(),
+        attempt_id: decision.attempt_id.clone(),
+        decided_at_unix_ms: decision.decided_at_unix_ms,
+        candidates,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3362,6 +3493,22 @@ impl Fleet {
         })
     }
 
+    fn record_memory_lookup_failures(
+        &self,
+        resolved: &mut resource_profiles::ResolvedResourceProfile,
+        executor_id: &str,
+    ) {
+        for failure in &resolved.process_evidence.unreadable_memory {
+            if !resolved.rationale.unreadable_memory.contains(failure) {
+                resolved.rationale.unreadable_memory.push(failure.clone());
+            }
+        }
+        for failure in &resolved.rationale.unreadable_memory {
+            self.runner_events
+                .memory_evidence_unreadable(failure, executor_id);
+        }
+    }
+
     /// The sink every runner lifecycle fact is recorded through.
     pub fn runner_events(&self) -> &runner_events::RunnerEvents {
         &self.runner_events
@@ -4186,6 +4333,7 @@ fn home_cannot_hold(
         winner.executor_name
     );
     let mut rejected = vec![PlacementRejection {
+        unreadable_memory: Vec::new(),
         drain_blockers: Vec::new(),
         prediction: None,
         executor_name: home_name.clone(),
@@ -7581,14 +7729,7 @@ impl Fleet {
             let declines: Vec<_> = entry
                 .declined
                 .iter()
-                .map(|(executor_id, decline)| {
-                    (
-                        executor_id.clone(),
-                        decline.reason,
-                        decline.detail.clone(),
-                        decline.at_unix_ms,
-                    )
-                })
+                .map(|(executor_id, decline)| (executor_id.clone(), decline.clone()))
                 .collect();
             let waited_behind = entry
                 .latest_placement()
@@ -7597,7 +7738,7 @@ impl Fleet {
             (
                 entry.state.clone(),
                 entry.queued_at_unix_ms(),
-                (declines, waited_behind),
+                (declines, waited_behind, check_placement_pass(entry)),
                 entry
                     .request
                     .owner
@@ -7622,7 +7763,7 @@ impl Fleet {
                 },
                 owner,
             ),
-            Some((_, since_unix_ms, (raw_declines, waited_behind), owner)) => {
+            Some((_, since_unix_ms, (raw_declines, waited_behind, placement), owner)) => {
                 let takes_room_on = self.room_taken_first_on(identity, unix_time_ms());
                 let turn = if takes_room_on.is_empty() {
                     waited_behind
@@ -7631,14 +7772,12 @@ impl Fleet {
                 };
                 let mut declines: Vec<_> = raw_declines
                     .into_iter()
-                    .map(
-                        |(executor_id, reason, detail, at_unix_ms)| CheckDispatchDecline {
-                            executor_name: self.executor_name_for_text(&executor_id),
-                            reason,
-                            detail,
-                            at_unix_ms,
-                        },
-                    )
+                    .map(|(executor_id, decline)| {
+                        CheckDispatchDecline::from_entry(
+                            &self.executor_name_for_text(&executor_id),
+                            &decline,
+                        )
+                    })
                     .collect();
                 declines.sort_by(|a, b| {
                     b.at_unix_ms
@@ -7649,6 +7788,7 @@ impl Fleet {
                     CheckDispatchPhase::Placing {
                         since_unix_ms,
                         declines,
+                        placement,
                         turn,
                     },
                     owner,
@@ -15498,6 +15638,7 @@ impl Fleet {
                             diagnostic: error.diagnostic,
                         };
                         decision.rejected.push(PlacementRejection {
+                            unreadable_memory: Vec::new(),
                             executor_name: executor_name.clone(),
                             executor_id: selected.executor_id.clone(),
                             reason: error.reason,
@@ -15731,6 +15872,7 @@ impl Fleet {
         let mut rows: Vec<PlacementRejection> = declined
             .into_iter()
             .map(|(executor_id, decline)| PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: Vec::new(),
                 executor_name: self
                     .executor_public_name(&executor_id)
@@ -16034,7 +16176,7 @@ impl Fleet {
             };
             let run = match plan {
                 Some(plan) => {
-                    let resolved = plan
+                    let mut resolved = plan
                         .resolve_for(
                             request,
                             &entry.identity.device_id,
@@ -16043,6 +16185,7 @@ impl Fleet {
                             duration_context,
                         )
                         .await;
+                    self.record_memory_lookup_failures(&mut resolved, &entry.identity.executor_id);
                     let run = resolved.duration.clone();
                     reservations.insert(entry.identity.executor_id.clone(), resolved);
                     run
@@ -16096,6 +16239,44 @@ impl Fleet {
                 }
             }
             predictions.insert(entry.identity.executor_id.clone(), prediction);
+        }
+        // A machine that is only away for now (it declined this entry, is
+        // backing off, updating, drained, or another request has its turn)
+        // left the usable set before anything was priced for it, yet whether
+        // one process of this work fits it is a fact about its size that its
+        // momentary state does not change. Judge it the same way, so a hard
+        // misfit everywhere is refused rather than waited on. Kept apart from
+        // `reservations`, which ranking and the ceiling note read as the set
+        // of machines that were offered a choice.
+        let mut actual_survey = actual_survey;
+        if let (Some(plan), Ok(survey)) = (plan, actual_survey.as_mut()) {
+            let mut away_reservations = HashMap::new();
+            for row in survey
+                .rejected
+                .iter()
+                .filter(|row| away_for_now(&row.reason))
+            {
+                let Some(entry) = connections.get(&row.executor_id) else {
+                    continue;
+                };
+                let duration_context = resource_profiles::DurationContext {
+                    class: request.command_class,
+                    warmth: candidate_warmth(entry, request, now).for_lookup(),
+                    now_unix_ms: now,
+                };
+                let mut resolved = plan
+                    .resolve_for(
+                        request,
+                        &entry.identity.device_id,
+                        &entry.identity.executor_id,
+                        &entry.advertisement.capabilities,
+                        duration_context,
+                    )
+                    .await;
+                self.record_memory_lookup_failures(&mut resolved, &row.executor_id);
+                away_reservations.insert(row.executor_id.clone(), resolved);
+            }
+            judge_machines_away_for_now(&mut survey.rejected, &connections, &away_reservations);
         }
         // Stage three: rank on when each machine is predicted to answer. Budget
         // inspection and consumption share one short critical section, after all
@@ -16285,6 +16466,7 @@ impl Fleet {
                 return true;
             };
             deferred.push(PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: executor_public_name(machine),
@@ -16343,6 +16525,7 @@ impl Fleet {
                 return true;
             };
             deferred.push(PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: Vec::new(),
                 prediction: None,
                 executor_name: executor_public_name(machine),
@@ -17891,6 +18074,7 @@ fn survey_candidates<'a>(
             });
         match reason {
             Some(reason) => rejected.push(PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: entry.drain_blockers.clone(),
                 prediction: None,
                 executor_name: executor_public_name(entry),
@@ -17905,6 +18089,7 @@ fn survey_candidates<'a>(
             .iter()
             .filter(|machine| !connections.contains_key(&machine.executor_id))
             .map(|machine| PlacementRejection {
+                unreadable_memory: Vec::new(),
                 drain_blockers: machine.drain_state.blockers.clone(),
                 prediction: None,
                 executor_name: machine.name.clone(),
@@ -17927,6 +18112,7 @@ fn survey_candidates<'a>(
     let mut journal: Vec<PlacementRejection> = declined
         .iter()
         .map(|(executor_id, decline)| PlacementRejection {
+            unreadable_memory: Vec::new(),
             drain_blockers: Vec::new(),
             prediction: None,
             executor_name: connections
@@ -18067,6 +18253,52 @@ fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
             | PlacementRejectionReason::ProvisioningTurn { .. }
             | PlacementRejectionReason::CadenceTurn { .. }
     )
+}
+
+/// Whether a machine is only away for now, so that the work may yet go there:
+/// [`waits_on_machine`], or a drain. The set a refusal for size waits on.
+fn away_for_now(reason: &PlacementRejectionReason) -> bool {
+    waits_on_machine(reason) || matches!(reason, PlacementRejectionReason::Drained)
+}
+
+/// The refusal a machine's size makes whatever it is doing now: a single
+/// process of the work larger than it can give ([`ProcessFit::Refused`]).
+/// A waiver or a deferral is not one, and nothing resolved for the machine,
+/// or an unread total, is unknown rather than a misfit.
+fn hard_process_refusal(
+    entry: &ExecutorConnectionState,
+    reservation: Option<&resource_profiles::ResolvedResourceProfile>,
+) -> Option<PlacementRejectionReason> {
+    match process_fit(&reservation?.process_evidence, entry)? {
+        ProcessFit::Refused(reason) => Some(reason),
+        ProcessFit::Waived(_) | ProcessFit::Deferred(_) => None,
+    }
+}
+
+/// Replace the reason of every machine the survey set aside as only away for
+/// now with its hard single-process refusal, where its size makes one. A
+/// machine with no attached connection (reconnecting, or never attached) has
+/// nothing to judge and keeps its wait, as cairn/5602 bounds it.
+fn judge_machines_away_for_now(
+    rejected: &mut [PlacementRejection],
+    connections: &HashMap<String, ExecutorConnectionState>,
+    reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
+) {
+    for rejection in rejected
+        .iter_mut()
+        .filter(|rejection| away_for_now(&rejection.reason))
+    {
+        let Some(entry) = connections.get(&rejection.executor_id) else {
+            continue;
+        };
+        if let Some(resolved) = reservations.get(&rejection.executor_id) {
+            rejection.unreadable_memory = resolved.rationale.unreadable_memory.clone();
+        }
+        if let Some(reason) = hard_process_refusal(entry, reservations.get(&rejection.executor_id))
+        {
+            rejection.reason = reason;
+        }
+    }
 }
 
 /// Why `entry` cannot take work needing `demand` of memory because of the
@@ -18683,6 +18915,7 @@ mod process_fit_tests {
             test_phase: None,
             build_job_memory: None,
             build_jobs_elsewhere: None,
+            unreadable_memory: Vec::new(),
         };
         match judge_process_evidence(
             &evidence,
@@ -18803,6 +19036,7 @@ mod process_fit_tests {
             test_phase: None,
             build_job_memory: None,
             build_jobs_elsewhere: None,
+            unreadable_memory: Vec::new(),
         };
         let budget = Some(24 * GIB / 100 * 85);
         for kernel_kills in [false, true] {
@@ -18838,6 +19072,7 @@ mod process_fit_tests {
             test_phase: None,
             build_job_memory: None,
             build_jobs_elsewhere: None,
+            unreadable_memory: Vec::new(),
         };
         let judge = |kernel_kills| {
             judge_process_evidence(
@@ -18881,6 +19116,7 @@ mod process_fit_tests {
             test_phase: None,
             build_job_memory: None,
             build_jobs_elsewhere: None,
+            unreadable_memory: Vec::new(),
         };
         assert_eq!(
             judge_process_evidence(
@@ -19538,14 +19774,20 @@ fn rank_survey(
                 return true;
             };
             if free_to_move && !hold.relieves_itself {
+                // A machine too small for one process of the work says that
+                // rather than its hold: no wait on the hold makes it fit.
+                let reason = hard_process_refusal(entry, reservations.get(executor_id)).unwrap_or(
+                    PlacementRejectionReason::Held {
+                        evidence: hold.evidence,
+                    },
+                );
                 rejected.push(PlacementRejection {
+                    unreadable_memory: Vec::new(),
                     drain_blockers: entry.drain_blockers.clone(),
                     prediction: None,
                     executor_name: executor_public_name(entry),
                     executor_id: executor_id.clone(),
-                    reason: PlacementRejectionReason::Held {
-                        evidence: hold.evidence,
-                    },
+                    reason,
                 });
                 return false;
             }
@@ -19554,6 +19796,28 @@ fn rank_survey(
         })
         .collect();
     if usable.is_empty() {
+        // Nothing is left to rank, but the machines set aside may already
+        // have answered: each one judged too small for one process, with
+        // none only away for now, is the same refusal ranking would give.
+        let too_small_somewhere = rejected.iter().any(|rejection| {
+            matches!(
+                rejection.reason,
+                PlacementRejectionReason::ProcessTooLarge(_)
+            )
+        });
+        if too_small_somewhere
+            && !rejected
+                .iter()
+                .any(|rejection| away_for_now(&rejection.reason))
+        {
+            return Err(PlacementFailure {
+                diagnostic: format!(
+                    "no machine can run this work: {}. Nothing was run; this needs a machine with more memory for one process.",
+                    describe_memory_rejections(&rejected).unwrap_or_default()
+                ),
+                rejected,
+            });
+        }
         return Ok(PlacementDraft {
             selected: None,
             rejected,
@@ -19649,10 +19913,9 @@ fn rank_survey(
         rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
         // Refused at once, unless some machine is only away for now (held,
         // declining, updating, or drained) and may yet be the one that fits.
-        let something_to_wait_for = rejected.iter().any(|rejection| {
-            waits_on_machine(&rejection.reason)
-                || matches!(rejection.reason, PlacementRejectionReason::Drained)
-        });
+        let something_to_wait_for = rejected
+            .iter()
+            .any(|rejection| away_for_now(&rejection.reason));
         if all_too_small && !something_to_wait_for {
             return Err(PlacementFailure {
                 diagnostic: format!(
@@ -20204,6 +20467,10 @@ impl<'a> ScoredCandidate<'a> {
 
     fn rejection(&self) -> PlacementRejection {
         PlacementRejection {
+            unreadable_memory: self
+                .reservation
+                .map(|resolved| resolved.rationale.unreadable_memory.clone())
+                .unwrap_or_default(),
             drain_blockers: Vec::new(),
             prediction: Some(self.prediction.clone()),
             executor_name: executor_public_name(self.entry),
@@ -20237,6 +20504,10 @@ impl<'a> ScoredCandidate<'a> {
                 executor_name: winner_name.to_string(),
             });
         PlacementRejection {
+            unreadable_memory: self
+                .reservation
+                .map(|resolved| resolved.rationale.unreadable_memory.clone())
+                .unwrap_or_default(),
             drain_blockers: Vec::new(),
             // A machine that was ranked and lost owes the operator its numbers,
             // not just the name of whoever beat it.
@@ -21453,6 +21724,7 @@ fn unresolved_rationale(stated: &ResourceReservation) -> ReservationRationale {
         fallback: Some(ReservationFallback::CallerDeclared),
         memory_kill: None,
         build_jobs_price: None,
+        unreadable_memory: Vec::new(),
     }
 }
 
@@ -21602,7 +21874,9 @@ impl ReservationPlan {
                 .unwrap_or_default(),
             request_identity: request.command_resource_identity.clone(),
             declared_concurrency,
-            resolves: declared_concurrency.is_some()
+            resolves: (declared_concurrency.is_some()
+                && request.resource_reservation.memory_bytes == 0
+                && request.resource_reservation.disk_growth_bytes == 0)
                 || request.resource_reservation == ResourceReservation::default(),
             stated: request.resource_reservation.clone(),
             parallel_width: batch.filter(|batch| !batch.sequential).map_or(1, |batch| {
@@ -21728,6 +22002,9 @@ impl ReservationPlan {
             // measured here, which sizes the jobs the executor grants.
             let process_evidence = self.process_evidence(&context).await;
             let mut reservation = self.stated.clone();
+            if let Some(units) = self.declared_concurrency {
+                reservation.concurrency_units = clamp_declared_concurrency(units, capabilities);
+            }
             reservation.build_job_memory = process_evidence.build_job_memory;
             return resource_profiles::ResolvedResourceProfile {
                 reservation,
@@ -21749,7 +22026,9 @@ impl ReservationPlan {
         // the learning it named cannot produce a concurrency number at all.
         let prior = resource_profiles::cold_start_prior(self.command_class, capabilities);
         let class_prior = prior.clone();
-        let mut resolved = if self.batch_identities.is_empty() {
+        let mut resolved = if self.batch_suites.is_empty()
+            || (self.parallel_width > 1 && self.batch_identities.is_empty())
+        {
             resource_profiles::resolve_reservation(
                 self.db.clone(),
                 self.request_identity.as_ref(),
@@ -21765,6 +22044,7 @@ impl ReservationPlan {
                 prior,
                 capabilities.memory_budget_bytes,
                 duration_context,
+                capabilities,
             )
             .await
         };
@@ -21792,17 +22072,27 @@ impl ReservationPlan {
         if let Some(units) = self.declared_concurrency {
             let clamped = clamp_declared_concurrency(units, capabilities);
             resolved.reservation.concurrency_units = clamped;
-            resolved.reservation.source = ResourceReservationSource::Declared;
             resolved.rationale.declared_concurrency_units = Some(clamped);
         }
-        resolved.process_evidence = self.process_evidence(&context).await;
-        resolved.charge_measured_peak();
-        // The widest grant this machine's executor can make, which its
-        // memory cap may hold narrower still.
-        let cpu_width = capabilities
-            .concurrency_capacity
-            .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX));
-        resolved.price_at_width(cpu_width, &class_prior, capabilities.memory_budget_bytes);
+        if self.batch_suites.is_empty() || self.parallel_width > 1 {
+            resolved.process_evidence = self.process_evidence(&context).await;
+            if self.batch_suites.is_empty() && self.request_identity.is_none() {
+                resolved.process_evidence.build_job_memory = None;
+                resolved.process_evidence.build_jobs_elsewhere = None;
+                resolved.process_evidence.test_phase = None;
+            }
+            resolved.charge_measured_peak();
+            let cpu_width = capabilities
+                .concurrency_capacity
+                .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX));
+            if self.parallel_width == 1 {
+                resolved.price_at_width(cpu_width, &class_prior, capabilities.memory_budget_bytes);
+            } else if resolved.reservation.source == ResourceReservationSource::Unmeasured {
+                let fit = resolved.memory_fit;
+                resolved.price_at_width(cpu_width, &class_prior, capabilities.memory_budget_bytes);
+                resolved.memory_fit = fit;
+            }
+        }
         resolved
     }
 
@@ -21887,6 +22177,7 @@ impl ReservationPlan {
         prior: ResourceReservation,
         memory_budget_bytes: Option<u64>,
         duration_context: resource_profiles::DurationContext,
+        capabilities: &ExecutorCapabilities,
     ) -> resource_profiles::ResolvedResourceProfile {
         let mut reservation = ResourceReservation::default();
         let mut learned_estimates = Vec::with_capacity(self.batch_identities.len());
@@ -21896,17 +22187,63 @@ impl ReservationPlan {
         let mut rationale: Option<ReservationRationale> = None;
         // The batch must fit its heaviest item, so the item measured furthest
         // past the cap is the one that says this machine cannot hold it.
-        let mut memory_fits = Vec::with_capacity(self.batch_identities.len());
-        for identity in &self.batch_identities {
-            let item = resource_profiles::resolve_reservation(
+        let mut unreadable_memory = Vec::new();
+        let mut memory_fits = Vec::with_capacity(self.batch_suites.len());
+        let mut members = Vec::with_capacity(self.batch_suites.len());
+        let mut process_evidence = None;
+        let cpu_width = capabilities
+            .concurrency_capacity
+            .unwrap_or_else(|| u32::try_from(capabilities.logical_cores).unwrap_or(u32::MAX))
+            .max(1);
+        for (identity, suite, class) in &self.batch_suites {
+            if self.parallel_width > 1 && identity.is_none() {
+                continue;
+            }
+            let member_prior = if self.parallel_width == 1 {
+                resource_profiles::cold_start_prior(*class, capabilities)
+            } else {
+                prior.clone()
+            };
+            let mut item = resource_profiles::resolve_reservation(
                 self.db.clone(),
-                Some(identity),
+                identity.as_ref(),
                 context,
-                prior.clone(),
+                member_prior.clone(),
                 memory_budget_bytes,
-                duration_context,
+                if self.parallel_width == 1 {
+                    resource_profiles::DurationContext {
+                        class: *class,
+                        ..duration_context
+                    }
+                } else {
+                    duration_context
+                },
             )
             .await;
+            if self.parallel_width == 1 {
+                item.process_evidence = resource_profiles::resolve_process_demand(
+                    self.db.clone(),
+                    identity.as_ref(),
+                    suite.as_deref(),
+                    *class,
+                    context,
+                )
+                .await;
+                if identity.is_none() {
+                    item.process_evidence.build_job_memory = None;
+                    item.process_evidence.build_jobs_elsewhere = None;
+                    item.process_evidence.test_phase = None;
+                }
+                item.charge_measured_peak();
+                item.price_at_width(cpu_width, &member_prior, memory_budget_bytes);
+                process_evidence = Some(match process_evidence {
+                    Some(held) => {
+                        resource_profiles::ProcessEvidence::max(held, item.process_evidence.clone())
+                    }
+                    None => item.process_evidence.clone(),
+                });
+                members.push(item.reservation.clone());
+            }
             reservation.memory_bytes = reservation.memory_bytes.max(item.reservation.memory_bytes);
             reservation.disk_growth_bytes = reservation
                 .disk_growth_bytes
@@ -21924,20 +22261,196 @@ impl ReservationPlan {
             if rationale.is_none() || item.reservation.memory_bytes >= reservation.memory_bytes {
                 rationale = Some(item.rationale.clone());
             }
+            for failure in &item.rationale.unreadable_memory {
+                if !unreadable_memory.contains(failure) {
+                    unreadable_memory.push(failure.clone());
+                }
+            }
             memory_fits.push(item.memory_fit);
             learned_estimates.push(item.learned_estimate);
             item_durations.push(item.duration);
         }
+        let mut memory_fit = resource_profiles::MemoryFit::of_batch(memory_fits);
+        let mut evidence = process_evidence.unwrap_or_default();
+        if self.parallel_width == 1 {
+            // Policy may raise a reduced live advertisement back to startup
+            // capacity after placement. Prove the envelope through the immutable
+            // hardware budget that bounds startup and every policy reapply.
+            let envelope_width = cairn_common::executor_protocol::admission_concurrency_budget(
+                capabilities.logical_cores,
+            );
+            reservation = sequential_memory_envelope(&members, envelope_width);
+            evidence.build_job_memory = reservation.build_job_memory;
+            evidence.build_jobs_elsewhere = None;
+            // A later member may compile autonomously. Without re-admission a
+            // current member's test phase cannot release the future envelope.
+            if members.len() > 1 {
+                evidence.test_phase = None;
+            }
+            if reservation.build_job_memory.is_none()
+                && memory_budget_bytes.is_some_and(|budget| {
+                    reservation.memory_charge_bytes()
+                        > resource_profiles::memory_reservation_cap(budget)
+                })
+                && !matches!(memory_fit, resource_profiles::MemoryFit::Exceeds(_))
+            {
+                memory_fit = resource_profiles::MemoryFit::of(
+                    Some(reservation.memory_charge_bytes()),
+                    memory_budget_bytes,
+                );
+            }
+        }
         resource_profiles::ResolvedResourceProfile {
             reservation,
             learned_estimate: aggregate_batch_learned_estimates(&learned_estimates),
-            rationale: rationale
-                .unwrap_or_else(|| resource_profiles::declared_rationale(context, prior)),
+            rationale: {
+                let mut rationale = rationale
+                    .unwrap_or_else(|| resource_profiles::declared_rationale(context, prior));
+                rationale.unreadable_memory = unreadable_memory;
+                rationale
+            },
             duration: self.predict_batch_duration(context, duration_context).await,
             item_durations,
-            memory_fit: resource_profiles::MemoryFit::of_batch(memory_fits),
-            process_evidence: resource_profiles::ProcessEvidence::default(),
+            memory_fit,
+            process_evidence: evidence,
         }
+    }
+}
+
+/// One existing wire model may describe a sequential group only when an
+/// actual member dominates every other member over the entire grant range.
+/// Crossing curves retain their full-width envelope instead of synthesizing
+/// an unmeasured max-largest/max-typical process model.
+fn sequential_memory_envelope(
+    members: &[ResourceReservation],
+    max_jobs: u32,
+) -> ResourceReservation {
+    if let [member] = members {
+        return member.clone();
+    }
+    let max_jobs = max_jobs.max(1);
+    let whole = members
+        .iter()
+        .map(ResourceReservation::memory_charge_bytes)
+        .max()
+        .unwrap_or(0);
+    let mut boundaries = vec![1, max_jobs];
+    for member in members {
+        if let Some(model) = member.build_job_memory {
+            let plateau = model.jobs_within(member.memory_charge_bytes());
+            boundaries.push(plateau.clamp(1, max_jobs));
+            boundaries.push(plateau.saturating_add(1).clamp(1, max_jobs));
+        }
+    }
+    let dominant = members.iter().find(|candidate| {
+        candidate.build_job_memory.is_some()
+            && candidate.source == ResourceReservationSource::Learned
+            && candidate.memory_charge_bytes() == whole
+            && boundaries.iter().all(|width| {
+                members.iter().all(|member| {
+                    candidate.memory_charge_at(Some(*width))
+                        >= member.memory_charge_at(Some(*width))
+                })
+            })
+    });
+    let mut reservation = dominant.cloned().unwrap_or_else(|| ResourceReservation {
+        memory_bytes: members
+            .iter()
+            .map(|member| member.memory_charge_at(Some(max_jobs)))
+            .max()
+            .unwrap_or(0),
+        ..ResourceReservation::default()
+    });
+    reservation.test_phase = None;
+    reservation.disk_growth_bytes = members
+        .iter()
+        .map(|member| member.disk_growth_bytes)
+        .max()
+        .unwrap_or(0);
+    reservation.concurrency_units = members
+        .iter()
+        .map(|member| member.concurrency_units)
+        .max()
+        .unwrap_or(1);
+    reservation
+}
+
+#[cfg(test)]
+mod sequential_memory_tests {
+    use super::*;
+    use cairn_common::executor_protocol::BuildJobMemoryEvidence;
+
+    fn member(largest: u64, typical: u64, whole: u64) -> ResourceReservation {
+        ResourceReservation {
+            memory_bytes: whole,
+            source: ResourceReservationSource::Learned,
+            build_job_memory: Some(BuildJobMemoryEvidence {
+                largest_bytes: largest,
+                typical_bytes: typical,
+                samples: 1,
+            }),
+            ..ResourceReservation::default()
+        }
+    }
+
+    #[test]
+    fn sequential_envelope_uses_a_real_dominating_member_at_every_width() {
+        let members = [member(15, 3, 100), member(12, 2, 80), member(10, 1, 50)];
+        let group = sequential_memory_envelope(&members, 32);
+        assert_eq!(group.build_job_memory, members[0].build_job_memory);
+        for width in 1..=32 {
+            assert_eq!(
+                group.memory_charge_at(Some(width)),
+                members
+                    .iter()
+                    .map(|member| member.memory_charge_at(Some(width)))
+                    .max()
+                    .unwrap()
+            );
+        }
+        assert_eq!(group.test_phase, None);
+    }
+
+    #[test]
+    fn crossing_or_unknown_members_keep_a_fixed_conservative_envelope() {
+        let curves = [member(20, 1, 100), member(10, 3, 100)];
+        let group = sequential_memory_envelope(&curves, 20);
+        assert_eq!(group.build_job_memory, None);
+        assert_eq!(group.memory_bytes, 67);
+        for width in 1..=20 {
+            assert!(curves
+                .iter()
+                .all(|member| group.memory_charge_bytes() >= member.memory_charge_at(Some(width))));
+        }
+        let mixed = [
+            member(20, 1, 100),
+            ResourceReservation {
+                memory_bytes: 50,
+                ..ResourceReservation::default()
+            },
+        ];
+        let group = sequential_memory_envelope(&mixed, 20);
+        assert_eq!(group.build_job_memory, None);
+        assert_eq!(group.source, ResourceReservationSource::Unmeasured);
+        assert_eq!(group.memory_charge_bytes(), 50);
+        let mut prior = member(20, 3, 30);
+        prior.source = ResourceReservationSource::Unmeasured;
+        let group = sequential_memory_envelope(
+            &[
+                prior,
+                ResourceReservation {
+                    memory_bytes: 5,
+                    ..ResourceReservation::default()
+                },
+            ],
+            20,
+        );
+        assert_eq!(group.build_job_memory, None);
+        assert_eq!(group.memory_charge_bytes(), 77);
+        assert_eq!(
+            sequential_memory_envelope(&[], 20),
+            ResourceReservation::default()
+        );
     }
 }
 
@@ -26751,7 +27264,7 @@ mod tests {
         let units = |batch: ProcessBatch, capabilities: ExecutorCapabilities| {
             let (db, request) = (db.clone(), request.clone());
             async move {
-                ReservationPlan::new(db, &request, Some(&batch))
+                let resolved = ReservationPlan::new(db, &request, Some(&batch))
                     .resolve_for(
                         &request,
                         "device",
@@ -26763,9 +27276,12 @@ mod tests {
                             now_unix_ms: NOW,
                         },
                     )
-                    .await
-                    .reservation
-                    .concurrency_units
+                    .await;
+                assert!(
+                    resolved.reservation.memory_charge_bytes() > 0,
+                    "members without identities retain their conservative class prior"
+                );
+                resolved.reservation.concurrency_units
             }
         };
 
@@ -26825,6 +27341,11 @@ mod tests {
         );
         assert_eq!(resolved.reservation.concurrency_units, 1);
         assert_eq!(
+            resolved.reservation.source,
+            ResourceReservationSource::Unmeasured,
+            "declaring CPU concurrency must not declare memory or disable width pricing"
+        );
+        assert_eq!(
             resolved.rationale.fallback,
             Some(cairn_common::executor_protocol::ReservationFallback::NoProfileRecorded),
             "and the learned half still explains itself in its own terms"
@@ -26834,7 +27355,7 @@ mod tests {
         // provenance rather than a conclusion drawn from a thin profile.
         request.resource_reservation.concurrency_units =
             ResourceReservation::WHOLE_MACHINE_CONCURRENCY;
-        let exclusive = ReservationPlan::new(db, &request, None)
+        let exclusive = ReservationPlan::new(db.clone(), &request, None)
             .resolve_for(
                 &request,
                 "device",
@@ -26854,6 +27375,41 @@ mod tests {
         assert_eq!(
             exclusive.rationale.declared_concurrency_units,
             Some(capabilities.admission_concurrency_budget())
+        );
+        request.resource_reservation.concurrency_units = 0;
+        let zero = ReservationPlan::new(db.clone(), &request, None)
+            .resolve_for(
+                &request,
+                "device",
+                "executor",
+                &capabilities,
+                resource_profiles::DurationContext {
+                    class: request.command_class,
+                    warmth: ExecutionWarmth::Cold,
+                    now_unix_ms: NOW,
+                },
+            )
+            .await;
+        assert_ne!(zero.reservation.source, ResourceReservationSource::Declared);
+        assert_eq!(zero.rationale.declared_concurrency_units, Some(0));
+        request.resource_reservation.memory_bytes = 123_456;
+        let stated = ReservationPlan::new(db, &request, None)
+            .resolve_for(
+                &request,
+                "device",
+                "executor",
+                &capabilities,
+                resource_profiles::DurationContext {
+                    class: request.command_class,
+                    warmth: ExecutionWarmth::Cold,
+                    now_unix_ms: NOW,
+                },
+            )
+            .await;
+        assert_eq!(stated.reservation.memory_bytes, 123_456);
+        assert_eq!(
+            stated.reservation.source,
+            ResourceReservationSource::Declared
         );
     }
 
@@ -27018,11 +27574,14 @@ mod tests {
                 phase: CheckDispatchPhase::Placing {
                     since_unix_ms: 1_000,
                     turn: None,
+                    placement: None,
                     declines: vec![CheckDispatchDecline {
                         executor_name: "fedora".into(),
                         reason: DeclineReason::Pressure,
                         detail: Some("memory floor".into()),
                         at_unix_ms: 2_500,
+                        superseded_at_unix_ms: None,
+                        retry_after_unix_ms: 3_500,
                     }],
                 },
                 joined: None,
@@ -27087,11 +27646,14 @@ mod tests {
             Some(CheckDispatchPhase::Placing {
                 since_unix_ms: 1_000,
                 turn: None,
+                placement: None,
                 declines: vec![CheckDispatchDecline {
                     executor_name: "local".into(),
                     reason: DeclineReason::Pressure,
                     detail: Some("cpu 97%".into()),
                     at_unix_ms: 2_500,
+                    superseded_at_unix_ms: None,
+                    retry_after_unix_ms: 3_500,
                 }],
             })
         );
@@ -27110,6 +27672,125 @@ mod tests {
         assert_eq!(
             pool.request_dispatch_phase(&("unknown".into(), "unknown".into())),
             None
+        );
+    }
+
+    /// The cairn/7189 shape: two machines excluded before any offer by the
+    /// memory ceiling, one that was asked and declined, and one drained. The
+    /// dispatch phase carries the latest pass under the request's own identity
+    /// with every one of them, and only the machine that was asked is a
+    /// decline.
+    #[test]
+    fn request_dispatch_phase_carries_every_candidate_of_the_latest_pass() {
+        let pool = Fleet::default();
+        let key = ("parked-wave".to_string(), "parked-attempt".to_string());
+        let entry = enqueue_owned_entry(&pool, &key);
+        assert!(pool.queue.offer(&entry, "fedora", "fedora", 3, 2_000));
+        pool.queue.decline(
+            &entry,
+            "fedora",
+            3,
+            DeclineReason::Pressure,
+            Some("owed 53.9 GiB + 67.3 GiB for this request > available 94.6 GiB".into()),
+            None,
+            None,
+            2_500,
+        );
+        let mut request = provenance_request();
+        request.request_id.clone_from(&key.0);
+        request.attempt_id.clone_from(&key.1);
+        let unreadable = |name: &str| {
+            if name == "mac" {
+                vec![cairn_common::executor_protocol::MemoryEvidenceFailure {
+                    query: "suite_evidence".into(),
+                    error_class: "schema".into(),
+                    error: "no such column: job_census_samples".into(),
+                }]
+            } else {
+                Vec::new()
+            }
+        };
+        let row = |name: &str, reason: PlacementRejectionReason| PlacementRejection {
+            unreadable_memory: unreadable(name),
+            drain_blockers: Vec::new(),
+            executor_name: name.into(),
+            executor_id: name.into(),
+            reason,
+            prediction: None,
+        };
+        let ceiling = |estimate_bytes| PlacementRejectionReason::ExceedsMemoryCeiling {
+            estimate_bytes,
+            ceiling_bytes: 72_215_848_550,
+            killed_here: None,
+        };
+        pool.queue.record_placement(&placement_decision(
+            &request,
+            3_000,
+            None,
+            None,
+            PlacementOutcome::Waiting {
+                diagnostic: "waiting".into(),
+            },
+            vec![
+                row("bginf-sp1", ceiling(73_152_409_600)),
+                row("bginf-sp2", ceiling(72_489_070_720)),
+                row(
+                    "fedora",
+                    PlacementRejectionReason::Declined {
+                        reason: DeclineReason::Pressure,
+                        detail: Some("stale words".into()),
+                        declined_at_unix_ms: 2_500,
+                    },
+                ),
+                row("mac", PlacementRejectionReason::Drained),
+            ],
+        ));
+
+        let Some(CheckDispatchPhase::Placing {
+            declines,
+            placement,
+            ..
+        }) = pool.request_dispatch_phase(&key)
+        else {
+            panic!("a queued request is placing");
+        };
+        let fedora = CheckDispatchDecline {
+            executor_name: "fedora".into(),
+            reason: DeclineReason::Pressure,
+            detail: Some("owed 53.9 GiB + 67.3 GiB for this request > available 94.6 GiB".into()),
+            at_unix_ms: 2_500,
+            superseded_at_unix_ms: None,
+            retry_after_unix_ms: 3_500,
+        };
+        assert_eq!(declines, vec![fedora.clone()]);
+        let candidate = |name: &str, status| CheckPlacementCandidate {
+            unreadable_memory: unreadable(name),
+            executor_name: name.into(),
+            status,
+        };
+        assert_eq!(
+            placement,
+            Some(CheckPlacementPass {
+                request_id: "parked-wave".into(),
+                attempt_id: "parked-attempt".into(),
+                decided_at_unix_ms: 3_000,
+                candidates: vec![
+                    candidate(
+                        "bginf-sp1",
+                        CheckCandidateStatus::NotOffered(ceiling(73_152_409_600))
+                    ),
+                    candidate(
+                        "bginf-sp2",
+                        CheckCandidateStatus::NotOffered(ceiling(72_489_070_720))
+                    ),
+                    candidate("fedora", CheckCandidateStatus::Declined(fedora)),
+                    candidate(
+                        "mac",
+                        CheckCandidateStatus::NotOffered(PlacementRejectionReason::Drained)
+                    ),
+                ],
+            }),
+            "every candidate of the pass survives, and the machine's own words win over the pass's copy"
         );
     }
 
@@ -31095,6 +31776,108 @@ mod tests {
         );
     }
 
+    /// cairn/7189: a single process larger than a machine can give is a fact
+    /// about the machine's size, so neither a decline nor a posted hold on a
+    /// machine that is too small may turn the refusal into a wait. Every
+    /// matching machine is judged, held or not. A machine that could hold
+    /// the process and has only said "not yet" still keeps the request
+    /// waiting (cairn/5602).
+    #[tokio::test]
+    async fn a_hard_process_misfit_is_not_hidden_behind_a_decline_or_a_hold() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let select = |pool: Fleet,
+                      db,
+                      request: CellRequest,
+                      declined: HashMap<String, queue::EntryDecline>| async move {
+            let plan = ReservationPlan::new(db, &request, None);
+            pool.select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &declined,
+                &AdmissionView::of_request(&request),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+        };
+        let declined_by = |pool: &Fleet, id: &str| {
+            HashMap::from([(
+                id.to_string(),
+                queue::EntryDecline {
+                    generation: pool.lock_connections()[id].generation,
+                    reason: DeclineReason::Pressure,
+                    detail: Some("build volume write stall".into()),
+                    disk: None,
+                    at_unix_ms: unix_time_ms(),
+                    condition: None,
+                    backoff_ms: 0,
+                    retry_after_unix_ms: 0,
+                    superseded_at_unix_ms: None,
+                },
+            )])
+        };
+        let both_too_small = |refusal: &str| {
+            assert!(
+                refusal.contains("no machine can run this work"),
+                "{refusal}"
+            );
+            assert!(refusal.contains("bgsrv-ub: needs one process"), "{refusal}");
+            assert!(refusal.contains("other: needs one process"), "{refusal}");
+        };
+
+        // Declined, and backing off: never surveyed as usable, still judged.
+        let (pool, db, request) = process_fit_fleet("hard-fit-declined.db", 14 * GIB, false).await;
+        let declined = declined_by(&pool, "other");
+        let refusal = select(pool, db, request, declined)
+            .await
+            .expect_err("a decline from a machine too small for one rustc is no wait")
+            .diagnostic;
+        both_too_small(&refusal);
+
+        // Held on a disk floor nothing is sweeping: filtered before ranking.
+        let (pool, db, request) = process_fit_fleet("hard-fit-disk-held.db", 14 * GIB, false).await;
+        Arc::make_mut(&mut pool.lock_connections().get_mut("other").unwrap().health)
+            .disk
+            .watermark_bytes = 1000 * GIB;
+        let refusal = select(pool, db, request, HashMap::new())
+            .await
+            .expect_err("a hold on a machine too small for one rustc is no wait")
+            .diagnostic;
+        both_too_small(&refusal);
+
+        // Held on pressure: ranked behind, and judged the same way.
+        let (pool, db, request) =
+            process_fit_fleet("hard-fit-pressure-held.db", 14 * GIB, false).await;
+        Arc::make_mut(&mut pool.lock_connections().get_mut("other").unwrap().health)
+            .host
+            .memory_admission = cairn_common::executor_protocol::StallInstrumentHealth {
+            state: StallInstrumentState::Pressured,
+            reading: Some(0.4),
+            state_since_unix_ms: Some(unix_time_ms()),
+            measured_at_unix_ms: Some(unix_time_ms()),
+        };
+        let refusal = select(pool, db, request, HashMap::new())
+            .await
+            .expect_err("pressure on a machine too small for one rustc is no wait")
+            .diagnostic;
+        both_too_small(&refusal);
+
+        // A capable machine that declined is still something to wait for.
+        let (pool, db, request) =
+            process_fit_fleet("hard-fit-capable-declined.db", 125 * GIB, false).await;
+        let declined = declined_by(&pool, "other");
+        let Selection::Waiting { rejected } = select(pool, db, request, declined)
+            .await
+            .expect("a capable decliner keeps the request alive")
+        else {
+            panic!("the only capable machine declined; nothing may be placed");
+        };
+        assert!(rejected.iter().any(|row| row.executor_id == "other"
+            && matches!(row.reason, PlacementRejectionReason::Declined { .. })));
+        assert!(rejected.iter().any(|row| row.executor_id == "bgsrv-ub"
+            && matches!(row.reason, PlacementRejectionReason::ProcessTooLarge(_))));
+    }
+
     #[tokio::test]
     async fn large_work_parks_for_a_detached_enrollment_and_places_on_reattach() {
         let (pool, db, request) =
@@ -34042,6 +34825,140 @@ mod tests {
         }
     }
 
+    /// A hold on the machine placement would otherwise prefer is
+    /// current evidence that it will decline, so work free to move goes to an
+    /// admissible alternative in the same pass, whatever the hold: nothing
+    /// waits on the preferred machine's warmth or stable-order advantage. A
+    /// pin or a platform selector still keeps the work where its caller put
+    /// it.
+    #[test]
+    fn every_hold_on_the_preferred_machine_spills_to_an_idle_alternative_in_one_pass() {
+        use cairn_common::executor_protocol::StallInstrumentHealth;
+        type Hold = fn(&mut ExecutorConnectionState);
+        let holds: Vec<(&str, Hold)> = vec![
+            ("cpu pressure", |entry| {
+                Arc::make_mut(&mut entry.health).host.cpu_admission = StallInstrumentHealth {
+                    state: StallInstrumentState::Pressured,
+                    reading: Some(0.95),
+                    state_since_unix_ms: Some(NOW - 20_000),
+                    measured_at_unix_ms: Some(NOW),
+                };
+            }),
+            ("available memory owed", |entry| {
+                Arc::make_mut(&mut entry.health).admission.owed_memory_bytes = Some(128 * GIB);
+            }),
+            ("memory stall", |entry| {
+                Arc::make_mut(&mut entry.health).host.memory_admission = StallInstrumentHealth {
+                    state: StallInstrumentState::Pressured,
+                    reading: Some(0.4),
+                    state_since_unix_ms: Some(NOW - 20_000),
+                    measured_at_unix_ms: Some(NOW),
+                };
+            }),
+            ("build volume write stall", |entry| {
+                Arc::make_mut(&mut entry.health).host.disk_write_arms.stall =
+                    StallInstrumentHealth {
+                        state: StallInstrumentState::Pressured,
+                        reading: Some(0.04),
+                        state_since_unix_ms: Some(NOW - 20_000),
+                        measured_at_unix_ms: Some(NOW),
+                    };
+            }),
+            ("provisioning", |entry| {
+                Arc::make_mut(&mut entry.snapshot).provisioning_holds =
+                    vec![cairn_common::executor_protocol::ProvisioningHold {
+                        project_id: "p".into(),
+                        owner_request_id: "another-request".into(),
+                        entry_id: Some("another-entry".into()),
+                        since_unix_ms: NOW - 61_000,
+                    }];
+            }),
+            ("latched cleanup", |entry| {
+                Arc::make_mut(&mut entry.health).disk.cleanup_blocked = true;
+            }),
+            ("disk floor", |entry| {
+                Arc::make_mut(&mut entry.health).disk.watermark_bytes = 1000 * GIB;
+            }),
+            ("operator drain", |entry| {
+                published_drains_fixture(entry, false, true);
+            }),
+            ("update pending", |entry| {
+                published_drains_fixture(entry, true, false);
+            }),
+        ];
+        let mut request = spillable_request();
+        request.command = "bun run test:rust".into();
+        request.command_class = CellCommandClass::classify(&request.command);
+        let view = AdmissionView {
+            interactive: false,
+            entry_id: Some("entry".into()),
+            execution_residency: None,
+        };
+        let fleet = |hold: Option<Hold>, alternative_os: &str| {
+            let (preferred_id, mut preferred) = idle("a-preferred");
+            if let Some(hold) = hold {
+                hold(&mut preferred);
+            }
+            let (alternative_id, mut alternative) =
+                fleet_entry("b-alternative", alternative_os, 0, &[]);
+            measured(&mut alternative, 0.05, 48 * GIB, 900 * GIB);
+            Arc::make_mut(&mut alternative.health)
+                .admission
+                .concurrency_capacity = Some(8);
+            HashMap::from([(preferred_id, preferred), (alternative_id, alternative)])
+        };
+        assert_eq!(
+            chosen(&place_entry(&fleet(None, "linux"), &request, &HashMap::new(), &view).unwrap())
+                .executor_id,
+            "a-preferred",
+            "unheld, the stable order prefers a-preferred"
+        );
+        for (class, hold) in holds {
+            let connections = fleet(Some(hold), "linux");
+            let draft = place_entry(&connections, &request, &HashMap::new(), &view)
+                .unwrap_or_else(|refusal| panic!("{class}: refused: {refusal}"));
+            let selected = draft
+                .selected
+                .as_ref()
+                .unwrap_or_else(|| panic!("{class}: waited instead of spilling"));
+            assert_eq!(selected.1.executor_id, "b-alternative", "{class}");
+            assert!(
+                !matches!(
+                    rejection_for(&draft, "a-preferred"),
+                    PlacementRejectionReason::OutrankedBy { .. }
+                ),
+                "{class}: the held machine names its hold, not a lost race: {:?}",
+                rejection_for(&draft, "a-preferred")
+            );
+
+            // A pin keeps the work on its machine, held or not.
+            let mut pinned = request.clone();
+            pinned.pinned_executor_id = Some("a-preferred".into());
+            if let Ok(draft) = place_entry(&connections, &pinned, &HashMap::new(), &view) {
+                assert_ne!(
+                    draft.selected.map(|(_, selection)| selection.executor_id),
+                    Some("b-alternative".to_string()),
+                    "{class}: a pin is never spilled"
+                );
+            }
+
+            // A platform selector the alternative fails keeps it out.
+            let connections = fleet(Some(hold), "macos");
+            let mut constrained = request.clone();
+            constrained.executor = Some(ExecutorSelector {
+                os: Some("linux".into()),
+                ..ExecutorSelector::default()
+            });
+            if let Ok(draft) = place_entry(&connections, &constrained, &HashMap::new(), &view) {
+                assert_ne!(
+                    draft.selected.map(|(_, selection)| selection.executor_id),
+                    Some("b-alternative".to_string()),
+                    "{class}: a platform selector is never overridden"
+                );
+            }
+        }
+    }
+
     /// A hold this entry's own acquisition took is not a hold on it.
     #[test]
     fn an_entrys_own_provisioning_hold_does_not_demote_the_machine() {
@@ -35388,6 +36305,7 @@ mod tests {
     #[test]
     fn the_journal_replaces_readings_but_not_structural_reasons() {
         let row = |id: &str, reason| PlacementRejection {
+            unreadable_memory: Vec::new(),
             drain_blockers: Vec::new(),
             prediction: None,
             executor_name: id.into(),
