@@ -33,6 +33,11 @@ pub(crate) fn emit_terminal_change(orch: &Orchestrator, action: &str) {
     );
 }
 
+/// Why a runner-local terminal ended at startup. Rendered as the clause of its
+/// exit wake, so it is lowercase with no full stop.
+const RUNNER_RESTART_EXIT_REASON: &str =
+    "the runner restarted and this terminal did not survive it";
+
 /// Durable running rows are attachable only while their session exists in this
 /// host. A new host starts with an empty PtyState, so settle runner-local orphans
 /// as exited and fence executor-backed orphans into recovery before any terminal
@@ -78,9 +83,10 @@ pub async fn prepare_terminal_recovery(orch: &Orchestrator) -> Result<u64, Strin
                     updated += conn
                         .execute(
                             "UPDATE job_terminals
-                     SET status = 'exited', exited_at = COALESCE(exited_at, ?2)
+                     SET status = 'exited', exited_at = COALESCE(exited_at, ?2),
+                         exit_reason = COALESCE(exit_reason, ?3)
                      WHERE id = ?1 AND status IN ('running', 'recovering')",
-                            params![id.as_str(), now],
+                            params![id.as_str(), now, RUNNER_RESTART_EXIT_REASON],
                         )
                         .await?;
                 }
@@ -104,7 +110,7 @@ pub async fn prepare_terminal_recovery(orch: &Orchestrator) -> Result<u64, Strin
     if updated > 0 {
         emit_terminal_change(orch, "update");
     }
-    crate::mcp::handlers::terminal::reconcile_exited_terminal_wakes(orch).await?;
+    crate::mcp::handlers::terminal::reconcile_exited_terminal_wakes(orch, None).await?;
     Ok(updated)
 }
 
@@ -288,7 +294,7 @@ pub(crate) async fn reconcile_terminal_lifecycle_with(
     }
     if changed > 0 {
         emit_terminal_change(orch, "update");
-        crate::mcp::handlers::terminal::reconcile_exited_terminal_wakes(orch).await?;
+        crate::mcp::handlers::terminal::reconcile_exited_terminal_wakes(orch, None).await?;
     }
     Ok(changed)
 }

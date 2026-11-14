@@ -55,6 +55,7 @@ fn terminal_exit_event(
     runtime_secs: Option<i64>,
     tail: Option<&str>,
     reason: Option<&str>,
+    urgency: DeliveryUrgency,
 ) -> WakeEvent {
     WakeEvent {
         // The match key is the terminal's canonical URI, NOT the bare slug:
@@ -76,7 +77,7 @@ fn terminal_exit_event(
                 reason,
             ),
         },
-        urgency: DeliveryUrgency::Queue,
+        urgency,
         muted: MutedDelivery::Drop,
         fact_key: None,
     }
@@ -94,12 +95,21 @@ pub(crate) fn route_terminal_exit(
 ) -> Result<WakeRouteAction, String> {
     route_wake_sync(
         orch,
-        terminal_exit_event(slug, detail_uri, exit_code, runtime_secs, tail, reason),
+        terminal_exit_event(
+            slug,
+            detail_uri,
+            exit_code,
+            runtime_secs,
+            tail,
+            reason,
+            DeliveryUrgency::Queue,
+        ),
     )
 }
 
 /// Route a terminal-exit wake from an async context (the immediate-fire path when
-/// subscribing to an already-exited terminal).
+/// subscribing to an already-exited terminal). An exit observed live or at
+/// subscribe time is fresh news, so it wakes its subscriber.
 pub async fn route_terminal_exit_async(
     orch: &Orchestrator,
     slug: &str,
@@ -109,9 +119,44 @@ pub async fn route_terminal_exit_async(
     tail: Option<&str>,
     reason: Option<&str>,
 ) -> Result<WakeRouteAction, String> {
+    route_terminal_exit_at(
+        orch,
+        slug,
+        detail_uri,
+        exit_code,
+        runtime_secs,
+        tail,
+        reason,
+        DeliveryUrgency::Queue,
+    )
+    .await
+}
+
+/// Route a terminal-exit wake at a chosen urgency. Reconciliation delivers an
+/// exit that is already stale passively: recorded where its subscriber reads,
+/// consuming the one-shot, and waking nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_terminal_exit_at(
+    orch: &Orchestrator,
+    slug: &str,
+    detail_uri: &str,
+    exit_code: Option<i32>,
+    runtime_secs: Option<i64>,
+    tail: Option<&str>,
+    reason: Option<&str>,
+    urgency: DeliveryUrgency,
+) -> Result<WakeRouteAction, String> {
     route_wake(
         orch,
-        terminal_exit_event(slug, detail_uri, exit_code, runtime_secs, tail, reason),
+        terminal_exit_event(
+            slug,
+            detail_uri,
+            exit_code,
+            runtime_secs,
+            tail,
+            reason,
+            urgency,
+        ),
     )
     .await
 }
