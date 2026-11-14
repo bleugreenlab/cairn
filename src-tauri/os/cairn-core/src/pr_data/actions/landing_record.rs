@@ -843,6 +843,7 @@ async fn settle_publication(
                 Landed {
                     commit: Some(&commit),
                     source: Some(source),
+                    resolved_at: None,
                 },
             )
             .await?;
@@ -1558,6 +1559,7 @@ mod tests {
             Landed {
                 commit: Some(&publication.landing_commit),
                 source: Some(&publication.source_after),
+                resolved_at: None,
             },
         )
         .await

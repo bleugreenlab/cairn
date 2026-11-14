@@ -253,6 +253,25 @@ pub(super) async fn query_mr_context_for_create_pr_artifact_job(
     query_pr_node_mr_context_for_artifact_job(conn, job_id).await
 }
 
+/// The job whose `create-pr` artifact presents a merge request: the inverse of
+/// [`query_mr_context_for_create_pr_artifact_job`]. That is the row's owner,
+/// except for a legacy row keyed to a `pr`/`create_pr` action_run, whose
+/// artifact lives on the run's parent job.
+pub(super) async fn create_pr_artifact_job_for_merge_request(
+    db: &LocalDb,
+    mr_id: &str,
+) -> Result<Option<String>, String> {
+    db.query_opt_text(
+        "SELECT COALESCE(ar.parent_job_id, mr.job_id)
+           FROM merge_requests mr
+           LEFT JOIN action_runs ar ON ar.id = mr.job_id
+          WHERE mr.id = ?1 AND mr.job_id IS NOT NULL",
+        params![mr_id],
+    )
+    .await
+    .map_err(|e| db_error("Failed to resolve the job presenting the merge request", e))
+}
+
 /// Resolve the PR context for a job, erroring if the job has no PR.
 pub async fn resolve_mr_context_for_job(db: &LocalDb, job_id: &str) -> Result<MrContext, String> {
     let job_id = job_id.to_string();

@@ -1094,6 +1094,7 @@ async fn merge_pr_for_job_past_barrier(
         Landed {
             commit: Some(merged_commit.as_str()),
             source: merged_source,
+            resolved_at: None,
         },
     )
     .await

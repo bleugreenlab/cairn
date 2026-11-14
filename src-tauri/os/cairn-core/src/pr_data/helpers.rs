@@ -28,6 +28,26 @@ pub(crate) struct ParsedPrDetails {
     pub(crate) head_sha: String,
     /// The commit the merge wrote to the base, for a merged pull request only.
     pub(crate) merge_commit: Option<String>,
+    /// When GitHub says the pull request merged (or, unmerged, closed), in
+    /// Unix seconds. `None` while it is open.
+    pub(crate) resolved_at: Option<i64>,
+}
+
+/// GitHub's resolution time for a pull request in `state`: `merged_at` for a
+/// merge, `closed_at` for a close.
+fn resolution_time(
+    state: &PrState,
+    merged_at: Option<&str>,
+    closed_at: Option<&str>,
+) -> Option<i64> {
+    let stamp = match state {
+        PrState::Merged => merged_at,
+        PrState::Closed => closed_at,
+        PrState::Open | PrState::Unpublished => None,
+    }?;
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|time| time.timestamp())
 }
 
 // ── Pure Computation ───────────────────────────────────────────
@@ -188,6 +208,7 @@ async fn fetch_pr_via_api_with_backoff(
         .unwrap_or_default();
 
     let review_decision = compute_review_decision(&reviews);
+    let resolved_at = resolution_time(&state, pr.merged_at.as_deref(), pr.closed_at.as_deref());
 
     Ok(ParsedPrDetails {
         title: Some(pr.title),
@@ -200,6 +221,7 @@ async fn fetch_pr_via_api_with_backoff(
         deletions: Some(pr.deletions),
         head_sha: pr.head.sha,
         merge_commit: pr.merge_commit_sha.filter(|_| pr.merged),
+        resolved_at,
     })
 }
 

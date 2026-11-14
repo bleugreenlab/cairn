@@ -24,6 +24,8 @@ mod resolution;
 mod store_merge;
 
 #[cfg(test)]
+mod seal_tests;
+#[cfg(test)]
 mod test_support;
 
 pub(crate) use conflict::{
@@ -37,8 +39,9 @@ pub use context::{
 #[cfg(feature = "test-utils")]
 pub use create_pr::prose_edit_seam;
 pub(crate) use create_pr::{
-    complete_deferred_pr_sync, publish_pr_branch_for_job, sync_create_pr_artifact_for_job,
-    DeferredPrSync, DeferredPrSyncOutcome, DEFERRED_PR_SYNC_PENDING,
+    complete_deferred_pr_sync, ensure_pr_artifact_writable, publish_pr_branch_for_job,
+    sync_create_pr_artifact_for_job, DeferredPrSync, DeferredPrSyncOutcome, GatedAct,
+    DEFERRED_PR_SYNC_PENDING,
 };
 pub use default_landing::reconcile_approved_merges;
 pub use landing_record::{

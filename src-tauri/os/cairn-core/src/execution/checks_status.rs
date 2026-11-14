@@ -6330,6 +6330,7 @@ mod moved_wave_projection_tests {
             crate::pr_data::actions::Landed {
                 commit: Some(&landed),
                 source: Some(&landed),
+                resolved_at: None,
             },
         )
         .await

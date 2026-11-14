@@ -516,7 +516,17 @@ pub(crate) async fn preview_artifact_change(
     )
     .await?;
     let contract = resolve_artifact_contract(orch, &job_id, task_name, artifact_name).await;
-    let (_, output_name) = resolve_artifact_identity(orch, &job_id, artifact_name).await;
+    let (artifact_type, output_name) =
+        resolve_artifact_identity(orch, &job_id, artifact_name).await;
+    if is_create_pr_identity(artifact_name, &output_name, &artifact_type) {
+        crate::pr_data::actions::ensure_pr_artifact_writable(
+            orch,
+            &job_id,
+            false,
+            crate::pr_data::actions::GatedAct::NewVersion,
+        )
+        .await?;
+    }
     let latest = load_latest_artifact(orch, &job_id, &output_name).await;
     let mut effective_payload =
         compose_artifact_payload(latest.as_ref().map(|(base, _)| base), payload, is_patch)?;
@@ -547,6 +557,14 @@ pub(crate) async fn preview_artifact_change(
 /// lock. A create-pr version's pull-request sync is network I/O, so it is then
 /// not run here: the stored version comes back as a [`DeferredPrSync`] for the
 /// write to complete after it releases the lock.
+///
+/// `pr_gate_read_live` says the caller already read GitHub live through
+/// [`crate::pr_data::actions::ensure_pr_artifact_writable`] for this write
+/// (the `write` dispatch does, before its commit barrier, for a write addressed
+/// to `create-pr`). Otherwise a create-pr write outside the store lock reads
+/// GitHub here, so a write that only resolves to create-pr (the generic
+/// `/artifact` alias) is held to the same live read before its prose is
+/// synced.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_artifact_change(
     orch: &Orchestrator,
@@ -560,6 +578,7 @@ pub(crate) async fn write_artifact_change(
     payload: &serde_json::Value,
     is_patch: bool,
     defer_pr_sync: bool,
+    pr_gate_read_live: bool,
 ) -> Result<(String, Option<crate::pr_data::actions::DeferredPrSync>), String> {
     let services = &orch.services;
     refuse_thread_session_artifact(number, exec_seq, node_name, task_name, artifact_name)?;
@@ -641,10 +660,19 @@ pub(crate) async fn write_artifact_change(
     // `create_pr_artifact_details` syncs on, so a ctx-self write under a create-pr
     // terminal never triggers it. The reserved `action:` merge/close/refresh paths
     // return earlier and never reach here.
-    let is_create_pr_write = artifact_name == Some("create-pr")
-        || output_name.as_str() == "create-pr"
-        || artifact_type.as_str() == "create-pr";
+    let is_create_pr_write = is_create_pr_identity(artifact_name, &output_name, &artifact_type);
     if is_create_pr_write {
+        // GitHub is read once per write: here, unless the caller already read
+        // it or the write holds the store lock (where no network call may run,
+        // and the deferred sync reads it after the lock is released). The
+        // recorded seal is checked either way, at no network cost.
+        crate::pr_data::actions::ensure_pr_artifact_writable(
+            orch,
+            &job_id,
+            !defer_pr_sync && !pr_gate_read_live,
+            crate::pr_data::actions::GatedAct::NewVersion,
+        )
+        .await?;
         let job = crate::jobs::queries::get_job(&db, &job_id)
             .await
             .map_err(|e| {
@@ -1159,6 +1187,16 @@ fn should_arm_output_artifact_interrupt(
     has_output_contract && !is_patch && output_artifact_name_matches(artifact_name, required_name)
 }
 
+/// Whether a write's stored identity is a create-pr artifact: by the addressed
+/// name, or, through the generic `/artifact` alias, by the name it resolved to.
+fn is_create_pr_identity(
+    artifact_name: Option<&str>,
+    output_name: &str,
+    artifact_type: &str,
+) -> bool {
+    artifact_name == Some("create-pr") || output_name == "create-pr" || artifact_type == "create-pr"
+}
+
 fn create_pr_artifact_details(
     payload: &serde_json::Value,
     artifact_name: Option<&str>,
@@ -1548,6 +1586,64 @@ async fn store_artifact(
     })
     .await
     .map_err(|e| format!("Failed to store artifact: {}", e))
+}
+
+/// Append versions to a job's artifact chains in one write, outside the write
+/// verb: no contract, no gate, no pull-request sync. For a record Cairn itself
+/// restores (a resolved pull request's create-pr record and the draft written
+/// over it), never for a caller's content. Each entry is `(name, data,
+/// confirmed)`; the name is both the chain and the type. Returns each stored
+/// version number, in order.
+pub(crate) async fn append_restored_artifact_versions(
+    orch: &Orchestrator,
+    job_id: &str,
+    versions: Vec<(String, serde_json::Value, bool)>,
+) -> Result<Vec<i32>, String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await?;
+    let encoded = versions
+        .iter()
+        .map(|(name, data, confirmed)| {
+            serde_json::to_string(data)
+                .map(|json| (name.clone(), json, *confirmed))
+                .map_err(|e| format!("Failed to serialize artifact: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let owned_job_id = job_id.to_string();
+    let stored = db
+        .write(|conn| {
+            let job_id = owned_job_id.clone();
+            let encoded = encoded.clone();
+            Box::pin(async move {
+                let mut stored = Vec::with_capacity(encoded.len());
+                for (name, json, confirmed) in &encoded {
+                    stored.push(
+                        insert_next_artifact_version(conn, &job_id, name, name, json, *confirmed)
+                            .await?,
+                    );
+                }
+                Ok(stored)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to store artifact: {e}"))?;
+    for (stored, (_, data, confirmed)) in stored.iter().zip(versions) {
+        let artifact = crate::models::Artifact {
+            id: stored.artifact_id.clone(),
+            job_id: Some(job_id.to_string()),
+            artifact_type: stored.artifact_type.clone(),
+            schema_version: 1,
+            data,
+            version: stored.version,
+            parent_version_id: stored.parent_version_id.clone(),
+            output_name: stored.output_name.clone(),
+            created_at: stored.created_at as i64,
+            updated_at: stored.updated_at as i64,
+            seen_at: None,
+            confirmed,
+        };
+        orch.notifier.artifact(&db, &artifact).await;
+    }
+    Ok(stored.iter().map(|stored| stored.version).collect())
 }
 
 /// Insert the next version in an artifact's `(job_id, output_name)` chain.

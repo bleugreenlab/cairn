@@ -390,6 +390,12 @@ pub struct PullRequest {
     /// `merged` is set.
     pub(crate) merge_commit_sha: Option<String>,
     pub(crate) head: PrHead,
+    /// RFC 3339; set once the pull request merged.
+    #[serde(default)]
+    pub(crate) merged_at: Option<String>,
+    /// RFC 3339; set once the pull request closed, merged or not.
+    #[serde(default)]
+    pub(crate) closed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -595,6 +601,29 @@ pub(crate) async fn fetch_pr(
     let url = format!(
         "{}/repos/{}/{}/pulls/{}",
         GITHUB_API_BASE, owner, repo, pr_number
+    );
+    github_get_json(http, auth, &url).await
+}
+
+/// One entry of GitHub's pull-request listing: enough to name the pull
+/// requests worth reading in full.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ListedPull {
+    pub(crate) number: i32,
+}
+
+/// The 30 most recently updated closed pull requests (merged or not) into
+/// `base`, newest first.
+pub(crate) async fn list_closed_pulls(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+    base: &str,
+) -> Result<Vec<ListedPull>, String> {
+    let base: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
+    let url = format!(
+        "{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls?state=closed&base={base}&sort=updated&direction=desc&per_page=30"
     );
     github_get_json(http, auth, &url).await
 }

@@ -481,6 +481,11 @@ struct ObservedResolution {
     merged_source: Option<String>,
     project_id: String,
     target_branch: Option<String>,
+    /// When GitHub says the merge or close happened.
+    resolved_at: Option<i64>,
+    /// The title and body GitHub showed when it was observed, which tell a
+    /// record Cairn rewrote after the resolution from one someone else wrote.
+    github_prose: Option<super::resolution::GitHubProse>,
 }
 
 /// What a fetched pull request says the row has not recorded yet, if anything.
@@ -512,6 +517,14 @@ fn observe_resolution(
             .filter(|head| !head.is_empty()),
         project_id: mr_context.project_id.clone(),
         target_branch: branches.map(|(_, target)| target.clone()),
+        resolved_at: pr_details.resolved_at,
+        github_prose: pr_details
+            .title
+            .clone()
+            .map(|title| super::resolution::GitHubProse {
+                title,
+                body: pr_details.body.clone(),
+            }),
     })
 }
 
@@ -533,7 +546,9 @@ async fn settle_observed_resolution(orch: &Orchestrator, snapshot: &PrSnapshot) 
         super::Landed {
             commit: observed.merged_commit.as_deref(),
             source: observed.merged_source.as_deref(),
+            resolved_at: observed.resolved_at,
         },
+        observed.github_prose.clone(),
     )
     .await
     {
@@ -596,14 +611,137 @@ async fn settle_landing_follow_up(orch: &Orchestrator, job_id: &str, snapshot: &
     }
 }
 
+/// An open, bound pull request into a branch, as [`observe_external_resolutions`]
+/// considers it.
+struct OpenPull {
+    owner_id: String,
+    number: i32,
+    pr_url: String,
+    repo_path: String,
+}
+
+async fn open_pulls_into(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+) -> Result<Vec<OpenPull>, String> {
+    let (project_id, branch) = (project_id.to_string(), branch.to_string());
+    db.read(|conn| {
+        let (project_id, branch) = (project_id.clone(), branch.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT mr.job_id, mr.github_pr_number, COALESCE(mr.github_pr_url, ''),
+                            p.repo_path
+                       FROM merge_requests mr
+                       JOIN projects p ON p.id = mr.project_id
+                      WHERE mr.project_id = ?1 AND mr.target_branch = ?2
+                        AND mr.status = 'open' AND mr.job_id IS NOT NULL
+                        AND mr.github_pr_number > 0 AND COALESCE(mr.is_local, 0) = 0",
+                    params![project_id.as_str(), branch.as_str()],
+                )
+                .await?;
+            let mut pulls = Vec::new();
+            while let Some(row) = rows.next().await? {
+                pulls.push(OpenPull {
+                    owner_id: row.text(0)?,
+                    number: row.i64(1)? as i32,
+                    pr_url: row.text(2)?,
+                    repo_path: row.text(3)?,
+                });
+            }
+            Ok(pulls)
+        })
+    })
+    .await
+    .map_err(|e| db_error("Failed to load the branch's open pull requests", e))
+}
+
+/// Find the pull requests into `branch` that GitHub resolved without Cairn,
+/// and settle each as a reader's refresh would.
+///
+/// Called when origin's `branch` has advanced past the store. Cairn's own
+/// merges land through the store, so an advance the store lacks was made
+/// elsewhere, most often by a pull request merged on GitHub. Before this, such
+/// a merge stayed unseen until something happened to read its pull request,
+/// which took hours, and once days. One listing of recently closed pull
+/// requests per repository names the candidates; each open row it names is
+/// refreshed live, and that refresh's observation resolves it (and restores
+/// its record if it was written over meanwhile).
+pub(crate) async fn observe_external_resolutions(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) {
+    let pulls = match crate::execution::routing::owning_db_for_project(&orch.db, project_id).await {
+        Ok(db) => open_pulls_into(&db, project_id, branch).await,
+        Err(error) => Err(error.to_string()),
+    };
+    let pulls = match pulls {
+        Ok(pulls) if pulls.is_empty() => return,
+        Ok(pulls) => pulls,
+        Err(error) => {
+            log::warn!(
+                "Could not look for external merges into `{branch}` of project {project_id}: {error}"
+            );
+            return;
+        }
+    };
+    let mut by_repo: std::collections::BTreeMap<(String, String), Vec<OpenPull>> =
+        Default::default();
+    for pull in pulls {
+        match get_owner_repo_for_pr(&pull.pr_url, &pull.repo_path) {
+            Ok(repo) => by_repo.entry(repo).or_default().push(pull),
+            Err(error) => log::warn!(
+                "Could not name the repository of PR #{} into `{branch}` of project \
+                 {project_id}: {error}",
+                pull.number
+            ),
+        }
+    }
+    for ((owner, repo), pulls) in by_repo {
+        let listed = match installation_authority(&orch.db.local, &owner).await {
+            Ok(auth) => {
+                api::list_closed_pulls(&*orch.services.http, &auth, &owner, &repo, branch).await
+            }
+            Err(error) => Err(error),
+        };
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                log::warn!(
+                    "Could not list closed pull requests into `{branch}` of {owner}/{repo} \
+                     (project {project_id}): {error}"
+                );
+                continue;
+            }
+        };
+        for pull in pulls {
+            if !listed.iter().any(|entry| entry.number == pull.number) {
+                continue;
+            }
+            if let Err(error) =
+                pr_snapshot_for_job(orch, &pull.owner_id, Some(Instant::now())).await
+            {
+                log::warn!(
+                    "Could not refresh PR #{} of {owner}/{repo}, which GitHub lists as closed \
+                     (project {project_id}, `{branch}`): {error}",
+                    pull.number
+                );
+            }
+        }
+    }
+}
+
 /// A change whose remote signals are still resolving — GitHub computes
 /// mergeability asynchronously, and a check run in flight has no verdict yet —
 /// is genuinely live, so it re-reads on a short window.
 const UNRESOLVED_FRESHNESS_SECS: i64 = 15;
-/// An open change whose signals HAVE resolved rides a long window. Every real
-/// transition (a push, a review, a check completing, a merge) advances the
-/// generation exactly, so this window is a backstop for a workspace with no
-/// webhook delivery, not the mechanism liveness depends on.
+/// An open change whose signals HAVE resolved rides a long window. A transition
+/// Cairn makes (a push, a merge, a prose edit) advances the generation exactly.
+/// A merge made elsewhere is found when origin's base advances past the store
+/// ([`observe_external_resolutions`]); a close made elsewhere moves nothing on
+/// origin, so a reader within this window, or a later one, is what sees it.
 const RESOLVED_FRESHNESS_SECS: i64 = 300;
 
 impl PrSnapshot {
@@ -1435,6 +1573,16 @@ pub async fn render_live_pr_section(
                 out.push_str(&format!("Landed with: {record}\n"));
             }
         }
+    }
+    if let Some(sealed) = super::resolution::render_sealed_record(
+        &db,
+        &mr_context.mr_id,
+        cache.pr_number,
+        &cache.state,
+    )
+    .await
+    {
+        out.push_str(&sealed);
     }
     if let Some(review) = &cache.review_decision {
         out.push_str(&format!("Review: {}\n", review));

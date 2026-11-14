@@ -583,6 +583,20 @@ async fn sync_if_behind(
     let orch = orch.clone();
     let project_id = project_id.to_string();
     let branch = branch.to_string();
+    // Cairn's own merges land through the store, so origin ahead of the store
+    // means something else moved the branch: most often a pull request merged
+    // on GitHub, which nothing else notices until its pull request is read.
+    {
+        let (orch, project_id, branch) = (orch.clone(), project_id.clone(), branch.clone());
+        tokio::spawn(async move {
+            crate::pr_data::actions::refresh::observe_external_resolutions(
+                &orch,
+                &project_id,
+                &branch,
+            )
+            .await
+        });
+    }
     tokio::spawn(async move { sync(&orch, &project_id, &branch).await });
 }
 

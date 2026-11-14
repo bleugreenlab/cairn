@@ -132,26 +132,238 @@ fn publish_failure_remedy(error: &str) -> &'static str {
     }
 }
 
-/// The merge request's recorded lifecycle, read before anything is pushed.
-async fn merge_request_is_recorded_open(db: &LocalDb, mr_id: &str) -> Result<bool, String> {
-    let mr_id = mr_id.to_string();
-    db.read(move |conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM merge_requests
-                      WHERE id = ?1
-                        AND status NOT IN ('merged', 'closed')
-                        AND (github_state IS NULL
-                             OR lower(github_state) NOT IN ('merged', 'closed'))",
-                    params![mr_id.as_str()],
-                )
-                .await?;
-            Ok(rows.next().await?.is_some())
-        })
-    })
+/// How a node's pull request was resolved. A resolved pull request's create-pr
+/// artifact is sealed: it is the record of what merged (or closed), so nothing
+/// writes a new version of it or pushes its prose or branch again. A reopened
+/// pull request stays sealed; its follow-up is a new execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sealed {
+    Merged,
+    Closed,
+}
+
+impl Sealed {
+    /// The seal a row's recorded status and last-fetched GitHub state imply.
+    /// Either side saying merged is a merge; GitHub can merge a pull request
+    /// the row recorded closed.
+    fn of(status: Option<&str>, github_state: Option<&str>) -> Option<Self> {
+        let github = github_state.map(str::to_ascii_lowercase);
+        if status == Some("merged") || github.as_deref() == Some("merged") {
+            Some(Self::Merged)
+        } else if status == Some("closed") || github.as_deref() == Some("closed") {
+            Some(Self::Closed)
+        } else {
+            None
+        }
+    }
+
+    fn from_state(state: &crate::models::PrState) -> Option<Self> {
+        match state {
+            crate::models::PrState::Merged => Some(Self::Merged),
+            crate::models::PrState::Closed => Some(Self::Closed),
+            crate::models::PrState::Open | crate::models::PrState::Unpublished => None,
+        }
+    }
+}
+
+/// The merge request's recorded lifecycle, read before anything is written,
+/// pushed or edited.
+async fn recorded_seal(db: &LocalDb, mr_id: &str) -> Result<Option<Sealed>, String> {
+    db.query_opt(
+        "SELECT status, github_state FROM merge_requests WHERE id = ?1",
+        (mr_id.to_string(),),
+        |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+    )
     .await
     .map_err(|error| db_error("Failed to read the merge request's state", error))
+    .map(|row| row.and_then(|(status, github)| Sealed::of(status.as_deref(), github.as_deref())))
+}
+
+/// `cairn://p/KEY/N` for a node URI `cairn://p/KEY/N/EXEC/NODE`.
+fn issue_uri_of(node_uri: &str) -> Option<String> {
+    let rest = node_uri.strip_prefix("cairn://p/")?;
+    let mut parts = rest.splitn(3, '/');
+    let (key, number) = (parts.next()?, parts.next()?);
+    (!key.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("cairn://p/{key}/{number}"))
+}
+
+/// What a gated caller was about to do, which its refusal says did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatedAct {
+    /// Store a new version of the create-pr artifact.
+    NewVersion,
+    /// Push the pull request's branch.
+    Publish,
+    /// Edit the pull request's title and body from a version already stored.
+    ProseSync,
+}
+
+impl GatedAct {
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::NewVersion => "Nothing was written.",
+            Self::Publish => "The branch was not published.",
+            Self::ProseSync => "The pull request was not edited.",
+        }
+    }
+}
+
+/// The one refusal of a write to a sealed create-pr artifact. It names the
+/// route a follow-up takes, because a second pull request from the node whose
+/// pull request already resolved is exactly what the seal exists to stop.
+pub(crate) fn sealed_refusal(
+    node_uri: Option<&str>,
+    pr_number: Option<i32>,
+    sealed: Sealed,
+    act: GatedAct,
+) -> String {
+    let subject = match pr_number {
+        Some(number) => format!("PR #{number}"),
+        None => "change".to_string(),
+    };
+    let outcome = match sealed {
+        Sealed::Merged => "merged",
+        Sealed::Closed => "closed without merging",
+    };
+    let issue = node_uri.and_then(|uri| Some((uri, issue_uri_of(uri)?)));
+    let (executions, continuity) = match issue {
+        Some((node, issue)) => (format!("{issue}/executions"), node.to_string()),
+        None => (
+            "cairn://p/PROJECT/NUMBER/executions".to_string(),
+            "<this node's URI>".to_string(),
+        ),
+    };
+    let consequence = act.consequence();
+    format!(
+        "This node's {subject} {outcome}. Follow-up work goes in a new execution on this issue \
+         (`{executions}` with `continuity`), or a new issue. {consequence}\n\
+         e.g. write({{changes:[{{target:\"{executions}\",mode:\"append\",payload:{{continuity:\"{continuity}\"}}}}]}})"
+    )
+}
+
+/// The one gate on every write of a create-pr artifact: a new version, a
+/// publish of its branch, or a sync of its prose into the pull request.
+///
+/// The recorded state answers first and costs no network call. A pull request
+/// the record calls open is then read live from GitHub when `live` is set,
+/// unconditionally: `github_fetched_at` dates the last fetch that changed
+/// something, not the last look, so no stored timestamp can say the record is
+/// fresh. A failed read refuses, because a stale "open" is how a merged pull
+/// request's record came to be rewritten. `live` is unset only where network
+/// I/O must not run (under a store lock); the deferred sync re-gates live.
+///
+/// A job with no merge request yet is writable: its first pull request has not
+/// opened. `act` is what the caller was about to do, which a refusal says did
+/// not happen.
+pub(crate) async fn ensure_pr_artifact_writable(
+    orch: &Orchestrator,
+    job_id: &str,
+    live: bool,
+    act: GatedAct,
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let owned_job_id = job_id.to_string();
+    let Some(mr) = db
+        .read(|conn| {
+            let job_id = owned_job_id.clone();
+            Box::pin(
+                async move { query_mr_context_for_create_pr_artifact_job(conn, &job_id).await },
+            )
+        })
+        .await
+        .map_err(|e| db_error("Failed to resolve merge request", e))?
+    else {
+        return Ok(());
+    };
+    if let Some(sealed) = recorded_seal(&db, &mr.mr_id).await? {
+        return Err(refusal_for_job(&db, job_id, mr.github_pr_number, sealed, act).await);
+    }
+    let Some(pr_number) = mr.github_pr_number.filter(|_| live && !mr.is_local) else {
+        return Ok(());
+    };
+    // The live read goes through the GitHub App even though the prose edit runs
+    // through `gh`. A missing installation is fixed in GitHub's settings, where
+    // retrying does nothing, so it is told apart before the read is attempted.
+    let owner = crate::github::credentials::get_owner_repo_for_pr(&mr.pr_url, &mr.repo_path)
+        .map(|(owner, _)| owner)
+        .map_err(|error| unconfirmed_refusal(pr_number, Unconfirmed::UnknownOwner(error), act))?;
+    if let Err(detail) =
+        crate::security::broker::github::installation_authority(&orch.db.local, &owner).await
+    {
+        return Err(unconfirmed_refusal(
+            pr_number,
+            Unconfirmed::NotInstalled { owner, detail },
+            act,
+        ));
+    }
+    // The snapshot's own observation of a merge or close records it, so the
+    // refusal below and the row agree.
+    let snapshot = crate::pr_data::actions::refresh::pr_snapshot_for_job(
+        orch,
+        &mr.job_id,
+        Some(std::time::Instant::now()),
+    )
+    .await
+    .map_err(|error| unconfirmed_refusal(pr_number, Unconfirmed::Unanswered(error), act))?;
+    match Sealed::from_state(&snapshot.cache.state) {
+        Some(sealed) => Err(refusal_for_job(&db, job_id, Some(pr_number), sealed, act).await),
+        None => Ok(()),
+    }
+}
+
+/// Why a pull request the record calls open could not be confirmed open. Each
+/// cause carries its own remedy, because the gate fails closed on all of them.
+enum Unconfirmed {
+    /// The pull request's URL named no repository owner.
+    UnknownOwner(String),
+    /// No GitHub App installation covers the owner, so there is no credential
+    /// to read the pull request with.
+    NotInstalled { owner: String, detail: String },
+    /// The read was attempted and GitHub did not answer it.
+    Unanswered(String),
+}
+
+fn unconfirmed_refusal(pr_number: i32, cause: Unconfirmed, act: GatedAct) -> String {
+    let consequence = act.consequence();
+    let (cause, remedy) = match cause {
+        Unconfirmed::UnknownOwner(error) => (
+            format!("its repository owner could not be resolved ({error})"),
+            "check the pull request URL bound to this node's merge request, then retry."
+                .to_string(),
+        ),
+        Unconfirmed::NotInstalled { owner, detail } => (
+            format!("no GitHub App installation for {owner} ({detail})"),
+            format!(
+                "install Cairn's GitHub App on {owner} (connect the app first if none is), then \
+                 retry. The edit runs through `gh`, but whether the pull request is still open \
+                 is read through the app."
+            ),
+        ),
+        Unconfirmed::Unanswered(error) => (
+            format!("GitHub did not answer the read ({error})"),
+            "retry once GitHub answers. The write is refused rather than risk rewriting a pull \
+             request that may have merged."
+                .to_string(),
+        ),
+    };
+    format!(
+        "Could not confirm PR #{pr_number} is still open: {cause}. {consequence}\nRemedy: {remedy}"
+    )
+}
+
+/// [`sealed_refusal`] addressed from the node `job_id` belongs to.
+async fn refusal_for_job(
+    db: &LocalDb,
+    job_id: &str,
+    pr_number: Option<i32>,
+    sealed: Sealed,
+    act: GatedAct,
+) -> String {
+    let node_uri = crate::messages::delivery::node_uri_for_job(db, job_id).await;
+    sealed_refusal(node_uri.as_deref(), pr_number, sealed, act)
 }
 
 /// What a live re-read after the push establishes about the pull request.
@@ -221,8 +433,9 @@ fn publish_outcome_message(
 /// branch that shares its history, and refuses one that does not.
 ///
 /// Refused without pushing unless the pull request is bound and open, both as
-/// recorded and as GitHub reports it live: publishing the branch of a merged or
-/// closed pull request could recreate a remote branch removed on purpose.
+/// recorded and as GitHub reports it live ([`ensure_pr_artifact_writable`]):
+/// publishing the branch of a merged or closed pull request could recreate a
+/// remote branch removed on purpose.
 ///
 /// A commit barrier first: commits earlier batches sealed on the branch but
 /// could not publish are republished, so the push carries them.
@@ -241,8 +454,6 @@ async fn publish_pr_branch_past_barrier(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<String, String> {
-    use crate::models::PrState;
-
     let mr = crate::pr_data::actions::try_resolve_mr_context_for_job(&orch.db.local, job_id)
         .await?
         .ok_or_else(|| {
@@ -262,29 +473,7 @@ async fn publish_pr_branch_past_barrier(
                 .to_string(),
         );
     }
-    if !merge_request_is_recorded_open(&orch.db.local, &mr.mr_id).await? {
-        return Err(
-            "this pull request is merged or closed, so its branch was not published".to_string(),
-        );
-    }
-    let live = crate::pr_data::actions::refresh::pr_snapshot_for_job(
-        orch,
-        &mr.job_id,
-        Some(std::time::Instant::now()),
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "could not confirm the pull request is still open, so its branch was not \
-                 published: {error}"
-        )
-    })?;
-    if live.unbound.is_some() || !matches!(live.cache.state, PrState::Open) {
-        return Err(format!(
-            "GitHub reports this pull request as {}, so its branch was not published",
-            live.cache.state
-        ));
-    }
+    ensure_pr_artifact_writable(orch, job_id, true, GatedAct::Publish).await?;
 
     let branch = publish_merge_request_branch(orch, &mr.repo_path, &mr.mr_id)
         .await
@@ -430,6 +619,13 @@ pub(crate) async fn complete_deferred_pr_sync(
         if attempt > 0 && id == synced_id {
             return Ok(DeferredPrSyncOutcome::Synced);
         }
+        // The version was stored under a store lock, where only the recorded
+        // state could be checked. GitHub answers before its prose is pushed;
+        // a merge seen here restores the record and keeps this version as a
+        // post-merge draft.
+        if attempt == 0 {
+            ensure_pr_artifact_writable(orch, &deferral.job_id, true, GatedAct::ProseSync).await?;
+        }
         let title = data
             .get("title")
             .and_then(serde_json::Value::as_str)
@@ -474,6 +670,19 @@ async fn sync_pr_prose(
     else {
         return Ok(false);
     };
+    // Every caller has passed the gate already; the recorded seal is checked
+    // again here because a merge can be recorded between the gate and this
+    // edit, and an edit of a merged pull request rewrites its record.
+    if let Some(sealed) = recorded_seal(&orch.db.local, &mr_context.mr_id).await? {
+        return Err(refusal_for_job(
+            &orch.db.local,
+            &job_id,
+            mr_context.github_pr_number,
+            sealed,
+            GatedAct::ProseSync,
+        )
+        .await);
+    }
 
     // Only a bound remote PR has a head to advance; a local-only change has no
     // origin to publish to and nothing external reading it.
@@ -489,18 +698,15 @@ async fn sync_pr_prose(
             publish_branch_for_artifact_sync(orch, &mr_context.repo_path, &mr_context.mr_id)
                 .await?;
         }
-        #[cfg(feature = "test-utils")]
-        let scripted =
-            prose_edit_seam::intercept(orch, &mr_context.repo_path, &mr_context.mr_id, pr_number)
-                .await;
-        #[cfg(not(feature = "test-utils"))]
-        let scripted: Option<Result<(), String>> = None;
-        match scripted {
-            Some(result) => result?,
-            None => {
-                edit_github_pr_title_body(&mr_context.repo_path, pr_number, title, body).await?
-            }
-        }
+        edit_pull_request_prose(
+            orch,
+            &mr_context.repo_path,
+            &mr_context.mr_id,
+            pr_number,
+            title,
+            body,
+        )
+        .await?;
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -519,6 +725,44 @@ async fn sync_pr_prose(
     Ok(true)
 }
 
+/// Edit a bound pull request's title and body on GitHub.
+async fn edit_pull_request_prose(
+    orch: &Orchestrator,
+    repo_path: &str,
+    mr_id: &str,
+    pr_number: i32,
+    title: &str,
+    body: Option<&str>,
+) -> Result<(), String> {
+    #[cfg(feature = "test-utils")]
+    let scripted = prose_edit_seam::intercept(orch, repo_path, mr_id, pr_number, title, body).await;
+    #[cfg(not(feature = "test-utils"))]
+    let scripted: Option<Result<(), String>> = {
+        let _ = (orch, mr_id);
+        None
+    };
+    match scripted {
+        Some(result) => result,
+        None => edit_github_pr_title_body(repo_path, pr_number, title, body).await,
+    }
+}
+
+/// Put a resolved pull request's merged prose back on GitHub and in its row,
+/// after Cairn itself pushed a post-merge draft over it. The seal's gate never
+/// sees this edit: it restores the record the gate protects.
+pub(super) async fn restore_pull_request_prose(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    repo_path: &str,
+    mr_id: &str,
+    pr_number: i32,
+    title: &str,
+    body: Option<&str>,
+) -> Result<(), String> {
+    edit_pull_request_prose(orch, repo_path, mr_id, pr_number, title, body).await?;
+    update_merge_request_title_body(db, mr_id, title, body, chrono::Utc::now().timestamp()).await
+}
+
 /// Lets an integration test stand in for `gh pr edit` on one repository and
 /// observe the locks held at the moment the pull request would be edited.
 #[cfg(feature = "test-utils")]
@@ -530,6 +774,8 @@ pub mod prose_edit_seam {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ProseEditProbe {
         pub pr_number: i32,
+        pub title: String,
+        pub body: Option<String>,
         pub store_lock_holder: Option<String>,
         pub branch_reservation_holder: Option<String>,
     }
@@ -576,6 +822,8 @@ pub mod prose_edit_seam {
         repo_path: &str,
         mr_id: &str,
         pr_number: i32,
+        title: &str,
+        body: Option<&str>,
     ) -> Option<Result<(), String>> {
         let (script, probes) = SEAMS.lock().unwrap().get(repo_path).cloned()?;
         let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(repo_path));
@@ -584,6 +832,8 @@ pub mod prose_edit_seam {
             .unwrap_or_default();
         let probe = ProseEditProbe {
             pr_number,
+            title: title.to_string(),
+            body: body.map(str::to_string),
             store_lock_holder: orch
                 .store_lock_status(&store)
                 .and_then(|status| status.holder.map(|(operation, _)| operation)),
@@ -723,14 +973,14 @@ mod tests {
     /// A merged or closed pull request's branch is never published: the refusal
     /// comes from the recorded state, before any push is attempted (reaching
     /// the push here would fail with "could not publish", since the fixture has
-    /// no store).
+    /// no store). It is the seal's one refusal, route included.
     #[tokio::test(flavor = "current_thread")]
     async fn publish_refuses_a_merged_or_closed_pull_request_without_pushing() {
-        for (column, value) in [
-            ("status", "closed"),
-            ("status", "merged"),
-            ("github_state", "MERGED"),
-            ("github_state", "CLOSED"),
+        for (column, value, outcome) in [
+            ("status", "closed", "PR #2833 closed without merging"),
+            ("status", "merged", "PR #2833 merged"),
+            ("github_state", "MERGED", "PR #2833 merged"),
+            ("github_state", "CLOSED", "PR #2833 closed without merging"),
         ] {
             let db = migrated_db().await;
             let repo = tempfile::tempdir().unwrap();
@@ -747,7 +997,9 @@ mod tests {
                 .await
                 .expect_err("a merged or closed pull request must not be published");
             assert!(
-                error.contains("merged or closed") && error.contains("not published"),
+                error.contains(outcome)
+                    && error.contains("continuity")
+                    && error.contains("The branch was not published."),
                 "{column}={value}: {error}"
             );
             assert!(

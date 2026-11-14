@@ -383,7 +383,14 @@ pub(super) async fn dispatch(
                 // A write holding its store lock has already drained its
                 // branch's held work under that lock and pushes the branch after
                 // releasing it; the barrier's own push would need the lock.
-                let barrier = if artifact_label == "create-pr" && held_store.is_none() {
+                //
+                // Before the barrier, the seal: a resolved pull request's record
+                // takes no new version, and one the record calls open is read
+                // live first. Under the store lock no network call may run, so
+                // `write_artifact_change` checks the recorded state there and
+                // the deferred sync reads GitHub after the lock is released.
+                let gated_live = artifact_label == "create-pr" && held_store.is_none();
+                let barrier = if gated_live {
                     match crate::resources::resolve_node_or_task_job_id(
                         &orch.db.local,
                         project,
@@ -394,10 +401,20 @@ pub(super) async fn dispatch(
                     )
                     .await
                     {
-                        Ok(job_id) => Some(
-                            crate::mcp::handlers::run::held::job_commit_barrier(orch, &job_id)
-                                .await,
-                        ),
+                        Ok(job_id) => {
+                            crate::pr_data::actions::ensure_pr_artifact_writable(
+                                orch,
+                                &job_id,
+                                true,
+                                crate::pr_data::actions::GatedAct::NewVersion,
+                            )
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?;
+                            Some(
+                                crate::mcp::handlers::run::held::job_commit_barrier(orch, &job_id)
+                                    .await,
+                            )
+                        }
                         Err(_) => None,
                     }
                 } else {
@@ -415,6 +432,7 @@ pub(super) async fn dispatch(
                     payload,
                     matches!(mode, ChangeMode::Patch),
                     held_store.is_some(),
+                    gated_live,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -477,6 +495,7 @@ pub(super) async fn dispatch(
                     payload,
                     matches!(mode, ChangeMode::Patch),
                     held_store.is_some(),
+                    false,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

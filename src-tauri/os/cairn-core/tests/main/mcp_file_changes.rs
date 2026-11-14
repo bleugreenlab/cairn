@@ -14,7 +14,8 @@ use cairn_core::internal::mcp::handlers::write::replay::{
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::lifecycle;
 use cairn_core::internal::orchestrator::Orchestrator;
-use cairn_core::internal::services::{testing::TestServicesBuilder, RealGitClient};
+use cairn_core::internal::services::testing::{MockHttpClient, TestServicesBuilder};
+use cairn_core::internal::services::{HttpResponse, RealGitClient};
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::memories::db as memory_db;
 use cairn_core::models::{
@@ -1667,8 +1668,45 @@ async fn orchestrator_with_config(config_dir: &Path) -> Orchestrator {
     let db = Arc::new(db);
     let search_index = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db, search_index));
-    let services = Arc::new(TestServicesBuilder::new().with_git(RealGitClient).build());
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_git(RealGitClient)
+            .with_http(github_with_open_pull_request())
+            .build(),
+    );
     Orchestrator::builder(db_state, services, config_dir.to_path_buf()).build()
+}
+
+const TEST_KEY: &str = include_str!("../fixtures/test_rsa_key.pem");
+
+/// GitHub reporting the pull request [`bind_remote_pr_to_job`] binds as open,
+/// which a create-pr write confirms before it syncs prose into it.
+fn github_with_open_pull_request() -> MockHttpClient {
+    let json = |status: u16, value: serde_json::Value| {
+        HttpResponse::new(status, serde_json::to_vec(&value).unwrap())
+    };
+    MockHttpClient::new()
+        .respond_to(
+            "access_tokens",
+            json(
+                201,
+                json!({"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}),
+            ),
+        )
+        .respond_to("/pulls/4242/reviews", json(200, json!([])))
+        .respond_to("/pulls/4242/files", json(200, json!([])))
+        .respond_to("/check-runs", json(200, json!({"check_runs": []})))
+        .respond_to(
+            "/pulls/4242",
+            json(
+                200,
+                json!({
+                    "title": "Old title", "body": null, "state": "open", "draft": false,
+                    "mergeable": true, "mergeable_state": "clean", "additions": 1,
+                    "deletions": 0, "merged": false, "head": {"sha": "0".repeat(40)}
+                }),
+            ),
+        )
 }
 
 async fn insert_issue(db: &LocalDb, project_id: &str, number: i64, title: &str) -> String {
@@ -2822,19 +2860,24 @@ async fn a_write_whose_publication_failed_is_not_replayed_as_committed() {
 }
 
 /// Bind an open remote pull request to this fixture's own job, so a create-pr
-/// artifact write on that job has a pull request to sync.
+/// artifact write on that job has a pull request to sync. The fixture's GitHub
+/// ([`github_with_open_pull_request`]) confirms it open.
 async fn bind_remote_pr_to_job(repo: &ChangeTestRepo) {
-    repo.orch
-        .db
-        .local
-        .execute(
-            "INSERT INTO merge_requests
-             (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number)
-             VALUES ('mr-deferred', 'job-change', ?1, 'Old title', 'agent/CHG-1-builder-0', 'main', 'open', 0, 1, 1, 4242)",
-            cairn_db::turso::params![repo.project_id.clone()],
-        )
-        .await
-        .unwrap();
+    let db = &repo.orch.db.local;
+    db.execute(
+        "INSERT INTO github_app (id, app_id, private_key, installation_id) VALUES ('default', 123, ?1, 999)",
+        cairn_db::turso::params![TEST_KEY],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO merge_requests
+         (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number, github_pr_url)
+         VALUES ('mr-deferred', 'job-change', ?1, 'Old title', 'agent/CHG-1-builder-0', 'main', 'open', 0, 1, 1, 4242, 'https://github.com/octo/widget/pull/4242')",
+        cairn_db::turso::params![repo.project_id.clone()],
+    )
+    .await
+    .unwrap();
 }
 
 fn file_and_create_pr_payload() -> serde_json::Value {

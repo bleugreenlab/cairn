@@ -7,7 +7,8 @@ use crate::transitions::Resolution;
 use cairn_db::turso::params;
 
 use super::context::{
-    db_error, resolve_merge_mr_context_for_job, MergeMrContext, PrNodeResolution,
+    create_pr_artifact_job_for_merge_request, db_error, resolve_merge_mr_context_for_job,
+    MergeMrContext, MrContext, PrNodeResolution,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -865,24 +866,27 @@ async fn claim_merge_request_resolution(
     landed: Landed<'_>,
     now: i64,
 ) -> Result<bool, String> {
+    // The resolution's own time is when it happened; `updated_at` is when the
+    // row learned of it.
+    let resolved_at = landed.resolved_at.unwrap_or(now);
     let moved = match resolution {
         PrNodeResolution::Merge => {
             db.execute(
                 "UPDATE merge_requests
-                 SET status = 'merged', merged_at = ?1, updated_at = ?1,
+                 SET status = 'merged', merged_at = ?1, updated_at = ?5,
                      merged_commit = COALESCE(?2, merged_commit),
                      merged_source_commit = COALESCE(?3, merged_source_commit)
                  WHERE id = ?4 AND status IN ('open', 'closed')",
-                params![now, landed.commit, landed.source, mr_id],
+                params![resolved_at, landed.commit, landed.source, mr_id, now],
             )
             .await
         }
         PrNodeResolution::Close => {
             db.execute(
                 "UPDATE merge_requests
-                 SET status = 'closed', closed_at = ?1, updated_at = ?1
+                 SET status = 'closed', closed_at = ?1, updated_at = ?3
                  WHERE id = ?2 AND status = 'open'",
-                params![now, mr_id],
+                params![resolved_at, mr_id, now],
             )
             .await
         }
@@ -953,8 +957,16 @@ enum Resolver {
     /// A Cairn action that performed the merge or close. `None` is a boundary
     /// that did not say whom it acted for, which is journaled loudly.
     Performed(Option<PrResolutionAttribution>),
-    /// A refresh that saw GitHub report a merge or close Cairn did not perform.
-    Observed,
+    /// A refresh that saw GitHub report a merge or close Cairn did not perform,
+    /// with the title and body GitHub showed when it did.
+    Observed(Option<GitHubProse>),
+}
+
+/// A pull request's title and body as one GitHub fetch saw them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GitHubProse {
+    pub(super) title: String,
+    pub(super) body: Option<String>,
 }
 
 /// What a merge put where: the commit it wrote to the target, and the commit
@@ -966,10 +978,15 @@ enum Resolver {
 /// cleanup deletes a merged branch only while it still holds this commit, so a
 /// commit its owner made after the landing is never deleted. `None` when the
 /// route cannot name it; cleanup then falls back to a real ancestry proof.
+///
+/// `resolved_at` is when the merge or close actually happened, when that is
+/// known and is not now: GitHub's `merged_at`/`closed_at` for a resolution
+/// Cairn only observed. `None` stamps the claim with the time it runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Landed<'a> {
     pub commit: Option<&'a str>,
     pub source: Option<&'a str>,
+    pub resolved_at: Option<i64>,
 }
 
 /// Resolve a `pr` node by its owner id (`merge_requests.job_id`): the producing
@@ -991,6 +1008,7 @@ pub async fn resolve_pr_node(
         Landed {
             commit: merged_commit,
             source: None,
+            resolved_at: None,
         },
         Resolver::Performed(attribution),
     )
@@ -1034,8 +1052,16 @@ pub(super) async fn resolve_observed_pr_node(
     owner_id: &str,
     resolution: PrNodeResolution,
     landed: Landed<'_>,
+    github_prose: Option<GitHubProse>,
 ) -> Result<bool, String> {
-    resolve_pr_node_as(orch, owner_id, resolution, landed, Resolver::Observed).await
+    resolve_pr_node_as(
+        orch,
+        owner_id,
+        resolution,
+        landed,
+        Resolver::Observed(github_prose),
+    )
+    .await
 }
 
 async fn resolve_pr_node_as(
@@ -1079,6 +1105,10 @@ async fn resolve_pr_node_as(
     }
     let lane_snapshot = serde_json::to_string(&lane_snapshot)
         .map_err(|e| format!("Failed to record the lane snapshot: {e}"))?;
+    let github_prose = match &resolver {
+        Resolver::Observed(prose) => prose.clone(),
+        Resolver::Performed(_) => None,
+    };
     let attribution = match resolver {
         Resolver::Performed(attribution) => Some(attribution.unwrap_or_else(|| {
             log::error!(
@@ -1092,7 +1122,7 @@ async fn resolve_pr_node_as(
         })),
         // Only the call that resolved the row journals the observation, so a
         // resolution observed by many readers is recorded once.
-        Resolver::Observed => claimed.then(PrResolutionAttribution::github_observation),
+        Resolver::Observed(_) => claimed.then(PrResolutionAttribution::github_observation),
     };
     if let Some(attribution) = attribution {
         db.execute(
@@ -1123,6 +1153,17 @@ async fn resolve_pr_node_as(
         announce_pr_resolution(orch, &merge_context);
         return Ok(false);
     }
+
+    // Only the call that won the claim restores the record, so it is restored
+    // once however many readers saw the resolution.
+    restore_sealed_pr_record(
+        orch,
+        &db,
+        &merge_context.mr,
+        landed.resolved_at.unwrap_or(now),
+        github_prose.as_ref(),
+    )
+    .await;
 
     // Resolving the PR resolves its issue, and resolving an issue runs the
     // terminal cascade: the issue's live work is stopped, its queued work is
@@ -1265,6 +1306,234 @@ async fn resolve_pr_node_as(
 
     announce_pr_resolution(orch, &merge_context);
     Ok(true)
+}
+
+/// The chain a create-pr version written after its pull request resolved is
+/// kept in once the resolved record is restored over it. Its own name keeps it
+/// out of the pull-request artifact's identity, so nothing ever syncs it to
+/// GitHub, and labels it wherever the node's artifacts are listed.
+pub(crate) const POST_MERGE_DRAFT_CHAIN: &str = "create-pr-post-merge-draft";
+
+const CREATE_PR_CHAIN: &str = "create-pr";
+
+/// One stored version of a create-pr chain.
+struct ChainVersion {
+    version: i32,
+    data: serde_json::Value,
+    created_at: i64,
+    confirmed: bool,
+}
+
+impl ChainVersion {
+    fn says(&self, prose: &GitHubProse) -> bool {
+        let title = self.data.get("title").and_then(serde_json::Value::as_str);
+        let body = self.data.get("body").and_then(serde_json::Value::as_str);
+        title.is_some_and(|title| same_prose(title, &prose.title))
+            && same_prose(body.unwrap_or(""), prose.body.as_deref().unwrap_or(""))
+    }
+}
+
+/// GitHub stores a body it was sent with CRLF line ends and trailing space
+/// trimmed, so equal prose compares equal only after the same normalization.
+fn same_prose(a: &str, b: &str) -> bool {
+    let normalize = |text: &str| text.replace("\r\n", "\n").trim().to_string();
+    normalize(a) == normalize(b)
+}
+
+/// The lines a resolved pull request's live section adds: the record is
+/// sealed, and where a draft written after the resolution is kept, if one was.
+pub(super) async fn render_sealed_record(
+    db: &LocalDb,
+    mr_id: &str,
+    pr_number: Option<i32>,
+    state: &crate::models::PrState,
+) -> Option<String> {
+    let verb = match state {
+        crate::models::PrState::Merged => "merged",
+        crate::models::PrState::Closed => "closed",
+        crate::models::PrState::Open | crate::models::PrState::Unpublished => return None,
+    };
+    let subject = pr_number
+        .map(|number| format!("PR #{number}"))
+        .unwrap_or_else(|| "This change".to_string());
+    let mut out = format!("Sealed: {subject} {verb}; this record is what {verb}.\n");
+    let job_id = create_pr_artifact_job_for_merge_request(db, mr_id)
+        .await
+        .ok()
+        .flatten()?;
+    let has_draft = db
+        .query_opt_text(
+            "SELECT id FROM artifacts WHERE job_id = ?1 AND output_name = ?2 LIMIT 1",
+            params![job_id.as_str(), POST_MERGE_DRAFT_CHAIN],
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if has_draft {
+        if let Some(node) = crate::messages::delivery::node_uri_for_job(db, &job_id).await {
+            out.push_str(&format!(
+                "A draft written after the {} is kept at {node}/{POST_MERGE_DRAFT_CHAIN}\n",
+                if verb == "merged" { "merge" } else { "close" }
+            ));
+        }
+    }
+    Some(out)
+}
+
+async fn load_create_pr_chain(db: &LocalDb, job_id: &str) -> Result<Vec<ChainVersion>, String> {
+    let job_id = job_id.to_string();
+    let rows = db
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT version, data, created_at, confirmed FROM artifacts
+                          WHERE job_id = ?1 AND output_name = ?2
+                          ORDER BY version",
+                        params![job_id.as_str(), CREATE_PR_CHAIN],
+                    )
+                    .await?;
+                let mut versions = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    versions.push((
+                        row.i64(0)? as i32,
+                        row.text(1)?,
+                        row.i64(2)?,
+                        row.opt_i64(3)?.unwrap_or(0) != 0,
+                    ));
+                }
+                Ok(versions)
+            })
+        })
+        .await
+        .map_err(|e| db_error("Failed to load the create-pr artifact's versions", e))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(version, data, created_at, confirmed)| {
+            Some(ChainVersion {
+                version,
+                data: serde_json::from_str(&data).ok()?,
+                created_at,
+                confirmed,
+            })
+        })
+        .collect())
+}
+
+/// Put a resolved pull request's create-pr record back to what resolved.
+///
+/// A create-pr version written after the pull request's real resolution time
+/// was written over a sealed record: the resolution had not been seen yet. The
+/// version at or before that time is appended as the chain's newest (history
+/// stays append-only), and the newest post-resolution version is kept in
+/// [`POST_MERGE_DRAFT_CHAIN`] rather than lost. When the record has no version
+/// from before the resolution, GitHub's own prose is the record, unless it is
+/// one of the post-resolution versions.
+///
+/// GitHub is edited back only when its text is one of those post-resolution
+/// versions, which only Cairn's own sync puts there; prose someone else wrote
+/// on GitHub is theirs. A failure is logged, never raised: the resolution has
+/// already happened.
+async fn restore_sealed_pr_record(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    mr: &MrContext,
+    resolved_at: i64,
+    github: Option<&GitHubProse>,
+) {
+    if let Err(error) = try_restore_sealed_pr_record(orch, db, mr, resolved_at, github).await {
+        log::warn!(
+            "Could not restore the resolved record of merge request {}: {error}",
+            mr.mr_id
+        );
+    }
+}
+
+async fn try_restore_sealed_pr_record(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    mr: &MrContext,
+    resolved_at: i64,
+    github: Option<&GitHubProse>,
+) -> Result<(), String> {
+    let Some(job_id) = create_pr_artifact_job_for_merge_request(db, &mr.mr_id).await? else {
+        return Ok(());
+    };
+    let (before, after): (Vec<_>, Vec<_>) = load_create_pr_chain(db, &job_id)
+        .await?
+        .into_iter()
+        .partition(|version| version.created_at <= resolved_at);
+    let Some(draft) = after.last() else {
+        return Ok(());
+    };
+    let github_is_a_draft = github.is_some_and(|prose| after.iter().any(|v| v.says(prose)));
+    let record = match (before.last(), github) {
+        (Some(version), _) => version.data.clone(),
+        (None, Some(prose)) if !github_is_a_draft => serde_json::json!({
+            "title": prose.title,
+            "body": prose.body,
+        }),
+        _ => {
+            log::warn!(
+                "Merge request {} resolved before its create-pr artifact's first version and \
+                 GitHub shows a post-resolution version, so no resolved record is known to restore",
+                mr.mr_id
+            );
+            return Ok(());
+        }
+    };
+    let stored = crate::mcp::handlers::comments_artifacts::append_restored_artifact_versions(
+        orch,
+        &job_id,
+        vec![
+            (CREATE_PR_CHAIN.to_string(), record.clone(), draft.confirmed),
+            (
+                POST_MERGE_DRAFT_CHAIN.to_string(),
+                draft.data.clone(),
+                draft.confirmed,
+            ),
+        ],
+    )
+    .await?;
+
+    let node = crate::messages::delivery::node_uri_for_job(db, &job_id)
+        .await
+        .unwrap_or_else(|| format!("job {job_id}"));
+    let subject = mr
+        .github_pr_number
+        .map(|number| format!("PR #{number}"))
+        .unwrap_or_else(|| format!("merge request {}", mr.mr_id));
+    log::info!(
+        "Restored {subject}'s resolved record (create-pr v{}); the post-resolution draft v{} is \
+         kept at {node}/{POST_MERGE_DRAFT_CHAIN}",
+        stored.first().copied().unwrap_or_default(),
+        draft.version
+    );
+
+    if let (true, Some(pr_number), false, Some(title)) = (
+        github_is_a_draft,
+        mr.github_pr_number,
+        mr.is_local,
+        record.get("title").and_then(serde_json::Value::as_str),
+    ) {
+        let body = record.get("body").and_then(serde_json::Value::as_str);
+        if let Err(error) = super::create_pr::restore_pull_request_prose(
+            orch,
+            db,
+            &mr.repo_path,
+            &mr.mr_id,
+            pr_number,
+            title,
+            body,
+        )
+        .await
+        {
+            log::warn!("Could not put {subject}'s resolved title and body back on GitHub: {error}");
+        }
+    }
+    Ok(())
 }
 
 /// Merged/closed is the settled terminal state the PR snapshot caches without
@@ -1891,7 +2160,9 @@ mod tests {
             Landed {
                 commit: Some("b77e7657"),
                 source: None,
+                resolved_at: None,
             },
+            None,
         )
         .await
         .expect("the observed merge resolves");
@@ -1941,7 +2212,9 @@ mod tests {
             Landed {
                 commit: Some("b77e7657"),
                 source: None,
+                resolved_at: None,
             },
+            None,
         )
         .await
         .expect("a repeat observation is harmless");
@@ -1972,7 +2245,8 @@ mod tests {
             &orch,
             "builder-job",
             PrNodeResolution::Close,
-            Landed::default()
+            Landed::default(),
+            None,
         )
         .await
         .unwrap());
@@ -2031,7 +2305,8 @@ mod tests {
             &orch,
             "builder-job",
             PrNodeResolution::Close,
-            Landed::default()
+            Landed::default(),
+            None,
         )
         .await
         .unwrap());
@@ -2074,7 +2349,8 @@ mod tests {
             &orch,
             "builder-job",
             PrNodeResolution::Merge,
-            Landed::default()
+            Landed::default(),
+            None,
         )
         .await
         .unwrap());
