@@ -161,7 +161,13 @@ async fn assert_seeks(db: &LocalDb, sql: &str, binds: usize, using: &str) {
 async fn every_selection_and_delete_seeks() {
     let (_temp, db) = private_db().await;
     const ROWID: &str = "USING INTEGER PRIMARY KEY";
-    for walk in [OUTBOX_WALK, SEARCH_OUTBOX_WALK, STREAM_WALK, CODEMAP_WALK] {
+    for walk in [
+        OUTBOX_WALK,
+        SEARCH_OUTBOX_WALK,
+        STREAM_WALK,
+        CODEMAP_WALK,
+        REGENERATION_WALK,
+    ] {
         assert_seeks(&db, walk, 2, ROWID).await;
     }
     assert_seeks(
@@ -178,6 +184,14 @@ async fn every_selection_and_delete_seeks() {
         "idx_codemap_cache_project_computed_at",
     )
     .await;
+    assert_seeks(
+        &db,
+        REGENERATION_BRANCH,
+        2,
+        "idx_branch_regenerations_branch",
+    )
+    .await;
+    assert_seeks(&db, &live_branch_sql(), 2, "idx_jobs_project_branch").await;
     assert_seeks(&db, ARC_CHAINS, 2, "idx_artifacts_output_job_version").await;
     assert_seeks(&db, ARC_SUPERSEDED, 4, "idx_artifacts_output_job_version").await;
     assert_seeks(&db, ARC_PINNED, 1, "idx_job_artifact_inputs_producer").await;
@@ -217,6 +231,7 @@ async fn every_selection_and_delete_seeks() {
         "codemap_cache",
         "artifacts",
         "agent_waits",
+        "branch_regenerations",
     ] {
         let delete = format!("DELETE FROM {table} WHERE rowid IN ({})", placeholders(3));
         assert_seeks(&db, &delete, 3, ROWID).await;
@@ -979,6 +994,74 @@ async fn a_wait_delete_reaches_its_prompts_through_the_index() {
             .any(|op| op.starts_with("Rewind") && op.contains("prompts")),
         "the cascade scans prompts: {program:#?}"
     );
+}
+
+async fn insert_regeneration(
+    db: &LocalDb,
+    id: i64,
+    bookmark: &str,
+    paths: &str,
+    state: &str,
+    updated_s: i64,
+) {
+    db.execute(
+        "INSERT INTO branch_regenerations
+           (id, project_id, store_path, bookmark, install_group, rule_json, stale_json,
+            installed_head, base_commit, state, created_ms, updated_ms)
+         VALUES (?1, 'p', '/store', ?2, 'g', ?3, '[]', 'h', 'b', ?4, ?5, ?5)",
+        (
+            id,
+            bookmark.to_string(),
+            format!(r#"{{"paths":["{paths}"],"regenerate":"make"}}"#),
+            state.to_string(),
+            updated_s * 1_000,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// The newest row of each rule on a live branch is its stale marker, the
+/// rebase page's account and what a re-dispatch runs, and a holding row holds
+/// the branch: none of them ever goes. A row a newer one of its rule shadows
+/// goes after a day, and a branch no live job holds loses its rows after a week.
+#[tokio::test]
+async fn settled_regenerations_go_once_shadowed_or_retired_and_live_ones_never_do() {
+    let (_temp, db) = private_db().await;
+    seed_owners(&db).await;
+    db.execute_script(
+        "UPDATE jobs SET branch = 'live' WHERE id = 'j';
+         INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at)
+             VALUES ('m','p',2,'M','merged','none',1,1);
+         INSERT INTO jobs (id,issue_id,project_id,status,uri_segment,node_name,branch,created_at,updated_at)
+             VALUES ('gone','m','p','complete','g','g','merged',1,1);",
+    )
+    .await
+    .unwrap();
+    let days = |n: i64| NOW - n * DAY_S;
+    // The live branch.
+    insert_regeneration(&db, 1, "live", "wasm/*", "failed", days(12)).await;
+    insert_regeneration(&db, 2, "live", "gen/*", "failed", days(30)).await;
+    insert_regeneration(&db, 3, "live", "wasm/*", "superseded", NOW - 2 * HOUR).await;
+    insert_regeneration(&db, 4, "live", "wasm/*", "running", days(10)).await;
+    // A branch whose only job is on a merged issue.
+    insert_regeneration(&db, 5, "merged", "wasm/*", "failed", days(8)).await;
+    insert_regeneration(&db, 6, "merged", "gen/*", "succeeded", days(2)).await;
+    insert_regeneration(&db, 7, "merged", "other/*", "pending", days(30)).await;
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledRegenerations]).await;
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert_eq!(report.rows(), 2, "{report}");
+    let kept: Vec<i64> = db
+        .query_all(
+            "SELECT id FROM branch_regenerations ORDER BY id",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kept, vec![2, 3, 4, 6, 7]);
 }
 
 #[tokio::test]

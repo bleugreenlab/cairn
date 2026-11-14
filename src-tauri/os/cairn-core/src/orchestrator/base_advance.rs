@@ -29,6 +29,7 @@ use crate::orchestrator::conflict_session::{record_marker_state, MarkerState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{ResidencyOperation, ResidencyResult};
+use cairn_db::db_records::LIVE_JOB_PREDICATE;
 use cairn_db::turso::params;
 
 #[cfg(test)]
@@ -3323,30 +3324,6 @@ async fn load_execution_snapshot_conn(
     crate::config::snapshot_migrate::load(&snapshot_json)
         .map_err(|error| DbError::Row(error.to_string()))
 }
-
-/// In-flight siblings on the same base that may need rebasing after a merge.
-/// Beyond the status filter (still-running jobs), this also enumerates a
-/// **completed** sibling that still has an **open** PR (`merge_requests.status`
-/// not merged/closed): a child whose build job finished but whose PR is awaiting
-/// merge is exactly the sibling that must auto-rebase onto the advanced base.
-/// A job that can still act on the base it records: it is not on a resolved
-/// issue, and it is either still running or still holding an open pull request.
-///
-/// Shared by the sibling selection and the child re-point, because the two have
-/// to name one population. Every branch that inherits a base advance is a branch
-/// whose recorded base must survive that advance, and a predicate written twice
-/// is a population that eventually differs.
-const LIVE_JOB_PREDICATE: &str = "NOT EXISTS (
-              SELECT 1 FROM issues i
-               WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
-            )
-            AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
-                  OR EXISTS (
-                    SELECT 1 FROM merge_requests mr
-                     WHERE mr.source_branch = j.branch
-                       AND mr.project_id = j.project_id
-                       AND mr.status NOT IN ('merged', 'closed')
-                  ) )";
 
 /// Joins `delegator` to job `j` when `j` works on the branch of the job that
 /// delegated it: a sub-agent task (or a workflow agent) on its parent's

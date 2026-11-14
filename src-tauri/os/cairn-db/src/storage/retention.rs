@@ -245,6 +245,9 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     evict("artifacts", Eviction::SupersededArcVersions).budget(768),
     evict("agent_waits", Eviction::SettledWaits).budget(64),
     evict("codex_watchdog_lifecycle", Eviction::WatchdogLifecycle).budget(256),
+    // A few rows per install that takes a declared regenerable path, each a
+    // few kilobytes at most (a failure keeps a 4,000-character output tail).
+    evict("branch_regenerations", Eviction::SettledRegenerations).budget(16),
     // Pruned by their own owners.
     owned_by(
         "runner_events",
@@ -813,6 +816,14 @@ const SETTLED_WAIT_AGE_S: i64 = 7 * DAY_S;
 /// the live recovery budget. Older evidence is forensic, not recovery state.
 const WATCHDOG_ROUTINE_AGE_S: i64 = 7 * DAY_S;
 const WATCHDOG_RECOVERY_AGE_S: i64 = 30 * DAY_S;
+/// A settled regeneration a newer row of the same branch and rule shadows is
+/// read by nothing but a merge still waiting on it by id, and that wait is
+/// bounded by the rule's two command timeouts plus slack, well under a day.
+const SHADOWED_REGENERATION_AGE_S: i64 = DAY_S;
+/// The newest regeneration of a rule on a branch no live job holds. A branch
+/// whose issue is reopened becomes live again, and its stale marker must still
+/// be there when it does, so this window is a week rather than a day.
+const RETIRED_REGENERATION_AGE_S: i64 = 7 * DAY_S;
 /// Wait rows carry the settled batch's output: about 3 KB on average and up to
 /// 3.3 MB on the 11-02 database, so a typical write stays near 400 KB.
 const WAIT_PAGE_ROWS: usize = 128;
@@ -866,6 +877,23 @@ pub(crate) const WATCHDOG_WALK: &str = "SELECT rowid FROM codex_watchdog_lifecyc
      OR kind IN ('phase_transition', 'armed', 'disarmed')) \
      ORDER BY created_at LIMIT ?3";
 
+/// Regenerations in rowid order. The table is small (this rule keeps it to
+/// about one row per rule per live branch), so a pass walks it whole.
+pub(crate) const REGENERATION_WALK: &str = "SELECT id, project_id, bookmark, state, updated_ms \
+     FROM branch_regenerations WHERE id > ?1 ORDER BY id LIMIT ?2";
+/// Every regeneration of one branch, to find which rows a newer one shadows.
+pub(crate) const REGENERATION_BRANCH: &str = "SELECT id, rule_json FROM branch_regenerations \
+     WHERE project_id = ?1 AND bookmark = ?2";
+
+/// Whether a live job ([`crate::db_records::LIVE_JOB_PREDICATE`]) still holds
+/// a branch of a project.
+pub(crate) fn live_branch_sql() -> String {
+    format!(
+        "SELECT 1 FROM jobs j WHERE j.project_id = ?1 AND j.branch = ?2 AND {} LIMIT 1",
+        crate::db_records::LIVE_JOB_PREDICATE
+    )
+}
+
 /// One deleting rule of the evictor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Eviction {
@@ -890,12 +918,18 @@ pub enum Eviction {
     /// Routine watchdog events older than seven days; all other kinds older
     /// than thirty days, including any kinds added in the future.
     WatchdogLifecycle,
+    /// Settled `branch_regenerations` that nothing reads any more: a day after
+    /// a newer row of the same branch and rule shadows them, or a week after
+    /// they settled on a branch no live job holds. A pending or running row,
+    /// and the newest row of each rule on a live branch (its stale marker, the
+    /// rebase page's account and what a re-dispatch runs), are never deleted.
+    SettledRegenerations,
 }
 
 impl Eviction {
     /// The initial order before budget-driven rotation. Watchdog evidence gets
     /// the first runtime turn rather than waiting behind payload-heavy journals.
-    pub const ALL: [Eviction; 7] = [
+    pub const ALL: [Eviction; 8] = [
         Eviction::WatchdogLifecycle,
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
@@ -903,6 +937,7 @@ impl Eviction {
         Eviction::SupersededArcVersions,
         Eviction::SettledWaits,
         Eviction::AppliedSearchOutbox,
+        Eviction::SettledRegenerations,
     ];
 
     pub fn name(self) -> &'static str {
@@ -914,6 +949,7 @@ impl Eviction {
             Eviction::SupersededArcVersions => "superseded_arc_versions",
             Eviction::SettledWaits => "settled_waits",
             Eviction::WatchdogLifecycle => "watchdog_lifecycle",
+            Eviction::SettledRegenerations => "settled_regenerations",
         }
     }
 
@@ -927,6 +963,7 @@ impl Eviction {
             Eviction::SupersededArcVersions => &["artifacts"],
             Eviction::SettledWaits => &["agent_waits"],
             Eviction::WatchdogLifecycle => &["codex_watchdog_lifecycle"],
+            Eviction::SettledRegenerations => &["branch_regenerations"],
         }
     }
 
@@ -940,6 +977,7 @@ impl Eviction {
             Eviction::SupersededArcVersions => select_superseded_arcs(db, cursor).await?,
             Eviction::SettledWaits => select_settled_waits(db, now, cursor).await?,
             Eviction::WatchdogLifecycle => select_watchdog_lifecycle(db, now).await?,
+            Eviction::SettledRegenerations => select_settled_regenerations(db, now, cursor).await?,
         };
         let select = started.elapsed();
         let rows = selection.rows();
@@ -1509,6 +1547,122 @@ async fn select_settled_waits(db: &LocalDb, now: i64, cursor: &mut Cursor) -> Db
         },
         unlink_parents: Vec::new(),
         done,
+    })
+}
+
+/// The identity a regeneration's readers group its rows by: the rule's
+/// `paths`, as cairn-core's `stale_failures` keeps the newest row per paths.
+/// A row whose rule does not parse is its own group, so it is never shadowed.
+fn regeneration_rule_key(rule_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(rule_json)
+        .ok()
+        .and_then(|rule| rule.get("paths").map(ToString::to_string))
+        .unwrap_or_else(|| rule_json.to_string())
+}
+
+/// Settled regenerations nothing reads any more ([`Eviction::SettledRegenerations`]).
+///
+/// Each branch's readers want its newest row (the rebase page, a re-dispatch)
+/// and the newest row of each rule (the stale marker a merge, the PR and a red
+/// lane are told), so an older row of the same rule is invisible to them once
+/// no merge is still waiting on it by id. Deleting a shadowed row therefore
+/// exposes nothing. A branch no live job holds has no readers left; its rows
+/// go in rowid order, oldest first, so a page never leaves an older failed row
+/// newest of its rule.
+async fn select_settled_regenerations(
+    db: &LocalDb,
+    now: i64,
+    cursor: &mut Cursor,
+) -> DbResult<Selection> {
+    let shadowed_cutoff = (now - SHADOWED_REGENERATION_AGE_S) * 1_000;
+    let retired_cutoff = (now - RETIRED_REGENERATION_AGE_S) * 1_000;
+    let after = cursor.rowid;
+    let (rowids, walked, next) = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut walked = Vec::new();
+                let mut rows = conn
+                    .query(REGENERATION_WALK, (after, PAGE_ROWS as i64))
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    walked.push((
+                        row.i64(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.text(3)?,
+                        row.i64(4)?,
+                    ));
+                }
+                drop(rows);
+                let count = walked.len();
+                let next = walked.last().map_or(after, |row| row.0);
+                // Per branch: the rows a newer row of the same rule shadows,
+                // and whether a live job holds it (asked only when needed).
+                let mut shadowed: HashMap<(String, String), HashSet<i64>> = HashMap::new();
+                let mut live: HashMap<(String, String), bool> = HashMap::new();
+                let live_sql = live_branch_sql();
+                let mut rowids = Vec::new();
+                for (id, project_id, bookmark, state, updated_ms) in walked {
+                    if matches!(state.as_str(), "pending" | "running") {
+                        continue;
+                    }
+                    let branch = (project_id, bookmark);
+                    if !shadowed.contains_key(&branch) {
+                        let mut newest: HashMap<String, i64> = HashMap::new();
+                        let mut ids = Vec::new();
+                        let mut rows = conn
+                            .query(REGENERATION_BRANCH, (branch.0.clone(), branch.1.clone()))
+                            .await?;
+                        while let Some(row) = rows.next().await? {
+                            let (row_id, key) = (row.i64(0)?, regeneration_rule_key(&row.text(1)?));
+                            let top = newest.entry(key.clone()).or_insert(row_id);
+                            *top = (*top).max(row_id);
+                            ids.push((row_id, key));
+                        }
+                        drop(rows);
+                        let set = ids
+                            .into_iter()
+                            .filter(|(row_id, key)| newest[key] > *row_id)
+                            .map(|(row_id, _)| row_id)
+                            .collect();
+                        shadowed.insert(branch.clone(), set);
+                    }
+                    if shadowed[&branch].contains(&id) && updated_ms < shadowed_cutoff {
+                        rowids.push(id);
+                        continue;
+                    }
+                    if updated_ms >= retired_cutoff {
+                        continue;
+                    }
+                    let held = match live.get(&branch) {
+                        Some(held) => *held,
+                        None => {
+                            let mut rows = conn
+                                .query(&live_sql, (branch.0.clone(), branch.1.clone()))
+                                .await?;
+                            let held = rows.next().await?.is_some();
+                            drop(rows);
+                            live.insert(branch.clone(), held);
+                            held
+                        }
+                    };
+                    if !held {
+                        rowids.push(id);
+                    }
+                }
+                Ok((rowids, count, next))
+            })
+        })
+        .await?;
+    cursor.rowid = next;
+    Ok(Selection {
+        done: rowids.is_empty() && walked < PAGE_ROWS,
+        deletes: if rowids.is_empty() {
+            Vec::new()
+        } else {
+            vec![("branch_regenerations", rowids)]
+        },
+        unlink_parents: Vec::new(),
     })
 }
 

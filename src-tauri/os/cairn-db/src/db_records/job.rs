@@ -13,6 +13,28 @@ pub const JOB_COLUMNS: &str = "id, execution_id, recipe_node_id, parent_job_id,
     parent_tool_use_id, task_index, started_at, model, node_name, base_branch,
     current_turn_id, uri_segment, pack_anchor, thread_id";
 
+/// Whether job `j` (the statement's alias for `jobs`) can still act on its
+/// branch and the base it records: it is not on a resolved issue, and it is
+/// either still running or still holding an open pull request. A completed job
+/// whose pull request awaits merge is live: it is exactly the sibling that must
+/// rebase onto an advanced base.
+///
+/// The one definition of a live job. Base advance selects the siblings it
+/// rebases and the children it re-points with it, and retention asks it whether
+/// anything can still read a branch's records; a predicate written twice is a
+/// population that eventually differs.
+pub const LIVE_JOB_PREDICATE: &str = "NOT EXISTS (
+              SELECT 1 FROM issues i
+               WHERE i.id = j.issue_id AND i.status IN ('merged', 'closed')
+            )
+            AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
+                  OR EXISTS (
+                    SELECT 1 FROM merge_requests mr
+                     WHERE mr.source_branch = j.branch
+                       AND mr.project_id = j.project_id
+                       AND mr.status NOT IN ('merged', 'closed')
+                  ) )";
+
 #[derive(Debug, Clone)]
 pub struct DbJob {
     pub id: String,
