@@ -1525,6 +1525,8 @@ async fn check_verdict_coordinate(
                 &jj,
                 &coordinate_repository,
                 &fork.base,
+                &commit,
+                changed.as_deref().unwrap_or(&[]),
             );
             if subtracts {
                 let (jj, object_repository, repository, base, head, label, name, project) = (

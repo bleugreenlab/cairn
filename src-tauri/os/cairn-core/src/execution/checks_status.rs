@@ -1840,6 +1840,8 @@ async fn statuses_at_range(
                     &status_jj,
                     &logical_repository,
                     base,
+                    &logical_head,
+                    changed.as_deref().unwrap_or(&[]),
                 )
             });
             // A base-subtracting check is keyed by the base finding set it is
@@ -5990,8 +5992,8 @@ mod complete_input_projection_tests {
         let path = "src-tauri/os/cairn-common/src/executor_protocol.rs";
         let authored = [changed(path)];
         let tree = TreeFixture::new().file(path, "branch protocol");
-        let old_base = vec![(path.into(), "base-v1".into())];
-        let new_base = vec![(path.into(), "base-v2".into())];
+        let old_base = vec![(path.into(), Some("base-v1".into()))];
+        let new_base = vec![(path.into(), Some("base-v2".into()))];
         let original = f.keys(
             &tree,
             "same-head",

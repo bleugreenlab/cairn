@@ -39,6 +39,8 @@ tempfile = "3"
 # transaction here so its gix-heavy graph never enters cairn-core directly.
 # Keep this exactly aligned with the bundled jj sidecar in scripts/fetch-jj.ts.
 jj-lib = "=0.42.0"
+# Named immutable object reads share jj-lib's Git implementation, without CLI polling.
+gix = { version = "=0.84.0", default-features = false }
 futures = "0.3"
 # `rt-multi-thread` is what provides `block_in_place`, which `in_place_blocking`
 # needs in every build, not only where dev-dependency feature unification

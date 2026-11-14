@@ -1952,9 +1952,9 @@ pub(crate) struct BaseRelativeChange {
     head: String,
     target: String,
     changed: Vec<GraphFileChange>,
-    /// The base tree's listing, read only for a check Cairn ships base content
+    /// The selected base path/blob pairs, read only for a check Cairn ships base content
     /// to, whose key names the base blobs that content came from.
-    base_entries: Option<Vec<(String, String)>>,
+    base_entries: Option<Vec<(String, Option<String>)>>,
     /// The base finding set a base-subtracting check is shipped, read once so
     /// its key and its transport name the same set.
     base_findings: Option<crate::execution::lint_baseline::LintBaselineTransport>,
@@ -2054,7 +2054,7 @@ async fn resolve_base_relative_change(
             format!("the changed files of {base}..{head} could not be read: {error}")
         })?;
         let base_entries = names_base_blobs
-            .then(|| tree_entries(&jj, &repository, &base))
+            .then(|| executor_base_content_entries(&jj, &repository, &base, &head, &changed))
             .transpose()
             .map_err(|error| format!("the tree of base {base} could not be read: {error}"))?;
         let base_findings = baseline_store.and_then(|(db, project_id)| {
@@ -2100,12 +2100,13 @@ fn base_relative_transport_for(
         jj,
         repository,
         base,
+        head,
         changed,
         base_findings,
         ..
     } = change;
     let base_content = needs_executor_base_content(check_name)
-        .then(|| executor_base_content_bundle(jj, repository, base, changed))
+        .then(|| executor_base_content_bundle(jj, repository, base, head, changed))
         .transpose()
         .map_err(|error| format!("executor protocol base content from {base}: {error}"))?;
     let mut env = check_transport_env(changed, base_content);
@@ -6295,7 +6296,7 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
         Ok(transport) => transport,
         Err(error) => return Some(Err(error)),
     };
-    let base_entries = key_base_entries(&checks, &jj, &repository, &base);
+    let base_entries = key_base_entries(&checks, &jj, &repository, &base, &head, &changed);
     let basis = ChangeBasis::Against {
         changed: &changed,
         base_entries: base_entries.as_deref(),
@@ -6414,6 +6415,7 @@ fn write_wave_transport(
             change.jj,
             change.repository,
             change.base,
+            change.head,
             change.changed,
         )?)
     } else {
@@ -7447,40 +7449,67 @@ const MAX_CHECK_TIMEOUT_MS: u32 = 3_600_000;
 const BASE_CONTENT_CONTENT_ENV: &str = "CAIRN_CHECK_BASE_CONTENT_CONTENT";
 const CHANGED_FILES_CONTENT_ENV: &str = "CAIRN_CHECK_CHANGED_FILES_CONTENT";
 const EXECUTOR_PROTOCOL_CHECK: &str = "executor-protocol";
+#[cfg(test)]
 const EXECUTOR_PROTOCOL_SOURCE: &str = "src-tauri/os/cairn-common/src/executor_protocol.rs";
-const EXECUTOR_WIRE_PATHS: &[&str] = &[
-    "src-tauri/cairn-exec/",
-    "src-tauri/cairn-orch/src/remote_executor.rs",
-    "src-tauri/os/cairn-core/src/execution/wire.rs",
-    "src-tauri/os/cairn-core/src/fleet/mod.rs",
-    "src-tauri/os/cairn-common/src/executor_protocol.rs",
-    "src-tauri/cairn-transport/src/routes/executor.rs",
-    "src-tauri/cairn-transport/src/routes/executor_artifact.rs",
-    "src-tauri/cairn-transport/src/server.rs",
-];
-const EXECUTOR_PROCESS_PATH_RENAMES: &[(&str, &str)] = &[
-    ("src-tauri/cairn-exec/", "src-tauri/cairn-executor/"),
-    ("src-tauri/cairn-orch/", "src-tauri/cairn-runner/"),
-];
-const NON_WIRE_RUNTIME_PATHS: &[&str] = &[
-    "src-tauri/cairn-orch/src/executor_distribution.rs",
-    "src-tauri/cairn-orch/src/remote_provision.rs",
-    "src-tauri/cairn-exec/src/storage.rs",
-    "src-tauri/cairn-exec/Cargo.toml",
-];
+const EXECUTOR_WIRE_POLICY_FILE: &str = "scripts/executor-wire-paths.json";
 
-fn executor_base_content_paths(changed: &[GraphFileChange]) -> BTreeSet<String> {
-    let mut paths = BTreeSet::from([EXECUTOR_PROTOCOL_SOURCE.to_string()]);
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutorWirePolicy {
+    protocol_source: String,
+    wire_behavior_paths: Vec<String>,
+    non_wire_runtime_paths: Vec<String>,
+    process_path_renames: Vec<(String, String)>,
+}
+
+fn executor_wire_policy(
+    objects: &cairn_vcs::jj::ObjectReader,
+    head: &str,
+    base: &str,
+) -> Result<ExecutorWirePolicy, String> {
+    let load = || -> Result<ExecutorWirePolicy, String> {
+        for commit in [head, base] {
+            let Some(bytes) = objects.read_commit_file(commit, EXECUTOR_WIRE_POLICY_FILE)? else {
+                continue;
+            };
+            return serde_json::from_slice(&bytes).map_err(|error| error.to_string());
+        }
+        Err(format!("absent from head {head} and base {base}"))
+    };
+    load().map_err(|error| format!("{EXECUTOR_WIRE_POLICY_FILE}: {error}"))
+}
+
+#[cfg(test)]
+const TEST_WIRE_POLICY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../scripts/executor-wire-paths.json"
+));
+
+#[cfg(test)]
+fn test_wire_policy() -> ExecutorWirePolicy {
+    serde_json::from_str(TEST_WIRE_POLICY).unwrap()
+}
+
+fn executor_base_content_paths(
+    policy: &ExecutorWirePolicy,
+    changed: &[GraphFileChange],
+) -> BTreeSet<String> {
+    let mut paths = BTreeSet::from([policy.protocol_source.clone()]);
     for path in changed.iter().filter_map(|change| {
         let path = change.path.as_str();
         (path.ends_with(".rs")
-            && !NON_WIRE_RUNTIME_PATHS.contains(&path)
-            && EXECUTOR_WIRE_PATHS
+            && !policy
+                .non_wire_runtime_paths
                 .iter()
-                .any(|wire| path == *wire || path.starts_with(wire)))
+                .any(|excluded| excluded == path)
+            && policy
+                .wire_behavior_paths
+                .iter()
+                .any(|wire| path == wire || path.starts_with(wire)))
         .then(|| path.to_string())
     }) {
-        if let Some((current, legacy)) = EXECUTOR_PROCESS_PATH_RENAMES
+        if let Some((current, legacy)) = policy
+            .process_path_renames
             .iter()
             .find(|(current, _)| path.starts_with(current))
         {
@@ -7491,27 +7520,54 @@ fn executor_base_content_paths(changed: &[GraphFileChange]) -> BTreeSet<String> 
     paths
 }
 
+/// The exact path/blob pairs the transport ships, including absent base paths.
+fn executor_base_content_entries(
+    _jj: &JjEnv,
+    repository: &Path,
+    base: &str,
+    head: &str,
+    changed: &[GraphFileChange],
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let objects = cairn_vcs::jj::ObjectReader::open(repository)
+        .map_err(|error| format!("{EXECUTOR_WIRE_POLICY_FILE}: {error}"))?;
+    let policy = executor_wire_policy(&objects, head, base)?;
+    let paths: Vec<_> = executor_base_content_paths(&policy, changed)
+        .into_iter()
+        .collect();
+    let names: Vec<_> = paths.iter().map(String::as_str).collect();
+    let ids = objects.named_path_blob_ids(base, &names)?;
+    Ok(paths.into_iter().zip(ids).collect())
+}
+
 fn executor_base_content_bundle(
     jj: &JjEnv,
     repository: &Path,
     base: &str,
+    head: &str,
     changed: &[GraphFileChange],
 ) -> Result<String, String> {
-    let wanted = executor_base_content_paths(changed);
-    let entries = tree_entries(jj, repository, base)?;
-    let selected: Vec<_> = entries
+    let selected = executor_base_content_entries(jj, repository, base, head, changed)?;
+    let ids: Vec<_> = selected
         .iter()
-        .filter(|(path, _)| wanted.contains(path))
+        .filter_map(|(_, id)| id.as_deref())
         .collect();
-    let ids: Vec<_> = selected.iter().map(|(_, id)| id.as_str()).collect();
     let blobs = read_blobs(jj, repository, &ids)?;
-    let mut content: BTreeMap<String, Option<String>> =
-        wanted.iter().map(|path| (path.clone(), None)).collect();
+    let mut content = BTreeMap::new();
     for (path, id) in selected {
-        let Some(bytes) = blobs.get(id) else { continue };
-        let source = std::str::from_utf8(bytes)
-            .map_err(|_| format!("base content for {path} is not UTF-8"))?;
-        content.insert(path.clone(), Some(source.to_string()));
+        let source = match id {
+            Some(id) => {
+                let bytes = blobs
+                    .get(&id)
+                    .ok_or_else(|| format!("base content for {path} is unreadable"))?;
+                Some(
+                    std::str::from_utf8(bytes)
+                        .map_err(|_| format!("base content for {path} is not UTF-8"))?
+                        .to_string(),
+                )
+            }
+            None => None,
+        };
+        content.insert(path, source);
     }
     serde_json::to_string(&content).map_err(|error| format!("serialize base content: {error}"))
 }
@@ -10330,7 +10386,7 @@ fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String> {
     };
     let base_findings = wave_base_findings(&wave_change, &planned, db, &project_id);
     let transport = write_wave_transport(&wave_change, &planned, base_findings.as_ref())?;
-    let base_entries = key_base_entries(&checks, &jj, &repository, &base);
+    let base_entries = key_base_entries(&checks, &jj, &repository, &base, &head, &changed);
     let basis = ChangeBasis::Against {
         changed: &changed,
         base_entries: base_entries.as_deref(),
@@ -11616,10 +11672,10 @@ pub(crate) enum ChangeBasis<'a> {
     Against {
         /// Everything that changed since the base: what the transport ships.
         changed: &'a [GraphFileChange],
-        /// The base tree's listing. Read only for a check Cairn ships base
-        /// content to, whose key names the base blobs that content came from;
+        /// The selected base path/blob pairs. Read only for a check Cairn ships base
+        /// content to, selected by the same commit-owned policy as the bundle;
         /// `None` leaves such a check's key unformable.
-        base_entries: Option<&'a [(String, String)]>,
+        base_entries: Option<&'a [(String, Option<String>)]>,
         /// The base finding set this evaluation ships a base-subtracting check
         /// ([`crate::execution::lint_baseline::lint_baseline_for`]), which its
         /// key folds; `None` exactly when none ships (the base is the head).
@@ -11692,19 +11748,7 @@ fn change_identity(
         let Some(base_entries) = base_entries else {
             return Some(unformable());
         };
-        let blobs: HashMap<&str, &str> = base_entries
-            .iter()
-            .map(|(path, blob)| (path.as_str(), blob.as_str()))
-            .collect();
-        Some(
-            executor_base_content_paths(changed)
-                .into_iter()
-                .map(|path| {
-                    let blob = blobs.get(path.as_str()).map(|blob| blob.to_string());
-                    (path, blob)
-                })
-                .collect::<Vec<_>>(),
-        )
+        Some(base_entries.to_vec())
     } else {
         None
     };
@@ -11737,19 +11781,22 @@ fn base_findings_identity(change: CheckChange<'_>) -> Option<String> {
     ))
 }
 
-/// The base tree's listing, when some configured check's key names base blobs
-/// ([`change_identity`]). `None` otherwise, and when the base cannot be listed,
-/// which leaves that check's key unformable rather than wrong.
+/// The selected base path/blob pairs, when some configured check's key names base blobs
+/// ([`change_identity`]). Missing base paths have no blob id. `None` when no
+/// check needs these pairs, or when the commit policy or base cannot be read;
+/// the latter leaves that check's key unformable rather than wrong.
 pub(crate) fn key_base_entries(
     checks: &HashMap<String, CheckCommand>,
     jj: &JjEnv,
     repository: &Path,
     base: &str,
-) -> Option<Vec<(String, String)>> {
+    head: &str,
+    changed: &[GraphFileChange],
+) -> Option<Vec<(String, Option<String>)>> {
     checks
-        .iter()
-        .any(|(name, check)| is_base_relative(name, check) && needs_executor_base_content(name))
-        .then(|| tree_entries(jj, repository, base).ok())
+        .keys()
+        .any(|name| needs_executor_base_content(name))
+        .then(|| executor_base_content_entries(jj, repository, base, head, changed).ok())
         .flatten()
 }
 
@@ -14559,7 +14606,14 @@ async fn run_prospective_tree_checks(
 
     let platform = check_platform_identity();
     let toolchain = check_toolchain_identity();
-    let base_entries = key_base_entries(&checks, &gate_jj, &gate_repository, base_commit_id);
+    let base_entries = key_base_entries(
+        &checks,
+        &gate_jj,
+        &gate_repository,
+        base_commit_id,
+        commit_id,
+        changed,
+    );
     // Read before keying: a base-subtracting lane's key names the set it ships.
     let base_findings = if plans
         .iter()
@@ -14618,6 +14672,7 @@ async fn run_prospective_tree_checks(
             &gate_jj,
             &gate_repository,
             base_commit_id,
+            commit_id,
             attributed_changed,
         ) {
             Ok(content) => Some(content),
@@ -29140,11 +29195,14 @@ mod executor_base_content_tests {
 
     #[test]
     fn base_bundle_selects_protocol_and_changed_rust_wire_paths() {
-        let paths = executor_base_content_paths(&[
-            changed("src-tauri/cairn-exec/src/main.rs"),
-            changed("src-tauri/cairn-exec/Cargo.toml"),
-            changed("src/unrelated.rs"),
-        ]);
+        let paths = executor_base_content_paths(
+            &test_wire_policy(),
+            &[
+                changed("src-tauri/cairn-exec/src/main.rs"),
+                changed("src-tauri/cairn-exec/Cargo.toml"),
+                changed("src/unrelated.rs"),
+            ],
+        );
         assert!(paths.contains(EXECUTOR_PROTOCOL_SOURCE));
         assert!(paths.contains("src-tauri/cairn-exec/src/main.rs"));
         assert!(paths.contains("src-tauri/cairn-executor/src/main.rs"));
@@ -29441,6 +29499,139 @@ mod manual_transport_tests {
         git_stdout(repo, &["rev-parse", "HEAD"])
     }
 
+    #[test]
+    #[serial_test::serial(jj)]
+    fn commit_owned_policy_selects_new_paths_falls_back_and_fails_closed() {
+        use crate::execution::check_identity::change_fingerprint;
+        let Some(bin) = jj_bin() else { return };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path();
+        init_project(repo);
+        let jj = crate::jj::environment(&bin, home.path());
+        let missing = git_stdout(repo, &["rev-parse", "HEAD"]);
+        let changes = [
+            GraphFileChange {
+                path: "branch/wire_vocabulary.rs".into(),
+                status: "modified".into(),
+                previous_path: None,
+                additions: 1,
+                deletions: 0,
+            },
+            GraphFileChange {
+                path: "src-tauri/os/cairn-common/src/wire_vocabulary.rs".into(),
+                status: "added".into(),
+                previous_path: None,
+                additions: 1,
+                deletions: 0,
+            },
+        ];
+        let absent =
+            executor_base_content_bundle(&jj, repo, &missing, &missing, &changes).unwrap_err();
+        assert!(absent.contains(EXECUTOR_WIRE_POLICY_FILE), "{absent}");
+        let base = commit(
+            repo,
+            &[
+                (EXECUTOR_WIRE_POLICY_FILE, TEST_WIRE_POLICY),
+                ("branch/wire_vocabulary.rs", "old wire"),
+            ],
+            "base policy",
+        );
+        let mut policy: serde_json::Value = serde_json::from_str(TEST_WIRE_POLICY).unwrap();
+        policy["wireBehaviorPaths"].as_array_mut().unwrap().extend([
+            "branch/".into(),
+            "src-tauri/os/cairn-common/src/wire_vocabulary.rs".into(),
+        ]);
+        let head = commit(
+            repo,
+            &[(EXECUTOR_WIRE_POLICY_FILE, &policy.to_string())],
+            "branch policy",
+        );
+        // The worktree is deliberately not the checked head.
+        std::fs::write(repo.join(EXECUTOR_WIRE_POLICY_FILE), "not JSON").unwrap();
+        let bundle: BTreeMap<String, Option<String>> = serde_json::from_str(
+            &executor_base_content_bundle(&jj, repo, &base, &head, &changes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle["branch/wire_vocabulary.rs"].as_deref(),
+            Some("old wire")
+        );
+        assert_eq!(
+            bundle["src-tauri/os/cairn-common/src/wire_vocabulary.rs"],
+            None
+        );
+        assert_eq!(bundle.len(), 3);
+        let selected = executor_base_content_entries(&jj, repo, &base, &head, &changes).unwrap();
+        let original = executor_base_content_entries(&jj, repo, &base, &base, &changes).unwrap();
+        assert_ne!(
+            change_fingerprint(&[], Some(&selected)),
+            change_fingerprint(&[], Some(&original)),
+            "a policy change must not reuse a key omitting the newly shipped base blobs"
+        );
+        // A head predating the file uses BASE's policy, not a compiled default.
+        let fallback = executor_base_content_entries(&jj, repo, &head, &missing, &changes).unwrap();
+        assert!(fallback
+            .iter()
+            .any(|(path, _)| path == "branch/wire_vocabulary.rs"));
+        for malformed in ["not JSON", "{}", r#"{"protocolSource":42}"#] {
+            let bad = commit(
+                repo,
+                &[(EXECUTOR_WIRE_POLICY_FILE, malformed)],
+                "malformed policy",
+            );
+            let error = executor_base_content_bundle(&jj, repo, &base, &bad, &changes).unwrap_err();
+            assert!(error.contains(EXECUTOR_WIRE_POLICY_FILE), "{error}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn executor_bundle_ignores_replaced_base_blobs() {
+        use crate::execution::check_identity::change_fingerprint;
+        let Some(bin) = jj_bin() else { return };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path();
+        init_project(repo);
+        let jj = crate::jj::environment(&bin, home.path());
+        let base = commit(
+            repo,
+            &[
+                (EXECUTOR_WIRE_POLICY_FILE, TEST_WIRE_POLICY),
+                (EXECUTOR_PROTOCOL_SOURCE, "original protocol"),
+                ("replacement", "replacement protocol"),
+            ],
+            "base with policy",
+        );
+        let selected = executor_base_content_entries(&jj, repo, &base, &base, &[]).unwrap();
+        let original_id = git_stdout(
+            repo,
+            &["rev-parse", &format!("{base}:{EXECUTOR_PROTOCOL_SOURCE}")],
+        );
+        let replacement_id = git_stdout(repo, &["rev-parse", &format!("{base}:replacement")]);
+        git(repo, &["replace", &original_id, &replacement_id]);
+        assert_eq!(
+            git_stdout(repo, &["cat-file", "blob", &original_id]),
+            "replacement protocol"
+        );
+        let after = executor_base_content_entries(&jj, repo, &base, &base, &[]).unwrap();
+        assert_eq!(after, selected);
+        assert_eq!(
+            change_fingerprint(&[], Some(&after)),
+            change_fingerprint(&[], Some(&selected)),
+        );
+        let bundle: BTreeMap<String, Option<String>> = serde_json::from_str(
+            &executor_base_content_bundle(&jj, repo, &base, &base, &[]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle[EXECUTOR_PROTOCOL_SOURCE].as_deref(),
+            Some("original protocol")
+        );
+        assert_eq!(bundle.len(), 1);
+    }
+
     /// A protocol source at `version`, in the shape the ledger derives it from:
     /// a heading for the version above the constant that reads it.
     fn protocol(version: u32) -> String {
@@ -29479,7 +29670,10 @@ mod manual_transport_tests {
         init_project(repo);
         commit(
             repo,
-            &[(EXECUTOR_PROTOCOL_SOURCE, &protocol(40))],
+            &[
+                (EXECUTOR_PROTOCOL_SOURCE, &protocol(40)),
+                (EXECUTOR_WIRE_POLICY_FILE, TEST_WIRE_POLICY),
+            ],
             "protocol 40",
         );
         git(repo, &["checkout", "-q", "-b", "feature"]);
@@ -30458,9 +30652,10 @@ mod base_relative_key_tests {
     fn a_base_content_check_names_its_base_blobs() {
         let protocol = check("command: bun run check:executor-protocol\nimpact: [src-tauri/**]\n");
         let changed = [change(EXECUTOR_PROTOCOL_SOURCE)];
-        let base = |blob: &str| vec![(EXECUTOR_PROTOCOL_SOURCE.to_string(), blob.to_string())];
+        let base =
+            |blob: &str| vec![(EXECUTOR_PROTOCOL_SOURCE.to_string(), Some(blob.to_string()))];
         let (v40, v41) = (base("v40"), base("v41"));
-        let key_against = |entries: Option<&[(String, String)]>| {
+        let key_against = |entries: Option<&[(String, Option<String>)]>| {
             key(
                 EXECUTOR_PROTOCOL_CHECK,
                 &protocol,

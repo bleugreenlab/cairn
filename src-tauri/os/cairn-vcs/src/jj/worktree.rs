@@ -210,6 +210,128 @@ pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String,
     Ok(parse_ls_tree(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// A scoped, read-only Git object reader for named paths at immutable commits.
+/// Opens the authoritative jj backend or ordinary Git repository once, sharing
+/// object-database initialization across reads without retaining a global cache.
+pub struct ObjectReader {
+    repo: gix::Repository,
+}
+
+impl ObjectReader {
+    pub fn open(repository: &Path) -> Result<Self, String> {
+        let mut repo = if is_jj_dir(repository) {
+            let git_dir = backend_git_dir(repository).ok_or_else(|| {
+                format!("{} has an unreadable jj Git backend", repository.display())
+            })?;
+            gix::open(git_dir).map_err(|error| format!("open jj object store: {error}"))?
+        } else {
+            gix::discover(repository).map_err(|error| format!("discover object store: {error}"))?
+        };
+        // Immutable identities must not be redirected by user replacement refs.
+        repo.objects.ignore_replacements = true;
+        Ok(Self { repo })
+    }
+
+    /// Resolve only named repository-relative paths at a full immutable commit
+    /// ID. Missing paths are `None`; invalid commits, unreadable trees, and
+    /// non-blob entries are errors. Does not list the full tree.
+    pub fn named_path_blob_ids(
+        &self,
+        commit: &str,
+        paths: &[&str],
+    ) -> Result<Vec<Option<String>>, String> {
+        let tree = self.commit_tree(commit)?;
+        paths
+            .iter()
+            .map(|path| {
+                named_blob_entry(&tree, path).map(|entry| entry.map(|entry| entry.id().to_string()))
+            })
+            .collect()
+    }
+
+    /// Read one file in process. Only an absent path returns `None`; invalid
+    /// commits and unreadable trees or blobs remain errors.
+    pub fn read_commit_file(&self, commit: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let tree = self.commit_tree(commit)?;
+        named_blob_entry(&tree, path)?
+            .map(|entry| {
+                let object = entry
+                    .object()
+                    .map_err(|error| format!("read blob for {path}: {error}"))?;
+                let blob = object
+                    .try_into_blob()
+                    .map_err(|error| format!("read blob for {path}: {error}"))?;
+                Ok(blob.data.to_vec())
+            })
+            .transpose()
+    }
+
+    fn commit_tree(&self, commit: &str) -> Result<gix::Tree<'_>, String> {
+        let id = gix::ObjectId::from_hex(commit.as_bytes())
+            .map_err(|error| format!("invalid full commit ID {commit:?}: {error}"))?;
+        let object = self
+            .repo
+            .find_object(id)
+            .map_err(|error| format!("read commit {commit}: {error}"))?;
+        let commit_object = object
+            .try_into_commit()
+            .map_err(|error| format!("read commit {commit}: {error}"))?;
+        commit_object
+            .tree()
+            .map_err(|error| format!("read tree of {commit}: {error}"))
+    }
+}
+
+fn named_blob_entry<'repo>(
+    tree: &gix::Tree<'repo>,
+    path: &str,
+) -> Result<Option<gix::object::tree::Entry<'repo>>, String> {
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(format!("invalid repository-relative path {path:?}"));
+    }
+    let mut subtree = None;
+    let mut components = path.split('/').peekable();
+    let entry = loop {
+        let component = components.next().expect("nonempty path");
+        let current = subtree.as_ref().unwrap_or(tree);
+        let mut found = None;
+        for entry in current.iter() {
+            let entry = entry.map_err(|error| format!("decode tree path {path}: {error}"))?;
+            if entry.filename() == component.as_bytes() {
+                found = Some(entry.to_owned());
+                break;
+            }
+        }
+        let Some(entry) = found else {
+            return Ok(None);
+        };
+        if components.peek().is_none() {
+            break Some(entry);
+        }
+        if !entry.mode().is_tree() {
+            return Ok(None);
+        }
+        subtree = Some(
+            entry
+                .object()
+                .map_err(|error| format!("read tree path {path}: {error}"))?
+                .try_into_tree()
+                .map_err(|error| format!("read tree path {path}: {error}"))?,
+        );
+    };
+    if entry
+        .as_ref()
+        .is_some_and(|entry| !entry.mode().is_blob() && !entry.mode().is_link())
+    {
+        return Err(format!("tree path {path} is not a blob"));
+    }
+    Ok(entry)
+}
+
 /// The change a branch carries on top of an integration target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnPatch {
@@ -410,7 +532,13 @@ pub fn read_blobs(
         .map_err(|error| format!("git cat-file --batch request: {error}"))?;
     let out = jj.command_output(
         cairn_platform::env::git()
-            .args(["--git-dir", &git_dir, "cat-file", "--batch"])
+            .args([
+                "--no-replace-objects",
+                "--git-dir",
+                &git_dir,
+                "cat-file",
+                "--batch",
+            ])
             .stdin(Stdio::from(request)),
         JJ_DEFAULT_TIMEOUT,
         "git cat-file --batch",
@@ -476,4 +604,99 @@ pub(crate) fn parse_ls_tree(output: &str) -> Vec<(String, String)> {
         .collect();
     entries.sort();
     entries
+}
+
+#[cfg(test)]
+mod named_path_tests {
+    use super::*;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = cairn_platform::env::git()
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn named_paths_distinguish_absence_and_invalid_commit_and_honor_jj_backend() {
+        let ancestor = tempfile::tempdir().unwrap();
+        git(ancestor.path(), &["init", "-b", "main"]);
+        let backend = tempfile::tempdir().unwrap();
+        git(backend.path(), &["init", "-b", "main"]);
+        std::fs::create_dir(backend.path().join("nested")).unwrap();
+        std::fs::write(backend.path().join("nested/policy"), b"committed").unwrap();
+        git(backend.path(), &["add", "."]);
+        git(
+            backend.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        let commit = git(backend.path(), &["rev-parse", "HEAD"]);
+        let blob = git(backend.path(), &["rev-parse", "HEAD:nested/policy"]);
+        let workspace = ancestor.path().join("store");
+        let store = workspace.join(".jj/repo/store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("git_target"),
+            backend.path().join(".git").to_str().unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(backend.path().join("replacement"), b"replacement").unwrap();
+        let replacement = git(backend.path(), &["hash-object", "-w", "replacement"]);
+        git(backend.path(), &["replace", &blob, &replacement]);
+        assert_eq!(
+            git(backend.path(), &["cat-file", "blob", &blob]),
+            "replacement"
+        );
+        let jj = JjEnv::resolve("", ancestor.path());
+        for repo in [backend.path(), workspace.as_path()] {
+            assert_eq!(
+                read_blobs(&jj, repo, &[&blob]).unwrap()[&blob],
+                b"committed"
+            );
+            let objects = ObjectReader::open(repo).unwrap();
+            let corrupt = gix::Tree::from_data(
+                gix::ObjectId::from_hex(blob.as_bytes()).unwrap(),
+                b"invalid tree".to_vec(),
+                &objects.repo,
+            );
+            assert!(named_blob_entry(&corrupt, "absent").is_err());
+            assert_eq!(
+                objects
+                    .named_path_blob_ids(&commit, &["nested/policy", "absent"])
+                    .unwrap(),
+                vec![Some(blob.clone()), None]
+            );
+            assert_eq!(
+                objects.read_commit_file(&commit, "nested/policy").unwrap(),
+                Some(b"committed".to_vec())
+            );
+            assert_eq!(objects.read_commit_file(&commit, "absent").unwrap(), None);
+            assert!(objects
+                .named_path_blob_ids(&"f".repeat(40), &["absent"])
+                .is_err());
+            assert!(objects.read_commit_file("HEAD", "absent").is_err());
+            assert!(objects.named_path_blob_ids(&blob, &["absent"]).is_err());
+            assert!(objects.read_commit_file(&commit, "nested").is_err());
+        }
+        std::fs::write(store.join("git_target"), "missing-backend").unwrap();
+        assert!(ObjectReader::open(&workspace).is_err());
+    }
 }

@@ -1945,6 +1945,8 @@ async fn run_turn_end_checks_inner(
                 &planning_jj,
                 &planning_repository,
                 &key_base,
+                &planning_commit,
+                &planning_changed,
             );
             // The base finding set the lint lane ships (step 11), read once
             // here because its key names it.
