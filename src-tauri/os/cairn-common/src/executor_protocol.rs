@@ -8363,6 +8363,15 @@ pub struct LearnedResourceEstimate {
 /// rejections are runner-composed evidence; an older executor is sent the same
 /// requests and its admission replies are interpreted unchanged. No older peer
 /// gets anything wrong: no new refusal is requested from or sent to it.
+///
+/// cairn/7156 does not move the number. Relative slowest-device ranking no
+/// longer qualifies build-volume stall admission, and write-saturation
+/// reclamation requires a fresh pressured latency arm. An older executor
+/// retains its over-conservative quiet-device hold and may still report
+/// stall-only writeSaturation as a reclamation cause. The runner reads those
+/// existing fields exactly as before and places elsewhere; no capacity is
+/// overstated, field misread, or new field required. Mixed versions are safe,
+/// and the old behavior ends when the executor adopts the new build by hash.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above

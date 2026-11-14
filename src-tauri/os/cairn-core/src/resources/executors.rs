@@ -6130,11 +6130,18 @@ fn render_volume_discards(executor: &ExecutorInspection) -> String {
                 VolumeDiscardRefusalKind::Unsupported => ("unsupported", "in"),
                 VolumeDiscardRefusalKind::Failed => ("failed", "in"),
             };
+            let retry = if refusal.retry_after_unix_ms <= captured {
+                "retry eligible; pending the next idle opportunity".to_string()
+            } else {
+                format!(
+                    "asks again {again} {}",
+                    span(refusal.retry_after_unix_ms - captured),
+                )
+            };
             parts.push(format!(
-                "{kind} {}: {} (asks again {again} {})",
+                "{kind} {}: {} ({retry})",
                 age(captured.saturating_sub(refusal.at_unix_ms)),
                 refusal.detail,
-                span(refusal.retry_after_unix_ms.saturating_sub(captured)),
             ));
         } else if let Some(due) = volume.next_due_unix_ms {
             parts.push(format!(
@@ -7434,6 +7441,44 @@ mod storage_section_tests {
                 rendered.contains(expected),
                 "missing {expected:?} in {rendered}"
             );
+        }
+
+        for kind in [
+            VolumeDiscardRefusalKind::NotPermitted,
+            VolumeDiscardRefusalKind::Unsupported,
+            VolumeDiscardRefusalKind::Failed,
+        ] {
+            for (retry_after_unix_ms, expected) in [
+                (
+                    at - 60_000,
+                    "retry eligible; pending the next idle opportunity",
+                ),
+                (at, "retry eligible; pending the next idle opportunity"),
+                (
+                    at + 24 * HOUR,
+                    if kind == VolumeDiscardRefusalKind::NotPermitted {
+                        "asks again at the next attach or in 24h"
+                    } else {
+                        "asks again in 24h"
+                    },
+                ),
+            ] {
+                let refusal = executor
+                    .health
+                    .disk
+                    .volume_discards
+                    .as_mut()
+                    .unwrap()
+                    .volumes[1]
+                    .refusal
+                    .as_mut()
+                    .unwrap();
+                refusal.kind = kind;
+                refusal.retry_after_unix_ms = retry_after_unix_ms;
+                let rendered = render_executor(&executor);
+                assert!(rendered.contains(expected), "{rendered}");
+                assert!(!rendered.contains("in 0m"), "{rendered}");
+            }
         }
 
         executor.health.disk.volume_discards = Some(VolumeDiscardReport {
