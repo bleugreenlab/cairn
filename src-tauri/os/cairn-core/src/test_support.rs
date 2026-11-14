@@ -6,6 +6,7 @@ ctor::declarative::ctor! {
     #[ctor(unsafe)]
     fn seal_test_process() {
         cairn_common::test_seal::seal_process();
+        cairn_checkenv::install_test_identity();
     }
 }
 

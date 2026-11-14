@@ -1485,6 +1485,7 @@ mod tests {
                 "ast-grep-outline",
                 "cairn-analytics",
                 "cairn-attention",
+                "cairn-build-id",
                 "cairn-cell",
                 "cairn-channels",
                 "cairn-checkenv",

@@ -17,6 +17,7 @@ use cairn_core::internal::storage::{LocalDb, RowExt};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("held");
 

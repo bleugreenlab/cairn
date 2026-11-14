@@ -42,6 +42,7 @@ impl log::Log for Stderr {
 
 #[tokio::main]
 async fn main() {
+    cairn_build_id::install();
     let _ = log::set_logger(&Stderr).map(|()| log::set_max_level(log::LevelFilter::Info));
     let args: Vec<String> = std::env::args().collect();
     let [_, db_path, project_key, destination] = args.as_slice() else {

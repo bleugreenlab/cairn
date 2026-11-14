@@ -27,6 +27,7 @@ fn int(v: &Value) -> i64 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let db_path = std::env::args()
         .nth(1)
         .expect("usage: dump_event_sizes <db>");

@@ -49,6 +49,7 @@ async fn register_anonymous_device() -> String {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((db_path, queries)) = args.split_first() else {
         eprintln!("usage: verify_semantic_search <DB_PATH> <QUERY>...");

@@ -46,6 +46,7 @@ const PER_JOB: &str = "SELECT state, end_reason FROM turns WHERE job_id = ?1
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let db_path = std::env::args()
         .nth(1)
         .expect("usage: explain_boot_repair <db> [run-slow]");

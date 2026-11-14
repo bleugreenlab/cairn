@@ -913,6 +913,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-build-id"
+version = "0.13.7"
+dependencies = [
+ "cairn-checkenv",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "cairn-cell"
 version = "0.13.7"
 dependencies = [
@@ -945,7 +954,6 @@ name = "cairn-checkenv"
 version = "0.13.7"
 dependencies = [
  "cairn-common",
- "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
@@ -1059,6 +1067,7 @@ dependencies = [
  "base64 0.22.1",
  "cairn-analytics",
  "cairn-attention",
+ "cairn-build-id",
  "cairn-cell",
  "cairn-channels",
  "cairn-checkenv",

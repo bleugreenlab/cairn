@@ -8301,6 +8301,15 @@ pub struct LearnedResourceEstimate {
 /// bound reads back as assumed, which it was, and it reports no census, so
 /// the runner learns nothing from it. An older runner ignores the census and
 /// the reserve's source and sends no learned figure.
+///
+/// cairn/7083 does not move the number. The check implementation identity's
+/// build script moved from `cairn-checkenv` to the binary-only `cairn-build-id`,
+/// which `cairn-exec`'s `main` installs at startup; it hashes the same inputs
+/// the same way, so a runner and an executor built from one tree still report
+/// one identity, byte for byte as before. No frame, variant or field changes.
+/// What a runner gets wrong talking to an older executor: nothing; the older
+/// executor carries the identity its own tree hashed to, as it always has.
+///
 /// cairn/7084 does not move the number. Under the Rust 1.99.1 pin,
 /// `ProcessTreeAdoptionChange::Adopt` boxes its `ProcessTreeAdoption`, and the
 /// executor's CLI-refresh failure boxes the artifact it names; serde writes a

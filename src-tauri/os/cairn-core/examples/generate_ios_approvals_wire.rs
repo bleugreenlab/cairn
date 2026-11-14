@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    cairn_build_id::install();
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
     let approvals = fs::read_to_string(root.join("src-tauri/os/cairn-common/src/approvals.rs"))
         .expect("read canonical approvals owner");

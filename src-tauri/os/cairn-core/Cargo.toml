@@ -160,6 +160,9 @@ keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "a
 libc = "0.2"
 
 [dev-dependencies]
+# Examples install the real identity; test binaries install the fixed test one.
+cairn-build-id = { path = "../cairn-build-id" }
+cairn-checkenv = { path = "../cairn-checkenv", features = ["test-utils"] }
 cairn-procmem = { path = "../cairn-procmem", features = ["test-utils"] }
 cairn-common = { path = "../cairn-common", features = ["test-utils"] }
 cairn-config = { path = "../cairn-config", features = ["test-utils"] }

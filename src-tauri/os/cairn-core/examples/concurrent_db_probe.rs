@@ -50,6 +50,7 @@ impl Default for Config {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let args: Vec<String> = std::env::args().collect();
 
     // Worker mode: `concurrent_db_probe worker <db_path> <iters> <worker_id> [--delete-heavy]`

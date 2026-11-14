@@ -340,6 +340,7 @@ async fn measure(
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
+    cairn_build_id::install();
     register_archived_file_renderer();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {

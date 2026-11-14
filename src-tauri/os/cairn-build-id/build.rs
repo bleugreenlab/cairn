@@ -51,7 +51,7 @@ fn main() {
     let workspace = manifest
         .ancestors()
         .nth(2)
-        .expect("cairn-checkenv must remain beneath src-tauri/os")
+        .expect("cairn-build-id must remain beneath src-tauri/os")
         .to_path_buf();
     let mut inputs = Vec::new();
     collect_inputs(&workspace, &workspace, &mut inputs);

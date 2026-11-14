@@ -58,6 +58,7 @@ struct RunEvent {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let mut args = std::env::args().skip(1);
     let db_path = args
         .next()

@@ -89,6 +89,7 @@ impl log::Log for Stderr {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    cairn_build_id::install();
     let level = match std::env::var("CLONE_LOG").as_deref() {
         Ok("debug") => log::LevelFilter::Debug,
         Ok("warn") => log::LevelFilter::Warn,

@@ -21,6 +21,7 @@ fn version(name: &str) -> &str {
         .unwrap()
 }
 fn main() {
+    cairn_build_id::install();
     println!(
         "// Canonical protocol v{}, framing v{}",
         version("COMPANION_PROTOCOL_VERSION"),

@@ -163,6 +163,7 @@ fn quantile(sorted: &[f32], q: f64) -> f32 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(db_path) = args.first() else {
         eprintln!("usage: tenet_evidence_dry_run <DB_PATH> [PROJECT_KEY] [N]");

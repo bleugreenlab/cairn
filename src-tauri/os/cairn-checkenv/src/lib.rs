@@ -2,11 +2,13 @@
 //!
 //! Its source-sensitive build identity lives above the shared protocol and
 //! storage crates, so a workload implementation edit cannot invalidate them.
+//! The identity itself is computed in `cairn-build-id`, which only binaries
+//! link, and installed here at startup: no library compiles against it.
 
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use sha2::{Digest, Sha256};
 
@@ -40,11 +42,48 @@ pub const KEYED_INSTRUMENTS: &[&str] = &["rustc", "bun"];
 /// verdict whose runtime nobody measured never answers a lookup that expects one.
 const UNRECORDED: &str = "unrecorded";
 
-/// Source-sensitive identity embedded by `build.rs`, deliberately equal in every
-/// runner and executor linked against the same workspace source. The build fails
-/// rather than falling back to package semver when this identity cannot be made.
-pub const fn implementation_identity() -> &'static str {
-    env!("CAIRN_CHECK_IMPLEMENTATION_ID")
+static IMPLEMENTATION_IDENTITY: OnceLock<&'static str> = OnceLock::new();
+
+/// Install this process's source-sensitive implementation identity. Binaries
+/// call it through `cairn_build_id::install()`, first in `main`.
+///
+/// The value must be `cairn_build_id::IMPLEMENTATION_ID`, never a literal: that
+/// is what keeps it equal in every runner and executor built from the same
+/// workspace source, and different in any two builds that are not, which is
+/// what lets verdict reuse and the runner build id compare it across
+/// processes. A second install of a different value panics, because one
+/// process keying its verdicts under two identities would mix them.
+pub fn set_implementation_identity(identity: &'static str) {
+    let installed = *IMPLEMENTATION_IDENTITY.get_or_init(|| identity);
+    assert_eq!(
+        installed, identity,
+        "a second, different check implementation identity was installed"
+    );
+}
+
+/// The identity [`set_implementation_identity`] installed.
+///
+/// Panics when nothing installed it rather than defaulting: a defaulted identity
+/// would let two different builds share verdicts.
+pub fn implementation_identity() -> &'static str {
+    IMPLEMENTATION_IDENTITY.get().copied().unwrap_or_else(|| {
+        panic!(
+            "the check implementation identity was read before it was installed: \
+             call cairn_build_id::install() first in main (a test binary calls \
+             cairn_checkenv::install_test_identity() from its constructor)"
+        )
+    })
+}
+
+/// The fixed identity test binaries run under. It is not a source hash, so no
+/// verdict a real lane records can ever match one keyed under it.
+#[cfg(feature = "test-utils")]
+pub const TEST_IMPLEMENTATION_IDENTITY: &str = "test-implementation-identity";
+
+/// Install [`TEST_IMPLEMENTATION_IDENTITY`], from a test binary's constructor.
+#[cfg(feature = "test-utils")]
+pub fn install_test_identity() {
+    set_implementation_identity(TEST_IMPLEMENTATION_IDENTITY);
 }
 
 /// Hash only the environment variables a check declares as verdict inputs.
@@ -541,6 +580,13 @@ pub fn local_fingerprint(variable_names: impl IntoIterator<Item = String>) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing in this test binary installs an identity, so a read must refuse.
+    #[test]
+    #[should_panic(expected = "call cairn_build_id::install() first in main")]
+    fn reading_the_identity_before_it_is_installed_fails() {
+        implementation_identity();
+    }
 
     #[test]
     fn shared_build_identity_participates_in_the_fingerprint() {

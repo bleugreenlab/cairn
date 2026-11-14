@@ -5,6 +5,7 @@ members = [
   "os/ast-grep-outline",
   "os/cairn-analytics",
   "os/cairn-attention",
+  "os/cairn-build-id",
   "os/cairn-cell",
   "os/cairn-channels",
   "os/cairn-checkenv",

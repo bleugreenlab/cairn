@@ -151,6 +151,7 @@ async fn open_entries(conn: &Connection, incarnation: &str) -> Vec<(String, i64)
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let db_path = std::env::args()
         .nth(1)
         .expect("usage: explain_queue_expiry <db> [baseline] [incarnations] [write]");

@@ -49,6 +49,7 @@ fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    cairn_build_id::install();
     let args: Vec<String> = std::env::args().collect();
     let Some(db_path) = args.get(1).filter(|a| !a.starts_with("--")).cloned() else {
         eprintln!(

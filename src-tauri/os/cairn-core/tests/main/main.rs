@@ -21,6 +21,7 @@ ctor::declarative::ctor! {
     fn seal_test_process() {
         common::sync_server::hand_tursodb_across_the_seal();
         cairn_common::test_seal::seal_process();
+        cairn_checkenv::install_test_identity();
     }
 }
 

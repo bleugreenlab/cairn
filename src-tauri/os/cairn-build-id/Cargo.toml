@@ -1,0 +1,16 @@
+[package]
+name = "cairn-build-id"
+version.workspace = true
+edition = "2021"
+description = "Source-sensitive check implementation identity, linked only by binaries"
+license = "BUSL-1.1"
+
+# Only binary packages depend on this crate. Its build script hashes every Rust
+# source and manifest in the workspace, so any edit reruns it; a library that
+# depended on it would recompile on every edit anywhere in the tree.
+[dependencies]
+cairn-checkenv = { path = "../cairn-checkenv" }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
