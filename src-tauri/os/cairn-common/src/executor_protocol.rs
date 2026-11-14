@@ -6254,6 +6254,11 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/7187 does not move the number. Memory admission boxes its private
+/// error result and moves the condition back out before constructing wire
+/// evidence. No condition, field, serialization or admission decision changes;
+/// a runner talking to an older executor gets nothing wrong.
+///
 /// cairn/6097 does not move the number. `ExecutorCapabilities` gains the
 /// defaulted `credentialFloorServiceResidents`, and an executor that sets it
 /// confines a service-held resident exactly as its declared sandbox mode says
