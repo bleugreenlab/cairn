@@ -50,7 +50,7 @@ pub(crate) mod retirement;
 
 pub(crate) use replay_requests::{
     on_branch_hold_released, on_branch_hold_released_for_run, request_branch_replay,
-    serve_pending_replay_requests, REPEAT_REFUSED,
+    serve_pending_replay_requests, HEAL_REFUSED, HEAL_REPEAT_REFUSED, REPEAT_REFUSED,
 };
 
 /// The one project whose store holds a branch, the database that owns its
@@ -1803,6 +1803,13 @@ async fn materialize_markers_for_branch(
     branch: &str,
     diagnostic: &crate::jj::ConflictDiagnostic,
 ) -> (MarkerState, Option<String>, Vec<(String, String)>) {
+    if diagnostic.condition == crate::jj::ConflictCondition::HealRefused {
+        return (
+            MarkerState::NotMaterialized,
+            Some("an ancestry heal refusal leaves no content to merge".to_string()),
+            Vec::new(),
+        );
+    }
     let paths = diagnostic.conflicting_paths();
     if paths.is_empty() {
         return (
@@ -2767,6 +2774,10 @@ pub(super) async fn retry_pending_materializations(orch: &Orchestrator, db: &Loc
             conflicted_tip: session.conflicted_tip.clone(),
             condition: crate::jj::ConflictCondition::from_stored(&session.condition),
             validation: None,
+            heal_refusal: session
+                .heal_refusal
+                .as_ref()
+                .map(|recorded| recorded.refusal.clone()),
             incoming: session
                 .files
                 .iter()
@@ -2969,6 +2980,10 @@ fn render_incoming_group(label: &str, paths: &[String]) -> String {
 /// and CAIRN-3328 each burned.
 fn marker_guidance(state: MarkerState, condition: crate::jj::ConflictCondition) -> &'static str {
     let drift = condition == crate::jj::ConflictCondition::BaseDrift;
+    if condition == crate::jj::ConflictCondition::HealRefused {
+        return "\nThere are no conflict markers in your checkout, and nothing in it to edit: your \
+                content resolution is complete.";
+    }
     match state {
         MarkerState::Materialized if drift => {
             "\nAny marker-bearing file in your checkout is scaffolding from this diagnostic, not \
@@ -3084,11 +3099,23 @@ fn append_conflict_diagnostic(
         (None, crate::jj::ConflictCondition::Unparseable) => {
             unparseable_guidance(diagnostic.validation.as_ref())
         }
+        (None, crate::jj::ConflictCondition::HealRefused) => format!(
+            "\n{} Your content resolution stands and your branch is unchanged; editing files \
+             cannot change this.\n\n{}",
+            diagnostic
+                .heal_refusal
+                .as_ref()
+                .map(crate::orchestrator::conflict_session::heal_refused_condition)
+                .unwrap_or_else(|| "Condition: ancestry heal refused.".to_string()),
+            replay_cost::merge_catch_up_exit()
+        ),
     };
     let conflicting_label = if diagnostic.scaffolding.is_some() {
         "Affected files in the replay withheld for conflict scaffolding"
     } else if diagnostic.condition == crate::jj::ConflictCondition::Unparseable {
         "Changed on both sides, merged by jj into files that do not parse"
+    } else if diagnostic.condition == crate::jj::ConflictCondition::HealRefused {
+        "Files your committed resolution placed, already resolved"
     } else {
         "Conflicting files, yours to merge"
     };

@@ -720,10 +720,12 @@ pub(crate) fn budgets_line() -> String {
     )
 }
 
-/// The operational exit for a branch whose replay cannot fit, as both the
-/// replay answer and the rebase page name it.
+/// The operational exit for a branch whose replay cannot fit its budget or
+/// whose ancestry heal cannot be made exact, as the replay answer, the owner's
+/// wake and the rebase page all name it.
 pub(crate) fn merge_catch_up_exit() -> &'static str {
-    "The operational exit for a branch whose replay cannot fit is merge catch-up mode \
+    "The operational exit for a branch whose replay cannot fit, or whose ancestry heal cannot \
+     be made exact, is merge catch-up mode \
      (cairn/6080): the base is brought in by one merge commit and no branch commit is replayed \
      or healed. It is the operator's decision, never automatic: request it with \
      `write({changes:[{target:\"cairn:~/rebase\",mode:\"patch\",payload:{action:\"catch-up-mode\",\

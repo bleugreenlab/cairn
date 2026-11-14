@@ -1,0 +1,15 @@
+-- lineage: shared
+-- cairn/6019: a replay whose content is resolved, and whose ancestry heal the
+-- guard refused, is its own session condition (`conflict_condition =
+-- 'heal_refused'`), never a content conflict.
+--
+-- `heal_refusal_json` holds what that condition was recorded for: the guard
+-- that refused, the pre-heal and healed tips and trees, the paths the trees
+-- differ on, and the exact attempt that met it (head, destination, resolution
+-- fingerprint, replay engine version). The heal is deterministic, so an
+-- explicit replay identical in all four is refused before it computes; a new
+-- commit, a different resolution or a new engine is a different attempt. A
+-- base advance is not: a take-committed-tip replay lands on the session's
+-- recorded base while the live base still contains it. NULL for every other
+-- condition.
+ALTER TABLE jj_reconcile_items ADD COLUMN heal_refusal_json TEXT;

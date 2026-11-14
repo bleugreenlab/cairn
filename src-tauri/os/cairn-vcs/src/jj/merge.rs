@@ -544,6 +544,12 @@ pub enum ConflictCondition {
     /// can merge "cleanly" into a list closed twice. The remedy is the content
     /// one, guided by the parser's first error rather than by markers.
     Unparseable,
+    /// The content is resolved and the rebase landed, but the ancestry heal
+    /// that clears the conflict flags from the branch's own history could not
+    /// keep the clean tip's tree, so its guard refused it (see
+    /// [`super::HealRefusal`]). Nothing in the agent's checkout can change
+    /// this; editing files is never the remedy.
+    HealRefused,
 }
 
 impl ConflictCondition {
@@ -553,6 +559,7 @@ impl ConflictCondition {
             Self::ContentConflict => "content_conflict",
             Self::BaseDrift => "base_drift",
             Self::Unparseable => "unparseable",
+            Self::HealRefused => "heal_refused",
         }
     }
 
@@ -562,6 +569,7 @@ impl ConflictCondition {
         match name {
             "base_drift" => Self::BaseDrift,
             "unparseable" => Self::Unparseable,
+            "heal_refused" => Self::HealRefused,
             _ => Self::ContentConflict,
         }
     }
@@ -640,6 +648,10 @@ pub struct ConflictDiagnostic {
     /// `conflicted_tip` is that refused commit and the conflicting paths are
     /// exactly the files that failed to parse.
     pub validation: Option<ValidationRefusal>,
+    /// Set when the condition is [`ConflictCondition::HealRefused`]: the guard
+    /// that refused and the trees it compared. Then `conflicted_tip` is the
+    /// healed tip the guard refused, when the heal produced one.
+    pub heal_refusal: Option<super::HealRefusal>,
 }
 
 /// A rebased tip refused at export because its tree root carried jj conflict
@@ -665,6 +677,19 @@ impl ConflictDiagnostic {
                     classification: IncomingClassification::Conflicting,
                 })
                 .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// A diagnostic for a refused heal that knows only the refusal: `ours` is
+    /// the pre-heal tip and no incoming change is enumerated. A caller holding
+    /// the replay's coordinates fills in the rest.
+    pub fn heal_refused(refusal: super::HealRefusal) -> Self {
+        Self {
+            ours: Some(refusal.pre_heal_tip.clone()),
+            conflicted_tip: refusal.healed_tip.clone(),
+            condition: ConflictCondition::HealRefused,
+            heal_refusal: Some(refusal),
             ..Self::default()
         }
     }
@@ -1030,6 +1055,7 @@ pub(crate) fn capture_conflict_diagnostic(
         incoming,
         scaffolding: None,
         validation: None,
+        heal_refusal: None,
     }
 }
 

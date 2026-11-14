@@ -84,6 +84,14 @@ const REPLAY_ATTEMPTS: u32 = 3;
 /// compute timeout; the rebase page reads it back.
 pub(crate) const REPEAT_REFUSED: &str = "repeat_refused";
 
+/// The failure kind of a request whose replay the ancestry heal's guard
+/// refused; the rebase page reads it back from the served verdict.
+pub(crate) const HEAL_REFUSED: &str = "ancestry_heal_refused";
+
+/// The close kind of a request refused as an identical repeat of one the
+/// ancestry heal's guard already refused.
+pub(crate) const HEAL_REPEAT_REFUSED: &str = "heal_repeat_refused";
+
 /// The sanctioned store-side replay of one branch onto its current base.
 ///
 /// The only surface that can move a branch's ancestry: an agent's slot is a
@@ -524,6 +532,20 @@ async fn replay(
                 let how = match &refusal {
                     PreparationRefusal::RepeatTimeout(_) => Settle::Closed {
                         kind: REPEAT_REFUSED,
+                    },
+                    PreparationRefusal::RepeatHealRefused(_) => Settle::Closed {
+                        kind: HEAL_REPEAT_REFUSED,
+                    },
+                    // The session holds the condition; the request's own row
+                    // freezes the verdict the page shows for it.
+                    PreparationRefusal::HealRefused { conflict, .. } => Settle::Served {
+                        base_branch: conflict.base_branch.clone(),
+                        base_commit: conflict.base_commit.clone(),
+                        record: Some(Verdict {
+                            outcome: "failed",
+                            failure: Some(HEAL_REFUSED),
+                            tip: Some(conflict.head.clone()),
+                        }),
                     },
                     PreparationRefusal::Conflict(conflict) => Settle::Served {
                         base_branch: conflict.base_branch.clone(),
@@ -1796,6 +1818,31 @@ fn not_landed(
         PreparationRefusal::RepeatTimeout(blocker) => Err(format!(
             "Explicit replay of `{branch}` was not attempted, and `{branch}` is unchanged. {}\n\n{}",
             super::replay_cost::blocked_guidance(&blocker),
+            super::replay_cost::merge_catch_up_exit()
+        )),
+        PreparationRefusal::HealRefused { conflict, refusal } => {
+            let super::preparation::BaseConflict {
+                base_branch,
+                base_commit,
+                head,
+                ..
+            } = *conflict;
+            Ok(format!(
+                "Explicit replay of `{branch}` at `{head}` onto `{base_branch}` at \
+                 `{base_commit}` was not installed. {} Your content resolution stands; `{branch}` \
+                 is unchanged. cairn:~/rebase holds this as an ancestry heal refusal. {}\n\n{}",
+                conflict_session::heal_refused_finding(&refusal),
+                conflict_session::HEAL_REPEAT_RULE,
+                super::replay_cost::merge_catch_up_exit()
+            ))
+        }
+        PreparationRefusal::RepeatHealRefused(recorded) => Err(format!(
+            "Explicit replay of `{branch}` was not attempted, and `{branch}` is unchanged: an \
+             identical replay of `{}` onto `{}` was already refused. {} {}\n\n{}",
+            recorded.head,
+            recorded.destination,
+            conflict_session::heal_refused_finding(&recorded.refusal),
+            conflict_session::HEAL_REPEAT_RULE,
             super::replay_cost::merge_catch_up_exit()
         )),
         PreparationRefusal::Busy(BusyReason::RunBatch(batch)) => Err(format!(

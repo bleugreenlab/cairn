@@ -351,6 +351,230 @@ async fn a_resolution_against_d1_is_not_restored_over_d2s_same_spot_append() {
     );
 }
 
+// ── cairn/6019: the ancestry heal ─────────────────────────────────────────────
+
+/// cairn/6019's specimen through the request: the branch changes a file main
+/// also changed, the session is recorded, and the agent integrates main's
+/// version by content in one commit (not a merge) and commits on. The
+/// take-committed-tip replay leaves both the branch's change and its
+/// integration conflict-flagged under a clean tip; the heal repairs them
+/// without undoing main's change, so the replay lands.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn take_committed_tip_lands_over_an_integrated_main_resolution() {
+    let bin = jj_or_skip!();
+    const FILE: &str = "permission.rs";
+    let integrated = "start\nnew\nend\nhelper\nold1\nold2\nextra\n";
+    let r = replay_harness(
+        &bin,
+        "integrated-main.db",
+        &[(FILE, "start\nold1\nold2\nend\n")],
+    )
+    .await;
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(FILE, "start\nold1\nold2\nextra\nend\n")],
+        "branch change",
+    );
+    let main = commit(
+        &r.fx,
+        &r.main_ws,
+        MAIN_LINE,
+        &[(FILE, "start\nnew\nend\n")],
+        "main change",
+    );
+    set_main(&r.fx, &main);
+    owner_commit_conflicts(&r).await;
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(FILE, integrated)],
+        "integrate main",
+    );
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(OTHER, "other\n")],
+        "unrelated tail",
+    );
+
+    let answer = request_take_committed_tip(&r).await;
+    assert!(carries(&r, &main), "the replay landed: {answer}");
+    assert!(answer.starts_with("Replayed"), "{answer}");
+    assert_eq!(
+        text_at(&r.fx, BRANCH, FILE),
+        integrated,
+        "main's change kept"
+    );
+    assert_eq!(text_at(&r.fx, BRANCH, OTHER), "other\n");
+    assert!(
+        open_session(&r).await.is_none(),
+        "the session closes: {answer}"
+    );
+}
+
+/// cairn/6019: a resolved replay the ancestry heal guard refuses is its own
+/// condition end to end. The session records `heal_refused` with the refusal;
+/// the answer names the guard's finding, both trees and merge catch-up, and
+/// never a content conflict; the page reads the same finding. An identical
+/// request is refused before computing and leaves the session as it was, and
+/// a new commit is a different attempt.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(jj)]
+async fn a_refused_heal_is_its_own_condition_and_an_identical_repeat_is_refused() {
+    use crate::orchestrator::base_advance::preparation::tests::{
+        refuse_heal, REFUSED_HEALED_TIP, REFUSED_HEALED_TREE,
+    };
+    use crate::orchestrator::conflict_session::{
+        heal_refused_condition, heal_refused_finding, HEAL_REPEAT_RULE,
+    };
+    let bin = jj_or_skip!();
+    let (r, d1, resolved) = same_spot_resolution(&bin, "heal-refused.db").await;
+    refuse_heal(&r.fx.store, true);
+
+    let answer = request_take_committed_tip(&r).await;
+    let session = open_session(&r)
+        .await
+        .expect("the refusal is held on a session");
+    assert!(session.is_heal_refused(), "{}: {answer}", session.condition);
+    let recorded = session
+        .heal_refusal
+        .clone()
+        .expect("the session carries the refusal");
+    assert_eq!(
+        (recorded.head.as_str(), recorded.destination.as_str()),
+        (resolved.as_str(), d1.as_str())
+    );
+    assert_eq!(recorded.engine_version, crate::jj::REPLAY_ENGINE_VERSION);
+    let refusal = &recorded.refusal;
+    assert_eq!(refusal.healed_tip.as_deref(), Some(REFUSED_HEALED_TIP));
+    let finding = heal_refused_finding(refusal);
+    for expected in [
+        finding.as_str(),
+        refusal.pre_heal_tree.as_str(),
+        REFUSED_HEALED_TREE,
+        "was not installed",
+        "Your content resolution stands",
+        "merge catch-up mode",
+    ] {
+        assert!(answer.contains(expected), "{expected}: {answer}");
+    }
+    assert!(
+        !answer.to_lowercase().contains("content conflict"),
+        "{answer}"
+    );
+    assert_eq!(branch_tip(&r), resolved, "nothing was installed");
+
+    r.db.execute_script(format!(
+        "UPDATE jobs SET uri_segment = 'node' WHERE id = '{JOB}';"
+    ))
+    .await
+    .unwrap();
+    let page = crate::resources::read_node_rebase(&r.orch, "proj", 1, 1, "node", &[]).await;
+    let condition = page
+        .lines()
+        .find(|line| line.starts_with("**Condition:"))
+        .unwrap_or_else(|| panic!("the page states a condition: {page}"));
+    assert_eq!(
+        condition,
+        format!("**Condition: ancestry heal refused.** {finding}"),
+        "{page}"
+    );
+    assert!(
+        page.contains("**the last attempt was refused** by the ancestry heal guard")
+            && page.contains(crate::orchestrator::base_advance::replay_cost::merge_catch_up_exit())
+            && !page.contains("Condition: content conflict"),
+        "{page}"
+    );
+    // Nothing on the page invites merge work the condition rules out.
+    assert!(
+        page.contains("**Markers:** none, and none are needed")
+            && !page.contains("computes the merge for you")
+            && !page.contains("complete merged file to commit"),
+        "{page}"
+    );
+    // The orchestrator's log line carries the same condition and finding.
+    let logged = heal_refused_condition(refusal);
+    assert_eq!(
+        logged,
+        format!("Condition: ancestry heal refused. {finding}")
+    );
+    eprintln!("LOGGED: {logged}\nPAGE: {condition}");
+
+    let unchanged = |session: &ConflictSession| {
+        (
+            session.intent_id.clone(),
+            session.condition.clone(),
+            session.fingerprint(),
+            session.heal_refusal.clone(),
+            conflicting(session)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let before = unchanged(&session);
+    let second = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+        .await
+        .expect_err("an identical repeat is refused");
+    for expected in [
+        "was not attempted",
+        "was already refused",
+        finding.as_str(),
+        HEAL_REPEAT_RULE,
+        "catch-up-mode",
+    ] {
+        assert!(second.contains(expected), "{expected}: {second}");
+    }
+    let after = open_session(&r).await.expect("the session stays open");
+    assert_eq!(unchanged(&after), before, "the session is not re-recorded");
+    assert_eq!(branch_tip(&r), resolved);
+
+    // A base advance is not a different attempt: the take-committed-tip
+    // replay still lands on the recorded base, so it meets the same refusal.
+    let moved = commit(
+        &r.fx,
+        &r.main_ws,
+        MAIN_LINE,
+        &[(UNRELATED, "u\n")],
+        "main moves on an unrelated file",
+    );
+    set_main(&r.fx, &moved);
+    let after_move = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+        .await
+        .expect_err("a base advance does not admit the identical repeat");
+    assert!(
+        after_move.contains("was already refused") && after_move.contains(&d1),
+        "{after_move}"
+    );
+    assert_eq!(
+        unchanged(&open_session(&r).await.unwrap()),
+        before,
+        "still not re-recorded"
+    );
+
+    // A new commit is a different attempt, and with the guard lifted it lands.
+    refuse_heal(&r.fx.store, false);
+    commit(
+        &r.fx,
+        &r.branch_ws,
+        BRANCH,
+        &[(OTHER, "after\n")],
+        "a new commit",
+    );
+    let third = request_take_committed_tip(&r).await;
+    assert!(carries(&r, &d1), "{third}");
+    assert!(
+        carries(&r, &moved),
+        "the clean increment lands too: {third}"
+    );
+    assert!(open_session(&r).await.is_none(), "{third}");
+}
+
 // ── cairn/7095: land on the recorded base, then the increment ──────────────────
 
 const OTHER: &str = "other.txt";

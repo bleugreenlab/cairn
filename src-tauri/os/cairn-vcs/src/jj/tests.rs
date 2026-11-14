@@ -1945,9 +1945,11 @@ fn an_unmoved_branch_whose_heal_cannot_run_is_a_retried_failure_not_a_conflict()
     record_unmoved_heal_refusal(
         &mut lock,
         branch,
-        "jj restore (ancestry heal) failed: The lock for the packed-ref file could not be obtained\n\
-         packed-refs lock: contention — held by live process 77 (git) after 30s"
-            .to_string(),
+        HealError::Failed(
+            "jj restore (ancestry heal) failed: The lock for the packed-ref file could not be \
+             obtained\npacked-refs lock: contention — held by live process 77 (git) after 30s"
+                .to_string(),
+        ),
     );
     assert!(lock.conflicted.is_empty(), "a lock is not a conflict");
     assert_eq!(lock.failed.len(), 1);
@@ -1957,10 +1959,18 @@ fn an_unmoved_branch_whose_heal_cannot_run_is_a_retried_failure_not_a_conflict()
     );
 
     let mut guard = ReconcileReport::default();
+    let refusal = HealRefusal {
+        guard: HealGuard::TipTreeChanged,
+        pre_heal_tip: "1dc97f55".to_string(),
+        pre_heal_tree: "0520dad1".to_string(),
+        healed_tip: Some("920cd1ed".to_string()),
+        healed_tree: Some("b93db1c1".to_string()),
+        paths: vec!["permission.rs".to_string()],
+    };
     record_unmoved_heal_refusal(
         &mut guard,
         branch,
-        format!("{ANCESTRY_HEAL_GUARD} commit abc is still conflict-flagged after the heal"),
+        HealError::Refused(Box::new(refusal.clone())),
     );
     assert_eq!(
         guard.conflicted,
@@ -1968,6 +1978,18 @@ fn an_unmoved_branch_whose_heal_cannot_run_is_a_retried_failure_not_a_conflict()
         "a guard refusal is still a finding about the tree"
     );
     assert!(guard.failed.is_empty());
+    let diagnostic = &guard.conflict_diagnostics[branch];
+    assert_eq!(
+        diagnostic.condition,
+        ConflictCondition::HealRefused,
+        "never a content conflict: there is no content to resolve"
+    );
+    assert_eq!(diagnostic.heal_refusal.as_ref(), Some(&refusal));
+    assert_eq!(
+        refusal.to_string(),
+        "ancestry heal guard: the healed tip `920cd1ed` (tree `b93db1c1`) does not hold the tree \
+         `0520dad1` of the pre-heal tip `1dc97f55`; differs in: permission.rs"
+    );
 }
 
 /// A rollback that did not complete outranks the lock that caused it. Such an
@@ -1994,18 +2016,18 @@ fn an_incomplete_rollback_outranks_a_nested_lost_lock() {
     );
 
     // An unmoved branch whose heal failed and could not be undone is a
-    // reported failure — even when the failure was a guard refusal.
+    // reported failure, whatever refused it first.
     let branch = "agent/cairn-4994-builder-0";
     let mut report = ReconcileReport::default();
     record_unmoved_heal_refusal(
         &mut report,
         branch,
-        format!(
-            "{ANCESTRY_HEAL_GUARD} commit abc is still conflict-flagged after the heal\n{}",
+        HealError::Failed(format!(
+            "the healed tip carries jj conflict scaffolding\n{}",
             rollback_incomplete(
                 "the refused heal of `b` could not be undone to operation op1: lock"
             )
-        ),
+        )),
     );
     assert!(report.conflicted.is_empty(), "{report:?}");
     assert_eq!(report.failed.len(), 1);

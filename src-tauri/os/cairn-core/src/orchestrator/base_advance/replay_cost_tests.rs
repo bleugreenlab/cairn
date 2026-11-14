@@ -416,8 +416,11 @@ fn a_measurement_reports_observed_counts_phases_and_that_the_heal_is_only_part_o
         Ok(Vec::new()),
         at(Some(HEAD), BASE),
     );
+    let header = format!(
+        "explicit budget of 60.0s, replay mode, engine v{REPLAY_ENGINE_VERSION}, build `content-v2:abc`, host bbl.local, load 11.50"
+    );
     for expected in [
-        "explicit budget of 60.0s, replay mode, engine v1, build `content-v2:abc`, host bbl.local, load 11.50",
+        header.as_str(),
         "current: the branch and base are where it was measured",
         "247 branch commit(s); 14 already conflict-flagged in its history; 14 conflict-flagged after the rebase",
         "a newer base may introduce more or fewer, unknown until it runs",
@@ -486,9 +489,12 @@ fn a_current_blocker_says_an_identical_replay_is_refused_what_changes_it_and_the
         Ok(vec![blocker(key())]),
         at(Some(HEAD), BASE),
     );
+    let key_line = format!(
+        "`agent/x` at `111111111111` onto `main` at `222222222222` (replay mode, resolution `tip=true;drop=false;carry=0011223344556677`, engine v{REPLAY_ENGINE_VERSION})"
+    );
     for expected in [
         "**An identical explicit replay is refused.**",
-        "`agent/x` at `111111111111` onto `main` at `222222222222` (replay mode, resolution `tip=true;drop=false;carry=0011223344556677`, engine v1)",
+        key_line.as_str(),
         "it ran 57.5s of the 57.8s it had, in ancestry heal",
         "14 conflict-flagged commit(s) to heal of 247 on the branch and 9 restored",
         "a new commit on `agent/x`, `main` advancing, a different resolution, a new replay engine version, or the operator's approval of merge catch-up mode",
@@ -523,6 +529,7 @@ fn a_current_blocker_says_an_identical_replay_is_refused_what_changes_it_and_the
     // nothing, and the replay next action stays.
     let mut old_engine = blocker(key());
     old_engine.key.engine_version = REPLAY_ENGINE_VERSION + 1;
+    let other_engine = format!("replay engine v{}", REPLAY_ENGINE_VERSION + 1);
     for (what, blockers, head, mode, says) in [
         (
             "a new head",
@@ -536,7 +543,7 @@ fn a_current_blocker_says_an_identical_replay_is_refused_what_changes_it_and_the
             vec![old_engine],
             HEAD,
             ReplayMode::Replay,
-            "replay engine v2",
+            other_engine.as_str(),
         ),
         (
             "approved merge mode",

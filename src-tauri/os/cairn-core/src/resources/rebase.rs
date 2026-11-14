@@ -468,6 +468,24 @@ fn render_request_section(
                         ),
                         false,
                     ),
+                    (_, Some(crate::orchestrator::base_advance::HEAL_REFUSED)) => (
+                        format!(
+                            "onto `{destination}`: **the last attempt was refused** by the \
+                             ancestry heal guard. Nothing was installed, and your content \
+                             resolution stands. The session below says why and what moves the \
+                             branch now"
+                        ),
+                        false,
+                    ),
+                    (_, Some(crate::orchestrator::base_advance::HEAL_REPEAT_REFUSED)) => (
+                        format!(
+                            "was **refused as an identical repeat** of an explicit replay onto \
+                             `{destination}` that the ancestry heal guard already refused; \
+                             nothing was attempted. The session below says what would make a \
+                             different attempt"
+                        ),
+                        false,
+                    ),
                     (_, Some(crate::orchestrator::base_advance::REPEAT_REFUSED)) => (
                         format!(
                             "was **refused as an identical repeat** of an explicit replay onto \
@@ -1513,6 +1531,11 @@ fn incoming_line(session: &ConflictSession) -> String {
 }
 
 fn marker_line(session: &ConflictSession) -> String {
+    if session.is_heal_refused() {
+        return "**Markers:** none, and none are needed: an ancestry heal refusal leaves no \
+                content to merge."
+            .to_string();
+    }
     match session.marker_state {
         MarkerState::Materialized => {
             let bearing: Vec<&str> = session
@@ -1654,7 +1677,10 @@ fn render_summary(
         &coordinates,
     );
 
-    let (condition, replay_payload) = if session.is_base_drift() {
+    let heal_refused = session.is_heal_refused();
+    let (condition, replay_payload) = if heal_refused {
+        (heal_refused_condition(session), "")
+    } else if session.is_base_drift() {
         (
             "**Condition: base drift.** Every conflicting file is already byte-identical between your \
              branch and the new base, so there is nothing to merge — what is stale is your branch's \
@@ -1717,25 +1743,37 @@ fn render_summary(
             ),
         ),
     };
-    let resolution = format!(
-        "{assessment_unknown}{}",
-        resolution_section(assessment.as_ref(), &base)
-    );
+    // A refused heal has no content left to resolve, so the sections that
+    // judge or guide a resolution would only invite edits that change nothing.
+    let resolution = if heal_refused {
+        String::new()
+    } else {
+        format!(
+            "{assessment_unknown}{}",
+            resolution_section(assessment.as_ref(), &base)
+        )
+    };
+    let outcome = if heal_refused {
+        "replaying your branch onto it rebased with your committed resolution and a clean tip, \
+         and was not installed"
+    } else {
+        "preparing your branch onto it recorded a conflict and did not land the new base"
+    };
 
     format!(
-        "# Rebase session for `{branch}`\n{version_note}\n{incoming}, and preparing your branch onto it \
-         recorded a conflict and did not land the new base. Your branch remains on its \
-         pre-advance content, but replay machinery may rewrite its store commit identity; the \
-         coordinates below are current.\n\n{condition}\n{status}\n{markers}\n{standing}\n## Three-way \
+        "# Rebase session for `{branch}`\n{version_note}\n{incoming}, and {outcome}. Your branch \
+         remains on its pre-advance content, but replay machinery may rewrite its store commit \
+         identity; the coordinates below are current.\n\n{condition}\n{status}\n{markers}\n{standing}\n## Three-way \
          coordinates\n\n{coords}\nThese are immutable commits. Read any file as of either side \
          with `?branch=<commit>`, or read the merge:\n\n- `{base}?view=merged` — the two sides \
-         merged line-wise, with everything non-overlapping already resolved. Add `file=PATH` for \
-         the complete merged file to commit.{merged_warning}\n- `{base}?view=base-ours` — what your branch \
+         merged line-wise, with everything non-overlapping already resolved. \
+         {merged_file}{merged_warning}\n- `{base}?view=base-ours` — what your branch \
          did\n- `{base}?view=base-theirs` — what arrived\n\nAll three accept `file=PATH`, \
          `offset=N`, and `limit=N`.\n{resolution_section}{conflicting_table}{dropped_section}{collision_section}{clean_table}\n{next}\n\nSession \
          fingerprint `{fingerprint}`, recorded {recorded}.\n",
         next = match blocked {
             Some(blocked) => blocked.to_string(),
+            None if heal_refused => heal_refused_next_action(),
             None => format!(
                 "## Next action\n\n```\nwrite({{changes:[{{target:\"cairn:~/rebase\",mode:\"patch\",\
                  payload:{{{replay_payload}}}}}]}})\n```\n\nThis asks the store to replay your \
@@ -1752,12 +1790,27 @@ fn render_summary(
         standing = standing_section(session, standing),
         coords = coordinates_block(session),
         resolution_section = resolution,
-        dropped_section = dropped_work_section(assessment.as_ref(), &base),
-        collision_section = exact
-            .as_ref()
-            .map(|jj| collision_section(jj, &session_store, session))
-            .unwrap_or_default(),
-        conflicting_table = file_table("Conflicting files, yours to merge", &conflicting),
+        dropped_section = if heal_refused {
+            String::new()
+        } else {
+            dropped_work_section(assessment.as_ref(), &base)
+        },
+        collision_section = if heal_refused {
+            String::new()
+        } else {
+            exact
+                .as_ref()
+                .map(|jj| collision_section(jj, &session_store, session))
+                .unwrap_or_default()
+        },
+        conflicting_table = file_table(
+            if heal_refused {
+                "Files your committed resolution placed, already resolved"
+            } else {
+                "Conflicting files, yours to merge"
+            },
+            &conflicting
+        ),
         clean_table = file_table(
             "Also arriving with this change, cleanly on replay",
             &clean
@@ -1766,6 +1819,68 @@ fn render_summary(
         recorded = crate::clock::stamp(session.updated_at)
             .unwrap_or_else(|| "at an unrecorded time".to_string()),
         merged_warning = merged_warning,
+        merged_file = if heal_refused {
+            "Add `file=PATH` for one file; under this condition it is for reading, with nothing \
+             left to commit."
+        } else {
+            "Add `file=PATH` for the complete merged file to commit."
+        },
+    )
+}
+
+/// The condition of a session whose replay the ancestry heal's guard refused:
+/// the guard's finding in the words the replay answer and the log use, the
+/// trees it compared, and that the content is already resolved.
+fn heal_refused_condition(session: &ConflictSession) -> String {
+    let Some(recorded) = session.heal_refusal.as_ref() else {
+        return "**Condition: ancestry heal refused.** The replay rebased with your committed \
+                resolution and a clean tip, and the ancestry heal's guard refused it; the \
+                refusal's detail could not be read. Your content is resolved: nothing editable \
+                in your checkout changes this."
+            .to_string();
+    };
+    let refusal = &recorded.refusal;
+    let mut trees = format!(
+        "\n\n- Pre-heal tip `{}`, tree `{}`: the clean rebased tip, whose tree the heal must keep",
+        refusal.pre_heal_tip, refusal.pre_heal_tree
+    );
+    if let Some(healed) = refusal.healed_tip.as_deref() {
+        trees.push_str(&format!(
+            "\n- Healed tip `{healed}`, tree `{}`: what the heal produced",
+            refusal.healed_tree.as_deref().unwrap_or("unrecorded")
+        ));
+    }
+    if !refusal.paths.is_empty() {
+        trees.push_str(&format!(
+            "\n- Differs in: {}",
+            refusal
+                .paths
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    format!(
+        "**Condition: ancestry heal refused.** {}{trees}\n\nYour content is resolved: the replay \
+         of `{}` onto `{}` rebased your branch with your committed resolution and a clean tip. \
+         What was refused is the heal that clears the conflict flags from the commits below \
+         that tip, because the healed history would not hold exactly your tip's tree. Nothing \
+         editable in your checkout changes this, so do not edit or re-commit files for it.",
+        crate::orchestrator::conflict_session::heal_refused_finding(refusal),
+        recorded.head,
+        recorded.destination,
+    )
+}
+
+/// The next action of a heal-refused session: nothing the agent edits or
+/// re-requests moves the branch, and merge catch-up mode is the exit.
+fn heal_refused_next_action() -> String {
+    format!(
+        "## Next action\n\nNothing editable in your checkout changes this, and requesting the \
+         replay again does not either: {}\n\n{}",
+        crate::orchestrator::conflict_session::HEAL_REPEAT_RULE,
+        crate::orchestrator::base_advance::replay_cost::merge_catch_up_exit()
     )
 }
 
@@ -2739,6 +2854,7 @@ mod tests {
             resolution_basis: Default::default(),
             replay_requested_tip: None,
             replay_requested_destination: None,
+            heal_refusal: None,
         }
     }
 
@@ -3013,6 +3129,111 @@ mod tests {
         assert!(
             merged.contains("**landed** on `a337fa4d`") && !merged.contains("Request it again"),
             "a merge catch-up lands like a replay: {merged}"
+        );
+    }
+
+    /// cairn/6019: a session whose replay the ancestry heal guard refused is its
+    /// own condition. It names the guard's finding in the replay answer's words,
+    /// both tips and trees and the paths they differ on, and merge catch-up as
+    /// the next step; it never reads as a content conflict to resolve, and it
+    /// does not offer the replay that an identical attempt would refuse. The
+    /// request section freezes the refusal as the last attempt's verdict.
+    #[test]
+    fn a_heal_refused_session_names_the_guard_both_trees_and_merge_catch_up() {
+        use crate::orchestrator::conflict_session::{
+            heal_refused_finding, RecordedHealRefusal, ReplayPass, ReplayRequestState,
+            HEAL_REPEAT_RULE,
+        };
+        let refusal = crate::jj::HealRefusal {
+            guard: crate::jj::HealGuard::TipTreeChanged,
+            pre_heal_tip: "1dc97f55".to_string(),
+            pre_heal_tree: "0520dad1".to_string(),
+            healed_tip: Some("920cd1ed".to_string()),
+            healed_tree: Some("b93db1c1".to_string()),
+            paths: vec!["permission.rs".to_string()],
+        };
+        let mut session = recorded_session();
+        session.condition = crate::jj::ConflictCondition::HealRefused
+            .as_str()
+            .to_string();
+        session.heal_refusal = Some(RecordedHealRefusal {
+            refusal: refusal.clone(),
+            head: "c9bcf33c".to_string(),
+            destination: "a337fa4d".to_string(),
+            resolution: "tip=true;drop=false;carry=00".to_string(),
+            engine_version: crate::jj::REPLAY_ENGINE_VERSION,
+        });
+        assert!(session.is_heal_refused());
+
+        let condition = heal_refused_condition(&session);
+        let next = heal_refused_next_action();
+        assert!(
+            condition.starts_with(&format!(
+                "**Condition: ancestry heal refused.** {}",
+                heal_refused_finding(&refusal)
+            )),
+            "{condition}"
+        );
+        for expected in [
+            "Pre-heal tip `1dc97f55`, tree `0520dad1`",
+            "Healed tip `920cd1ed`, tree `b93db1c1`",
+            "Differs in: `permission.rs`",
+            "Your content is resolved",
+            "Nothing editable in your checkout changes this",
+        ] {
+            assert!(condition.contains(expected), "{expected}: {condition}");
+        }
+        assert!(
+            next.contains(HEAL_REPEAT_RULE)
+                && next.contains(
+                    crate::orchestrator::base_advance::replay_cost::merge_catch_up_exit()
+                ),
+            "{next}"
+        );
+        let page = format!("{condition}\n{next}");
+        assert!(
+            !page.to_lowercase().contains("content conflict")
+                && !page.contains("resolution:\"take-committed-tip\"")
+                && !page.contains("action:\"replay\""),
+            "{page}"
+        );
+
+        let refused = render_request_section(
+            &latest(ReplayRequestState::Served {
+                pass: ReplayPass {
+                    outcome_kind: Some("failed".into()),
+                    failure_kind: Some(crate::orchestrator::base_advance::HEAL_REFUSED.into()),
+                    diagnostic: Some("Explicit replay of `agent/test` was not installed.".into()),
+                    ..ReplayPass::default()
+                },
+                destination: "a337fa4d".into(),
+            }),
+            &Ok(None),
+        );
+        assert!(
+            refused.contains("**the last attempt was refused** by the ancestry heal guard")
+                && refused.contains("> Explicit replay of `agent/test` was not installed.")
+                && !refused.contains("Request it again"),
+            "{refused}"
+        );
+        let repeat = render_request_section(
+            &latest(ReplayRequestState::Served {
+                pass: ReplayPass {
+                    failure_kind: Some(
+                        crate::orchestrator::base_advance::HEAL_REPEAT_REFUSED.into(),
+                    ),
+                    ..ReplayPass::default()
+                },
+                destination: "a337fa4d".into(),
+            }),
+            &Ok(None),
+        );
+        assert!(
+            repeat.contains("**refused as an identical repeat**")
+                && repeat.contains("the ancestry heal guard already refused")
+                && !repeat.contains("compute budget")
+                && !repeat.contains("Request it again"),
+            "{repeat}"
         );
     }
 

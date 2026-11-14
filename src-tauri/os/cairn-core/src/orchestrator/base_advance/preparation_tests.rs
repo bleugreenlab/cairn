@@ -397,6 +397,69 @@ pub(in crate::orchestrator::base_advance) fn starve_compute(store: &Path, starve
     }
 }
 
+fn refused_heals() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static REFUSED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    REFUSED.get_or_init(Default::default)
+}
+
+/// Fault injection: every detached computation of `store` that would install
+/// a new head answers instead as the ancestry heal guard refusing it, with the
+/// candidate as the pre-heal tip and a fixed healed tip and tree.
+pub(in crate::orchestrator::base_advance) fn refuse_heal(store: &Path, refused: bool) {
+    let mut stores = refused_heals().lock().unwrap();
+    if refused {
+        stores.insert(store.to_path_buf());
+    } else {
+        stores.remove(store);
+    }
+}
+
+pub(in crate::orchestrator::base_advance) const REFUSED_HEALED_TIP: &str =
+    "920cd1ed19ae0000000000000000000000000000";
+pub(in crate::orchestrator::base_advance) const REFUSED_HEALED_TREE: &str =
+    "b93db1c10000000000000000000000000000000f";
+
+pub(super) fn substituted_heal_refusal(
+    store: &Path,
+    coordinate: &crate::jj::AdvanceCoordinate,
+    computed: Result<crate::jj::BranchAdvanceCandidate, crate::jj::AdvanceComputeError>,
+) -> Result<crate::jj::BranchAdvanceCandidate, crate::jj::AdvanceComputeError> {
+    let candidate = match computed {
+        Ok(candidate)
+            if candidate.head() != coordinate.head
+                && refused_heals().lock().unwrap().contains(store) =>
+        {
+            candidate
+        }
+        other => return other,
+    };
+    let refusal = crate::jj::HealRefusal {
+        guard: crate::jj::HealGuard::TipTreeChanged,
+        pre_heal_tip: candidate.head(),
+        pre_heal_tree: candidate.tree().unwrap(),
+        healed_tip: Some(REFUSED_HEALED_TIP.to_string()),
+        healed_tree: Some(REFUSED_HEALED_TREE.to_string()),
+        paths: vec!["shared.rs".to_string()],
+    };
+    // The three-way coordinates the engine's own refusal carries.
+    let bin = crate::jj::tests::jj_bin().expect("a heal refusal is substituted only under jj");
+    let fork = crate::jj::merge_bases(
+        &crate::jj::environment(&bin, store),
+        store,
+        &coordinate.head,
+        &coordinate.base,
+    )
+    .ok()
+    .and_then(|bases| bases.into_iter().next());
+    let mut diagnostic = crate::jj::ConflictDiagnostic::heal_refused(refusal);
+    diagnostic.base = fork;
+    diagnostic.ours = Some(coordinate.head.clone());
+    diagnostic.theirs = Some(coordinate.base.clone());
+    Err(crate::jj::AdvanceComputeError::HealRefused(Box::new(
+        diagnostic,
+    )))
+}
+
 /// Two suites of one `cairn check run` prepare the same branch at once. The
 /// one that reaches the install while its sibling's preparation still holds
 /// the branch's reservation waits for it and then installs, rather than

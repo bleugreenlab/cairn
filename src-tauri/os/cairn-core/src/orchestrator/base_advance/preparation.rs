@@ -565,6 +565,17 @@ pub(crate) enum PreparationRefusal {
     /// exhausted its compute budget (cairn/6456). Refused before computing;
     /// nothing was recorded or changed. Boxed for the refusal's size.
     RepeatTimeout(Box<super::replay_cost::TimeoutBlocker>),
+    /// The replay rebased with a clean tip, and the ancestry heal's guard
+    /// refused it. The branch's session now holds condition `heal_refused`
+    /// with the refusal; nothing was installed.
+    HealRefused {
+        conflict: Box<BaseConflict>,
+        refusal: Box<crate::jj::HealRefusal>,
+    },
+    /// An explicit replay identical to one the ancestry heal's guard already
+    /// refused, which the open session records. The heal is deterministic, so
+    /// it was refused before computing; nothing was recorded or changed.
+    RepeatHealRefused(Box<crate::orchestrator::conflict_session::RecordedHealRefusal>),
     RetriesExhausted {
         attempts: u32,
         last: String,
@@ -607,6 +618,8 @@ impl PreparationRefusal {
             Self::HeldByParentConflict(_) => "held by parent conflict",
             Self::TimedOut { .. } => "timed out",
             Self::RepeatTimeout(_) => "identical repeat of a timeout",
+            Self::HealRefused { .. } => "ancestry heal refused",
+            Self::RepeatHealRefused(_) => "identical repeat of an ancestry heal refusal",
             Self::RetriesExhausted { .. } => "retries exhausted",
             Self::Moved { .. } => "moved",
             Self::AlreadyPublished => "already published",
@@ -742,6 +755,33 @@ impl std::fmt::Display for PreparationRefusal {
                 "an identical explicit replay of {} onto `{}` at {} already exhausted its \
                  compute budget, so this one was refused before computing; nothing changed",
                 blocker.key.head, blocker.key.base_branch, blocker.key.base
+            ),
+            Self::HealRefused { conflict, refusal } => write!(
+                f,
+                "`{}` at {} onto base `{}` at {} was not installed: {refusal}. The content is \
+                 resolved and the branch is unchanged{}",
+                conflict.branch,
+                conflict.head,
+                conflict.base_branch,
+                conflict.base_commit,
+                // Only an owner's preparation records a session; a check or
+                // run capture leaves evidence and names no page.
+                match conflict.record {
+                    ConflictRecord::Session { .. } => {
+                        "; its rebase session (`cairn:~/rebase` on its owner's node) holds this \
+                         as an ancestry heal refusal"
+                    }
+                    ConflictRecord::CheckEvidence { .. } => {
+                        "; this preparation recorded no session, and the branch's owner meets \
+                         the same refusal at its next replay"
+                    }
+                }
+            ),
+            Self::RepeatHealRefused(recorded) => write!(
+                f,
+                "an identical explicit replay of {} onto {} was already refused by the ancestry \
+                 heal guard, so this one was refused before computing; nothing changed",
+                recorded.head, recorded.destination
             ),
             Self::RetriesExhausted { attempts, last } => write!(
                 f,
@@ -1819,6 +1859,7 @@ impl CachedMergeConflict {
             theirs: self.theirs,
             conflicted_tip: self.conflicted_tip,
             condition: crate::jj::ConflictCondition::from_stored(&self.condition),
+            heal_refusal: None,
             scaffolding: self
                 .scaffolding
                 .map(|(commit, entries)| crate::jj::ScaffoldingRefusal { commit, entries }),
@@ -2622,6 +2663,21 @@ impl Context<'_> {
                 drop(guard);
                 return Err(PreparationRefusal::RepeatTimeout(Box::new(blocker)));
             }
+            // The heal is deterministic: the same head, destination,
+            // resolution and engine meet the same guard. Refused before
+            // computing, so a repeat never re-records the session.
+            if let Some(recorded) = load_active_session(self.db, branch)
+                .await
+                .map_err(PreparationRefusal::Repository)?
+                .filter(ConflictSession::is_heal_refused)
+                .and_then(|session| session.heal_refusal)
+                .filter(|recorded| {
+                    recorded.refuses(&coordinate.head, &coordinate.base, &self.resolution())
+                })
+            {
+                drop(guard);
+                return Err(PreparationRefusal::RepeatHealRefused(Box::new(recorded)));
+            }
         }
         // Only now is a replay certain: the fast path and the bound-session
         // shortcut have both passed, so an up-to-date branch never pays for,
@@ -2676,6 +2732,8 @@ impl Context<'_> {
         let compute_started = std::time::Instant::now();
         #[cfg(test)]
         let hook_store = self.store.clone();
+        #[cfg(test)]
+        let refused_store = self.store.clone();
         let computed = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             tests::during_compute(&hook_store);
@@ -2693,6 +2751,8 @@ impl Context<'_> {
         })
         .await
         .map_err(|error| PreparationRefusal::Repository(format!("preparation worker: {error}")))?;
+        #[cfg(test)]
+        let computed = tests::substituted_heal_refusal(&refused_store, &coordinate, computed);
         self.with_cost(|cost| {
             cost.phases.compute_ms = Some(super::replay_cost::millis(compute_started.elapsed()));
         });
@@ -2759,6 +2819,35 @@ impl Context<'_> {
                     branch: branch.to_string(),
                     commit,
                 });
+            }
+            // The content is resolved and the rebase landed; only the heal of
+            // the branch's own history was refused. It is recorded as its own
+            // condition, never as a content conflict.
+            Err(crate::jj::AdvanceComputeError::HealRefused(diagnostic)) => {
+                let Some(refusal) = diagnostic.heal_refusal.clone() else {
+                    return Err(PreparationRefusal::Repository(
+                        "an ancestry heal refusal carried no guard".to_string(),
+                    ));
+                };
+                return match self
+                    .conflicted(&relationship, &coordinate, *diagnostic, true)
+                    .await
+                {
+                    Err(PreparationRefusal::Conflict(conflict)) => {
+                        log::warn!(
+                            "replay of `{branch}` at {} onto `{}` at {} was not installed. {}",
+                            coordinate.head,
+                            coordinate.base_branch,
+                            coordinate.base,
+                            crate::orchestrator::conflict_session::heal_refused_condition(&refusal)
+                        );
+                        Err(PreparationRefusal::HealRefused {
+                            conflict,
+                            refusal: Box::new(refusal),
+                        })
+                    }
+                    other => other,
+                };
             }
             Err(crate::jj::AdvanceComputeError::CoordinatesChanged) => {
                 return Ok(Attempt::Raced(
@@ -4827,6 +4916,15 @@ impl Context<'_> {
             .outcome_intent(&coordinate.base_branch, &coordinate.base)
             .await?;
         let fingerprint = diagnostic.fingerprint();
+        let heal_refusal = diagnostic.heal_refusal.clone().map(|refusal| {
+            crate::orchestrator::conflict_session::RecordedHealRefusal {
+                refusal,
+                head: coordinate.head.clone(),
+                destination: coordinate.base.clone(),
+                resolution: self.resolution(),
+                engine_version: crate::jj::REPLAY_ENGINE_VERSION,
+            }
+        });
         if crate::orchestrator::catch_up::mode_for(
             self.db,
             &self.request.project_id,
@@ -4861,7 +4959,7 @@ impl Context<'_> {
                 ));
             }
             // The same conflict, unless this attempt found a path the open
-            // session does not list yet.
+            // session does not list yet, or a different condition or refusal.
             let already_open = open.as_ref().is_some_and(|session| {
                 let listed: std::collections::BTreeSet<&str> = session
                     .conflicting()
@@ -4869,6 +4967,8 @@ impl Context<'_> {
                     .collect();
                 session.intent_id == intent_id
                     && session.fingerprint() == fingerprint
+                    && session.condition == diagnostic.condition.as_str()
+                    && session.heal_refusal == heal_refusal
                     && diagnostic
                         .conflicting_paths()
                         .iter()
@@ -4902,6 +5002,7 @@ impl Context<'_> {
                     &diagnostic,
                     &incoming,
                     &basis,
+                    heal_refusal.as_ref(),
                 )
                 .await
                 .map_err(PreparationRefusal::Repository)?;
@@ -4933,8 +5034,14 @@ impl Context<'_> {
                 reopened: !already_open,
             }
         } else {
-            self.record_check_evidence(&intent_id, coordinate, &fingerprint, &paths)
-                .await?;
+            self.record_check_evidence(
+                &intent_id,
+                coordinate,
+                &fingerprint,
+                &paths,
+                diagnostic.heal_refusal.as_ref(),
+            )
+            .await?;
             drop(guard);
             ConflictRecord::CheckEvidence { intent_id }
         };
@@ -4956,6 +5063,7 @@ impl Context<'_> {
         coordinate: &crate::jj::AdvanceCoordinate,
         fingerprint: &str,
         paths: &[String],
+        heal_refusal: Option<&crate::jj::HealRefusal>,
     ) -> Result<(), PreparationRefusal> {
         let branch = self.request.branch.as_str();
         if item_has_session(self.db, intent_id, branch)
@@ -4964,18 +5072,28 @@ impl Context<'_> {
         {
             return Ok(());
         }
-        let evidence = format!(
-            "{} preparation of `{branch}` at {} conflicts with base `{}` at {}{}",
-            self.request.purpose.label(),
-            coordinate.head,
-            coordinate.base_branch,
-            coordinate.base,
-            if paths.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", paths.join(", "))
-            }
-        );
+        let evidence = match heal_refusal {
+            Some(refusal) => format!(
+                "{} preparation of `{branch}` at {} onto base `{}` at {} was not installed. {}",
+                self.request.purpose.label(),
+                coordinate.head,
+                coordinate.base_branch,
+                coordinate.base,
+                crate::orchestrator::conflict_session::heal_refused_condition(refusal)
+            ),
+            None => format!(
+                "{} preparation of `{branch}` at {} conflicts with base `{}` at {}{}",
+                self.request.purpose.label(),
+                coordinate.head,
+                coordinate.base_branch,
+                coordinate.base,
+                if paths.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", paths.join(", "))
+                }
+            ),
+        };
         persist_reconcile_item(
             self.db,
             ReconcileItemUpdate {
@@ -5032,12 +5150,21 @@ impl Context<'_> {
             .map_err(PreparationRefusal::Repository)?;
             state
         };
-        let note = build_preparation_conflict_note(
-            branch,
-            &coordinate.base_branch,
-            &coordinate.base,
-            request.purpose,
-        );
+        let note = match &diagnostic.heal_refusal {
+            Some(refusal) => build_preparation_heal_refused_note(
+                branch,
+                &coordinate.base_branch,
+                &coordinate.base,
+                request.purpose,
+                refusal,
+            ),
+            None => build_preparation_conflict_note(
+                branch,
+                &coordinate.base_branch,
+                &coordinate.base,
+                request.purpose,
+            ),
+        };
         let message = append_conflict_diagnostic(&note, Some(diagnostic), marker_state);
         let fingerprint = diagnostic.fingerprint();
         let jobs = load_on_branch_jobs(self.db, &request.project_id, branch)
@@ -5756,6 +5883,27 @@ fn build_preparation_conflict_note(
          land until it carries the base.",
         purpose.label(),
         short(base_commit),
+    )
+}
+
+/// The owner's wake for a replay whose heal the guard refused. Its content is
+/// resolved, so it never asks for content work.
+fn build_preparation_heal_refused_note(
+    branch: &str,
+    base_branch: &str,
+    base_commit: &str,
+    purpose: PreparationPurpose,
+    refusal: &crate::jj::HealRefusal,
+) -> String {
+    format!(
+        "⛔ BLOCKING [Base branch update] Your {} needed `{branch}` on its current base \
+         `{base_branch}` at {}. The replay rebased with your resolution and a clean tip, but \
+         was not installed. {} Your content resolution stands and your branch is unchanged; \
+         nothing in your checkout changes this. `cairn:~/rebase` holds it as an ancestry heal \
+         refusal and names the next step.",
+        purpose.label(),
+        short(base_commit),
+        crate::orchestrator::conflict_session::heal_refused_condition(refusal),
     )
 }
 

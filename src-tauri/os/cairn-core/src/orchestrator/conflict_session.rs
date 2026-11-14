@@ -244,6 +244,61 @@ pub(crate) struct ConflictSession {
     /// base its resolution was made against, and is never retargeted; the
     /// live base's newer commits are the following round it opens.
     pub(crate) replay_requested_destination: Option<String>,
+    /// Set when the condition is `heal_refused`: the refusal and the attempt
+    /// that met it.
+    pub(crate) heal_refusal: Option<RecordedHealRefusal>,
+}
+
+/// An ancestry heal refusal as a session records it: the guard's finding and
+/// the exact attempt that met it.
+///
+/// The heal is deterministic in these four inputs, so an explicit replay
+/// identical in all of them would meet the same refusal and is refused before
+/// it computes (see [`Self::refuses`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RecordedHealRefusal {
+    pub(crate) refusal: crate::jj::HealRefusal,
+    /// The branch head the replay started from.
+    pub(crate) head: String,
+    /// The base commit it was replayed onto.
+    pub(crate) destination: String,
+    /// [`super::base_advance::replay_cost::resolution_fingerprint`] of what it
+    /// carried.
+    pub(crate) resolution: String,
+    pub(crate) engine_version: u32,
+}
+
+/// What the ancestry heal guard found, as one sentence. The rebase page, the
+/// replay answer, the owner's wake and the orchestrator log all say it in
+/// these words.
+pub(crate) fn heal_refused_finding(refusal: &crate::jj::HealRefusal) -> String {
+    format!("The ancestry heal guard found that {}.", refusal.sentence())
+}
+
+/// What an identical repeat meets, as the page and the replay answer say it.
+pub(crate) const HEAL_REPEAT_RULE: &str = "The heal is deterministic, so an identical replay is \
+     refused before it computes until the branch has a new commit, it carries a different \
+     resolution, or the replay engine changes. Waiting for the base to move does not change it: a \
+     take-committed-tip replay lands on the base this session recorded, which a base advance \
+     leaves the same.";
+
+/// The condition line with its finding, as the log and the wake carry it.
+pub(crate) fn heal_refused_condition(refusal: &crate::jj::HealRefusal) -> String {
+    format!(
+        "Condition: ancestry heal refused. {}",
+        heal_refused_finding(refusal)
+    )
+}
+
+impl RecordedHealRefusal {
+    /// Whether an attempt at these coordinates, by this build's engine, is
+    /// identical to the one refused.
+    pub(crate) fn refuses(&self, head: &str, destination: &str, resolution: &str) -> bool {
+        self.engine_version == crate::jj::REPLAY_ENGINE_VERSION
+            && self.head == head
+            && self.destination == destination
+            && self.resolution == resolution
+    }
 }
 
 /// What the reconcile row that processes a replay request last recorded.
@@ -389,6 +444,11 @@ impl ConflictSession {
 
     pub(crate) fn is_unparseable(&self) -> bool {
         self.condition == ConflictCondition::Unparseable.as_str()
+    }
+
+    /// The content is resolved; the ancestry heal's guard refused the replay.
+    pub(crate) fn is_heal_refused(&self) -> bool {
+        self.condition == ConflictCondition::HealRefused.as_str()
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -1352,8 +1412,13 @@ pub(crate) async fn record_conflict_session(
     diagnostic: &ConflictDiagnostic,
     incoming: &IncomingIdentity,
     basis: &ResolutionBasis,
+    heal_refusal: Option<&RecordedHealRefusal>,
 ) -> Result<(), String> {
     let basis_json = encode_basis(basis)?;
+    let heal_refusal_json = heal_refusal
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("encode heal refusal: {error}"))?;
     db.execute(
         "UPDATE jj_reconcile_items SET
            diagnostic_version = ?3,
@@ -1377,7 +1442,8 @@ pub(crate) async fn record_conflict_session(
              AND replay_served_at IS NULL THEN replay_requested_tip END,
            replay_requested_destination = CASE WHEN replay_request_id IS NOT NULL
              AND replay_served_at IS NULL THEN replay_requested_destination END,
-           resolution_basis_json = ?14
+           resolution_basis_json = ?14,
+           heal_refusal_json = ?15
          WHERE intent_id = ?1 AND bookmark = ?2",
         params![
             intent_id,
@@ -1394,6 +1460,7 @@ pub(crate) async fn record_conflict_session(
             MarkerState::NotMaterialized.as_str(),
             ResolutionState::Open.as_str(),
             basis_json.as_deref(),
+            heal_refusal_json.as_deref(),
         ],
     )
     .await
@@ -2238,7 +2305,7 @@ const SESSION_COLUMNS: &str = "i.intent_id, i.bookmark, n.project_id, n.store_pa
      i.base_commit, i.ours_commit, i.theirs_commit, i.conflicted_tip, i.incoming_pr_number, \
      i.incoming_issue, i.incoming_base_branch, i.marker_state, i.marker_diagnostic, \
      i.resolution_state, i.updated_at, i.replay_requested_at, i.resolution_basis_json, \
-     i.replay_requested_tip, i.replay_requested_destination";
+     i.replay_requested_tip, i.replay_requested_destination, i.heal_refusal_json";
 
 /// The active resolution session for a branch, if one is open.
 pub(crate) async fn load_active_session(
@@ -2358,6 +2425,12 @@ async fn load_session_where(
                     resolution_basis: decode_basis(row.opt_text(20)?.as_deref()),
                     replay_requested_tip: row.opt_text(21)?,
                     replay_requested_destination: row.opt_text(22)?,
+                    // An undecodable refusal reads as none: the page then shows
+                    // the stored condition without its detail, and nothing is
+                    // refused as a repeat on evidence that cannot be read.
+                    heal_refusal: row
+                        .opt_text(23)?
+                        .and_then(|json| serde_json::from_str(&json).ok()),
                 }))
             })
         })
@@ -2809,6 +2882,7 @@ mod tests {
             resolution_basis: ResolutionBasis::new(),
             replay_requested_tip: None,
             replay_requested_destination: None,
+            heal_refusal: None,
         }
     }
 
@@ -3484,6 +3558,7 @@ mod tests {
                 },
                 &IncomingIdentity::default(),
                 &ResolutionBasis::new(),
+                None,
             )
             .await
             .unwrap();

@@ -18,7 +18,14 @@ fn record_failure(report: &mut ReconcileReport, branch: &str, error: String) {
 /// silently reporting a successful reconcile for a branch that never moved.
 fn record_conflict(report: &mut ReconcileReport, branch: &str, diagnostic: ConflictDiagnostic) {
     let paths = diagnostic.conflicting_paths();
-    log::warn!(
+    if let Some(refusal) = &diagnostic.heal_refusal {
+        log::warn!(
+            "jj reconcile: {branch} is recorded as condition {}: {refusal}. The branch is \
+             unchanged.",
+            diagnostic.condition.as_str()
+        );
+    } else {
+        log::warn!(
         "jj reconcile: {branch} hit a {} against the advanced base; the rebase was rolled back and \
          the branch is unchanged. Conflicting file(s): {}. The incoming change also carries {} \
          file(s) that arrive cleanly on retry.",
@@ -30,6 +37,7 @@ fn record_conflict(report: &mut ReconcileReport, branch: &str, diagnostic: Confl
         },
         diagnostic.clean_on_retry_paths().len()
     );
+    }
     report.conflicted.push(branch.to_string());
     report
         .conflict_diagnostics
@@ -234,15 +242,6 @@ pub(crate) struct RebaseRollback {
     pub(crate) pre_tip: Option<String>,
 }
 
-/// Whether a heal refusal came from one of its guards — a positive finding that
-/// this history cannot be healed exactly — rather than from jj failing to run.
-/// The prefix is the one [`heal_conflicted_ancestry`] writes for its guards; the
-/// heal's verified export refusing a tree that carries conflict scaffolding is
-/// the same kind of finding, reached through the export guard.
-fn heal_refusal_is_guard(error: &str) -> bool {
-    error.starts_with(ANCESTRY_HEAL_GUARD) || is_conflict_scaffolding_export_refusal(error)
-}
-
 /// Undo this pass's rebase of a branch whose conflicted history could not be
 /// healed, and say truthfully why.
 ///
@@ -261,19 +260,34 @@ pub(crate) fn roll_back_refused_heal(
     branch: &str,
     dest: &str,
     rollback: &RebaseRollback,
-    refusal: String,
+    refusal: HealError,
     report: &mut ReconcileReport,
 ) {
-    let diagnostic = heal_refusal_is_guard(&refusal).then(|| {
-        let paths: Vec<String> =
-            conflicted_commits(jj, store, &format!("({dest})..bookmarks(exact:{branch:?})"))
-                .into_iter()
-                .flat_map(|commit| commit.files)
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-        capture_conflict_diagnostic(jj, store, branch, dest, rollback.pre_tip.as_deref(), paths)
-    });
+    let diagnostic = match &refusal {
+        HealError::Refused(heal) => {
+            let paths: Vec<String> =
+                conflicted_commits(jj, store, &format!("({dest})..bookmarks(exact:{branch:?})"))
+                    .into_iter()
+                    .flat_map(|commit| commit.files)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            let mut diagnostic = capture_conflict_diagnostic(
+                jj,
+                store,
+                branch,
+                dest,
+                rollback.pre_tip.as_deref(),
+                paths,
+            );
+            diagnostic.condition = ConflictCondition::HealRefused;
+            diagnostic.conflicted_tip = heal.healed_tip.clone();
+            diagnostic.heal_refusal = Some(heal.as_ref().clone());
+            Some(diagnostic)
+        }
+        HealError::Failed(_) => None,
+    };
+    let refusal = refusal.to_string();
     let cleanup = jj.cleanup_env();
     let jj = &cleanup;
     if let Err(error) = restore_operation(jj, store, &rollback.pre_op) {
@@ -318,13 +332,8 @@ pub(crate) fn roll_back_refused_heal(
         return;
     }
     match diagnostic {
-        Some(diagnostic) => {
-            log::warn!(
-                "jj reconcile: heal of {branch} refused by guard ({refusal}); rebase rolled \
-                 back and recorded as a conflict"
-            );
-            record_conflict(report, branch, diagnostic);
-        }
+        // `record_conflict` logs the condition with the guard's sentence.
+        Some(diagnostic) => record_conflict(report, branch, diagnostic),
         None => {
             log::warn!(
                 "jj reconcile: heal of {branch} could not run ({refusal}); rebase rolled back \
@@ -353,8 +362,15 @@ pub(crate) fn roll_back_refused_heal(
 pub(crate) fn record_unmoved_heal_refusal(
     report: &mut ReconcileReport,
     branch: &str,
-    refusal: String,
+    refusal: HealError,
 ) {
+    let refusal = match refusal {
+        HealError::Refused(heal) => {
+            record_conflict(report, branch, ConflictDiagnostic::heal_refused(*heal));
+            return;
+        }
+        HealError::Failed(error) => error,
+    };
     if refusal.contains(ROLLBACK_INCOMPLETE) {
         log::error!("jj reconcile: heal of {branch} failed and was not fully undone: {refusal}");
         record_failure(
@@ -362,13 +378,6 @@ pub(crate) fn record_unmoved_heal_refusal(
             branch,
             format!("healing this branch's conflict-flagged history failed: {refusal}"),
         );
-        return;
-    }
-    if heal_refusal_is_guard(&refusal) {
-        log::warn!(
-            "jj reconcile: heal of {branch} refused by guard ({refusal}); classifying conflicted"
-        );
-        report.conflicted.push(branch.to_string());
         return;
     }
     log::warn!("jj reconcile: heal of {branch} could not run ({refusal}); left for retry");

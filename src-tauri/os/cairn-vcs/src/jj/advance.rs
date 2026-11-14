@@ -12,6 +12,7 @@ use jj_lib::backend::{CommitId, CopyId, TreeValue};
 use jj_lib::commit::Commit;
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::Merge;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
@@ -520,14 +521,29 @@ impl BranchAdvanceCandidate {
 #[derive(Debug, Clone)]
 pub enum AdvanceComputeError {
     Conflict(Box<super::ConflictDiagnostic>),
-    BaseConflicted { base: String },
+    BaseConflicted {
+        base: String,
+    },
     TimedOut,
     CoordinatesChanged,
-    AmbiguousOwnership { commit: String },
-    UnknownEvidence { commit: String },
+    AmbiguousOwnership {
+        commit: String,
+    },
+    UnknownEvidence {
+        commit: String,
+    },
     Busy,
-    UnaccountedRemoteCommits { commits: Vec<String> },
-    EvidenceLimit { limit: usize },
+    UnaccountedRemoteCommits {
+        commits: Vec<String>,
+    },
+    EvidenceLimit {
+        limit: usize,
+    },
+    /// The rebase landed with a clean tip, and the ancestry heal's guard
+    /// refused to clear the branch history's conflict flags. The diagnostic's
+    /// condition is [`super::ConflictCondition::HealRefused`] and its
+    /// `heal_refusal` names the guard. Boxed for the refusal's size.
+    HealRefused(Box<super::ConflictDiagnostic>),
     Repository(String),
 }
 
@@ -562,6 +578,10 @@ impl std::fmt::Display for AdvanceComputeError {
                 f,
                 "advance evidence `{commit}` is not a full indexed commit"
             ),
+            Self::HealRefused(diagnostic) => match &diagnostic.heal_refusal {
+                Some(refusal) => refusal.fmt(f),
+                None => write!(f, "{} refused", super::ANCESTRY_HEAL_GUARD),
+            },
             Self::Repository(error) => f.write_str(error),
         }
     }
@@ -804,7 +824,7 @@ impl Deadline {
 /// branch and base: measurements and timeout evidence recorded under one
 /// version are never compared with, or allowed to block, another. A rebuild
 /// that leaves the algorithm alone keeps the version.
-pub const REPLAY_ENGINE_VERSION: u32 = 1;
+pub const REPLAY_ENGINE_VERSION: u32 = 2;
 
 /// The step a detached computation last entered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1960,6 +1980,15 @@ async fn rewrite_hidden(
     Ok(commit)
 }
 
+/// A commit's tree as a refusal names it: the tree id, or a marker for a
+/// conflicted tree, which has no single id.
+fn tree_label(commit: &Commit) -> String {
+    commit
+        .tree_ids()
+        .as_resolved()
+        .map_or_else(|| "<conflicted>".to_string(), |tree| tree.hex())
+}
+
 fn conflict_paths(commit: &Commit) -> Result<Vec<String>, AdvanceComputeError> {
     commit
         .tree()
@@ -1971,14 +2000,15 @@ fn conflict_paths(commit: &Commit) -> Result<Vec<String>, AdvanceComputeError> {
         .collect()
 }
 
-async fn restore_paths(
-    repo: &mut MutableRepo,
-    commit: &Commit,
+/// `tree` with each of `paths` holding `source`'s value, and a path `source`
+/// lacks removed. Every other path keeps `tree`'s value.
+async fn replace_paths(
+    tree: MergedTree,
     source: &Commit,
     paths: &[String],
     deadline: &Deadline,
-) -> Result<Commit, AdvanceComputeError> {
-    let mut tree = MergedTreeBuilder::new(commit.tree());
+) -> Result<MergedTree, AdvanceComputeError> {
+    let mut tree = MergedTreeBuilder::new(tree);
     for path in paths {
         deadline.check()?;
         let path = RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
@@ -1992,17 +2022,67 @@ async fn restore_paths(
         }
         tree.set_or_remove(path, value);
     }
-    let tree = tree.write_tree().await.map_err(compute_error)?;
-    let restored = repo
-        .rewrite_commit(commit)
-        .set_predecessors(rewrite_predecessors(commit, deadline)?)
+    tree.write_tree().await.map_err(compute_error)
+}
+
+/// `old` on `parents` holding exactly `tree`. A commit whose parents and tree
+/// are both unchanged is `old` itself, so history below the first repaired
+/// commit keeps its ids.
+async fn write_with_tree(
+    repo: &mut MutableRepo,
+    old: &Commit,
+    parents: Vec<CommitId>,
+    tree: MergedTree,
+    deadline: &Deadline,
+) -> Result<Commit, AdvanceComputeError> {
+    if parents == old.parent_ids() && tree.tree_ids() == old.tree_ids() {
+        return Ok(old.clone());
+    }
+    let commit = repo
+        .rewrite_commit(old)
+        .set_parents(parents)
         .set_tree(tree)
+        .set_predecessors(rewrite_predecessors(old, deadline)?)
         .detach()
         .write_hidden()
         .await
         .map_err(compute_error)?;
-    repo.add_head(&restored).await.map_err(compute_error)?;
-    Ok(restored)
+    repo.add_head(&commit).await.map_err(compute_error)?;
+    Ok(commit)
+}
+
+/// The paths among `paths` at which `commit` differs from its first parent:
+/// where a repaired commit now changes something itself, as opposed to a
+/// conflict it only inherited and its parent's repair already settled.
+async fn own_changes(
+    repo: &MutableRepo,
+    commit: &Commit,
+    paths: &[String],
+    deadline: &Deadline,
+) -> Result<Vec<String>, AdvanceComputeError> {
+    let Some(parent) = commit.parent_ids().first() else {
+        return Ok(paths.to_vec());
+    };
+    let parent = repo.store().get_commit(parent).map_err(compute_error)?;
+    let mut own = Vec::new();
+    for path in paths {
+        deadline.check()?;
+        let repo_path = RepoPathBuf::from_internal_string(path.clone()).map_err(compute_error)?;
+        if commit
+            .tree()
+            .path_value(&repo_path)
+            .await
+            .map_err(compute_error)?
+            != parent
+                .tree()
+                .path_value(&repo_path)
+                .await
+                .map_err(compute_error)?
+        {
+            own.push(path.clone());
+        }
+    }
+    Ok(own)
 }
 
 struct ProvenMergeCollapse {
@@ -2104,6 +2184,18 @@ async fn heal_branch(
         }
     };
     note(&|observed| observed.phase = Some(ComputePhase::Heal));
+    let refused = |guard: super::HealGuard, healed: Option<&Commit>, paths: Vec<String>| {
+        AdvanceComputeError::HealRefused(Box::new(super::ConflictDiagnostic::heal_refused(
+            super::HealRefusal {
+                guard,
+                pre_heal_tip: head.id().hex(),
+                pre_heal_tree: tree_label(head),
+                healed_tip: healed.map(|commit| commit.id().hex()),
+                healed_tree: healed.map(tree_label),
+                paths,
+            },
+        )))
+    };
     let before = branch_commits(repo, head.id(), base.id(), deadline, None).await?;
     let flagged = before.iter().filter(|commit| commit.has_conflict()).count() as u64;
     note(&|observed| {
@@ -2129,8 +2221,12 @@ async fn heal_branch(
         deadline.check()?;
         if pinned.contains(old.id()) {
             if old.has_conflict() {
-                return Err(compute_error(
-                    "cannot heal conflicted history owned by a foreign branch",
+                return Err(refused(
+                    super::HealGuard::ForeignConflictedHistory {
+                        commit: old.id().hex(),
+                    },
+                    None,
+                    conflict_paths(old)?,
                 ));
             }
             mapping.insert(old.id().clone(), old.id().clone());
@@ -2141,32 +2237,46 @@ async fn heal_branch(
             .iter()
             .map(|id| mapping.get(id).unwrap_or(id).clone())
             .collect();
-        let mut current = rewrite_hidden(repo, old, parents, deadline).await?;
+        // Each commit is given the tree it must hold rather than its diff
+        // rebased onto a healed parent. That rebase can leave a descendant
+        // clean but different: an integrated resolution re-applied over its
+        // repaired parent resolves without a conflict, so nothing repairs it,
+        // and the commits above it then undo the base's change. Built
+        // explicitly, a commit the rebase left clean keeps its exact tree and a
+        // flagged one changes only at the paths it carries a conflict on.
         let mut resolved_paths = None;
-        if current.has_conflict() {
-            let paths = conflict_paths(&current)?;
+        let current = if old.has_conflict() {
+            let paths = conflict_paths(old)?;
             if paths.is_empty() {
-                return Err(compute_error(format!(
-                    "{} no conflicted paths named",
-                    super::ANCESTRY_HEAL_GUARD
-                )));
+                return Err(refused(
+                    super::HealGuard::NoConflictedPaths {
+                        commit: old.id().hex(),
+                    },
+                    None,
+                    Vec::new(),
+                ));
             }
-            // An existing conflict takes the committed clean-tip resolution.
-            // A newly conflicted descendant takes its own pre-heal tree.
-            let source = if old.has_conflict() { head } else { old };
-            current = restore_paths(repo, &current, source, &paths, deadline).await?;
+            let tree = replace_paths(old.tree(), head, &paths, deadline).await?;
+            let current = write_with_tree(repo, old, parents, tree, deadline).await?;
             super::reached_step("ancestry heal: commit resolved");
             note(&|observed| observed.restored_commits += 1);
-            if old.has_conflict() {
-                affected.extend(paths.iter().cloned());
-                resolved_paths = Some(paths);
+            let own = own_changes(repo, &current, &paths, deadline).await?;
+            if !own.is_empty() {
+                affected.extend(own.iter().cloned());
+                resolved_paths = Some(own);
             }
-        }
+            current
+        } else {
+            write_with_tree(repo, old, parents, old.tree(), deadline).await?
+        };
         if current.has_conflict() {
-            return Err(compute_error(format!(
-                "{} restored commit remains conflicted",
-                super::ANCESTRY_HEAL_GUARD
-            )));
+            return Err(refused(
+                super::HealGuard::RemainsConflicted {
+                    commit: old.id().hex(),
+                },
+                None,
+                conflict_paths(&current)?,
+            ));
         }
         if let Some(parent) = newly_empty(repo, old, &current, None).await? {
             dropped_ids.insert(old.id().clone());
@@ -2188,10 +2298,12 @@ async fn heal_branch(
     let final_id = mapping.get(head.id()).unwrap_or(head.id()).clone();
     let final_head = repo.store().get_commit(&final_id).map_err(compute_error)?;
     if final_head.tree_ids() != head.tree_ids() {
-        return Err(compute_error(format!(
-            "{} healed tip tree changed",
-            super::ANCESTRY_HEAL_GUARD
-        )));
+        let paths = changed(head, &final_head, deadline).await?;
+        return Err(refused(
+            super::HealGuard::TipTreeChanged,
+            Some(&final_head),
+            paths.into_iter().map(|(_, path)| path).collect(),
+        ));
     }
     // Add provenance only to surviving healed commits, then rebase their
     // branch-owned descendants. Metadata-only rewrites cannot alter the tree.
@@ -2250,10 +2362,12 @@ async fn heal_branch(
     let id = annotated.get(final_head.id()).unwrap_or(final_head.id());
     let result = repo.store().get_commit(id).map_err(compute_error)?;
     if result.tree_ids() != head.tree_ids() {
-        return Err(compute_error(format!(
-            "{} annotated tip tree changed",
-            super::ANCESTRY_HEAL_GUARD
-        )));
+        let paths = changed(head, &result, deadline).await?;
+        return Err(refused(
+            super::HealGuard::AnnotatedTipTreeChanged,
+            Some(&result),
+            paths.into_iter().map(|(_, path)| path).collect(),
+        ));
     }
     let report = super::AncestryHeal {
         tip: result.id().hex(),
@@ -2476,7 +2590,45 @@ async fn diagnostic(
             .collect(),
         scaffolding: None,
         validation: None,
+        heal_refusal: None,
     })
+}
+
+/// A heal refusal with the replay's own coordinates: `ours` the branch before
+/// the replay, `theirs` the base, and every file the base's change carries,
+/// which arrives cleanly once the branch lands. When the file set cannot be
+/// read in time the refusal still stands on its three-way coordinates, which
+/// a later take-committed-tip proof needs.
+async fn heal_refusal_diagnostic(
+    snapshot: &BranchAdvanceSnapshot,
+    ours: &Commit,
+    base: &Commit,
+    candidate: &Commit,
+    refused: super::ConflictDiagnostic,
+    deadline: &Deadline,
+) -> AdvanceComputeError {
+    let mut diagnostic = match diagnostic(snapshot, ours, base, candidate, &[], deadline).await {
+        Ok(diagnostic) => diagnostic,
+        Err(error) => {
+            log::warn!(
+                "the heal refusal for `{}` keeps only its own coordinates: {error}",
+                snapshot.coordinate.branch
+            );
+            super::ConflictDiagnostic {
+                base: crate::best_common_ancestor(snapshot.repo.as_ref(), ours.id(), base.id())
+                    .ok()
+                    .flatten()
+                    .map(|fork| fork.hex()),
+                ours: Some(ours.id().hex()),
+                theirs: Some(base.id().hex()),
+                ..super::ConflictDiagnostic::default()
+            }
+        }
+    };
+    diagnostic.condition = super::ConflictCondition::HealRefused;
+    diagnostic.conflicted_tip = refused.conflicted_tip;
+    diagnostic.heal_refusal = refused.heal_refusal;
+    AdvanceComputeError::HealRefused(Box::new(diagnostic))
 }
 
 async fn apply_declared_edits(
@@ -2983,7 +3135,7 @@ async fn compute_candidate(
         });
         return Err(AdvanceComputeError::Conflict(Box::new(refusal)));
     }
-    let (head, mut healing) = heal_branch(
+    let (head, mut healing) = match heal_branch(
         transaction.repo_mut(),
         &candidate,
         &base,
@@ -2992,7 +3144,17 @@ async fn compute_candidate(
         deadline,
         snapshot.cost.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(healed) => healed,
+        Err(AdvanceComputeError::HealRefused(refused)) => {
+            return Err(heal_refusal_diagnostic(
+                snapshot, &ours, &base, &candidate, *refused, deadline,
+            )
+            .await)
+        }
+        Err(error) => return Err(error),
+    };
     snapshot.note(|observed| observed.phase = Some(ComputePhase::Claims));
     if !transaction
         .repo()
@@ -3085,45 +3247,73 @@ pub(super) fn heal_branch_locked(
     store: &Path,
     branch: &str,
     base: &str,
-) -> Result<super::AncestryHeal, String> {
-    let snapshot = capture_replay(store, branch, base, false)?;
-    let head = CommitId::try_from_hex(&snapshot.coordinate.head).ok_or("invalid heal head")?;
-    let base = CommitId::try_from_hex(&snapshot.coordinate.base).ok_or("invalid heal base")?;
+) -> Result<super::AncestryHeal, super::HealError> {
+    use super::{HealError, HealGuard, HealRefusal};
+    let failed = |error: String| HealError::Failed(error);
+    let snapshot = capture_replay(store, branch, base, false).map_err(failed)?;
+    let head_id = CommitId::try_from_hex(&snapshot.coordinate.head)
+        .ok_or_else(|| failed("invalid heal head".to_string()))?;
+    let base = CommitId::try_from_hex(&snapshot.coordinate.base)
+        .ok_or_else(|| failed("invalid heal base".to_string()))?;
+    let head = snapshot
+        .repo
+        .store()
+        .get_commit(&head_id)
+        .map_err(|error| failed(error.to_string()))?;
+    let refusal = |guard: HealGuard| HealRefusal {
+        guard,
+        pre_heal_tip: head.id().hex(),
+        pre_heal_tree: tree_label(&head),
+        healed_tip: None,
+        healed_tree: None,
+        paths: Vec::new(),
+    };
     if !snapshot
         .repo
         .index()
-        .is_ancestor(&base, &head)
-        .map_err(|error| error.to_string())?
+        .is_ancestor(&base, &head_id)
+        .map_err(|error| failed(error.to_string()))?
     {
-        return Err(format!(
-            "{} branch does not descend from its heal base",
-            super::ANCESTRY_HEAL_GUARD
-        ));
+        return Err(HealError::Refused(Box::new(refusal(
+            HealGuard::NotDescendedFromBase,
+        ))));
     }
-    if snapshot
-        .repo
-        .store()
-        .get_commit(&head)
-        .map_err(|error| error.to_string())?
-        .has_conflict()
-    {
-        return Err(format!(
-            "{} tip is itself conflict-flagged",
-            super::ANCESTRY_HEAL_GUARD
-        ));
+    if head.has_conflict() {
+        return Err(HealError::Refused(Box::new(refusal(
+            HealGuard::TipConflicted,
+        ))));
     }
     let pre_op = snapshot.coordinate.operation.clone();
     let remaining = jj
         .operation_deadline
         .map(|deadline| deadline.saturating_duration_since(Instant::now()))
         .unwrap_or(super::env::JJ_DEFAULT_TIMEOUT);
-    let candidate =
-        compute_legacy_replay(jj, snapshot, None, remaining).map_err(|error| error.to_string())?;
-    let installed = install_legacy_replay(jj, candidate).map_err(|error| error.to_string())?;
+    let candidate = match compute_legacy_replay(jj, snapshot, None, remaining) {
+        Ok(candidate) => candidate,
+        Err(AdvanceComputeError::HealRefused(diagnostic)) => {
+            return Err(match diagnostic.heal_refusal {
+                Some(refusal) => HealError::Refused(Box::new(refusal)),
+                None => failed("ancestry heal refused without a recorded guard".to_string()),
+            })
+        }
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    let installed =
+        install_legacy_replay(jj, candidate).map_err(|error| failed(error.to_string()))?;
     if let Err(error) = installed.export {
-        return Err(super::merge::roll_back_rebase(
-            jj, store, branch, &pre_op, error,
-        ));
+        let undone = super::merge::roll_back_rebase(jj, store, branch, &pre_op, error);
+        // The verified export refusing scaffolding is the same kind of
+        // finding as a guard, unless the undo itself is in doubt.
+        if !undone.contains(super::ROLLBACK_INCOMPLETE)
+            && super::is_conflict_scaffolding_export_refusal(&undone)
+        {
+            return Err(HealError::Refused(Box::new(HealRefusal {
+                healed_tip: Some(installed.head.clone()),
+                healed_tree: Some(installed.tree.clone()),
+                ..refusal(HealGuard::ExportScaffolding { detail: undone })
+            })));
+        }
+        return Err(failed(undone));
     }
     Ok(installed.healing)
 }
@@ -5321,6 +5511,138 @@ mod tests {
             conflicted_commits(&fixture.jj, &fixture.store, "prior..feature").len(),
             2,
             "the live branch at {live} is untouched"
+        );
+    }
+
+    /// cairn/6019's specimen in miniature. The branch changes a file main also
+    /// changed, then integrates main's version by content (one parent, not a
+    /// merge), then carries an empty commit and one unrelated commit. Rebased
+    /// onto main with the committed tip taken, the branch's change and its
+    /// integration are both conflict-flagged under a clean tip. Rebasing each
+    /// commit's diff onto its healed parent turned the integration clean (its
+    /// diff re-applied over the resolution resolves to the resolution) and so
+    /// left it unrepaired, and the descendants then re-applied main's change in
+    /// reverse: the tip came out clean but reverted. Every commit the heal does
+    /// not repair must keep its exact pre-heal tree.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_heal_keeps_clean_descendants_exact_after_an_integrated_main_resolution() {
+        let Some(bin) = jj_bin() else {
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        init_project(root);
+        let commit = |file: &str, content: &str, message: &str| {
+            std::fs::write(root.join(file), content).unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-qm", message]);
+        };
+        let integrated = "start\nnew\nend\nhelper\nold1\nold2\nextra\n";
+        commit("file.txt", "start\nold1\nold2\nend\n", "common ancestor");
+        git(root, &["checkout", "-qb", "feature"]);
+        commit(
+            "file.txt",
+            "start\nold1\nold2\nextra\nend\n",
+            "branch change",
+        );
+        commit("file.txt", integrated, "integrate main");
+        git(
+            root,
+            &["commit", "-q", "--allow-empty", "-m", "empty follow-up"],
+        );
+        commit("other.txt", "other\n", "unrelated tail");
+        git(root, &["checkout", "-q", "main"]);
+        commit("file.txt", "start\nnew\nend\n", "main change");
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("store");
+        ensure_project_store(&jj, &store, root).unwrap();
+        let run = |args: &[&str]| {
+            let mut args = args.to_vec();
+            args.push("--ignore-working-copy");
+            jj.run(&store, &args, "integrated heal fixture").unwrap()
+        };
+        let original = bookmark_commit(&jj, &store, "feature").unwrap();
+        run(&["rebase", "-b", "feature", "-o", "main"]);
+        // Take the committed tip: the resolution is restored into the tip only.
+        run(&[
+            "restore", "--from", &original, "--into", "feature", "--", "file.txt",
+        ]);
+
+        let snapshot = capture_branch_advance(&store, "feature", "main").unwrap();
+        let repo = snapshot.repo.clone();
+        let load = |hex: &str| {
+            repo.store()
+                .get_commit(&CommitId::try_from_hex(hex).unwrap())
+                .unwrap()
+        };
+        let head = load(&snapshot.coordinate.head);
+        let base = load(&snapshot.coordinate.base);
+        let deadline = Deadline(Instant::now() + Duration::from_secs(60));
+        let before = futures::executor::block_on(branch_commits(
+            repo.as_ref(),
+            head.id(),
+            base.id(),
+            &deadline,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|commit| commit.has_conflict())
+                .collect::<Vec<_>>(),
+            vec![true, true, true, false],
+            "precondition: the change, its integration and the empty commit are flagged under a clean tip"
+        );
+        let mut transaction = repo.start_transaction();
+        let (healed, report) = futures::executor::block_on(heal_branch(
+            transaction.repo_mut(),
+            &head,
+            &base,
+            &HashSet::new(),
+            &mut HashSet::new(),
+            &deadline,
+            None,
+        ))
+        .unwrap_or_else(|error| panic!("the heal is exact: {error}"));
+        assert_eq!(healed.tree_ids(), head.tree_ids(), "the tip tree is exact");
+        let after = futures::executor::block_on(branch_commits(
+            transaction.repo(),
+            healed.id(),
+            base.id(),
+            &deadline,
+            None,
+        ))
+        .unwrap();
+        assert!(after.iter().all(|commit| !commit.has_conflict()));
+        for commit in &after {
+            let pre = before
+                .iter()
+                .find(|old| old.change_id() == commit.change_id())
+                .expect("every surviving commit has its pre-heal version");
+            if !pre.has_conflict() {
+                assert_eq!(
+                    commit.tree_ids(),
+                    pre.tree_ids(),
+                    "`{}` was clean before the heal and keeps its exact tree",
+                    commit.description().trim_end()
+                );
+            }
+        }
+        let path = RepoPathBuf::from_internal_string("file.txt").unwrap();
+        let tip_file = futures::executor::block_on(healed.tree().path_value(&path)).unwrap();
+        let main_file = futures::executor::block_on(head.tree().path_value(&path)).unwrap();
+        assert_eq!(tip_file, main_file, "the tip keeps main's change");
+        assert_eq!(
+            report
+                .healed
+                .iter()
+                .flat_map(|commit| commit.paths.clone())
+                .collect::<Vec<_>>(),
+            vec!["file.txt".to_string()],
+            "{report:?}"
         );
     }
 
