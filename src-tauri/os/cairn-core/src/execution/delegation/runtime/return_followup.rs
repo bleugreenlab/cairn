@@ -269,7 +269,7 @@ async fn settle_conn(
             crate::messages::delivery::insert_system_direct_push_once_conn(
                 conn,
                 job_id,
-                run_id,
+                Some(run_id),
                 &reprompt_text(&artifact_name),
                 DeliveryUrgency::Queue,
                 &reprompt_idempotency_key(job_id),

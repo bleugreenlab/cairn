@@ -30,7 +30,8 @@ pub struct NewDirect {
 }
 
 impl NewDirect {
-    /// A system-sent direct to one recipient, at `now`.
+    /// A system-sent direct to one recipient, at `now`. The recipient is its
+    /// job; `recipient_run_id` is provenance, absent for a job with no run yet.
     #[allow(clippy::too_many_arguments)]
     pub fn system_to_one(
         id: &str,
@@ -38,7 +39,7 @@ impl NewDirect {
         content: &str,
         urgency: DeliveryUrgency,
         recipient_job_id: &str,
-        recipient_run_id: &str,
+        recipient_run_id: Option<&str>,
         wake: Wake,
         now: i64,
     ) -> Self {
@@ -51,7 +52,7 @@ impl NewDirect {
             created_at: now,
             recipients: vec![NewRecipient {
                 job_id: recipient_job_id.to_string(),
-                run_id_at_send: Some(recipient_run_id.to_string()),
+                run_id_at_send: recipient_run_id.map(str::to_string),
                 wake: Some(wake),
             }],
         }
@@ -318,7 +319,7 @@ pub async fn settle_direct_conn(
             content,
             urgency,
             recipient_job_id,
-            recipient_run_id,
+            Some(recipient_run_id),
             wake,
             now,
         ),
@@ -384,7 +385,7 @@ pub async fn insert_system_direct_push_with_message_id_conn(
             content,
             urgency,
             recipient_job_id,
-            recipient_run_id,
+            Some(recipient_run_id),
             wake,
             now,
         ),

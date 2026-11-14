@@ -476,9 +476,15 @@ async fn send(
     ))
 }
 
-/// The operator answering a message from the app: delivered to its sender
-/// as his own words (a thread through its append, an issue node through its
-/// job), headed by the message it answers, then recorded as the answer.
+/// The operator answering a message from the app: recorded as the answer,
+/// then delivered to its sender as his own words (a thread through its
+/// append, an issue node through its job), headed by the message it answers.
+///
+/// Recorded first so that only the write that closes the entry delivers: a
+/// record that fails, or a concurrent answer that won, delivers nothing. A
+/// delivery that fails after the record is this write's failure, naming that
+/// the entry stays answered; the row is not reopened, since reopening could
+/// race a second answer into a double delivery.
 async fn answer(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -505,6 +511,18 @@ async fn answer(
     if dry_run {
         return Ok(format!("Would answer {uri} to {}.", message.sender_home));
     }
+    if crate::operator::record_answered(
+        orch,
+        id,
+        AnsweredVia::App,
+        None,
+        chrono::Utc::now().timestamp(),
+    )
+    .await?
+    .is_none()
+    {
+        return Err(format!("{uri} is already answered"));
+    }
     let answer_ref = messages::deliver_answer(
         orch,
         &message,
@@ -512,15 +530,18 @@ async fn answer(
         content,
         messages::AnswerHeader::Reply,
     )
-    .await?;
-    crate::operator::record_answered(
-        orch,
-        id,
-        AnsweredVia::App,
-        answer_ref.as_deref(),
-        chrono::Utc::now().timestamp(),
-    )
-    .await?;
+    .await
+    .map_err(|error| {
+            format!(
+                "{uri} is recorded as answered, but your reply did not reach {}: {error}. The entry stays answered and nothing was delivered; send the reply to {} another way.",
+                message.sender_home, message.sender_home
+            )
+        })?;
+    if let Some(answer_ref) = answer_ref {
+        if let Err(error) = messages::attach_answer_ref(&orch.db.local, id, &answer_ref).await {
+            log::warn!("answer to {uri} was delivered as {answer_ref}, but {error}");
+        }
+    }
     Ok(format!(
         "Answered {uri}; delivered to {}.",
         message.sender_home
@@ -1169,6 +1190,173 @@ mod tests {
         let again = seen().await.unwrap();
         assert!(again.contains("already seen"), "{again}");
         assert_eq!(notices().await, 1, "one notice, however often it is opened");
+    }
+
+    /// The thread messages that carry an answer to `uri`.
+    async fn replies(orch: &Orchestrator, uri: &str) -> i64 {
+        orch.db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'thread' AND content LIKE ?1",
+                cairn_db::turso::params![format!("[Reply to {uri}]%")],
+            )
+            .await
+            .unwrap()
+            .unwrap_or_default()
+    }
+
+    /// A thread sender is addressed by name, so a thread whose session has no
+    /// run when he sees the message still holds the passive notice for its
+    /// next turn.
+    #[tokio::test]
+    async fn a_thread_with_no_run_holds_its_seen_notice_for_its_next_turn() {
+        let orch = orchestrator("seen-runless").await;
+        let local = &orch.db.local;
+        local
+            .execute_script(
+                "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+                 VALUES ('t-quiet', 'p', 'quiet', 'active', 1, 1);",
+            )
+            .await
+            .unwrap();
+        let session = crate::threads::ensure_thread_session(local, "t-quiet")
+            .await
+            .unwrap();
+        messages::insert(
+            local,
+            &messages::NewMessage {
+                id: "m-quiet".into(),
+                project_id: "p".into(),
+                sender_home: "cairn://p/prj/quiet".into(),
+                sender_job_id: session.clone(),
+                via: crate::operator::Via::App,
+                content: "Rotating the key".into(),
+                default_text: Some("I rotate at noon".into()),
+                headline: None,
+                created_at: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::messages::delivery::latest_run_for_job_async(local, &session)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let seen = messages::record_seen(
+            &orch,
+            messages::MessageFilter::Ids(vec!["m-quiet".into()]),
+            SeenVia::App,
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.len(), 1);
+        let notice = crate::messages::delivery::system_direct_once_message_id(
+            &messages::seen_notice_key("m-quiet"),
+        );
+        let (recipient, run) = local
+            .query_opt(
+                "SELECT recipient_job_id, recipient_run_id FROM message_recipients WHERE message_id = ?1",
+                cairn_db::turso::params![notice.clone()],
+                |row| {
+                    use crate::storage::RowExt;
+                    Ok((row.text(0)?, row.opt_text(1)?))
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the notice is addressed to the thread's session");
+        assert_eq!((recipient.as_str(), run), (session.as_str(), None));
+        let wake = local
+            .query_opt_text(
+                "SELECT wake FROM attention_pushes WHERE recipient = ?1 AND key = ?2",
+                cairn_db::turso::params![
+                    session.clone(),
+                    crate::orchestrator::attention_push::direct_push_key(&notice, None)
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wake.as_deref(),
+            Some("passive"),
+            "it rides the next turn, waking nothing"
+        );
+    }
+
+    /// The answer is recorded before it is delivered: a record that fails
+    /// delivers nothing, and a delivery that fails after the record is the
+    /// write's failure and leaves the entry answered.
+    #[tokio::test]
+    async fn an_answer_is_recorded_before_it_is_delivered() {
+        let orch = orchestrator("answer-order").await;
+        let id = sent_id(
+            &send(
+                &orch,
+                Some("r-live"),
+                serde_json::json!({"content": "Rename?", "via": "cairn://channels/app", "default": "I rename Friday"}),
+            )
+            .await
+            .unwrap(),
+        );
+        let uri = messages::message_uri(&id);
+        let answer = || {
+            crate::channels::write_as_operator(
+                &orch,
+                &uri,
+                "append",
+                Some(serde_json::json!({"content": "yes, rename it"})),
+            )
+        };
+
+        orch.db
+            .local
+            .execute_script(
+                "CREATE TRIGGER refuse_answer BEFORE UPDATE ON operator_messages
+                 BEGIN SELECT RAISE(ABORT, 'answer store down'); END;",
+            )
+            .await
+            .unwrap();
+        let refused = answer().await.unwrap_err();
+        assert!(refused.contains("answer store down"), "{refused}");
+        assert_eq!(replies(&orch, &uri).await, 0, "no record, no delivery");
+        assert_eq!(state_of(&orch, &id).await, State::Delivered);
+        assert!(entries(&orch).await.iter().any(|entry| entry.is_open()));
+
+        orch.db
+            .local
+            .execute_script(
+                "DROP TRIGGER refuse_answer;
+                 UPDATE threads SET status = 'closed' WHERE id = 't-general';",
+            )
+            .await
+            .unwrap();
+        let undelivered = answer().await.unwrap_err();
+        assert!(
+            undelivered.contains("recorded as answered")
+                && undelivered.contains("cairn://p/prj/general")
+                && undelivered.contains("closed"),
+            "{undelivered}"
+        );
+        assert_eq!(replies(&orch, &uri).await, 0);
+        assert!(matches!(state_of(&orch, &id).await, State::Answered { .. }));
+        assert!(entries(&orch).await.iter().all(|entry| !entry.is_open()));
+
+        orch.db
+            .local
+            .execute(
+                "UPDATE threads SET status = 'active' WHERE id = 't-general'",
+                (),
+            )
+            .await
+            .unwrap();
+        let again = answer().await.unwrap_err();
+        assert!(again.contains("already answered"), "{again}");
+        assert_eq!(replies(&orch, &uri).await, 0, "a retry delivers nothing");
     }
 
     #[tokio::test]

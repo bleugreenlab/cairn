@@ -749,7 +749,7 @@ pub(crate) fn system_direct_once_message_id(idempotency_key: &str) -> String {
 pub(crate) async fn insert_system_direct_push_once_conn(
     conn: &cairn_db::storage::TrackedConnection,
     recipient_job_id: &str,
-    recipient_run_id: &str,
+    recipient_run_id: Option<&str>,
     content: &str,
     urgency: DeliveryUrgency,
     idempotency_key: &str,
@@ -900,6 +900,40 @@ pub(crate) fn queue_system_direct_once(
     .map(|_| ())
 }
 
+/// [`queue_system_direct_once`] addressed to a job rather than a run. A
+/// direct's addressee is its job and a run only provenance, so a job that has
+/// no run yet (a thread session minted for its next turn) still holds the
+/// notice, and its first turn drains it.
+pub(crate) fn queue_system_direct_once_to_job(
+    orch: &Orchestrator,
+    recipient_job_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    idempotency_key: &str,
+) -> Result<(), String> {
+    let (db, run_id) = run_db_blocking({
+        let dbs = orch.db.clone();
+        let job = recipient_job_id.to_string();
+        move || async move {
+            let db = owning_db_for_job(&dbs, &job)
+                .await
+                .map_err(|e| e.to_string())?;
+            let run_id = latest_run_for_job_async(&db, &job).await?;
+            Ok::<_, String>((db, run_id))
+        }
+    })?;
+    insert_and_announce_system_direct(
+        orch,
+        &db,
+        recipient_job_id,
+        run_id.as_deref(),
+        content,
+        urgency,
+        Some(idempotency_key),
+    )
+    .map(|_| ())
+}
+
 fn queue_system_direct_impl(
     orch: &Orchestrator,
     recipient_run_id: &str,
@@ -939,11 +973,33 @@ fn queue_system_direct_impl(
         );
         return Ok(DirectQueueDisposition::Undeliverable);
     };
+    insert_and_announce_system_direct(
+        orch,
+        &db,
+        &job_id,
+        Some(recipient_run_id),
+        content,
+        urgency,
+        idempotency_key,
+    )
+}
 
+/// Write a system direct to `job_id` in `db`, announce it, and rouse an idle
+/// recipient when its urgency wakes. An unkeyed direct is always addressed
+/// through a run, so only a keyed one may name no run.
+fn insert_and_announce_system_direct(
+    orch: &Orchestrator,
+    db: &std::sync::Arc<LocalDb>,
+    job_id: &str,
+    run_id: Option<&str>,
+    content: &str,
+    urgency: DeliveryUrgency,
+    idempotency_key: Option<&str>,
+) -> Result<DirectQueueDisposition, String> {
     let (message_id, effective, inserted) = run_db_blocking({
         let db = db.clone();
-        let job_id = job_id.clone();
-        let run_id = recipient_run_id.to_string();
+        let job_id = job_id.to_string();
+        let run_id = run_id.map(str::to_string);
         let content = content.to_string();
         let idempotency_key = idempotency_key.map(str::to_string);
         move || async move {
@@ -953,15 +1009,21 @@ fn queue_system_direct_impl(
                 let content = content.clone();
                 let idempotency_key = idempotency_key.clone();
                 Box::pin(async move {
-                    if let Some(key) = idempotency_key.as_deref() {
-                        insert_system_direct_push_once_conn(
-                            conn, &job_id, &run_id, &content, urgency, key,
-                        )
-                        .await
-                    } else {
-                        insert_system_direct_push_conn(conn, &job_id, &run_id, &content, urgency)
+                    match (idempotency_key.as_deref(), run_id.as_deref()) {
+                        (Some(key), run_id) => {
+                            insert_system_direct_push_once_conn(
+                                conn, &job_id, run_id, &content, urgency, key,
+                            )
                             .await
-                            .map(|(id, wake)| (id, wake, true))
+                        }
+                        (None, Some(run_id)) => {
+                            insert_system_direct_push_conn(conn, &job_id, run_id, &content, urgency)
+                                .await
+                                .map(|(id, wake)| (id, wake, true))
+                        }
+                        (None, None) => Err(DbError::Row(format!(
+                            "an unkeyed system direct to job {job_id} names no run"
+                        ))),
                     }
                 })
             })
@@ -980,7 +1042,7 @@ fn queue_system_direct_impl(
     );
 
     if effective.wakes_idle() {
-        if let Err(e) = nudge_job_for_urgency(orch, &job_id, urgency) {
+        if let Err(e) = nudge_job_for_urgency(orch, job_id, urgency) {
             log::warn!("queue_system_direct: nudge failed for job {job_id}: {e}");
         }
     }

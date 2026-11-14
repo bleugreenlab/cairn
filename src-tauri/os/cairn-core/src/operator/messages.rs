@@ -604,6 +604,51 @@ pub async fn record_answered(
     Ok(message)
 }
 
+/// Attach the thread message an answer was delivered as, once the answer is
+/// recorded: the answer is recorded before it is delivered, so the id it was
+/// delivered under is only known afterward.
+pub async fn attach_answer_ref(db: &LocalDb, id: &str, answer_ref: &str) -> Result<(), String> {
+    db.execute(
+        "UPDATE operator_messages SET answer_ref = ?2 WHERE id = ?1 AND answer_ref IS NULL",
+        params![id.to_string(), answer_ref.to_string()],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("failed to attach the answer's message: {error}"))
+}
+
+/// The thread a sender home names when it is a thread's own home (not one of
+/// its tasks): the thread's database and id. A thread is addressed by name,
+/// so whichever session it holds when something arrives receives it.
+async fn sender_thread(
+    orch: &Orchestrator,
+    home: &str,
+) -> Result<Option<(std::sync::Arc<LocalDb>, String)>, String> {
+    let Some(cairn_uri::CairnResource::Thread {
+        project,
+        name,
+        path,
+    }) = cairn_uri::parse_uri(home)
+    else {
+        return Ok(None);
+    };
+    if !path.is_empty() {
+        return Ok(None);
+    }
+    let project = cairn_uri::canonical_project(&project);
+    let db = orch.db.for_project(&project).await;
+    let thread_id = db
+        .query_opt_text(
+            "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id
+              WHERE LOWER(p.key) = ?1 AND t.name = ?2",
+            params![project.clone(), name.clone()],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("{project} has no thread named {name}"))?;
+    Ok(Some((db, thread_id)))
+}
+
 /// How an answer reached the message's sender, which its header says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerHeader<'a> {
@@ -640,35 +685,17 @@ pub async fn deliver_answer(
     header: AnswerHeader<'_>,
 ) -> Result<Option<String>, String> {
     let delivered = format!("{} {text}", header.render(&message.uri()));
-    if let Some(cairn_uri::CairnResource::Thread {
-        project,
-        name,
-        path,
-    }) = cairn_uri::parse_uri(&message.sender_home)
-    {
-        if path.is_empty() {
-            let project = cairn_uri::canonical_project(&project);
-            let db = orch.db.for_project(&project).await;
-            let thread_id = db
-                .query_opt_text(
-                    "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id
-                      WHERE LOWER(p.key) = ?1 AND t.name = ?2",
-                    params![project.clone(), name.clone()],
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("{project} has no thread named {name}"))?;
-            return crate::messages::delivery::append_thread_message(
-                orch,
-                &db,
-                &thread_id,
-                None,
-                sender_name,
-                &delivered,
-            )
-            .await
-            .map(Some);
-        }
+    if let Some((db, thread_id)) = sender_thread(orch, &message.sender_home).await? {
+        return crate::messages::delivery::append_thread_message(
+            orch,
+            &db,
+            &thread_id,
+            None,
+            sender_name,
+            &delivered,
+        )
+        .await
+        .map(Some);
     }
     let orch = orch.clone();
     let job_id = message.sender_job_id.clone();
@@ -712,34 +739,30 @@ pub fn seen_notice_key(id: &str) -> String {
     format!("operator-seen:{id}")
 }
 
+/// The job a message's notices reach: a thread sender's current session,
+/// addressed by the thread's name as [`deliver_answer`] addresses it, or the
+/// sending job itself for an issue node or a task.
+async fn notice_recipient(orch: &Orchestrator, message: &Message) -> Result<String, String> {
+    match sender_thread(orch, &message.sender_home).await? {
+        Some((db, thread_id)) => crate::threads::ensure_thread_session(&db, &thread_id).await,
+        None => Ok(message.sender_job_id.clone()),
+    }
+}
+
 /// The sender's passive notice that he saw it. It rides along with the
 /// sender's next turn rather than waking it: being seen changes nothing the
-/// sender must do now, and a waiting message's default still stands.
+/// sender must do now, and a waiting message's default still stands. It is
+/// addressed to a job, never a run, because `record_seen` has already stamped
+/// the message: a sender with no run now must still find it when it next
+/// wakes, since nothing queues it again.
 async fn notify_seen(orch: &Orchestrator, message: &Message, via: SeenVia) {
-    let db = match crate::execution::routing::owning_db_for_job(&orch.db, &message.sender_job_id)
-        .await
-    {
-        Ok(db) => db,
+    let job_id = match notice_recipient(orch, message).await {
+        Ok(job_id) => job_id,
         Err(error) => {
             log::warn!(
-                "operator message {} seen, but its sender's job is unreachable: {error}",
-                message.id
-            );
-            return;
-        }
-    };
-    let run_id = match crate::messages::delivery::latest_run_for_job_async(
-        &db,
-        &message.sender_job_id,
-    )
-    .await
-    {
-        Ok(Some(run_id)) => run_id,
-        Ok(None) => return,
-        Err(error) => {
-            log::warn!(
-                "operator message {} seen, but its sender has no run to notify: {error}",
-                message.id
+                "operator message {} seen, but its sender {} is unreachable: {error}",
+                message.id,
+                message.sender_home
             );
             return;
         }
@@ -751,9 +774,9 @@ async fn notify_seen(orch: &Orchestrator, message: &Message, via: SeenVia) {
     let orch = orch.clone();
     let key = seen_notice_key(&message.id);
     let result = tokio::task::spawn_blocking(move || {
-        crate::messages::delivery::queue_system_direct_once(
+        crate::messages::delivery::queue_system_direct_once_to_job(
             &orch,
-            &run_id,
+            &job_id,
             &content,
             DeliveryUrgency::Passive,
             &key,

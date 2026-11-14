@@ -247,7 +247,7 @@ async fn deliver_wake(orch: &Orchestrator, intent: &RequestOutbox) -> Result<(),
                     crate::messages::delivery::insert_system_direct_push_once_conn(
                         conn,
                         &job_id,
-                        &run_id,
+                        Some(run_id.as_str()),
                         &content,
                         DeliveryUrgency::Steer,
                         &key,
@@ -768,7 +768,7 @@ mod tests {
                     crate::messages::delivery::insert_system_direct_push_once_conn(
                         conn,
                         &job,
-                        run,
+                        Some(run),
                         &content,
                         DeliveryUrgency::Steer,
                         "operator-request:stable",
