@@ -6626,6 +6626,15 @@ impl Fleet {
                     return false;
                 }
                 let key = (request_id, attempt_id);
+                if self.queue.binding_of(&key).is_none()
+                    && self.is_direct_check_result(&key, executor_id)
+                    && self
+                        .link_generation(executor_id)
+                        .is_some_and(|current| current >= generation)
+                {
+                    self.receive_direct_check_result(&key, executor_id);
+                    return false;
+                }
                 if self.adoption_owner(&key).is_some()
                     && self
                         .check_claim(&key)
@@ -6723,6 +6732,10 @@ impl Fleet {
                     metadata.executor_device_id = device_id;
                     metadata.executor_connection_generation = bound_generation;
                 }
+                let direct = self.is_direct_check_result(&key, executor_id);
+                if direct {
+                    self.receive_direct_check_result(&key, executor_id);
+                }
                 self.queue.settle(
                     &key,
                     Some((executor_id, bound_generation)),
@@ -6730,7 +6743,9 @@ impl Fleet {
                     outcome,
                     unix_time_ms(),
                 );
-                self.acknowledge_settled_result(executor_id, &key);
+                if !direct {
+                    self.acknowledge_settled_result(executor_id, &key);
+                }
                 self.binding_changed.notify_waiters();
                 false
             }
@@ -8531,6 +8546,14 @@ impl Fleet {
         }
         for candidate in &mut candidates {
             let bound = self.queue.identities_bound_to(&candidate.executor_id);
+            // A terminal result remains delivery debt until its durable
+            // disposition authorizes ACK, even after the execution queue ends.
+            let mut bound = bound;
+            bound.extend(
+                self.check_claims_for_machine(&candidate.executor_id)
+                    .into_iter()
+                    .map(|(identity, _)| identity),
+            );
             join_runner_work(
                 &mut candidate.work,
                 &bound,
@@ -8545,7 +8568,16 @@ impl Fleet {
         // No connection or rollout lock crosses persistence. A failed commit
         // leaves both the applied schedule and its existing holds untouched.
         persist(&proposed.required_drains())?;
+        let refusal_events = proposed.record_committed_drains(unix_time_ms().max(now_unix_ms));
         *self.self_update.lock().unwrap() = proposed;
+        for (executor_id, detail) in refusal_events {
+            self.runner_events.record(
+                runner_events::RunnerEvent::new(runner_events::RunnerEventKind::ExecutorSelfUpdate)
+                    .executor(executor_id)
+                    .cause("committed self-update admission refusal transition")
+                    .detail(detail),
+            );
+        }
         let mut released = false;
         let delivered = {
             let mut connections = self.lock_connections();
@@ -8960,7 +8992,7 @@ impl Fleet {
                 let back = match returns_by_unix_ms {
                     Some(at) => format!(", expected back by {}", describe_clock(at)),
                     None => {
-                ", with no return time yet (work past its bound is still progressing, or the machine updating ahead of it has no bound)"
+                ", with no safe restart time yet while work remains or the machine updating ahead has no bound"
                     .to_string()
             }
                 };
@@ -9980,7 +10012,13 @@ impl Fleet {
                 "the first report of the machine's newer connection (generation {generation}) does not list it"
             ),
         );
-        self.account_check_claims(executor_id, generation, &listed, &completed);
+        self.account_check_claims(
+            executor_id,
+            generation,
+            first_of_connection,
+            &listed,
+            &completed,
+        );
         for request in post_boot.still_running {
             if protected_checks.contains(&request) || self.check_claim(&request).is_some() {
                 continue;
@@ -14042,6 +14080,9 @@ impl Fleet {
             )
             .into();
         }
+        let request_id = request.request_id.clone();
+        let attempt_id = request.attempt_id.clone();
+        self.register_direct_check((request_id.clone(), attempt_id.clone()));
         let runner_context_id = uuid::Uuid::new_v4().to_string();
         let output = output_guard::RelayedOutput::shared();
         let flushed_context = run_context.clone();
@@ -14077,6 +14118,10 @@ impl Fleet {
         };
         output_guard::flush_batch_output(orch, &output, flushed_context.as_ref());
         self.settle_runner_context(&runner_context_id);
+        let identity = (request_id, attempt_id);
+        if self.check_claim(&identity).is_none() {
+            self.check_leader_completed(&identity);
+        }
         executed
     }
 
@@ -16504,7 +16549,13 @@ impl Fleet {
     /// unless it belongs to a run batch whose settlement acknowledges it.
     fn acknowledge_settled_result(&self, executor_id: &str, key: &RequestIdentity) {
         {
+            // Keep the exact claim and its ACK fence atomic with cancellation's
+            // partition of request-scoped deferrals.
+            let state = self.check_adoptions.lock().unwrap();
             let mut deferred = self.deferred_acks.lock().unwrap();
+            if state.claims.contains_key(key) {
+                deferred.entry(key.0.clone()).or_default();
+            }
             if let Some(delivered) = deferred.get_mut(&key.0) {
                 let attempt = (key.1.clone(), executor_id.to_string());
                 if !delivered.contains(&attempt) {
@@ -22012,8 +22063,12 @@ fn rollout_candidate(entry: &ExecutorConnectionState, now_unix_ms: u64) -> rollo
 /// The key a command holds a self-update drain under, shared by every witness
 /// to it (the machine's executing, queued, and granted lists, and the runner's
 /// queue binding), so one command is one piece of work however many report it.
-fn held_request_key(request_id: &str) -> String {
-    format!("request:{request_id}")
+fn held_request_key(request_id: &str, attempt_id: &str) -> String {
+    format!(
+        "request:{}:{request_id}:{}:{attempt_id}",
+        request_id.len(),
+        attempt_id.len()
+    )
 }
 
 /// A command named the way an operator reads it: the first line of what it
@@ -22082,12 +22137,18 @@ fn snapshot_work(
         estimate.and_then(|estimate| estimate.upper_duration_ms)
     };
     // A granted attempt names no command; the cell it holds does.
-    let active: HashMap<&str, &cairn_common::executor_protocol::ActiveCellRequest> = snapshot
-        .cells
-        .iter()
-        .filter_map(|cell| cell.occupancy.command.as_ref())
-        .map(|command| (command.request_id.as_str(), command))
-        .collect();
+    let active: HashMap<(&str, &str), &cairn_common::executor_protocol::ActiveCellRequest> =
+        snapshot
+            .cells
+            .iter()
+            .filter_map(|cell| cell.occupancy.command.as_ref())
+            .map(|command| {
+                (
+                    (command.request_id.as_str(), command.attempt_id.as_str()),
+                    command,
+                )
+            })
+            .collect();
     // What the attempt's own stall stop holds about its tree, from the latest
     // machine sample. Absent whenever that stop cannot judge, which leaves the
     // drain to the bound alone.
@@ -22108,7 +22169,7 @@ fn snapshot_work(
     let mut work: Vec<rollout::HeldWork> = Vec::new();
     for request in &snapshot.executing_requests {
         work.push(rollout::HeldWork {
-            key: held_request_key(&request.request_id),
+            key: held_request_key(&request.request_id, &request.attempt_id),
             label: held_command_label(&request.command, request.owner.as_ref()),
             started_at_unix_ms: Some(request.started_at_unix_ms),
             expected_ms: learned(request.learned_estimate.as_ref()),
@@ -22116,26 +22177,28 @@ fn snapshot_work(
         });
     }
     for granted in &snapshot.granted_attempts {
-        work.push(match active.get(granted.request_id.as_str()) {
-            Some(command) => rollout::HeldWork {
-                key: held_request_key(&granted.request_id),
-                label: held_command_label(&command.command, command.owner.as_ref()),
-                started_at_unix_ms: command.started_at_unix_ms,
-                expected_ms: learned(command.learned_estimate.as_ref()),
-                progress: progress(&granted.request_id, &granted.attempt_id),
+        work.push(
+            match active.get(&(granted.request_id.as_str(), granted.attempt_id.as_str())) {
+                Some(command) => rollout::HeldWork {
+                    key: held_request_key(&granted.request_id, &granted.attempt_id),
+                    label: held_command_label(&command.command, command.owner.as_ref()),
+                    started_at_unix_ms: command.started_at_unix_ms,
+                    expected_ms: learned(command.learned_estimate.as_ref()),
+                    progress: progress(&granted.request_id, &granted.attempt_id),
+                },
+                None => rollout::HeldWork {
+                    key: held_request_key(&granted.request_id, &granted.attempt_id),
+                    label: format!("request {} (preparing its cell)", granted.request_id),
+                    started_at_unix_ms: None,
+                    expected_ms: None,
+                    progress: None,
+                },
             },
-            None => rollout::HeldWork {
-                key: held_request_key(&granted.request_id),
-                label: format!("request {} (preparing its cell)", granted.request_id),
-                started_at_unix_ms: None,
-                expected_ms: None,
-                progress: None,
-            },
-        });
+        );
     }
     for queued in &snapshot.queued_requests {
         work.push(rollout::HeldWork {
-            key: held_request_key(&queued.request_id),
+            key: held_request_key(&queued.request_id, &queued.attempt_id),
             label: held_command_label(&queued.command, queued.owner.as_ref()),
             started_at_unix_ms: None,
             expected_ms: learned(queued.learned_estimate.as_ref()),
@@ -22226,9 +22289,9 @@ fn join_runner_work(
     bound: &[RequestIdentity],
     pending_residency: &[String],
 ) {
-    for (request_id, _) in bound {
+    for (request_id, attempt_id) in bound {
         work.push(rollout::HeldWork {
-            key: held_request_key(request_id),
+            key: held_request_key(request_id, attempt_id),
             label: format!("request {request_id} (bound here, not yet reported by the machine)"),
             started_at_unix_ms: None,
             expected_ms: None,
@@ -38046,7 +38109,7 @@ mod tests {
     /// before cairn/6382 only a memory wait was recorded, and work parked on
     /// bbs's 68-minute drain left no decision anywhere.
     #[tokio::test]
-    async fn a_wait_on_a_machines_update_is_recorded_with_its_estimate() {
+    async fn a_wait_on_a_machines_update_records_an_unknown_safe_bound_while_work_remains() {
         let pool = Fleet::default();
         let now = unix_time_ms();
         let (executor_id, mut connection) = fleet_entry_at("bbs", "linux", 0, &[], now);
@@ -38093,18 +38156,10 @@ mod tests {
         );
         assert!(waits[0].contains("cairn://executors/bbs"), "{}", waits[0]);
 
-        // The refusal carries when bbs is expected back, the rollout's own
-        // bound, and the wait states it as a clock time.
-        let returns_by = pool
-            .self_update
-            .lock()
-            .unwrap()
-            .returns_by(&executor_id)
-            .expect("a bounded drain");
+        // An unmeasured scheduling budget never promises a safe restart.
         assert_eq!(
-            returns_by,
-            now + rollout::UNMEASURED_HOLD_MS + rollout::RETURN_BUDGET_MS,
-            "an unmeasured grant's hold, then the return budget"
+            pool.self_update.lock().unwrap().returns_by(&executor_id),
+            None
         );
         let refusals: Vec<Option<u64>> = pool
             .placements_naming("bbs")
@@ -38118,20 +38173,12 @@ mod tests {
             })
             .collect();
         assert!(!refusals.is_empty());
-        assert!(
-            refusals.iter().all(|bound| *bound == Some(returns_by)),
-            "{refusals:?}"
-        );
-        assert!(
-            waits[0].contains(&format!(
-                "expected back by {}",
-                cairn_common::executor_protocol::describe_clock(returns_by)
-            )),
-            "{}",
-            waits[0]
-        );
+        assert!(refusals.iter().all(Option::is_none), "{refusals:?}");
+        assert!(!waits[0].contains("expected back by"), "{}", waits[0]);
+        assert!(waits[0].contains("no safe restart time"), "{}", waits[0]);
         // A bound that moves is a different verdict, so the wait is recorded
         // again rather than left standing with a stale clock time.
+        let returns_by = now + 60_000;
         let moved = |at: u64| {
             placement_rejection_signature(&PlacementRejectionReason::UpdatePending {
                 returns_by_unix_ms: Some(at),
@@ -40888,21 +40935,45 @@ mod tests {
         let (work, _, _) = snapshot_work(&entry);
         let progress: Vec<_> = work
             .iter()
-            .map(|item| (item.key.as_str(), item.progress))
+            .map(|item| (item.key.clone(), item.progress))
             .collect();
         assert_eq!(
             progress,
             vec![
                 (
-                    "request:r1",
+                    held_request_key("r1", "a1"),
                     Some(rollout::Progress {
                         quiet_ms: 120_000,
                         silence_bound_ms: Fleet::REVIEW_CHECK_SILENCE_BOUND_MS,
                         measured_at_unix_ms: 40,
                     })
                 ),
-                ("request:r2", None),
+                (held_request_key("r2", "a2"), None),
             ]
+        );
+
+        // Witnesses for one physical attempt union, but retries of one request
+        // remain distinct even while an older result is retained.
+        Arc::make_mut(&mut entry.snapshot).granted_attempts = vec![
+            cairn_common::executor_protocol::GrantedAttempt {
+                request_id: "r1".into(),
+                attempt_id: "a1".into(),
+            },
+            cairn_common::executor_protocol::GrantedAttempt {
+                request_id: "r1".into(),
+                attempt_id: "a2".into(),
+            },
+        ];
+        let (mut work, _, _) = snapshot_work(&entry);
+        join_runner_work(
+            &mut work,
+            &[("r1".into(), "a2".into()), ("r1".into(), "a3".into())],
+            &[],
+        );
+        assert_eq!(
+            work.len(),
+            4,
+            "r1's three attempts and r2's attempt must not share a suppression identity"
         );
     }
 

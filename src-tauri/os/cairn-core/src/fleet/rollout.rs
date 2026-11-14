@@ -8,57 +8,15 @@
 //! would install: an executor fix merged without a protocol bump. That one is
 //! scheduled here, so it costs the fleet nothing it was doing.
 //!
-//! The schedule has four properties, each against a specific failure:
-//!
-//! - **One machine at a time, the readiest first.** A bad artifact strands
-//!   the one machine that took it, and the failure halts the rollout of that
-//!   build before it reaches the next. The rule counts machines mid-update; it
-//!   does not make one machine's work another machine's wait. The turn (the
-//!   head) goes only to a machine with nothing in flight, which is confirmed
-//!   empty, directed, and awaited on its return. A machine with work in flight
-//!   drains beside it, refused new work but holding no one, so idle machines
-//!   update ahead of it however long its cells run. Once it is empty it takes
-//!   the head next, ahead of any idle machine, since it has refused work the
-//!   longest. One machine drains at a time, so at most two machines refuse new
-//!   work at once: the one updating and the one emptying.
-//! - **Empty before restart, however long emptying takes.** A draining
-//!   machine is refused new placement until it is empty, and the directive
-//!   goes out only once the runner's queue binds nothing to it and two
-//!   snapshots taken after the hold show nothing in flight, so a restart kills
-//!   no work. A busy machine is doing its job, not holding the fleet hostage,
-//!   and handing it work back after a fixed budget only guarantees that a
-//!   machine with a steady stream of work never empties. So the drain is
-//!   bounded per piece of work rather than as a whole: a command may hold it
-//!   for its own learned duration plus margin, and work with no expected end
-//!   for a fixed hold. A command past that bound keeps the drain for as long
-//!   as its own stall stop still sees its tree progressing, because a slow
-//!   command on a stalled disk is busy, not wedged. New environments are
-//!   refused, but a job already resident there may still send it batches;
-//!   those are commands and are bounded like any other. Already-running
-//!   commands and resident processes keep running.
-//! - **Residents are cycled after a short notice, never waited on.** A
-//!   terminal, REPL or dev instance ends when its owner ends it, which may be
-//!   days, and every executor exit ends it whether the rollout waits or not:
-//!   no process survives an executor restart. Waiting buys it nothing, so a
-//!   resident holds the drain only for one notice period
-//!   ([`RESIDENT_NOTICE_MS`]) fixed when the turn begins and never extended by
-//!   residents that appear later. Its owner is told when the drain first sees
-//!   it and again when the restart that ends it is directed. A resident never
-//!   defers a machine, so the hold-then-defer loop a long-lived terminal used
-//!   to cause cannot recur.
-//! - **Long-lived services are cycled, not waited on.** A service instance
-//!   never finishes, and any executor restart ends it whether the rollout waits
-//!   or not; its owner already re-places it whenever its executor is lost. So
-//!   service residents are named as what the restart will cycle rather than
-//!   counted as work in flight. A service's one-shot command is work, and is
-//!   waited on like any other.
-//! - **No wedged machine holds the fleet hostage.** Work that outruns its bound
-//!   and has stopped progressing, or that outruns it with nothing able to say
-//!   whether it progresses, gives the machine back and passes the drain to the
-//!   next busy machine; a machine that
-//!   ignores a directive is excluded from that build without halting it. A
-//!   served build that moves during a drain retargets the drain rather than
-//!   ending it, so a nearly empty machine is not sent to the back of the line.
+//! An idle update head and one busy drain advance independently. Every restart
+//! still requires empty work, reconciled runner bindings, fresh same-generation
+//! snapshots, and the resident turn's fixed notice. Scheduling overruns never
+//! prove command death: release the refusal once, then admit ordinary work while
+//! the exact unresolved physical holders suppress another busy drain. Retargets
+//! and reconnects do not make those holders new work. Boot-local episode history
+//! records committed refusal intervals; a runner restart may relearn a holder at
+//! the cost of one more drain. Sustained long work can postpone an update without
+//! a deadline. Services cycle as before; terminals retain Announced/Ending notice.
 //!
 //! This module is the decision alone, over plain facts the fleet copies out of
 //! its connection table, so every transition is testable without a link.
@@ -70,8 +28,8 @@ use cairn_common::executor_protocol::{
     ResidentProcessKind, SelfUpdatePhase, SelfUpdateStatus, UpdateReport, UpdateState,
 };
 
-/// The least slack a command gets past its own expected finish before the
-/// rollout reads it as wedged rather than busy.
+/// The least scheduling slack past a command's expected finish before an
+/// unsuccessful drain releases admission. This is never a process lifetime.
 pub(crate) const COMMAND_MARGIN_MS: u64 = 10 * 60 * 1000;
 /// How long work with no expected end may hold a turn: a command never
 /// measured, or an environment being acquired, neither of which says when it
@@ -82,9 +40,6 @@ pub(crate) const UNMEASURED_HOLD_MS: u64 = 60 * 60 * 1000;
 /// save what they need, short enough that a resident costs the fleet minutes
 /// rather than the machine.
 pub(crate) const RESIDENT_NOTICE_MS: u64 = 5 * 60 * 1000;
-/// How long a machine whose work outran its bound keeps that work before it
-/// is asked again.
-pub(crate) const DEFER_MS: u64 = 30 * 60 * 1000;
 /// How long a directed machine may stay on the link it was directed on. The
 /// executor ends that link as soon as it reads the directive, so a machine
 /// still there after this did not act on it.
@@ -140,10 +95,8 @@ pub(crate) struct HeldWork {
 /// how long its whole tree had gone without output, CPU or storage progress,
 /// against the bound that stop ends it at (the cadence's silence interval).
 ///
-/// One definition of progress serves both the stop and the drain, so a
-/// command the executor would keep running is never read here as wedged, and
-/// the instruments' exclusions (the executor's own output backpressure, an
-/// incomplete reading) hold in both.
+/// The drain displays the executor's own progress evidence. It does not use
+/// that sample to infer death or to override the executor's stall-stop policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Progress {
     pub quiet_ms: u64,
@@ -176,15 +129,14 @@ impl HeldWork {
             .and_then(|progress| progress.progressing(now_unix_ms))
     }
 
-    /// Whether this work holds the turn past its bound: it is past it and
-    /// still progressing.
+    /// Whether the display should lead with work past its estimate that the
+    /// executor still reports as progressing. This never authorizes a restart.
     fn held_past(hold: &DrainHold, now_unix_ms: u64) -> bool {
         now_unix_ms >= hold.deadline_unix_ms && hold.progressing == Some(true)
     }
 
-    /// When this work is expected to finish, when the turn stops waiting for
-    /// it unless it is still progressing, and whether it is, given when the
-    /// drain first saw it.
+    /// Expected finish, scheduling-cost bound and sampled progress, measured
+    /// from when the drain first saw the work.
     ///
     /// Measured from no earlier than first sight, so work that started long
     /// before the turn, or was already past its estimate when the turn began,
@@ -486,8 +438,7 @@ enum TurnPhase {
         cycles: Vec<String>,
         /// Residents the restart will end, as `(key, label)`.
         residents: Vec<(String, String)>,
-        /// When the last pass expected the restart, or `None` while work past
-        /// its bound is still progressing.
+        /// A resident-only restart bound; unknown while any work remains.
         restart_expected_unix_ms: Option<u64>,
     },
     Directed {
@@ -518,7 +469,6 @@ impl TurnPhase {
             !candidate.residents.is_empty(),
             residents_release_at_unix_ms,
             since_unix_ms,
-            now_unix_ms,
         );
         Self::Draining {
             since_unix_ms,
@@ -537,32 +487,19 @@ impl TurnPhase {
     }
 }
 
-/// When a draining machine's restart is expected: the later of its
-/// residents' notice period and the latest bound among its work, or the
-/// moment the drain began when nothing holds it. `None` while work past its
-/// bound is still progressing, since nothing bounds that but its progress.
+/// A scheduling budget is not a safe restart deadline. Only a machine with
+/// no work in flight has a restart bound (its residents' fixed notice).
 fn restart_expected(
     holds: &[DrainHold],
     has_residents: bool,
     residents_release_at_unix_ms: u64,
     since_unix_ms: u64,
-    now_unix_ms: u64,
 ) -> Option<u64> {
-    if holds
-        .iter()
-        .any(|hold| HeldWork::held_past(hold, now_unix_ms))
-    {
-        return None;
-    }
-    let notice = has_residents.then_some(residents_release_at_unix_ms);
-    Some(
-        holds
-            .iter()
-            .map(|hold| hold.deadline_unix_ms)
-            .chain(notice)
-            .max()
-            .unwrap_or(since_unix_ms),
-    )
+    holds.is_empty().then_some(if has_residents {
+        residents_release_at_unix_ms
+    } else {
+        since_unix_ms
+    })
 }
 
 /// When each piece of work was first seen (work that finished is forgotten,
@@ -627,23 +564,68 @@ pub(crate) struct Rollout {
     line: Vec<String>,
     /// Builds no machine is directed to, with why.
     halted: HashMap<String, String>,
-    /// Machines whose work outran its bound, until when and why.
+    /// An unsuccessful drain suppresses another until its exact holders settle.
     deferred: HashMap<String, Deferral>,
-    /// How many times each machine has been deferred, for the build it was
-    /// last deferred for. Kept past the deferral itself, so a machine deferred
-    /// again for the same build is counted rather than starting over.
-    deferral_counts: HashMap<String, (String, u32)>,
+    /// Cost and holder history belong to the update episode, not its target build.
+    episodes: HashMap<String, UpdateEpisode>,
     /// Machines that did not act on a directive, with the build and why.
     excluded: HashMap<String, (String, String)>,
 }
 
-/// One machine's deferral: when it is asked again, the work read as wedged,
-/// and how many times it has been deferred for this build.
+/// Absence is considered only after a fresh same-generation account, joined
+/// with the runner's bindings and unsettled check claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Deferral {
-    until_unix_ms: u64,
-    cause: String,
-    count: u32,
+    blockers: HashMap<String, String>,
+    generation: u64,
+    snapshots_at_release: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UpdateEpisode {
+    since_unix_ms: u64,
+    unsuccessful_drains: u32,
+    release_counted: bool,
+    refused_ms: u64,
+    refusal_since_unix_ms: Option<u64>,
+    operation_id: Option<String>,
+    released_holders: HashSet<String>,
+    repeated_holder: bool,
+    completed: bool,
+}
+
+impl UpdateEpisode {
+    fn close_refusal(&mut self, now_unix_ms: u64) {
+        if let Some(since) = self.refusal_since_unix_ms.take() {
+            self.refused_ms = self
+                .refused_ms
+                .saturating_add(now_unix_ms.saturating_sub(since));
+            if !self.completed && !self.release_counted {
+                self.unsuccessful_drains = self.unsuccessful_drains.saturating_add(1);
+            }
+            self.release_counted = false;
+        }
+    }
+
+    fn event(&self, phase: &str, now_unix_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "phase": phase,
+            "operationId": self.operation_id,
+            "pendingSinceUnixMs": self.since_unix_ms,
+            "unsuccessfulDrains": self.unsuccessful_drains,
+            "refusedMs": self.refusal_at(now_unix_ms),
+            "repeatedHolder": self.repeated_holder,
+            "holders": self.released_holders,
+            "costMeaning": "time the self-update refusal stood this boot, not marginal capacity loss",
+        })
+    }
+
+    fn refusal_at(&self, now_unix_ms: u64) -> u64 {
+        self.refused_ms.saturating_add(
+            self.refusal_since_unix_ms
+                .map_or(0, |since| now_unix_ms.saturating_sub(since)),
+        )
+    }
 }
 
 /// The durable admission hold a proposed rollout needs before it can act.
@@ -655,6 +637,55 @@ pub(crate) struct SelfUpdateDrain {
 }
 
 impl Rollout {
+    /// Called only after the exact owned drain mutation commits. Count the
+    /// union of intervals during which our refusal stood, not a sum per holder.
+    pub(crate) fn record_committed_drains(
+        &mut self,
+        now_unix_ms: u64,
+    ) -> Vec<(String, serde_json::Value)> {
+        let required: HashMap<_, _> = self
+            .required_drains()
+            .into_iter()
+            .map(|hold| (hold.executor_id.clone(), hold))
+            .collect();
+        let mut events = Vec::new();
+        for (executor_id, episode) in &mut self.episodes {
+            let standing = required.get(executor_id);
+            if episode.refusal_since_unix_ms.is_some()
+                && standing
+                    .is_some_and(|hold| episode.operation_id.as_ref() != Some(&hold.operation_id))
+            {
+                episode.close_refusal(now_unix_ms);
+                events.push((
+                    executor_id.clone(),
+                    episode.event("refusalEnded", now_unix_ms),
+                ));
+                if episode.completed {
+                    *episode = UpdateEpisode {
+                        since_unix_ms: now_unix_ms,
+                        ..UpdateEpisode::default()
+                    };
+                }
+            }
+            let phase = match (episode.refusal_since_unix_ms, standing) {
+                (None, Some(hold)) => {
+                    episode.refusal_since_unix_ms = Some(now_unix_ms);
+                    episode.operation_id = Some(hold.operation_id.clone());
+                    Some("refusalStarted")
+                }
+                (Some(_), None) => {
+                    episode.close_refusal(now_unix_ms);
+                    Some("refusalEnded")
+                }
+                _ => None,
+            };
+            if let Some(phase) = phase {
+                events.push((executor_id.clone(), episode.event(phase, now_unix_ms)));
+            }
+        }
+        events
+    }
+
     pub(crate) fn required_drains(&self) -> Vec<SelfUpdateDrain> {
         self.turns()
             .map(|(_, turn)| SelfUpdateDrain {
@@ -698,7 +729,7 @@ impl Rollout {
     /// When this machine is expected back on the runner's build, for work
     /// waiting on it: its expected restart plus the return budget while it
     /// drains, the end of the return budget once directed. `None` when no
-    /// turn holds it, or while work past its bound still progresses.
+    /// turn holds it, or while any physical work or result debt remains.
     pub(crate) fn returns_by(&self, executor_id: &str) -> Option<u64> {
         let (_, turn) = self
             .turns()
@@ -790,8 +821,93 @@ impl Rollout {
     ) -> Step {
         let mut step = Step::default();
         self.absorb_reported_failures(candidates);
-        self.deferred
-            .retain(|_, deferral| deferral.until_unix_ms > now_unix_ms);
+        for candidate in candidates {
+            let Some(ArtifactBuild::Resolved(build)) =
+                candidate.target.and_then(|target| artifacts.get(target))
+            else {
+                continue;
+            };
+            if candidate.running_build.as_ref() == Some(build) {
+                self.deferred.remove(&candidate.executor_id);
+                if let Some(episode) = self.episodes.get_mut(&candidate.executor_id) {
+                    episode.completed = true;
+                }
+            } else {
+                let episode = self
+                    .episodes
+                    .entry(candidate.executor_id.clone())
+                    .or_default();
+                if episode.completed {
+                    *episode = UpdateEpisode::default();
+                }
+                if episode.since_unix_ms == 0 {
+                    episode.since_unix_ms = now_unix_ms;
+                }
+            }
+        }
+        self.deferred.retain(|executor_id, deferral| {
+            let Some(candidate) = candidates.iter().find(|c| &c.executor_id == executor_id) else {
+                return true;
+            };
+            if candidate.generation != deferral.generation {
+                deferral.generation = candidate.generation;
+                deferral.snapshots_at_release = candidate.snapshots_received;
+                return true;
+            }
+            if candidate.reachable
+                && candidate.snapshots_received
+                    >= deferral
+                        .snapshots_at_release
+                        .saturating_add(FRESH_SNAPSHOTS)
+            {
+                deferral
+                    .blockers
+                    .retain(|key, _| candidate.work.iter().any(|w| &w.key == key));
+            }
+            !deferral.blockers.is_empty()
+        });
+        // A physical identity cannot become new work on reconnect or retarget.
+        // If a reconciled holder reappears, surface an incident instead of paying
+        // for another drain of the same work.
+        for candidate in candidates {
+            if self.deferred.contains_key(&candidate.executor_id)
+                || self.holds(&candidate.executor_id)
+            {
+                continue;
+            }
+            let Some(episode) = self.episodes.get_mut(&candidate.executor_id) else {
+                continue;
+            };
+            let blockers: HashMap<_, _> = candidate
+                .work
+                .iter()
+                .filter(|w| episode.released_holders.contains(&w.key))
+                .map(|w| (w.key.clone(), w.label.clone()))
+                .collect();
+            if blockers.is_empty() || episode.completed {
+                continue;
+            }
+            if !episode.repeated_holder {
+                episode.repeated_holder = true;
+                step.transitions.push(Transition {
+                    executor_id: candidate.executor_id.clone(),
+                    kind: TransitionKind::Deferred,
+                    build_id: candidate.target.and_then(|t| artifacts.get(t))
+                        .and_then(|a| match a { ArtifactBuild::Resolved(b) => Some(b.clone()), _ => None })
+                        .unwrap_or_default(),
+                    cause: "incident: an unresolved physical holder reappeared after reconciliation; admission remains open and another drain is suppressed".into(),
+                    deferrals: Some(episode.unsuccessful_drains),
+                });
+            }
+            self.deferred.insert(
+                candidate.executor_id.clone(),
+                Deferral {
+                    blockers,
+                    generation: candidate.generation,
+                    snapshots_at_release: candidate.snapshots_received,
+                },
+            );
+        }
         if let Some(turn) = self.drain.take() {
             self.drain = self.continue_turn(
                 turn,
@@ -979,10 +1095,14 @@ impl Rollout {
             };
         }
         if let Some(deferral) = self.deferred.get(&candidate.executor_id) {
-            return SelfUpdatePhase::Deferred {
-                until_unix_ms: deferral.until_unix_ms,
-                cause: Some(deferral.cause.clone()),
-                deferrals: deferral.count,
+            let episode = &self.episodes[&candidate.executor_id];
+            let mut blockers: Vec<_> = deferral.blockers.values().cloned().collect();
+            blockers.sort();
+            return SelfUpdatePhase::WaitingForSettlement {
+                blockers,
+                since_unix_ms: episode.since_unix_ms,
+                unsuccessful_drains: episode.unsuccessful_drains,
+                refused_ms: episode.refused_ms,
             };
         }
         // The machine updating now goes before everything in line.
@@ -1260,20 +1380,16 @@ impl Rollout {
                     now_unix_ms,
                 );
                 turn.announce(candidate, step);
-                // An empty head not yet confirmed empty, or not reachable to
-                // direct: nothing it holds can be wedged. Residents are never
-                // read as wedged: they hold the turn only to its notice bound.
+                // Only a busy drain has a scheduling overrun. An empty head
+                // waits for confirmation; residents retain their fixed notice.
                 if slot == Slot::Head {
                     return Some(turn);
                 }
                 let TurnPhase::Draining { first_seen, .. } = &turn.phase else {
                     unreachable!("just set to draining");
                 };
-                // The most overdue piece of work that outran its bound and is
-                // not still progressing, if any: a machine whose work neither
-                // ends nor moves is wedged, and a wedged machine does not hold
-                // the fleet. Work that outran its bound but whose tree is still
-                // working is a slow machine doing its job, and keeps the turn.
+                // This bounds the scheduling cost, never the command's life.
+                // Neither an estimate nor a quiet sample proves process death.
                 let overrun = candidate
                     .work
                     .iter()
@@ -1281,19 +1397,9 @@ impl Rollout {
                         let seen = first_seen.get(&item.key).copied().unwrap_or(now_unix_ms);
                         (item, seen, item.hold(seen, now_unix_ms))
                     })
-                    .filter(|(_, _, hold)| {
-                        now_unix_ms >= hold.deadline_unix_ms && hold.progressing != Some(true)
-                    })
+                    .filter(|(_, _, hold)| now_unix_ms >= hold.deadline_unix_ms)
                     .min_by_key(|(_, _, hold)| hold.deadline_unix_ms);
                 if let Some((item, seen, bound)) = overrun {
-                    let silent = match item.progress {
-                        Some(progress) if bound.progressing == Some(false) => format!(
-                            ", and its tree has shown no progress for {} minutes against its own {}-minute stall bound",
-                            progress.quiet_at(now_unix_ms) / 60_000,
-                            progress.silence_bound_ms / 60_000,
-                        ),
-                        _ => String::new(),
-                    };
                     let why = match bound.expected_done_unix_ms {
                         Some(done) => format!(
                             "was expected to finish {} minutes ago, from its own learned duration of {} minutes",
@@ -1305,29 +1411,35 @@ impl Rollout {
                             now_unix_ms.saturating_sub(seen) / 60_000
                         ),
                     };
-                    let count = match self.deferral_counts.get(&turn.executor_id) {
-                        Some((build, count)) if *build == turn.build_id => count + 1,
-                        _ => 1,
-                    };
-                    self.deferral_counts
-                        .insert(turn.executor_id.clone(), (turn.build_id.clone(), count));
-                    let cause = format!("{}'s {} {why}{silent}", turn.name, item.label);
+                    let episode = self
+                        .episodes
+                        .entry(turn.executor_id.clone())
+                        .or_insert_with(|| UpdateEpisode {
+                            since_unix_ms,
+                            ..UpdateEpisode::default()
+                        });
+                    episode.unsuccessful_drains = episode.unsuccessful_drains.saturating_add(1);
+                    episode.release_counted = true;
+                    let count = episode.unsuccessful_drains;
+                    let blockers: HashMap<_, _> = candidate
+                        .work
+                        .iter()
+                        .map(|w| (w.key.clone(), w.label.clone()))
+                        .collect();
+                    episode.released_holders.extend(blockers.keys().cloned());
                     self.deferred.insert(
                         turn.executor_id.clone(),
                         Deferral {
-                            until_unix_ms: now_unix_ms + DEFER_MS,
-                            cause: cause.clone(),
-                            count,
+                            blockers,
+                            generation: candidate.generation,
+                            snapshots_at_release: candidate.snapshots_received,
                         },
                     );
                     let mut deferred = transition(
                         TransitionKind::Deferred,
                         format!(
-                            "{cause}, so it is read as wedged; {} takes work again and is asked after {} minutes ({} for {})",
-                            turn.name,
-                            DEFER_MS / 60_000,
-                            nth_deferral(count),
-                            turn.build_id,
+                            "{}'s {} {why}; update not installed; scheduling bound exceeded, not a death verdict; admitting work, with no new drain until these physical attempts settle ({count} unsuccessful drains this boot)",
+                            turn.name, item.label,
                         ),
                     );
                     deferred.deferrals = Some(count);
@@ -1346,6 +1458,10 @@ impl Rollout {
                 match candidate {
                     Some(candidate) if candidate.generation != generation => {
                         if candidate.running_build.as_deref() == Some(turn.build_id.as_str()) {
+                            if let Some(episode) = self.episodes.get_mut(&turn.executor_id) {
+                                episode.completed = true;
+                            }
+                            self.deferred.remove(&turn.executor_id);
                             step.transitions.push(transition(
                                 TransitionKind::Updated,
                                 format!("{} returned on {}", turn.name, turn.build_id),
@@ -1539,18 +1655,6 @@ fn ready(turn: &Turn, candidates: &[Candidate], now_unix_ms: u64) -> bool {
     })
 }
 
-/// `1st deferral`, `2nd deferral`, `3rd deferral`, `11th deferral`.
-fn nth_deferral(count: u32) -> String {
-    let suffix = match (count % 10, count % 100) {
-        (_, 11..=13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{count}{suffix} deferral")
-}
-
 impl Candidate {
     /// Nothing a restart would end: no work in flight and no resident.
     fn is_empty(&self) -> bool {
@@ -1697,15 +1801,6 @@ mod tests {
             measured_at_unix_ms: at,
         });
         item
-    }
-
-    /// A machine running one whole-suite pass with a learned hour, beside a
-    /// busier one, so it takes the first turn. Its bound falls at 90 minutes.
-    fn suite_fleet() -> Vec<Candidate> {
-        let mut fleet = vec![remote("fedora", "old"), remote("busy", "old")];
-        fleet[0].work = vec![command("rust-tests", NOW, Some(HOUR))];
-        fleet[1].work = vec![command("a", NOW, None), command("b", NOW, None)];
-        fleet
     }
 
     /// `count` measured lanes that started at `NOW`.
@@ -2192,8 +2287,7 @@ mod tests {
         assert!(step.direct.is_some(), "and updates once it is empty");
     }
 
-    /// What bounds a turn is each command's own learned duration plus margin:
-    /// a lane past that is wedged, and a wedged machine gives its turn away.
+    /// Learned duration plus margin bounds the admission cost, not the command.
     #[test]
     fn work_that_outruns_its_own_learned_duration_passes_the_turn() {
         let artifacts = serving("new");
@@ -2234,150 +2328,43 @@ mod tests {
         assert_eq!(held(&step), ["id-idle"], "the next machine takes the turn");
         assert!(matches!(
             phase(&rollout, &fleet[0], &artifacts),
-            SelfUpdatePhase::Deferred {
-                until_unix_ms,
-                cause: Some(ref cause),
-                deferrals: 1,
-            } if until_unix_ms == deadline + DEFER_MS
-                && cause.contains("`rust-tests` was expected to finish 10 minutes ago")
+            SelfUpdatePhase::WaitingForSettlement {
+                unsuccessful_drains: 1,
+                ref blockers,
+                ..
+            } if blockers == &["`rust-tests`".to_string()]
         ));
     }
 
-    /// The fedora specimen (cairn/5672): a whole-suite pass with a learned
-    /// hour ran 170 minutes on a disk stalled 40-80%, emitting results the
-    /// whole time. Past its bound it keeps the turn for as long as its own
-    /// stall stop sees its tree progress, the drain says so, and the machine
-    /// updates the moment the pass finishes.
     #[test]
-    fn work_past_its_bound_that_is_still_progressing_keeps_the_turn() {
-        let artifacts = serving("new");
-        let mut rollout = Rollout::default();
-        let mut fleet = suite_fleet();
-        let deadline = NOW + HOUR + HOUR / 2;
-        for minute in [0, 90, 100, 130, 169] {
-            let now = NOW + minute * 60_000;
-            fleet[0].work = vec![sampled(
-                command("rust-tests", NOW, Some(HOUR)),
-                2 * 60_000,
+    fn scheduling_overrun_does_not_judge_process_progress_or_rearm_the_same_holder() {
+        for quiet in [0, REVIEW_BOUND_MS] {
+            let mut rollout = Rollout::default();
+            let mut machine = remote("fedora", "old");
+            machine.work = vec![sampled(
+                command("suite/attempt-1", NOW, Some(HOUR)),
+                quiet,
                 REVIEW_BOUND_MS,
-                now,
+                NOW,
             )];
-            let step = rollout.advance(&fleet, &artifacts, now);
-            assert_eq!(held(&step), ["id-fedora"], "at {minute}");
-            assert!(
-                step.transitions.is_empty() || minute == 0,
-                "{:?}",
-                step.transitions
+            let artifacts = serving("new");
+            rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+            let deadline = NOW + HOUR + HOUR / 2;
+            let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, deadline);
+            assert!(step.direct.is_none());
+            assert!(!rollout.holds(&machine.executor_id));
+            assert!(matches!(
+                phase(&rollout, &machine, &artifacts),
+                SelfUpdatePhase::WaitingForSettlement { .. }
+            ));
+            let step = rollout.advance(
+                std::slice::from_ref(&machine),
+                &artifacts,
+                deadline + 10 * HOUR,
             );
-            let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &fleet[0], &artifacts)
-            else {
-                panic!("draining at {minute}");
-            };
-            assert_eq!(holds[0].progressing, Some(true));
-            assert_eq!(holds[0].deadline_unix_ms, deadline);
+            assert!(!rollout.holds(&machine.executor_id));
+            assert!(step.direct.is_none());
         }
-
-        fleet[0].work.clear();
-        settle(&mut fleet[0]);
-        let step = rollout.advance(&fleet, &artifacts, NOW + 170 * 60_000);
-        assert_eq!(
-            step.direct.map(|direct| direct.executor_id),
-            Some("id-fedora".to_string()),
-            "it updates as soon as the pass finishes"
-        );
-    }
-
-    /// Past its bound, work whose tree has gone quiet for its whole stall
-    /// bound, by output, CPU and storage alike, is wedged, and the turn passes.
-    #[test]
-    fn work_past_its_bound_and_silent_on_its_instruments_passes_the_turn() {
-        let artifacts = serving("new");
-        let mut rollout = Rollout::default();
-        let mut fleet = suite_fleet();
-        rollout.advance(&fleet, &artifacts, NOW);
-
-        let now = NOW + 95 * 60_000;
-        fleet[0].work = vec![sampled(
-            command("rust-tests", NOW, Some(HOUR)),
-            REVIEW_BOUND_MS - 1,
-            REVIEW_BOUND_MS,
-            now,
-        )];
-        let step = rollout.advance(&fleet, &artifacts, now);
-        assert_eq!(
-            held(&step),
-            ["id-fedora"],
-            "quiet, but not for its whole bound"
-        );
-
-        let now = now + 1;
-        fleet[0].work = vec![sampled(
-            command("rust-tests", NOW, Some(HOUR)),
-            REVIEW_BOUND_MS,
-            REVIEW_BOUND_MS,
-            now,
-        )];
-        let step = rollout.advance(&fleet, &artifacts, now);
-        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
-        assert!(
-            step.transitions[0].cause.contains(
-                "`rust-tests` was expected to finish 35 minutes ago, from its own learned duration of 60 minutes, and its tree has shown no progress for 30 minutes against its own 30-minute stall bound, so it is read as wedged"
-            ),
-            "{}",
-            step.transitions[0].cause
-        );
-        assert_eq!(held(&step), ["id-busy"]);
-    }
-
-    /// A reading of progress is only as good as the sample that carried it:
-    /// one that stops being refreshed ages, and stops holding the turn once
-    /// its age makes up the bound.
-    #[test]
-    fn a_progress_reading_that_stops_being_refreshed_stops_holding_the_turn() {
-        let artifacts = serving("new");
-        let mut rollout = Rollout::default();
-        let mut fleet = suite_fleet();
-        let last_sample = NOW + 100 * 60_000;
-        fleet[0].work = vec![sampled(
-            command("rust-tests", NOW, Some(HOUR)),
-            0,
-            REVIEW_BOUND_MS,
-            last_sample,
-        )];
-        rollout.advance(&fleet, &artifacts, NOW);
-        let step = rollout.advance(&fleet, &artifacts, last_sample + REVIEW_BOUND_MS - 1);
-        assert_eq!(held(&step), ["id-fedora"]);
-        let step = rollout.advance(&fleet, &artifacts, last_sample + REVIEW_BOUND_MS);
-        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
-    }
-
-    /// Where nothing can say whether the work progresses (a platform that
-    /// cannot read the tree's CPU, or a stop with no complete reading), the
-    /// progress test is off rather than half-run, and the bound alone decides,
-    /// exactly as before.
-    #[test]
-    fn work_its_stall_stop_cannot_judge_is_bounded_by_its_duration_alone() {
-        let artifacts = serving("new");
-        let mut rollout = Rollout::default();
-        let fleet = suite_fleet();
-        let deadline = NOW + HOUR + HOUR / 2;
-        rollout.advance(&fleet, &artifacts, NOW);
-        let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &fleet[0], &artifacts) else {
-            panic!("draining");
-        };
-        assert_eq!(holds[0].progressing, None);
-
-        let step = rollout.advance(&fleet, &artifacts, deadline - 1);
-        assert_eq!(held(&step), ["id-fedora"]);
-        let step = rollout.advance(&fleet, &artifacts, deadline);
-        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
-        assert!(
-            step.transitions[0]
-                .cause
-                .contains("from its own learned duration of 60 minutes, so it is read as wedged"),
-            "{}",
-            step.transitions[0].cause
-        );
     }
 
     /// An agent's batch carries a zero stall bound: no stop judges it, so its
@@ -2406,9 +2393,9 @@ mod tests {
         let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
         assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
         assert!(
-            step.transitions[0].cause.contains(
-                "has held the turn 60 minutes without finishing, so it is read as wedged"
-            ),
+            step.transitions[0]
+                .cause
+                .contains("scheduling bound exceeded, not a death verdict"),
             "{}",
             step.transitions[0].cause
         );
@@ -2511,7 +2498,6 @@ mod tests {
         assert_eq!(notice.resident.label, "terminal `lab` of cairn/6613");
         assert_eq!(notice.build_id, "new");
         transitions.extend(step.transitions);
-        let lane_deadline = NOW + LANE_MS + COMMAND_MARGIN_MS;
         let SelfUpdatePhase::Draining {
             in_flight,
             residents,
@@ -2532,11 +2518,8 @@ mod tests {
                 notice: ResidentNotice::Pending,
             }]
         );
-        assert_eq!(restart_expected_unix_ms, Some(lane_deadline));
-        assert_eq!(
-            rollout.returns_by("id-fedora"),
-            Some(lane_deadline + RETURN_BUDGET_MS)
-        );
+        assert_eq!(restart_expected_unix_ms, None);
+        assert_eq!(rollout.returns_by("id-fedora"), None);
 
         // The runner tells the owner; the page says so, and the owner is
         // never told the same thing twice.
@@ -2821,61 +2804,114 @@ mod tests {
         );
     }
 
-    /// A machine deferred again for the same build says how many times, and
-    /// what was read as wedged.
     #[test]
-    fn a_deferral_is_counted_per_build() {
-        let artifacts = serving("new");
+    fn refusal_cost_counts_committed_interval_unions_and_survives_retarget_and_release() {
         let mut rollout = Rollout::default();
         let mut machine = remote("fedora", "old");
-        machine.work = vec![command("wedged", NOW, Some(LANE_MS))];
-        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
-        let first = NOW + LANE_MS + COMMAND_MARGIN_MS;
-        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, first);
-        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
-        assert_eq!(step.transitions[0].deferrals, Some(1));
-
-        // Asked again, it drains anew; the same work is still there.
-        let again = first + DEFER_MS;
-        rollout.advance(std::slice::from_ref(&machine), &artifacts, again);
-        let second = again + COMMAND_MARGIN_MS;
-        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, second);
-        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
-        assert_eq!(step.transitions[0].deferrals, Some(2));
-        assert!(
-            step.transitions[0].cause.contains("(2nd deferral for new)"),
-            "{}",
-            step.transitions[0].cause
-        );
-        assert!(matches!(
-            phase(&rollout, &machine, &artifacts),
-            SelfUpdatePhase::Deferred {
-                deferrals: 2,
-                cause: Some(ref cause),
-                ..
-            } if cause.starts_with("fedora's `wedged` was expected to finish")
-        ));
-
-        // A different build starts the count over.
-        let newer = serving("newer");
-        let resumed = second + DEFER_MS;
-        rollout.advance(std::slice::from_ref(&machine), &newer, resumed);
-        let step = rollout.advance(
+        machine.work = vec![command("request/attempt-1", NOW, None)];
+        rollout.advance(std::slice::from_ref(&machine), &serving("new"), NOW);
+        let events = rollout.record_committed_drains(NOW + 5);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1["phase"], "refusalStarted");
+        assert!(rollout.record_committed_drains(NOW + 100).is_empty());
+        let episode = &rollout.episodes[&machine.executor_id];
+        assert_eq!(episode.refusal_at(NOW + 100), 95);
+        rollout.advance(std::slice::from_ref(&machine), &serving("newer"), NOW + 100);
+        assert!(rollout.record_committed_drains(NOW + 100).is_empty());
+        rollout.advance(
             std::slice::from_ref(&machine),
-            &newer,
-            resumed + COMMAND_MARGIN_MS,
+            &serving("newer"),
+            NOW + HOUR,
         );
-        assert_eq!(step.transitions[0].deferrals, Some(1));
+        let events = rollout.record_committed_drains(NOW + HOUR + 7);
+        assert_eq!(events[0].1["phase"], "refusalEnded");
+        assert_eq!(events[0].1["refusedMs"], HOUR + 2);
+        assert_eq!(
+            rollout.episodes[&machine.executor_id].unsuccessful_drains,
+            1
+        );
+        assert!(rollout.record_committed_drains(NOW + 10 * HOUR).is_empty());
+        assert_eq!(
+            rollout.episodes[&machine.executor_id].refusal_at(NOW + 10 * HOUR),
+            HOUR + 2
+        );
+
+        // A disappearing holder needs the post-release account barrier. A new
+        // physical attempt under the same request does not inherit its wait.
+        machine.work = vec![command("request/attempt-2", NOW + HOUR, None)];
+        rollout.advance(
+            std::slice::from_ref(&machine),
+            &serving("newer"),
+            NOW + HOUR + 10,
+        );
+        assert!(!rollout.holds(&machine.executor_id));
+        settle(&mut machine);
+        rollout.advance(
+            std::slice::from_ref(&machine),
+            &serving("newer"),
+            NOW + HOUR + 20,
+        );
+        assert!(rollout.holds(&machine.executor_id));
+        rollout.record_committed_drains(NOW + HOUR + 20);
+        rollout.advance(&[], &serving("newer"), NOW + HOUR + 30);
+        let events = rollout.record_committed_drains(NOW + HOUR + 30);
+        assert_eq!(
+            events[0].1["refusedMs"],
+            HOUR + 12,
+            "detach closes the second interval once"
+        );
+        assert_eq!(events[0].1["unsuccessfulDrains"], 2);
     }
 
     #[test]
-    fn ordinal_deferrals_read_as_english() {
-        assert_eq!(nth_deferral(1), "1st deferral");
-        assert_eq!(nth_deferral(2), "2nd deferral");
-        assert_eq!(nth_deferral(3), "3rd deferral");
-        assert_eq!(nth_deferral(4), "4th deferral");
-        assert_eq!(nth_deferral(11), "11th deferral");
-        assert_eq!(nth_deferral(22), "22nd deferral");
+    fn unresolved_attempts_never_repeat_a_busy_drain_across_time_reconnect_or_retarget() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("fedora", "old");
+        machine.work = vec![
+            command("request-a/attempt-1", NOW, None),
+            command("request-b/attempt-1", NOW, None),
+        ];
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        let first = NOW + UNMEASURED_HOLD_MS;
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, first);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert!(!rollout.holds(&machine.executor_id));
+        assert!(step.direct.is_none());
+
+        let newer = serving("newer");
+        for hour in 2..8 {
+            machine.generation += 1;
+            machine.snapshots_received = 1;
+            let step = rollout.advance(std::slice::from_ref(&machine), &newer, NOW + hour * HOUR);
+            assert!(
+                !rollout.holds(&machine.executor_id),
+                "unchanged physical work must keep ordinary admission open"
+            );
+            assert!(step.direct.is_none());
+            assert!(!step
+                .transitions
+                .iter()
+                .any(|t| t.kind == TransitionKind::Deferred));
+        }
+        machine.work.remove(0);
+        settle(&mut machine);
+        rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 8 * HOUR);
+        assert!(
+            !rollout.holds(&machine.executor_id),
+            "the second original blocker remains"
+        );
+
+        machine.work.clear();
+        settle(&mut machine);
+        rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 9 * HOUR);
+        assert!(
+            rollout.holds(&machine.executor_id),
+            "settlement restores update eligibility"
+        );
+        settle(&mut machine);
+        let step = rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 9 * HOUR + 1);
+        assert_eq!(step.direct.unwrap().build_id, "newer");
     }
 
     #[test]
@@ -3056,11 +3092,13 @@ mod tests {
         let mut rollout = Rollout::default();
         let mut machine = remote("a", "old");
         rollout.advance(std::slice::from_ref(&machine), &serving("new"), NOW);
+        rollout.record_committed_drains(NOW);
         settle(&mut machine);
         assert!(rollout
             .advance(std::slice::from_ref(&machine), &serving("new"), NOW + 1_000)
             .direct
             .is_some());
+        rollout.record_committed_drains(NOW + 1_000);
         let newer = serving("newer");
         let step = rollout.advance(&[], &newer, NOW + 30_000);
         assert_eq!(held(&step), ["id-a"], "held while it installs");
@@ -3072,6 +3110,19 @@ mod tests {
         assert_eq!(step.transitions[0].build_id, "new");
         assert_eq!(step.transitions[1].kind, TransitionKind::Draining);
         assert_eq!(step.transitions[1].build_id, "newer");
+        let events = rollout.record_committed_drains(NOW + 60_000);
+        assert_eq!(
+            events.len(),
+            2,
+            "the successful operation ends before the new target starts"
+        );
+        assert_eq!(events[0].1["refusedMs"], 60_000);
+        assert_eq!(events[0].1["unsuccessfulDrains"], 0);
+        assert_eq!(events[1].1["refusedMs"], 0);
+        assert_eq!(
+            rollout.episodes[&machine.executor_id].since_unix_ms,
+            NOW + 60_000
+        );
     }
 
     #[test]

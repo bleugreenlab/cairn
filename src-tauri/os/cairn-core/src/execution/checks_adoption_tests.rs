@@ -655,12 +655,6 @@ pub(super) fn batch_item(
 
 #[tokio::test]
 #[serial_test::serial(jj)]
-async fn cadence_joining_a_three_suite_manual_grant_survives_restart_and_acks_after_all_rows() {
-    shared_manual_batch(false, false, false, false, false).await;
-}
-
-#[tokio::test]
-#[serial_test::serial(jj)]
 async fn a_rejected_second_observation_retains_the_entire_batch_until_the_store_recovers() {
     shared_manual_batch(true, false, false, false, false).await;
 }
@@ -1424,6 +1418,513 @@ async fn shared_manual_batch(
         }
     }
     assert_eq!(ack_count, 1);
+}
+
+/// A remote `when: write` batch whose physical result reached the runner, but
+/// whose sole direct consumer was answered from the verdict cache instead: the
+/// write wave filters cache misses before it submits, then the shared engine
+/// resolves the cache again, and a hit leaves the parked batch outcome (and its
+/// direct consumer guard) unused. The completed physical attempt must still
+/// settle durably and be acknowledged, or the executor keeps it forever.
+#[tokio::test]
+async fn direct_write_check_answered_from_cache_still_settles_and_acks_its_physical_result() {
+    direct_write_settlement(false, false).await;
+}
+
+#[tokio::test]
+async fn direct_write_check_rejected_settlement_retains_result_until_retry() {
+    direct_write_settlement(true, true).await;
+}
+
+async fn direct_write_settlement(withdraw_first: bool, reject_settlement: bool) {
+    let home = tempfile::tempdir().unwrap();
+    let local = Arc::new(
+        LocalDb::open_migrated_for_test(home.path().join("runner.db"))
+            .await
+            .unwrap(),
+    );
+    local
+        .execute(
+            "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('p','default','P','P','/fixture',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let orch = boot(home.path(), local.clone()).await;
+    // The test fleet's machines serve project `p`.
+    let mut frames = orch.fleet.attach_reported_machine_for_test(REMOTE, &[]);
+    let key: (String, String) = (REQUEST.into(), ATTEMPT.into());
+
+    // What the write wave registers before submitting (checks.rs, the
+    // non-pure-verdict arm of the planned batch submission).
+    let mut template = claim("running", "write");
+    template.consumer_ref = "write-job".into();
+    template.project_id = "p".into();
+    orch.fleet
+        .register_check_claim(key.clone(), template.clone());
+    let guard = orch
+        .fleet
+        .check_consumer_guard_for(&key, "smoke", &template);
+
+    let mut request = orch.fleet.cell_request_for_test(REQUEST);
+    request.attempt_id = ATTEMPT.into();
+    request.project_id = "p".into();
+    request.base_commit = "original-commit".into();
+    request.repository = RepositoryLocator::ScratchOnly {
+        owner_id: "p".into(),
+    };
+    request.pinned_executor_id = Some(REMOTE.into());
+    request.mutation_policy = MutationPolicy::AllowDelta;
+    request.requesting_job_id = Some("write-job".into());
+    request.wait_horizon_unix_ms = u64::MAX;
+    let submitting = orch.clone();
+    let process = batch_item("smoke", "original-input", "write-checks:run:0").process;
+    let mut submission = tokio::spawn(async move {
+        submitting
+            .fleet
+            .submit_write_check_batch(&submitting, request, vec![process], None, None)
+            .await
+    });
+    let next_frame = |frames: &mut mpsc::UnboundedReceiver<ExecutorMessage>| {
+        let frame = frames.try_recv();
+        frame.ok()
+    };
+    let entry_id = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            tokio::select! {
+                frame = frames.recv() => if let Some(ExecutorMessage::Offer { entry_id, .. }) = frame { break entry_id; },
+                ended = &mut submission => panic!("write submission ended before Offer: {:?}", ended.map(|e| format!("{:?}", e.outcome))),
+            }
+        }
+    })
+    .await
+    .expect("the AllowDelta write batch is offered to the pinned remote");
+    let generation = orch.fleet.link_generation(REMOTE).unwrap();
+    orch.fleet
+        .handle_executor_message(REMOTE, generation, ExecutorMessage::Claim { entry_id });
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(ExecutorMessage::Granted {
+                request,
+                batch: Some(batch),
+                ..
+            }) = frames.recv().await
+            {
+                assert_eq!((request.request_id, request.attempt_id), key);
+                assert_eq!(batch.items.len(), 1);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the remote claim is granted");
+    let granted = claims::lookup(&local, REQUEST, ATTEMPT)
+        .await
+        .unwrap()
+        .expect("a remote write grant is durably claimed");
+    assert_eq!(granted.state, "running");
+    let consumers = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
+    assert_eq!(
+        consumers.len(),
+        1,
+        "the direct write consumer is the sole consumer"
+    );
+    assert_eq!(
+        (consumers[0].consumer.as_str(), consumers[0].state.as_str()),
+        ("write", "running")
+    );
+
+    let acks = Arc::new(AtomicUsize::new(0));
+    let probe_acks = acks.clone();
+    let probe_db = local.clone();
+    orch.fleet
+        .set_result_ack_probe_for_test(Arc::new(move |request, attempt| {
+            assert_eq!((request, attempt), (REQUEST, ATTEMPT));
+            // Runs synchronously before the frame is sent, on a separate
+            // checkout: only committed rows are visible here.
+            let (settled, consumers) = crate::storage::run_db_blocking(|| async {
+                let settled = claims::lookup(&probe_db, REQUEST, ATTEMPT)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .expect("the physical row outlives its settlement");
+                let consumers = claims::waiters(&probe_db, REQUEST, ATTEMPT)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok((settled, consumers))
+            })
+            .unwrap();
+            assert_eq!(
+                settled.state, "cancelled",
+                "ResultAck must follow the durable physical disposition: {settled:?}"
+            );
+            assert!(
+                settled
+                    .evidence
+                    .as_deref()
+                    .is_some_and(|e| e.contains("no live consumer")),
+                "{settled:?}"
+            );
+            assert!(
+                consumers
+                    .iter()
+                    .all(|w| w.state == "cancelled" && w.observation_id.is_none()),
+                "{consumers:?}"
+            );
+            probe_acks.fetch_add(1, Ordering::SeqCst);
+        }));
+
+    if withdraw_first {
+        drop(guard);
+        submission.abort();
+        assert!(matches!(submission.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap()[0].state != "cancelled" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            claims::lookup(&local, REQUEST, ATTEMPT)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        assert_eq!(acks.load(Ordering::SeqCst), 0);
+        while let Ok(frame) = frames.try_recv() {
+            assert!(!matches!(frame, ExecutorMessage::ResultAck { .. }));
+        }
+        let mut retries = orch.fleet.direct_settlement_retries_for_test();
+        if reject_settlement {
+            local.execute_script("CREATE TRIGGER reject_direct_settlement BEFORE UPDATE OF state ON check_lane_adoptions WHEN NEW.state='cancelled' BEGIN SELECT RAISE(ABORT,'reject direct settlement'); END;").await.unwrap();
+        }
+        // Aborting the submission removed its queue binding. The retained result
+        // must converge with bound ingest, not become generic no-adopter loss.
+        orch.fleet.handle_executor_message(
+            REMOTE,
+            generation,
+            ExecutorMessage::Result {
+                request_id: REQUEST.into(),
+                attempt_id: ATTEMPT.into(),
+                outcome: result(&orch).outcome,
+            },
+        );
+        if reject_settlement {
+            let (retried, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), retries.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(retried, key);
+            assert_eq!(acks.load(Ordering::SeqCst), 0);
+            assert!(orch.fleet.check_claim(&key).is_some());
+            assert_no_release(&mut frames);
+            local
+                .execute_script("DROP TRIGGER reject_direct_settlement;")
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(ExecutorMessage::ResultAck {
+                    request_id,
+                    attempt_id,
+                }) = frames.recv().await
+                {
+                    assert_eq!((request_id, attempt_id), key);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(acks.load(Ordering::SeqCst), 1);
+        orch.fleet.assert_check_settlement_drained_for_test(&key);
+        assert!(claims::open(&local)
+            .await
+            .unwrap()
+            .iter()
+            .all(|claim| claim.request_id != REQUEST));
+        return;
+    }
+
+    // The remote formatter succeeded and reports one typed item outcome.
+    orch.fleet.handle_executor_message(
+        REMOTE,
+        generation,
+        ExecutorMessage::Result {
+            request_id: REQUEST.into(),
+            attempt_id: ATTEMPT.into(),
+            outcome: result(&orch).outcome,
+        },
+    );
+    let executed = tokio::time::timeout(std::time::Duration::from_secs(15), submission)
+        .await
+        .expect("the write submission returns the remote result")
+        .unwrap();
+    assert!(
+        matches!(
+            executed.outcome,
+            CellOutcome::Completed {
+                exit_code: Some(0),
+                ..
+            }
+        ),
+        "{:?}",
+        executed.outcome
+    );
+    assert_eq!(
+        acks.load(Ordering::SeqCst),
+        0,
+        "a claimed grant defers its ack"
+    );
+    assert_no_release(&mut frames);
+
+    // The wave parks the item with its direct guard (checks.rs, after
+    // `submit_write_check_batch`), exactly as production does.
+    let (mut items, delta) =
+        split_write_check_batch_outcome(executed.outcome, &executed.account, 1);
+    assert!(delta.is_none());
+    for item in items.iter_mut() {
+        let parked = item.as_mut().expect("the remote item outcome is usable");
+        parked.publication = Some(
+            crate::fleet::PublicationCoordination::for_request(key.clone())
+                .with_consumer_guard(guard.clone()),
+        );
+    }
+    drop(guard);
+    let batched_results: Arc<
+        std::sync::Mutex<HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>>,
+    > = Arc::new(std::sync::Mutex::new(
+        items.into_iter().enumerate().collect(),
+    ));
+
+    // The race: another lane recorded a reusable verdict for the same input
+    // after the wave's miss filter and before the engine's cache phase.
+    let configured: CheckCommand = serde_yaml::from_str("command: \"echo smoke\"\n").unwrap();
+    let plan = CheckPlan {
+        name: "smoke".into(),
+        applies: true,
+        command: "echo smoke".into(),
+        scope: CheckScope::Full,
+        resource_class: crate::config::project_settings::CheckResourceClass::Shared,
+        verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
+            &configured,
+        ),
+        verdict_executor_ids: None,
+        config_error: None,
+        verdict_platforms: vec![crate::execution::check_identity::gating_platform().to_string()],
+        verdict_runtime: crate::execution::check_identity::expected_verdict_runtime(
+            &configured,
+            check_toolchain_identity(),
+        ),
+    };
+    record_fresh_check_observation(
+        local.clone(),
+        reusable_smoke_observation("original-input", plan_environment_fingerprint(&plan)),
+    )
+    .unwrap();
+    let parked = batched_results.clone();
+    let outcomes = run_planned_checks(
+        local.clone(),
+        "p",
+        "original-tree",
+        "write-job",
+        &[(plan, "original-input".into())],
+        "write-checks:run",
+        CheckExecMode::Shared,
+        Some(&orch),
+        move |index, _command, _stream| {
+            let parked = parked.clone();
+            async move {
+                parked.lock().unwrap().remove(&index).unwrap_or_else(|| {
+                    Err(CheckExecutionFailure::from(
+                        "no parked write outcome".to_string(),
+                    ))
+                })
+            }
+        },
+        |_| {},
+    )
+    .await;
+    assert!(
+        outcomes[0].cached && outcomes[0].passed,
+        "the engine must answer from the seeded reusable verdict"
+    );
+    assert!(outcomes[0].consumer_guard.is_none());
+    assert!(
+        batched_results.lock().unwrap().contains_key(&0),
+        "the cache hit left the physical item outcome untaken"
+    );
+    // The wave ends; its parked outcomes (and their direct guard) drop unused.
+    drop(batched_results);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let consumers = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
+            if consumers[0].state == "cancelled" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the last direct guard withdraws the sole consumer");
+    let withdrawn = claims::waiters(&local, REQUEST, ATTEMPT).await.unwrap();
+    assert!(withdrawn[0].observation_id.is_none());
+    assert!(withdrawn[0]
+        .evidence
+        .as_deref()
+        .is_some_and(|e| e.contains("live consumer dropped")));
+    // Whatever settles the physical row may do so together with the
+    // withdrawal; while it still reads `running`, nothing may have released
+    // the executor's retained result.
+    let physical = claims::lookup(&local, REQUEST, ATTEMPT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(physical.observation_id.is_none());
+    if physical.state == "running" {
+        assert_eq!(acks.load(Ordering::SeqCst), 0);
+        while let Some(frame) = next_frame(&mut frames) {
+            assert!(
+                !matches!(
+                    frame,
+                    ExecutorMessage::ResultAck { .. } | ExecutorMessage::Cancel { .. }
+                ),
+                "released before any durable settlement: {frame:?}"
+            );
+        }
+    }
+
+    // The completed physical attempt has no consumer left and its result is in
+    // hand: it must settle durably and then be acknowledged exactly once.
+    let acked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(ExecutorMessage::ResultAck {
+                request_id,
+                attempt_id,
+            }) = frames.recv().await
+            {
+                break (request_id, attempt_id);
+            }
+        }
+    })
+    .await;
+    let physical = claims::lookup(&local, REQUEST, ATTEMPT).await.unwrap();
+    assert!(
+        acked.is_ok(),
+        "no ResultAck: the completed remote write attempt was never settled after its sole \
+         direct consumer withdrew; physical row = {:?}, in-memory claim open = {}, \
+         consumers = {:?}",
+        physical
+            .as_ref()
+            .map(|c| (&c.state, &c.observation_id, &c.evidence)),
+        orch.fleet.check_claim(&key).is_some(),
+        claims::waiters(&local, REQUEST, ATTEMPT)
+            .await
+            .unwrap()
+            .iter()
+            .map(|w| (&w.consumer, &w.state))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(acked.unwrap(), key);
+    assert_eq!(physical.unwrap().state, "cancelled");
+    assert_eq!(acks.load(Ordering::SeqCst), 1);
+    // No debt remains in memory or in the open-claim scan a restart reads.
+    orch.fleet.assert_check_settlement_drained_for_test(&key);
+    assert!(claims::open(&local)
+        .await
+        .unwrap()
+        .iter()
+        .all(|claim| claim.request_id != REQUEST));
+    assert!(
+        !take_frames_contain_ack(&mut frames),
+        "exactly one ResultAck"
+    );
+}
+
+fn take_frames_contain_ack(frames: &mut mpsc::UnboundedReceiver<ExecutorMessage>) -> bool {
+    let mut acked = false;
+    while let Ok(frame) = frames.try_recv() {
+        acked |= matches!(frame, ExecutorMessage::ResultAck { .. });
+    }
+    acked
+}
+
+fn reusable_smoke_observation(input_hash: &str, environment: String) -> FreshCheckObservationWrite {
+    FreshCheckObservationWrite {
+        manual_handle: None,
+        publication_id: None,
+        sealed_coordinate: crate::execution::cache::SealedCheckCoordinate::new(
+            "commit-source",
+            "commit-source",
+            "tree-source",
+            input_hash,
+        ),
+        id: "obs-smoke-review-lane".into(),
+        public_handle: "handle-smoke-review-lane".into(),
+        infra_reset_scopes: Vec::new(),
+        nested_sandbox_lane: None,
+        failure_signature: None,
+        placement_facts: None,
+        substrate_shape: None,
+        selection: None,
+        deferred_count: 0,
+        plan_audit_state: None,
+        plan_audit_note: None,
+        audit_findings: Vec::new(),
+        phases: None,
+        execution_warmth: None,
+        cell_origin: None,
+        build_jobs: None,
+        project_id: "p".into(),
+        commit_sha: "commit-source".into(),
+        defined_by_commit_sha: "commit-source".into(),
+        tree_hash: "tree-source".into(),
+        check_name: "smoke".into(),
+        input_hash: input_hash.into(),
+        environment_fingerprint: environment,
+        exit_code: 0,
+        verdict: "passed".into(),
+        failure_kind: None,
+        complete: true,
+        reusable: true,
+        non_reusable_reason: None,
+        parser_version: crate::execution::check_identity::CHECK_PARSER_VERSION as i64,
+        result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+        ran_at: 100,
+        duration_ms: 1,
+        job_id: Some("review-job".into()),
+        run_id: None,
+        cadence: "write".into(),
+        executor_id: None,
+        executor_device_id: None,
+        executor_connection_generation: None,
+        executor_cell_id: None,
+        executor_lease_epoch: None,
+        executor_started_at_unix_ms: None,
+        executor_finished_at_unix_ms: None,
+        runner_build_id: Some(cairn_checkenv::implementation_identity().to_string()),
+        toolchain_fingerprint: Some(check_toolchain_identity().to_string()),
+        output_tail: "cached".into(),
+        target_results_json: None,
+        tests: Vec::new(),
+        verdict_platform: Some(crate::execution::check_identity::gating_platform().to_string()),
+        verdict_arch: Some(std::env::consts::ARCH.to_string()),
+        verdict_environment_hash: Some(cairn_checkenv::verdict_environment_with_runtime(
+            &cairn_checkenv::verdict_environment_hash(Vec::<String>::new(), |_| None),
+            &cairn_checkenv::runtime_versions(
+                crate::config::project_settings::RuntimeInstrument::ALL
+                    .iter()
+                    .map(|instrument| instrument.as_str()),
+                Some(check_toolchain_identity()),
+            ),
+        )),
+    }
 }
 
 type RetryListeners = std::collections::HashMap<String, mpsc::UnboundedSender<String>>;

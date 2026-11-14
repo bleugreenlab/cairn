@@ -8197,7 +8197,7 @@ pub struct LearnedResourceEstimate {
 /// runner-authored types no executor decodes into a decision: `residents` and
 /// `restartExpectedUnixMs` on [`SelfUpdatePhase::Draining`], `ended` on
 /// [`SelfUpdatePhase::Directed`], `cause` and `deferrals` on
-/// [`SelfUpdatePhase::Deferred`], and `returnsByUnixMs` on
+/// the former `SelfUpdatePhase::Deferred`, and `returnsByUnixMs` on
 /// [`PlacementRejectionReason::UpdatePending`], which becomes a struct variant.
 /// The enum is internally tagged, so `{"kind":"updatePending"}` written by an
 /// older peer or stored in an older placement record decodes as the struct
@@ -8386,6 +8386,17 @@ pub struct LearnedResourceEstimate {
 /// existing fields exactly as before and places elsewhere; no capacity is
 /// overstated, field misread, or new field required. Mixed versions are safe,
 /// and the old behavior ends when the executor adopts the new build by hash.
+///
+/// cairn/7160 does not move the number. `SelfUpdatePhase::WaitingForSettlement`
+/// replaces the timed deferral on `SelfUpdateStatus`, which the runner fills
+/// only on its own `ExecutorInspection`; no executor sends or reads that
+/// status. Pending time, unresolved attempt labels and refusal cost are
+/// runner-local rollout facts. Direct check results now reach durable
+/// settlement independently of their consumers using the same Result and
+/// ResultAck frames, without new fields or variants on the executor wire.
+/// What a runner gets wrong talking to an older executor: nothing; it receives
+/// the same result and acknowledgement vocabulary and can settle that result
+/// even when the consumer has gone away.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 171;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -18253,8 +18264,8 @@ pub enum SelfUpdatePhase {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         updating: Option<String>,
     },
-    /// Emptying for its update. The runner refuses it new work until it is
-    /// empty, however long that takes, and then directs the update.
+    /// Emptying for its update. The runner refuses new work until it is empty
+    /// and directs the update, or releases the busy drain to await settlement.
     Draining {
         in_flight: u32,
         since_unix_ms: u64,
@@ -18297,16 +18308,16 @@ pub enum SelfUpdatePhase {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ended: Vec<ResidentHold>,
     },
-    /// Work on it outran its own bound and was read as wedged, so it takes
-    /// work again and its turn comes back after `until_unix_ms`.
-    Deferred {
-        until_unix_ms: u64,
-        /// The work read as wedged and why, as the deferral stated it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<String>,
-        /// How many times this machine has been deferred for this build.
-        #[serde(default, skip_serializing_if = "is_zero_u32")]
-        deferrals: u32,
+    /// A busy drain ended without installing the update. Ordinary admission
+    /// stays open until these physical attempts settle, with no timed retry.
+    WaitingForSettlement {
+        blockers: Vec<String>,
+        /// When this update first became pending, not when its drain ended.
+        since_unix_ms: u64,
+        /// Drains that ended without installing an update during this runner boot.
+        unsuccessful_drains: u32,
+        /// Committed time self-update refused work during this runner boot.
+        refused_ms: u64,
     },
     /// An update to this build failed in the fleet, so the runner directs no
     /// machine to it. A different artifact resumes the rollout.
@@ -18314,10 +18325,6 @@ pub enum SelfUpdatePhase {
     /// This machine did not act on a directive to this build. Other machines
     /// still update; this one is retried when the artifact changes.
     Excluded { cause: String },
-}
-
-fn is_zero_u32(value: &u32) -> bool {
-    *value == 0
 }
 
 /// A resident (terminal, REPL or dev instance) a self-update restart ends,

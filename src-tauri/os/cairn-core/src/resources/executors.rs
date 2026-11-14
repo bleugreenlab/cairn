@@ -1324,23 +1324,18 @@ fn render_self_update(
                 ),
             }
         ),
-        SelfUpdatePhase::Deferred {
-            until_unix_ms,
-            cause,
-            deferrals,
+        SelfUpdatePhase::WaitingForSettlement {
+            blockers,
+            since_unix_ms,
+            unsuccessful_drains,
+            refused_ms,
         } => format!(
-            "update deferred{}: {}, so it takes work again and is asked again at {} (in {})",
-            match deferrals {
-                0 | 1 => String::new(),
-                count => format!(" ({} time for this build)", ordinal(*count)),
-            },
-            match cause {
-                Some(cause) => format!("{cause}, and was read as wedged"),
-                None => "work there outran its own expected duration and was read as wedged"
-                    .to_string(),
-            },
-            cairn_common::executor_protocol::describe_clock(*until_unix_ms),
-            duration_ms(until_unix_ms.saturating_sub(captured_at_unix_ms))
+            "Update not installed, pending since {} ({}); waiting for {}; admitting work with no new drain until these attempts settle; {unsuccessful_drains} unsuccessful drain{} and {} total refused this boot; no safe bound for installing the update is known.",
+            cairn_common::executor_protocol::describe_clock(*since_unix_ms),
+            age(captured_at_unix_ms.saturating_sub(*since_unix_ms)),
+            blockers.join(", "),
+            if *unsuccessful_drains == 1 { "" } else { "s" },
+            duration_ms(*refused_ms),
         ),
         SelfUpdatePhase::Halted { cause } => {
             format!("update halted for {served}: {cause}")
@@ -1430,18 +1425,6 @@ fn restart_at(restart_expected_unix_ms: Option<u64>) -> String {
         ),
         None => String::new(),
     }
-}
-
-/// `2nd`, `3rd`, `11th`.
-fn ordinal(count: u32) -> String {
-    let suffix = match (count % 10, count % 100) {
-        (_, 11..=13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{count}{suffix}")
 }
 
 /// The service instances a self-update restart ends, which their owners place
@@ -13056,9 +13039,9 @@ mod tests {
 
     /// The cairn/6630 specimen on the page: a terminal holds the drain only
     /// to its notice bound, named with whose it is, when it ends, and whether
-    /// its owner was told; a deferral says what was wedged and how many times.
+    /// its owner was told; a released drain names its unresolved attempts and cost.
     #[test]
-    fn the_page_names_residents_their_bound_and_a_deferrals_cause() {
+    fn the_page_names_residents_their_bound_and_settlement_wait() {
         use cairn_common::executor_protocol::{
             describe_clock, DrainHold, ResidentHold, ResidentNotice, SelfUpdatePhase,
         };
@@ -13127,16 +13110,16 @@ mod tests {
             waits_for_turn: true,
             updating: None,
             residents: vec![lab(ResidentNotice::OwnerNotFound)],
-            restart_expected_unix_ms: Some(lane_deadline),
+            restart_expected_unix_ms: None,
         }));
         assert!(
             busy.contains(&format!(
-                "draining for update: 2 in flight, the longest `rust-tests` for cairn/6093, ~4.0m left; new work goes elsewhere, and it holds no other machine's update (since 1m ago); terminal `lab` of cairn/6613 ends with the restart, no earlier than {} (owner not found; noted in its own transcript); restarts by {}\n",
+                "draining for update: 2 in flight, the longest `rust-tests` for cairn/6093, ~4.0m left; new work goes elsewhere, and it holds no other machine's update (since 1m ago); terminal `lab` of cairn/6613 ends with the restart, no earlier than {} (owner not found; noted in its own transcript)\n",
                 describe_clock(ends),
-                describe_clock(lane_deadline),
             )),
             "{busy}"
         );
+        assert!(!busy.contains("restarts by"), "{busy}");
 
         let directed = render_executor(&self_updating(SelfUpdatePhase::Directed {
             at_unix_ms: CAPTURED_AT - 60_000,
@@ -13151,21 +13134,33 @@ mod tests {
             "{directed}"
         );
 
-        let asked_at = CAPTURED_AT + 29 * 60_000;
-        let deferred = render_executor(&self_updating(SelfUpdatePhase::Deferred {
-            until_unix_ms: asked_at,
-            cause: Some(
-                "fedora's `cargo test` for cairn/6093 was expected to finish 12 minutes ago, from its own learned duration of 20 minutes".into(),
-            ),
-            deferrals: 2,
+        let since = CAPTURED_AT - 3 * 60_000;
+        let blockers = vec![
+            "request a/attempt-1".to_string(),
+            "`cargo test` for cairn/6093".to_string(),
+        ];
+        let waiting = render_executor(&self_updating(SelfUpdatePhase::WaitingForSettlement {
+            blockers: blockers.clone(),
+            since_unix_ms: since,
+            unsuccessful_drains: 2,
+            refused_ms: 3_600_000,
         }));
-        assert!(
-            deferred.contains(&format!(
-                "- Self-update: update deferred (2nd time for this build): fedora's `cargo test` for cairn/6093 was expected to finish 12 minutes ago, from its own learned duration of 20 minutes, and was read as wedged, so it takes work again and is asked again at {} (in 29.0m)\n",
-                describe_clock(asked_at)
-            )),
-            "{deferred}"
-        );
+        for label in blockers {
+            assert!(waiting.contains(&label), "{waiting}");
+        }
+        for fact in [
+            "Update not installed",
+            &format!("pending since {} (3m ago)", describe_clock(since)),
+            "admitting work",
+            "no new drain until these attempts settle",
+            "2 unsuccessful drains",
+            "60.0m total refused this boot",
+            "no safe bound",
+        ] {
+            assert!(waiting.contains(fact), "{waiting}");
+        }
+        assert!(!waiting.contains("asked again"), "{waiting}");
+        assert!(!waiting.contains("wedged"), "{waiting}");
     }
 }
 

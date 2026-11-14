@@ -23,7 +23,10 @@ pub(super) struct CheckAdoptions {
     pub(super) claims: HashMap<RequestIdentity, store::Claim>,
     held: HashMap<RequestIdentity, UnboundResult>,
     received: HashSet<RequestIdentity>,
+    /// Current-incarnation non-coalesced writes have no leader publication task.
+    direct: HashMap<RequestIdentity, Option<u64>>,
     terminal: HashSet<RequestIdentity>,
+    settling: HashSet<RequestIdentity>,
     waiters: HashMap<RequestIdentity, Vec<oneshot::Sender<CellOutcome>>>,
     accounted: HashSet<RequestIdentity>,
     reloaded: HashSet<RequestIdentity>,
@@ -33,9 +36,23 @@ pub(super) struct CheckAdoptions {
     settlement_retry_probe: Option<mpsc::UnboundedSender<(RequestIdentity, String)>>,
 }
 
+struct CheckSettlementWorker {
+    fleet: Fleet,
+    identity: RequestIdentity,
+}
+
+impl Drop for CheckSettlementWorker {
+    fn drop(&mut self) {
+        lock_through_poison(&self.fleet.check_adoptions)
+            .settling
+            .remove(&self.identity);
+    }
+}
+
 impl CheckAdoptions {
     fn forget_consumers(&mut self, identity: &RequestIdentity) {
         self.templates.remove(identity);
+        self.direct.remove(identity);
         self.consumers.remove(identity);
         self.consumer_guards
             .retain(|consumer, _| &consumer.physical != identity);
@@ -355,6 +372,65 @@ impl Fleet {
             .insert(identity, claim);
     }
 
+    pub(super) fn register_direct_check(&self, identity: RequestIdentity) {
+        let mut state = self.check_adoptions.lock().unwrap();
+        if state.templates.contains_key(&identity) {
+            state.direct.insert(identity, None);
+        }
+    }
+
+    pub(super) fn is_direct_check_result(
+        &self,
+        identity: &RequestIdentity,
+        executor: &str,
+    ) -> bool {
+        let state = self.check_adoptions.lock().unwrap();
+        state.direct.contains_key(identity)
+            && state
+                .claims
+                .get(identity)
+                .is_some_and(|claim| claim.executor_id == executor)
+    }
+
+    /// Receipt proves physical completion, not publication or consumer delivery.
+    /// Queue the durable writer independently of the submitting future's lifetime.
+    pub(super) fn receive_direct_check_result(&self, identity: &RequestIdentity, executor: &str) {
+        self.acknowledge_settled_result(executor, identity);
+        let first = {
+            let mut state = self.check_adoptions.lock().unwrap();
+            state.claims.contains_key(identity) && state.received.insert(identity.clone())
+        };
+        if first {
+            self.retry_check_settlement(identity);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_check_settlement_drained_for_test(&self, identity: &RequestIdentity) {
+        let state = self.check_adoptions.lock().unwrap();
+        assert!(!state.claims.contains_key(identity));
+        assert!(!state.direct.contains_key(identity));
+        assert!(!state.received.contains(identity));
+        assert!(!state.held.contains_key(identity));
+        assert!(!state.templates.contains_key(identity));
+        assert!(!state.consumers.contains_key(identity));
+        drop(state);
+        assert!(!self.deferred_acks.lock().unwrap().contains_key(&identity.0));
+        assert!(self
+            .purpose_debts()
+            .iter()
+            .all(|debt| &debt.request != identity));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_settlement_retries_for_test(
+        &self,
+    ) -> mpsc::UnboundedReceiver<(RequestIdentity, String)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.check_adoptions.lock().unwrap().settlement_retry_probe = Some(tx);
+        rx
+    }
+
     #[cfg(test)]
     pub(crate) fn remove_machine_for_check_adoption_test(&self, executor_id: &str, evidence: &str) {
         self.settle_purpose_debts_for_lost_machine(executor_id, evidence);
@@ -514,6 +590,9 @@ impl Fleet {
                 let mut state = self.check_adoptions.lock().unwrap();
                 state.consumers.insert(identity.clone(), consumers);
                 state.claims.insert(identity.clone(), claim);
+                if let Some(generation) = state.direct.get_mut(identity) {
+                    *generation = Some(selected.generation);
+                }
             }
             Err(error) => log::error!("check_lane_adoptions grant write failed for request {} attempt {}: {error}; this lane is not adoptable", identity.0, identity.1),
         }
@@ -611,11 +690,40 @@ impl Fleet {
         executed
     }
 
+    /// The caller holds the claim-state lock, after committing this exact
+    /// attempt's disposition. Sibling claims keep their request-level fence.
+    fn take_settled_check_acks(
+        &self,
+        state: &CheckAdoptions,
+        identity: &RequestIdentity,
+    ) -> HashSet<(String, String)> {
+        let mut deferred = self.deferred_acks.lock().unwrap();
+        let mut delivered = HashSet::new();
+        if let Some(pending) = deferred.get_mut(&identity.0) {
+            pending.retain(|(attempt, executor)| {
+                if attempt == &identity.1 {
+                    delivered.insert((attempt.clone(), executor.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if state.claims.keys().any(|key| key.0 == identity.0) {
+            deferred.entry(identity.0.clone()).or_default();
+        } else if let Some(pending) = deferred.remove(&identity.0) {
+            // A failed grant can leave a sibling receipt without a claim. Once
+            // the last claim settles, no durable check debt fences that receipt.
+            delivered.extend(pending);
+        }
+        delivered
+    }
+
     /// The caller has already durably recorded loss. End any remaining work
     /// and release any retained result, then let the cadence's one waiter settle.
     pub(crate) fn cancel_adopted(&self, request_id: &str, attempt_id: &str, executor_id: &str) {
         let key = (request_id.to_owned(), attempt_id.to_owned());
-        let (held, waiter, ended) = {
+        let (held, waiter, ended, mut delivered) = {
             let mut state = self.check_adoptions.lock().unwrap();
             let ended = state.received.contains(&key) || state.release_authorized.remove(&key);
             state.claims.remove(&key);
@@ -625,7 +733,13 @@ impl Fleet {
             state.terminal.remove(&key);
             state.accounted.remove(&key);
             state.losing.remove(&key);
-            (state.held.remove(&key), state.waiters.remove(&key), ended)
+            let delivered = self.take_settled_check_acks(&state, &key);
+            (
+                state.held.remove(&key),
+                state.waiters.remove(&key),
+                ended,
+                delivered,
+            )
         };
         if let Some(generation) = self.link_generation(executor_id) {
             let _ = self.send_to(
@@ -638,14 +752,8 @@ impl Fleet {
             );
         }
         if let Some(result) = held {
-            self.send_result_ack(&result.executor_id, request_id, attempt_id);
+            delivered.insert((attempt_id.into(), result.executor_id));
         }
-        let delivered = self
-            .deferred_acks
-            .lock()
-            .unwrap()
-            .remove(request_id)
-            .unwrap_or_default();
         for (attempt, executor) in delivered {
             self.send_result_ack(&executor, request_id, &attempt);
         }
@@ -1143,7 +1251,12 @@ impl Fleet {
         if !complete {
             // An empty coalescing tombstone remains joinable until its leader
             // publishes. Consumer withdrawal alone cannot end its physical claim.
-            if self.check_adoptions.lock().unwrap().terminal.contains(&key) {
+            let ready = {
+                let state = self.check_adoptions.lock().unwrap();
+                state.terminal.contains(&key)
+                    || (state.direct.contains_key(&key) && state.received.contains(&key))
+            };
+            if ready {
                 store::settle_failure(
                     db,
                     &key.0,
@@ -1172,12 +1285,18 @@ impl Fleet {
         .map_err(|e| e.to_string())?;
         let key = (claim.request_id.clone(), claim.attempt_id.clone());
         self.finish_check_claim(&key);
-        drop(self.defer_result_ack(&key.0));
+        let delivered = {
+            let state = self.check_adoptions.lock().unwrap();
+            self.take_settled_check_acks(&state, &key)
+        };
+        for (attempt, executor) in delivered {
+            self.send_result_ack(&executor, &key.0, &attempt);
+        }
         Ok(())
     }
 
     pub(super) fn check_leader_completed(&self, identity: &RequestIdentity) {
-        let (gate, db) = {
+        {
             let mut state = self.check_adoptions.lock().unwrap();
             if !state.claims.contains_key(identity) {
                 state.forget_consumers(identity);
@@ -1186,10 +1305,24 @@ impl Fleet {
             if !state.terminal.insert(identity.clone()) {
                 return;
             }
-            (state.mutation.clone(), state.db.clone())
+        }
+        self.retry_check_settlement(identity);
+    }
+
+    fn retry_check_settlement(&self, identity: &RequestIdentity) {
+        let (gate, db) = {
+            let mut state = self.check_adoptions.lock().unwrap();
+            let Some(db) = state.db.clone() else {
+                return;
+            };
+            if !state.claims.contains_key(identity) || !state.settling.insert(identity.clone()) {
+                return;
+            }
+            (state.mutation.clone(), db)
         };
-        let Some(db) = db else {
-            return;
+        let worker = CheckSettlementWorker {
+            fleet: self.clone(),
+            identity: identity.clone(),
         };
         let fleet = self.clone();
         let identity = identity.clone();
@@ -1200,6 +1333,7 @@ impl Fleet {
         crate::orchestrator::spawn_onto(
             runtime.as_ref(),
             async move {
+                let _worker = worker;
                 loop {
                     let result = async {
                         let _mutation = gate.lock().await;
@@ -1253,6 +1387,7 @@ impl Fleet {
             state.templates.remove(identity);
             state.held.remove(identity);
             state.received.remove(identity);
+            state.direct.remove(identity);
             state.terminal.remove(identity);
             state.reloaded.remove(identity);
             state.accounted.remove(identity);
@@ -1275,7 +1410,15 @@ impl Fleet {
     pub(super) fn protected_check_claims(&self, executor_id: &str) -> HashSet<RequestIdentity> {
         self.check_claims_for_machine(executor_id)
             .into_iter()
-            .filter(|(key, _)| self.adoption_owner(key).is_some())
+            .filter(|(key, _)| {
+                self.adoption_owner(key).is_some()
+                    || self
+                        .check_adoptions
+                        .lock()
+                        .unwrap()
+                        .direct
+                        .contains_key(key)
+            })
             .map(|(key, _)| key)
             .collect()
     }
@@ -1284,10 +1427,35 @@ impl Fleet {
         &self,
         executor_id: &str,
         generation: u64,
+        first_of_connection: bool,
         listed: &HashSet<RequestIdentity>,
         completed: &HashSet<RequestIdentity>,
     ) {
         for (key, claim) in self.check_claims_for_machine(executor_id) {
+            let direct = {
+                let state = self.check_adoptions.lock().unwrap();
+                state
+                    .direct
+                    .get(&key)
+                    .copied()
+                    .flatten()
+                    .map(|granted_generation| (granted_generation, state.received.contains(&key)))
+            };
+            if let Some((granted_generation, received)) = direct {
+                if received {
+                    self.retry_check_settlement(&key);
+                } else if first_of_connection
+                    && generation > granted_generation
+                    && !listed.contains(&key)
+                {
+                    self.authorize_check_release(&key);
+                    self.settle_check_claim(&key, "lost", format!(
+                        "{}'s first report at newer connection generation {generation} omits direct request {} attempt {} granted at generation {granted_generation}, and it resent no result",
+                        claim.machine, key.0, key.1
+                    ), true);
+                }
+                continue;
+            }
             let received = {
                 let state = self.check_adoptions.lock().unwrap();
                 if !state.reloaded.contains(&key) || state.accounted.contains(&key) {
@@ -2995,6 +3163,229 @@ mod tests {
         assert!(orch.fleet.check_claim(&key).is_none());
     }
 
+    #[tokio::test]
+    async fn direct_first_account_requires_newer_omission_without_received_result() {
+        for received in [false, true] {
+            let source = claim("write", "running");
+            let key = identity(&source);
+            let (fleet, db, mut remote) = fixture(source.clone()).await;
+            let generation = fleet.link_generation(&source.executor_id).unwrap();
+            {
+                let mut state = fleet.check_adoptions.lock().unwrap();
+                state.reloaded.remove(&key);
+                state.direct.insert(key.clone(), Some(generation));
+            }
+            let empty = HashSet::new();
+            let listed = HashSet::from([key.clone()]);
+            assert!(fleet
+                .protected_check_claims(&source.executor_id)
+                .contains(&key));
+            fleet.account_check_claims(
+                &source.executor_id,
+                generation.saturating_sub(1),
+                true,
+                &empty,
+                &empty,
+            );
+            fleet.account_check_claims(&source.executor_id, generation, true, &empty, &empty);
+            fleet.account_check_claims(&source.executor_id, generation + 1, false, &empty, &empty);
+            // A retained/listed grant is protected even if completion also appears.
+            fleet.account_check_claims(&source.executor_id, generation + 1, true, &listed, &listed);
+            assert!(fleet.check_claim(&key).is_some());
+            assert!(take_frames(&mut remote).is_empty());
+            if received {
+                let mut sibling = source.clone();
+                sibling.attempt_id = "fresh-attempt".into();
+                let sibling_key = identity(&sibling);
+                let mut consumers = store::waiters(&db, &key.0, &key.1).await.unwrap();
+                for waiter in &mut consumers {
+                    waiter.attempt_id = sibling.attempt_id.clone();
+                }
+                store::insert_grant(&db, &sibling, &consumers)
+                    .await
+                    .unwrap();
+                {
+                    let mut state = fleet.check_adoptions.lock().unwrap();
+                    state.claims.insert(sibling_key.clone(), sibling.clone());
+                    state.consumers.insert(sibling_key.clone(), consumers);
+                    state.direct.insert(sibling_key.clone(), Some(generation));
+                }
+                let mut newest = source.clone();
+                newest.attempt_id = "newest-attempt".into();
+                let newest_key = identity(&newest);
+                let mut consumers = store::waiters(&db, &key.0, &key.1).await.unwrap();
+                for waiter in &mut consumers {
+                    waiter.attempt_id = newest.attempt_id.clone();
+                }
+                store::insert_grant(&db, &newest, &consumers).await.unwrap();
+                {
+                    let mut state = fleet.check_adoptions.lock().unwrap();
+                    state.claims.insert(newest_key.clone(), newest.clone());
+                    state.consumers.insert(newest_key.clone(), consumers);
+                    state.direct.insert(newest_key.clone(), Some(generation));
+                }
+                let gate = fleet.check_adoptions.lock().unwrap().mutation.clone();
+                let mutation = gate.lock().await;
+                // No request marker exists here: the exact live claims must
+                // restore it before either retained Result can be released.
+                assert!(!fleet.deferred_acks.lock().unwrap().contains_key(&key.0));
+                send_result(&fleet, &source);
+                send_result(&fleet, &sibling);
+                send_result(&fleet, &newest);
+                for _ in 0..32 {
+                    fleet.account_check_claims(
+                        &source.executor_id,
+                        generation + 1,
+                        true,
+                        &empty,
+                        &empty,
+                    );
+                }
+                assert_eq!(fleet.check_adoptions.lock().unwrap().settling.len(), 3);
+                assert!(!fleet.check_adoptions.lock().unwrap().losing.contains(&key));
+                assert!(take_frames(&mut remote).is_empty());
+                drop(mutation);
+                fleet
+                    .withdraw_check_consumer(
+                        &key,
+                        "rust-tests",
+                        &source.consumer,
+                        &source.consumer_ref,
+                        "caller ended",
+                    )
+                    .await
+                    .unwrap();
+                let frames = take_frames(&mut remote);
+                let acknowledgements: Vec<_> = frames
+                    .iter()
+                    .filter_map(|frame| match frame {
+                        ExecutorMessage::ResultAck {
+                            request_id,
+                            attempt_id,
+                        } => Some((request_id.clone(), attempt_id.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(acknowledgements, vec![key.clone()]);
+                assert_eq!(
+                    store::lookup(&db, &key.0, &key.1)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "cancelled"
+                );
+                assert_eq!(
+                    store::lookup(&db, &sibling_key.0, &sibling_key.1)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "running"
+                );
+                assert_eq!(
+                    fleet
+                        .deferred_acks
+                        .lock()
+                        .unwrap()
+                        .get(&key.0)
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                // Recorded completion releases only its own attempt too, rather
+                // than stranding it behind a sibling's still-live receipt.
+                record_and_deliver(&fleet, &db, &sibling).await;
+                let acknowledgements: Vec<_> = take_frames(&mut remote)
+                    .into_iter()
+                    .filter_map(|frame| match frame {
+                        ExecutorMessage::ResultAck {
+                            request_id,
+                            attempt_id,
+                        } => Some((request_id, attempt_id)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(acknowledgements, vec![sibling_key.clone()]);
+                assert_eq!(
+                    store::lookup(&db, &sibling_key.0, &sibling_key.1)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "recorded"
+                );
+                // Even a missing marker cannot bypass the remaining live claim.
+                fleet.deferred_acks.lock().unwrap().remove(&key.0);
+                send_result(&fleet, &newest);
+                let unclaimed_key = (key.0.clone(), "unpersisted-grant".to_owned());
+                fleet.acknowledge_settled_result(&source.executor_id, &unclaimed_key);
+                assert!(take_frames(&mut remote).is_empty());
+                fleet
+                    .withdraw_check_consumer(
+                        &newest_key,
+                        "rust-tests",
+                        &newest.consumer,
+                        &newest.consumer_ref,
+                        "newest caller ended",
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    store::lookup(&db, &newest_key.0, &newest_key.1)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "cancelled"
+                );
+                let acknowledgements: Vec<_> = take_frames(&mut remote)
+                    .into_iter()
+                    .filter_map(|frame| match frame {
+                        ExecutorMessage::ResultAck {
+                            request_id,
+                            attempt_id,
+                        } => Some((request_id, attempt_id)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    acknowledgements.into_iter().collect::<HashSet<_>>(),
+                    HashSet::from([newest_key.clone(), unclaimed_key])
+                );
+                fleet.assert_check_settlement_drained_for_test(&key);
+                fleet.assert_check_settlement_drained_for_test(&sibling_key);
+                fleet.assert_check_settlement_drained_for_test(&newest_key);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !fleet.check_adoptions.lock().unwrap().settling.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                fleet.account_check_claims(
+                    &source.executor_id,
+                    generation + 1,
+                    true,
+                    &empty,
+                    &empty,
+                );
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while fleet.check_claim(&key).is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let settled = store::lookup(&db, &key.0, &key.1).await.unwrap().unwrap();
+                assert_eq!(settled.state, "lost");
+                assert!(settled.evidence.unwrap().contains("newer connection"));
+                assert!(store::open(&db).await.unwrap().is_empty());
+            }
+        }
+    }
+
     #[test]
     fn terminal_undurable_check_attempts_do_not_accumulate_consumer_metadata() {
         let fleet = Fleet::default();
@@ -3003,6 +3394,7 @@ mod tests {
             source.request_id = format!("undurable-{index}");
             let key = identity(&source);
             fleet.register_check_claim(key.clone(), source.clone());
+            fleet.register_direct_check(key.clone());
             let guard = fleet.check_consumer_guard_for(&key, "rust-tests", &source);
             fleet.track_check_consumer(
                 ("subscriber".into(), index.to_string()),
@@ -3021,6 +3413,7 @@ mod tests {
         assert!(state.consumer_guards.is_empty());
         assert!(state.subscriber_consumers.is_empty());
         assert!(state.terminal.is_empty());
+        assert!(state.direct.is_empty());
     }
 
     #[test]
