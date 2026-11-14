@@ -281,6 +281,8 @@ fn mcp_input_value(stored: &str) -> serde_json::Value {
         StoredAnswer::Answers(answers) => {
             return serde_json::to_value(answers.answers()).unwrap_or_default()
         }
+        // Never written for an MCP-owned question, which only an answer resolves.
+        StoredAnswer::Closed(closure) => return serde_json::Value::String(closure.render()),
         StoredAnswer::Legacy(text) => text,
     };
     serde_json::from_str(&answer).unwrap_or(serde_json::Value::String(answer))

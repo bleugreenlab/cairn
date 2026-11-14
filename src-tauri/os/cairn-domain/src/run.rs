@@ -219,6 +219,11 @@ pub struct Prompt {
     pub answered_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolution: Option<ResolutionReceipt>,
+    /// The waiting `write` call a blocking ask's answer is the result of;
+    /// `None` for a non-blocking ask. The transcript keys the in-flight
+    /// question card by it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_use_id: Option<String>,
 }
 
 /// A permission request awaiting user approval

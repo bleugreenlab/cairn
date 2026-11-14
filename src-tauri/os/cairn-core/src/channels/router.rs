@@ -2355,12 +2355,12 @@ impl ChannelRouter {
             let mut question_receipt = None;
             let result = if kind == "question" {
                 match stored_prompt_answers(&self.orch, &action_ref, &answers[0].1).await {
-                    Ok((rendered, prompt_answers)) => {
+                    Ok((rendered, resolution)) => {
                         question_receipt = Some(rendered);
-                        crate::mcp::handlers::planning::answer_prompt_id_domain(
+                        crate::mcp::handlers::planning::resolve_prompt_domain(
                             &self.orch,
                             &action_ref,
-                            prompt_answers,
+                            resolution,
                             winner.resolution_provenance()?,
                         )
                         .await
@@ -4504,18 +4504,18 @@ async fn prompt_questions(
     Err(format!("prompt not found: {prompt_id}"))
 }
 
-/// A claimed winner read back for its domain action: the answers it stored and
-/// their rendering. A winner claimed before answers were stored by index is
+/// A claimed winner read back for its domain action: the resolution it stored
+/// and its rendering. A winner claimed before answers were stored by index is
 /// legacy typed text and goes back through the typed-input parser.
 async fn stored_prompt_answers(
     orch: &Orchestrator,
     prompt_id: &str,
     stored: &str,
-) -> Result<(String, crate::models::question::PromptAnswers), String> {
+) -> Result<(String, crate::models::question::PromptResolution), String> {
     let questions = prompt_questions(orch, prompt_id).await?;
-    let answers = crate::models::question::PromptAnswers::decode_stored(stored)
-        .into_answers(questions.len())?;
-    Ok((answers.render(&questions), answers))
+    let resolution = crate::models::question::PromptAnswers::decode_stored(stored)
+        .into_resolution(questions.len())?;
+    Ok((resolution.render(&questions), resolution))
 }
 
 /// The prompt's answers once one conversation has staged a reply to every
@@ -4553,6 +4553,7 @@ fn question_message_answer(kind: &str, binding_ref: &str, stored: &str) -> Strin
             .get(index)
             .map(|answer| answer.answer.clone())
             .unwrap_or_else(|| stored.to_string()),
+        (_, crate::models::question::StoredAnswer::Closed(closure)) => closure.render(),
         _ => stored.to_string(),
     }
 }

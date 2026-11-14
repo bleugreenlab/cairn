@@ -82,9 +82,9 @@ fn read_task_rows<'s, T: Send + 'static>(
 use cairn_common::query::QueryParam;
 use cairn_uri::{
     build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri, build_node_checks_uri,
-    build_node_permission_uri, build_node_question_uri, build_node_uri, build_node_wakes_uri,
-    build_task_artifact_uri, build_task_artifact_uri_named, build_task_chat_uri,
-    build_task_checks_uri, build_task_permission_uri,
+    build_node_permission_uri, build_node_uri, build_node_wakes_uri, build_task_artifact_uri,
+    build_task_artifact_uri_named, build_task_chat_uri, build_task_checks_uri,
+    build_task_permission_uri,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1339,28 +1339,112 @@ fn summarize_questions_json(questions_json: &str) -> String {
 
 struct NodeQuestionRow {
     prompt_id: String,
+    run_id: String,
     segment: String,
+    /// The question's canonical URI, when its asker's home has one.
+    uri: Option<String>,
     questions_json: String,
     response: Option<String>,
     answered: bool,
+    answered_at: Option<i64>,
+    created_at: i64,
+    background: bool,
+    context: Option<String>,
+    /// Waiting on the operator, by [`cairn_db::pending_question_sql!`].
+    pending: bool,
     resolution: Option<cairn_db::models::ResolutionReceipt>,
     /// `Some` when withdrawn, holding the stored cause if there is one.
     withdrawn: Option<Option<String>>,
     /// Why the answer did not resume the job, when it did not.
     resume_error: Option<String>,
+    /// The newest `moot_when`: its clauses, and how it fired if it did.
+    condition: Option<QuestionCondition>,
+}
+
+struct QuestionCondition {
+    until_json: String,
+    fired_kind: Option<String>,
+    fired_reason: Option<String>,
+}
+
+impl QuestionCondition {
+    fn rendered(&self) -> String {
+        let clauses = crate::execution::approvals::parse_until(&self.until_json);
+        crate::execution::approvals::render_until(
+            &crate::execution::gates::authoring::gate_vocabulary(),
+            &clauses,
+        )
+    }
+
+    fn state(&self) -> &str {
+        self.fired_kind.as_deref().unwrap_or("open")
+    }
+}
+
+/// Every state a question can be in, for `?state=`.
+const QUESTION_STATES: [&str; 6] = ["open", "lapsed", "answered", "handled", "moot", "withdrawn"];
+
+/// Seconds since the epoch from a stored instant. An MCP input request's
+/// answer stamps `answered_at` in milliseconds, every other path in seconds.
+fn epoch_seconds(at: i64) -> i64 {
+    if at > 100_000_000_000 {
+        at / 1000
+    } else {
+        at
+    }
 }
 
 impl NodeQuestionRow {
-    /// Where the question stands. A string rather than a flag, so states
-    /// beyond pending, answered and withdrawn have somewhere to go.
+    fn stored(&self) -> Option<crate::models::question::StoredAnswer> {
+        self.response
+            .as_deref()
+            .filter(|response| !response.is_empty())
+            .map(crate::models::question::PromptAnswers::decode_stored)
+    }
+
+    fn questions(&self) -> Vec<crate::models::question::Question> {
+        serde_json::from_str(&self.questions_json).unwrap_or_default()
+    }
+
+    /// Where the question stands: `open` while it waits on the operator,
+    /// `lapsed` when it is unresolved but no longer does (a blocking ask whose
+    /// turn or job ended), then `answered`, `handled`, `moot` or `withdrawn`.
     fn state(&self) -> &'static str {
         if self.answered {
-            "answered"
+            self.stored().map_or("answered", |stored| stored.form())
         } else if self.withdrawn.is_some() {
             "withdrawn"
+        } else if self.pending {
+            "open"
         } else {
-            "pending"
+            "lapsed"
         }
+    }
+
+    fn unresolved(&self) -> bool {
+        matches!(self.state(), "open" | "lapsed")
+    }
+
+    fn mode(&self) -> &'static str {
+        if self.background {
+            "non-blocking"
+        } else {
+            "blocking"
+        }
+    }
+
+    /// The `closes when` clause while its condition is open on an open question.
+    fn closes_when(&self) -> Option<String> {
+        self.condition
+            .as_ref()
+            .filter(|condition| condition.fired_kind.is_none() && self.unresolved())
+            .map(QuestionCondition::rendered)
+    }
+
+    fn address(&self) -> String {
+        self.uri
+            .clone()
+            .unwrap_or_else(|| format!("cairn:~/questions/{}", self.segment))
     }
 }
 
@@ -1368,23 +1452,38 @@ async fn load_node_questions(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
 ) -> Vec<NodeQuestionRow> {
+    let home = crate::jobs::queries::home_uri_for_job_conn(conn, job_id)
+        .await
+        .ok()
+        .flatten();
     let mut questions = Vec::new();
-    if let Ok(mut rows) = conn
-        .query(
-            "
+    let sql = format!(
+        "
             SELECT p.uri_segment, p.questions, p.response, p.answered_at,
                    p.resolution_id, p.resolution_surface, p.resolution_provider,
                    p.resolution_conversation, p.resolution_actor, p.created_at,
-                   p.withdrawn_at, p.withdrawn_cause, p.resume_error, p.id
+                   p.withdrawn_at, p.withdrawn_cause, p.resume_error, p.id,
+                   p.background, p.context, {pending},
+                   (SELECT c.until_json FROM ask_conditions c
+                     WHERE c.ask_kind = 'question' AND c.ask_id = p.id
+                     ORDER BY c.created_at DESC LIMIT 1),
+                   (SELECT c.fired_kind FROM ask_conditions c
+                     WHERE c.ask_kind = 'question' AND c.ask_id = p.id
+                     ORDER BY c.created_at DESC LIMIT 1),
+                   (SELECT c.fired_reason FROM ask_conditions c
+                     WHERE c.ask_kind = 'question' AND c.ask_id = p.id
+                     ORDER BY c.created_at DESC LIMIT 1),
+                   p.run_id
             FROM prompts p
             JOIN runs r ON p.run_id = r.id
+            JOIN jobs j ON j.id = COALESCE(p.job_id, r.job_id)
+            LEFT JOIN turns pt ON pt.id = p.turn_id
             WHERE r.job_id = ?1
             ORDER BY p.created_at ASC, p.id ASC
             ",
-            (job_id,),
-        )
-        .await
-    {
+        pending = cairn_db::pending_question_sql!()
+    );
+    if let Ok(mut rows) = conn.query(&sql, (job_id,)).await {
         let mut fallback_ordinal = 0;
         while let Ok(Some(row)) = rows.next().await {
             let (Ok(segment), Ok(questions_json), Ok(response), Ok(answered_at)) = (
@@ -1396,12 +1495,23 @@ async fn load_node_questions(
                 continue;
             };
             fallback_ordinal += 1;
+            let segment = segment.unwrap_or_else(|| format!("q-{}", fallback_ordinal));
+            let uri = home.as_deref().and_then(|home| {
+                crate::mcp::handlers::planning::question_uri_under_home(home, &segment)
+            });
             questions.push(NodeQuestionRow {
                 prompt_id: row.text(13).unwrap_or_default(),
-                segment: segment.unwrap_or_else(|| format!("q-{}", fallback_ordinal)),
+                run_id: row.text(20).unwrap_or_default(),
+                segment,
+                uri,
                 questions_json,
                 response,
                 answered: answered_at.is_some(),
+                answered_at: answered_at.map(epoch_seconds),
+                created_at: row.i64(9).unwrap_or_default(),
+                background: row.opt_i64(14).ok().flatten().unwrap_or(0) != 0,
+                context: row.opt_text(15).ok().flatten(),
+                pending: row.opt_i64(16).ok().flatten().unwrap_or(0) != 0,
                 resolution: row.opt_text(5).ok().flatten().map(|surface| {
                     cairn_db::models::ResolutionReceipt {
                         id: row.opt_text(4).ok().flatten(),
@@ -1418,10 +1528,174 @@ async fn load_node_questions(
                     .flatten()
                     .map(|_| row.opt_text(11).ok().flatten()),
                 resume_error: row.opt_text(12).ok().flatten(),
+                condition: row
+                    .opt_text(17)
+                    .ok()
+                    .flatten()
+                    .map(|until_json| QuestionCondition {
+                        until_json,
+                        fired_kind: row.opt_text(18).ok().flatten(),
+                        fired_reason: row.opt_text(19).ok().flatten(),
+                    }),
             });
         }
     }
     questions
+}
+
+/// How a caller names one question: its canonical URI, or its prompt id.
+pub(crate) enum QuestionRef<'a> {
+    Uri(&'a str),
+    Prompt(&'a str),
+}
+
+/// One question as the operator's surfaces render it (the `get_question`
+/// invoke): the same rows the question resource reads, as JSON.
+pub(crate) async fn question_view(
+    orch: &crate::orchestrator::Orchestrator,
+    reference: QuestionRef<'_>,
+) -> Result<serde_json::Value, String> {
+    let question = match reference {
+        QuestionRef::Uri(uri) => {
+            let resource = cairn_uri::parse_uri(uri)
+                .and_then(|resource| cairn_uri::delegate_thread_descendant(resource).ok());
+            let Some(cairn_uri::CairnResource::NodeQuestion {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                segment,
+            }) = resource
+            else {
+                return Err(format!("{uri} is not a question's URI"));
+            };
+            let db = orch.db.for_project(&project).await;
+            let read = read_node_rows(&db, &project, number, exec_seq, &node_id, |conn, job| {
+                Box::pin(async move { load_node_questions(conn, &job.id).await })
+            });
+            let (_, questions) = read.await?;
+            questions.into_iter().find(|q| q.segment == segment)
+        }
+        QuestionRef::Prompt(prompt_id) => {
+            let db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let prompt = prompt_id.to_string();
+            db.read(move |conn| {
+                let prompt = prompt.clone();
+                Box::pin(async move {
+                    let job = crate::storage::query_opt_text_conn(
+                        conn,
+                        "SELECT r.job_id FROM prompts p JOIN runs r ON r.id = p.run_id WHERE p.id = ?1",
+                        cairn_db::turso::params![prompt.as_str()],
+                    )
+                    .await?;
+                    Ok(match job {
+                        Some(job) => load_node_questions(conn, &job)
+                            .await
+                            .into_iter()
+                            .find(|q| q.prompt_id == prompt),
+                        None => None,
+                    })
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+    };
+    let question = question.ok_or_else(|| "question not found".to_string())?;
+    Ok(question.view())
+}
+
+impl NodeQuestionRow {
+    fn view(&self) -> serde_json::Value {
+        let questions = self.questions();
+        let resolution = self.stored().map(|stored| {
+            let mut resolution = serde_json::json!({
+                "form": stored.form(),
+                "rendered": stored.render(&questions),
+                "at": self.answered_at,
+            });
+            match &stored {
+                crate::models::question::StoredAnswer::Closed(closure) => {
+                    resolution["note"] = serde_json::json!(closure.note());
+                    resolution["by"] = match closure.condition() {
+                        Some(condition) => serde_json::json!({ "condition": condition }),
+                        None => self.receipt_view(),
+                    };
+                }
+                crate::models::question::StoredAnswer::Answers(answers) => {
+                    resolution["answers"] = serde_json::json!(answers.answers());
+                    resolution["by"] = self.receipt_view();
+                }
+                crate::models::question::StoredAnswer::Legacy(_) => {
+                    resolution["by"] = self.receipt_view();
+                }
+            }
+            resolution
+        });
+        serde_json::json!({
+            "promptId": self.prompt_id,
+            "runId": self.run_id,
+            "uri": self.uri,
+            "segment": self.segment,
+            "blocking": !self.background,
+            "questions": questions,
+            "context": self.context,
+            "createdAt": self.created_at,
+            "state": self.state(),
+            "resolution": resolution,
+            "withdrawnCause": self.withdrawn.clone().flatten(),
+            "withdrawnReason": self.withdrawn.as_ref().map(|cause| {
+                cause
+                    .as_deref()
+                    .and_then(|cause| {
+                        serde_json::from_value::<crate::mcp::handlers::permission::WithdrawalCause>(
+                            serde_json::Value::String(cause.to_string()),
+                        )
+                        .ok()
+                    })
+                    .map(|cause| cause.sentence())
+                    .unwrap_or("its recorded cause could not be read")
+            }),
+            "mootWhen": self.condition.as_ref().map(|condition| serde_json::json!({
+                "clauses": condition.rendered(),
+                "state": condition.state(),
+                "reason": condition.fired_reason,
+            })),
+        })
+    }
+
+    fn receipt_view(&self) -> serde_json::Value {
+        match &self.resolution {
+            Some(receipt) => serde_json::json!({
+                "surface": receipt.surface,
+                "actor": receipt.actor,
+            }),
+            None => serde_json::Value::Null,
+        }
+    }
+}
+
+/// The `?state=` a questions listing was filtered to, refusing anything else.
+fn question_state_filter(params: &[QueryParam]) -> Result<Option<String>, String> {
+    if let Some(other) = params.iter().find(|param| param.key != "state") {
+        return Err(format!(
+            "Query parameter {} is not supported on node questions resources; the one filter is state",
+            other.key
+        ));
+    }
+    match params.iter().rev().find(|param| param.key == "state") {
+        None => Ok(None),
+        Some(param) if QUESTION_STATES.contains(&param.value.as_str()) => {
+            Ok(Some(param.value.clone()))
+        }
+        Some(param) => Err(format!(
+            "state={} is not a question state; one of {}",
+            param.value,
+            QUESTION_STATES.join(", ")
+        )),
+    }
 }
 
 pub(super) async fn read_node_questions(
@@ -1430,37 +1704,68 @@ pub(super) async fn read_node_questions(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    params: &[QueryParam],
 ) -> String {
+    let state = match question_state_filter(params) {
+        Ok(state) => state,
+        Err(error) => return error,
+    };
     let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
         Box::pin(async move { load_node_questions(conn, &job.id).await })
     });
-    let questions = match read.await {
+    let mut questions = match read.await {
         Ok((_, questions)) => questions,
         Err(error) => return error,
     };
+    let total = questions.len();
+    questions.retain(|question| {
+        state
+            .as_deref()
+            .is_none_or(|state| question.state() == state)
+    });
+    questions.reverse();
+    let now = chrono::Utc::now().timestamp();
 
     let mut output = format!("# Questions — {}\n\n", node_name);
-    if questions.is_empty() {
+    if total == 0 {
         output.push_str("No questions asked yet.\n\n");
+    } else if questions.is_empty() {
+        output.push_str(&format!(
+            "No {} questions ({total} in all).\n\n",
+            state.as_deref().unwrap_or_default()
+        ));
     } else {
-        output.push_str(&format!("{} question(s)\n\n", questions.len()));
+        match state.as_deref() {
+            Some(state) => output.push_str(&format!(
+                "{} {state} question(s) of {total}, newest first\n\n",
+                questions.len()
+            )),
+            None => output.push_str(&format!("{total} question(s), newest first\n\n")),
+        }
         for question in &questions {
-            let icon = if question.answered { "✓" } else { "⏳" };
-            output.push_str(&format!(
-                "- [{}]({}) [{}] {}\n",
+            let mut line = format!(
+                "- [{}]({}) · {} · {} · {} · asked {} ago",
                 question.segment,
-                build_node_question_uri(
-                    project_key,
-                    number,
-                    exec_seq,
-                    node_name,
-                    &question.segment
-                ),
-                icon,
+                question.address(),
+                question.state(),
+                question.mode(),
                 summarize_questions_json(&question.questions_json),
-            ));
-            if let Some(response) = question.response.as_deref().filter(|r| !r.is_empty()) {
-                let answer = displayed_answer(&question.questions_json, response);
+                crate::clock::format_elapsed(now.saturating_sub(question.created_at).max(0)),
+            );
+            if let Some(at) = question.answered_at {
+                line.push_str(&format!(
+                    " · {} {} ago",
+                    question.state(),
+                    crate::clock::format_elapsed(now.saturating_sub(at).max(0))
+                ));
+            }
+            if let Some(closes) = question.closes_when() {
+                line.push_str(&format!(" · closes when {closes}"));
+            }
+            output.push_str(&line);
+            output.push('\n');
+            if let Some(stored) = question.stored() {
+                let answer = stored.render(&question.questions());
                 output.push_str(&format!("  → {}\n", answer.replace('\n', "\n    ")));
             }
             if let Some(receipt) = &question.resolution {
@@ -1496,38 +1801,102 @@ pub(super) async fn read_node_question(
             segment, node_name, project_key, number
         );
     };
+    let now = chrono::Utc::now().timestamp();
 
     let mut output = format!("# Question {} — {}\n\n", segment, node_name);
-    output.push_str(&format!("Status: {}\n\n", question.state()));
+    output.push_str(&format!(
+        "Status: {} · {}\n",
+        question.state(),
+        question.mode()
+    ));
+    output.push_str(&format!(
+        "Asked: {} ago\n",
+        crate::clock::format_elapsed(now.saturating_sub(question.created_at).max(0))
+    ));
+    if let Some(uri) = question.uri.as_deref() {
+        output.push_str(&format!("URI: {uri}\n"));
+    }
+    output.push('\n');
 
-    if let Ok(serde_json::Value::Array(items)) =
-        serde_json::from_str::<serde_json::Value>(&question.questions_json)
-    {
-        for item in &items {
-            if let Some(text) = item.get("question").and_then(|value| value.as_str()) {
-                output.push_str(&format!("## {}\n\n", text));
+    for item in question.questions() {
+        output.push_str(&format!("## {}\n\n", item.question));
+        if !item.options.is_empty() {
+            for option in &item.options {
+                let recommended = if option.recommended {
+                    " (recommended)"
+                } else {
+                    ""
+                };
+                output.push_str(&format!(
+                    "- **{}**{recommended}: {}\n",
+                    option.label, option.description
+                ));
             }
-            if let Some(options) = item.get("options").and_then(|value| value.as_array()) {
-                for option in options {
-                    if let Some(label) = option.get("label").and_then(|value| value.as_str()) {
-                        let description = option
-                            .get("description")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or_default();
-                        output.push_str(&format!("- **{}**: {}\n", label, description));
-                    }
-                }
-                output.push('\n');
-            }
+            output.push('\n');
         }
     }
 
-    match question.response.as_deref().filter(|r| !r.is_empty()) {
-        Some(response) => output.push_str(&format!(
-            "## Response\n\n{}\n\n",
-            displayed_answer(&question.questions_json, response)
-        )),
-        None => output.push_str("## Response\n\n(awaiting answer)\n\n"),
+    if let Some(context) = question.context.as_deref() {
+        output.push_str(&format!("## Context\n\n{context}\n\n"));
+    }
+    if let Some(condition) = question.condition.as_ref() {
+        let standing = match (condition.state(), condition.fired_reason.as_deref()) {
+            ("open", _) => {
+                "open: the question closes itself as moot when this comes true".to_string()
+            }
+            (state, Some(reason)) => format!("{state}: {reason}"),
+            (state, None) => state.to_string(),
+        };
+        output.push_str(&format!(
+            "## Closes when\n\n{} ({standing})\n\n",
+            condition.rendered()
+        ));
+    }
+
+    match question.stored() {
+        Some(stored) => {
+            output.push_str(&format!(
+                "## Response\n\n{}\n\n",
+                stored.render(&question.questions())
+            ));
+            let by = match (&stored, &question.resolution) {
+                (crate::models::question::StoredAnswer::Closed(closure), _)
+                    if closure.condition().is_some() =>
+                {
+                    Some("Resolved by its moot_when condition".to_string())
+                }
+                (_, Some(receipt)) => Some(format_resolution_receipt(receipt)),
+                _ => None,
+            };
+            if let Some(by) = by {
+                let when = question
+                    .answered_at
+                    .map(|at| {
+                        format!(
+                            ", {} ago",
+                            crate::clock::format_elapsed(now.saturating_sub(at).max(0))
+                        )
+                    })
+                    .unwrap_or_default();
+                output.push_str(&format!("{by}{when}\n\n"));
+            }
+        }
+        None => match &question.withdrawn {
+            Some(cause) => {
+                let sentence = cause
+                    .as_deref()
+                    .and_then(|cause| {
+                        serde_json::from_value::<crate::mcp::handlers::permission::WithdrawalCause>(
+                            serde_json::Value::String(cause.to_string()),
+                        )
+                        .ok()
+                    })
+                    .map(|cause| cause.sentence())
+                    .unwrap_or("its recorded cause could not be read");
+                output.push_str(&format!("## Response\n\n(withdrawn: {sentence})\n\n"));
+            }
+            None => output.push_str("## Response\n\n(awaiting answer)\n\n"),
+        },
     }
     if let Some(line) = resume_refusal_line(question.resume_error.as_deref()) {
         output.push_str(&format!("## Resume\n\n{line}\n\n"));
@@ -1536,8 +1905,11 @@ pub(super) async fn read_node_question(
     output
 }
 
-/// Block until a question is no longer pending, then return where it stands
-/// as one line of JSON: `{"state":"answered","answers":[{index,answer}],"text"}`,
+/// Block until a question is resolved or withdrawn, then return where it
+/// stands as one line of JSON:
+/// `{"state":"answered","answers":[{index,answer}],"text"}`,
+/// `{"state":"handled","note"?,"text"}`,
+/// `{"state":"moot","note"?,"condition"?,"text"}`,
 /// `{"state":"withdrawn","cause"}`, or, when the long-poll budget runs out
 /// first, `{"state":"pending"}` (the caller reads again). The script-facing
 /// await behind the harness `ask()`, as [`wait_for_task_artifact`] is behind
@@ -1553,7 +1925,7 @@ pub(super) async fn wait_for_question(
     segment: &str,
     reader_run_id: Option<&str>,
 ) -> String {
-    // Answers are broadcast; a withdrawal is not, so the wait also re-reads
+    // Resolutions are broadcast; a withdrawal is not, so the wait also re-reads
     // on a short tick.
     const TICK: std::time::Duration = std::time::Duration::from_secs(5);
     let mut rx = orch.prompt_responses.subscribe();
@@ -1576,7 +1948,7 @@ pub(super) async fn wait_for_question(
             .to_string();
         };
         match question.state() {
-            "pending" => {}
+            "open" | "lapsed" => {}
             "withdrawn" => {
                 return serde_json::json!({
                     "state": "withdrawn",
@@ -1596,17 +1968,31 @@ pub(super) async fn wait_for_question(
                         log::warn!("{error}; the answer may also arrive at a tool boundary");
                     }
                 }
-                let response = question.response.unwrap_or_default();
-                let questions: Vec<crate::models::question::Question> =
-                    serde_json::from_str(&question.questions_json).unwrap_or_default();
-                let stored = crate::models::question::PromptAnswers::decode_stored(&response);
+                let questions = question.questions();
+                let Some(stored) = question.stored() else {
+                    return serde_json::json!({ "state": state, "text": "" }).to_string();
+                };
                 let text = stored.render(&questions);
-                let answers = stored
-                    .into_answers(questions.len())
-                    .map(|answers| answers.into_answers())
-                    .unwrap_or_default();
-                return serde_json::json!({ "state": state, "answers": answers, "text": text })
-                    .to_string();
+                return match stored {
+                    crate::models::question::StoredAnswer::Closed(closure) => {
+                        let mut body = serde_json::json!({ "state": state, "text": text });
+                        if let Some(note) = closure.note() {
+                            body["note"] = serde_json::json!(note);
+                        }
+                        if let Some(condition) = closure.condition() {
+                            body["condition"] = serde_json::json!(condition);
+                        }
+                        body.to_string()
+                    }
+                    stored => {
+                        let answers = stored
+                            .into_answers(questions.len())
+                            .map(|answers| answers.into_answers())
+                            .unwrap_or_default();
+                        serde_json::json!({ "state": state, "answers": answers, "text": text })
+                            .to_string()
+                    }
+                };
             }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1619,14 +2005,6 @@ pub(super) async fn wait_for_question(
             tokio::time::sleep(remaining.min(TICK)).await
         }
     }
-}
-
-/// A stored answer as a reader sees it: indexed answers rendered against the
-/// prompt's questions, an answer stored before answers were indexed verbatim.
-fn displayed_answer(questions_json: &str, response: &str) -> String {
-    let questions: Vec<crate::models::question::Question> =
-        serde_json::from_str(questions_json).unwrap_or_default();
-    crate::models::question::PromptAnswers::decode_stored(response).render(&questions)
 }
 
 struct NodePermissionRow {
@@ -3993,7 +4371,7 @@ mod task_permission_tests {
             db.execute(sql, ()).await.unwrap();
         }
 
-        let list = read_node_questions(&db, "prj", 2, 1, "builder").await;
+        let list = read_node_questions(&db, "prj", 2, 1, "builder", &[]).await;
         assert!(
             list.contains("answered, but the resume was refused: session closed"),
             "{list}"

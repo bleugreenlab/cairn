@@ -351,7 +351,10 @@ async fn answer_with_a_foreign_successor_queues_and_reports_applied() {
         .unwrap()
         .expect("one queued message keyed by the prompt");
     assert!(
-        queued.starts_with("Your question q-1 was answered:") && queued.contains("Option A"),
+        queued.starts_with("Your question cairn://")
+            && queued.contains("/questions/q-1 (")
+            && queued.contains(") was answered:")
+            && queued.contains("Option A"),
         "{queued}"
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM queued_messages").await, 1);
@@ -715,8 +718,16 @@ async fn answers_at_boundary(orch: &Orchestrator) -> usize {
     output
         .reminders
         .iter()
-        .filter(|reminder| reminder.contains("Your question q-1 was answered:"))
+        .filter(|reminder| is_framed_answer(reminder))
         .count()
+}
+
+/// The answer as the asker reads it: the question's URI and first line, then
+/// the answer.
+fn is_framed_answer(text: &str) -> bool {
+    text.contains("Your question cairn://")
+        && text.contains("/questions/q-1 (")
+        && text.contains(") was answered:")
 }
 
 async fn pending_answer_rows(db: &LocalDb) -> i64 {
@@ -766,7 +777,7 @@ async fn an_answer_to_an_open_turn_reaches_its_next_tool_boundary_once() {
     let carried: Vec<_> = output
         .reminders
         .iter()
-        .filter(|reminder| reminder.contains("Your question q-1 was answered:"))
+        .filter(|reminder| is_framed_answer(reminder))
         .collect();
     assert_eq!(
         carried.len(),
@@ -872,7 +883,7 @@ async fn a_wait_read_by_the_asking_job_takes_the_boundary_delivery() {
     assert!(
         !own.reminders
             .iter()
-            .any(|reminder| reminder.contains("Your question q-1 was answered:")),
+            .any(|reminder| is_framed_answer(reminder)),
         "the same call's boundary does not repeat it: {:?}",
         own.reminders
     );
@@ -985,7 +996,7 @@ async fn an_answer_outlives_a_turn_that_ends_before_its_next_tool_boundary() {
 
     assert_eq!(
         delivered_text(&delivered)
-            .matches("Your question q-1 was answered:")
+            .matches(") was answered:")
             .count(),
         1,
         "the resume delivers the framed answer once: {}",

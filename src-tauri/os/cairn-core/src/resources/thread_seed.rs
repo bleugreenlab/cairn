@@ -224,7 +224,11 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let camps = camp_lines(db, thread_id.as_deref(), &coordinates.project_key).await;
     // The thread's own store is a second database, opened and counted after
     // every main read has released.
-    let store = format!("{camps}{}", thread_store_census(thread_id, now).await);
+    let store = format!(
+        "{camps}{}{}",
+        thread_store_census(thread_id, now).await,
+        open_questions_census(db, job_id, &coordinates.base_uri, now).await
+    );
     let chat_uri = format!("{}/chat", coordinates.base_uri);
 
     let marks = compaction::unconsumed_marks(db, job_id, &source_session_id)
@@ -2215,15 +2219,124 @@ const CHILD_PRS_SQL: &str = "SELECT child.id, m.github_pr_number, m.status
         AND m.github_pr_number > 0
       ORDER BY m.opened_at ASC";
 
-const CHILD_QUESTIONS_SQL: &str = "SELECT child.id, COUNT(*)
+const CHILD_QUESTIONS_SQL: &str = concat!(
+    "SELECT child.id, COUNT(*)
        FROM issues child INDEXED BY idx_issues_parent_thread_id
        JOIN runs r INDEXED BY idx_runs_issue_id ON r.issue_id = child.id
        JOIN prompts p INDEXED BY idx_prompts_run_id ON p.run_id = r.id
+       JOIN jobs j ON j.id = COALESCE(p.job_id, r.job_id)
+       LEFT JOIN turns pt ON pt.id = p.turn_id
       WHERE child.parent_thread_id = ?1
         AND child.status NOT IN ('merged', 'closed')
         AND p.answered_at IS NULL
-        AND p.withdrawn_at IS NULL
-      GROUP BY child.id";
+        AND ",
+    cairn_db::pending_question_sql!(),
+    "
+      GROUP BY child.id"
+);
+
+/// The thread's own questions still waiting on the operator, newest first,
+/// with the open `moot_when` of each.
+///
+/// Scoped to the session job on purpose. A thread question's address,
+/// `cairn://p/P/<thread>/questions/q-N`, resolves through the thread's one
+/// session job, and segments are numbered per job, so a question on any other
+/// job would be listed under an address that names a different question. A
+/// rebuild or compaction opens a new session and run on the same job, which
+/// this reads through.
+const OWN_OPEN_QUESTIONS_SQL: &str = concat!(
+    "SELECT p.uri_segment, p.questions, p.created_at, p.background,
+            (SELECT c.until_json FROM ask_conditions c
+              WHERE c.ask_kind = 'question' AND c.ask_id = p.id AND c.fired_at IS NULL)
+       FROM runs r
+       JOIN prompts p ON p.run_id = r.id
+       JOIN jobs j ON j.id = COALESCE(p.job_id, r.job_id)
+       LEFT JOIN turns pt ON pt.id = p.turn_id
+      WHERE r.job_id = ?1 AND ",
+    cairn_db::pending_question_sql!(),
+    "
+      ORDER BY p.created_at DESC, p.id DESC"
+);
+
+/// How many open questions the seed lists before pointing at the rest.
+const OPEN_QUESTIONS_CAP: usize = 10;
+
+/// The seed's `## Questions awaiting the operator` census: each question the
+/// thread asked that still waits on the operator, by URI, one line and age,
+/// so a rebuilt session knows the address without restating the content.
+/// Named apart from the journal's open questions, which are things the thread
+/// itself holds open. Generated from live state, never authored; empty when
+/// there are none.
+async fn open_questions_census(db: &LocalDb, job_id: &str, base_uri: &str, now: i64) -> String {
+    let rows: Vec<_> = db
+        .query_all(OWN_OPEN_QUESTIONS_SQL, (job_id.to_string(),), |row| {
+            Ok((
+                row.opt_text(0)?,
+                row.text(1)?,
+                row.i64(2)?,
+                row.i64(3)? != 0,
+                row.opt_text(4)?,
+            ))
+        })
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("failed to read a thread's open questions for its seed: {error}");
+            Vec::new()
+        })
+        .into_iter()
+        .filter_map(|(segment, questions, created_at, background, until)| {
+            // A row with no segment has no address to point at; listing one
+            // would hand the reader a URI that resolves to nothing.
+            let Some(uri) = segment.as_deref().and_then(|segment| {
+                crate::mcp::handlers::planning::question_uri_under_home(base_uri, segment)
+            }) else {
+                log::warn!("an open question of thread job {job_id} has no addressable segment");
+                return None;
+            };
+            Some((uri, questions, created_at, background, until))
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let vocabulary = crate::execution::gates::authoring::gate_vocabulary();
+    let mut out = String::from("## Questions awaiting the operator\n\n");
+    for (uri, questions, created_at, background, until) in rows.iter().take(OPEN_QUESTIONS_CAP) {
+        let first = serde_json::from_str::<Vec<crate::models::question::Question>>(questions)
+            .ok()
+            .and_then(|questions| questions.into_iter().next())
+            .map(|question| question.question)
+            .unwrap_or_default();
+        let line: String = first.lines().next().unwrap_or_default().trim().to_string();
+        let line = match line.char_indices().nth(100) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => line,
+        };
+        let age = crate::clock::format_elapsed(now.saturating_sub(*created_at).max(0));
+        out.push_str(&format!("- {uri} · {line} · asked {age} ago"));
+        if *background {
+            out.push_str(" · non-blocking");
+        }
+        if let Some(until) = until.as_deref() {
+            let clauses = crate::execution::approvals::parse_until(until);
+            if !clauses.is_empty() {
+                out.push_str(&format!(
+                    " · closes when {}",
+                    crate::execution::approvals::render_until(&vocabulary, &clauses)
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if rows.len() > OPEN_QUESTIONS_CAP {
+        out.push_str(&format!(
+            "- +{} more at cairn:~/questions?state=open\n",
+            rows.len() - OPEN_QUESTIONS_CAP
+        ));
+    }
+    out.push('\n');
+    out
+}
 
 /// Oldest first again: the newest observation of a check name replaces the
 /// one before it, so each child ends with one current verdict per check. Read
@@ -3976,8 +4089,8 @@ mod tests {
                VALUES ('run-open','job-open-build','i-open','running',1,1);
              INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number)
                VALUES ('mr-open','job-open-build','p','i-open','Lease renewal backoff','feat/lease','main','open',10,10,892);
-             INSERT INTO prompts(id, run_id, questions, created_at)
-               VALUES ('q-open','run-open','[{\"question\":\"which backoff curve?\"}]',20);
+             INSERT INTO prompts(id, run_id, job_id, questions, created_at, background)
+               VALUES ('q-open','run-open','job-open-review','[{\"question\":\"which backoff curve?\"}]',20,1);
              INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
                VALUES ('ev-open','run-open',1,9_100,'assistant','{}',9_100);",
         )
@@ -4204,7 +4317,7 @@ mod tests {
             let mut counts = Vec::new();
             for table in ["messages", "attention_pushes", "turns", "runs"] {
                 counts.push(
-                    db.query_one(&format!("SELECT COUNT(*) FROM {table}"), (), |row| {
+                    db.query_one(format!("SELECT COUNT(*) FROM {table}"), (), |row| {
                         row.i64(0)
                     })
                     .await
@@ -4879,6 +4992,109 @@ mod tests {
             .iter()
             .all(|entry| entry.source == EntrySource::Interstitial));
         assert!(seed.consumed_child_issue_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_seed_lists_the_threads_open_questions_by_uri_and_age_newest_first() {
+        let db = thread_fixture("thread-seed-open-questions.db").await;
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
+               VALUES ('i-pr','p',4382,'A PR','active','none',1,1);
+             INSERT INTO prompts(id, run_id, job_id, questions, created_at, background, uri_segment)
+               VALUES ('pq-1','run-1','job-thread','[{\"question\":\"Merge #4382 now?\\nIt is green.\"}]',100,1,'q-1');
+             INSERT INTO prompts(id, run_id, job_id, questions, created_at, background, uri_segment, response, answered_at)
+               VALUES ('pq-2','run-1','job-thread','[{\"question\":\"Already answered?\"}]',200,1,'q-2','[]',300);
+             INSERT INTO prompts(id, run_id, job_id, questions, created_at, background, uri_segment)
+               VALUES ('pq-3','run-1','job-thread','[{\"question\":\"Which curve?\"}]',400,1,'q-3');
+             INSERT INTO ask_conditions(id, ask_kind, ask_id, job_id, effect, until_json, created_at)
+               VALUES ('c-1','question','pq-1','job-thread','moot','[{\"fact\":\"issue_resolution\",\"issue\":\"cairn://p/prj/4382\",\"resolution\":\"merged\"}]',100);",
+        )
+        .await
+        .unwrap();
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        let block = seed
+            .content
+            .split("## Questions awaiting the operator\n\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n\n").next())
+            .unwrap_or_else(|| panic!("an open-questions block: {}", seed.content));
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(lines.len(), 2, "{block}");
+        assert!(
+            lines[0].starts_with("- cairn://p/prj/platform/questions/q-3 · Which curve? · asked "),
+            "newest first: {block}"
+        );
+        assert!(
+            lines[1]
+                .starts_with("- cairn://p/prj/platform/questions/q-1 · Merge #4382 now? · asked ")
+                && lines[1]
+                    .ends_with(" · non-blocking · closes when issue cairn://p/prj/4382 merged"),
+            "one line, age and the open condition: {block}"
+        );
+        assert!(!block.contains("Already answered"), "{block}");
+        let eras = seed.content.find("## Eras").unwrap();
+        assert!(
+            seed.content
+                .find("## Questions awaiting the operator")
+                .unwrap()
+                < eras
+        );
+
+        // A rebuild opens a new session and run on the same job; the question
+        // asked in the old session keeps its address in the new seed.
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('sess-2','job-thread','claude','open',2,500,500);
+             UPDATE sessions SET status = 'closed' WHERE id = 'sess-1';
+             UPDATE jobs SET current_session_id = 'sess-2' WHERE id = 'job-thread';
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-2','job-thread','i-thread','running',500,500);",
+        )
+        .await
+        .unwrap();
+        let rebuilt = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        assert!(
+            rebuilt
+                .content
+                .contains("- cairn://p/prj/platform/questions/q-1 · Merge #4382 now?"),
+            "{}",
+            rebuilt.content
+        );
+
+        // A row with no segment has no address and is left out.
+        db.execute(
+            "INSERT INTO prompts(id, run_id, job_id, questions, created_at, background)
+             VALUES ('pq-unaddressed','run-2','job-thread','[{\"question\":\"Nowhere?\"}]',450,1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let unaddressed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        assert!(
+            !unaddressed.content.contains("Nowhere?"),
+            "{}",
+            unaddressed.content
+        );
+        assert!(!unaddressed.content.contains("questions/?"));
+
+        for n in 4..=13 {
+            db.execute(
+                "INSERT INTO prompts(id, run_id, job_id, questions, created_at, background, uri_segment)
+                 VALUES (?1,'run-1','job-thread','[{\"question\":\"More?\"}]',?2,1,?3)",
+                params![format!("pq-{n}"), 400 + n, format!("q-{n}")],
+            )
+            .await
+            .unwrap();
+        }
+        let capped = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        assert!(
+            capped
+                .content
+                .contains("- +2 more at cairn:~/questions?state=open\n"),
+            "{}",
+            capped.content
+        );
     }
 
     #[tokio::test]

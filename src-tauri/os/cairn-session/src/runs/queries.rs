@@ -537,7 +537,7 @@ pub const RUN_COLUMNS: &str = "id, issue_id, project_id, job_id, status, session
 // unchanged.
 pub use cairn_db::storage::events::columns::{event_from_row, EVENT_COLUMNS, EVENT_COLUMN_COUNT};
 
-const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id, resolution_id, resolution_surface, resolution_provider, resolution_conversation, resolution_actor";
+const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id, resolution_id, resolution_surface, resolution_provider, resolution_conversation, resolution_actor, tool_use_id";
 
 /// Exit reason for a stale run whose surviving process this sweep stopped. Kept
 /// distinct from the blanket `crash` so a row says whether the death was caused
@@ -2269,6 +2269,7 @@ fn prompt_from_row(row: &Row) -> DbResult<Prompt> {
         created_at,
         answered_at,
         resolution,
+        tool_use_id: row.opt_text(12)?,
     })
 }
 

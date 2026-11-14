@@ -45,6 +45,154 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// The one effect artifact deferrals run when they fire.
 pub const EFFECT_RESURFACE: &str = "resurface";
 
+/// A question's `moot_when` (cairn/5519): `ask_id` is the `prompts.id`.
+pub const ASK_KIND_QUESTION: &str = "question";
+
+/// What a question's condition does when it comes true: close it as moot.
+pub const EFFECT_MOOT: &str = "moot";
+
+/// A condition's clauses in canonical form, and where they stand right now.
+pub(crate) struct AssessedUntil {
+    pub(crate) predicates: Vec<String>,
+    pub(crate) rendered: String,
+    pub(crate) standing: UntilStanding,
+}
+
+impl AssessedUntil {
+    /// The stored `until_json`: the canonical predicates as one array.
+    pub(crate) fn until_json(&self) -> String {
+        format!("[{}]", self.predicates.join(","))
+    }
+}
+
+pub(crate) enum UntilStanding {
+    /// Some clause is false and every false clause can still come true.
+    Open,
+    /// Every clause is true already.
+    AlreadyTrue,
+    /// `clause` can never come true, so under AND semantics the whole never will.
+    Never { clause: String, reason: String },
+}
+
+/// Parse, canonicalize and evaluate the clauses a condition is written with.
+/// `None` when there are no clauses; refusals of the clause shapes are the
+/// `after:` vocabulary's own, naming `key`. Every writer of a condition words
+/// its refusal of an already-true or never-true condition from the standing.
+pub(crate) async fn assess_until(
+    orch: &Orchestrator,
+    until: Option<&Value>,
+    key: &str,
+) -> Result<Option<AssessedUntil>, String> {
+    let clauses = parse_after(until, key)?;
+    if clauses.is_empty() {
+        return Ok(None);
+    }
+    let predicates = canonical_predicates(&clauses, key)?;
+    let clauses: Vec<TriggerClause> = predicates
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    let vocabulary = gate_vocabulary();
+    let ctx = GateContext::new(orch, orch.services.clock.now());
+    let mut standing = UntilStanding::AlreadyTrue;
+    for clause in &clauses {
+        match vocabulary
+            .resolve(&ctx, clause)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            GateOutcome::Satisfied => {}
+            _ => {
+                if let Some(reason) = vocabulary
+                    .foreclosed(&ctx, clause)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    standing = UntilStanding::Never {
+                        clause: vocabulary.render(clause),
+                        reason,
+                    };
+                    break;
+                }
+                standing = UntilStanding::Open;
+            }
+        }
+    }
+    Ok(Some(AssessedUntil {
+        rendered: render_until(&vocabulary, &clauses),
+        predicates,
+        standing,
+    }))
+}
+
+/// A question's validated `moot_when`, ready to store beside its prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MootWhen {
+    pub until_json: String,
+    pub rendered: String,
+}
+
+/// Validate a questions append's `moot_when`: clauses in the `after:`
+/// vocabulary that can still come true and are not all true yet.
+pub(crate) async fn question_moot_when(
+    orch: &Orchestrator,
+    value: &Value,
+) -> Result<MootWhen, String> {
+    let key = "payload.moot_when";
+    let Some(assessed) = assess_until(orch, Some(value), key).await? else {
+        return Err(format!(
+            "{key} is empty: it names what would make the question moot. e.g. \
+             moot_when:[{{fact:\"pr_state\",issue:\"cairn://p/PROJECT/N\",state:\"merged\"}}], or omit it"
+        ));
+    };
+    match assessed.standing {
+        UntilStanding::Open => Ok(MootWhen {
+            until_json: assessed.until_json(),
+            rendered: assessed.rendered,
+        }),
+        UntilStanding::AlreadyTrue => Err(format!(
+            "`{}` is already true: the question would be moot as soon as it was asked, so don't ask it",
+            assessed.rendered
+        )),
+        UntilStanding::Never { clause, reason } => Err(format!(
+            "`{clause}` can never come true: {reason}. Ask without moot_when, or name \
+             something that can still happen."
+        )),
+    }
+}
+
+/// Record a question's `moot_when`, in the transaction that inserts its prompt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_question_condition_conn(
+    conn: &crate::storage::TrackedConnection,
+    prompt_id: &str,
+    job_id: &str,
+    issue_id: Option<&str>,
+    moot_when: &MootWhen,
+    created_by: Option<&str>,
+    now: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO ask_conditions
+            (id, ask_kind, ask_id, job_id, issue_id, effect, until_json, created_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            ASK_KIND_QUESTION,
+            prompt_id,
+            job_id,
+            issue_id,
+            EFFECT_MOOT,
+            moot_when.until_json.as_str(),
+            created_by,
+            now
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(DbError::from)
+}
+
 /// The facts an approver may defer on, for refusals and the affordance.
 pub fn deferrable_facts() -> Vec<&'static str> {
     gate_vocabulary()
@@ -106,18 +254,12 @@ pub async fn defer(
     dry_run: bool,
 ) -> Result<String, String> {
     let key = "payload.defer.until";
-    let clauses = parse_after(until, key)?;
-    if clauses.is_empty() {
+    let Some(assessed) = assess_until(orch, until, key).await? else {
         return Err(format!(
             "{key} is empty: a deferral names what it waits for. e.g. \
              {{defer:{{until:[{{fact:\"issue_resolution\",issue:\"cairn://p/PROJECT/N\",resolution:\"merged\"}}]}}}}"
         ));
-    }
-    let predicates = canonical_predicates(&clauses, key)?;
-    let clauses: Vec<TriggerClause> = predicates
-        .iter()
-        .filter_map(|json| serde_json::from_str(json).ok())
-        .collect();
+    };
 
     let job = job_id.to_string();
     let approval = db
@@ -144,38 +286,21 @@ pub async fn defer(
         }
     }
 
-    let vocabulary = gate_vocabulary();
-    let ctx = GateContext::new(orch, orch.services.clock.now());
-    let mut all_true = true;
-    for clause in &clauses {
-        match vocabulary
-            .resolve(&ctx, clause)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            GateOutcome::Satisfied => {}
-            _ => {
-                all_true = false;
-                if let Some(reason) = vocabulary
-                    .foreclosed(&ctx, clause)
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    return Err(format!(
-                        "`{}` can never come true: {reason}. Confirm or continue the artifact \
-                         now, or defer on something that can still happen.",
-                        vocabulary.render(clause)
-                    ));
-                }
-            }
+    let rendered = assessed.rendered.clone();
+    match assessed.standing {
+        UntilStanding::Open => {}
+        UntilStanding::Never { clause, reason } => {
+            return Err(format!(
+                "`{clause}` can never come true: {reason}. Confirm or continue the artifact \
+                 now, or defer on something that can still happen."
+            ))
         }
-    }
-    let rendered = render_until(&vocabulary, &clauses);
-    if all_true {
-        return Err(format!(
-            "`{rendered}` is already true: confirm or continue {} now rather than deferring it",
-            approval.artifact_uri
-        ));
+        UntilStanding::AlreadyTrue => {
+            return Err(format!(
+                "`{rendered}` is already true: confirm or continue {} now rather than deferring it",
+                approval.artifact_uri
+            ))
+        }
     }
     if dry_run {
         return Ok(format!(
@@ -185,7 +310,7 @@ pub async fn defer(
     }
 
     let now = orch.services.clock.now();
-    let until_json = format!("[{}]", predicates.join(","));
+    let until_json = assessed.until_json();
     let condition_id = uuid::Uuid::new_v4().to_string();
     let row = (
         condition_id.clone(),
@@ -342,6 +467,10 @@ async fn sweep_db(
     let ctx = GateContext::new(orch, now);
 
     for mut row in owed {
+        if row.ask_kind == ASK_KIND_QUESTION {
+            sweep_question_condition(orch, db, vocabulary, &ctx, row, now, report).await?;
+            continue;
+        }
         if row.ask_kind != ASK_KIND_ARTIFACT {
             // Another kind's effect is its own module's; this pass leaves it.
             continue;
@@ -384,6 +513,194 @@ async fn sweep_db(
         }
     }
     Ok(())
+}
+
+/// Whether a question still waits on the operator, by the one definition every
+/// operator-facing surface uses ([`cairn_db::pending_question_sql!`]). A
+/// question whose asker's job has ended is not: its condition clears rather
+/// than delivering a moot to work that is over.
+async fn question_pending(db: &LocalDb, prompt_id: &str) -> Result<bool, String> {
+    db.query_opt_text(
+        concat!(
+            "SELECT p.id FROM prompts p
+               JOIN runs r ON r.id = p.run_id
+               JOIN jobs j ON j.id = COALESCE(p.job_id, r.job_id)
+               LEFT JOIN turns pt ON pt.id = p.turn_id
+              WHERE p.id = ?1 AND ",
+            cairn_db::pending_question_sql!()
+        ),
+        (prompt_id.to_string(),),
+    )
+    .await
+    .map(|row| row.is_some())
+    .map_err(|error| format!("failed to read a question's state: {error}"))
+}
+
+/// One question's `moot_when`.
+///
+/// - Not pending (answered, handled, moot, withdrawn): latch `cleared`; nobody
+///   is told anything, since whatever closed it already said so.
+/// - Satisfied: close the question as moot through the one resolution path,
+///   whose compare-and-set on the prompt is the exactly-once guarantee, then
+///   latch. A crash between the two leaves an open row on a question that is
+///   no longer pending, which the next pass clears.
+/// - Foreclosed: the question does NOT become moot, because its cause can no
+///   longer resolve on its own. The asker is woken once to decide.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_question_condition(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    vocabulary: &GateVocabulary,
+    ctx: &GateContext<'_>,
+    mut row: OwedCondition,
+    now: i64,
+    report: &mut AskSweepReport,
+) -> Result<(), String> {
+    if row.fired_kind.is_none() {
+        let fired = if question_pending(db, &row.ask_id).await? {
+            evaluate(vocabulary, ctx, &row.until).await?
+        } else {
+            Some((
+                "cleared",
+                "the question no longer waits on the operator".to_string(),
+            ))
+        };
+        let Some((kind, reason)) = fired else {
+            return Ok(());
+        };
+        let kind = if kind == "satisfied" {
+            let moot = crate::models::question::PromptResolution::Closed(
+                crate::models::question::Closure::Moot {
+                    note: None,
+                    condition: Some(crate::models::question::MootCondition {
+                        id: row.id.clone(),
+                        reason: reason.clone(),
+                    }),
+                },
+            );
+            match crate::mcp::handlers::planning::resolve_prompt(orch, &row.ask_id, moot, None)
+                .await
+            {
+                Ok(outcome) if outcome.withdrawn.is_none() && !outcome.duplicate => "satisfied",
+                // Answered or withdrawn first: the condition had nothing left to do.
+                Ok(_) => "cleared",
+                Err(error) => {
+                    log::warn!(
+                        "question condition {} came true but the moot could not be recorded: {error}",
+                        row.id
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            kind
+        };
+        if !latch(db, &row.id, kind, &reason, now).await? {
+            return Ok(());
+        }
+        report.fired.push((row.id.clone(), kind));
+        announce(orch, row.project_id.as_deref(), "update");
+        row.fired_kind = Some(kind.to_string());
+        row.fired_reason = Some(reason);
+        if kind == "cleared" {
+            report.delivered.push(row.id.clone());
+            return Ok(());
+        }
+    }
+    match row.fired_kind.as_deref() {
+        // The moot's delivery rode the resolution path.
+        Some("satisfied") => {
+            stamp_delivered(db, &row.id, now).await?;
+            report.delivered.push(row.id.clone());
+        }
+        Some("foreclosed") => {
+            if deliver_question_foreclosure(orch, db, &row, now).await? {
+                report.delivered.push(row.id.clone());
+            }
+        }
+        _ => {
+            stamp_delivered(db, &row.id, now).await?;
+            report.delivered.push(row.id.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Wake a question's asker once: its `moot_when` can no longer come true.
+async fn deliver_question_foreclosure(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    row: &OwedCondition,
+    now: i64,
+) -> Result<bool, String> {
+    let condition_id = row.id.clone();
+    let prompt_id = row.ask_id.clone();
+    let asker = row.job_id.clone();
+    let reason = row
+        .fired_reason
+        .clone()
+        .unwrap_or_else(|| "its cause is gone".to_string());
+    let outcome = db
+        .write(move |conn| {
+            let condition_id = condition_id.clone();
+            let prompt_id = prompt_id.clone();
+            let asker = asker.clone();
+            let reason = reason.clone();
+            Box::pin(async move {
+                let message_id = super::sweep::wake_message_id("question-foreclosed", &condition_id);
+                if super::sweep::wake_already_sent_conn(conn, &message_id).await? {
+                    stamp_delivered_conn(conn, &condition_id, now).await?;
+                    return Ok(Delivery::Done(None));
+                }
+                // Still open: an answer since the latch leaves nothing to decide.
+                let open = crate::storage::query_opt_text_conn(
+                    conn,
+                    "SELECT uri_segment FROM prompts WHERE id = ?1 AND response IS NULL AND withdrawn_at IS NULL",
+                    params![prompt_id.as_str()],
+                )
+                .await?;
+                let Some(segment) = open else {
+                    stamp_delivered_conn(conn, &condition_id, now).await?;
+                    return Ok(Delivery::Done(None));
+                };
+                let Some(run) = super::sweep::recipient_run_conn(conn, &asker).await? else {
+                    return Ok(Delivery::Owed);
+                };
+                let address = crate::jobs::queries::home_uri_for_job_conn(conn, &asker)
+                    .await?
+                    .and_then(|home| {
+                        crate::mcp::handlers::planning::question_uri_under_home(&home, &segment)
+                    })
+                    .unwrap_or(segment);
+                let content = format!(
+                    "Your question {address}'s moot_when can no longer come true: {reason}. \
+                     It stays open; withdraw it if it no longer applies."
+                );
+                super::sweep::send_wake_conn(
+                    conn,
+                    &asker,
+                    &run,
+                    &content,
+                    &format!("ask-condition:{condition_id}"),
+                    &message_id,
+                )
+                .await?;
+                stamp_delivered_conn(conn, &condition_id, now).await?;
+                Ok(Delivery::Done(Some(asker)))
+            })
+        })
+        .await
+        .map_err(|error| format!("failed to deliver a question's foreclosure: {error}"))?;
+    match outcome {
+        Delivery::Owed => Ok(false),
+        Delivery::Done(recipient) => {
+            if let Some(recipient) = recipient {
+                super::sweep::nudge_woken(orch, &recipient, "question moot_when foreclosed");
+            }
+            announce(orch, row.project_id.as_deref(), "update");
+            Ok(true)
+        }
+    }
 }
 
 /// `Some((kind, reason))` when the condition fires now.

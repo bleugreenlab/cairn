@@ -185,3 +185,96 @@ async fn a_job_blocked_on_its_missing_output_is_an_open_link_only_entry() {
     let kinds: Vec<_> = snapshot.entries.iter().map(|entry| entry.kind).collect();
     assert_eq!(kinds, vec![NotificationKind::AwaitingReview]);
 }
+
+/// cairn/5519: a thread's non-blocking question stays open after its turn has
+/// moved on, links its own URI and carries its context; it resolves on an
+/// answer, a handled or moot closure (by the operator or its condition), and
+/// a withdrawal. A blocking question off the current turn is not listed.
+#[tokio::test]
+async fn a_threads_non_blocking_question_stays_open_across_turns_and_resolves_every_way() {
+    let db = crate::storage::migrated_test_db("notif-thread-question").await;
+    db.execute_script(
+        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+           VALUES ('p-tq', 'default', 'Q', 'tq', '/tmp/tq', 1, 1);
+         INSERT INTO threads (id, project_id, name, created_at, updated_at)
+           VALUES ('tq-thread', 'p-tq', 'platform', 1, 1);
+         INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq)
+           VALUES ('tq-e', 'thread', 'p-tq', 'running', 1, 1);
+         INSERT INTO jobs (id, execution_id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+           VALUES ('tq-job', 'tq-e', 'tq-thread', 'p-tq', 'running', 'thread', 'thread', 1, 1);
+         INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('tq-s', 'tq-job', 1, 1);
+         INSERT INTO runs (id, job_id, session_id, status, created_at, updated_at)
+           VALUES ('tq-run', 'tq-job', 'tq-s', 'live', 1, 1);
+         INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+           VALUES ('tq-t1', 'tq-s', 'tq-run', 'tq-job', 1, 'completed', 'initial', 1, 1),
+                  ('tq-t2', 'tq-s', 'tq-run', 'tq-job', 2, 'running', 'user_message', 2, 2);
+         UPDATE jobs SET current_turn_id = 'tq-t2' WHERE id = 'tq-job';
+         INSERT INTO prompts (id, run_id, job_id, questions, created_at, turn_id, uri_segment, background, context)
+           VALUES ('tq-p1', 'tq-run', 'tq-job', '[{\"question\":\"Merge #4382?\"}]', 10, 'tq-t1', 'q-1', 1, 'About cairn://p/tq/4382');
+         INSERT INTO prompts (id, run_id, job_id, questions, created_at, turn_id, uri_segment, background)
+           VALUES ('tq-p2', 'tq-run', 'tq-job', '[{\"question\":\"Blocking, on an old turn?\"}]', 11, 'tq-t1', 'q-2', 0);",
+    )
+    .await
+    .unwrap();
+    let derive = || async {
+        derive_snapshot(
+            &db,
+            &db,
+            &HoldRegistry::default(),
+            "p-tq",
+            1_000,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap()
+    };
+    let question = |snapshot: &OperatorNotificationsSnapshot| {
+        snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "question:tq-p1")
+            .cloned()
+    };
+
+    let snapshot = derive().await;
+    assert!(
+        !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.key == "question:tq-p2"),
+        "a blocking question holds only its current turn: {:#?}",
+        snapshot.entries
+    );
+    let entry = question(&snapshot).expect("the non-blocking question is listed");
+    assert_eq!(entry.state, NotificationState::Open);
+    assert_eq!(entry.summary, "thread platform asks: Merge #4382?");
+    assert_eq!(entry.source_uri, "cairn://p/tq/platform");
+    assert_eq!(
+        entry.action,
+        Some(NotificationAction::Question {
+            prompt_id: "tq-p1".into(),
+            run_id: "tq-run".into(),
+            questions: "[{\"question\":\"Merge #4382?\"}]".into(),
+            uri: Some("cairn://p/tq/platform/questions/q-1".into()),
+            context: Some("About cairn://p/tq/4382".into()),
+        })
+    );
+
+    for close in [
+        "UPDATE prompts SET response = '[{\"index\":0,\"answer\":\"yes\"}]', answered_at = 20 WHERE id = 'tq-p1'",
+        "UPDATE prompts SET response = '{\"form\":\"handled\"}', answered_at = 20 WHERE id = 'tq-p1'",
+        "UPDATE prompts SET response = '{\"form\":\"moot\",\"condition\":{\"id\":\"c\",\"reason\":\"merged\"}}', answered_at = 20 WHERE id = 'tq-p1'",
+        "UPDATE prompts SET withdrawn_at = 20, withdrawn_cause = 'retracted' WHERE id = 'tq-p1'",
+    ] {
+        db.execute(close, ()).await.unwrap();
+        let entry = question(&derive().await).expect("a resolved question is still listed recently");
+        assert_eq!(entry.state, NotificationState::Resolved, "{close}");
+        assert_eq!(entry.state_at, Some(20), "{close}");
+        db.execute(
+            "UPDATE prompts SET response = NULL, answered_at = NULL, withdrawn_at = NULL, withdrawn_cause = NULL WHERE id = 'tq-p1'",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+}

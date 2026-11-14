@@ -289,6 +289,17 @@ pub(crate) async fn run_blocking_group(
                 Ok(mode) => mode,
                 Err(refusal) => return refusal.into(),
             };
+            let moot_when = match mode.moot_when.as_ref() {
+                Some(value) => {
+                    match crate::execution::gates::ask_conditions::question_moot_when(orch, value)
+                        .await
+                    {
+                        Ok(moot_when) => Some(moot_when),
+                        Err(refusal) => return refusal.into(),
+                    }
+                }
+                None => None,
+            };
             let ask: AskUserPayload = match serde_json::from_value(payload) {
                 Ok(ask) => ask,
                 Err(e) => return format!("Invalid question append payload: {e}").into(),
@@ -318,12 +329,16 @@ pub(crate) async fn run_blocking_group(
                 .tool_use_id
                 .as_deref()
                 .or(resolved_tool_use_id.as_deref());
-            let outcome = crate::mcp::handlers::planning::ask_questions(
+            let outcome = crate::mcp::handlers::planning::ask_questions_with(
                 orch,
                 request,
                 ask,
                 !mode.blocking,
                 tool_use_id,
+                crate::mcp::handlers::planning::AskExtras {
+                    context: mode.context.clone(),
+                    moot_when,
+                },
             )
             .await;
             if let (Some(key), Some(uri)) = (memo, outcome.uri.as_deref()) {
@@ -340,17 +355,42 @@ pub(crate) async fn run_blocking_group(
                     log::warn!("failed to journal question {uri}: {error}");
                 }
             }
-            BlockingResult::from(outcome).into()
+            // The question is a thing the write created, listed with its
+            // address so a transcript renders it from data, never from prose.
+            let applied = match (outcome.uri.clone(), outcome.prompt_id.clone()) {
+                (Some(uri), Some(prompt_id)) => vec![BlockingApplied {
+                    index: indices[0],
+                    summary: format!("Asked question {uri}"),
+                    data: serde_json::json!({
+                        "question": uri,
+                        "promptId": prompt_id,
+                        "blocking": mode.blocking,
+                    }),
+                }],
+                _ => Vec::new(),
+            };
+            BlockingGroupOutcome {
+                blocking: Some(BlockingResult::from(outcome)),
+                applied,
+                failures: Vec::new(),
+            }
         }
     }
 }
 
-/// How a questions append asks: blocking (the default) or not, and the
-/// journal ordinal a workflow node keys a non-blocking ask by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The longest context a question carries. Past it the asker is pointing at
+/// too little and quoting too much; the canonical URIs carry the rest.
+const QUESTION_CONTEXT_LIMIT: usize = 2000;
+
+/// How a questions append asks: blocking (the default) or not, the journal
+/// ordinal a workflow node keys a non-blocking ask by, its context, and the
+/// raw `moot_when` clauses (validated against live facts by the caller).
+#[derive(Debug, Clone, PartialEq)]
 struct QuestionAskMode {
     blocking: bool,
     ordinal: Option<i64>,
+    context: Option<String>,
+    moot_when: Option<serde_json::Value>,
 }
 
 impl QuestionAskMode {
@@ -378,7 +418,35 @@ impl QuestionAskMode {
                 "payload.ordinal keys a non-blocking ask; set blocking: false with it".to_string(),
             );
         }
-        Ok(Self { blocking, ordinal })
+        if payload.get("mootWhen").is_some() {
+            return Err("payload.mootWhen is spelled moot_when".to_string());
+        }
+        let context = match payload.get("context") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(context)) => {
+                let context = context.trim();
+                let length = context.chars().count();
+                if length > QUESTION_CONTEXT_LIMIT {
+                    return Err(format!(
+                        "payload.context is {length} characters; the limit is \
+                         {QUESTION_CONTEXT_LIMIT}. Say what the question is about and point at \
+                         the canonical URIs rather than quoting them"
+                    ));
+                }
+                (!context.is_empty()).then(|| context.to_string())
+            }
+            Some(_) => return Err("payload.context is a string".to_string()),
+        };
+        let moot_when = match payload.get("moot_when") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.clone()),
+        };
+        Ok(Self {
+            blocking,
+            ordinal,
+            context,
+            moot_when,
+        })
     }
 }
 
@@ -1191,6 +1259,662 @@ mod non_blocking_question_tests {
         assert_eq!(
             waited,
             serde_json::json!({"state": "withdrawn", "cause": "operator_stop"})
+        );
+    }
+
+    /// A thread `platform` (session job `j-th`, run `th-run` on an open turn)
+    /// and issues the conditions name: 8 merged, 9 closed, 10 still active.
+    async fn seed_thread(db: &LocalDb) {
+        for sql in [
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i8','p',8,'Merged','merged',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i9','p',9,'Closed','closed',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i10','p',10,'Open','active',1,1)",
+            "INSERT INTO threads (id, project_id, name, status, created_at, updated_at) VALUES ('t','p','platform','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq) VALUES ('e-t','thread','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, thread_id, project_id, status, uri_segment, node_name, agent_config_id, current_session_id, created_at, updated_at) VALUES ('j-th','e-t','t','p','running','thread','thread','thread','s-th',1,1)",
+            "INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('s-th','j-th',1,1)",
+            "INSERT INTO runs (id, job_id, session_id, status, created_at, updated_at) VALUES ('th-run','j-th','s-th','live',1,1)",
+            "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('th-turn','s-th','th-run','j-th',1,'running','initial',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    async fn write_at(
+        orch: &Orchestrator,
+        run: &str,
+        target: &str,
+        mode: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp/p".to_string(),
+            run_id: Some(run.to_string()),
+            tool: "write".to_string(),
+            tool_use_id: None,
+            payload: serde_json::json!({
+                "changes": [{ "target": target, "mode": mode, "payload": payload }]
+            }),
+            origin: None,
+        };
+        let result = crate::mcp::handlers::write::handle_write(orch, &request).await;
+        serde_json::from_str(&result).unwrap()
+    }
+
+    const THREAD_QUESTIONS: &str = "cairn://p/prj/platform/questions";
+
+    /// Ask on the thread and pin the prompt to the thread's open turn, as the
+    /// live process state would.
+    async fn thread_ask(
+        orch: &Orchestrator,
+        db: &LocalDb,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let report = write_at(orch, "th-run", THREAD_QUESTIONS, "append", payload).await;
+        db.execute(
+            "UPDATE prompts SET turn_id = 'th-turn' WHERE job_id = 'j-th'",
+            (),
+        )
+        .await
+        .unwrap();
+        report
+    }
+
+    async fn text(db: &LocalDb, sql: &str) -> Option<String> {
+        db.query_opt_text(sql, ()).await.unwrap()
+    }
+
+    fn thread_question(
+        context: Option<&str>,
+        moot_when: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "questions": [{"question": "Merge #10 now?\nIt is green.", "options": []}],
+            "blocking": false,
+        });
+        if let Some(context) = context {
+            payload["context"] = serde_json::json!(context);
+        }
+        if let Some(moot_when) = moot_when {
+            payload["moot_when"] = moot_when;
+        }
+        payload
+    }
+
+    fn merged(number: i32) -> serde_json::Value {
+        serde_json::json!([{"fact": "issue_resolution", "issue": format!("cairn://p/prj/{number}"), "resolution": "merged"}])
+    }
+
+    #[tokio::test]
+    async fn a_thread_asks_without_blocking_and_gets_its_own_question_uri_with_context() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        let report = thread_ask(
+            &orch,
+            &db,
+            thread_question(Some("  About cairn://p/prj/10, green since noon. "), None),
+        )
+        .await;
+        let uri = "cairn://p/prj/platform/questions/q-1";
+        assert_eq!(
+            report["blocking"]["artifact_uri"].as_str(),
+            Some(uri),
+            "{report}"
+        );
+        let said = report["blocking"]["text"].as_str().unwrap();
+        assert!(said.contains(&format!("is open at {uri}")), "{said}");
+        assert!(
+            report
+                .to_string()
+                .contains(&format!("\"question\":\"{uri}\"")),
+            "the report carries the question's URI as data: {report}"
+        );
+        assert_eq!(
+            text(&db, "SELECT context FROM prompts WHERE job_id = 'j-th'")
+                .await
+                .as_deref(),
+            Some("About cairn://p/prj/10, green since noon.")
+        );
+        let long = "x".repeat(2001);
+        let refused = thread_ask(&orch, &db, thread_question(Some(&long), None)).await;
+        assert!(
+            refused.to_string().contains("the limit is 2000"),
+            "{refused}"
+        );
+
+        let single =
+            crate::resources::node::read_node_question(&db, "prj", 0, 0, "platform", "q-1").await;
+        for expected in [
+            "Status: open · non-blocking",
+            "URI: cairn://p/prj/platform/questions/q-1",
+            "## Context\n\nAbout cairn://p/prj/10",
+            "(awaiting answer)",
+        ] {
+            assert!(
+                single.contains(expected),
+                "missing {expected:?} in {single}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn moot_when_refuses_what_could_never_close_the_question() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        for (moot_when, expected) in [
+            (serde_json::json!("when #10 merges"), "payload.moot_when"),
+            (merged(8), "is already true"),
+            (merged(9), "can never come true"),
+            (
+                serde_json::json!([{"fact": "issue_resolutoin", "issue": "cairn://p/prj/10"}]),
+                "unknown gate fact",
+            ),
+        ] {
+            let report = thread_ask(&orch, &db, thread_question(None, Some(moot_when))).await;
+            assert!(
+                report.to_string().contains(expected),
+                "{expected}: {report}"
+            );
+        }
+        assert_eq!(prompt_count(&db).await, 0, "a refused ask records nothing");
+        let opened = thread_ask(&orch, &db, thread_question(None, Some(merged(10)))).await;
+        assert!(opened["blocking"]["artifact_uri"].is_string(), "{opened}");
+        assert_eq!(
+            text(
+                &db,
+                "SELECT effect FROM ask_conditions WHERE ask_kind = 'question'"
+            )
+            .await
+            .as_deref(),
+            Some("moot")
+        );
+    }
+
+    #[tokio::test]
+    async fn handled_moot_and_withdraw_close_a_question_once_and_name_it_to_the_asker() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, None)).await;
+        let q1 = format!("{THREAD_QUESTIONS}/q-1");
+
+        let mixed = write_at(
+            &orch,
+            "ag-run",
+            &q1,
+            "patch",
+            serde_json::json!({"answer": "yes", "handled": true}),
+        )
+        .await;
+        assert!(mixed.to_string().contains("resolves one way"), "{mixed}");
+
+        let handled = write_at(
+            &orch,
+            "ag-run",
+            &q1,
+            "patch",
+            serde_json::json!({"handled": true, "note": "merged it from the console"}),
+        )
+        .await;
+        assert!(
+            handled.to_string().contains("Marked question q-1 handled"),
+            "{handled}"
+        );
+        assert_eq!(
+            text(
+                &db,
+                "SELECT response FROM prompts WHERE uri_segment = 'q-1' AND job_id = 'j-th'"
+            )
+            .await
+            .as_deref(),
+            Some(r#"{"form":"handled","note":"merged it from the console"}"#)
+        );
+        let told = text(
+            &db,
+            "SELECT content FROM queued_messages WHERE job_id = 'j-th'",
+        )
+        .await
+        .expect("the asker is told at its next tool boundary");
+        assert_eq!(
+            told,
+            "Your question cairn://p/prj/platform/questions/q-1 (\"Merge #10 now?\") was marked \
+             handled by cairn://p/prj/7/1/agent: merged it from the console",
+            "an agent's closure names that agent, not the operator"
+        );
+
+        let again = write_at(
+            &orch,
+            "ag-run",
+            &q1,
+            "patch",
+            serde_json::json!({"moot": true}),
+        )
+        .await;
+        assert!(
+            again.to_string().contains("was already marked handled"),
+            "{again}"
+        );
+        let waited: serde_json::Value = serde_json::from_str(
+            &crate::resources::node::wait_for_question(
+                &orch, &db, "prj", 0, 0, "platform", "q-1", None,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(waited["state"], "handled");
+        assert_eq!(waited["note"], "merged it from the console");
+
+        thread_ask(&orch, &db, thread_question(None, None)).await;
+        let q2 = format!("{THREAD_QUESTIONS}/q-2");
+        let stranger = write_at(
+            &orch,
+            "ag-run",
+            &q2,
+            "patch",
+            serde_json::json!({"withdraw": true}),
+        )
+        .await;
+        assert!(
+            stranger
+                .to_string()
+                .contains("only its asker can withdraw it"),
+            "{stranger}"
+        );
+        let own = write_at(
+            &orch,
+            "th-run",
+            &q2,
+            "patch",
+            serde_json::json!({"withdraw": true}),
+        )
+        .await;
+        assert!(own.to_string().contains("Withdrew question q-2"), "{own}");
+        let late = write_at(
+            &orch,
+            "ag-run",
+            &q2,
+            "patch",
+            serde_json::json!({"answer": "yes"}),
+        )
+        .await;
+        assert!(late.to_string().contains("its asker withdrew it"), "{late}");
+
+        let listing = crate::resources::node::read_node_questions(
+            &db,
+            "prj",
+            0,
+            0,
+            "platform",
+            &[cairn_common::query::QueryParam {
+                key: "state".into(),
+                value: "handled".into(),
+            }],
+        )
+        .await;
+        assert!(listing.contains("1 handled question(s) of 2"), "{listing}");
+        assert!(
+            listing
+                .contains("[q-1](cairn://p/prj/platform/questions/q-1) · handled · non-blocking"),
+            "{listing}"
+        );
+        assert!(!listing.contains("[q-2]"), "{listing}");
+    }
+
+    #[tokio::test]
+    async fn a_question_moots_itself_when_its_issue_merges_and_the_asker_is_told_once() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, Some(merged(10)))).await;
+        let now = chrono::Utc::now().timestamp();
+        crate::execution::gates::sweep::sweep_at(&orch, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'").await,
+            None,
+            "nothing before the merge"
+        );
+
+        db.execute("UPDATE issues SET status = 'merged' WHERE id = 'i10'", ())
+            .await
+            .unwrap();
+        crate::execution::gates::sweep::sweep_at(&orch, now)
+            .await
+            .unwrap();
+        crate::execution::gates::sweep::sweep_at(&orch, now)
+            .await
+            .unwrap();
+        let stored = text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'")
+            .await
+            .unwrap();
+        assert!(stored.contains(r#""form":"moot""#), "{stored}");
+        assert_eq!(
+            text(
+                &db,
+                "SELECT resolution_surface FROM prompts WHERE job_id = 'j-th'"
+            )
+            .await,
+            None,
+            "a condition's moot has no operator surface"
+        );
+        let told = text(
+            &db,
+            "SELECT content FROM queued_messages WHERE job_id = 'j-th'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            told,
+            "Your question cairn://p/prj/platform/questions/q-1 (\"Merge #10 now?\") closed \
+             itself as moot: issue cairn://p/prj/10 merged"
+        );
+        assert_eq!(
+            db.query_all("SELECT id FROM queued_messages", (), |row| row.text(0))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "told exactly once"
+        );
+        assert_eq!(
+            text(&db, "SELECT fired_kind FROM ask_conditions")
+                .await
+                .as_deref(),
+            Some("satisfied")
+        );
+        assert!(
+            text(
+                &db,
+                "SELECT id FROM ask_conditions WHERE delivered_at IS NOT NULL"
+            )
+            .await
+            .is_some(),
+            "the condition owes nothing more"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answered_question_clears_its_condition_silently() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, Some(merged(10)))).await;
+        write_at(
+            &orch,
+            "ag-run",
+            &format!("{THREAD_QUESTIONS}/q-1"),
+            "patch",
+            serde_json::json!({"answer": "not yet"}),
+        )
+        .await;
+        db.execute("UPDATE issues SET status = 'merged' WHERE id = 'i10'", ())
+            .await
+            .unwrap();
+        crate::execution::gates::sweep::sweep_at(&orch, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(
+            text(&db, "SELECT fired_kind FROM ask_conditions")
+                .await
+                .as_deref(),
+            Some("cleared")
+        );
+        let stored = text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'")
+            .await
+            .unwrap();
+        assert!(stored.starts_with('['), "the answer stands: {stored}");
+    }
+
+    /// A blocking ask whose `moot_when` comes true while its call waits: the
+    /// call returns the moot, framed with the question's URI, and its report
+    /// names the question as data.
+    #[tokio::test]
+    async fn a_blocking_question_moots_itself_and_the_waiting_call_returns_the_moot() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        db.execute(
+            "UPDATE jobs SET current_turn_id = 'th-turn' WHERE id = 'j-th'",
+            (),
+        )
+        .await
+        .unwrap();
+        let mut payload = thread_question(None, Some(merged(10)));
+        payload["blocking"] = serde_json::json!(true);
+        let asking = {
+            let orch = orch.clone();
+            tokio::spawn(async move {
+                write_at(&orch, "th-run", THREAD_QUESTIONS, "append", payload).await
+            })
+        };
+        // The prompt row is on its turn, as the live process state puts it.
+        for _ in 0..200 {
+            if prompt_count(&db).await == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        db.execute(
+            "UPDATE prompts SET turn_id = 'th-turn' WHERE job_id = 'j-th'",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute("UPDATE issues SET status = 'merged' WHERE id = 'i10'", ())
+            .await
+            .unwrap();
+        crate::execution::gates::sweep::sweep_at(&orch, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(10), asking)
+            .await
+            .expect("the waiting call returns once the question moots")
+            .unwrap();
+        let said = report["blocking"]["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            said,
+            "Your question cairn://p/prj/platform/questions/q-1 (\"Merge #10 now?\") closed \
+             itself as moot: issue cairn://p/prj/10 merged",
+            "{report}"
+        );
+        assert!(
+            report
+                .to_string()
+                .contains("\"question\":\"cairn://p/prj/platform/questions/q-1\""),
+            "a blocking ask's report names the question too: {report}"
+        );
+    }
+
+    /// A condition on a question whose asker's work ended clears; nothing is
+    /// recorded or delivered to the ended job.
+    #[tokio::test]
+    async fn a_condition_clears_when_its_askers_job_has_ended() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, Some(merged(10)))).await;
+        db.execute("UPDATE jobs SET status = 'complete' WHERE id = 'j-th'", ())
+            .await
+            .unwrap();
+        db.execute("UPDATE issues SET status = 'merged' WHERE id = 'i10'", ())
+            .await
+            .unwrap();
+        crate::execution::gates::sweep::sweep_at(&orch, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(
+            text(&db, "SELECT fired_kind FROM ask_conditions")
+                .await
+                .as_deref(),
+            Some("cleared")
+        );
+        assert_eq!(
+            text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'").await,
+            None
+        );
+        assert_eq!(
+            text(&db, "SELECT id FROM queued_messages").await,
+            None,
+            "nothing is delivered to work that is over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clock_moot_fires_on_time() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        let now = orch.services.clock.now();
+        let due = now + 100;
+        let at = chrono::DateTime::from_timestamp(due, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        thread_ask(
+            &orch,
+            &db,
+            thread_question(
+                None,
+                Some(serde_json::json!([{"fact": "clock", "notBefore": at}])),
+            ),
+        )
+        .await;
+        assert_eq!(
+            crate::execution::gates::sweep::next_gate_due_after(&orch, now).await,
+            Some(due),
+            "the sweep loop sleeps until the moot is due"
+        );
+        crate::execution::gates::sweep::sweep_at(&orch, due - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'").await,
+            None
+        );
+        crate::execution::gates::sweep::sweep_at(&orch, due)
+            .await
+            .unwrap();
+        let stored = text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'")
+            .await
+            .expect("moot at its instant");
+        assert!(stored.contains(r#""form":"moot""#), "{stored}");
+    }
+
+    /// Compact withdraws only what belonged to the killed session: a blocking
+    /// question, never a non-blocking one.
+    #[tokio::test]
+    async fn compact_counts_only_blocking_questions_as_the_sessions_live_work() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, None)).await;
+        db.execute(
+            "INSERT INTO prompts (id, run_id, job_id, questions, created_at, turn_id, uri_segment, background)
+             VALUES ('p-blocking', 'th-run', 'j-th', '[{\"question\":\"Sign in?\"}]', 5, 'th-turn', 'q-9', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        let live = crate::execution::operator_compact::LiveWork::for_job(&db, "j-th")
+            .await
+            .unwrap();
+        assert_eq!(live.questions, vec!["p-blocking".to_string()]);
+    }
+
+    /// Stopping the work withdraws the blocking question its turn raised, and
+    /// leaves a non-blocking one open for whoever continues the job.
+    #[tokio::test]
+    async fn stop_withdraws_blocking_questions_and_keeps_non_blocking_ones() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, None)).await;
+        db.execute(
+            "INSERT INTO prompts (id, run_id, job_id, questions, created_at, turn_id, uri_segment, background)
+             VALUES ('p-blocking', 'th-run', 'j-th', '[{\"question\":\"Sign in?\"}]', 5, 'th-turn', 'q-9', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        let withdrawn = db
+            .write(|conn| {
+                Box::pin(async move {
+                    crate::mcp::handlers::planning::withdraw_job_prompts_conn(
+                        conn,
+                        "j-th",
+                        crate::mcp::handlers::permission::WithdrawalCause::OperatorStop,
+                        9,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(withdrawn, 1);
+        assert!(text(
+            &db,
+            "SELECT id FROM prompts WHERE id = 'p-blocking' AND withdrawn_at IS NOT NULL"
+        )
+        .await
+        .is_some());
+        assert!(
+            text(
+                &db,
+                "SELECT id FROM prompts WHERE uri_segment = 'q-1' AND withdrawn_at IS NULL"
+            )
+            .await
+            .is_some(),
+            "the non-blocking question survives the stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreclosed_moot_when_wakes_the_asker_once_and_the_question_stays_open() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        seed_thread(&db).await;
+        thread_ask(&orch, &db, thread_question(None, Some(merged(10)))).await;
+        db.execute("UPDATE issues SET status = 'closed' WHERE id = 'i10'", ())
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        crate::execution::gates::sweep::sweep_at(&orch, now)
+            .await
+            .unwrap();
+        crate::execution::gates::sweep::sweep_at(&orch, now)
+            .await
+            .unwrap();
+        let wakes = db
+            .query_all(
+                "SELECT content FROM messages WHERE id IN (SELECT message_id FROM message_recipients WHERE recipient_run_id = 'th-run')",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wakes.len(), 1, "{wakes:?}");
+        assert!(
+            wakes[0].starts_with(
+                "Your question cairn://p/prj/platform/questions/q-1's moot_when can no longer come true"
+            ) && wakes[0].contains("It stays open"),
+            "{}",
+            wakes[0]
+        );
+        assert_eq!(
+            text(&db, "SELECT response FROM prompts WHERE job_id = 'j-th'").await,
+            None,
+            "foreclosure does not moot the question"
+        );
+        assert_eq!(
+            text(&db, "SELECT fired_kind FROM ask_conditions")
+                .await
+                .as_deref(),
+            Some("foreclosed")
         );
     }
 

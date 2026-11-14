@@ -4,7 +4,7 @@
 
 use crate::agent_process::process::GoalPauseOwner;
 use crate::mcp::types::{AskUserPayload, McpCallbackRequest, Question};
-use crate::models::question::{PromptAnswers, QuestionAnswer};
+use crate::models::question::{Closure, PromptAnswers, PromptResolution, QuestionAnswer};
 
 use crate::models::TurnYieldReason;
 use crate::orchestrator::Orchestrator;
@@ -55,7 +55,57 @@ pub async fn ask_questions(
     background: bool,
     tool_use_id: Option<&str>,
 ) -> QuestionsOutcome {
-    ask_questions_owned(orch, request, payload, background, tool_use_id, None).await
+    ask_questions_with(
+        orch,
+        request,
+        payload,
+        background,
+        tool_use_id,
+        AskExtras::default(),
+    )
+    .await
+}
+
+/// What an ask carries beside its questions: the asker's `context`, and the
+/// validated `moot_when` that closes it by itself.
+#[derive(Debug, Clone, Default)]
+pub struct AskExtras {
+    pub context: Option<String>,
+    pub moot_when: Option<crate::execution::gates::ask_conditions::MootWhen>,
+}
+
+/// [`ask_questions`] with the ask's context and `moot_when`.
+pub async fn ask_questions_with(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload: AskUserPayload,
+    background: bool,
+    tool_use_id: Option<&str>,
+    extras: AskExtras,
+) -> QuestionsOutcome {
+    ask_questions_owned(
+        orch,
+        request,
+        payload,
+        background,
+        tool_use_id,
+        None,
+        extras,
+    )
+    .await
+}
+
+/// The question's canonical URI beneath its asker's home, when that home has a
+/// questions resource the parser resolves. A sub-agent task's does not yet
+/// (cairn/4772), and a URI nothing resolves is worse than none.
+pub(crate) fn question_uri_under_home(home_uri: &str, segment: &str) -> Option<String> {
+    let uri = format!("{home_uri}/questions/{segment}");
+    let resource = cairn_uri::parse_uri(&uri)?;
+    matches!(
+        cairn_uri::delegate_thread_descendant(resource),
+        Ok(cairn_uri::CairnResource::NodeQuestion { .. })
+    )
+    .then_some(uri)
 }
 
 /// What asking returns to the asking call: the text the agent reads and, when
@@ -82,22 +132,99 @@ impl From<String> for QuestionsOutcome {
     }
 }
 
-/// A recorded answer as broadcast to an inline waiter: the answers keyed by
-/// question index and their one rendering for the agent to read.
+/// A recorded resolution as broadcast to an inline waiter: how the question
+/// was resolved, its plain rendering, and the framed text the asker reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnsweredPrompt {
-    pub answers: PromptAnswers,
+    pub resolution: PromptResolution,
     pub rendered: String,
+    /// The resolution as the asker reads it, naming the question's URI and
+    /// text so it still says which question after compaction.
+    pub framed: String,
+    pub uri: Option<String>,
 }
 
 impl From<AnsweredPrompt> for QuestionsOutcome {
     fn from(answered: AnsweredPrompt) -> Self {
         Self {
-            text: answered.rendered,
-            answers: Some(answered.answers.into_answers()),
-            uri: None,
+            text: answered.framed,
+            answers: answered
+                .resolution
+                .answers()
+                .map(|answers| answers.clone().into_answers()),
+            uri: answered.uri,
             prompt_id: None,
         }
+    }
+}
+
+/// The first question's text on one line, cut short, for a framing that has
+/// to say which question without restating it.
+fn question_line(questions: &[Question]) -> Option<String> {
+    const LIMIT: usize = 100;
+    let line = questions.first()?.question.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(match line.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_string(),
+    })
+}
+
+/// A resolution as the asker reads it when it reaches them as a message or a
+/// tool result: which question (its URI and first line), and how it closed.
+pub(crate) fn framed_resolution(
+    address: Option<&str>,
+    questions: &[Question],
+    resolution: &PromptResolution,
+    rendered: &str,
+    closer: &str,
+) -> String {
+    let mut subject = match address {
+        Some(address) => format!("Your question {address}"),
+        None => "Your question".to_string(),
+    };
+    if let Some(line) = question_line(questions) {
+        subject.push_str(&format!(" (\"{line}\")"));
+    }
+    let with_note = |note: Option<&str>| match note {
+        Some(note) => format!(": {note}"),
+        None => ".".to_string(),
+    };
+    match resolution {
+        PromptResolution::Answered(_) => format!("{subject} was answered:\n\n{rendered}"),
+        PromptResolution::Closed(Closure::Handled { note }) => format!(
+            "{subject} was marked handled by {closer}{}",
+            with_note(note.as_deref())
+        ),
+        PromptResolution::Closed(Closure::Moot {
+            condition: Some(condition),
+            ..
+        }) => format!("{subject} closed itself as moot: {}", condition.reason),
+        PromptResolution::Closed(Closure::Moot { note, .. }) => format!(
+            "{subject} was closed as moot by {closer}{}",
+            with_note(note.as_deref())
+        ),
+    }
+}
+
+/// Who closed a question, as its asker is told: the agent whose home patched
+/// the question's resource, or the operator for every operator surface.
+fn closer_label(provenance: Option<&crate::turns::queries::ResolutionProvenance>) -> String {
+    match provenance {
+        Some(provenance)
+            if matches!(
+                provenance.surface,
+                cairn_common::identity::AppearanceTransport::ResourcePatch
+            ) =>
+        {
+            provenance
+                .actor
+                .clone()
+                .unwrap_or_else(|| "an agent".to_string())
+        }
+        _ => "the operator".to_string(),
     }
 }
 
@@ -110,7 +237,16 @@ pub(crate) async fn ask_mcp_questions(
     payload: AskUserPayload,
     mcp_wait_id: &str,
 ) -> QuestionsOutcome {
-    ask_questions_owned(orch, request, payload, true, None, Some(mcp_wait_id)).await
+    ask_questions_owned(
+        orch,
+        request,
+        payload,
+        true,
+        None,
+        Some(mcp_wait_id),
+        AskExtras::default(),
+    )
+    .await
 }
 
 async fn ask_questions_owned(
@@ -120,6 +256,7 @@ async fn ask_questions_owned(
     background: bool,
     tool_use_id: Option<&str>,
     mcp_wait_id: Option<&str>,
+    extras: AskExtras,
 ) -> QuestionsOutcome {
     log::info!(
         "Prompting user for cwd={} with {} questions (background={})",
@@ -154,17 +291,7 @@ async fn ask_questions_owned(
     };
 
     // Look up the run and store prompt in DB
-    let (
-        run_id,
-        prompt_id,
-        uri_segment,
-        node_segment,
-        project_key,
-        issue_number,
-        exec_seq,
-        current_turn_id,
-        owns_turn_loop,
-    ) = {
+    let (run_id, prompt_id, uri_segment, question_uri, current_turn_id, owns_turn_loop) = {
         // Owned-loop backends (OpenRouter) suspend the turn on a foreground
         // question instead of inline-waiting and entering AwaitingHost.
         let owns_turn_loop = !background && orch.process_state.run_owns_turn_loop(&ctx.run_id);
@@ -204,6 +331,7 @@ async fn ask_questions_owned(
                 let issue_id = ctx.issue_id.clone();
                 let request_tool_use_id = request_tool_use_id.clone();
                 let mcp_wait_id = mcp_wait_id.clone();
+                let extras = extras.clone();
                 Box::pin(async move {
                     // Stable per-node ordinal: count this node's existing prompts.
                     let mut count_rows = conn
@@ -241,9 +369,9 @@ async fn ask_questions_owned(
                         INSERT INTO prompts (
                             id, run_id, job_id, questions, response,
                             created_at, answered_at, turn_id, uri_segment, tool_use_id,
-                            mcp_wait_id, background
+                            mcp_wait_id, background, context
                         )
-                        SELECT ?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, ?10
+                        SELECT ?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11
                         WHERE ?9 IS NULL OR EXISTS (
                             SELECT 1 FROM agent_waits
                             WHERE id = ?9 AND state IN ('pending', 'resolving')
@@ -259,12 +387,44 @@ async fn ask_questions_owned(
                                 uri_segment.as_str(),
                                 request_tool_use_id.as_deref(),
                                 mcp_wait_id.as_deref(),
-                                i64::from(background)
+                                i64::from(background),
+                                extras.context.as_deref()
                             ],
                         )
                         .await?;
                     if mcp_wait_id.is_some() && inserted == 0 {
                         return Err(DbError::internal("MCP continuation wait is not active"));
+                    }
+
+                    // Every asker with a home has the question's address: a
+                    // thread's beneath its name, a node's beneath its coordinate.
+                    let home_uri = match job_id.as_deref() {
+                        Some(job_id) => {
+                            crate::jobs::queries::home_uri_for_job_conn(conn, job_id).await?
+                        }
+                        None => None,
+                    };
+                    let question_uri = home_uri
+                        .as_deref()
+                        .and_then(|home| question_uri_under_home(home, &uri_segment));
+                    // The condition commits with its question, so no sweep ever
+                    // sees a question whose moot_when is still to be written.
+                    if let Some(moot_when) = extras.moot_when.as_ref() {
+                        let Some(job_id) = job_id.as_deref() else {
+                            return Err(DbError::internal(
+                                "a question with moot_when needs an asking job",
+                            ));
+                        };
+                        crate::execution::gates::ask_conditions::insert_question_condition_conn(
+                            conn,
+                            &prompt_id,
+                            job_id,
+                            issue_id.as_deref(),
+                            moot_when,
+                            home_uri.as_deref(),
+                            i64::from(now),
+                        )
+                        .await?;
                     }
 
                     // Background prompts never yield the parent turn.
@@ -303,18 +463,26 @@ async fn ask_questions_owned(
                         }
                     }
 
-                    Ok((yielded_turn, uri_segment, node_segment))
+                    Ok((yielded_turn, uri_segment, node_segment, question_uri))
                 })
             })
             .await;
 
-        let (yielded_turn, uri_segment, node_segment) = match insert_result {
+        let (yielded_turn, uri_segment, node_segment, question_uri) = match insert_result {
             Ok(tuple) => tuple,
             Err(e) => {
                 log::error!("Failed to insert prompt: {}", e);
                 return format!("Failed to store prompt: {}", e).into();
             }
         };
+        if extras.moot_when.is_some() {
+            // A clock clause moves the sweep's next due instant.
+            crate::execution::gates::sweep::notify_gate_evidence_changed();
+            let _ = services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "ask_conditions", "action": "insert"}),
+            );
+        }
 
         // Typed emit: the question is the actionable fact. Build the event
         // with the full question payload inline so the watch long-poll returns
@@ -411,10 +579,7 @@ async fn ask_questions_owned(
             ctx.run_id,
             prompt_id,
             uri_segment,
-            node_segment,
-            ctx.project_key,
-            ctx.issue_number,
-            ctx.exec_seq,
+            question_uri,
             current_turn_id,
             owns_turn_loop,
         )
@@ -428,23 +593,13 @@ async fn ask_questions_owned(
     let _ = services.emitter.emit("db-change", run_change);
 
     if background {
-        let question_uri = match (issue_number, node_segment.as_deref()) {
-            (Some(number), Some(node)) => Some(cairn_uri::build_node_question_uri(
-                &project_key,
-                number,
-                exec_seq.unwrap_or(1),
-                node,
-                &uri_segment,
-            )),
-            _ => None,
-        };
-        let _ = &current_turn_id;
         return QuestionsOutcome {
             text: match &question_uri {
                 Some(uri) => format!(
-                    "Question '{}' recorded; keep working. Its answer reaches you when it is \
-                     given, at your next tool call or by resuming you if your turn has ended, \
-                     and stays readable at {}",
+                    "Question '{}' is open at {}; keep working. Its answer reaches you when it is \
+                     given, at your next tool call or by resuming you if your turn has ended. \
+                     That URI is the question's one home, with its context: point at it \
+                     whenever you mention the question.",
                     uri_segment, uri
                 ),
                 None => format!(
@@ -529,6 +684,7 @@ async fn ask_questions_owned(
                     Err(e) => log::warn!("Failed to ensure successor turn: {}", e),
                 }
             }
+            let _ = &question_uri;
 
             // Run stays Live — no status change needed on prompt response.
             // The successor turn handles the semantic state change.
@@ -560,7 +716,10 @@ async fn ask_questions_owned(
                     .emit("db-change", crate::notify::issue_db_change(issue, "update"));
             }
 
-            answered.into()
+            QuestionsOutcome {
+                prompt_id: Some(prompt_id.clone()),
+                ..answered.into()
+            }
         }
         Ok(Err(msg)) => {
             log::warn!("Prompt wait channel ended for run {}: {}", run_id, msg);
@@ -592,6 +751,9 @@ async fn ask_questions_owned(
 pub struct PromptAnswerOutcome {
     pub duplicate: bool,
     pub response: String,
+    /// `answered`, `handled` or `moot`: the resolution this call recorded, or
+    /// for a duplicate the one already recorded.
+    pub form: &'static str,
     /// The question had been withdrawn when this answer reached it: what the
     /// answer surface shows instead of an acknowledgement. Nothing was
     /// recorded, replayed, or resumed.
@@ -608,6 +770,7 @@ impl PromptAnswerOutcome {
         Self {
             duplicate: false,
             response: String::new(),
+            form: "withdrawn",
             withdrawn: Some(withdrawn_question_notice(cause)),
             continuation: None,
         }
@@ -617,23 +780,35 @@ impl PromptAnswerOutcome {
     /// question `segment`. The answer is always reported as applied; how it
     /// reached the job is said beside it, never in place of it.
     pub fn answered_summary(&self, segment: &str) -> String {
+        let done = match self.form {
+            "handled" => format!("Marked question {segment} handled"),
+            "moot" => format!("Closed question {segment} as moot"),
+            _ => format!("Answered question {segment}"),
+        };
         match &self.continuation {
-            None | Some(HostWaitContinuation::Driven) => format!("Answered question {segment}"),
-            Some(HostWaitContinuation::Queued) => format!(
-                "Answered question {segment}; the job was busy, so the answer was queued for \
-                 its next turn"
-            ),
+            None | Some(HostWaitContinuation::Driven) => done,
+            Some(HostWaitContinuation::Queued) => {
+                format!("{done}; the job was busy, so the answer was queued for its next turn")
+            }
             Some(HostWaitContinuation::AtNextToolBoundary) => format!(
-                "Answered question {segment}; the agent is mid-turn and receives the answer at \
-                 its next tool call"
+                "{done}; the agent is mid-turn and receives the answer at its next tool call"
             ),
             Some(HostWaitContinuation::AfterCurrentWait) => format!(
-                "Answered question {segment}; the agent is waiting on something else and \
-                 receives the answer when it continues"
+                "{done}; the agent is waiting on something else and receives the answer when \
+                 it continues"
             ),
-            Some(HostWaitContinuation::Refused { reason }) => format!(
-                "Answered question {segment} (recorded), but the job could not continue: {reason}"
-            ),
+            Some(HostWaitContinuation::Refused { reason }) => {
+                format!("{done} (recorded), but the job could not continue: {reason}")
+            }
+        }
+    }
+
+    /// What an answer surface says about a duplicate: which resolution won.
+    pub fn duplicate_summary(&self, segment: &str) -> String {
+        match self.form {
+            "handled" => format!("Question {segment} was already marked handled"),
+            "moot" => format!("Question {segment} was already closed as moot"),
+            _ => format!("Question {segment} was already answered"),
         }
     }
 }
@@ -686,8 +861,10 @@ pub(crate) async fn withdraw_prompt_conn(
     Ok(changed > 0)
 }
 
-/// Withdraw every pending question raised on one of `job_id`'s turns. A
-/// question owned by an MCP wait has no turn and is left to that wait.
+/// Withdraw every pending blocking question raised on one of `job_id`'s
+/// turns. A question owned by an MCP wait has no turn and is left to that
+/// wait; a non-blocking question belongs to the job rather than the turn, so
+/// stopping the work leaves it open for whoever continues the job.
 pub(crate) async fn withdraw_job_prompts_conn(
     conn: &cairn_db::storage::TrackedConnection,
     job_id: &str,
@@ -698,7 +875,7 @@ pub(crate) async fn withdraw_job_prompts_conn(
     let withdrawn = conn
         .execute(
             "UPDATE prompts SET withdrawn_at = ?2, withdrawn_cause = ?3
-              WHERE response IS NULL AND withdrawn_at IS NULL
+              WHERE response IS NULL AND withdrawn_at IS NULL AND background = 0
                 AND turn_id IN (SELECT id FROM turns WHERE job_id = ?1)",
             params![job_id, now, cause],
         )
@@ -759,12 +936,16 @@ struct PromptResume {
     issue_id: Option<String>,
     /// Set only for a blocking ask: the call the answer is the result of.
     tool_use_id: Option<String>,
-    uri_segment: Option<String>,
     duplicate: bool,
     /// The ask did not suspend its turn, so no inline waiter is ever this answer's.
     background: bool,
     /// The answer committed with a queued row for the asker, delivered this way.
     boundary_delivery: Option<crate::messages::queued::Delivery>,
+    /// For a duplicate, the resolution already recorded.
+    recorded: Option<String>,
+    question_uri: Option<String>,
+    /// What the asker reads: [`framed_resolution`].
+    framed: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -807,6 +988,70 @@ struct PromptAnswerItem {
     selection: Option<String>,
     selections: Option<Vec<String>>,
     text: Option<String>,
+}
+
+/// `payload.<key>` as a resolution flag: `true` asks for it; absent, null or
+/// `false` does not.
+fn resolution_flag(payload: &Value, key: &str) -> Result<bool, String> {
+    match payload.get(key) {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(false),
+        Some(Value::Bool(true)) => Ok(true),
+        Some(_) => Err(format!("payload.{key} is true or omitted")),
+    }
+}
+
+/// Normalize a resolution payload: an answer (`answer` or `answers[]`),
+/// `{handled:true, note?}`, or `{moot:true, note?}`. Exactly one form.
+pub(crate) fn normalize_prompt_resolution_payload(
+    questions: &[Question],
+    payload: &Value,
+) -> Result<PromptResolution, String> {
+    let answering = payload.get("answer").is_some() || payload.get("answers").is_some();
+    let handled = resolution_flag(payload, "handled")?;
+    let moot = resolution_flag(payload, "moot")?;
+    let forms: Vec<&str> = [
+        (answering, "answer/answers"),
+        (handled, "handled:true"),
+        (moot, "moot:true"),
+    ]
+    .into_iter()
+    .filter_map(|(given, name)| given.then_some(name))
+    .collect();
+    if forms.len() > 1 {
+        return Err(format!(
+            "a question resolves one way: answer or answers, handled:true, or moot:true; this \
+             payload gives {}",
+            forms.join(" and ")
+        ));
+    }
+    let note = match payload.get("note") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(note)) => Some(note.trim()).filter(|note| !note.is_empty()),
+        Some(_) => return Err("payload.note is a string".to_string()),
+    }
+    .map(str::to_string);
+    if handled {
+        return Ok(PromptResolution::Closed(Closure::Handled { note }));
+    }
+    if moot {
+        return Ok(PromptResolution::Closed(Closure::Moot {
+            note,
+            condition: None,
+        }));
+    }
+    if note.is_some() {
+        return Err(
+            "payload.note rides on handled:true or moot:true; an answer is its own text"
+                .to_string(),
+        );
+    }
+    if !answering {
+        return Err(
+            "payload.answer or payload.answers is required (or handled:true or moot:true)"
+                .to_string(),
+        );
+    }
+    normalize_prompt_answer_payload(questions, payload).map(PromptResolution::Answered)
 }
 
 fn parse_prompt_questions(questions_json: &str) -> Result<Vec<Question>, String> {
@@ -947,7 +1192,63 @@ pub async fn answer_node_question(
     prompt_segment: &str,
     payload: &Value,
 ) -> Result<PromptAnswerOutcome, String> {
-    let (prompt_id, answers, home_uri) = resolve_node_question(
+    answer_node_question_as(
+        orch,
+        None,
+        project_key,
+        issue_number,
+        exec_seq,
+        node_segment,
+        prompt_segment,
+        payload,
+    )
+    .await
+}
+
+/// The canonical home of the job a run belongs to.
+async fn home_uri_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+        .await
+        .ok()?;
+    let run_id = run_id.to_string();
+    db.read(move |conn| {
+        let run_id = run_id.clone();
+        Box::pin(async move {
+            let job = crate::storage::query_opt_text_conn(
+                conn,
+                "SELECT job_id FROM runs WHERE id = ?1",
+                params![run_id.as_str()],
+            )
+            .await?;
+            match job {
+                Some(job) => crate::jobs::queries::home_uri_for_job_conn(conn, &job).await,
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// [`answer_node_question`] by the agent whose run patched the question's
+/// resource: its home is the resolution's actor, which the asker is told.
+#[allow(clippy::too_many_arguments)]
+pub async fn answer_node_question_as(
+    orch: &Orchestrator,
+    caller_run_id: Option<&str>,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    node_segment: &str,
+    prompt_segment: &str,
+    payload: &Value,
+) -> Result<PromptAnswerOutcome, String> {
+    let caller_home = match caller_run_id {
+        Some(run_id) => home_uri_for_run(orch, run_id).await,
+        None => None,
+    };
+    let (prompt_id, resolution, home_uri) = resolve_node_question(
         orch,
         project_key,
         issue_number,
@@ -964,23 +1265,23 @@ pub async fn answer_node_question(
     // that resolves to nothing — into every resolution receipt a thread ever
     // writes. The fallback keeps issue behavior identical when a job somehow has
     // no home to report.
-    let actor = home_uri.unwrap_or_else(|| {
+    let actor = caller_home.or(home_uri).unwrap_or_else(|| {
         format!("cairn://p/{project_key}/{issue_number}/{exec_seq}/{node_segment}")
     });
-    answer_prompt_id(
+    resolve_prompt(
         orch,
         &prompt_id,
-        answers,
-        crate::turns::queries::ResolutionProvenance::new(
+        resolution,
+        Some(crate::turns::queries::ResolutionProvenance::new(
             cairn_common::identity::AppearanceTransport::ResourcePatch,
             Some(actor),
-        ),
+        )),
     )
     .await
 }
 
-/// Resolve a node-coordinate question to its prompt, its normalized answers,
-/// and the answering job's canonical home URI.
+/// Resolve a node-coordinate question to its prompt, its normalized
+/// resolution, and the answering job's canonical home URI.
 async fn resolve_node_question(
     orch: &Orchestrator,
     project_key: &str,
@@ -989,7 +1290,7 @@ async fn resolve_node_question(
     node_segment: &str,
     prompt_segment: &str,
     payload: &Value,
-) -> Result<(String, PromptAnswers, Option<String>), String> {
+) -> Result<(String, PromptResolution, Option<String>), String> {
     let (prompt_id, questions_json, home_uri) = lookup_prompt_for_node_question(
         orch,
         project_key,
@@ -1000,8 +1301,8 @@ async fn resolve_node_question(
     )
     .await?;
     let questions = parse_prompt_questions(&questions_json)?;
-    let answers = normalize_prompt_answer_payload(&questions, payload)?;
-    Ok((prompt_id, answers, home_uri))
+    let resolution = normalize_prompt_resolution_payload(&questions, payload)?;
+    Ok((prompt_id, resolution, home_uri))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1015,7 +1316,7 @@ pub async fn answer_node_question_with_provenance(
     payload: &Value,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    let (prompt_id, answers, _home_uri) = resolve_node_question(
+    let (prompt_id, resolution, _home_uri) = resolve_node_question(
         orch,
         project_key,
         issue_number,
@@ -1025,12 +1326,13 @@ pub async fn answer_node_question_with_provenance(
         payload,
     )
     .await?;
-    answer_prompt_id(orch, &prompt_id, answers, provenance).await
+    resolve_prompt(orch, &prompt_id, resolution, Some(provenance)).await
 }
 
-/// Answer a prompt by id from an answer payload (`answer` or `answers[]`), the
-/// shape every answer surface sends. Normalized against the prompt's own
-/// questions, read from the database that owns it.
+/// Resolve a prompt by id from a resolution payload (`answer`, `answers[]`,
+/// `handled:true` or `moot:true`), the shape every answer surface sends.
+/// Normalized against the prompt's own questions, read from the database that
+/// owns it.
 pub async fn answer_prompt_payload(
     orch: &Orchestrator,
     prompt_id: &str,
@@ -1041,8 +1343,8 @@ pub async fn answer_prompt_payload(
         .await
         .map_err(|error| error.to_string())?;
     let questions = load_prompt_questions(&db, prompt_id).await?;
-    let answers = normalize_prompt_answer_payload(&questions, payload)?;
-    answer_prompt_id(orch, prompt_id, answers, provenance).await
+    let resolution = normalize_prompt_resolution_payload(&questions, payload)?;
+    resolve_prompt(orch, prompt_id, resolution, Some(provenance)).await
 }
 
 pub async fn answer_prompt_id(
@@ -1051,16 +1353,41 @@ pub async fn answer_prompt_id(
     answers: PromptAnswers,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    answer_prompt_id_impl(orch, prompt_id, answers, provenance, true).await
+    resolve_prompt(
+        orch,
+        prompt_id,
+        PromptResolution::Answered(answers),
+        Some(provenance),
+    )
+    .await
 }
 
-pub(crate) async fn answer_prompt_id_domain(
+/// The one record-and-deliver path for every way a question closes: an
+/// answer, the operator's handled or moot, and a `moot_when` coming true.
+///
+/// A resolution with provenance came from a surface, and goes through the
+/// ask-resolution ledger that arbitrates between surfaces. One without (a
+/// condition's moot) has no surface to arbitrate: the prompt's own
+/// compare-and-set (`response IS NULL AND withdrawn_at IS NULL`) is its
+/// exactly-once guarantee, and losing it reports a duplicate.
+pub async fn resolve_prompt(
     orch: &Orchestrator,
     prompt_id: &str,
-    answers: PromptAnswers,
+    resolution: PromptResolution,
+    provenance: Option<crate::turns::queries::ResolutionProvenance>,
+) -> Result<PromptAnswerOutcome, String> {
+    let use_gate = provenance.is_some();
+    resolve_prompt_impl(orch, prompt_id, resolution, provenance, use_gate).await
+}
+
+/// A ledger winner's domain action, run by the surface that leased it.
+pub(crate) async fn resolve_prompt_domain(
+    orch: &Orchestrator,
+    prompt_id: &str,
+    resolution: PromptResolution,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    answer_prompt_id_impl(orch, prompt_id, answers, provenance, false).await
+    resolve_prompt_impl(orch, prompt_id, resolution, Some(provenance), false).await
 }
 
 /// A prompt's questions, as stored when it was asked.
@@ -1105,40 +1432,104 @@ fn check_answers_fit(answers: &PromptAnswers, questions: &[Question]) -> Result<
     }
 }
 
-async fn answer_prompt_id_impl(
+/// The prompt facts a resolution is checked against before anything records.
+struct PromptGate {
+    questions: Vec<Question>,
+    /// Already resolved, by any path: its stored response.
+    resolved: Option<String>,
+    mcp_owned: bool,
+}
+
+async fn prompt_gate_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+    prompt_id: &str,
+) -> DbResult<Result<PromptGate, Option<WithdrawalCause>>> {
+    if let Some(cause) = prompt_withdrawal_conn(conn, prompt_id).await? {
+        return Ok(Err(cause));
+    }
+    let questions = load_prompt_questions_conn(conn, prompt_id).await?;
+    let mut rows = conn
+        .query(
+            "SELECT response, mcp_wait_id IS NOT NULL FROM prompts WHERE id = ?1",
+            params![prompt_id],
+        )
+        .await?;
+    let (resolved, mcp_owned) = match rows.next().await? {
+        Some(row) => (row.opt_text(0)?, row.i64(1)? != 0),
+        None => (None, false),
+    };
+    Ok(Ok(PromptGate {
+        questions,
+        resolved,
+        mcp_owned,
+    }))
+}
+
+/// Refuse a resolution that cannot apply to these questions: answers that do
+/// not cover them, or a closure on an MCP tool's input request, which only a
+/// value answers.
+fn check_resolution_fits(
+    resolution: &PromptResolution,
+    questions: &[Question],
+    mcp_owned: bool,
+) -> Result<(), String> {
+    match resolution {
+        PromptResolution::Answered(answers) => check_answers_fit(answers, questions),
+        PromptResolution::Closed(closure) if mcp_owned => Err(format!(
+            "this question is an MCP tool's input request: it takes an answer, not {}",
+            closure.form()
+        )),
+        PromptResolution::Closed(_) => Ok(()),
+    }
+}
+
+/// What a duplicate resolution reports: the one already recorded.
+fn already_resolved(stored: &str, questions: &[Question]) -> PromptAnswerOutcome {
+    let recorded = PromptAnswers::decode_stored(stored);
+    PromptAnswerOutcome {
+        duplicate: true,
+        response: recorded.render(questions),
+        form: recorded.form(),
+        withdrawn: None,
+        continuation: None,
+    }
+}
+
+async fn resolve_prompt_impl(
     orch: &Orchestrator,
     prompt_id: &str,
-    answers: PromptAnswers,
-    provenance: crate::turns::queries::ResolutionProvenance,
+    resolution: PromptResolution,
+    provenance: Option<crate::turns::queries::ResolutionProvenance>,
     use_gate: bool,
 ) -> Result<PromptAnswerOutcome, String> {
-    if use_gate {
+    if let (true, Some(provenance)) = (use_gate, provenance.as_ref()) {
         let gate_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
             .await
             .map_err(|error| error.to_string())?;
         // Ahead of the claim: a withdrawn question has no winner to record, and
-        // claiming one would leave the ledger naming an answer nothing took.
+        // claiming one would leave the ledger naming an answer nothing took. A
+        // question already resolved (by a condition, which claims no ledger
+        // row) reports what resolved it rather than a winner nothing ran.
         let gate = gate_db
             .read(|conn| {
                 let prompt_id = prompt_id.to_string();
-                Box::pin(async move {
-                    if let Some(cause) = prompt_withdrawal_conn(conn, &prompt_id).await? {
-                        return Ok(Err(cause));
-                    }
-                    Ok(Ok(load_prompt_questions_conn(conn, &prompt_id).await?))
-                })
+                Box::pin(async move { prompt_gate_conn(conn, &prompt_id).await })
             })
             .await
             .map_err(|error| error.to_string())?;
-        let questions = match gate {
-            Ok(questions) => questions,
+        let gate = match gate {
+            Ok(gate) => gate,
             Err(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
         };
-        check_answers_fit(&answers, &questions)?;
+        if let Some(stored) = gate.resolved.as_deref() {
+            return Ok(already_resolved(stored, &gate.questions));
+        }
+        let questions = gate.questions;
+        check_resolution_fits(&resolution, &questions, gate.mcp_owned)?;
         let claim = crate::channels::ledger::claim_ask_resolution(
             &gate_db,
             prompt_id,
-            &answers.to_stored(),
+            &resolution.to_stored(),
             provenance.surface,
             provenance.provider.as_deref(),
             provenance.conversation.as_deref(),
@@ -1156,6 +1547,7 @@ async fn answer_prompt_id_impl(
         // were stored by index reads back as legacy text.
         let winning = PromptAnswers::decode_stored(&winner.answer);
         let winning_response = winning.render(&questions);
+        let winning_form = winning.form();
         // The claim winner and the domain-action lease winner are independent.
         // Always execute with the persisted claim winner's identity, even when
         // this caller acquired the lease after losing the claim.
@@ -1167,19 +1559,20 @@ async fn answer_prompt_id_impl(
             return Ok(PromptAnswerOutcome {
                 duplicate: true,
                 response: winning_response,
+                form: winning_form,
                 withdrawn: None,
                 continuation: None,
             });
         };
         // A legacy winner still to run was typed text, so the typed-input
         // parser recovers it; one it cannot read is an ordinary action failure.
-        let result = match winning.into_answers(questions.len()) {
+        let result = match winning.into_resolution(questions.len()) {
             Ok(winning) => {
-                Box::pin(answer_prompt_id_impl(
+                Box::pin(resolve_prompt_impl(
                     orch,
                     prompt_id,
                     winning,
-                    winning_provenance,
+                    Some(winning_provenance),
                     false,
                 ))
                 .await
@@ -1190,11 +1583,25 @@ async fn answer_prompt_id_impl(
         };
         return match result {
             Ok(outcome) if outcome.withdrawn.is_some() => Ok(outcome),
+            // The winner lost the prompt's own compare-and-set to a resolution
+            // that needs no ledger (a condition's moot): the receipt names
+            // what is recorded, not what the winner asked for.
+            Ok(mut outcome) if outcome.duplicate => {
+                crate::channels::ledger::finalize_ask_resolution(
+                    &gate_db,
+                    prompt_id,
+                    &format!("✓ {}: {}", outcome.form, outcome.response),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                outcome.duplicate = true;
+                Ok(outcome)
+            }
             Ok(mut outcome) => {
                 crate::channels::ledger::finalize_ask_resolution(
                     &gate_db,
                     prompt_id,
-                    &format!("✓ answered: {winning_response}"),
+                    &format!("✓ {winning_form}: {winning_response}"),
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
@@ -1224,29 +1631,42 @@ async fn answer_prompt_id_impl(
     let owning_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
         .await
         .map_err(|e| e.to_string())?;
-    let questions = load_prompt_questions(&owning_db, prompt_id).await?;
-    check_answers_fit(&answers, &questions)?;
-    let answered = AnsweredPrompt {
-        rendered: answers.render(&questions),
-        answers,
+    let gate = owning_db
+        .read(|conn| {
+            let prompt_id = prompt_id.to_string();
+            Box::pin(async move { prompt_gate_conn(conn, &prompt_id).await })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let gate = match gate {
+        Ok(gate) => gate,
+        Err(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
     };
-    let response = answered.rendered.clone();
+    let questions = gate.questions;
+    check_resolution_fits(&resolution, &questions, gate.mcp_owned)?;
+    let rendered = resolution.render(&questions);
+    let form = resolution.form();
+    let closer = closer_label(provenance.as_ref());
     let now = chrono::Utc::now().timestamp();
     let prompt_id_owned = prompt_id.to_string();
     let record = owning_db
         .write(|conn| {
             let prompt_id = prompt_id_owned.clone();
-            let answers = answered.answers.clone();
-            let rendered = answered.rendered.clone();
+            let resolution = resolution.clone();
+            let rendered = rendered.clone();
+            let questions = questions.clone();
             let provenance = provenance.clone();
+            let closer = closer.clone();
             let process_state = orch.process_state.clone();
             Box::pin(
                 async move {
                     let result = match record_prompt_response_conn(
                         conn,
                         &prompt_id,
-                        &answers,
+                        &resolution,
                         &rendered,
+                        &questions,
+                        &closer,
                         now,
                         &process_state,
                     )
@@ -1255,11 +1675,13 @@ async fn answer_prompt_id_impl(
                         PromptRecord::Recorded(result) => result,
                         withdrawn @ PromptRecord::Withdrawn(_) => return Ok(withdrawn),
                     };
-                    if !result.duplicate {
+                    // A condition's moot has no surface: its provenance is the
+                    // condition named in the resolution itself.
+                    if let (false, Some(provenance)) = (result.duplicate, provenance.as_ref()) {
                         let surface = provenance.surface_name();
                         conn.execute(
                             "UPDATE prompts SET resolution_id = ?2, resolution_surface = ?3, resolution_provider = ?4, resolution_conversation = ?5, resolution_actor = ?6 WHERE id = ?1",
-                            params![prompt_id, provenance.id, surface, provenance.provider, provenance.conversation, provenance.actor],
+                            params![prompt_id, provenance.id.as_str(), surface, provenance.provider.as_deref(), provenance.conversation.as_deref(), provenance.actor.as_deref()],
                         ).await?;
                     }
                     Ok(PromptRecord::Recorded(result))
@@ -1272,6 +1694,18 @@ async fn answer_prompt_id_impl(
         PromptRecord::Recorded(resume) => resume,
         PromptRecord::Withdrawn(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
     };
+    if resume.duplicate {
+        if let Some(stored) = resume.recorded.as_deref() {
+            return Ok(already_resolved(stored, &questions));
+        }
+    }
+    let answered = AnsweredPrompt {
+        resolution,
+        rendered: rendered.clone(),
+        framed: resume.framed.clone(),
+        uri: resume.question_uri.clone(),
+    };
+    let response = rendered;
     if !resume.duplicate {
         // An operator's rejection of a generation's last candidate ends it
         // here, at the answer, whatever its agent does next.
@@ -1337,6 +1771,7 @@ async fn answer_prompt_id_impl(
         return Ok(PromptAnswerOutcome {
             duplicate: resume.duplicate,
             response,
+            form,
             withdrawn: None,
             continuation: None,
         });
@@ -1366,29 +1801,25 @@ async fn answer_prompt_id_impl(
                     &resume,
                     successor,
                     &answered,
-                    &provenance,
+                    provenance.as_ref(),
                 )
                 .await,
             )
         }
         _ => None,
     };
+    if !resume.duplicate {
+        // An open moot_when on this question latches cleared on the next pass.
+        crate::execution::gates::sweep::notify_gate_evidence_changed();
+    }
 
     Ok(PromptAnswerOutcome {
         duplicate: resume.duplicate,
         response,
+        form,
         withdrawn: None,
         continuation,
     })
-}
-
-/// An answer as the agent reads it when it is not the result of a waiting call.
-/// Unframed it would read as a stray user turn.
-fn framed_answer(segment: Option<&str>, rendered: &str) -> String {
-    match segment {
-        Some(segment) => format!("Your question {segment} was answered:\n\n{rendered}"),
-        None => format!("Your question was answered:\n\n{rendered}"),
-    }
 }
 
 /// Whether an inline waiter is this question's own. `is_awaiting_host` says only
@@ -1479,26 +1910,26 @@ async fn resume_answered_question(
     resume: &PromptResume,
     successor: &HostWaitSuccessor,
     answered: &AnsweredPrompt,
-    provenance: &crate::turns::queries::ResolutionProvenance,
+    provenance: Option<&crate::turns::queries::ResolutionProvenance>,
 ) -> HostWaitContinuation {
     let Some(job_id) = resume.job_id.as_deref() else {
         return HostWaitContinuation::Refused {
             reason: "the question's run has no owning job".to_string(),
         };
     };
-    let framed = framed_answer(resume.uri_segment.as_deref(), &answered.rendered);
+    let framed = answered.framed.clone();
     let answers_open_tool_call = resume.tool_use_id.is_some();
     let suppress_user_event = match (resume.tool_use_id.as_deref(), resume.session_id.as_deref()) {
         (Some(tool_use_id), Some(session_id)) => {
             let now = chrono::Utc::now().timestamp() as i32;
-            let receipt = cairn_db::models::ResolutionReceipt {
+            let receipt = provenance.map(|provenance| cairn_db::models::ResolutionReceipt {
                 id: Some(provenance.id.clone()),
                 surface: provenance.surface_name(),
                 provider: provenance.provider.clone(),
                 conversation: provenance.conversation.clone(),
                 actor: provenance.actor.clone(),
                 resolved_at: now as i64 * 1000,
-            };
+            });
             match crate::execution::jobs::store_blocking_write_result_with_resolution(
                 orch,
                 &resume.run_id,
@@ -1510,7 +1941,7 @@ async fn resume_answered_question(
                 false,
                 now,
                 resume.predecessor_turn_id.as_deref(),
-                Some(&receipt),
+                receipt.as_ref(),
             ) {
                 Ok(()) => true,
                 Err(error) => {
@@ -1565,6 +1996,111 @@ async fn resume_answered_question(
             }
         },
     }
+}
+
+/// One question as the operator's surfaces render it, by its canonical URI
+/// or its prompt id: state, questions, context, `moot_when` and resolution.
+pub async fn get_question(
+    orch: &Orchestrator,
+    uri: Option<&str>,
+    prompt_id: Option<&str>,
+) -> Result<Value, String> {
+    use crate::resources::node::QuestionRef;
+    let reference = match (uri, prompt_id) {
+        (Some(uri), None) => QuestionRef::Uri(uri),
+        (None, Some(prompt_id)) => QuestionRef::Prompt(prompt_id),
+        _ => return Err("get_question takes exactly one of uri or promptId".to_string()),
+    };
+    crate::resources::node::question_view(orch, reference).await
+}
+
+/// The asker takes its own question back (`{withdraw:true}`). Only a run of
+/// the asking job may; anyone else closes it with `moot:true`. Nobody is
+/// woken, the operator's entry resolves, and an open `moot_when` latches
+/// cleared on the next sweep. Returns the reply line.
+pub async fn withdraw_node_question(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    node_segment: &str,
+    prompt_segment: &str,
+) -> Result<String, String> {
+    let (prompt_id, _questions, _home) = lookup_prompt_for_node_question(
+        orch,
+        project_key,
+        issue_number,
+        exec_seq,
+        node_segment,
+        prompt_segment,
+    )
+    .await?;
+    let caller_run = request.run_id.clone().ok_or_else(|| {
+        "only its asker can withdraw a question; answer {moot:true} to close it".to_string()
+    })?;
+    let db = crate::execution::routing::owning_db_for_prompt(&orch.db, &prompt_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    let outcome = db
+        .write(|conn| {
+            let prompt_id = prompt_id.clone();
+            let caller_run = caller_run.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COALESCE(p.job_id, r.job_id), p.response IS NOT NULL,
+                                p.withdrawn_at IS NOT NULL,
+                                (SELECT job_id FROM runs WHERE id = ?2)
+                           FROM prompts p JOIN runs r ON r.id = p.run_id
+                          WHERE p.id = ?1",
+                        params![prompt_id.as_str(), caller_run.as_str()],
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(Err("question not found".to_string()));
+                };
+                let asker = row.opt_text(0)?;
+                let resolved = row.i64(1)? != 0;
+                let withdrawn = row.i64(2)? != 0;
+                let caller = row.opt_text(3)?;
+                drop(rows);
+                if asker.is_none() || asker != caller {
+                    return Ok(Err(
+                        "only its asker can withdraw it; answer {moot:true} to close it"
+                            .to_string(),
+                    ));
+                }
+                if resolved {
+                    return Ok(Err(
+                        "it is already resolved; nothing to withdraw".to_string()
+                    ));
+                }
+                if withdrawn {
+                    return Ok(Ok(false));
+                }
+                Ok(Ok(withdraw_prompt_conn(
+                    conn,
+                    &prompt_id,
+                    WithdrawalCause::Retracted,
+                    now,
+                )
+                .await?))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|refusal| format!("Question {prompt_segment}: {refusal}"))?;
+    if !outcome {
+        return Ok(format!("Question {prompt_segment} was already withdrawn"));
+    }
+    let change = crate::notify::prompt_db_change_for_id(&db, &prompt_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
+    crate::execution::gates::sweep::notify_gate_evidence_changed();
+    Ok(format!(
+        "Withdrew question {prompt_segment}; its entry resolves for the operator and nobody is woken"
+    ))
 }
 
 async fn lookup_prompt_for_node_question(
@@ -1640,11 +2176,14 @@ async fn lookup_prompt_for_node_question(
         .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_prompt_response_conn(
     conn: &cairn_db::storage::TrackedConnection,
     prompt_id: &str,
-    answers: &PromptAnswers,
+    resolution: &PromptResolution,
     rendered: &str,
+    questions: &[Question],
+    closer: &str,
     answered_at: i64,
     process_state: &crate::agent_process::process::AgentProcessState,
 ) -> DbResult<PromptRecord> {
@@ -1653,21 +2192,29 @@ async fn record_prompt_response_conn(
     if let Some(cause) = prompt_withdrawal_conn(conn, prompt_id).await? {
         return Ok(PromptRecord::Withdrawn(cause));
     }
-    let mcp_claim = super::mcp_continuation::record_and_claim_answer_conn(
-        conn,
-        prompt_id,
-        answers,
-        answered_at.saturating_mul(1000),
-    )
-    .await?;
+    // Only an answer feeds an MCP tool's input; a closure was refused before
+    // this transaction for an MCP-owned question.
+    let mcp_claim = match resolution {
+        PromptResolution::Answered(answers) => {
+            super::mcp_continuation::record_and_claim_answer_conn(
+                conn,
+                prompt_id,
+                answers,
+                answered_at.saturating_mul(1000),
+            )
+            .await?
+        }
+        PromptResolution::Closed(_) => None,
+    };
     let mut rows = conn
         .query(
             "
             SELECT p.run_id, r.issue_id, p.turn_id, r.job_id, r.session_id,
                    p.tool_use_id,
-                   CASE WHEN p.response IS NULL THEN 0 ELSE 1 END,
+                   p.response,
                    p.uri_segment,
-                   p.background
+                   p.background,
+                   COALESCE(p.job_id, r.job_id)
             FROM prompts p
             JOIN runs r ON p.run_id = r.id
             WHERE p.id = ?1
@@ -1686,9 +2233,25 @@ async fn record_prompt_response_conn(
     let job_id = row.opt_text(3)?;
     let session_id = row.opt_text(4)?;
     let tool_use_id = row.opt_text(5)?;
-    let already_answered = row.i64(6)? != 0;
+    let recorded = row.opt_text(6)?;
+    let already_answered = recorded.is_some();
     let uri_segment = row.opt_text(7)?;
     let background = row.i64(8)? != 0;
+    let prompt_job_id = row.opt_text(9)?;
+    drop(rows);
+    let question_uri = match (prompt_job_id.as_deref(), uri_segment.as_deref()) {
+        (Some(job), Some(segment)) => crate::jobs::queries::home_uri_for_job_conn(conn, job)
+            .await?
+            .and_then(|home| question_uri_under_home(&home, segment)),
+        _ => None,
+    };
+    let framed = framed_resolution(
+        question_uri.as_deref().or(uri_segment.as_deref()),
+        questions,
+        resolution,
+        rendered,
+        closer,
+    );
     let (mcp_wait_id, mcp_duplicate) = match mcp_claim {
         Some(super::mcp_continuation::AnswerClaim::Claimed { wait_id, .. }) => {
             (Some(wait_id), false)
@@ -1710,7 +2273,7 @@ async fn record_prompt_response_conn(
             SET response = ?1, answered_at = ?2
             WHERE id = ?3 AND response IS NULL AND withdrawn_at IS NULL
             ",
-            params![answers.to_stored(), answered_at, prompt_id],
+            params![resolution.to_stored(), answered_at, prompt_id],
         )
         .await?
             == 0
@@ -1776,7 +2339,7 @@ async fn record_prompt_response_conn(
             conn,
             prompt_id,
             job_id,
-            &framed_answer(uri_segment.as_deref(), rendered),
+            &framed,
             delivery,
             answered_at,
         )
@@ -1799,10 +2362,12 @@ async fn record_prompt_response_conn(
         job_id,
         issue_id,
         tool_use_id,
-        uri_segment,
         duplicate,
         background,
         boundary_delivery,
+        recorded,
+        question_uri,
+        framed,
     })))
 }
 

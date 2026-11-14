@@ -178,12 +178,16 @@ impl LiveWork {
             .await
             .map_err(read("pending permissions"))?,
         );
+        // A non-blocking question belongs to the job, not to the session
+        // being killed: it stays open, and its answer reaches the successor
+        // session through the queue.
         self.questions.extend(
             db.query_all(
                 "SELECT p.id FROM prompts p
                    LEFT JOIN runs r ON r.id = p.run_id
                   WHERE COALESCE(p.job_id, r.job_id) = ?1
-                    AND p.response IS NULL AND p.withdrawn_at IS NULL",
+                    AND p.response IS NULL AND p.withdrawn_at IS NULL
+                    AND p.background = 0",
                 params![job],
                 |row| row.text(0),
             )

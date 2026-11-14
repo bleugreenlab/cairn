@@ -68,11 +68,121 @@ pub struct PromptAnswers {
     answers: Vec<QuestionAnswer>,
 }
 
+/// The condition whose coming true closed a question as moot by itself: the
+/// `ask_conditions` row and its rendered clauses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MootCondition {
+    pub id: String,
+    pub reason: String,
+}
+
+/// A question resolved without an answer: the operator did the thing outside
+/// Cairn (`handled`), or it no longer needs one (`moot`), by the operator's
+/// hand or by its `moot_when` coming true (`condition`).
+///
+/// Stored in `prompts.response` as an object tagged by `form`, beside the
+/// answer array, so `response IS NULL` still means exactly "unresolved".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "form", rename_all = "snake_case")]
+pub enum Closure {
+    Handled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    Moot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        condition: Option<MootCondition>,
+    },
+}
+
+impl Closure {
+    pub fn form(&self) -> &'static str {
+        match self {
+            Closure::Handled { .. } => "handled",
+            Closure::Moot { .. } => "moot",
+        }
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Closure::Handled { note } | Closure::Moot { note, .. } => note.as_deref(),
+        }
+    }
+
+    pub fn condition(&self) -> Option<&MootCondition> {
+        match self {
+            Closure::Moot { condition, .. } => condition.as_ref(),
+            Closure::Handled { .. } => None,
+        }
+    }
+
+    /// One line a reader sees in place of an answer.
+    pub fn render(&self) -> String {
+        let head = match self {
+            Closure::Handled { .. } => "Handled".to_string(),
+            Closure::Moot {
+                condition: Some(condition),
+                ..
+            } => format!("Moot: closed itself because {}", condition.reason),
+            Closure::Moot { .. } => "Moot".to_string(),
+        };
+        match self.note() {
+            Some(note) => format!("{head}: {note}"),
+            None => head,
+        }
+    }
+}
+
+/// How a question was resolved. Every resolution is recorded in
+/// `prompts.response` and delivered to the asker through one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptResolution {
+    Answered(PromptAnswers),
+    Closed(Closure),
+}
+
+impl PromptResolution {
+    pub fn to_stored(&self) -> String {
+        match self {
+            PromptResolution::Answered(answers) => answers.to_stored(),
+            PromptResolution::Closed(closure) => {
+                serde_json::to_string(closure).expect("a closure always serializes")
+            }
+        }
+    }
+
+    /// `answered`, `handled` or `moot`: the question's state once resolved.
+    pub fn form(&self) -> &'static str {
+        match self {
+            PromptResolution::Answered(_) => "answered",
+            PromptResolution::Closed(closure) => closure.form(),
+        }
+    }
+
+    pub fn render(&self, questions: &[Question]) -> String {
+        match self {
+            PromptResolution::Answered(answers) => answers.render(questions),
+            PromptResolution::Closed(closure) => closure.render(),
+        }
+    }
+
+    pub fn answers(&self) -> Option<&PromptAnswers> {
+        match self {
+            PromptResolution::Answered(answers) => Some(answers),
+            PromptResolution::Closed(_) => None,
+        }
+    }
+}
+
 /// A stored `prompts.response` (or claim-ledger answer) as read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredAnswer {
     /// The canonical indexed form.
     Answers(PromptAnswers),
+    /// Resolved without an answer: handled or moot.
+    Closed(Closure),
     /// A value written before answers were stored by index: bare text, the
     /// old `Question N: answer` lines, or a desktop JSON object keyed by
     /// question text. It is shown verbatim and never reinterpreted, except
@@ -204,16 +314,19 @@ impl PromptAnswers {
         serde_json::to_string(&self.answers).expect("question answers always serialize")
     }
 
-    /// Read a stored value back. Anything that is not the canonical array is
-    /// [`StoredAnswer::Legacy`], kept verbatim.
+    /// Read a stored value back: the canonical array, a [`Closure`] object,
+    /// or anything else as [`StoredAnswer::Legacy`], kept verbatim.
     pub fn decode_stored(stored: &str) -> StoredAnswer {
-        serde_json::from_str::<Vec<QuestionAnswer>>(stored)
+        if let Some(answers) = serde_json::from_str::<Vec<QuestionAnswer>>(stored)
             .ok()
             .and_then(|answers| Self::new(answers.len(), answers).ok())
-            .map_or_else(
-                || StoredAnswer::Legacy(stored.to_string()),
-                StoredAnswer::Answers,
-            )
+        {
+            return StoredAnswer::Answers(answers);
+        }
+        match serde_json::from_str::<Closure>(stored) {
+            Ok(closure) => StoredAnswer::Closed(closure),
+            Err(_) => StoredAnswer::Legacy(stored.to_string()),
+        }
     }
 
     /// What a person reads: one answer verbatim, or for several questions a
@@ -265,15 +378,39 @@ impl StoredAnswer {
                 answers.question_count(),
                 prompt_shape(question_count)
             )),
+            StoredAnswer::Closed(closure) => Err(format!(
+                "this question was closed as {}, not answered",
+                closure.form()
+            )),
             StoredAnswer::Legacy(text) => PromptAnswers::parse_typed(question_count, &text),
         }
     }
 
-    /// What a person reads: the canonical form rendered, a legacy value
-    /// verbatim.
+    /// The resolution a stored value records, recovering a legacy answer
+    /// through the typed-input parser as [`StoredAnswer::into_answers`] does.
+    pub fn into_resolution(self, question_count: usize) -> Result<PromptResolution, String> {
+        match self {
+            StoredAnswer::Closed(closure) => Ok(PromptResolution::Closed(closure)),
+            other => other
+                .into_answers(question_count)
+                .map(PromptResolution::Answered),
+        }
+    }
+
+    /// `answered`, `handled` or `moot`.
+    pub fn form(&self) -> &'static str {
+        match self {
+            StoredAnswer::Closed(closure) => closure.form(),
+            StoredAnswer::Answers(_) | StoredAnswer::Legacy(_) => "answered",
+        }
+    }
+
+    /// What a person reads: the canonical form rendered, a closure as its
+    /// line, a legacy value verbatim.
     pub fn render(&self, questions: &[Question]) -> String {
         match self {
             StoredAnswer::Answers(answers) => answers.render(questions),
+            StoredAnswer::Closed(closure) => closure.render(),
             StoredAnswer::Legacy(text) => text.clone(),
         }
     }
@@ -455,6 +592,48 @@ mod tests {
             assert_eq!(decoded, StoredAnswer::Legacy(old.to_string()));
             assert_eq!(decoded.render(&questions), old);
         }
+    }
+
+    #[test]
+    fn closures_round_trip_and_never_read_as_an_answer() {
+        let questions = [question("Merge #4382?")];
+        for (resolution, stored, rendered) in [
+            (
+                PromptResolution::Closed(Closure::Handled { note: None }),
+                r#"{"form":"handled"}"#,
+                "Handled",
+            ),
+            (
+                PromptResolution::Closed(Closure::Handled {
+                    note: Some("merged it from the console".into()),
+                }),
+                r#"{"form":"handled","note":"merged it from the console"}"#,
+                "Handled: merged it from the console",
+            ),
+            (
+                PromptResolution::Closed(Closure::Moot {
+                    note: None,
+                    condition: Some(MootCondition {
+                        id: "c-1".into(),
+                        reason: "cairn://p/cairn/4382 merged".into(),
+                    }),
+                }),
+                r#"{"form":"moot","condition":{"id":"c-1","reason":"cairn://p/cairn/4382 merged"}}"#,
+                "Moot: closed itself because cairn://p/cairn/4382 merged",
+            ),
+        ] {
+            assert_eq!(resolution.to_stored(), stored);
+            let decoded = PromptAnswers::decode_stored(stored);
+            assert_eq!(decoded.render(&questions), rendered);
+            assert_eq!(decoded.form(), resolution.form());
+            assert!(decoded.clone().into_answers(1).is_err());
+            assert_eq!(decoded.into_resolution(1).unwrap(), resolution);
+        }
+        let answered = PromptAnswers::new(1, vec![answer(0, "Yes")]).unwrap();
+        assert_eq!(
+            PromptAnswers::decode_stored(&answered.to_stored()).into_resolution(1),
+            Ok(PromptResolution::Answered(answered))
+        );
     }
 
     #[test]

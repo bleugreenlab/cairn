@@ -102,6 +102,12 @@ pub enum NotificationAction {
         prompt_id: String,
         run_id: String,
         questions: String,
+        /// The question's canonical URI, when its asker has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+        /// What the asker said the question is about.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
     },
     /// `respond_to_permission`.
     #[serde(rename_all = "camelCase")]

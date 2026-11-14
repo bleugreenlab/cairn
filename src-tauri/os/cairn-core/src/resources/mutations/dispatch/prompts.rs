@@ -169,28 +169,65 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "question answer requires payload"))?;
-            if payload.get("answer").is_none() && payload.get("answers").is_none() {
+            let withdraw = match payload.get("withdraw") {
+                None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => {
+                    false
+                }
+                Some(serde_json::Value::Bool(true)) => true,
+                Some(_) => {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        "payload.withdraw is true or omitted",
+                    ))
+                }
+            };
+            let answering = ["answer", "answers", "handled", "moot"]
+                .into_iter()
+                .any(|key| payload.get(key).is_some());
+            if withdraw && answering {
                 return Err(build_failure(
                     index,
                     item,
-                    "payload.answer or payload.answers is required",
+                    "payload.withdraw takes the question back; it does not ride with an answer, handled or moot",
+                ));
+            }
+            if !withdraw && !answering {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.answer or payload.answers is required (or handled:true or moot:true; the asker may withdraw:true)",
                 ));
             }
             if dry_run {
+                let verb = if withdraw { "withdraw" } else { "answer" };
                 format!(
-                    "Would answer question {} for {}-{}/{}/{}",
+                    "Would {verb} question {} for {}-{}/{}/{}",
                     segment, project, number, exec_seq, node_id
                 )
+            } else if withdraw {
+                planning::withdraw_node_question(
+                    orch, request, project, *number, *exec_seq, node_id, segment,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
             } else {
-                let outcome = planning::answer_node_question(
-                    orch, project, *number, *exec_seq, node_id, segment, payload,
+                let outcome = planning::answer_node_question_as(
+                    orch,
+                    request.run_id.as_deref(),
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                    segment,
+                    payload,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
                 if let Some(notice) = outcome.withdrawn {
                     notice
                 } else if outcome.duplicate {
-                    format!("Question {} was already answered", segment)
+                    outcome.duplicate_summary(segment)
                 } else {
                     outcome.answered_summary(segment)
                 }

@@ -568,6 +568,26 @@ pub(crate) const TASK_DESCRIPTION: KeySpec = KeySpec::new(
 pub(crate) const QUESTIONS: KeySpec = KeySpec::new("questions", KeyType::Array, "");
 pub(crate) const ANSWER: KeySpec =
     KeySpec::new("answer", KeyType::Str, "single-question shorthand answer");
+pub(crate) const QUESTION_HANDLED: KeySpec = KeySpec::new(
+    "handled",
+    KeyType::Bool,
+    "true: close it as handled (the thing was done outside Cairn); instead of an answer",
+);
+pub(crate) const QUESTION_MOOT: KeySpec = KeySpec::new(
+    "moot",
+    KeyType::Bool,
+    "true: close it as moot (it no longer needs an answer); instead of an answer",
+);
+pub(crate) const QUESTION_NOTE: KeySpec = KeySpec::new(
+    "note",
+    KeyType::Str,
+    "optional note delivered with handled or moot",
+);
+pub(crate) const QUESTION_WITHDRAW: KeySpec = KeySpec::new(
+    "withdraw",
+    KeyType::Bool,
+    "true: the asker takes its own question back; only a run of the asking job may",
+);
 pub(crate) const PERMISSION_DECISION: KeySpec =
     KeySpec::new("decision", KeyType::Str, "allow|deny");
 pub(crate) const PERMISSION_SCOPE: KeySpec =

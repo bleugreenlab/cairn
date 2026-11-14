@@ -212,8 +212,11 @@ pub(crate) const NODE_QUESTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeQuestions,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/questions",
         name: "Node questions",
-        description: "User questions asked by a node job (read; ask via change append)",
-        read_projections: NO_PROJECTIONS,
+        description: "Questions asked by a node or thread, newest first, with state (open, lapsed, answered, handled, moot, withdrawn), age, and the condition that closes each (read; ask via change append)",
+        read_projections: &[ProjectionSpec {
+            key: "state",
+            values: "open | lapsed | answered | handled | moot | withdrawn: only questions in that state",
+        }],
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[MutationSpec {
@@ -230,6 +233,16 @@ pub(crate) const NODE_QUESTIONS_CONTRACT: ResourceContract =
                     KeyType::Int,
                     "a workflow's dispatch ordinal for a non-blocking ask; a replay at the same ordinal returns the same question",
                 ),
+                KeySpec::new(
+                    "context",
+                    KeyType::Str,
+                    "what the question is about, in your own words, with the canonical URIs it concerns (at most 2000 characters); shown collapsed beneath the question, so nobody has to re-explain it",
+                ),
+                KeySpec::new(
+                    "moot_when",
+                    KeyType::Array,
+                    "gate clauses in the after: vocabulary (AND); when all come true the question closes itself as moot and you are told, e.g. [{fact:\"pr_state\",issue:\"cairn://p/PROJECT/N\",state:\"merged\"}]",
+                ),
             ],
             label: "ask question",
             example: "write({changes:[{target:\"cairn:~/questions\",mode:\"append\",payload:{questions:[{question:\"...\",options:[{label:\"...\",description:\"...\"}],multiSelect:false}]}}]})",
@@ -241,7 +254,7 @@ pub(crate) const NODE_QUESTION_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeQuestion,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/questions/{segment}",
         name: "Node question",
-        description: "A single user question and its response",
+        description: "A single question: its state, context, moot_when, and how it was resolved. The asker may withdraw its own; anyone answering may give an answer, handled:true or moot:true",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -249,7 +262,14 @@ pub(crate) const NODE_QUESTION_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Patch,
                 required: &[],
-                optional: &[ANSWER, ANSWERS],
+                optional: &[
+                    ANSWER,
+                    ANSWERS,
+                    QUESTION_HANDLED,
+                    QUESTION_MOOT,
+                    QUESTION_NOTE,
+                    QUESTION_WITHDRAW,
+                ],
                 label: "answer question",
                 example: "write({changes:[{target:\"cairn://p/PROJ/1/1/planner/questions/q-1\",mode:\"patch\",payload:{answers:[{index:0,selection:\"Option A\"},{index:1,text:\"free-form answer\"}]}}]})", // single-question shorthand: payload:{answer:\"Option 1\"}
             },

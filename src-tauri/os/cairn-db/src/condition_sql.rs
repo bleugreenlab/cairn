@@ -118,6 +118,30 @@ macro_rules! open_prompt_sql {
     };
 }
 
+/// True when question `p` waits on the operator: unanswered and unwithdrawn,
+/// and either asked non-blocking (`p.background = 1`) by a job that is still
+/// live, or a blocking question holding its job ([`open_prompt_sql!`]).
+///
+/// The two predicates answer different questions and must not be merged.
+/// [`open_prompt_sql!`] is "this question holds its job": the fleet cap and
+/// [`job_awaits_operator_sql!`] count on it, and a non-blocking asker is not
+/// held, since its turn moves on by design. This one is "the operator owes
+/// this question an answer", for the surfaces that list questions to the
+/// operator: the notification center, a questions listing's open state, the
+/// thread seed and the children census. An MCP tool's input request (owned by
+/// its durable wait, `mcp_wait_id`) is the wait's to surface, not this one's.
+/// Expects `prompts p`, `jobs j` and `turns pt` as [`open_prompt_sql!`] does.
+#[macro_export]
+macro_rules! pending_question_sql {
+    () => {
+        concat!(
+            "(p.response IS NULL AND p.withdrawn_at IS NULL AND ((p.background = 1 AND p.mcp_wait_id IS NULL AND j.status NOT IN ('complete', 'failed', 'cancelled')) OR (",
+            $crate::open_prompt_sql!(),
+            ")))"
+        )
+    };
+}
+
 /// True when permission request `pr` still waits on the operator. Expects a
 /// `permission_requests` row aliased `pr`.
 #[macro_export]

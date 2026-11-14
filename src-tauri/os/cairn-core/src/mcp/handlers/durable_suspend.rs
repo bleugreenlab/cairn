@@ -5037,8 +5037,10 @@ mod tests {
         let _ = orch.prompt_responses.send((
             prompt_id.clone(),
             crate::mcp::handlers::planning::AnsweredPrompt {
-                answers,
-                rendered: encoded,
+                resolution: crate::models::question::PromptResolution::Answered(answers),
+                rendered: encoded.clone(),
+                framed: encoded,
+                uri: None,
             },
         ));
         prompt_id

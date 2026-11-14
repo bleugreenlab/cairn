@@ -200,13 +200,16 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
     let mut stream = serde_json::Deserializer::from_str(result).into_iter::<Value>();
     let report = stream.next().unwrap().unwrap();
     assert_eq!(&result[stream.byte_offset()..], suffix);
+    // The waiting call's result names the question it answers, then carries
+    // the answer bytes unchanged.
+    let framed = format!("Your question (\"Which approach?\") was answered:\n\n{answer}");
     let mut expected = original;
-    expected["blocking"] = json!({"text": answer, "answers": [{"index": 0, "answer": answer}]});
+    expected["blocking"] = json!({"text": framed, "answers": [{"index": 0, "answer": answer}]});
     assert_eq!(
         report, expected,
         "only the host blocking payload may change"
     );
-    assert_eq!(report["blocking"]["text"], answer);
+    assert_eq!(report["blocking"]["text"], framed);
     assert_eq!(
         report["blocking"]["answers"][0]["answer"], answer,
         "the structured answer carries the same bytes"

@@ -107,6 +107,8 @@ pub enum WithdrawalCause {
     /// A newer ask replaced it: what it asked about changed before anyone
     /// answered.
     Superseded,
+    /// The asker took its own question back: it no longer applies.
+    Retracted,
 }
 
 impl From<HandoffClosed> for WithdrawalCause {
@@ -138,6 +140,7 @@ impl WithdrawalCause {
             Self::Superseded => {
                 "what it asked about changed before it was answered, and a newer question replaced it"
             }
+            Self::Retracted => "its asker withdrew it",
         }
     }
 }
@@ -166,6 +169,7 @@ mod withdrawal_cause_tests {
             ("operator_compact", WithdrawalCause::OperatorCompact),
             ("operator_stop", WithdrawalCause::OperatorStop),
             ("superseded", WithdrawalCause::Superseded),
+            ("retracted", WithdrawalCause::Retracted),
         ] {
             let row = format!(r#"{{"withdrawn":{{"cause":"{stored}"}}}}"#);
             assert_eq!(withdrawn_cause(Some(&row)), Some(cause));

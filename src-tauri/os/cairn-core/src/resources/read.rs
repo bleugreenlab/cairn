@@ -3267,13 +3267,7 @@ async fn render_resource_body(
             number,
             exec_seq,
             node_id,
-        } => {
-            if let Some(error) = reject_query_params("node questions", &params) {
-                error
-            } else {
-                read_node_questions(db, &project, number, exec_seq, &node_id).await
-            }
-        }
+        } => read_node_questions(db, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::NodeQuestion {
             project,
             number,

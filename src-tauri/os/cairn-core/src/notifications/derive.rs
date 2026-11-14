@@ -348,10 +348,12 @@ fn first_question(questions: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Open while unanswered and unwithdrawn on its job's current turn, on a job
-/// that is still live and a turn that was not cancelled; resolved when
-/// answered or withdrawn. A crashed run alone does not close a question: its
-/// yielded turn can still be answered and resumed.
+/// Open while it waits on the operator ([`cairn_db::pending_question_sql!`]):
+/// a blocking question on its job's current turn, on a live job and a turn
+/// that was not cancelled, or a non-blocking one on a live job whatever turn
+/// it is on now; resolved when answered, handled, moot or withdrawn. A crashed
+/// run alone does not close a question: its yielded turn can still be answered
+/// and resumed.
 pub(super) async fn questions(
     db: &LocalDb,
     project: &ProjectRef,
@@ -359,7 +361,7 @@ pub(super) async fn questions(
 ) -> Result<Vec<OperatorNotification>, String> {
     let sql = format!(
         "SELECT p.id, p.run_id, p.questions, p.created_at, p.answered_at, p.withdrawn_at,
-                {open_prompt},
+                {pending_question}, p.uri_segment, p.context,
                 {PLACE_COLUMNS}
            FROM prompts p
            JOIN runs r ON r.id = p.run_id
@@ -367,9 +369,9 @@ pub(super) async fn questions(
            LEFT JOIN turns pt ON pt.id = p.turn_id
            {PLACE_JOINS}
           WHERE j.project_id = ?1",
-        // One definition of an open question, shared with the execution
-        // queue's fleet cap, which frees exactly these jobs' slots.
-        open_prompt = cairn_db::open_prompt_sql!()
+        // One definition of a question waiting on the operator, shared with
+        // the questions listing, the thread seed and the children census.
+        pending_question = cairn_db::pending_question_sql!()
     );
     let rows = open_and_recent(
         db,
@@ -386,7 +388,8 @@ pub(super) async fn questions(
                 row.i64(3)?,
                 row.opt_i64(4)?.or(row.opt_i64(5)?),
                 row.opt_i64(6)?.unwrap_or(0) != 0,
-                JobPlace::read(row, 7)?,
+                (row.opt_text(7)?, row.opt_text(8)?),
+                JobPlace::read(row, 9)?,
             ))
         },
     )
@@ -394,7 +397,7 @@ pub(super) async fn questions(
     Ok(rows
         .into_iter()
         .filter_map(
-            |(id, run_id, questions, created_at, closed_at, current, place)| {
+            |(id, run_id, questions, created_at, closed_at, current, (segment, context), place)| {
                 let resolved_at = match closed_at {
                     Some(at) => Some(at),
                     // Unanswered: open only on the current turn of a live issue.
@@ -404,18 +407,24 @@ pub(super) async fn questions(
                 let asked = first_question(&questions)
                     .map(|question| format!(": {question}"))
                     .unwrap_or_default();
+                let home = place.uri(&project.key);
+                let uri = segment.as_deref().and_then(|segment| {
+                    crate::mcp::handlers::planning::question_uri_under_home(&home, segment)
+                });
                 Some(entry(
                     project,
                     format!("question:{id}"),
                     NotificationKind::Question,
                     created_at,
                     format!("{} asks{asked}", place.label()),
-                    place.uri(&project.key),
+                    home,
                     resolved_at,
                     Some(NotificationAction::Question {
                         prompt_id: id,
                         run_id,
                         questions,
+                        uri,
+                        context,
                     }),
                 ))
             },
